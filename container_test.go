@@ -13,6 +13,13 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+func TestMain(m *testing.M) {
+	// The developer's shell must not redirect fixture-backed tests to
+	// another backend; tests opting in use t.Setenv.
+	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Exit(m.Run())
+}
+
 const testInspectJSON = `[
   {
     "id": "myctr",
@@ -88,7 +95,9 @@ func newTestRunner() *fakeRunner {
 
 func runTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
 	t.Helper()
-	opts = append([]Option{WithName("myctr"), withRunner(f)}, opts...)
+	// Pin the apple engine so a CONTAINERGO_BACKEND in the developer's
+	// environment cannot redirect the apple-shaped fixtures.
+	opts = append([]Option{WithName("myctr"), withRunner(f), withEngine(appleEngine{})}, opts...)
 	ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err != nil {
 		t.Fatalf("Run: %v", err)

@@ -38,7 +38,6 @@ type config struct {
 func newConfig() *config {
 	return &config{
 		runner: &cli.ExecRunner{},
-		eng:    appleEngine{},
 		env:    map[string]string{},
 		labels: map[string]string{},
 	}

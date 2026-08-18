@@ -78,6 +78,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if !imageRE.MatchString(image) {
 		return nil, fmt.Errorf("invalid image reference %q", image)
 	}
+	if cfg.eng == nil {
+		eng, err := detectEngine()
+		if err != nil {
+			return nil, err
+		}
+		cfg.eng = eng
+	}
 	if cfg.name == "" {
 		cfg.name = newContainerName()
 	}

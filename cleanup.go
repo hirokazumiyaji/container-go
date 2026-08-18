@@ -39,7 +39,11 @@ func Cleanup(tb testing.TB, ctr *Container) {
 // Prune removes stopped containers created by this library, from any
 // session. It returns the IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
-	return pruneWith(ctx, &cli.ExecRunner{}, appleEngine{})
+	eng, err := detectEngine()
+	if err != nil {
+		return nil, err
+	}
+	return pruneWith(ctx, &cli.ExecRunner{}, eng)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {

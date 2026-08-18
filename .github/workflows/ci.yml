@@ -6,8 +6,11 @@ on:
   pull_request:
 
 jobs:
+  # Unit tests run against a fake CLI runner, so the cheaper Linux
+  # runner is enough; integration tests need real Apple Container and
+  # run locally via `make integration`.
   test:
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5

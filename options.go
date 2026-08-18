@@ -22,6 +22,7 @@ type config struct {
 	published  []publishSpec
 	labels     map[string]string
 	mounts     []Mount
+	files      []File
 	cpus       int
 	memory     string
 	user       string

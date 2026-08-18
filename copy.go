@@ -1,0 +1,100 @@
+package container
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"unicode/utf8"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
+)
+
+// File is a host file copied into the container right after start.
+type File struct {
+	HostPath      string
+	ContainerPath string
+}
+
+// WithFiles copies files into the container after it starts. Copy
+// failures fail Run and roll the container back.
+func WithFiles(files ...File) Option {
+	return func(c *config) error {
+		for _, f := range files {
+			if err := validateContainerPath(f.ContainerPath); err != nil {
+				return err
+			}
+		}
+		c.files = append(c.files, files...)
+		return nil
+	}
+}
+
+// CopyToContainer copies a host file or directory into the running
+// container.
+func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
+	if err := validateContainerPath(containerPath); err != nil {
+		return err
+	}
+	abs, err := filepath.Abs(hostPath)
+	if err != nil {
+		return err
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return fmt.Errorf("copy to container: %w", err)
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	_, _, err = c.runner.Run(qCtx, "cp", abs, c.id+":"+containerPath)
+	return cli.Classify(ctx, c.runner, err)
+}
+
+// CopyFileFromContainer copies one file out of the running container
+// and returns its content. Close releases the temporary copy.
+func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
+	if err := validateContainerPath(containerPath); err != nil {
+		return nil, err
+	}
+	dir, err := os.MkdirTemp("", "containergo-cp-")
+	if err != nil {
+		return nil, err
+	}
+	dst := filepath.Join(dir, filepath.Base(containerPath))
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	if _, _, err := c.runner.Run(qCtx, "cp", c.id+":"+containerPath, dst); err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, cli.Classify(ctx, c.runner, err)
+	}
+	f, err := os.Open(dst)
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	return &tempFileReader{File: f, dir: dir}, nil
+}
+
+type tempFileReader struct {
+	*os.File
+	dir string
+}
+
+func (r *tempFileReader) Close() error {
+	err := r.File.Close()
+	_ = os.RemoveAll(r.dir)
+	return err
+}
+
+// validateContainerPath enforces the invariants the copy protocol
+// relies on: absolute, valid UTF-8, and free of NUL bytes.
+func validateContainerPath(p string) error {
+	if !strings.HasPrefix(p, "/") {
+		return fmt.Errorf("container path %q must be absolute", p)
+	}
+	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
+		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)
+	}
+	return nil
+}

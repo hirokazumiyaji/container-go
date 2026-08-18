@@ -86,7 +86,7 @@ func newTestRunner() *fakeRunner {
 	return &fakeRunner{systemUp: true}
 }
 
-func runTestContainer(t *testing.T, f *fakeRunner, opts ...Option) *Container {
+func runTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
 	t.Helper()
 	opts = append([]Option{WithName("myctr"), withRunner(f)}, opts...)
 	ctr, err := Run(context.Background(), "redis:7-alpine", opts...)

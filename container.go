@@ -94,6 +94,16 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, cli.Classify(ctx, cfg.runner, err)
 	}
 
+	// The reaper only backs real CLI containers; with an injected
+	// test runner there is nothing external to clean up.
+	if er, ok := cfg.runner.(*cli.ExecRunner); ok && !keepContainers() {
+		bin := er.Binary
+		if bin == "" {
+			bin = "container"
+		}
+		registerWithGlobalReaper(bin, cfg.name)
+	}
+
 	c := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,

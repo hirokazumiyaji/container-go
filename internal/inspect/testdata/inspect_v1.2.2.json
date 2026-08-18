@@ -1,0 +1,99 @@
+[
+  {
+    "id": "containergo-1a2b3c4d",
+    "configuration": {
+      "id": "containergo-1a2b3c4d",
+      "image": {
+        "reference": "docker.io/library/redis:7-alpine",
+        "descriptor": {
+          "mediaType": "application/vnd.oci.image.index.v1+json",
+          "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "size": 1234
+        }
+      },
+      "mounts": [
+        {
+          "type": { "virtiofs": {} },
+          "source": "/Users/dev/data",
+          "destination": "/data",
+          "options": ["ro"]
+        }
+      ],
+      "publishedPorts": [
+        {
+          "hostAddress": "127.0.0.1",
+          "hostPort": 16379,
+          "containerPort": 6379,
+          "proto": "tcp",
+          "count": 1
+        }
+      ],
+      "publishedSockets": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": "f00dcafe"
+      },
+      "sysctls": {},
+      "networks": [{ "network": "default", "options": {} }],
+      "dns": { "nameservers": ["1.1.1.1"], "domain": null, "searchDomains": [], "options": [] },
+      "rosetta": false,
+      "initProcess": {
+        "executable": "docker-entrypoint.sh",
+        "arguments": ["redis-server"],
+        "environment": ["PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"],
+        "workingDirectory": "/data",
+        "terminal": false,
+        "user": { "id": { "uid": 0, "gid": 0 } },
+        "supplementalGroups": [],
+        "rlimits": []
+      },
+      "platform": { "os": "linux", "architecture": "arm64" },
+      "resources": { "cpus": 4, "memoryInBytes": 1073741824, "cpuOverhead": 1 },
+      "runtimeHandler": "container-runtime-linux",
+      "virtualization": false,
+      "ssh": false,
+      "readOnly": false,
+      "useInit": false,
+      "capAdd": [],
+      "capDrop": [],
+      "shmSize": 67108864,
+      "stopSignal": "SIGTERM",
+      "maskedPaths": null,
+      "readonlyPaths": null,
+      "creationDate": "2026-08-18T12:34:56Z"
+    },
+    "status": {
+      "state": "running",
+      "networks": [
+        {
+          "ipv4Address": "192.168.64.3/24",
+          "ipv4Gateway": "192.168.64.1",
+          "hostname": "containergo-1a2b3c4d.test.",
+          "network": "default"
+        }
+      ],
+      "startedDate": "2026-08-18T12:35:00Z"
+    }
+  },
+  {
+    "id": "stopped-one",
+    "configuration": {
+      "id": "stopped-one",
+      "image": { "reference": "docker.io/library/nginx:latest" },
+      "mounts": [],
+      "publishedPorts": [],
+      "publishedSockets": [],
+      "labels": {},
+      "sysctls": {},
+      "networks": [{ "network": "default", "options": {} }],
+      "platform": { "os": "linux", "architecture": "arm64" },
+      "resources": { "cpus": 4, "memoryInBytes": 1073741824 },
+      "creationDate": "2026-08-18T10:00:00Z"
+    },
+    "status": {
+      "state": "stopped",
+      "networks": [],
+      "startedDate": null
+    }
+  }
+]

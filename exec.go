@@ -38,6 +38,9 @@ func WithExecEnv(env map[string]string) ExecOption {
 // WithExecUser sets the user for the exec'd process.
 func WithExecUser(u string) ExecOption {
 	return func(c *execConfig) error {
+		if !userRE.MatchString(u) {
+			return fmt.Errorf("invalid exec user %q", u)
+		}
 		c.user = u
 		return nil
 	}
@@ -46,6 +49,9 @@ func WithExecUser(u string) ExecOption {
 // WithExecWorkDir sets the working directory for the exec'd process.
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
+		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
+			return fmt.Errorf("exec working directory %q must be an absolute path", dir)
+		}
 		c.workdir = dir
 		return nil
 	}

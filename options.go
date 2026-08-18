@@ -2,6 +2,7 @@ package container
 
 import (
 	"fmt"
+	"net/netip"
 	"regexp"
 	"strconv"
 	"strings"
@@ -101,6 +102,9 @@ func WithCmd(cmd ...string) Option {
 // WithEntrypoint overrides the image entrypoint.
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
+		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
+			return fmt.Errorf("invalid entrypoint %q", entrypoint)
+		}
 		c.entrypoint = entrypoint
 		return nil
 	}
@@ -190,9 +194,15 @@ func WithMemory(size string) Option {
 	}
 }
 
+// userRE allows "name", "uid", or "uid:gid" style users.
+var userRE = regexp.MustCompile(`^[a-zA-Z0-9._][a-zA-Z0-9._-]*(:[a-zA-Z0-9._-]+)?$`)
+
 // WithUser sets the user ("name" or "uid[:gid]") for the init process.
 func WithUser(u string) Option {
 	return func(c *config) error {
+		if !userRE.MatchString(u) {
+			return fmt.Errorf("invalid user %q", u)
+		}
 		c.user = u
 		return nil
 	}
@@ -201,6 +211,9 @@ func WithUser(u string) Option {
 // WithWorkingDir sets the working directory of the init process.
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
+		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
+			return fmt.Errorf("working directory %q must be an absolute path", dir)
+		}
 		c.workdir = dir
 		return nil
 	}
@@ -210,15 +223,24 @@ func WithWorkingDir(dir string) Option {
 // "default".
 func WithNetwork(name string) Option {
 	return func(c *config) error {
+		if !nameRE.MatchString(name) {
+			return fmt.Errorf("invalid network name %q", name)
+		}
 		c.network = name
 		return nil
 	}
 }
 
+// platformRE matches "os", "os/arch", or "os/arch/variant".
+var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
+
 // WithPlatform selects the image platform, e.g. "linux/amd64" (runs via
 // Rosetta).
 func WithPlatform(p string) Option {
 	return func(c *config) error {
+		if !platformRE.MatchString(p) {
+			return fmt.Errorf("invalid platform %q", p)
+		}
 		c.platform = p
 		return nil
 	}
@@ -337,6 +359,11 @@ func parsePublishSpec(s string) (publishSpec, error) {
 	} else if parts := strings.Split(rest, ":"); len(parts) == 3 {
 		spec.hostAddr = parts[0]
 		rest = parts[1] + ":" + parts[2]
+	}
+	if spec.hostAddr != "" {
+		if _, err := netip.ParseAddr(spec.hostAddr); err != nil {
+			return publishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
+		}
 	}
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")

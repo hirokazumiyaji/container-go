@@ -110,6 +110,17 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 	}
+	if cfg.waitStrategy != nil {
+		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
+			cleanupCtx := context.WithoutCancel(ctx)
+			tail := c.logTail(cleanupCtx)
+			_ = c.Terminate(cleanupCtx)
+			if tail != "" {
+				return nil, fmt.Errorf("container %s failed to become ready: %w\ncontainer logs:\n%s", c.id, err, tail)
+			}
+			return nil, fmt.Errorf("container %s failed to become ready: %w", c.id, err)
+		}
+	}
 	return c, nil
 }
 

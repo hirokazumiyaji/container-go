@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // Option configures Run.
@@ -21,8 +22,9 @@ type config struct {
 	exposed    []portSpec
 	published  []publishSpec
 	labels     map[string]string
-	mounts     []Mount
-	files      []File
+	mounts       []Mount
+	files        []File
+	waitStrategy wait.Strategy
 	cpus       int
 	memory     string
 	user       string

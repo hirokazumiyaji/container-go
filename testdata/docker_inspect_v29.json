@@ -1,0 +1,41 @@
+[
+  {
+    "Id": "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    "Created": "2026-08-19T01:23:45.678901234Z",
+    "Name": "/myctr",
+    "State": {
+      "Status": "running",
+      "Running": true,
+      "Paused": false,
+      "Restarting": false,
+      "ExitCode": 0,
+      "StartedAt": "2026-08-19T01:23:46.0Z"
+    },
+    "Config": {
+      "Image": "redis:7-alpine",
+      "Labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": "f00dcafe"
+      }
+    },
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "NetworkSettings": {
+      "Bridge": "",
+      "Ports": {
+        "6379/tcp": [
+          { "HostIp": "127.0.0.1", "HostPort": "49153" }
+        ],
+        "8080/tcp": null
+      },
+      "IPAddress": "172.17.0.2",
+      "Networks": {
+        "bridge": {
+          "IPAddress": "172.17.0.2",
+          "Gateway": "172.17.0.1"
+        }
+      }
+    }
+  }
+]

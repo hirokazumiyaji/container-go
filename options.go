@@ -77,6 +77,13 @@ func withRunner(r cli.Runner) Option {
 	}
 }
 
+func withEngine(e engine) Option {
+	return func(c *config) error {
+		c.eng = e
+		return nil
+	}
+}
+
 // WithName sets the container name, which Apple Container uses as the
 // container ID. Default is containergo-<random hex>.
 func WithName(name string) Option {

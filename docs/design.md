@@ -1,7 +1,7 @@
 # container-go 設計ドキュメント
 
-作成日: 2026-08-18
-対象: Apple Container v1.2.x、macOS 26 以降、Apple Silicon、Go 1.26
+作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
+対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.26
 
 ## 目的
 
@@ -299,13 +299,43 @@ type Runner interface {
 **CI**：ユニットテストと `go vet` はプッシュごとに GitHub Actions(macos ランナーで可、Apple Container 不要)で実行する。
 統合テストは GitHub ホストランナーの macOS バージョンと nested virtualization の制約により動かない可能性が高いため、当面はローカル実行を前提とし、`make integration` として手順化する。
 
-## スコープ外(初期リリースでは扱わない)
+## バックエンド(v0.2)
 
-- `container build` による Dockerfile ビルド
+v0.1 は Apple Container 専用だった。
+v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ API でテストコンテナを使えるようにする。
+
+**選択ルール**：環境変数 `CONTAINERGO_BACKEND` が最優先で、`apple` または `docker` を指定できる。
+未指定の場合は OS で決まる(macOS は Apple Container、Linux と Windows は Docker)。
+macOS で Docker Desktop を使いたい場合は `CONTAINERGO_BACKEND=docker` を設定する。
+
+**実現方式**：Docker も CLI ラッパーとする(`docker` コマンドを `os/exec` で呼ぶ)。
+container-rs は Docker Engine API を直接叩くが、本ライブラリでは採らない。
+API 直叩きは tar 生成、ログストリームの逆多重化、レジストリ認証、Windows named pipe を自前実装する必要があり、CLI ラッパーで統一すれば既存のランナー層(引数配列実行、タイムアウト、ストリーミング)をそのまま共有できるためである。
+`DOCKER_HOST` やコンテキスト、認証の解決は docker CLI 自身に委ねられる。
+
+**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
+プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
+正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
+
+**接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
+`WithExposedPorts` で宣言したポートは自動的に `127.0.0.1` のランダムポートへ公開し(`-p 127.0.0.1::<port>`)、`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。
+ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
+Apple Container バックエンドの既定(直接 IP)は変えない。
+
+**クリーンアップの違い**:watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
+リーパーは `/bin/sh` に依存するため Windows では動かない。
+v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
+`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+
+**システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
+
+## スコープ外
+
+- `container build` / `docker build` による Dockerfile ビルド
 - ネットワークの作成と管理(既定ネットワークのみ使う)
 - ボリュームの作成と管理
 - testcontainers のモジュール群(postgres など)に相当する高水準パッケージ(コア安定後に検討)
-- Linux / Docker バックエンド(container-rs は対応しているが、本ライブラリは Apple Container 専用とする)
+- Docker Engine API の直接クライアント(CLI ラッパーで足りなくなったら再検討)
 
 ## 実装フェーズ
 
@@ -323,6 +353,14 @@ type Runner interface {
 9. セキュリティ仕上げ：env-file 経由の環境変数、入力検証の網羅、ログのマスキング
 10. 統合テストと手順化
 11. ドキュメントとサンプル：README、使用例
+
+v0.2(Docker バックエンド)は次の順に進める。
+
+12. バックエンド抽象の導入：引数組み立てと inspect 正規化のインターフェース化、既存テストを green のまま Apple 実装へ切り出し
+13. Docker エンジン実装：run / inspect / lifecycle / exec / logs / copy の引数と JSON パース
+14. Docker の接続情報：ランダム公開ポート、`Host` / `MappedPort`、`DOCKER_HOST` 対応
+15. バックエンド選択と周辺：`CONTAINERGO_BACKEND`、OS 既定、リーパーと Prune と probe の切替
+16. Docker 統合テストとドキュメント更新
 
 ## 参考資料
 

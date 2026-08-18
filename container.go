@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
-	"github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
 const (
@@ -44,7 +43,7 @@ func newContainerName() string {
 	return "containergo-" + hex.EncodeToString(b[:])
 }
 
-// State is a container lifecycle state as reported by the CLI.
+// State is a container lifecycle state.
 type State string
 
 const (
@@ -58,11 +57,12 @@ const (
 type Container struct {
 	id        string
 	runner    cli.Runner
+	eng       engine
 	exposed   []portSpec
 	published []publishSpec
 
 	mu   sync.Mutex
-	info *inspect.Container // cached first inspect; immutable fields only
+	info *engineInfo // cached first inspect; immutable fields only
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -82,16 +82,20 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.name = newContainerName()
 	}
 
-	args, cleanup, err := buildRunArgs(cfg, image)
-	if err != nil {
-		return nil, err
+	var envFile string
+	if len(cfg.env) > 0 {
+		path, dir, err := writeEnvFile(cfg.env)
+		if err != nil {
+			return nil, err
+		}
+		defer os.RemoveAll(dir)
+		envFile = path
 	}
-	defer cleanup()
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
-	if _, _, err := cfg.runner.Run(runCtx, args...); err != nil {
-		return nil, cli.Classify(ctx, cfg.runner, err)
+	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
+		return nil, cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 	}
 
 	// The reaper only backs real CLI containers; with an injected
@@ -99,14 +103,15 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if er, ok := cfg.runner.(*cli.ExecRunner); ok && !keepContainers() {
 		bin := er.Binary
 		if bin == "" {
-			bin = "container"
+			bin = cfg.eng.binary()
 		}
-		registerWithGlobalReaper(bin, cfg.name)
+		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name)
 	}
 
 	c := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,
+		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
 	}
@@ -134,65 +139,6 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// buildRunArgs assembles the `container run` argv. The returned cleanup
-// removes the temporary env file directory and must always be called.
-func buildRunArgs(cfg *config, image string) (args []string, cleanup func(), err error) {
-	cleanup = func() {}
-	args = []string{"run", "--detach", "--name", cfg.name}
-
-	labels := map[string]string{
-		managedLabel: "true",
-		sessionLabel: sessionID(),
-	}
-	for k, v := range cfg.labels {
-		labels[k] = v
-	}
-	for _, k := range sortedKeys(labels) {
-		args = append(args, "--label", k+"="+labels[k])
-	}
-
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return nil, cleanup, err
-		}
-		cleanup = func() { _ = os.RemoveAll(dir) }
-		args = append(args, "--env-file", path)
-	}
-
-	for _, p := range cfg.published {
-		args = append(args, "--publish", p.raw)
-	}
-	for _, m := range cfg.mounts {
-		args = append(args, "--mount", m.arg())
-	}
-	if cfg.cpus > 0 {
-		args = append(args, "--cpus", strconv.Itoa(cfg.cpus))
-	}
-	if cfg.memory != "" {
-		args = append(args, "--memory", cfg.memory)
-	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	if cfg.network != "" {
-		args = append(args, "--network", cfg.network)
-	}
-	if cfg.platform != "" {
-		args = append(args, "--platform", cfg.platform)
-	}
-	if cfg.entrypoint != "" {
-		args = append(args, "--entrypoint", cfg.entrypoint)
-	}
-
-	args = append(args, image)
-	args = append(args, cfg.cmd...)
-	return args, cleanup, nil
-}
-
 // writeEnvFile stores env vars in a 0600 file under a private temporary
 // directory, keeping values out of the process table.
 func writeEnvFile(env map[string]string) (path, dir string, err error) {
@@ -215,27 +161,26 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 // ID returns the container ID (identical to its name).
 func (c *Container) ID() string { return c.id }
 
+func (c *Container) classify(ctx context.Context, err error) error {
+	return cli.Classify(ctx, c.runner, err, c.eng.probe())
+}
+
 // State returns the current lifecycle state.
 func (c *Container) State(ctx context.Context) (State, error) {
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
-	return State(info.Status.State), nil
+	return info.state, nil
 }
 
-// Stop stops the container. A nil timeout uses the CLI default grace
-// period (SIGTERM, then SIGKILL after 5 seconds).
+// Stop stops the container. A nil timeout uses the CLI's default grace
+// period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
-	args := []string{"stop"}
-	if timeout != nil {
-		args = append(args, "--time", strconv.Itoa(int(timeout.Seconds())))
-	}
-	args = append(args, c.id)
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, args...)
-	return cli.Classify(ctx, c.runner, err)
+	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	return c.classify(ctx, err)
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -243,35 +188,40 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err := c.runner.Run(delCtx, "delete", "--force", c.id)
+	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(c.id)...)
 	if err == nil || isNotFound(err) {
 		return nil
 	}
-	return cli.Classify(ctx, c.runner, err)
+	return c.classify(ctx, err)
 }
 
 // ContainerIP returns the container's address on its first attached
-// network.
+// network. With the Docker backend on Docker Desktop this address is
+// usually not reachable from the host; prefer Endpoint.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	info, err := c.cachedInfo(ctx)
 	if err != nil {
 		return "", err
 	}
-	return info.IPv4()
+	if info.ip == "" {
+		return "", fmt.Errorf("container %s has no reported IP address", c.id)
+	}
+	return info.ip, nil
 }
 
-// Host returns the address clients should connect to: the published
-// host address when ports are published, the container IP otherwise.
+// Host returns the address clients should connect to.
 func (c *Container) Host(ctx context.Context) (string, error) {
 	if len(c.published) > 0 {
 		return c.published[0].connectAddr(), nil
 	}
-	return c.ContainerIP(ctx)
+	if c.eng.directIP() {
+		return c.ContainerIP(ctx)
+	}
+	return c.eng.defaultHost(), nil
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
-// to the port clients should dial: the published host port when the
-// port is published, the container port itself otherwise.
+// to the port clients should dial.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
 	_, p, err := c.resolve(ctx, port)
 	return p, err
@@ -300,17 +250,34 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
-	ip, err := c.ContainerIP(ctx)
+	if c.eng.directIP() {
+		ip, err := c.ContainerIP(ctx)
+		if err != nil {
+			return "", 0, err
+		}
+		return ip, spec.port, nil
+	}
+	// Published-port mode: the backend assigned a host port at start.
+	info, err := c.cachedInfo(ctx)
 	if err != nil {
 		return "", 0, err
 	}
-	return ip, spec.port, nil
+	for _, b := range info.bound {
+		if b.containerPort == spec.port && b.proto == spec.proto {
+			host := b.hostAddr
+			if host == "" || host == "0.0.0.0" || host == "::" {
+				host = c.eng.defaultHost()
+			}
+			return host, b.hostPort, nil
+		}
+	}
+	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
 // cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (image, labels,
-// published ports, network address) should be read from it.
-func (c *Container) cachedInfo(ctx context.Context) (*inspect.Container, error) {
+// that cannot change while the container exists (labels, network
+// address, port bindings) should be read from it.
+func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.info != nil {
@@ -324,23 +291,14 @@ func (c *Container) cachedInfo(ctx context.Context) (*inspect.Container, error) 
 	return info, nil
 }
 
-func (c *Container) inspectFresh(ctx context.Context) (*inspect.Container, error) {
+func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, "inspect", c.id)
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, cli.Classify(ctx, c.runner, err)
+		return nil, c.classify(ctx, err)
 	}
-	containers, err := inspect.Decode(stdout)
-	if err != nil {
-		return nil, err
-	}
-	for i := range containers {
-		if containers[i].ID == c.id {
-			return &containers[i], nil
-		}
-	}
-	return nil, fmt.Errorf("container %s not in inspect output", c.id)
+	return c.eng.parseInspect(stdout, c.id)
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

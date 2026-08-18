@@ -13,11 +13,13 @@ import (
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, "logs", c.id)
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsArgs(c.id, false)...)
 	if err != nil {
-		return nil, cli.Classify(ctx, c.runner, err)
+		return nil, c.classify(ctx, err)
 	}
-	return io.NopCloser(bytes.NewReader(stdout)), nil
+	// docker logs splits the container's streams across the CLI's
+	// stdout and stderr; a snapshot carries both.
+	return io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))), nil
 }
 
 // FollowLogs streams the container's log output until Close is called
@@ -28,5 +30,5 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, "logs", "--follow", c.id)
+	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
 }

@@ -44,7 +44,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
-	r := newReaper(bin)
+	r := newReaper(bin, "delete")
 
 	if err := r.register("ctr-one"); err != nil {
 		t.Fatalf("register: %v", err)
@@ -62,7 +62,7 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
-	r := newReaper(bin)
+	r := newReaper(bin, "delete")
 	defer r.closeStdin()
 
 	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
@@ -74,7 +74,7 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
-	r := newReaper(bin)
+	r := newReaper(bin, "delete")
 
 	if err := r.register("before-crash"); err != nil {
 		t.Fatalf("register: %v", err)

@@ -16,6 +16,7 @@ type Option func(*config) error
 
 type config struct {
 	runner     cli.Runner
+	eng        engine
 	name       string
 	env        map[string]string
 	cmd        []string
@@ -37,9 +38,23 @@ type config struct {
 func newConfig() *config {
 	return &config{
 		runner: &cli.ExecRunner{},
+		eng:    appleEngine{},
 		env:    map[string]string{},
 		labels: map[string]string{},
 	}
+}
+
+// allLabels merges the session labels the library always applies with
+// user-supplied ones.
+func (c *config) allLabels() map[string]string {
+	labels := map[string]string{
+		managedLabel: "true",
+		sessionLabel: sessionID(),
+	}
+	for k, v := range c.labels {
+		labels[k] = v
+	}
+	return labels
 }
 
 // nameRE is Apple Container's container name rule; the name doubles as

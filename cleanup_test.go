@@ -82,7 +82,7 @@ const pruneLsJSON = `[
 func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
 
-	removed, err := pruneWith(context.Background(), f)
+	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {
 		t.Fatalf("Prune: %v", err)
 	}

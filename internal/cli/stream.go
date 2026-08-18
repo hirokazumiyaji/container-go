@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -19,14 +20,23 @@ type Streamer interface {
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
 	cmd := exec.CommandContext(ctx, r.binary(), args...)
 	cmd.WaitDelay = 3 * time.Second
-	stdout, err := cmd.StdoutPipe()
+	// One pipe carries both output streams: `docker logs` splits the
+	// container's stdout/stderr across the CLI's two streams.
+	pr, pw, err := os.Pipe()
 	if err != nil {
 		return nil, err
 	}
+	cmd.Stdout = pw
+	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {
+		pr.Close()
+		pw.Close()
 		return nil, fmt.Errorf("container %s: %w", strings.Join(args, " "), err)
 	}
-	return &processStream{ReadCloser: stdout, cmd: cmd}, nil
+	// The child holds its own copy of the write end; releasing ours
+	// lets the reader see EOF when the child exits.
+	pw.Close()
+	return &processStream{ReadCloser: pr, cmd: cmd}, nil
 }
 
 type processStream struct {

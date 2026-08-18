@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"strings"
 	"testing"
 	"time"
 )
@@ -29,6 +30,28 @@ func TestStreamReadsOutputAndCloseKillsProcess(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatal("Close did not return; child process not killed")
+	}
+}
+
+// docker logs writes the container's stderr to the CLI's stderr; the
+// stream must carry both output streams.
+func TestStreamMergesStderrIntoStream(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `echo out-line; echo err-line >&2`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	var lines []string
+	scanner := bufio.NewScanner(stream)
+	for scanner.Scan() {
+		lines = append(lines, scanner.Text())
+	}
+	joined := strings.Join(lines, "\n")
+	if !strings.Contains(joined, "out-line") || !strings.Contains(joined, "err-line") {
+		t.Errorf("stream = %q, want both stdout and stderr lines", joined)
 	}
 }
 

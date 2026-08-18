@@ -70,25 +70,17 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
-	args := []string{"exec"}
+	var envFile string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
 			return 0, nil, err
 		}
 		defer os.RemoveAll(dir)
-		args = append(args, "--env-file", path)
+		envFile = path
 	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	args = append(args, c.id)
-	args = append(args, cmd...)
 
-	stdout, stderr, err := c.runner.Run(ctx, args...)
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err != nil {
 		var cliErr *cli.CLIError
@@ -97,7 +89,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		if errors.As(err, &cliErr) && !isNotFound(err) {
 			return cliErr.ExitCode, io.MultiReader(output, bytes.NewReader([]byte(cliErr.Stderr))), nil
 		}
-		return 0, nil, cli.Classify(ctx, c.runner, err)
+		return 0, nil, c.classify(ctx, err)
 	}
 	return 0, output, nil
 }

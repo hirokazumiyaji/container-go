@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // File is a host file copied into the container right after start.
@@ -48,7 +46,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, "cp", abs, c.id+":"+containerPath)
-	return cli.Classify(ctx, c.runner, err)
+	return c.classify(ctx, err)
 }
 
 // CopyFileFromContainer copies one file out of the running container
@@ -66,7 +64,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, "cp", c.id+":"+containerPath, dst); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, cli.Classify(ctx, c.runner, err)
+		return nil, c.classify(ctx, err)
 	}
 	f, err := os.Open(dst)
 	if err != nil {

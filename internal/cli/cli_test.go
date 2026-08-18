@@ -108,18 +108,35 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	return []byte(res.stdout), nil, res.err
 }
 
+var appleProbe = Probe{Args: []string{"system", "status"}, Hint: "run `container system start`"}
+
 func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "XPC connection error"}
 	r := &fakeRunner{results: map[string]fakeResult{
 		"system status": {err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1}},
 	}}
 
-	err := Classify(context.Background(), r, orig)
+	err := Classify(context.Background(), r, orig, appleProbe)
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}
 	if !strings.Contains(err.Error(), "container system start") {
 		t.Errorf("Error() = %q, want hint to run 'container system start'", err.Error())
+	}
+}
+
+func TestClassifyUsesProbeSpecificHint(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"info": {err: &CLIError{Args: []string{"info"}, ExitCode: 1}},
+	}}
+
+	err := Classify(context.Background(), r, orig, Probe{Args: []string{"info"}, Hint: "start the Docker daemon"})
+	if !errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
+	}
+	if !strings.Contains(err.Error(), "start the Docker daemon") {
+		t.Errorf("Error() = %q, want docker hint", err.Error())
 	}
 }
 
@@ -129,7 +146,7 @@ func TestClassifyKeepsOriginalErrorWhenSystemIsRunning(t *testing.T) {
 		"system status": {stdout: "apiserver is running"},
 	}}
 
-	err := Classify(context.Background(), r, orig)
+	err := Classify(context.Background(), r, orig, appleProbe)
 	if !errors.Is(err, orig) {
 		t.Fatalf("error = %v, want original error preserved", err)
 	}
@@ -139,7 +156,7 @@ func TestClassifyKeepsOriginalErrorWhenSystemIsRunning(t *testing.T) {
 }
 
 func TestClassifyPassesThroughNil(t *testing.T) {
-	if err := Classify(context.Background(), &fakeRunner{}, nil); err != nil {
+	if err := Classify(context.Background(), &fakeRunner{}, nil, appleProbe); err != nil {
 		t.Fatalf("Classify(nil) = %v, want nil", err)
 	}
 }

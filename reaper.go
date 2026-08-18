@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"runtime"
 	"sync"
 )
 
@@ -19,12 +20,13 @@ import (
 // itself disables globbing and quotes every expansion the IDs reach.
 const reaperScript = `set -f
 bin="$1"
+sub="$2"
 ids=""
 while IFS= read -r id; do
   ids="$ids $id"
 done
 for id in $ids; do
-  "$bin" delete --force "$id" >/dev/null 2>&1 || true
+  "$bin" "$sub" --force "$id" >/dev/null 2>&1 || true
 done
 `
 
@@ -32,6 +34,9 @@ const maxReaperSpawnFailures = 3
 
 type reaper struct {
 	binary string
+	// subcommand deletes a container: "delete" (Apple) or "rm"
+	// (Docker); both take --force.
+	subcommand string
 
 	mu            sync.Mutex
 	cmd           *exec.Cmd
@@ -41,8 +46,8 @@ type reaper struct {
 	spawnFailures int
 }
 
-func newReaper(binary string) *reaper {
-	return &reaper{binary: binary}
+func newReaper(binary, subcommand string) *reaper {
+	return &reaper{binary: binary, subcommand: subcommand}
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
@@ -91,7 +96,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary)
+	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -130,15 +135,24 @@ func (r *reaper) killForTest() {
 }
 
 var (
-	globalReaperOnce sync.Once
-	globalReaper     *reaper
+	globalReapersMu sync.Mutex
+	globalReapers   = map[string]*reaper{}
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper. Reaper trouble never fails container startup.
-func registerWithGlobalReaper(binary, id string) {
-	globalReaperOnce.Do(func() {
-		globalReaper = newReaper(binary)
-	})
-	_ = globalReaper.register(id)
+// process-wide reaper for its backend binary. Reaper trouble never
+// fails container startup. The reaper needs /bin/sh, so on Windows
+// this is a no-op and cleanup relies on the normal paths.
+func registerWithGlobalReaper(binary, subcommand, id string) {
+	if runtime.GOOS == "windows" {
+		return
+	}
+	globalReapersMu.Lock()
+	r, ok := globalReapers[binary]
+	if !ok {
+		r = newReaper(binary, subcommand)
+		globalReapers[binary] = r
+	}
+	globalReapersMu.Unlock()
+	_ = r.register(id)
 }

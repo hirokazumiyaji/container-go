@@ -8,7 +8,6 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
-	"github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
 // keepContainers reports whether CONTAINERGO_KEEP=1 disables all
@@ -38,38 +37,34 @@ func Cleanup(tb testing.TB, ctr *Container) {
 }
 
 // Prune removes stopped containers created by this library, from any
-// session. The CLI has no label filter, so the listing is filtered
-// client-side. It returns the IDs it removed.
+// session. It returns the IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
-	return pruneWith(ctx, &cli.ExecRunner{})
+	return pruneWith(ctx, &cli.ExecRunner{}, appleEngine{})
 }
 
-func pruneWith(ctx context.Context, r cli.Runner) ([]string, error) {
+func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, "ls", "--all", "--format", "json")
+	stdout, _, err := r.Run(qCtx, eng.listArgs()...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err)
+		return nil, cli.Classify(ctx, r, err, eng.probe())
 	}
-	containers, err := inspect.Decode(stdout)
+	ids, err := eng.parseStoppedManaged(stdout)
 	if err != nil {
 		return nil, err
 	}
 
 	var removed []string
 	var errs []error
-	for _, c := range containers {
-		if c.Configuration.Labels[managedLabel] != "true" || c.Status.State != string(StateStopped) {
-			continue
-		}
+	for _, id := range ids {
 		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, "delete", "--force", c.ID)
+		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
 		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("prune %s: %w", c.ID, err))
+			errs = append(errs, fmt.Errorf("prune %s: %w", id, err))
 			continue
 		}
-		removed = append(removed, c.ID)
+		removed = append(removed, id)
 	}
 	return removed, errors.Join(errs...)
 }

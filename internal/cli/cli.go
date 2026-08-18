@@ -15,9 +15,17 @@ import (
 // maxStderr bounds the stderr captured into a CLIError.
 const maxStderr = 64 * 1024
 
-// ErrSystemNotRunning reports that the Apple Container system service
-// (container-apiserver) is not running.
-var ErrSystemNotRunning = errors.New("apple container system service is not running: run `container system start`")
+// ErrSystemNotRunning reports that the container backend (Apple
+// Container system service or Docker daemon) is not running.
+var ErrSystemNotRunning = errors.New("container backend is not running")
+
+// Probe is the backend-specific liveness check Classify runs after a
+// failure: a cheap CLI invocation plus the hint to show the user when
+// it fails.
+type Probe struct {
+	Args []string
+	Hint string
+}
 
 // Runner executes one `container` CLI invocation.
 type Runner interface {
@@ -82,10 +90,10 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// Classify augments a failed CLI call: if the system service does not
-// answer a status probe, the failure is reported as ErrSystemNotRunning
-// instead of the original error.
-func Classify(ctx context.Context, r Runner, err error) error {
+// Classify augments a failed CLI call: if the backend does not answer
+// the probe, the failure is reported as ErrSystemNotRunning instead of
+// the original error.
+func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
 	}
@@ -93,8 +101,8 @@ func Classify(ctx context.Context, r Runner, err error) error {
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if _, _, probeErr := r.Run(ctx, "system", "status"); probeErr != nil {
-		return fmt.Errorf("%w (underlying error: %v)", ErrSystemNotRunning, err)
+	if _, _, probeErr := r.Run(ctx, probe.Args...); probeErr != nil {
+		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
 	}
 	return err
 }

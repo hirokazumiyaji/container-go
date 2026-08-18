@@ -43,7 +43,7 @@ func Prune(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	return pruneWith(ctx, &cli.ExecRunner{}, eng)
+	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {

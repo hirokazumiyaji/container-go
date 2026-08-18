@@ -1,8 +1,9 @@
 # container-go
 
 A [testcontainers](https://testcontainers.com/)-style Go library for
-[Apple Container](https://github.com/apple/container): run throwaway
-containers from Go tests on macOS, with zero third-party dependencies.
+[Apple Container](https://github.com/apple/container) and Docker: run
+throwaway containers from Go tests, with zero third-party
+dependencies.
 
 ```go
 func TestRedis(t *testing.T) {
@@ -22,15 +23,22 @@ func TestRedis(t *testing.T) {
 }
 ```
 
-## Requirements
+## Backends
 
-- macOS 26 or later on Apple Silicon
-- [Apple Container](https://github.com/apple/container) 1.2.x installed,
-  with the system service running: `container system start`
-- Go 1.26+
+| OS | Default backend | Requirement |
+|---|---|---|
+| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) 1.2.x with `container system start` done |
+| Linux | Docker | docker CLI + running daemon |
+| Windows | Docker | docker CLI + running daemon (no watchdog reaper; see below) |
 
-The library shells out to the `container` CLI; it does not talk to
-Docker and does not require cgo.
+Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
+Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
+
+The library shells out to the backend CLI (`container` or `docker`) —
+no cgo, no daemon API client. `DOCKER_HOST`, contexts, and registry
+auth are handled by the docker CLI itself.
+
+Go 1.26+ is required.
 
 ## Installation
 
@@ -40,14 +48,22 @@ go get github.com/hirokazumiyaji/container-go
 
 ## Connection endpoints
 
-Apple Container gives every container a real IP on the `default` vmnet
-network, reachable directly from the host. By default this library uses
-that IP:
+**Apple Container backend**: every container gets a real IP on the
+`default` vmnet network, reachable directly from the host. By default
+this library uses that IP:
 
 - `Host` returns the container IP, `MappedPort` returns the container
   port itself, and `Endpoint` combines them.
 - No host ports are consumed, so parallel tests never conflict over
   ports.
+
+**Docker backend**: the container IP is generally not reachable from
+the host (Docker Desktop), so ports declared via `WithExposedPorts` are
+automatically published to daemon-assigned loopback ports — the classic
+testcontainers model. `Host` returns `127.0.0.1` (or the host from a
+`tcp://` `DOCKER_HOST`) and `MappedPort` returns the assigned port.
+Assignment happens atomically in the daemon, so parallel tests do not
+race over ports here either.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:
@@ -94,7 +110,9 @@ Three layers make sure containers do not outlive your tests:
    returning.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included.
+   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
+   unavailable on Windows — there, cleanup relies on the first two
+   layers only.
 
 Extras:
 
@@ -119,19 +137,19 @@ Not supported (Apple Container has no equivalent, or out of scope):
 
 | testcontainers-go | Here |
 |---|---|
-| `wait.ForHealthCheck` | No runtime healthcheck exists; use `ForLog`/`ForExec`/`ForHTTP` |
-| Building from a Dockerfile | Out of scope (use `container build` yourself) |
+| `wait.ForHealthCheck` | No equivalent; use `ForLog`/`ForExec`/`ForHTTP` |
+| Building from a Dockerfile | Out of scope (use `container build` / `docker build` yourself) |
 | Ryuk reaper container | Replaced by the local watchdog reaper process |
-| Random host port mapping | Not needed: connect to the container IP directly |
+| Random host port mapping | Apple backend connects to the container IP directly; Docker backend auto-publishes to random loopback ports |
 | Network/volume management APIs | Out of scope for now |
-| Docker provider / `DOCKER_HOST` | Apple Container only |
 
 ## Development
 
 ```
-make test         # unit tests (no Apple Container needed)
+make test                # unit tests (no backend needed)
 make vet
-make integration  # integration tests against the real CLI; skips if unavailable
+make integration         # all integration tests; each skips if its backend is unavailable
+make integration-docker  # Docker-backend integration tests only
 ```
 
 Design document (Japanese): [docs/design.md](docs/design.md)

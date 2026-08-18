@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"strings"
 	"testing"
@@ -58,6 +59,24 @@ func TestRunSelectsBackendFromEnv(t *testing.T) {
 	}
 	if ctr.eng.name() != "docker" {
 		t.Errorf("engine = %q, want docker", ctr.eng.name())
+	}
+}
+
+func TestDefaultRunnerBinaryFollowsEngine(t *testing.T) {
+	cfg := newConfig()
+	cfg.eng = dockerEngine{}
+	applyEngineBinary(cfg)
+	if got := cfg.runner.(*cli.ExecRunner).Binary; got != "docker" {
+		t.Errorf("Binary = %q, want docker", got)
+	}
+
+	// An explicitly configured binary is left alone.
+	cfg2 := newConfig()
+	cfg2.eng = dockerEngine{}
+	cfg2.runner.(*cli.ExecRunner).Binary = "/opt/docker"
+	applyEngineBinary(cfg2)
+	if got := cfg2.runner.(*cli.ExecRunner).Binary; got != "/opt/docker" {
+		t.Errorf("Binary = %q, want /opt/docker preserved", got)
 	}
 }
 

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // backendEnv selects the backend explicitly: "apple" or "docker".
@@ -13,6 +15,14 @@ const backendEnv = "CONTAINERGO_BACKEND"
 
 func detectEngine() (engine, error) {
 	return detectEngineFor(runtime.GOOS, os.Getenv(backendEnv))
+}
+
+// applyEngineBinary points the default runner at the selected engine's
+// CLI. An explicitly configured binary wins.
+func applyEngineBinary(cfg *config) {
+	if er, ok := cfg.runner.(*cli.ExecRunner); ok && er.Binary == "" {
+		er.Binary = cfg.eng.binary()
+	}
 }
 
 func detectEngineFor(goos, value string) (engine, error) {

@@ -1,4 +1,4 @@
-.PHONY: test vet integration
+.PHONY: test vet integration integration-docker
 
 test:
 	go test ./...
@@ -8,3 +8,6 @@ vet:
 
 integration:
 	go test -tags integration -count=1 -timeout 20m ./...
+
+integration-docker:
+	go test -tags integration -count=1 -timeout 20m -run IntegrationDocker ./...

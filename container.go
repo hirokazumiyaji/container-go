@@ -85,6 +85,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 		cfg.eng = eng
 	}
+	applyEngineBinary(cfg)
 	if cfg.name == "" {
 		cfg.name = newContainerName()
 	}

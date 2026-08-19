@@ -1,70 +1,99 @@
-# container-go 設計ドキュメント
+# container-go Design Document
 
-作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
-対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.26
+日本語版: [design.ja.md](design.ja.md)
 
-## 目的
+Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.26
 
-**container-go** は、Apple Container([apple/container](https://github.com/apple/container))を実行基盤とする、testcontainers スタイルの Go ライブラリである。
-Go のテストコードから使い捨てのコンテナを起動し、接続情報を取得し、テスト終了時に確実に破棄することを目的とする。
+## Purpose
 
-先行事例として、Rust には [shiguredo/container-rs](https://github.com/shiguredo/container-rs) がある。
-本ライブラリは同じ問題領域を Go で扱うが、実現方式は後述のとおり異なる。
+**container-go** is a testcontainers-style Go library backed by Apple
+Container ([apple/container](https://github.com/apple/container)).
+It starts throwaway containers from Go tests, hands out connection
+endpoints, and guarantees the containers are destroyed when the tests
+end.
 
-設計上の制約は次の三つである。
+[shiguredo/container-rs](https://github.com/shiguredo/container-rs) is
+prior art for Rust. This library covers the same problem space in Go,
+but with a different implementation strategy, described below.
 
-- **依存ゼロ**：サードパーティの Go モジュールに依存しない。標準ライブラリのみで実装する。
-- **セキュリティ**：外部プロセス起動と入力値の扱いにおいて、インジェクションと情報漏洩の経路を作らない。
-- **パフォーマンス**：テストスイートの実行時間を支配するのはコンテナ(VM)の起動時間である。ライブラリ側のオーバーヘッドをそれに対して無視できる水準に保ち、並列起動を妨げない。
+Three constraints shape the design.
 
-## 前提とする Apple Container の仕様
+- **Zero dependencies**: no third-party Go modules; the standard
+  library only.
+- **Security**: no injection or information-leak paths through
+  subprocess invocation or user input.
+- **Performance**: container (VM) startup dominates test suite time;
+  the library's own overhead must stay negligible against that, and it
+  must never serialize parallel startups.
 
-設計の根拠となる Apple Container(v1.2.2 時点)の仕様を先に整理する。
+## Apple Container facts the design relies on
 
-- ホスト要件は macOS 26 以降かつ Apple Silicon である。
-- 各コンテナは軽量 VM として起動し、vmnet ブリッジ(既定は `default`、`192.168.64.0/24`)上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開(`--publish`)は必須ではない。
-- すべての操作は `container` CLI から行える。list や inspect などの照会系コマンドは `--format json` で機械可読な出力を返す。
-- CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗する。起動状態は `container system status` で確認できる。
-- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない。
-- Docker にある次の機能が存在しない：ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチ。これらに相当する挙動はクライアント側で実装する必要がある。
-- `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
-- `container cp` は実行中のコンテナに対してのみ使える。
-- `--rm` で削除しても匿名ボリュームは残る。
+The design decisions below rest on these properties of Apple Container
+(as of v1.2.2).
 
-## 実現方式の選定
+- Host requirement: macOS 26 or later on Apple Silicon.
+- Each container boots as a lightweight VM with a real IP on a vmnet
+  bridge (default network `default`, `192.168.64.0/24`). The host can
+  reach that IP directly, so port publishing (`--publish`) is optional.
+- Everything is operable through the `container` CLI. Query commands
+  (list, inspect, …) emit machine-readable output with
+  `--format json`.
+- The CLI talks XPC to `container-apiserver` under launchd. Commands
+  fail while the service is down; `container system status` reports
+  its state.
+- The container name is the container ID. Names must match
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters.
+- Several Docker features do not exist: healthchecks, a `wait`
+  command, an event stream, label filters on `ls`, and re-attaching to
+  a running container. Their behavior must be reproduced client-side.
+- `--label` exists, but filtering by label means filtering the JSON
+  output client-side. Label keys are restricted to lowercase
+  Docker/OCI-style keys.
+- `container cp` only works on running containers.
+- `--rm` removal leaves anonymous volumes behind.
 
-実現方式には二つの候補がある。
+## Choosing the implementation strategy
 
-- **CLI ラッパー方式**：`os/exec` で `container` CLI を子プロセスとして起動し、JSON 出力を解釈する。
-- **XPC 直結方式**：container-rs が採る方式で、`container-apiserver` の XPC サービスを C ブリッジ経由で直接呼ぶ。
+Two candidate strategies exist.
 
-本ライブラリは CLI ラッパー方式を採用する。
-理由は次の三点である。
+- **CLI wrapper**: spawn the `container` CLI via `os/exec` and decode
+  its JSON output.
+- **Direct XPC**: what container-rs does — call the
+  `container-apiserver` XPC services through a C bridge.
 
-第一に、依存ゼロ要件との整合である。
-XPC 直結方式は cgo と自前の C ブリッジを必要とし、ビルドに macOS SDK が絡む。
-CLI ラッパー方式は純 Go・標準ライブラリのみで完結し、`CGO_ENABLED=0` でもビルドできる。
+This library adopts the CLI wrapper, for three reasons.
 
-第二に、安定性である。
-XPC のルート名やメッセージ構造は Apple Container の内部実装であり、互換性の保証がない。
-CLI はユーザー向けの公開インターフェースであり、JSON スキーマも Swift の公開ソースで確認できる。
+First, the zero-dependency constraint. Direct XPC needs cgo and a
+hand-written C bridge, dragging the macOS SDK into the build. The CLI
+wrapper is pure Go on the standard library and builds with
+`CGO_ENABLED=0`.
 
-第三に、性能上の差が問題にならないことである。
-子プロセス起動のコストは 1 呼び出しあたり数十ミリ秒程度で、コンテナ(VM)起動の数秒に対して十分小さい。
-テスト用途では XPC 直結による短縮効果は体感できない。
+Second, stability. XPC route names and message shapes are Apple
+Container's internal implementation with no compatibility promise. The
+CLI is the user-facing public interface, and its JSON schema can be
+verified against the public Swift sources.
 
-CLI ラッパー方式の弱点は、CLI のバージョン間で出力形式が変わりうることと、CLI が公開していない機能(ラベルフィルタなど)を使えないことである。
-前者は照会系をすべて `--format json` に限定し、テキスト出力のパースを行わないことで影響を局所化する。
-後者はクライアント側フィルタで代替する。
+Third, the performance difference does not matter. Spawning a child
+process costs tens of milliseconds per call against seconds of
+container (VM) startup; for test workloads the XPC saving is
+imperceptible.
 
-## 公開 API
+The CLI wrapper's weaknesses are output-format drift across CLI
+versions and features the CLI does not expose (label filters, for
+example). The first is contained by only ever parsing `--format json`
+output, never text tables. The second is worked around with
+client-side filtering.
 
-API の形は testcontainers-go(v0.44 系)の新 API に寄せる。
-既存の testcontainers ユーザーが学習なしで使えることを狙う。
+## Public API
 
-モジュールパスは `github.com/hirokazumiyaji/container-go`、ルートパッケージ名は `container` とする。
+The API shape follows testcontainers-go (v0.44 line) so that existing
+testcontainers users need no relearning.
 
-### 基本的な使い方
+Module path `github.com/hirokazumiyaji/container-go`, root package
+`container`.
+
+### Basic usage
 
 ```go
 func TestRedis(t *testing.T) {
@@ -75,42 +104,50 @@ func TestRedis(t *testing.T) {
         container.WithEnv(map[string]string{"REDIS_ARGS": "--appendonly yes"}),
         container.WithWaitStrategy(wait.ForListeningPort("6379/tcp")),
     )
-    container.Cleanup(t, ctr) // nil 安全。t.Cleanup で Terminate を登録する
+    container.Cleanup(t, ctr) // nil-safe; registers Terminate via t.Cleanup
     if err != nil {
         t.Fatal(err)
     }
 
-    endpoint, err := ctr.Endpoint(ctx, "6379/tcp") // 例: "192.168.64.3:6379"
+    endpoint, err := ctr.Endpoint(ctx, "6379/tcp") // e.g. "192.168.64.3:6379"
     ...
 }
 ```
 
-### Run とオプション
+### Run and options
 
 ```go
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-`Run` はイメージの取得(未取得なら CLI が自動 pull する)、コンテナ作成、起動、待機戦略の完了までを行い、失敗時は作成済みリソースをロールバック削除してからエラーを返す。
+`Run` fetches the image (the CLI auto-pulls when missing), creates and
+starts the container, and completes the wait strategy; on failure it
+rolls back whatever it created before returning the error.
 
-オプションは functional options で提供する。
-初期リリースで提供するものを挙げる。
+Options use the functional options pattern. The initial release
+provides:
 
-- `WithExposedPorts(ports ...string)`：接続対象のコンテナポート(`"6379/tcp"` 形式)を宣言する
-- `WithEnv(env map[string]string)`：環境変数
-- `WithCmd(cmd ...string)` / `WithEntrypoint(ep ...string)`：コマンドとエントリポイントの上書き
-- `WithWaitStrategy(s wait.Strategy)`：起動完了の判定
-- `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
-- `WithLabels(labels map[string]string)`：追加ラベル
-- `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
-- `WithFiles(files ...File)`：起動後にコンテナへコピーするファイル
-- `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
-- `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
-- `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
-- `WithNetwork(name string)`：接続先ネットワーク
-- `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
+- `WithExposedPorts(ports ...string)`: declare the container ports
+  (`"6379/tcp"` form) endpoints may resolve
+- `WithEnv(env map[string]string)`: environment variables
+- `WithCmd(cmd ...string)` / `WithEntrypoint(ep ...string)`: command
+  and entrypoint overrides
+- `WithWaitStrategy(s wait.Strategy)`: readiness detection
+- `WithName(name string)`: container name (default
+  `containergo-<random hex>`)
+- `WithLabels(labels map[string]string)`: extra labels
+- `WithMounts(mounts ...Mount)`: bind, volume, and tmpfs mounts
+- `WithFiles(files ...File)`: files copied into the container after
+  start
+- `WithPublishedPort(spec string)`: host-side port publishing (off by
+  default; see below)
+- `WithCPUs(n int)` / `WithMemory(size string)`: resource limits
+- `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
+  and working directory
+- `WithNetwork(name string)`: target network
+- `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
-### Container ハンドル
+### The Container handle
 
 ```go
 type Container struct { ... }
@@ -129,42 +166,64 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
-`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
+`Terminate` maps to `container delete --force` and is idempotent
+(deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
+`TerminateContainer(ctr)` are nil-safe helpers preserving the
+testcontainers-go idiom of deferring cleanup before the error check.
 
-## 接続エンドポイントの設計
+## Connection endpoints
 
-testcontainers の Docker 実装では、コンテナポートをホストのランダムポートへ publish し、`localhost:<mapped>` へ接続する。
-Apple Container ではこの方式を既定にしない。
+testcontainers' Docker implementation publishes container ports to
+random host ports and connects to `localhost:<mapped>`. On Apple
+Container this is not the default.
 
-既定では、`Host` はコンテナの実 IP(inspect の `status.networks[0].ipv4Address` から CIDR サフィックスを除いたもの)を返し、`MappedPort` はコンテナポートをそのまま返す。
-この方式を既定とする理由は三つある。
+By default, `Host` returns the container's real IP (from inspect's
+`status.networks[0].ipv4Address`, CIDR suffix stripped) and
+`MappedPort` returns the container port unchanged. Three reasons:
 
-- Apple Container にはランダムポート割り当てがなく、ホストポートを自前で確保すると「空きポートを探してから起動するまで」の競合が避けられない(container-rs も同じ競合を既知の制約として抱えている)。直接 IP 接続ならホストポートを一切消費しないため、この競合が存在しない。
-- ホストポートの衝突がないため、テストの並列実行を無制限にスケールできる。
-- ポート転送プロキシを経由しないため、転送実装の不具合(大きな転送が途中で切断される事例が報告されている)の影響を受けない。
+- Apple Container has no random port assignment; grabbing a free host
+  port up front races between "find free port" and "start container"
+  (container-rs documents the same race as a known limitation). Direct
+  IP connection consumes no host ports, so the race does not exist.
+- With no host-port collisions, parallel test runs scale without
+  limit.
+- No port-forwarding proxy is involved, avoiding its failure modes
+  (silently truncated large transfers have been reported).
 
-`localhost` 固定の接続先が必要な場合(コンテナ IP へ到達できない環境や、接続文字列に localhost を要求するクライアント)に限り、`WithPublishedPort("127.0.0.1:15432:5432")` で明示的に公開する。
-公開した場合、`Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
+When a client demands a `localhost` endpoint (or the container IP is
+unreachable in a given setup), publish explicitly with
+`WithPublishedPort("127.0.0.1:15432:5432")`. Then `Host` returns the
+given host address and `MappedPort` the host port.
 
-`MappedPort` は `WithExposedPorts` で宣言されていないポートに対してエラーを返す。
-宣言は待機戦略(ForListeningPort の既定ポートなど)にも使う。
+`MappedPort` errors with `ErrPortNotExposed` for ports not declared
+via `WithExposedPorts`. The declarations also feed wait strategies
+(the default port of ForListeningPort, for example).
 
-## 待機戦略
+## Wait strategies
 
-Apple Container にはヘルスチェックも wait コマンドもないため、起動完了の判定はすべてクライアント側で行う。
-`wait` サブパッケージに次の戦略を実装する。
+Apple Container has neither healthchecks nor a wait command, so
+readiness is decided entirely client-side. The `wait` subpackage
+provides:
 
-- `wait.ForLog(s string)`：`container logs --follow` の出力に部分文字列(または `AsRegexp` で正規表現)が現れるまで待つ。`WithOccurrence(n)` で出現回数を指定できる
-- `wait.ForListeningPort(port string)`：コンテナ IP の対象ポートへ `net.DialTimeout` が成功するまで待つ
-- `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
-- `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成
+- `wait.ForLog(s string)`: wait until a substring (or regexp via
+  `AsRegexp`) appears in `container logs --follow` output;
+  `WithOccurrence(n)` for repeat counts
+- `wait.ForListeningPort(port string)`: wait until `net.DialTimeout`
+  to the container IP succeeds
+- `wait.ForHTTP(path string)`: wait until an HTTP request via
+  `net/http` matches the status predicate (2xx by default,
+  `WithStatusCodeMatcher` to change)
+- `wait.ForExec(cmd []string)`: wait until `container exec` exits with
+  an accepted code (0 by default)
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
+  composition
 
-すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+Every strategy carries `WithStartupTimeout` (default 60s) and
+`WithPollInterval` (default 100ms). If the container transitions to
+stopped while waiting, the wait fails immediately (no timeout burn)
+and the error carries a log tail capped at 1MiB for diagnosis.
 
-戦略のインターフェースは次のとおり。
+The strategy interface:
 
 ```go
 type Strategy interface {
@@ -172,114 +231,143 @@ type Strategy interface {
 }
 ```
 
-`Target` はコンテナ IP、宣言済みポート、ログリーダー、exec、状態照会を提供する小さなインターフェースで、`*container.Container` が実装する。
-`wait` パッケージが `container` パッケージへ依存しない向きに保ち、循環参照を避ける。
+`Target` is a small interface (container IP, declared ports, log
+reader, exec, state query) implemented by adapting
+`*container.Container`. The dependency points from `container` to
+`wait`, never back, avoiding an import cycle.
 
-## クリーンアップ
+## Cleanup
 
-テストプロセスの終了パターンごとに、コンテナが確実に削除される経路を用意する。
+Every way a test process can exit has a path that still deletes its
+containers.
 
-**正常経路**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を呼ぶ。
-`Run` の途中失敗時は `Run` 自身がロールバック削除を行う。
+**Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
+`t.Cleanup`. Mid-`Run` failures are rolled back by `Run` itself.
 
-**異常終了経路(SIGKILL、パニック、`os.Exit`)**：Go の defer も t.Cleanup も走らないため、外部プロセスによる**watchdog リーパー**を用意する。
-ライブラリ初期化時に `/bin/sh` の子プロセスを一つ起動し、標準入力のパイプ越しにコンテナ ID を登録する。
-親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へ `container delete --force` を実行して自身も終了する。
-テストプロセス生存中はリーパーは何もしない(削除は通常経路が担い、リーパーは保険である)。
-この方式は container-rs の watchdog と同じで、シグナルハンドラでは捕捉できない SIGKILL にも対応できる。
+**Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
+`t.Cleanup` run, so an external **watchdog reaper** takes over. At
+library initialization one `/bin/sh` child is spawned; container IDs
+are registered by writing them down a pipe. However the parent dies,
+the pipe reaches EOF, and the reaper runs `container delete --force`
+for every registered ID and exits. While the parent lives the reaper
+does nothing (deletion belongs to the normal path; the reaper is
+insurance). This mirrors container-rs's watchdog and covers SIGKILL,
+which no signal handler can.
 
-**セッションラベル**：作成する全コンテナに次のラベルを付与する。
+**Session labels**: every created container carries
 
-- `com.github.hirokazumiyaji.container-go`：`true`(本ライブラリ管理下の印)
-- `com.github.hirokazumiyaji.container-go.session`：プロセスごとの乱数 ID
+- `com.github.hirokazumiyaji.container-go`: `true` (managed-by marker)
+- `com.github.hirokazumiyaji.container-go.session`: a per-process
+  random ID
 
-CLI にラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側でフィルタして行う。
-この掃除を行うヘルパー `Prune(ctx)` (自セッション以外も含め、本ライブラリのラベルを持つ停止済みコンテナを削除する)を提供する。
+The CLI has no label filter, so orphan sweeps filter
+`container ls -a --format json` client-side. A helper `Prune(ctx)`
+removes stopped containers carrying the managed label from any
+session.
 
-環境変数 `CONTAINERGO_KEEP=1` を設定した場合、`Cleanup` とリーパーは削除を行わない(デバッグ用)。
+Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
+reaper (for debugging).
 
-匿名ボリュームは `--rm` でも残る仕様のため、本ライブラリは匿名ボリュームを作らない。
-ボリュームが必要な場合は名前付きで作らせ、ライフサイクルは利用者に委ねる。
+Anonymous volumes survive `--rm`, so the library never creates one;
+volumes must be named, and their lifecycle belongs to the caller.
 
-## セキュリティ設計
+## Security design
 
-外部プロセス起動を伴うライブラリとして、次の原則を守る。
+As a library that spawns subprocesses, these rules hold.
 
-**シェルを経由しない**。
-すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
-唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証してからパイプへ書く。
-二重の防御により、ID 経由のコマンド注入を成立させない。
+**No shell involvement**. Every CLI call passes an argv array to
+`exec.Command`; no shell string is ever assembled. The single
+exception is the watchdog reaper's shell script. Its body is a fixed
+string; container IDs enter only as stdin data. The script defeats
+word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
+expansions), and the library validates every ID against Apple
+Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
+writing it to the pipe. The two layers together leave no command
+injection through IDs.
 
-**環境変数を argv に載せない**。
-`--env key=value` を使うと、値がプロセス一覧(`ps`)から他ユーザーにも見える。
-データベースのパスワードなど秘密情報が環境変数で渡される用途が主であるため、環境変数は `os.MkdirTemp` 配下にパーミッション 0600 で書いた一時ファイルに格納し、`--env-file` で渡して起動後に削除する。
+**No environment variables on argv**. `--env key=value` exposes values
+to every user via `ps`. Because environment variables are the main
+channel for secrets (database passwords and the like), the library
+writes them to a file under `os.MkdirTemp` with mode 0600, passes
+`--env-file`, and deletes the file after startup.
 
-**入力を検証する**。
-コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、環境変数キーは `=` と NUL を含まないこと、コピー対象のパスは絶対パスかつ有効な UTF-8 であることを、CLI へ渡す前に検証する。
-CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
+**Validate inputs**. Container names (name rule above), label keys
+(the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
+environment keys (no `=`, no NUL), and copy paths (absolute, valid
+UTF-8) are all validated before reaching the CLI. The CLI validates
+too, but validating first gives clearer errors and independence from
+future CLI changes.
 
-**認証情報を扱わない**。
-レジストリ認証は `container registry login`(資格情報は macOS Keychain に保存される)に委ね、本ライブラリは資格情報の入力経路を持たない。
+**Handle no credentials**. Registry auth is delegated to
+`container registry login` (credentials live in the macOS Keychain);
+the library has no credential input path.
 
-**ログに秘密を書かない**。
-デバッグログ(`WithLogger` で注入)に CLI の argv を出す場合、env-file の中身は出力しない。
+**No secrets in logs**. Debug logging of CLI argv never includes
+env-file contents.
 
-## パフォーマンス設計
+## Performance design
 
-**子プロセス数を最小にする**。
-作成と起動は `container run --detach` の 1 回で行う。
-起動後に不変な情報(設定、ラベル、公開ポート)は初回の inspect 結果をキャッシュし、状態(`status.state`)のみ毎回取得する。
+**Minimize subprocess count**. Create+start is one
+`container run --detach` call. Immutable facts (config, labels,
+published ports) are cached from the first inspect; only the state is
+re-queried.
 
-**待機を接続確認で行う**。
-ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TCP/HTTP 接続する。
-ポーリングのたびに子プロセスを起動するのは ForExec と状態照会だけで、これらも 100 ミリ秒間隔のポーリングで問題ない程度に軽い。
+**Wait via connections, not subprocesses**. ForListeningPort and
+ForHTTP dial the container IP directly without spawning the CLI. Only
+ForExec and state queries poll through subprocesses, cheap enough at
+the 100ms interval.
 
-**並列起動を妨げない**。
-ライブラリ内にグローバルロックを置かない(watchdog リーパーへの ID 登録のみミューテックスで直列化するが、書き込みは 1 行で済む)。
-ホストポートを消費しない既定設計により、並列数の上限はホストのリソースだけで決まる。
+**Never serialize parallel startups**. The library holds no global
+lock (reaper ID registration takes a mutex for a one-line write).
+Because the default design consumes no host ports, parallelism is
+bounded only by host resources.
 
-**ストリームを有限に保つ**。
-`Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
-ForLog が診断用に保持するログは 1MiB を上限とする。
+**Keep streams finite**. `Logs` returns the `container logs --follow`
+child as an `io.ReadCloser` whose `Close` (or context cancellation)
+reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
 
-**すべての CLI 呼び出しに期限を付ける**。
-各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
-コンテキスト取消時は子プロセスへ SIGKILL を送って回収し、ゾンビとハングを残さない。
+**Deadline every CLI call**. Every call honors `context` and carries a
+default timeout (30s for queries, 10min for pull-bearing runs). On
+cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 
-## エラー処理
+## Error handling
 
-エラーは `errors.Is`/`errors.As` で判別できる形で返す。
+Errors are discriminable with `errors.Is`/`errors.As`.
 
-- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
-- `ErrContainerNotFound`：inspect などの not found
-- `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `ErrSystemNotRunning`: after a CLI failure, a follow-up
+  `container system status` probe failed too; the message tells the
+  user to run `container system start`
+- `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrPortNotExposed`: querying a port not declared via
+  `WithExposedPorts`
+- `*CLIError`: any other CLI failure; carries the subcommand, exit
+  code, and stderr (capped at 64KiB)
 
-`Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
+When `Run` fails on a wait timeout, the returned error includes the
+container's log tail, and the rollback delete follows.
 
-システムサービスの自動起動(`container system start` の代行)は行わない。
-カーネルインストールの対話プロンプトを伴う場合があり、テストライブラリが暗黙に実行してよい操作ではないためである。
+The library never runs `container system start` itself: the command
+can prompt interactively for a kernel install, which a test library
+must not trigger implicitly.
 
-## パッケージ構成
+## Package layout
 
 ```
 container-go/
-├── container.go      // Run、Container、Option
+├── container.go      // Run, Container, Option
 ├── options.go        // functional options
-├── cleanup.go        // Cleanup、TerminateContainer、Prune
-├── reaper.go         // watchdog リーパー
+├── cleanup.go        // Cleanup, TerminateContainer, Prune
+├── reaper.go         // watchdog reaper
 ├── exec.go           // Exec
 ├── logs.go           // Logs
-├── copy.go           // CopyToContainer、CopyFileFromContainer
-├── errors.go         // エラー型
-├── internal/cli/     // CLI ランナー(コマンド組み立て、実行、タイムアウト)
-├── internal/inspect/ // inspect JSON モデルとデコード
-└── wait/             // 待機戦略
+├── copy.go           // CopyToContainer, CopyFileFromContainer
+├── errors.go         // error types
+├── internal/cli/     // CLI runner (argv assembly, execution, timeouts)
+├── internal/inspect/ // inspect JSON models and decoding
+└── wait/             // wait strategies
 ```
 
-`internal/cli` のランナーはインターフェースとして定義し、テストではフェイク実装を注入する。
+The `internal/cli` runner is an interface; tests inject a fake.
 
 ```go
 type Runner interface {
@@ -287,83 +375,119 @@ type Runner interface {
 }
 ```
 
-## テスト戦略
+## Testing strategy
 
-**ユニットテスト**：`Runner` のフェイク実装(固定 JSON を返す)を注入し、コマンド組み立て、JSON デコード、エラー分類、待機戦略のロジックを実機なしで検証する。
-本番コードが非 nil を前提とする依存には、テストでも必ず実体(フェイク)を渡す。
+**Unit tests**: inject a fake `Runner` returning canned JSON and
+verify argv assembly, JSON decoding, error classification, and wait
+strategy logic without real hardware. Dependencies that production
+code assumes non-nil get real fakes in tests, never nil.
 
-**統合テスト**：ビルドタグ `integration` で分離し、実機(macOS 26、Apple Container 起動済み)でのみ実行する。
-起動、接続、exec、コピー、クリーンアップ、watchdog(子プロセスを SIGKILL してリーパーの動作を確認)を通しで検証する。
-テスト冒頭で `container system status` を確認し、未起動なら skip する。
+**Integration tests**: split off behind the `integration` build tag
+and run only on real hardware (macOS 26 with Apple Container up). They
+cover startup, connection, exec, copy, cleanup, and the watchdog
+(SIGKILL a child process, watch the reaper act). They check
+`container system status` first and skip when the service is down.
 
-**CI**：ユニットテストと `go vet` はプッシュごとに GitHub Actions(macos ランナーで可、Apple Container 不要)で実行する。
-統合テストは GitHub ホストランナーの macOS バージョンと nested virtualization の制約により動かない可能性が高いため、当面はローカル実行を前提とし、`make integration` として手順化する。
+**CI**: unit tests and `go vet` run in GitHub Actions per push (no
+Apple Container needed). GitHub-hosted runners are unlikely to run the
+integration tests (macOS version and nested-virtualization limits), so
+those stay local as `make integration`.
 
-## バックエンド(v0.2)
+## Backends (v0.2)
 
-v0.1 は Apple Container 専用だった。
-v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ API でテストコンテナを使えるようにする。
+v0.1 was Apple Container only. v0.2 adds a Docker backend so the same
+API works on Linux and Windows.
 
-**選択ルール**：環境変数 `CONTAINERGO_BACKEND` が最優先で、`apple` または `docker` を指定できる。
-未指定の場合は OS で決まる(macOS は Apple Container、Linux と Windows は Docker)。
-macOS で Docker Desktop を使いたい場合は `CONTAINERGO_BACKEND=docker` を設定する。
+**Selection**: the environment variable `CONTAINERGO_BACKEND` wins,
+accepting `apple` or `docker`. Unset, the OS decides: macOS gets Apple
+Container; Linux and Windows get Docker. macOS users wanting Docker
+Desktop set `CONTAINERGO_BACKEND=docker`.
 
-**実現方式**：Docker も CLI ラッパーとする(`docker` コマンドを `os/exec` で呼ぶ)。
-container-rs は Docker Engine API を直接叩くが、本ライブラリでは採らない。
-API 直叩きは tar 生成、ログストリームの逆多重化、レジストリ認証、Windows named pipe を自前実装する必要があり、CLI ラッパーで統一すれば既存のランナー層(引数配列実行、タイムアウト、ストリーミング)をそのまま共有できるためである。
-`DOCKER_HOST` やコンテキスト、認証の解決は docker CLI 自身に委ねられる。
+**Strategy**: Docker is also a CLI wrapper (`docker` via `os/exec`).
+container-rs talks to the Docker Engine API directly; this library
+does not. A direct API client means hand-implementing tar packing, log
+stream demultiplexing, registry auth, and Windows named pipes, while a
+CLI wrapper shares the existing runner layer (argv execution,
+timeouts, streaming) unchanged. `DOCKER_HOST`, contexts, and auth
+resolution stay the docker CLI's job.
 
-**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
-プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
-正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
+**Internal structure**: a backend is an internal interface owning only
+argv assembly and inspect normalization. Process execution (the
+runner), wait strategies, cleanup, and validation are shared. The
+normalized record holds four things: state (mapped onto running /
+stopped / stopping / unknown), labels, the container IP, and host-side
+port bindings (container port → host address and port).
 
-**接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
-`WithExposedPorts` で宣言したポートは自動的に `127.0.0.1` のランダムポートへ公開し(`-p 127.0.0.1::<port>`)、`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。
-ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
-Apple Container バックエンドの既定(直接 IP)は変えない。
+**Endpoint differences**: Docker Desktop (macOS / Windows) does not
+route to container IPs from the host, so the Docker backend defaults
+to the published-port model testcontainers uses. Ports declared via
+`WithExposedPorts` are automatically published to random loopback
+ports (`-p 127.0.0.1::<port>`); `Host` returns `127.0.0.1` (or the
+host from a `tcp://` `DOCKER_HOST`) and `MappedPort` the assigned host
+port. The daemon assigns ports atomically at start, so the free-port
+race avoided on Apple Container does not reappear. The Apple backend's
+direct-IP default is unchanged.
 
-**クリーンアップの違い**:watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
-リーパーは `/bin/sh` に依存するため Windows では動かない。
-v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
-`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+**Cleanup differences**: the watchdog reaper switches its delete
+subcommand per backend (`delete --force` for Apple, `rm --force` for
+Docker). The reaper depends on `/bin/sh` and thus does not run on
+Windows; v0.2 documents that Windows relies on the normal cleanup
+paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
+on Docker (`--filter label=... --filter status=exited`).
 
-**システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
+**Liveness detection**: the probe command switches per backend
+(`system status` for Apple, `info` for Docker).
 
-## スコープ外
+## Out of scope
 
-- `container build` / `docker build` による Dockerfile ビルド
-- ネットワークの作成と管理(既定ネットワークのみ使う)
-- ボリュームの作成と管理
-- testcontainers のモジュール群(postgres など)に相当する高水準パッケージ(コア安定後に検討)
-- Docker Engine API の直接クライアント(CLI ラッパーで足りなくなったら再検討)
+- Dockerfile builds via `container build` / `docker build`
+- Network creation and management (only the default network is used)
+- Volume creation and management
+- High-level packages equivalent to testcontainers modules (postgres
+  and the like; revisit once the core is stable)
+- A direct Docker Engine API client (revisit if the CLI wrapper ever
+  falls short)
 
-## 実装フェーズ
+## Implementation phases
 
-実装は次の順に進める。
-各フェーズを GitHub Issue として起票し、進捗を管理する。
+Implementation proceeds in this order, one GitHub Issue per phase.
 
-1. プロジェクト基盤：go.mod、CI、Makefile
-2. CLI ランナー層：`internal/cli`、タイムアウト、エラー分類、`ErrSystemNotRunning` 判定
-3. inspect JSON モデル：`internal/inspect`
-4. コア API：`Run`、オプション、`Container` のライフサイクル(起動、Stop、Terminate、ロールバック)
-5. 接続情報 API：`Host`、`MappedPort`、`Endpoint`、`ContainerIP`、`WithPublishedPort`
-6. 待機戦略：`wait` パッケージ一式
-7. Exec、Logs、Copy
-8. クリーンアップ：`Cleanup`、`Prune`、セッションラベル、watchdog リーパー
-9. セキュリティ仕上げ：env-file 経由の環境変数、入力検証の網羅、ログのマスキング
-10. 統合テストと手順化
-11. ドキュメントとサンプル：README、使用例
+1. Project foundation: go.mod, CI, Makefile
+2. CLI runner layer: `internal/cli`, timeouts, error classification,
+   `ErrSystemNotRunning` detection
+3. inspect JSON models: `internal/inspect`
+4. Core API: `Run`, options, `Container` lifecycle (start, Stop,
+   Terminate, rollback)
+5. Connection info API: `Host`, `MappedPort`, `Endpoint`,
+   `ContainerIP`, `WithPublishedPort`
+6. Wait strategies: the `wait` package
+7. Exec, Logs, Copy
+8. Cleanup: `Cleanup`, `Prune`, session labels, the watchdog reaper
+9. Security pass: env-file environment variables, exhaustive input
+   validation, log masking
+10. Integration tests and runbook
+11. Documentation and examples: README, usage samples
 
-v0.2(Docker バックエンド)は次の順に進める。
+v0.2 (Docker backend) proceeds as:
 
-12. バックエンド抽象の導入：引数組み立てと inspect 正規化のインターフェース化、既存テストを green のまま Apple 実装へ切り出し
-13. Docker エンジン実装：run / inspect / lifecycle / exec / logs / copy の引数と JSON パース
-14. Docker の接続情報：ランダム公開ポート、`Host` / `MappedPort`、`DOCKER_HOST` 対応
-15. バックエンド選択と周辺：`CONTAINERGO_BACKEND`、OS 既定、リーパーと Prune と probe の切替
-16. Docker 統合テストとドキュメント更新
+12. Backend abstraction: interface over argv assembly and inspect
+    normalization; carve the Apple implementation out with tests green
+13. Docker engine: argv and JSON parsing for run / inspect / lifecycle
+    / exec / logs / copy
+14. Docker connection info: random published ports, `Host` /
+    `MappedPort`, `DOCKER_HOST`
+15. Backend selection and surroundings: `CONTAINERGO_BACKEND`, OS
+    defaults, reaper / Prune / probe switching
+16. Docker integration tests and documentation updates
 
-## 参考資料
+## References
 
-- [apple/container](https://github.com/apple/container) v1.2.2 コマンドリファレンスおよび `ContainerResource` ソース
-- [shiguredo/container-rs](https://github.com/shiguredo/container-rs)：XPC 直結方式の先行実装。watchdog リーパー、クリーンアップ契約、macOS 固有の制約(ポート競合、転送切断)の整理を参考にした
-- [testcontainers-go](https://github.com/testcontainers/testcontainers-go) v0.44.0：API 形状(functional options、wait 戦略、nil 安全なクリーンアップ)の参照元
+- [apple/container](https://github.com/apple/container) v1.2.2
+  command reference and `ContainerResource` sources
+- [shiguredo/container-rs](https://github.com/shiguredo/container-rs):
+  the direct-XPC prior art; its watchdog reaper, cleanup contract, and
+  catalog of macOS-specific constraints (port races, forwarding
+  truncation) informed this design
+- [testcontainers-go](https://github.com/testcontainers/testcontainers-go)
+  v0.44.0: source of the API shapes (functional options, wait
+  strategies, nil-safe cleanup)

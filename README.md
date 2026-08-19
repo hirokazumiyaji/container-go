@@ -1,5 +1,7 @@
 # container-go
 
+日本語版: [README.ja.md](README.ja.md)
+
 A [testcontainers](https://testcontainers.com/)-style Go library for
 [Apple Container](https://github.com/apple/container) and Docker: run
 throwaway containers from Go tests, with zero third-party
@@ -152,7 +154,8 @@ make integration         # all integration tests; each skips if its backend is u
 make integration-docker  # Docker-backend integration tests only
 ```
 
-Design document (Japanese): [docs/design.md](docs/design.md)
+Design document: [docs/design.md](docs/design.md) (日本語版:
+[docs/design.ja.md](docs/design.ja.md))
 
 ## License
 

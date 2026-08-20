@@ -3,7 +3,7 @@
 English (primary): [design.md](design.md)
 
 作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
-対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.26
+対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.27
 
 ## 目的
 

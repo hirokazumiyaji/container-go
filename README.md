@@ -40,7 +40,7 @@ The library shells out to the backend CLI (`container` or `docker`) —
 no cgo, no daemon API client. `DOCKER_HOST`, contexts, and registry
 auth are handled by the docker CLI itself.
 
-Go 1.26+ is required.
+Go 1.27+ is required.
 
 ## Installation
 

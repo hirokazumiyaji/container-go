@@ -40,7 +40,7 @@ macOS で Docker(Docker Desktop など)を使う場合は
 呼び出します。cgo 不要、デーモン API クライアント不要です。`DOCKER_HOST`、
 コンテキスト、レジストリ認証は docker CLI 自身が解決します。
 
-Go 1.26 以上が必要です。
+Go 1.27 以上が必要です。
 
 ## インストール
 

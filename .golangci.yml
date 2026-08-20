@@ -1,0 +1,14 @@
+version: "2"
+
+linters:
+  settings:
+    errcheck:
+      # Best-effort cleanup calls; failures are intentionally ignored.
+      exclude-functions:
+        - (io.Closer).Close
+        - os.RemoveAll
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck

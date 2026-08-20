@@ -1,10 +1,13 @@
-.PHONY: test vet integration integration-docker
+.PHONY: test vet lint integration integration-docker
 
 test:
 	go test ./...
 
 vet:
 	go vet ./...
+
+lint:
+	golangci-lint run ./...
 
 integration:
 	go test -tags integration -count=1 -timeout 20m ./...

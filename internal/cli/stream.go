@@ -29,13 +29,13 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	cmd.Stdout = pw
 	cmd.Stderr = pw
 	if err := cmd.Start(); err != nil {
-		pr.Close()
-		pw.Close()
+		_ = pr.Close()
+		_ = pw.Close()
 		return nil, fmt.Errorf("container %s: %w", strings.Join(args, " "), err)
 	}
 	// The child holds its own copy of the write end; releasing ours
 	// lets the reader see EOF when the child exits.
-	pw.Close()
+	_ = pw.Close()
 	return &processStream{ReadCloser: pr, cmd: cmd}, nil
 }
 

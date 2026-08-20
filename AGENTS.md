@@ -11,8 +11,9 @@
 - `mise install` installs the Go and linting tools declared in `mise.toml`.
 - `make test` runs the full default test suite (`go test ./...`) without requiring a container backend.
 - `make vet` runs `go vet ./...`.
+- `make lint` runs `golangci-lint run ./...` (also enforced in CI).
 - `make integration` runs tagged integration tests against the available default backend; `make integration-docker` limits them to Docker. These require the relevant CLI and daemon/service.
-- `go fmt ./...` formats all packages. Run `golangci-lint run` when changing broader areas or before submitting a large change.
+- `go fmt ./...` formats all packages.
 
 ## Coding Style & Naming
 
@@ -20,7 +21,7 @@ Use standard `gofmt` formatting and idiomatic Go names: mixedCaps for identifier
 
 ## Testing Guidelines
 
-Add focused regression tests beside changed code. Unit tests should use the repository’s fake CLI runner and remain backend-independent. Use the `integration` tag only for tests that need a real backend, and ensure they skip cleanly when that backend is unavailable. Run `make test` and `make vet` before opening a PR; run the relevant integration target when backend behavior changes.
+Add focused regression tests beside changed code. Unit tests should use the repository’s fake CLI runner and remain backend-independent. Use the `integration` tag only for tests that need a real backend, and ensure they skip cleanly when that backend is unavailable. Run `make test` and `make lint` before opening a PR; run the relevant integration target when backend behavior changes.
 
 ## Commits and Pull Requests
 

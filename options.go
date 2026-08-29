@@ -15,24 +15,24 @@ import (
 type Option func(*config) error
 
 type config struct {
-	runner     cli.Runner
-	eng        engine
-	name       string
-	env        map[string]string
-	cmd        []string
-	entrypoint string
-	exposed    []portSpec
-	published  []publishSpec
-	labels     map[string]string
+	runner       cli.Runner
+	eng          engine
+	name         string
+	env          map[string]string
+	cmd          []string
+	entrypoint   string
+	exposed      []portSpec
+	published    []publishSpec
+	labels       map[string]string
 	mounts       []Mount
 	files        []File
 	waitStrategy wait.Strategy
-	cpus       int
-	memory     string
-	user       string
-	workdir    string
-	network    string
-	platform   string
+	cpus         int
+	memory       string
+	user         string
+	workdir      string
+	network      string
+	platform     string
 }
 
 func newConfig() *config {

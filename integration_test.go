@@ -249,3 +249,47 @@ func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 	}
 	t.Fatalf("container %s still present 60s after SIGKILL; reaper did not fire", name)
 }
+
+// TestIntegrationLazyInspectStateAndWaitRollback covers #20: Run without
+// a wait strategy still reports State on demand, and a connection wait
+// that never succeeds removes the container.
+func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
+	requireSystem(t)
+	ctx := context.Background()
+
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	st, err := ctr.State(ctx)
+	if err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	if st != container.StateRunning {
+		t.Fatalf("State = %q, want %q", st, container.StateRunning)
+	}
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+
+	name := fmt.Sprintf("containergo-lazy-%d", os.Getpid())
+	_, err = container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithExposedPorts("80/tcp"),
+		container.WithCmd("sleep", "60"),
+		container.WithWaitStrategy(
+			wait.ForHTTP("/").
+				WithStartupTimeout(3*time.Second).
+				WithPollInterval(200*time.Millisecond),
+		),
+	)
+	if err == nil {
+		t.Fatal("want error when HTTP wait cannot succeed")
+	}
+	if out, inspectErr := exec.Command("container", "inspect", name).CombinedOutput(); inspectErr == nil {
+		t.Fatalf("container still present after wait rollback: %s", out)
+	}
+}

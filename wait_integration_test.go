@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -62,6 +63,35 @@ func TestRunWaitFailureRollsBackAndAttachesLogs(t *testing.T) {
 	}
 	if f.callWith("delete") == nil {
 		t.Error("rollback delete not issued")
+	}
+}
+
+// endpointInspectStrategy forces the wait path through Endpoint so a
+// deferred first inspect failure still rolls the container back.
+type endpointInspectStrategy struct{}
+
+func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.Target) error {
+	_, err := target.Endpoint(ctx, "6379/tcp")
+	return err
+}
+
+func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
+	f := newTestRunner()
+	f.failPrefix = "inspect"
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
+		WithExposedPorts("6379/tcp"),
+		WithWaitStrategy(endpointInspectStrategy{}),
+	)
+	if err == nil {
+		t.Fatal("want error when wait Endpoint inspect fails")
+	}
+	if !strings.Contains(err.Error(), "failed to become ready") {
+		t.Errorf("error = %v, want wait-path failure after deferred inspect", err)
+	}
+	del := f.callWith("delete")
+	if del == nil || !slices.Contains(del, "--force") || !slices.Contains(del, "myctr") {
+		t.Errorf("rollback delete not issued: %v", f.calls)
 	}
 }
 

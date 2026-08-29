@@ -309,16 +309,22 @@ func TestRunRejectsMountWithComma(t *testing.T) {
 	}
 }
 
-func TestRunRollsBackWhenInspectFails(t *testing.T) {
+func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
-	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"), withRunner(f))
-	if err == nil {
-		t.Fatal("want error when inspect fails")
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	del := f.callWith("delete")
-	if del == nil || !slices.Contains(del, "--force") || !slices.Contains(del, "myctr") {
-		t.Errorf("rollback delete not issued: %v", f.calls)
+	if f.callWith("inspect") != nil {
+		t.Errorf("inspect issued during Run: %v", f.calls)
+	}
+	if f.callWith("delete") != nil {
+		t.Errorf("unexpected delete during Run: %v", f.calls)
+	}
+	if _, err := ctr.State(context.Background()); err == nil {
+		t.Fatal("want error when first inspect fails after Run")
 	}
 }
 

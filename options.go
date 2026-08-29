@@ -33,6 +33,7 @@ type config struct {
 	workdir      string
 	network      string
 	platform     string
+	pullPolicy   PullPolicy
 }
 
 func newConfig() *config {

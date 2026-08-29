@@ -102,6 +102,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
+	// The pull policy brings the image into the local store before the
+	// run command; both share the aggregated flight so concurrent Runs
+	// of the same image pull once.
+	if err := cfg.ensureImage(runCtx, image); err != nil {
+		return nil, err
+	}
 	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
 		return nil, cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 	}

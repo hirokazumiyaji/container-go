@@ -60,10 +60,6 @@ func benchPortOptions(b bench.Backend, eng engine) func(cli.Runner) []Option {
 // Terminate happens after the measurement.
 func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenario string, prep func(*testing.T), opts func(cli.Runner) []Option) {
 	t.Helper()
-	eng, ok := benchEngines(b)
-	if !ok {
-		t.Fatalf("no engine for backend %s", b.Name)
-	}
 	for i := 1; i <= benchIterations; i++ {
 		if prep != nil {
 			prep(t)

@@ -101,6 +101,23 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 
+## Image pulls
+
+`Run` checks the image before starting and fetches it when missing
+(`PullMissing`, the previous implicit behavior). Concurrent `Run` calls
+in one process share the pull: the first caller fetches, the rest wait
+for it. The Docker backend passes `--pull=never` so pulling happens
+only through this aggregated path.
+
+```go
+container.Run(ctx, "redis:7-alpine",
+    container.WithPullPolicy(container.PullAlways)) // pull on every Run
+// container.PullNever: fail before starting when the image is absent
+// (errors.Is(err, container.ErrImageNotFound))
+
+container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
+```
+
 ## Cleanup contract
 
 Three layers make sure containers do not outlive your tests:

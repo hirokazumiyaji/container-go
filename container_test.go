@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -38,14 +39,20 @@ const testInspectJSON = `[
 
 // fakeRunner records CLI calls and replays canned results.
 type fakeRunner struct {
+	mu          sync.Mutex
 	calls       [][]string
 	envFiles    []string // contents of --env-file captured at call time
 	inspectJSON string
 	failPrefix  string // fail calls whose first arg matches
 	systemUp    bool
+
+	imagePresent bool // image in the local store (image inspect/pull)
+	pullCalls    int
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.calls = append(f.calls, args)
 	for i, a := range args {
 		if a == "--env-file" && i+1 < len(args) {
@@ -61,6 +68,28 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return []byte("running"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1}
+	}
+	// Image handling for both backends: docker inspects via
+	// `image inspect` and pulls via `pull`; apple uses
+	// `image inspect` / `image pull`.
+	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
+		if !f.systemUp {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
+		}
+		if f.imagePresent {
+			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+		}
+		// The message carries both backends' not-found wording so one
+		// fake serves the docker and apple classifiers.
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine (No such image)"}
+	}
+	if (args[0] == "image" && len(args) > 1 && args[1] == "pull") || args[0] == "pull" {
+		if !f.systemUp {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
+		}
+		f.imagePresent = true
+		f.pullCalls++
+		return nil, nil, nil
 	}
 	if f.failPrefix != "" && args[0] == f.failPrefix {
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}

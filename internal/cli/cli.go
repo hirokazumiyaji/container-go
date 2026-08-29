@@ -32,6 +32,28 @@ type Runner interface {
 	Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
 
+// ExternalRunner identifies runners that execute the CLI as real child
+// processes. container.Run registers containers started through such
+// runners with the orphan-cleanup reaper, so a runner that wraps an
+// ExecRunner forwards both methods to keep the production path intact
+// under instrumentation. Test doubles that return canned results do
+// not implement the interface.
+type ExternalRunner interface {
+	Runner
+
+	// External reports whether the runner spawns real child processes.
+	External() bool
+	// ExternalBinary is the binary those child processes execute, or
+	// "" when the runner defers to the engine's default.
+	ExternalBinary() string
+}
+
+// External reports that ExecRunner spawns real child processes.
+func (r *ExecRunner) External() bool { return true }
+
+// ExternalBinary reports the binary ExecRunner spawns.
+func (r *ExecRunner) ExternalBinary() string { return r.Binary }
+
 // CLIError is a non-zero exit from the `container` CLI.
 type CLIError struct {
 	Args     []string

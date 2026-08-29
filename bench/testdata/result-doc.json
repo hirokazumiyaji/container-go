@@ -1,0 +1,32 @@
+{
+  "env": {
+    "os": "darwin",
+    "arch": "arm64",
+    "cpus": 10,
+    "go": "go1.27.0",
+    "clis": {
+      "docker": "29.7.2"
+    },
+    "recorded_at": "2026-08-29T01:30:00Z"
+  },
+  "results": [
+    {
+      "backend": "docker",
+      "library": "container-go",
+      "image": "redis:7-alpine",
+      "scenario": "run/warm",
+      "iteration": 1,
+      "duration_ns": 140000000,
+      "subprocesses": 2
+    },
+    {
+      "backend": "docker",
+      "library": "testcontainers-go",
+      "image": "redis:7-alpine",
+      "scenario": "tc/single",
+      "iteration": 1,
+      "duration_ns": 900000000,
+      "subprocesses": 0
+    }
+  ]
+}

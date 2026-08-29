@@ -1,4 +1,4 @@
-.PHONY: test vet lint integration integration-docker
+.PHONY: test vet lint integration integration-docker bench-integration
 
 test:
 	go test ./...
@@ -14,3 +14,7 @@ integration:
 
 integration-docker:
 	go test -tags integration -count=1 -timeout 20m -run IntegrationDocker ./...
+
+bench-integration:
+	go test -tags integration -count=1 -timeout 30m -run TestIntegrationBench ./...
+	cd bench && go test -tags integration -count=1 -timeout 30m ./...

@@ -1,0 +1,109 @@
+# Benchmarks
+
+Run→ready measurement infrastructure for the performance issues
+(#17, #18, #19, #20, #21, #22). The harness answers three questions:
+
+1. How long does a `Run` take until the container is ready, cold and
+   warm?
+2. How many CLI child processes does a `Run` spawn (per call shape)?
+3. Is the CLI-based approach still competitive against
+   testcontainers-go, which talks to the Docker Engine API directly?
+
+## Layout
+
+- `internal/bench/`: shared result schema (backend, library, image,
+  scenario, iteration, duration, subprocess count), aggregation
+  (median / min / max), JSON output, and the backend harness (probe,
+  image ensure / pull / remove). Zero-dependency, part of the root
+  module.
+- Root package, `bench_integration_test.go` (`integration` tag):
+  counting scenarios. Each `Run` shape runs against a real backend
+  wrapped in a counting runner; every iteration records duration and
+  spawn count.
+- `bench/`: separate Go module holding the testcontainers-go
+  comparison. The dependency on testcontainers-go lives only here so
+  the library keeps its zero-dependency constraint. `result.go`
+  re-exports the shared schema; `scenario_test.go` (`integration` tag)
+  runs the wall-clock scenarios.
+
+## Scenarios
+
+| Scenario            | What it measures |
+| ------------------- | ---------------- |
+| `run/cold`          | Image removed first; Run includes the pull, up to listening-port readiness |
+| `run/warm`          | Image present; Run to listening-port readiness |
+| `run/warm-nginx`    | Same as warm with `nginx:alpine` |
+| `run/no-wait`       | Run without a wait strategy |
+| `run/forlog`        | Run with `wait.ForLog` |
+| `run/forexec`       | Run with `wait.ForExec` |
+| `run/parallel-8`    | Wall-clock until 8 containers started in parallel are all ready (durations are not summed) |
+| `run/multi-5`       | Five sequential containers in one process |
+| `tc/session-init`   | testcontainers-go: first container including session initialization (Ryuk sidecar) |
+| `tc/single`         | testcontainers-go: steady-state single container |
+| `tc/multi-5`        | testcontainers-go: five sequential containers, session init paid once |
+
+Each scenario runs 5 iterations; summaries report the median and the
+minimum. Every result doc embeds environment information (OS, arch,
+CPUs, Go version, backend CLI/daemon version).
+
+## Running
+
+```sh
+make bench-integration
+```
+
+This runs the counting scenarios (`go test -tags integration -run
+TestIntegrationBench ./...`) and the bench module (testcontainers-go
+comparison). Backends that are not available are skipped, same as the
+other integration tests:
+
+- docker: needs the `docker` CLI and a running daemon
+- apple: needs the `container` CLI and `container system start` to
+  have been run
+
+Both modules write JSON result docs and print a summary table:
+
+- counting scenarios: `bench/results/counting-<backend>-<timestamp>.json`
+- bench module: `bench/results/<name>-<timestamp>.json`
+
+`bench/results/` is gitignored.
+
+## Updating recorded results
+
+1. Run `make bench-integration` on an otherwise idle machine.
+2. Note the environment (recorded in each result doc) and keep the
+   variables below fixed when comparing runs.
+3. Replace the baseline table below and note the date and the commit.
+
+Variables to keep fixed across comparison runs:
+
+- the images (`redis:7-alpine`, `nginx:alpine`) and their digests
+- the readiness probe (`wait.ForListeningPort`)
+- the iteration count (5) and the parallelism (8)
+- backend CLI and daemon versions
+
+## Baseline (2026-08-29, commit `bench-harness` work tree)
+
+macOS 26, Apple Silicon (10 CPUs), Go 1.27.0, Docker daemon 29.7.2.
+Apple backend numbers pending a machine with the system service
+running; the scenarios skip cleanly without it.
+
+| Backend | Library            | Scenario       | Median | Spawn |
+| ------- | ------------------ | -------------- | ------ | ----- |
+| docker  | container-go       | run/cold       | ~5-16s (pull) | 2 |
+| docker  | container-go       | run/warm       | 275ms  | 2 |
+| docker  | container-go       | run/forlog     | 159ms  | 3 |
+| docker  | container-go       | run/forexec    | 211ms  | 3 |
+| docker  | container-go       | run/no-wait    | 133ms  | 2 |
+| docker  | container-go       | run/parallel-8 | 364ms  | 16 |
+| docker  | testcontainers-go  | tc/session-init| 14.7s  | 0 |
+| docker  | testcontainers-go  | tc/single      | 292ms  | 0 |
+| docker  | testcontainers-go  | tc/multi-5     | 1.49s (5 ctrs) | 0 |
+
+Reading: warm single-container latency is close (CLI spawn overhead is
+real but small against daemon work), while container-go pays no
+session initialization (testcontainers-go waits ~15s for its Ryuk
+sidecar once per process) and parallelizes without port contention.
+The remaining per-call spawn cost is what #18, #19, and #20 attack;
+whether the Docker backend needs a direct Engine API client (#22) is
+judged from these numbers.

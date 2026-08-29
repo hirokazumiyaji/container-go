@@ -127,11 +127,12 @@ func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 
 func TestClassifyUsesProbeSpecificHint(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
+	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
 	r := &fakeRunner{results: map[string]fakeResult{
-		"info": {err: &CLIError{Args: []string{"info"}, ExitCode: 1}},
+		strings.Join(probeArgs, " "): {err: &CLIError{Args: probeArgs, ExitCode: 1}},
 	}}
 
-	err := Classify(context.Background(), r, orig, Probe{Args: []string{"info"}, Hint: "start the Docker daemon"})
+	err := Classify(context.Background(), r, orig, Probe{Args: probeArgs, Hint: "start the Docker daemon"})
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}
@@ -158,5 +159,17 @@ func TestClassifyKeepsOriginalErrorWhenSystemIsRunning(t *testing.T) {
 func TestClassifyPassesThroughNil(t *testing.T) {
 	if err := Classify(context.Background(), &fakeRunner{}, nil, appleProbe); err != nil {
 		t.Fatalf("Classify(nil) = %v, want nil", err)
+	}
+}
+
+func TestIsCommandExit(t *testing.T) {
+	if !IsCommandExit(&CLIError{Args: []string{"exec"}, ExitCode: 1}) {
+		t.Error("CLIError should be a command exit")
+	}
+	if IsCommandExit(errors.New("executable file not found")) {
+		t.Error("launch failure must not count as command exit")
+	}
+	if IsCommandExit(nil) {
+		t.Error("nil must not count as command exit")
 	}
 }

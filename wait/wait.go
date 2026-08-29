@@ -5,6 +5,7 @@ package wait
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"time"
@@ -56,8 +57,12 @@ func (o options) effective() (timeout, interval time.Duration) {
 }
 
 // poll runs check every interval until it succeeds, the container
-// stops, or the timeout elapses.
-func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error) error {
+// stops, or the timeout elapses. When checkRunning is true the poll
+// also probes target.Running between checks and fails fast once the
+// container stopped; strategies whose check itself talks to the
+// container (ForExec) pass false and rely on the final classification
+// below.
+func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
 	timeout, interval := o.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -65,13 +70,21 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	var lastErr error
 	var lastStateCheck time.Time
 	for {
-		if err := check(ctx); err == nil {
+		if err := check(ctx); err != nil {
+			var fatal fatalCheckError
+			if errors.As(err, &fatal) {
+				// The check could not run at all; retrying cannot
+				// help, so surface the error right away.
+				return fmt.Errorf("%s: %w", what, fatal.err)
+			}
+			if ctx.Err() == nil {
+				lastErr = err
+			}
+		} else {
 			return nil
-		} else if ctx.Err() == nil {
-			lastErr = err
 		}
 
-		if time.Since(lastStateCheck) >= stateCheckInterval {
+		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
 			if running, err := target.Running(ctx); err == nil && !running {
 				return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
@@ -80,8 +93,33 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 
 		select {
 		case <-ctx.Done():
+			// Termination point: classify once. A poll without
+			// state checks only inspects the container now, so a
+			// stopped container is still reported accurately.
+			// Probe only after our wait deadline; never override
+			// caller cancellation, and bound the probe so a hung
+			// backend cannot outlive the wait by queryTimeout.
+			if !checkRunning && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
+				running, err := target.Running(probeCtx)
+				probeCancel()
+				if err == nil && !running {
+					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+				}
+			}
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr)
+			}
 			return fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr)
 		case <-time.After(interval):
 		}
 	}
 }
+
+// fatalCheckError wraps a check error that must end the poll
+// immediately instead of being retried: the check could not run at all
+// (CLI launch failure, unknown container), so retrying cannot help.
+type fatalCheckError struct{ err error }
+
+func (e fatalCheckError) Error() string { return e.err.Error() }
+func (e fatalCheckError) Unwrap() error { return e.err }

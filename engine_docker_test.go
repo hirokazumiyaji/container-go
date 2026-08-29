@@ -135,7 +135,7 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	if !slices.Equal(execArgs, []string{"exec", "--env-file", "/tmp/env", "--user", "u", "--workdir", "/w", "myctr", "id"}) {
 		t.Errorf("execArgs = %v", execArgs)
 	}
-	if got := e.probe().Args; !slices.Equal(got, []string{"info"}) {
+	if got := e.probe().Args; !slices.Equal(got, []string{"version", "--format", "{{.Server.Version}}"}) {
 		t.Errorf("probe = %v", got)
 	}
 }

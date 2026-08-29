@@ -39,6 +39,26 @@ func (r *countingRunner) Stream(ctx context.Context, args ...string) (io.ReadClo
 	return s.Stream(ctx, args...)
 }
 
+// External forwards the inner runner's externalness. Implementing
+// cli.ExternalRunner keeps Run's reaper registration active around the
+// counting scenarios, so they measure the production path; wrapping a
+// test double stays non-external, like the double itself.
+func (r *countingRunner) External() bool {
+	er, ok := r.inner.(cli.ExternalRunner)
+	return ok && er.External()
+}
+
+// ExternalBinary forwards the inner runner's binary, or "" when the
+// inner runner is not external (Run then falls back to the engine
+// default, which is unreachable because External reports false).
+func (r *countingRunner) ExternalBinary() string {
+	er, ok := r.inner.(cli.ExternalRunner)
+	if !ok {
+		return ""
+	}
+	return er.ExternalBinary()
+}
+
 func (r *countingRunner) count() int64 { return r.calls.Load() }
 
 // TestCountingRunnerCountsEveryCall pins the counter to a known CLI
@@ -65,5 +85,24 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	// The wrapper forwards results unchanged.
 	if got := len(f.calls); int64(got) != r.count() {
 		t.Errorf("inner calls = %d, counted = %d", got, r.count())
+	}
+}
+
+// TestCountingRunnerExternalForwarding pins the cli.ExternalRunner
+// forwarding: around the real ExecRunner the wrapper must stay
+// external so Run keeps registering containers with the reaper, and
+// around a test double it must not claim externalness.
+func TestCountingRunnerExternalForwarding(t *testing.T) {
+	double := newCountingRunner(newTestRunner())
+	if double.External() {
+		t.Error("countingRunner around a test double reports external, want false")
+	}
+
+	external := newCountingRunner(&cli.ExecRunner{Binary: "docker"})
+	if !external.External() {
+		t.Error("countingRunner around ExecRunner reports external = false, want true")
+	}
+	if got := external.ExternalBinary(); got != "docker" {
+		t.Errorf("ExternalBinary = %q, want %q", got, "docker")
 	}
 }

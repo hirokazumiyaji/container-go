@@ -108,9 +108,7 @@ func TestIntegrationBenchCounting(t *testing.T) {
 
 			doc := bench.Doc{Env: benchEnv(b)}
 			benchScenario(t, &doc, b, image, "run/cold", func(t *testing.T) {
-				if err := b.RemoveImage(image); err != nil {
-					t.Logf("remove image %s: %v", image, err)
-				}
+				b.EnsureImageAbsent(t, image)
 			}, benchPortOptions(b, eng))
 			benchScenario(t, &doc, b, image, "run/warm", nil, benchPortOptions(b, eng))
 			benchScenario(t, &doc, b, image, "run/no-wait", nil, func(r cli.Runner) []Option {

@@ -55,29 +55,54 @@ func record(doc *Doc, backend, library, image, name string, iteration int, elaps
 	})
 }
 
-// runScenario runs fn iterations times and records each duration.
-func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, fn func(t *testing.T) error) {
+// runScenario runs fn iterations times and records each Run→ready
+// duration. prep runs before the timer; cleanup runs after it, so
+// image setup/teardown and container termination stay out of the
+// measurement.
+func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, prep func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
 	t.Helper()
 	for i := 1; i <= iterations; i++ {
+		if prep != nil {
+			prep(t)
+		}
 		start := time.Now()
-		if err := fn(t); err != nil {
+		cleanup, err := fn(t)
+		elapsed := time.Since(start)
+		if err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
 			t.Fatalf("%s iteration %d: %v", name, i, err)
 		}
-		record(doc, backend, library, image, name, i, time.Since(start))
+		record(doc, backend, library, image, name, i, elapsed)
+		if cleanup != nil {
+			cleanup()
+		}
 	}
 }
 
-// containerGoRun starts one container and returns after it is ready.
-func containerGoRun(t *testing.T, image, port string) error {
+// containerGoStart starts one container and returns after it is ready.
+// Callers terminate outside the timed region.
+func containerGoStart(t *testing.T, image, port string) (*container.Container, error) {
 	t.Helper()
-	ctr, err := container.Run(context.Background(), image,
+	return container.Run(context.Background(), image,
 		container.WithExposedPorts(port),
 		container.WithWaitStrategy(wait.ForListeningPort(port)),
 	)
-	if err != nil {
-		return err
+}
+
+func terminateCleanup(t *testing.T, containers ...*container.Container) func() {
+	t.Helper()
+	return func() {
+		for _, ctr := range containers {
+			if ctr == nil {
+				continue
+			}
+			if err := ctr.Terminate(context.Background()); err != nil {
+				t.Logf("terminate: %v", err)
+			}
+		}
 	}
-	return ctr.Terminate(context.Background())
 }
 
 func benchEnv(b ibench.Backend) Env {
@@ -127,29 +152,37 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 			doc := Doc{Env: benchEnv(b)}
 
 			// Cold: remove the image so the run includes the pull.
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/cold", func(t *testing.T) error {
-				if err := b.RemoveImage(redisImage); err != nil {
-					t.Logf("remove image: %v", err)
-				}
-				return containerGoRun(t, redisImage, "6379/tcp")
-			})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/warm", func(t *testing.T) error {
-				return containerGoRun(t, redisImage, "6379/tcp")
-			})
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/cold",
+				func(t *testing.T) { b.EnsureImageAbsent(t, redisImage) },
+				func(t *testing.T) (func(), error) {
+					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
+					return terminateCleanup(t, ctr), err
+				})
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/warm", nil,
+				func(t *testing.T) (func(), error) {
+					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
+					return terminateCleanup(t, ctr), err
+				})
 			b.EnsureImage(t, nginxImage)
-			runScenario(t, &doc, b.Name, LibraryContainerGo, nginxImage, "run/warm-nginx", func(t *testing.T) error {
-				return containerGoRun(t, nginxImage, "80/tcp")
-			})
+			runScenario(t, &doc, b.Name, LibraryContainerGo, nginxImage, "run/warm-nginx", nil,
+				func(t *testing.T) (func(), error) {
+					ctr, err := containerGoStart(t, nginxImage, "80/tcp")
+					return terminateCleanup(t, ctr), err
+				})
 
 			// Multi: five sequential containers in one process.
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/multi-5", func(t *testing.T) error {
-				for range 5 {
-					if err := containerGoRun(t, redisImage, "6379/tcp"); err != nil {
-						return err
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/multi-5", nil,
+				func(t *testing.T) (func(), error) {
+					var containers []*container.Container
+					for range 5 {
+						ctr, err := containerGoStart(t, redisImage, "6379/tcp")
+						if err != nil {
+							return terminateCleanup(t, containers...), err
+						}
+						containers = append(containers, ctr)
 					}
-				}
-				return nil
-			})
+					return terminateCleanup(t, containers...), nil
+				})
 
 			// Parallel: eight concurrent starts; the value is the
 			// wall-clock until all eight are ready, excluding the
@@ -215,6 +248,20 @@ func tcRequest() tc.GenericContainerRequest {
 	}
 }
 
+func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
+	t.Helper()
+	return func() {
+		for _, ctr := range containers {
+			if ctr == nil {
+				continue
+			}
+			if err := ctr.Terminate(context.Background()); err != nil {
+				t.Logf("terminate: %v", err)
+			}
+		}
+	}
+}
+
 // TestIntegrationBenchTestcontainers measures testcontainers-go under
 // the same conditions. The first iteration includes the session
 // initialization (starting and connecting the Ryuk sidecar container),
@@ -227,36 +274,35 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	// scenario so steady-state numbers stay comparable.
 	start := time.Now()
 	ctr, err := tc.GenericContainer(context.Background(), tcRequest())
+	elapsed := time.Since(start)
 	if err != nil {
 		t.Fatalf("session-init container: %v", err)
 	}
-	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, time.Since(start))
+	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, elapsed)
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("terminate: %v", err)
 	}
 
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/single", func(t *testing.T) error {
-		ctr, err := tc.GenericContainer(context.Background(), tcRequest())
-		if err != nil {
-			return err
-		}
-		return ctr.Terminate(context.Background())
-	})
+	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/single", nil,
+		func(t *testing.T) (func(), error) {
+			ctr, err := tc.GenericContainer(context.Background(), tcRequest())
+			return tcTerminateCleanup(t, ctr), err
+		})
 
 	// Multi: five sequential containers in one process; the session
 	// initialization was already paid above.
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", func(t *testing.T) error {
-		for range 5 {
-			ctr, err := tc.GenericContainer(context.Background(), tcRequest())
-			if err != nil {
-				return err
+	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil,
+		func(t *testing.T) (func(), error) {
+			var containers []tc.Container
+			for range 5 {
+				ctr, err := tc.GenericContainer(context.Background(), tcRequest())
+				if err != nil {
+					return tcTerminateCleanup(t, containers...), err
+				}
+				containers = append(containers, ctr)
 			}
-			if err := ctr.Terminate(context.Background()); err != nil {
-				return err
-			}
-		}
-		return nil
-	})
+			return tcTerminateCleanup(t, containers...), nil
+		})
 
 	path := writeDoc(t, "docker-tc", doc)
 	t.Log("\n" + Table(Summarize(doc.Results)))

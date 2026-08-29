@@ -108,8 +108,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up.
-	if er, ok := cfg.runner.(*cli.ExecRunner); ok && !keepContainers() {
-		bin := er.Binary
+	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
+		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}

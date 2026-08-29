@@ -1,6 +1,7 @@
 package bench
 
 import (
+	"fmt"
 	"os/exec"
 	"testing"
 )
@@ -109,4 +110,33 @@ func (b Backend) EnsureImage(tb testing.TB, image string) {
 	if err := b.PullImage(image); err != nil {
 		tb.Fatalf("pull %s: %v", image, err)
 	}
+}
+
+// EnsureImageAbsent removes the image before a cold iteration.
+// A remove that fails because the image is already gone is fine; any
+// other failure where the image is still present aborts the scenario
+// so a warm start is not recorded under a cold label.
+func (b Backend) EnsureImageAbsent(tb testing.TB, image string) {
+	tb.Helper()
+	err := b.RemoveImage(image)
+	if err == nil {
+		return
+	}
+	if checkErr := imageRemovalAccepted(b.ImageExists, image, err); checkErr != nil {
+		tb.Fatal(checkErr)
+	}
+	tb.Logf("remove %s reported error but image is absent: %v", image, err)
+}
+
+// imageRemovalAccepted reports whether a RemoveImage failure is
+// tolerable because the image is already absent.
+func imageRemovalAccepted(exists func(string) (bool, error), image string, removeErr error) error {
+	ok, checkErr := exists(image)
+	if checkErr != nil {
+		return fmt.Errorf("remove %s: %w (and could not verify absence: %v)", image, removeErr, checkErr)
+	}
+	if ok {
+		return fmt.Errorf("remove %s: %w (image still present)", image, removeErr)
+	}
+	return nil
 }

@@ -48,5 +48,5 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) er
 			return err
 		}
 		return conn.Close()
-	})
+	}, true)
 }

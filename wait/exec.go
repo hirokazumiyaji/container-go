@@ -6,6 +6,10 @@ import (
 	"time"
 )
 
+// defaultExecPollInterval is coarser than the connection-based default
+// because each ForExec check already spawns a CLI process.
+const defaultExecPollInterval = 250 * time.Millisecond
+
 // ExecStrategy waits until a command run inside the container exits
 // with an accepted code (0 by default).
 type ExecStrategy struct {
@@ -16,7 +20,10 @@ type ExecStrategy struct {
 
 // ForExec waits for cmd to succeed inside the container.
 func ForExec(cmd []string) *ExecStrategy {
-	return &ExecStrategy{cmd: cmd}
+	return &ExecStrategy{
+		cmd:     cmd,
+		options: options{pollInterval: defaultExecPollInterval},
+	}
 }
 
 // WithExitCodeMatcher replaces the default exit-code-zero check.
@@ -40,14 +47,20 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	if matcher == nil {
 		matcher = func(code int) bool { return code == 0 }
 	}
+	// checkRunning is false: each check already talks to the container
+	// via exec, so a concurrent Running probe would only add spawns.
+	// A stopped container is still reported once at timeout.
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		code, err := target.ExecCommand(ctx, s.cmd)
 		if err != nil {
-			return err
+			// Command exits are returned as codes; any error means the
+			// check could not run (CLI launch failure, missing
+			// container) and retrying cannot help.
+			return fatalCheckError{err: err}
 		}
 		if !matcher(code) {
 			return fmt.Errorf("exit code %d not accepted", code)
 		}
 		return nil
-	})
+	}, false)
 }

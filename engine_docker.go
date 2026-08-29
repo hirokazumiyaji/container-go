@@ -23,7 +23,12 @@ func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
 func (dockerEngine) probe() cli.Probe {
-	return cli.Probe{Args: []string{"info"}, Hint: "start the Docker daemon"}
+	// version --format reaches the daemon without the heavy info
+	// collection; only reachability matters for ErrSystemNotRunning.
+	return cli.Probe{
+		Args: []string{"version", "--format", "{{.Server.Version}}"},
+		Hint: "start the Docker daemon",
+	}
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything

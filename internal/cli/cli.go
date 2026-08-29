@@ -112,6 +112,14 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
+// IsCommandExit reports whether err is a CLIError from a child process
+// that started and returned an exit status. Launch failures (missing
+// binary, OS exec errors) are not CLIErrors and return false.
+func IsCommandExit(err error) bool {
+	var e *CLIError
+	return errors.As(err, &e)
+}
+
 // Classify augments a failed CLI call: if the backend does not answer
 // the probe, the failure is reported as ErrSystemNotRunning instead of
 // the original error.

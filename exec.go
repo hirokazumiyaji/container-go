@@ -83,10 +83,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err != nil {
-		var cliErr *cli.CLIError
 		// The CLI propagates the process exit code; treat it as a
 		// result unless the failure is about the container itself.
-		if errors.As(err, &cliErr) && !isNotFound(err) {
+		if cli.IsCommandExit(err) && !isNotFound(err) {
+			var cliErr *cli.CLIError
+			errors.As(err, &cliErr)
 			return cliErr.ExitCode, io.MultiReader(output, bytes.NewReader([]byte(cliErr.Stderr))), nil
 		}
 		return 0, nil, c.classify(ctx, err)

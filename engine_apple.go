@@ -1,8 +1,10 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -146,4 +148,27 @@ func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
 		}
 	}
 	return ids, nil
+}
+
+func (appleEngine) imageInspectArgs(image string) []string {
+	return []string{"image", "inspect", image}
+}
+
+func (appleEngine) pullImageArgs(image string) []string {
+	return []string{"image", "pull", image}
+}
+
+// imageMissing matches the CLI's error for an absent image; the images
+// plugin reports ContainerizationError(.notFound).
+func (appleEngine) imageMissing(err error) bool {
+	var cliErr *cli.CLIError
+	return errors.As(err, &cliErr) && strings.Contains(strings.ToLower(cliErr.Stderr), "not found")
+}
+
+func (appleEngine) parseImageExists(data []byte) bool {
+	images, err := inspect.Decode(data)
+	if err != nil {
+		return false
+	}
+	return len(images) > 0
 }

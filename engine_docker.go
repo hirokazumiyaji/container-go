@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -38,7 +39,9 @@ func (dockerEngine) defaultHost() string {
 }
 
 func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
-	args := []string{"run", "--detach", "--name", cfg.name}
+	// The pull policy fetches the image beforehand; --pull=never keeps
+	// the run command from pulling a second time behind our back.
+	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
 	labels := cfg.allLabels()
 	for _, k := range sortedKeys(labels) {
 		args = append(args, "--label", k+"="+labels[k])
@@ -228,4 +231,26 @@ func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
 		}
 	}
 	return ids, nil
+}
+
+func (dockerEngine) imageInspectArgs(image string) []string {
+	return []string{"image", "inspect", image}
+}
+
+func (dockerEngine) pullImageArgs(image string) []string {
+	return []string{"pull", image}
+}
+
+// imageMissing matches the daemon's response for an absent image.
+func (dockerEngine) imageMissing(err error) bool {
+	var cliErr *cli.CLIError
+	return errors.As(err, &cliErr) && strings.Contains(strings.ToLower(cliErr.Stderr), "no such image")
+}
+
+func (dockerEngine) parseImageExists(data []byte) bool {
+	var images []json.RawMessage
+	if err := json.Unmarshal(data, &images); err != nil {
+		return false
+	}
+	return len(images) > 0
 }

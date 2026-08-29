@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -17,6 +18,9 @@ import (
 type countingRunner struct {
 	inner cli.Runner
 	calls atomic.Int64
+
+	mu   sync.Mutex
+	args [][]string // args of each counted call
 }
 
 func newCountingRunner(inner cli.Runner) *countingRunner {
@@ -25,6 +29,9 @@ func newCountingRunner(inner cli.Runner) *countingRunner {
 
 func (r *countingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls.Add(1)
+	r.mu.Lock()
+	r.args = append(r.args, args)
+	r.mu.Unlock()
 	return r.inner.Run(ctx, args...)
 }
 
@@ -36,6 +43,9 @@ func (r *countingRunner) Stream(ctx context.Context, args ...string) (io.ReadClo
 		return nil, fmt.Errorf("countingRunner: inner runner does not support streaming")
 	}
 	r.calls.Add(1)
+	r.mu.Lock()
+	r.args = append(r.args, args)
+	r.mu.Unlock()
 	return s.Stream(ctx, args...)
 }
 
@@ -67,19 +77,24 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	f := newTestRunner()
 	r := newCountingRunner(f)
 
+	// Seed the image into the fake store so the pull policy performs
+	// only the existence check.
+	f.imagePresent = true
+
 	ctr := runTestContainer(t, r, WithExposedPorts("6379/tcp"))
 
-	// Expected calls: run, then the eager first inspect cachedInfo
-	// performs right after start. (#20 will drop the second.)
-	if got := r.count(); got != 2 {
-		t.Fatalf("after Run: calls = %d, want 2", got)
+	// Expected calls: image inspect (present, no pull), run, then the
+	// eager first inspect cachedInfo performs right after start.
+	// (#20 will drop the last one.)
+	if got := r.count(); got != 3 {
+		t.Fatalf("after Run: calls = %d, want 3", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
 	// Endpoint resolves from the cached inspect; no extra spawn.
-	if got := r.count(); got != 2 {
-		t.Fatalf("after Endpoint: calls = %d, want 2", got)
+	if got := r.count(); got != 3 {
+		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
 
 	// The wrapper forwards results unchanged.

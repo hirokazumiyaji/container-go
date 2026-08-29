@@ -52,4 +52,14 @@ type engine interface {
 	directIP() bool
 	// defaultHost is the client-facing host in published-port mode.
 	defaultHost() string
+	// imageInspectArgs inspects an image reference in the backend's
+	// local store; failure with imageMissing means the image is absent.
+	imageInspectArgs(image string) []string
+	// pullImageArgs fetches the image into the local store.
+	pullImageArgs(image string) []string
+	// imageMissing reports whether a failed image inspect means the
+	// image is not in the local store.
+	imageMissing(err error) bool
+	// parseImageExists interprets image inspect output.
+	parseImageExists(data []byte) bool
 }

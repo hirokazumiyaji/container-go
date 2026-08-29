@@ -140,6 +140,9 @@ func TestIntegrationDockerParallelStarts(t *testing.T) {
 
 func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
+		// The child's TestMain unsets CONTAINERGO_BACKEND, so the
+		// env-passed selection never reaches Run; pin it here.
+		os.Setenv("CONTAINERGO_BACKEND", "docker")
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, "alpine:latest",
 			container.WithName(os.Getenv("CONTAINERGO_REAPER_NAME")),

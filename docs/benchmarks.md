@@ -82,7 +82,7 @@ Variables to keep fixed across comparison runs:
 - the iteration count (5) and the parallelism (8)
 - backend CLI and daemon versions
 
-## Baseline (2026-08-29, commit `bench-harness` work tree)
+## Baseline (2026-08-29, after #18: pull singleflight + `--pull=never`)
 
 macOS 26, Apple Silicon (10 CPUs), Go 1.27.0, Docker daemon 29.7.2.
 Apple backend numbers pending a machine with the system service
@@ -90,20 +90,32 @@ running; the scenarios skip cleanly without it.
 
 | Backend | Library            | Scenario       | Median | Spawn |
 | ------- | ------------------ | -------------- | ------ | ----- |
-| docker  | container-go       | run/cold       | ~5-16s (pull) | 2 |
-| docker  | container-go       | run/warm       | 275ms  | 2 |
-| docker  | container-go       | run/forlog     | 159ms  | 3 |
-| docker  | container-go       | run/forexec    | 211ms  | 3 |
-| docker  | container-go       | run/no-wait    | 133ms  | 2 |
-| docker  | container-go       | run/parallel-8 | 364ms  | 16 |
-| docker  | testcontainers-go  | tc/session-init| 14.7s  | 0 |
-| docker  | testcontainers-go  | tc/single      | 292ms  | 0 |
-| docker  | testcontainers-go  | tc/multi-5     | 1.49s (5 ctrs) | 0 |
+| docker  | container-go       | run/cold       | 3.5s (pull) | 4 |
+| docker  | container-go       | run/warm       | 149ms  | 3 |
+| docker  | container-go       | run/forlog     | 165ms  | 4 |
+| docker  | container-go       | run/forexec    | 188ms  | 4 |
+| docker  | container-go       | run/no-wait    | 145ms  | 3 |
+| docker  | container-go       | run/parallel-8 | 420ms  | 17 |
+| docker  | testcontainers-go  | tc/session-init| 0.5s warm / 14.7s cold | 0 |
+| docker  | testcontainers-go  | tc/single      | 335ms  | 0 |
+| docker  | testcontainers-go  | tc/multi-5     | 1.69s (5 ctrs) | 0 |
 
-Reading: warm single-container latency is close (CLI spawn overhead is
-real but small against daemon work), while container-go pays no
-session initialization (testcontainers-go waits ~15s for its Ryuk
-sidecar once per process) and parallelizes without port contention.
-The remaining per-call spawn cost is what #18, #19, and #20 attack;
-whether the Docker backend needs a direct Engine API client (#22) is
-judged from these numbers.
+Changes observed when the pull singleflight landed (#18), against the
+pre-#18 numbers from PR #23:
+
+- cold improved from ~4.7-6.1s to ~3.5s and lost its variance tail
+  (9.4s worst observed before): the pull is now an explicit
+  `docker pull`, and `docker run --pull=never` no longer performs its
+  own registry round-trip.
+- warm shapes pay exactly one extra spawn for the image existence
+  check (2 → 3 for plain Run); in exchange concurrent Runs of a
+  missing image pull once instead of racing.
+- testcontainers-go's `tc/session-init` depends on whether the Ryuk
+  sidecar image is cached: 14.7s on first-ever use, ~0.5s warm.
+
+Reading: warm single-container latency remains close to
+testcontainers-go, container-go still pays no per-process session
+initialization, and parallel starts stay port-contention-free. The
+remaining per-call spawn cost is what #19 and #20 attack; whether the
+Docker backend needs a direct Engine API client (#22) is judged from
+these numbers.

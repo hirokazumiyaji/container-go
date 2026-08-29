@@ -286,3 +286,114 @@ func TestFlightGroupCancelledWaiterDoesNotAffectLeader(t *testing.T) {
 		t.Errorf("leader error = %v", err)
 	}
 }
+
+func TestFlightGroupCancelledLeaderDoesNotAffectWaiters(t *testing.T) {
+	var g flightGroup
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	leaderCtx, leaderCancel := context.WithCancel(context.Background())
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- g.do(leaderCtx, "key", func() error {
+			close(started)
+			<-release
+			return nil
+		})
+	}()
+	<-started
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		waiterDone <- g.do(context.Background(), "key", func() error {
+			t.Error("waiter must not execute fn")
+			return nil
+		})
+	}()
+	// Let the waiter join the in-flight work before cancelling the leader.
+	time.Sleep(20 * time.Millisecond)
+	leaderCancel()
+	if err := <-leaderDone; !errors.Is(err, context.Canceled) {
+		t.Errorf("leader error = %v, want context.Canceled", err)
+	}
+
+	close(release)
+	select {
+	case err := <-waiterDone:
+		if err != nil {
+			t.Errorf("waiter error = %v, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not observe leader completion")
+	}
+}
+
+func TestFlightKeySeparatesPullAndMissing(t *testing.T) {
+	eng := dockerEngine{}
+	if flightKey(eng, "redis:7-alpine", flightPull) == flightKey(eng, "redis:7-alpine", flightMissing) {
+		t.Fatal("mandatory pull and missing-check keys must differ")
+	}
+}
+
+// hookRunner invokes before each CLI call, then delegates to fakeRunner.
+type hookRunner struct {
+	*fakeRunner
+	before func(args []string)
+}
+
+func (h *hookRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if h.before != nil {
+		h.before(args)
+	}
+	return h.fakeRunner.Run(ctx, args...)
+}
+
+func TestEnsureImagePullAlwaysDoesNotJoinMissingFlight(t *testing.T) {
+	// A PullMissing flight that finds the image present must not satisfy
+	// a concurrent PullAlways; otherwise the mandatory pull is skipped.
+	base := newTestRunner()
+	base.imagePresent = true
+
+	inspectEntered := make(chan struct{})
+	releaseInspect := make(chan struct{})
+	var inspectOnce sync.Once
+	r := &hookRunner{
+		fakeRunner: base,
+		before: func(args []string) {
+			if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
+				inspectOnce.Do(func() { close(inspectEntered) })
+				<-releaseInspect
+			}
+		},
+	}
+
+	missingDone := make(chan error, 1)
+	go func() {
+		cfg := &config{runner: r, eng: dockerEngine{}, pullPolicy: PullMissing}
+		missingDone <- cfg.ensureImage(context.Background(), "redis:7-alpine")
+	}()
+	<-inspectEntered
+
+	alwaysDone := make(chan error, 1)
+	go func() {
+		cfg := &config{runner: r, eng: dockerEngine{}, pullPolicy: PullAlways}
+		alwaysDone <- cfg.ensureImage(context.Background(), "redis:7-alpine")
+	}()
+
+	select {
+	case err := <-alwaysDone:
+		if err != nil {
+			t.Fatalf("PullAlways: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("PullAlways blocked behind PullMissing inspect-only flight")
+	}
+
+	close(releaseInspect)
+	if err := <-missingDone; err != nil {
+		t.Fatalf("PullMissing: %v", err)
+	}
+	if base.pullCalls != 1 {
+		t.Errorf("pulls = %d, want 1 from PullAlways", base.pullCalls)
+	}
+}

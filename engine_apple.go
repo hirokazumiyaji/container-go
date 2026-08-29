@@ -77,6 +77,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		info := &engineInfo{
 			state:  State(c.Status.State),
 			labels: c.Configuration.Labels,
+			image:  c.Configuration.Image.Reference,
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -171,4 +172,33 @@ func (appleEngine) parseImageExists(data []byte) bool {
 		return false
 	}
 	return len(images) > 0
+}
+
+func (appleEngine) listReuseGroupArgs(string) []string {
+	return []string{"ls", "--all", "--format", "json"}
+}
+
+func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
+	containers, err := inspect.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	var ids []string
+	for _, c := range containers {
+		if c.Configuration.Labels[reuseGroupLabel] == group {
+			ids = append(ids, c.ID)
+		}
+	}
+	return ids, nil
+}
+
+// nameConflict matches Apple Container's duplicate-name wording.
+func (appleEngine) nameConflict(err error) bool {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	return strings.Contains(s, "already") &&
+		(strings.Contains(s, "exist") || strings.Contains(s, "in use") || strings.Contains(s, "taken"))
 }

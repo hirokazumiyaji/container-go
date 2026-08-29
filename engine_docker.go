@@ -109,6 +109,7 @@ type dockerInspect struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
+		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
 	} `json:"Config"`
 	NetworkSettings struct {
@@ -136,6 +137,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
 		labels: c.Config.Labels,
+		image:  c.Config.Image,
 		ip:     c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
@@ -172,7 +174,9 @@ func dockerState(s string) State {
 	switch s {
 	case "running":
 		return StateRunning
-	case "exited", "dead", "created":
+	case "created":
+		return StateCreated
+	case "exited", "dead":
 		return StateStopped
 	case "restarting", "removing":
 		return StateStopping
@@ -258,4 +262,33 @@ func (dockerEngine) parseImageExists(data []byte) bool {
 		return false
 	}
 	return len(images) > 0
+}
+
+func (dockerEngine) listReuseGroupArgs(group string) []string {
+	return []string{
+		"ps", "--all", "--quiet",
+		"--filter", "label=" + reuseGroupLabel + "=" + group,
+		"--format", "{{.Names}}",
+	}
+}
+
+func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
+	var ids []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			ids = append(ids, line)
+		}
+	}
+	return ids, nil
+}
+
+// nameConflict matches Docker's duplicate container name error.
+func (dockerEngine) nameConflict(err error) bool {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	return strings.Contains(s, "conflict") ||
+		(strings.Contains(s, "already in use") && strings.Contains(s, "name"))
 }

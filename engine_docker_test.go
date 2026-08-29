@@ -93,6 +93,9 @@ func TestDockerParseInspect(t *testing.T) {
 	if info.ip != "172.17.0.2" {
 		t.Errorf("ip = %q", info.ip)
 	}
+	if info.image != "redis:7-alpine" {
+		t.Errorf("image = %q", info.image)
+	}
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)
@@ -104,7 +107,7 @@ func TestDockerStateMapping(t *testing.T) {
 		"running":    StateRunning,
 		"exited":     StateStopped,
 		"dead":       StateStopped,
-		"created":    StateStopped,
+		"created":    StateCreated,
 		"restarting": StateStopping,
 		"removing":   StateStopping,
 		"paused":     StateUnknown,

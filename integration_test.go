@@ -293,3 +293,95 @@ func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
 		t.Fatalf("container still present after wait rollback: %s", out)
 	}
 }
+
+func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
+	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
+		requireSystem(t)
+		ctx := context.Background()
+		ctr, err := container.Run(ctx, "redis:7-alpine",
+			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
+			container.WithReuse(),
+			container.WithReuseGroup("integration-reuse"),
+			container.WithExposedPorts("6379/tcp"),
+			container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
+		)
+		if err != nil {
+			fmt.Println("CHILD-ERROR:", err)
+			os.Exit(1)
+		}
+		st, err := ctr.State(ctx)
+		if err != nil {
+			fmt.Println("CHILD-ERROR:", err)
+			os.Exit(1)
+		}
+		fmt.Println("READY:", ctr.ID(), st)
+		select {}
+	}
+
+	requireSystem(t)
+	name := fmt.Sprintf("containergo-reuse-%d", os.Getpid())
+	defer func() {
+		_, _ = container.PruneReuseGroup(context.Background(), "integration-reuse")
+		_ = exec.Command("container", "delete", "--force", name).Run()
+	}()
+
+	startChild := func() *exec.Cmd {
+		cmd := exec.Command(os.Args[0], "-test.run", "^TestIntegrationReuseSharedAcrossProcesses$")
+		cmd.Env = append(os.Environ(),
+			"CONTAINERGO_REUSE_CHILD=1",
+			"CONTAINERGO_REUSE_NAME="+name)
+		return cmd
+	}
+
+	c1, c2 := startChild(), startChild()
+	out1, err1 := c1.StdoutPipe()
+	if err1 != nil {
+		t.Fatal(err1)
+	}
+	out2, err2 := c2.StdoutPipe()
+	if err2 != nil {
+		t.Fatal(err2)
+	}
+	if err := c1.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = c1.Process.Kill()
+		_ = c2.Process.Kill()
+		_, _ = c1.Process.Wait()
+		_, _ = c2.Process.Wait()
+	}()
+
+	readReady := func(r io.Reader) string {
+		buf := make([]byte, 4096)
+		var acc string
+		deadline := time.After(3 * time.Minute)
+		for {
+			select {
+			case <-deadline:
+				return acc
+			default:
+			}
+			n, err := r.Read(buf)
+			acc += string(buf[:n])
+			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
+				return acc
+			}
+		}
+	}
+
+	o1 := readReady(out1)
+	o2 := readReady(out2)
+	if !strings.Contains(o1, "READY:") {
+		t.Fatalf("child1: %q", o1)
+	}
+	if !strings.Contains(o2, "READY:") {
+		t.Fatalf("child2: %q", o2)
+	}
+	if !strings.Contains(o1, name) || !strings.Contains(o2, name) {
+		t.Fatalf("children did not share name %s: %q / %q", name, o1, o2)
+	}
+}

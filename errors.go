@@ -24,5 +24,11 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // exist.
 func isNotFound(err error) bool {
 	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && strings.Contains(strings.ToLower(cliErr.Stderr), "not found")
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	return strings.Contains(s, "not found") ||
+		strings.Contains(s, "no such object") ||
+		strings.Contains(s, "no such container")
 }

@@ -34,6 +34,8 @@ type config struct {
 	network      string
 	platform     string
 	pullPolicy   PullPolicy
+	reuse        bool
+	reuseGroup   string
 }
 
 func newConfig() *config {
@@ -51,10 +53,45 @@ func (c *config) allLabels() map[string]string {
 		managedLabel: "true",
 		sessionLabel: sessionID(),
 	}
+	if c.reuse {
+		labels[reuseLabel] = "true"
+	}
+	if c.reuseGroup != "" {
+		labels[reuseGroupLabel] = c.reuseGroup
+	}
 	for k, v := range c.labels {
 		labels[k] = v
 	}
 	return labels
+}
+
+// WithReuse enables process- and cross-process get-or-create for a
+// stable WithName. Concurrent Run calls with the same name share one
+// container; readiness strategies always re-run against it. Returned
+// handles are shared: Cleanup, TerminateContainer, and the watchdog
+// reaper do not remove them. Explicit Terminate still does — only use
+// it when no other process still needs the container.
+func WithReuse() Option {
+	return func(c *config) error {
+		c.reuse = true
+		return nil
+	}
+}
+
+// WithReuseGroup tags a reused container for later PruneReuseGroup.
+// The group is not part of the reuse key; WithName alone identifies the
+// shared container. Requires WithReuse.
+func WithReuseGroup(group string) Option {
+	return func(c *config) error {
+		if group == "" {
+			return fmt.Errorf("reuse group must not be empty")
+		}
+		if len(group) > 128 || !labelKeyRE.MatchString(group) {
+			return fmt.Errorf("invalid reuse group %q", group)
+		}
+		c.reuseGroup = group
+		return nil
+	}
 }
 
 // nameRE is Apple Container's container name rule; the name doubles as

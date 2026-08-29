@@ -120,6 +120,39 @@ wait.ForAll(...), wait.ForAny(...)           // 合成
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。
 
+## Reuse(テスト / プロセス間でのコンテナ共有)
+
+`WithReuse` は安定した `WithName` に対する get-or-create です。同一
+プロセス内の並列呼び出しや、別プロセスの `go test` パッケージが 1 つの
+コンテナを共有します。
+
+```go
+ctr, err := container.Run(ctx, "redis:7-alpine",
+    container.WithName("it-redis"),
+    container.WithReuse(),
+    container.WithReuseGroup("integration"),
+    container.WithExposedPorts("6379/tcp"),
+    container.WithWaitStrategy(wait.ForListeningPort("6379/tcp")),
+)
+container.Cleanup(t, ctr) // reused ハンドルでは何もしない
+```
+
+契約:
+
+- `WithName` 必須。待機戦略は attach 時も必ず再実行する。
+- 競合する create の名前衝突は成功として扱い、既存へ attach する。
+- stopped の残骸は削除して再作成する。running のまま ready にならない
+  場合は削除せずエラーを返す。
+- image / port が既存と不一致なら分かりやすいエラーを返す。
+- `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
+  削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
+- `container.PruneReuseGroup(ctx, "integration")` はそのグループの
+  コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
+
+ライブラリはテスト間のアプリケーションデータを自動初期化しません。
+キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って
+ください。
+
 ## セキュリティ上の注意
 
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
@@ -141,6 +174,7 @@ wait.ForAll(...), wait.ForAny(...)           // 合成
 | Ryuk リーパーコンテナ | ローカルの watchdog リーパープロセスで代替 |
 | ランダムホストポートマッピング | Apple バックエンドはコンテナ IP へ直接接続。Docker バックエンドはループバックのランダムポートへ自動公開 |
 | ネットワーク / ボリューム管理 API | 当面スコープ外 |
+| `GenericContainerRequest.Reuse` | `WithReuse` + `WithName`: プロセス間 get-or-create。再待機必須、Cleanup/リーパーは所有しない |
 
 ## 開発
 

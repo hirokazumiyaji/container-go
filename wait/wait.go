@@ -96,10 +96,19 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			// Termination point: classify once. A poll without
 			// state checks only inspects the container now, so a
 			// stopped container is still reported accurately.
-			if !checkRunning {
-				if running, err := target.Running(context.WithoutCancel(ctx)); err == nil && !running {
+			// Probe only after our wait deadline; never override
+			// caller cancellation, and bound the probe so a hung
+			// backend cannot outlive the wait by queryTimeout.
+			if !checkRunning && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
+				running, err := target.Running(probeCtx)
+				probeCancel()
+				if err == nil && !running {
 					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
 				}
+			}
+			if errors.Is(ctx.Err(), context.Canceled) {
+				return fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr)
 			}
 			return fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr)
 		case <-time.After(interval):

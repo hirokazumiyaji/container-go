@@ -2,7 +2,9 @@ package wait
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os/exec"
 	"time"
 )
 
@@ -53,10 +55,14 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		code, err := target.ExecCommand(ctx, s.cmd)
 		if err != nil {
-			// Command exits are returned as codes; any error means the
-			// check could not run (CLI launch failure, missing
-			// container) and retrying cannot help.
-			return fatalCheckError{err: err}
+			// Command exits are returned as codes. Only a CLI launch
+			// failure (*exec.Error) is known to be permanent; other
+			// errors may be transient and are retried until timeout.
+			var launchErr *exec.Error
+			if errors.As(err, &launchErr) {
+				return fatalCheckError{err: err}
+			}
+			return err
 		}
 		if !matcher(code) {
 			return fmt.Errorf("exit code %d not accepted", code)

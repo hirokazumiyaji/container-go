@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -269,7 +270,7 @@ func TestForExecSkipsRunningDuringPoll(t *testing.T) {
 
 func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	target := newFakeTarget()
-	target.execErr = errors.New("exec: failed to start")
+	target.execErr = &exec.Error{Name: "container", Err: errors.New("executable file not found in $PATH")}
 
 	s := ForExec([]string{"pg_isready"}).
 		WithStartupTimeout(30 * time.Second).
@@ -288,8 +289,107 @@ func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	if target.runningCalls.Load() != 0 {
 		t.Errorf("Running calls = %d, want 0 on fatal check error", target.runningCalls.Load())
 	}
-	if !strings.Contains(err.Error(), "failed to start") {
+	if !strings.Contains(err.Error(), "executable file not found") {
 		t.Errorf("error = %v, want launch failure", err)
+	}
+}
+
+func TestForExecRetriesTransientErrors(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = errors.New("temporary exec failure")
+
+	s := ForExec([]string{"pg_isready"}).
+		WithStartupTimeout(400 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond)
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want timeout error")
+	}
+	if n := target.execCalls.Load(); n < 3 {
+		t.Errorf("exec calls = %d, want >= 3 (retries)", n)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("error = %v, want timeout", err)
+	}
+}
+
+func TestForExecReportsStoppedAtTimeout(t *testing.T) {
+	target := newFakeTarget()
+	target.execCode = 1
+	target.running.Store(false)
+
+	s := ForExec([]string{"pg_isready"}).
+		WithStartupTimeout(200 * time.Millisecond).
+		WithPollInterval(40 * time.Millisecond)
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if !strings.Contains(err.Error(), "stopped") {
+		t.Errorf("error = %v, want stopped container", err)
+	}
+}
+
+func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
+	target := newFakeTarget()
+	target.execCode = 1
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		cancel()
+	}()
+
+	s := ForExec([]string{"pg_isready"}).
+		WithStartupTimeout(30 * time.Second).
+		WithPollInterval(20 * time.Millisecond)
+	err := s.WaitUntilReady(ctx, target)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want context.Canceled", err)
+	}
+	if target.runningCalls.Load() != 0 {
+		t.Errorf("Running calls = %d, want 0 when caller cancels", target.runningCalls.Load())
+	}
+}
+
+func TestForExecFinalRunningProbeIsBounded(t *testing.T) {
+	target := newFakeTarget()
+	target.execCode = 1
+	// Running ignores progress until its context ends; without a bound
+	// on the diagnostic probe this would hang for queryTimeout.
+	slow := &slowRunningTarget{fakeTarget: target, block: 30 * time.Second}
+
+	s := ForExec([]string{"pg_isready"}).
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(40 * time.Millisecond)
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), slow)
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v; want bounded final Running probe", elapsed)
+	}
+}
+
+// slowRunningTarget blocks in Running until ctx ends or block elapses.
+type slowRunningTarget struct {
+	*fakeTarget
+	block time.Duration
+}
+
+func (s *slowRunningTarget) Running(ctx context.Context) (bool, error) {
+	s.runningCalls.Add(1)
+	timer := time.NewTimer(s.block)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		return s.running.Load(), nil
 	}
 }
 

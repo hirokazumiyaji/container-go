@@ -17,9 +17,10 @@ func keepContainers() bool {
 }
 
 // TerminateContainer removes the container. It is nil-safe so it can be
-// deferred before the error check on Run.
+// deferred before the error check on Run. Shared WithReuse handles are
+// left alone; call ctr.Terminate explicitly to remove a reused container.
 func TerminateContainer(ctr *Container) error {
-	if ctr == nil || keepContainers() {
+	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
 	return ctr.Terminate(context.Background())

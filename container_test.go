@@ -511,3 +511,10 @@ func TestExposedPortParseErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestIsNotFoundRecognizesDockerWording(t *testing.T) {
+	err := &cli.CLIError{Stderr: "Error: No such object: myctr"}
+	if !isNotFound(err) {
+		t.Fatal("want isNotFound for docker 'No such object'")
+	}
+}

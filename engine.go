@@ -10,6 +10,8 @@ import (
 type engineInfo struct {
 	state  State
 	labels map[string]string
+	// image is the image reference the container was created from.
+	image string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
@@ -43,6 +45,15 @@ type engine interface {
 	// parseStoppedManaged extracts, from listArgs output, the IDs of
 	// stopped containers this library created.
 	parseStoppedManaged(data []byte) ([]string, error)
+	// listReuseGroupArgs lists every container tagged with the reuse
+	// group label, including running ones.
+	listReuseGroupArgs(group string) []string
+	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
+	// output that carry the given reuse group.
+	parseReuseGroupIDs(data []byte, group string) ([]string, error)
+	// nameConflict reports whether a failed run means the container
+	// name is already taken by another create.
+	nameConflict(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
 	// runs as `<binary> <subcommand> --force <id>`.
 	reaperSubcommand() string

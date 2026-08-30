@@ -7,7 +7,6 @@ import (
 	"slices"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -184,39 +183,40 @@ func TestFlightGroupAggregatesConcurrentCallers(t *testing.T) {
 	var g flightGroup
 	var calls int
 	var mu sync.Mutex
-	var waiting atomic.Int64
 	const n = 50
 
-	// The leader holds the flight open until every waiter has joined.
+	entered := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
 		_ = g.do(context.Background(), "key", func() error {
 			mu.Lock()
 			calls++
 			mu.Unlock()
-			deadline := time.Now().Add(5 * time.Second)
-			for waiting.Load() < n && time.Now().Before(deadline) {
-				time.Sleep(time.Millisecond)
-			}
-			// A short settle window covers the gap between a
-			// waiter's arrival count and its entry into do.
-			time.Sleep(50 * time.Millisecond)
-			close(release)
+			close(entered)
+			<-release
 			return nil
 		})
 	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never entered flight")
+	}
 
 	var wg sync.WaitGroup
 	for range n {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			waiting.Add(1)
 			if err := g.do(context.Background(), "key", func() error { return nil }); err != nil {
 				t.Errorf("do: %v", err)
 			}
 		}()
 	}
+	// Give waiters a moment to join the in-flight entry before
+	// releasing the leader.
+	time.Sleep(50 * time.Millisecond)
+	close(release)
 	wg.Wait()
 
 	mu.Lock()

@@ -18,12 +18,18 @@ import (
 )
 
 const (
-	managedLabel = "com.github.hirokazumiyaji.container-go"
-	sessionLabel = "com.github.hirokazumiyaji.container-go.session"
+	managedLabel    = "com.github.hirokazumiyaji.container-go"
+	sessionLabel    = "com.github.hirokazumiyaji.container-go.session"
+	reuseLabel      = "com.github.hirokazumiyaji.container-go.reuse"
+	reuseGroupLabel = "com.github.hirokazumiyaji.container-go.reuse-group"
 
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
 	runTimeout = 10 * time.Minute
+	// reuseAttachTimeout bounds waiting for another process's create
+	// to reach a usable state during WithReuse get-or-create.
+	reuseAttachTimeout = 60 * time.Second
+	reusePollInterval  = 100 * time.Millisecond
 )
 
 // sessionID identifies all containers created by this process.
@@ -50,6 +56,7 @@ const (
 	StateRunning  State = "running"
 	StateStopped  State = "stopped"
 	StateStopping State = "stopping"
+	StateCreated  State = "created"
 	StateUnknown  State = "unknown"
 )
 
@@ -60,6 +67,10 @@ type Container struct {
 	eng       engine
 	exposed   []portSpec
 	published []publishSpec
+	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
+	// and the watchdog reaper skip these so shared containers survive
+	// process exit. Explicit Terminate still removes them.
+	reused bool
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -67,7 +78,8 @@ type Container struct {
 
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
-// removed before returning.
+// removed before returning. WithReuse switches to get-or-create; see
+// WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -78,6 +90,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if !imageRE.MatchString(image) {
 		return nil, fmt.Errorf("invalid image reference %q", image)
 	}
+	if cfg.reuse && cfg.name == "" {
+		return nil, fmt.Errorf("WithReuse requires WithName")
+	}
+	if cfg.reuseGroup != "" && !cfg.reuse {
+		return nil, fmt.Errorf("WithReuseGroup requires WithReuse")
+	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()
 		if err != nil {
@@ -86,6 +104,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.eng = eng
 	}
 	applyEngineBinary(cfg)
+	if cfg.reuse {
+		return reuseRun(ctx, image, cfg)
+	}
 	if cfg.name == "" {
 		cfg.name = newContainerName()
 	}

@@ -140,6 +140,40 @@ Extras:
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label).
 
+## Reuse (shared containers across tests/processes)
+
+`WithReuse` turns `Run` into a get-or-create for a stable `WithName`.
+Concurrent callers in the same process, and parallel `go test` packages
+in other processes, share one container:
+
+```go
+ctr, err := container.Run(ctx, "redis:7-alpine",
+    container.WithName("it-redis"),
+    container.WithReuse(),
+    container.WithReuseGroup("integration"),
+    container.WithExposedPorts("6379/tcp"),
+    container.WithWaitStrategy(wait.ForListeningPort("6379/tcp")),
+)
+container.Cleanup(t, ctr) // no-op for reused handles
+```
+
+Contract:
+
+- `WithName` is required; readiness strategies always re-run.
+- Name conflicts from a racing create are treated as success and attach.
+- Stopped leftovers are deleted and recreated; a running container that
+  never becomes ready is left alone and returns an error.
+- Image / port mismatches vs the existing container return a clear error.
+- `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
+  handles so other packages keep working. Explicit `ctr.Terminate` still
+  removes the shared container — only do that when nothing else needs it.
+- `container.PruneReuseGroup(ctx, "integration")` force-removes every
+  container tagged with that group (CI teardown). Ordinary `Prune` still
+  only deletes stopped managed containers.
+
+This library does not reset application data between tests. Prefer a
+per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup
+step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
@@ -161,6 +195,7 @@ Not supported (Apple Container has no equivalent, or out of scope):
 | Ryuk reaper container | Replaced by the local watchdog reaper process |
 | Random host port mapping | Apple backend connects to the container IP directly; Docker backend auto-publishes to random loopback ports |
 | Network/volume management APIs | Out of scope for now |
+| `GenericContainerRequest.Reuse` | `WithReuse` + `WithName`: cross-process get-or-create with mandatory re-wait and no Cleanup/reaper ownership |
 
 ## Development
 

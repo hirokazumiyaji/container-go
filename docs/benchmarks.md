@@ -144,7 +144,7 @@ client if multi-package CI wall-clock is still CLI-bound after those
 land, or if a future baseline shows warm single `Run` falling behind
 testcontainers-go again.
 
-If revisited, follow the #22 design note: `CONTAINERGO_DOCKER_MODE=
-auto|api|cli`, hot-path only (create/start/inspect/rm/ps/exec/logs),
-pull/auth stay on the CLI, and transport choice is fixed at engine
-init (no per-operation fallback).
+If revisited, follow the #22 design note: `CONTAINERGO_DOCKER_MODE=auto|api|cli`,
+hot-path only (create/start/inspect/rm/ps/exec/logs), pull/auth stay on
+the CLI, and transport choice is fixed at engine init (no per-operation
+fallback).

@@ -12,8 +12,9 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// reuseFlights collapses concurrent WithReuse Runs that share a name
-// into one get-or-create execution.
+// reuseFlights collapses concurrent WithReuse get-or-create calls that
+// share a name into one ensure operation. Each caller still applies its
+// own compatibility check and wait strategy afterward.
 var reuseFlights reuseFlightGroup
 
 type reuseFlightGroup struct {
@@ -58,31 +59,55 @@ func (g *reuseFlightGroup) wait(ctx context.Context, f *reuseFlight) (*Container
 		if f.err != nil {
 			return nil, f.err
 		}
-		return f.ctr.sharedHandle(), nil
+		return f.ctr, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-func (c *Container) sharedHandle() *Container {
-	return &Container{
-		id:        c.id,
-		runner:    c.runner,
-		eng:       c.eng,
-		exposed:   c.exposed,
-		published: c.published,
-		reused:    true,
-	}
-}
-
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
-	return reuseFlights.do(ctx, key, func() (*Container, error) {
-		return reuseGetOrCreate(ctx, image, cfg)
+	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
+		// Shared ensure must not die with the first caller's cancel;
+		// waiters keep waiting on their own contexts.
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reuseAttachTimeout)
+		defer cancel()
+		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
+	if err != nil {
+		return nil, err
+	}
+
+	info := base.info
+	if info == nil {
+		info, err = inspectNamed(ctx, cfg, cfg.name)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := checkReuseCompat(info, image, cfg); err != nil {
+		return nil, err
+	}
+
+	ctr := &Container{
+		id:        base.id,
+		runner:    base.runner,
+		eng:       base.eng,
+		exposed:   cfg.exposed,
+		published: cfg.published,
+		reused:    true,
+		info:      info,
+	}
+	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		return nil, err
+	}
+	return ctr, nil
 }
 
-func reuseGetOrCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
+// reuseEnsureContainer creates or attaches to the named container
+// without per-caller wait or port compatibility checks. Those run in
+// reuseRun so every concurrent caller applies its own configuration.
+func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	deadline := time.Now().Add(reuseAttachTimeout)
 	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
 		deadline = d
@@ -121,16 +146,18 @@ func reuseGetOrCreate(ctx context.Context, image string, cfg *config) (*Containe
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
 			}
+			// Only recycle containers this library created for reuse
+			// with a compatible image; never delete foreign leftovers.
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
 			if err := deleteNamed(ctx, cfg, cfg.name); err != nil {
 				return nil, err
 			}
 			recreated = true
 			continue
 		case StateRunning:
-			if err := checkReuseCompat(info, image, cfg); err != nil {
-				return nil, err
-			}
-			ctr := &Container{
+			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
 				eng:       cfg.eng,
@@ -138,11 +165,7 @@ func reuseGetOrCreate(ctx context.Context, image string, cfg *config) (*Containe
 				published: cfg.published,
 				reused:    true,
 				info:      info,
-			}
-			if err := reuseWait(ctx, cfg, ctr); err != nil {
-				return nil, err
-			}
-			return ctr, nil
+			}, nil
 		default:
 			time.Sleep(reusePollInterval)
 		}
@@ -191,9 +214,6 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 	}
-	if err := reuseWait(ctx, cfg, ctr); err != nil {
-		return nil, err
-	}
 	return ctr, nil
 }
 
@@ -231,19 +251,30 @@ func deleteNamed(ctx context.Context, cfg *config, id string) error {
 	return cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 }
 
-func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
+// checkReuseOwned reports whether a stopped container may be deleted
+// and recreated for this reuse request.
+func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
 	}
-	if cfg.eng.directIP() {
-		return nil
+	return nil
+}
+
+func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
+	if err := checkReuseOwned(info, image, cfg); err != nil {
+		return err
 	}
-	for _, spec := range cfg.exposed {
-		if !hasBoundPort(info.bound, spec.port, spec.proto) {
-			return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+	// Auto-published exposed ports only appear as host bindings on
+	// published-port backends. Explicit WithPublishedPort always needs
+	// validation, including on direct-IP engines.
+	if !cfg.eng.directIP() {
+		for _, spec := range cfg.exposed {
+			if !hasBoundPort(info.bound, spec.port, spec.proto) {
+				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+			}
 		}
 	}
 	for _, p := range cfg.published {
@@ -281,13 +312,17 @@ func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
 
 // imagesCompatible reports whether a requested image reference matches
 // what inspect reported. Docker may expand short names to
-// docker.io/library/...; digests are accepted when they share a name.
+// docker.io/library/.... When the request pins a digest, that digest
+// must appear on the existing image.
 func imagesCompatible(requested, actual string) bool {
 	if requested == "" || actual == "" {
 		return requested == actual
 	}
 	if requested == actual {
 		return true
+	}
+	if reqDigest := imageDigest(requested); reqDigest != "" {
+		return reqDigest == imageDigest(actual)
 	}
 	req := stripImageDigest(requested)
 	act := stripImageDigest(actual)
@@ -298,6 +333,14 @@ func imagesCompatible(requested, actual string) bool {
 		return true
 	}
 	return imageNameTag(req) == imageNameTag(act)
+}
+
+func imageDigest(ref string) string {
+	i := strings.Index(ref, "@")
+	if i < 0 {
+		return ""
+	}
+	return ref[i+1:]
 }
 
 func stripImageDigest(ref string) string {

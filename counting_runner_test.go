@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // countingRunner wraps a cli.Runner and counts every invocation. The
@@ -83,23 +84,58 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 
 	ctr := runTestContainer(t, r, WithExposedPorts("6379/tcp"))
 
-	// Expected calls: image inspect (present, no pull), run, then the
-	// eager first inspect cachedInfo performs right after start.
-	// (#20 will drop the last one.)
-	if got := r.count(); got != 3 {
-		t.Fatalf("after Run: calls = %d, want 3", got)
+	// Expected calls: image inspect (present, no pull) and run. The
+	// first container inspect is deferred until connection info is needed.
+	if got := r.count(); got != 2 {
+		t.Fatalf("after Run: calls = %d, want 2", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint resolves from the cached inspect; no extra spawn.
+	// Endpoint triggers the deferred inspect once; later reads reuse it.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
+	}
+	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
+		t.Fatalf("Endpoint again: %v", err)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("after cached Endpoint: calls = %d, want 3", got)
 	}
 
 	// The wrapper forwards results unchanged.
 	if got := len(f.calls); int64(got) != r.count() {
 		t.Errorf("inner calls = %d, counted = %d", got, r.count())
+	}
+}
+
+// TestRunForLogSkipsInitialInspect pins that a successful ForLog wait
+// does not pay for an eager post-start inspect.
+func TestRunForLogSkipsInitialInspect(t *testing.T) {
+	inner := &streamRunner{
+		fakeRunner: newTestRunner(),
+		streamData: "Ready to accept connections\n",
+	}
+	inner.imagePresent = true
+	r := newCountingRunner(inner)
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}),
+		WithWaitStrategy(wait.ForLog("Ready to accept connections")),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// image inspect + run + logs stream; no container inspect.
+	if got := r.count(); got != 3 {
+		t.Fatalf("after ForLog Run: calls = %d, want 3", got)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, args := range r.args {
+		if len(args) > 0 && args[0] == "inspect" {
+			t.Fatalf("unexpected container inspect during ForLog Run: %v", r.args)
+		}
 	}
 }
 

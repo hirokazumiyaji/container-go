@@ -129,10 +129,6 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 	}
-	if _, err := c.cachedInfo(ctx); err != nil {
-		_ = c.Terminate(context.WithoutCancel(ctx))
-		return nil, err
-	}
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			_ = c.Terminate(context.WithoutCancel(ctx))

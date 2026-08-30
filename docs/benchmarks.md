@@ -119,3 +119,32 @@ initialization, and parallel starts stay port-contention-free. The
 remaining per-call spawn cost is what #19 and #20 attack; whether the
 Docker backend needs a direct Engine API client (#22) is judged from
 these numbers.
+
+## #22 decision (2026-08-30): defer Engine API client
+
+Spike on the same machine (Docker Desktop unix socket
+`/var/run/docker.sock`, 30 warm iterations, median):
+
+| Call | CLI median | Engine API median | Speedup |
+| ---- | ---------- | ----------------- | ------- |
+| version / `/version` | 26.3ms | 3.3ms | ~8× |
+| `ps -q` / `/containers/json` | 23.1ms | 1.5ms | ~15× |
+| `/_ping` | — | 0.9ms | — |
+
+Per-call API latency clears the “≥5× vs CLI” bar from #22. End-to-end
+warm `Run` is already faster than testcontainers-go on this baseline
+(149ms vs 335ms for a single ready container), and container-go still
+avoids Ryuk session init.
+
+**Decision:** do not land a stdlib Docker Engine API transport yet.
+Issue #22’s go/no-go gate was “CLI path cannot reach testcontainers-go
+on the #17 harness”; that gate is not met. Prefer finishing spawn
+reduction (#19, #20) and shared reuse (#21) first. Revisit the API
+client if multi-package CI wall-clock is still CLI-bound after those
+land, or if a future baseline shows warm single `Run` falling behind
+testcontainers-go again.
+
+If revisited, follow the #22 design note: `CONTAINERGO_DOCKER_MODE=auto|api|cli`,
+hot-path only (create/start/inspect/rm/ps/exec/logs), pull/auth stay on
+the CLI, and transport choice is fixed at engine init (no per-operation
+fallback).

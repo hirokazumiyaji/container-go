@@ -45,8 +45,22 @@ Go 1.27 以上が必要です。
 ## インストール
 
 ```
-go get github.com/hirokazumiyaji/container-go
+go get github.com/hirokazumiyaji/container-go@v0.2.0
 ```
+
+## API の安定性
+
+1.0 未満では、マイナーリリース(0.x)に破壊的変更が含まれる場合があります。
+再現可能なビルドにはモジュールバージョンを明示的に pin してください
+(`go get ...@v0.2.0`)。
+
+ルートの `container` パッケージ(`Run`、オプション、ライフサイクルヘルパー)が
+主な統合面で、マイナーシリーズ内では比較的安定を目指します。`wait`
+パッケージも公開 API ですが、カスタム戦略向けのインターフェース —
+特に [`wait.Target`](wait/wait.go) — はバックエンドやプローブ要件の変化に
+応じて変更される可能性があります。可能なら組み込み戦略を使ってください。
+
+リリースノートは [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
 ## 接続エンドポイント
 
@@ -187,6 +201,9 @@ make integration-docker  # Docker バックエンドの統合テストのみ
 
 設計ドキュメント: [docs/design.md](docs/design.md)(日本語版:
 [docs/design.ja.md](docs/design.ja.md))
+
+コントリビューション: [CONTRIBUTING.md](CONTRIBUTING.md)。セキュリティ報告:
+[SECURITY.md](SECURITY.md)。
 
 ## ライセンス
 

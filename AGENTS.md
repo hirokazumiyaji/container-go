@@ -25,7 +25,7 @@ Add focused regression tests beside changed code. Unit tests should use the repo
 
 ## Commits and Pull Requests
 
-Use concise, imperative commit subjects such as `Add ...`, `Extract ...`, or `docs: ...`. The current repository convention is to include `[skip ci]` while CI billing is unavailable; follow maintainer direction if that policy changes. PRs should explain the behavior change, identify affected backends or platforms, link related issues when applicable, and list the verification commands run.
+Use concise, imperative commit subjects such as `Add ...`, `Extract ...`, or `docs: ...`. PRs should explain the behavior change, identify affected backends or platforms, link related issues when applicable, and list the verification commands run.
 
 ## Security and Configuration
 

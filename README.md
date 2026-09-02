@@ -45,8 +45,22 @@ Go 1.27+ is required.
 ## Installation
 
 ```
-go get github.com/hirokazumiyaji/container-go
+go get github.com/hirokazumiyaji/container-go@v0.2.0
 ```
+
+## API stability
+
+Pre-1.0: minor releases (0.x) may include breaking API changes. Pin an
+explicit module version (`go get ...@v0.2.0`) for reproducible builds.
+
+The root `container` package (`Run`, options, lifecycle helpers) is the
+primary integration surface and is kept reasonably stable within a minor
+series. The `wait` package is also public, but interfaces intended for
+custom strategies — especially [`wait.Target`](wait/wait.go) — may evolve
+as backends and probing needs change; prefer the built-in strategies when
+possible.
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Connection endpoints
 
@@ -208,6 +222,9 @@ make integration-docker  # Docker-backend integration tests only
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md))
+
+Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
+[SECURITY.md](SECURITY.md).
 
 ## License
 

@@ -1,6 +1,6 @@
 module github.com/hirokazumiyaji/container-go/bench
 
-go 1.27.0
+go 1.23.0
 
 require (
 	github.com/hirokazumiyaji/container-go v0.0.0

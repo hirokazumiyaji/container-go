@@ -3,7 +3,7 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.27
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
 
 ## Purpose
 

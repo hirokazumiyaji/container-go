@@ -25,7 +25,7 @@ Add focused regression tests beside changed code. Unit tests should use the repo
 
 ## Commits and Pull Requests
 
-Use concise, imperative commit subjects such as `Add ...`, `Extract ...`, or `docs: ...`. Include `[skip ci]` on commits to avoid automatic CI runs and conserve Actions minutes; run CI manually from the Actions tab via the **CI** workflow's **Run workflow** button (`workflow_dispatch`). PRs should explain the behavior change, identify affected backends or platforms, link related issues when applicable, and list the verification commands run.
+Use concise, imperative commit subjects such as `Add ...`, `Extract ...`, or `docs: ...`. PRs should explain the behavior change, identify affected backends or platforms, link related issues when applicable, and list the verification commands run.
 
 ## Security and Configuration
 

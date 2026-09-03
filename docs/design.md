@@ -30,15 +30,15 @@ Three constraints shape the design.
 ## Apple Container facts the design relies on
 
 The design decisions below rest on these properties of Apple Container
-(as of v1.2.2).
+(verified against v1.2.x–1.3.x; fixtures cover 1.2.2 and 1.3.0).
 
 - Host requirement: macOS 26 or later on Apple Silicon.
 - Each container boots as a lightweight VM with a real IP on a vmnet
   bridge (default network `default`, `192.168.64.0/24`). The host can
   reach that IP directly, so port publishing (`--publish`) is optional.
-- Everything is operable through the `container` CLI. Query commands
-  (list, inspect, …) emit machine-readable output with
-  `--format json`.
+- Everything is operable through the `container` CLI. `ls --format json`
+  and `inspect` emit machine-readable JSON (additive fields are ignored
+  by `internal/inspect`).
 - The CLI talks XPC to `container-apiserver` under launchd. Commands
   fail while the service is down; `container system status` reports
   its state.
@@ -52,6 +52,10 @@ The design decisions below rest on these properties of Apple Container
   Docker/OCI-style keys.
 - `container cp` only works on running containers.
 - `--rm` removal leaves anonymous volumes behind.
+- Error classification depends on CLI stderr substrings owned by
+  `engine_apple.go` (name conflict, image/container missing). Those
+  matchers are regression-tested against a live CLI in
+  `cli_compat_integration_test.go`.
 
 ## Choosing the implementation strategy
 

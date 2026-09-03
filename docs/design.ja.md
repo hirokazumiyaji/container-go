@@ -21,17 +21,18 @@ Go のテストコードから使い捨てのコンテナを起動し、接続�
 
 ## 前提とする Apple Container の仕様
 
-設計の根拠となる Apple Container(v1.2.2 時点)の仕様を先に整理する。
+設計の根拠となる Apple Container(v1.2.x–1.3.x で確認。フィクスチャは 1.2.2 と 1.3.0)の仕様を先に整理する。
 
 - ホスト要件は macOS 26 以降かつ Apple Silicon である。
 - 各コンテナは軽量 VM として起動し、vmnet ブリッジ(既定は `default`、`192.168.64.0/24`)上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開(`--publish`)は必須ではない。
-- すべての操作は `container` CLI から行える。list や inspect などの照会系コマンドは `--format json` で機械可読な出力を返す。
+- すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返す(追加フィールドは `internal/inspect` が無視する)。
 - CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗する。起動状態は `container system status` で確認できる。
 - コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない。
 - Docker にある次の機能が存在しない：ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチ。これらに相当する挙動はクライアント側で実装する必要がある。
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。
 - `--rm` で削除しても匿名ボリュームは残る。
+- エラー分類は `engine_apple.go` が持つ CLI stderr 部分文字列に依存する(名前衝突、image/container missing)。ライブ CLI に対する回帰は `cli_compat_integration_test.go` で確認する。
 
 ## 実現方式の選定
 

@@ -14,6 +14,23 @@ import (
 // appleEngine drives Apple Container's `container` CLI.
 type appleEngine struct{}
 
+// Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
+// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Sources (apple/container):
+//   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,
+//     message: "container with id \(id) already exists")
+//   - image missing / container missing: ContainerizationError(.notFound)
+//     surfaces as "image not found: …" / "container not found: …"
+const (
+	appleStderrAlready    = "already"
+	appleStderrExist      = "exist"
+	appleStderrInUse      = "in use"
+	appleStderrTaken      = "taken"
+	appleStderrNotFound   = "not found"
+	appleStderrNoSuchObj  = "no such object"    // defensive; not observed on 1.3.0
+	appleStderrNoSuchCtr  = "no such container" // defensive; not observed on 1.3.0
+)
+
 func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
@@ -159,11 +176,9 @@ func (appleEngine) pullImageArgs(image string) []string {
 	return []string{"image", "pull", image}
 }
 
-// imageMissing matches the CLI's error for an absent image; the images
-// plugin reports ContainerizationError(.notFound).
+// imageMissing matches the CLI's error for an absent image.
 func (appleEngine) imageMissing(err error) bool {
-	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && strings.Contains(strings.ToLower(cliErr.Stderr), "not found")
+	return appleStderrContains(err, appleStderrNotFound)
 }
 
 func (appleEngine) parseImageExists(data []byte) bool {
@@ -194,11 +209,36 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 
 // nameConflict matches Apple Container's duplicate-name wording.
 func (appleEngine) nameConflict(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	s, ok := appleCLIStderr(err)
+	if !ok {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	return strings.Contains(s, "already") &&
-		(strings.Contains(s, "exist") || strings.Contains(s, "in use") || strings.Contains(s, "taken"))
+	return strings.Contains(s, appleStderrAlready) &&
+		(strings.Contains(s, appleStderrExist) ||
+			strings.Contains(s, appleStderrInUse) ||
+			strings.Contains(s, appleStderrTaken))
+}
+
+// containerMissing matches a CLI failure for an absent container.
+func (appleEngine) containerMissing(err error) bool {
+	s, ok := appleCLIStderr(err)
+	if !ok {
+		return false
+	}
+	return strings.Contains(s, appleStderrNotFound) ||
+		strings.Contains(s, appleStderrNoSuchObj) ||
+		strings.Contains(s, appleStderrNoSuchCtr)
+}
+
+func appleCLIStderr(err error) (string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return "", false
+	}
+	return strings.ToLower(cliErr.Stderr), true
+}
+
+func appleStderrContains(err error, substr string) bool {
+	s, ok := appleCLIStderr(err)
+	return ok && strings.Contains(s, substr)
 }

@@ -2,7 +2,6 @@ package container
 
 import (
 	"errors"
-	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -21,14 +20,7 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 var ErrImageNotFound = errors.New("image not found in local store")
 
 // isNotFound reports whether a CLI failure means the container does not
-// exist.
+// exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return false
-	}
-	s := strings.ToLower(cliErr.Stderr)
-	return strings.Contains(s, "not found") ||
-		strings.Contains(s, "no such object") ||
-		strings.Contains(s, "no such container")
+	return appleEngine{}.containerMissing(err) || dockerEngine{}.containerMissing(err)
 }

@@ -42,6 +42,18 @@ macOS で Docker(Docker Desktop など)を使う場合は
 
 Go 1.23 以上が必要です。
 
+動作確認済みバックエンド(本ライブラリがマッチする CLI stderr 文言と
+inspect JSON 形状):
+
+| バックエンド | 確認済みバージョン |
+|---|---|
+| Apple Container | 1.2.x–1.3.x |
+| Docker Engine / CLI | 29.x |
+
+新しい CLI ではエラー文言や JSON フィールドが変わる可能性があります。
+`engine_apple.go` / `engine_docker.go` 先頭の stderr マッチャと、
+`internal/inspect/testdata/`・`testdata/` のフィクスチャを参照してください。
+
 ## インストール
 
 ```

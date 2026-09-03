@@ -42,6 +42,18 @@ auth are handled by the docker CLI itself.
 
 Go 1.23+ is required.
 
+Verified backends (CLI stderr wording and inspect JSON shapes this library
+matches against):
+
+| Backend | Verified versions |
+|---|---|
+| Apple Container | 1.2.x–1.3.x |
+| Docker Engine / CLI | 29.x |
+
+Newer CLI releases may change error text or JSON fields; see the stderr
+matchers at the top of `engine_apple.go` / `engine_docker.go` and the
+fixtures under `internal/inspect/testdata/` and `testdata/`.
+
 ## Installation
 
 ```

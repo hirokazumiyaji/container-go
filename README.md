@@ -85,6 +85,10 @@ this library uses that IP:
 - No host ports are consumed, so parallel tests never conflict over
   ports.
 
+Prefer `Endpoint` (or `MappedPort` with a known host) when you care
+about a specific published port: `Host` reports only the first published
+binding's address when several publish host-IPs differ.
+
 **Docker backend**: the container IP is generally not reachable from
 the host (Docker Desktop), so ports declared via `WithExposedPorts` are
 automatically published to daemon-assigned loopback ports — the classic

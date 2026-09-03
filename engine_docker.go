@@ -216,13 +216,7 @@ func (dockerEngine) listArgs() []string {
 }
 
 func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	var ids []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			ids = append(ids, line)
-		}
-	}
-	return ids, nil
+	return splitNonEmptyLines(data), nil
 }
 
 func (dockerEngine) imageInspectArgs(image string) []string {
@@ -255,13 +249,7 @@ func (dockerEngine) listReuseGroupArgs(group string) []string {
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	var ids []string
-	for _, line := range strings.Split(string(data), "\n") {
-		if line = strings.TrimSpace(line); line != "" {
-			ids = append(ids, line)
-		}
-	}
-	return ids, nil
+	return splitNonEmptyLines(data), nil
 }
 
 // nameConflict matches Docker's duplicate container name error.

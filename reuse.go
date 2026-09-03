@@ -59,18 +59,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 // without per-caller wait or port compatibility checks. Those run in
 // reuseRun so every concurrent caller applies its own configuration.
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
-	deadline := time.Now().Add(reuseAttachTimeout)
-	if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
-		deadline = d
-	}
 	recreated := false
 
 	for {
 		if err := ctx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
+			}
 			return nil, err
-		}
-		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
@@ -183,23 +179,21 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 }
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := cfg.runner.Run(qCtx, cfg.eng.inspectArgs(id)...)
-	if err != nil {
-		return nil, cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-	}
-	return cfg.eng.parseInspect(stdout, id)
+	return namedContainer(cfg, id).inspectFresh(ctx)
 }
 
 func deleteNamed(ctx context.Context, cfg *config, id string) error {
-	dCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	_, _, err := cfg.runner.Run(dCtx, cfg.eng.deleteArgs(id)...)
-	if err == nil || isNotFound(err) {
-		return nil
+	return namedContainer(cfg, id).Terminate(ctx)
+}
+
+func namedContainer(cfg *config, id string) *Container {
+	return &Container{
+		id:        id,
+		runner:    cfg.runner,
+		eng:       cfg.eng,
+		exposed:   cfg.exposed,
+		published: cfg.published,
 	}
-	return cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted
@@ -323,31 +317,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := r.Run(qCtx, eng.listReuseGroupArgs(group)...)
-	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
-	}
-	ids, err := eng.parseReuseGroupIDs(stdout, group)
-	if err != nil {
-		return nil, err
-	}
-
-	var removed []string
-	var errs []error
-	for _, id := range ids {
-		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
-		dCancel()
-		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("prune reuse group %s: %s: %w", group, id, err))
-			continue
-		}
-		removed = append(removed, id)
-	}
-	if len(errs) > 0 {
-		return removed, errors.Join(errs...)
-	}
-	return removed, nil
+	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+		return eng.parseReuseGroupIDs(data, group)
+	}, "prune reuse group "+group)
 }

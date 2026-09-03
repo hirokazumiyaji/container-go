@@ -289,10 +289,13 @@ func WithCPUs(n int) Option {
 	}
 }
 
+// memoryRE accepts sizes like "512M" or "1G".
+var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
+
 // WithMemory sets the VM memory size, e.g. "512M" or "1G".
 func WithMemory(size string) Option {
 	return func(c *config) error {
-		if !regexp.MustCompile(`^[0-9]+[KMGTP]?$`).MatchString(size) {
+		if !memoryRE.MatchString(size) {
 			return fmt.Errorf("invalid memory size %q", size)
 		}
 		c.memory = size

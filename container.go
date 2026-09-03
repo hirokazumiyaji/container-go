@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -240,7 +241,10 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	return info.ip, nil
 }
 
-// Host returns the address clients should connect to.
+// Host returns the address clients should connect to. When multiple
+// published ports use different host IPs, prefer Endpoint for the
+// specific port — Host returns only the first published binding's
+// address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
 	if len(c.published) > 0 {
 		return c.published[0].connectAddr(), nil
@@ -353,4 +357,15 @@ func sortedKeys[V any](m map[string]V) []string {
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// splitNonEmptyLines splits CLI stdout on newlines and drops blank lines.
+func splitNonEmptyLines(data []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
 }

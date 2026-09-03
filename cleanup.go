@@ -48,13 +48,19 @@ func Prune(ctx context.Context) ([]string, error) {
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {
+	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
+}
+
+// pruneListed lists containers with listArgs, parses IDs, and force-deletes
+// each one. errKind prefixes per-ID delete failures ("prune", …).
+func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, eng.listArgs()...)
+	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
 		return nil, cli.Classify(ctx, r, err, eng.probe())
 	}
-	ids, err := eng.parseStoppedManaged(stdout)
+	ids, err := parse(stdout)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +72,7 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
 		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("prune %s: %w", id, err))
+			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
 			continue
 		}
 		removed = append(removed, id)

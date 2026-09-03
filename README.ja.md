@@ -84,6 +84,10 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
   はその組み合わせを返します。
 - ホストポートを消費しないため、並列テストがポールで衝突しません。
 
+特定の publish ポートを使うときは `Endpoint`(または既知ホスト +
+`MappedPort`)を優先してください。複数 publish の host-IP が異なる場合、
+`Host` は先頭の publish のアドレスだけを返します。
+
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
 ループバックのランダムポートへ自動公開されます(testcontainers と同じ

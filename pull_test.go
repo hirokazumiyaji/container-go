@@ -180,7 +180,7 @@ const testImageInspectJSON = `[
 ]`
 
 func TestFlightGroupAggregatesConcurrentCallers(t *testing.T) {
-	var g flightGroup
+	var g flightGroup[struct{}]
 	var calls int
 	var mu sync.Mutex
 	const n = 50
@@ -188,7 +188,7 @@ func TestFlightGroupAggregatesConcurrentCallers(t *testing.T) {
 	entered := make(chan struct{})
 	release := make(chan struct{})
 	go func() {
-		_ = g.do(context.Background(), "key", func() error {
+		_ = doErr(context.Background(), &g, "key", func() error {
 			mu.Lock()
 			calls++
 			mu.Unlock()
@@ -208,7 +208,7 @@ func TestFlightGroupAggregatesConcurrentCallers(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if err := g.do(context.Background(), "key", func() error { return nil }); err != nil {
+			if err := doErr(context.Background(), &g, "key", func() error { return nil }); err != nil {
 				t.Errorf("do: %v", err)
 			}
 		}()
@@ -230,12 +230,12 @@ func TestFlightGroupLateCallersReexecuteAfterCompletion(t *testing.T) {
 	// A caller arriving after a flight completed re-runs fn: for the
 	// image flows that means a fresh existence check instead of a
 	// stale result.
-	var g flightGroup
-	if err := g.do(context.Background(), "key", func() error { return nil }); err != nil {
+	var g flightGroup[struct{}]
+	if err := doErr(context.Background(), &g, "key", func() error { return nil }); err != nil {
 		t.Fatalf("first: %v", err)
 	}
 	executed := false
-	if err := g.do(context.Background(), "key", func() error {
+	if err := doErr(context.Background(), &g, "key", func() error {
 		executed = true
 		return nil
 	}); err != nil {
@@ -247,8 +247,8 @@ func TestFlightGroupLateCallersReexecuteAfterCompletion(t *testing.T) {
 }
 
 func TestFlightGroupPropagatesErrorToWaitersAndRetries(t *testing.T) {
-	var g flightGroup
-	first := g.do(context.Background(), "key", func() error {
+	var g flightGroup[struct{}]
+	first := doErr(context.Background(), &g, "key", func() error {
 		return fmt.Errorf("boom")
 	})
 	if first == nil || first.Error() != "boom" {
@@ -256,19 +256,19 @@ func TestFlightGroupPropagatesErrorToWaitersAndRetries(t *testing.T) {
 	}
 	// A completed failed flight must not be reused; the next call
 	// executes again.
-	second := g.do(context.Background(), "key", func() error { return nil })
+	second := doErr(context.Background(), &g, "key", func() error { return nil })
 	if second != nil {
 		t.Fatalf("second error = %v, want nil", second)
 	}
 }
 
 func TestFlightGroupCancelledWaiterDoesNotAffectLeader(t *testing.T) {
-	var g flightGroup
+	var g flightGroup[struct{}]
 	release := make(chan struct{})
 	started := make(chan struct{})
 	leaderDone := make(chan error, 1)
 	go func() {
-		leaderDone <- g.do(context.Background(), "key", func() error {
+		leaderDone <- doErr(context.Background(), &g, "key", func() error {
 			close(started)
 			<-release
 			return nil
@@ -278,7 +278,7 @@ func TestFlightGroupCancelledWaiterDoesNotAffectLeader(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if err := g.do(ctx, "key", func() error { return nil }); !errors.Is(err, context.Canceled) {
+	if err := doErr(ctx, &g, "key", func() error { return nil }); !errors.Is(err, context.Canceled) {
 		t.Errorf("waiter error = %v, want context.Canceled", err)
 	}
 	close(release)
@@ -288,14 +288,14 @@ func TestFlightGroupCancelledWaiterDoesNotAffectLeader(t *testing.T) {
 }
 
 func TestFlightGroupCancelledLeaderDoesNotAffectWaiters(t *testing.T) {
-	var g flightGroup
+	var g flightGroup[struct{}]
 	release := make(chan struct{})
 	started := make(chan struct{})
 
 	leaderCtx, leaderCancel := context.WithCancel(context.Background())
 	leaderDone := make(chan error, 1)
 	go func() {
-		leaderDone <- g.do(leaderCtx, "key", func() error {
+		leaderDone <- doErr(leaderCtx, &g, "key", func() error {
 			close(started)
 			<-release
 			return nil
@@ -305,7 +305,7 @@ func TestFlightGroupCancelledLeaderDoesNotAffectWaiters(t *testing.T) {
 
 	waiterDone := make(chan error, 1)
 	go func() {
-		waiterDone <- g.do(context.Background(), "key", func() error {
+		waiterDone <- doErr(context.Background(), &g, "key", func() error {
 			t.Error("waiter must not execute fn")
 			return nil
 		})

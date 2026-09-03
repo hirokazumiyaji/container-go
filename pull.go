@@ -3,7 +3,6 @@ package container
 import (
 	"context"
 	"fmt"
-	"sync"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -55,7 +54,7 @@ func Pull(ctx context.Context, image string) error {
 		return err
 	}
 	r := &cli.ExecRunner{Binary: eng.binary()}
-	return imageFlights.do(ctx, flightKey(eng, image, flightPull), func() error {
+	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
 		_, _, err := r.Run(execCtx, eng.pullImageArgs(image)...)
@@ -75,55 +74,7 @@ func flightKey(eng engine, image, op string) string {
 // imageFlights aggregates concurrent image fetches across the process.
 // Entries are always removed on completion, so a failed pull is
 // retried on the next call.
-var imageFlights flightGroup
-
-// flightGroup collapses concurrent calls with the same key into one
-// execution: the first caller starts fn on a detached context, later
-// callers wait for its result. Any caller's cancelled context returns
-// without disturbing the execution or the other waiters.
-type flightGroup struct {
-	mu       sync.Mutex
-	inflight map[string]*flight
-}
-
-type flight struct {
-	done chan struct{}
-	err  error
-}
-
-func (g *flightGroup) do(ctx context.Context, key string, fn func() error) error {
-	g.mu.Lock()
-	if g.inflight == nil {
-		g.inflight = map[string]*flight{}
-	}
-	if f, ok := g.inflight[key]; ok {
-		g.mu.Unlock()
-		return g.wait(ctx, f)
-	}
-	f := &flight{done: make(chan struct{})}
-	g.inflight[key] = f
-	g.mu.Unlock()
-
-	go func() {
-		f.err = fn()
-		close(f.done)
-
-		g.mu.Lock()
-		delete(g.inflight, key)
-		g.mu.Unlock()
-	}()
-
-	return g.wait(ctx, f)
-}
-
-func (g *flightGroup) wait(ctx context.Context, f *flight) error {
-	select {
-	case <-f.done:
-		return f.err
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
+var imageFlights flightGroup[struct{}]
 
 // ensureImage brings the image into the backend's local store according
 // to the pull policy. It runs once per concurrent set of Runs sharing
@@ -141,13 +92,13 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 		}
 		return nil
 	case PullAlways:
-		return imageFlights.do(ctx, flightKey(c.eng, image, flightPull), func() error {
+		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
 			return pullImage(execCtx, c.runner, c.eng, image)
 		})
 	default:
-		return imageFlights.do(ctx, flightKey(c.eng, image, flightMissing), func() error {
+		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
 			exists, err := imageExists(execCtx, c.runner, c.eng, image)

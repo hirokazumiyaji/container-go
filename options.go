@@ -65,6 +65,53 @@ func (c *config) allLabels() map[string]string {
 	return labels
 }
 
+// commonRunArgs builds the shared run flags after --name: labels,
+// env-file, publish (explicit then extras), mounts, resources,
+// entrypoint, image, and cmd. Engines supply only their prefix and any
+// backend-specific publish entries (Docker auto-publish).
+func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []string {
+	var args []string
+	labels := c.allLabels()
+	for _, k := range sortedKeys(labels) {
+		args = append(args, "--label", k+"="+labels[k])
+	}
+	if envFile != "" {
+		args = append(args, "--env-file", envFile)
+	}
+	for _, p := range c.published {
+		args = append(args, "--publish", p.raw)
+	}
+	for _, raw := range extraPublish {
+		args = append(args, "--publish", raw)
+	}
+	for _, m := range c.mounts {
+		args = append(args, "--mount", m.arg())
+	}
+	if c.cpus > 0 {
+		args = append(args, "--cpus", strconv.Itoa(c.cpus))
+	}
+	if c.memory != "" {
+		args = append(args, "--memory", c.memory)
+	}
+	if c.user != "" {
+		args = append(args, "--user", c.user)
+	}
+	if c.workdir != "" {
+		args = append(args, "--workdir", c.workdir)
+	}
+	if c.network != "" {
+		args = append(args, "--network", c.network)
+	}
+	if c.platform != "" {
+		args = append(args, "--platform", c.platform)
+	}
+	if c.entrypoint != "" {
+		args = append(args, "--entrypoint", c.entrypoint)
+	}
+	args = append(args, image)
+	return append(args, c.cmd...)
+}
+
 // WithReuse enables process- and cross-process get-or-create for a
 // stable WithName. Concurrent Run calls with the same name share one
 // container; readiness strategies always re-run against it. Returned

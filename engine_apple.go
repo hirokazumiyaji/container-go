@@ -43,41 +43,7 @@ func (appleEngine) probe() cli.Probe {
 
 func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 	args := []string{"run", "--detach", "--name", cfg.name}
-	for _, k := range sortedKeys(cfg.allLabels()) {
-		args = append(args, "--label", k+"="+cfg.allLabels()[k])
-	}
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
-	}
-	for _, p := range cfg.published {
-		args = append(args, "--publish", p.raw)
-	}
-	for _, m := range cfg.mounts {
-		args = append(args, "--mount", m.arg())
-	}
-	if cfg.cpus > 0 {
-		args = append(args, "--cpus", strconv.Itoa(cfg.cpus))
-	}
-	if cfg.memory != "" {
-		args = append(args, "--memory", cfg.memory)
-	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	if cfg.network != "" {
-		args = append(args, "--network", cfg.network)
-	}
-	if cfg.platform != "" {
-		args = append(args, "--platform", cfg.platform)
-	}
-	if cfg.entrypoint != "" {
-		args = append(args, "--entrypoint", cfg.entrypoint)
-	}
-	args = append(args, image)
-	return append(args, cfg.cmd...)
+	return append(args, cfg.commonRunArgs(image, envFile, nil)...)
 }
 
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }

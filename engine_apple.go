@@ -90,6 +90,14 @@ func (appleEngine) deleteArgs(id string) []string {
 	return []string{"delete", "--force", id}
 }
 
+func (appleEngine) copyToArgs(id, hostPath, containerPath string) []string {
+	return []string{"cp", hostPath, id + ":" + containerPath}
+}
+
+func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
+	return []string{"cp", id + ":" + containerPath, hostPath}
+}
+
 func (appleEngine) reaperSubcommand() string { return "delete" }
 
 func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {

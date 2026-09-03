@@ -180,6 +180,14 @@ func (dockerEngine) deleteArgs(id string) []string {
 	return []string{"rm", "--force", id}
 }
 
+func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
+	return []string{"cp", hostPath, id + ":" + containerPath}
+}
+
+func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
+	return []string{"cp", id + ":" + containerPath, hostPath}
+}
+
 func (dockerEngine) reaperSubcommand() string { return "rm" }
 
 func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {

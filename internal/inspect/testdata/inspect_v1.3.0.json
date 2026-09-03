@@ -1,0 +1,92 @@
+[
+  {
+    "configuration": {
+      "capAdd": [],
+      "capDrop": [],
+      "creationDate": "2026-09-03T01:05:45Z",
+      "dns": {
+        "nameservers": [],
+        "options": [],
+        "searchDomains": []
+      },
+      "id": "containergo-1a2b3c4d",
+      "image": {
+        "descriptor": {
+          "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+          "mediaType": "application/vnd.oci.image.index.v1+json",
+          "size": 1234
+        },
+        "reference": "docker.io/library/redis:7-alpine"
+      },
+      "initProcess": {
+        "arguments": [
+          "redis-server"
+        ],
+        "environment": [
+          "REDIS_VERSION=7.4.11",
+          "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+        ],
+        "executable": "docker-entrypoint.sh",
+        "rlimits": [],
+        "supplementalGroups": [],
+        "terminal": false,
+        "user": {
+          "id": {
+            "gid": 0,
+            "uid": 0
+          }
+        },
+        "workingDirectory": "/data"
+      },
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": "f00dcafe"
+      },
+      "mounts": [],
+      "networks": [
+        {
+          "network": "default",
+          "options": {
+            "hostname": "containergo-insp-25071",
+            "mtu": 1280
+          }
+        }
+      ],
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux"
+      },
+      "publishedPorts": [],
+      "publishedSockets": [],
+      "readOnly": false,
+      "resources": {
+        "cpuOverhead": 1,
+        "cpus": 4,
+        "memoryInBytes": 1073741824
+      },
+      "rosetta": false,
+      "runtimeHandler": "container-runtime-linux",
+      "ssh": false,
+      "sysctls": {},
+      "useInit": false,
+      "virtualization": false
+    },
+    "id": "containergo-1a2b3c4d",
+    "status": {
+      "networks": [
+        {
+          "hostname": "containergo-1a2b3c4d",
+          "ipv4Address": "192.168.64.3/24",
+          "ipv4Gateway": "192.168.64.1",
+          "ipv6Address": "fd6d:1f99:45da:2c69:fc30:2eff:fe09:599c/64",
+          "macAddress": "fe:30:2e:09:59:9c",
+          "mtu": 1280,
+          "network": "default",
+          "variant": "reserved"
+        }
+      ],
+      "startedDate": "2026-09-03T01:05:46Z",
+      "state": "running"
+    }
+  }
+]

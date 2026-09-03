@@ -19,6 +19,23 @@ import (
 // ports and endpoints resolve to those.
 type dockerEngine struct{}
 
+// Verified against Docker Engine / CLI 29.x (local: 29.7.2).
+// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Observed wording:
+//   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
+//   - image missing: "Error response from daemon: No such image: …"
+//   - container missing: "error: no such object: …" (also historically
+//     "No such container" / "not found")
+const (
+	dockerStderrConflict     = "conflict"
+	dockerStderrAlreadyInUse = "already in use"
+	dockerStderrName         = "name"
+	dockerStderrNoSuchImage  = "no such image"
+	dockerStderrNotFound     = "not found"
+	dockerStderrNoSuchObj    = "no such object"
+	dockerStderrNoSuchCtr    = "no such container"
+)
+
 func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
@@ -252,8 +269,7 @@ func (dockerEngine) pullImageArgs(image string) []string {
 
 // imageMissing matches the daemon's response for an absent image.
 func (dockerEngine) imageMissing(err error) bool {
-	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && strings.Contains(strings.ToLower(cliErr.Stderr), "no such image")
+	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
 func (dockerEngine) parseImageExists(data []byte) bool {
@@ -284,11 +300,34 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	s, ok := dockerCLIStderr(err)
+	if !ok {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	return strings.Contains(s, "conflict") ||
-		(strings.Contains(s, "already in use") && strings.Contains(s, "name"))
+	return strings.Contains(s, dockerStderrConflict) ||
+		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
+}
+
+// containerMissing matches a CLI failure for an absent container.
+func (dockerEngine) containerMissing(err error) bool {
+	s, ok := dockerCLIStderr(err)
+	if !ok {
+		return false
+	}
+	return strings.Contains(s, dockerStderrNotFound) ||
+		strings.Contains(s, dockerStderrNoSuchObj) ||
+		strings.Contains(s, dockerStderrNoSuchCtr)
+}
+
+func dockerCLIStderr(err error) (string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return "", false
+	}
+	return strings.ToLower(cliErr.Stderr), true
+}
+
+func dockerStderrContains(err error, substr string) bool {
+	s, ok := dockerCLIStderr(err)
+	return ok && strings.Contains(s, substr)
 }

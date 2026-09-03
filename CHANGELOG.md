@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
+  versions; centralize stderr matchers on each engine with source comments;
+  add live CLI compatibility integration tests; add Apple inspect fixture
+  for 1.3.0.
+
 ## [0.2.0] - 2026-09-02
 
 First tagged release. Covers the Apple Container backend (v0.1 development)

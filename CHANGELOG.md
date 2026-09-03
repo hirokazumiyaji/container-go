@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
+- Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`
+  in `flight.go`.
 
 ## [0.2.0] - 2026-09-02
 

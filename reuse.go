@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -15,55 +14,7 @@ import (
 // reuseFlights collapses concurrent WithReuse get-or-create calls that
 // share a name into one ensure operation. Each caller still applies its
 // own compatibility check and wait strategy afterward.
-var reuseFlights reuseFlightGroup
-
-type reuseFlightGroup struct {
-	mu       sync.Mutex
-	inflight map[string]*reuseFlight
-}
-
-type reuseFlight struct {
-	done chan struct{}
-	ctr  *Container
-	err  error
-}
-
-func (g *reuseFlightGroup) do(ctx context.Context, key string, fn func() (*Container, error)) (*Container, error) {
-	g.mu.Lock()
-	if g.inflight == nil {
-		g.inflight = map[string]*reuseFlight{}
-	}
-	if f, ok := g.inflight[key]; ok {
-		g.mu.Unlock()
-		return g.wait(ctx, f)
-	}
-	f := &reuseFlight{done: make(chan struct{})}
-	g.inflight[key] = f
-	g.mu.Unlock()
-
-	go func() {
-		f.ctr, f.err = fn()
-		close(f.done)
-
-		g.mu.Lock()
-		delete(g.inflight, key)
-		g.mu.Unlock()
-	}()
-
-	return g.wait(ctx, f)
-}
-
-func (g *reuseFlightGroup) wait(ctx context.Context, f *reuseFlight) (*Container, error) {
-	select {
-	case <-f.done:
-		if f.err != nil {
-			return nil, f.err
-		}
-		return f.ctr, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
-}
+var reuseFlights flightGroup[*Container]
 
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name

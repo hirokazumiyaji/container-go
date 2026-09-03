@@ -64,18 +64,9 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// The pull policy fetches the image beforehand; --pull=never keeps
 	// the run command from pulling a second time behind our back.
 	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
-	labels := cfg.allLabels()
-	for _, k := range sortedKeys(labels) {
-		args = append(args, "--label", k+"="+labels[k])
-	}
-	if envFile != "" {
-		args = append(args, "--env-file", envFile)
-	}
-	for _, p := range cfg.published {
-		args = append(args, "--publish", p.raw)
-	}
 	// Publish every declared port the user did not publish explicitly
 	// to a daemon-assigned loopback port.
+	var extraPublish []string
 	for _, spec := range cfg.exposed {
 		published := false
 		for _, p := range cfg.published {
@@ -85,35 +76,10 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 			}
 		}
 		if !published {
-			args = append(args, "--publish", "127.0.0.1::"+spec.String())
+			extraPublish = append(extraPublish, "127.0.0.1::"+spec.String())
 		}
 	}
-	for _, m := range cfg.mounts {
-		args = append(args, "--mount", m.arg())
-	}
-	if cfg.cpus > 0 {
-		args = append(args, "--cpus", strconv.Itoa(cfg.cpus))
-	}
-	if cfg.memory != "" {
-		args = append(args, "--memory", cfg.memory)
-	}
-	if cfg.user != "" {
-		args = append(args, "--user", cfg.user)
-	}
-	if cfg.workdir != "" {
-		args = append(args, "--workdir", cfg.workdir)
-	}
-	if cfg.network != "" {
-		args = append(args, "--network", cfg.network)
-	}
-	if cfg.platform != "" {
-		args = append(args, "--platform", cfg.platform)
-	}
-	if cfg.entrypoint != "" {
-		args = append(args, "--entrypoint", cfg.entrypoint)
-	}
-	args = append(args, image)
-	return append(args, cfg.cmd...)
+	return append(args, cfg.commonRunArgs(image, envFile, extraPublish)...)
 }
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }

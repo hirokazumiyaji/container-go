@@ -52,6 +52,9 @@ func TestExecRunnerNonZeroExitReturnsCLIError(t *testing.T) {
 	if !strings.Contains(cliErr.Error(), "inspect") {
 		t.Errorf("Error() = %q, want to contain subcommand %q", cliErr.Error(), "inspect")
 	}
+	if cliErr.Binary == "" || !strings.Contains(cliErr.Error(), cliErr.Binary) {
+		t.Errorf("Binary = %q, Error() = %q", cliErr.Binary, cliErr.Error())
+	}
 }
 
 func TestExecRunnerCapsStderr(t *testing.T) {
@@ -81,6 +84,21 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestCLIErrorIncludesBinaryName(t *testing.T) {
+	err := &CLIError{Binary: "docker", Args: []string{"run", "--detach"}, ExitCode: 125, Stderr: "conflict"}
+	got := err.Error()
+	if !strings.HasPrefix(got, "docker run --detach:") {
+		t.Errorf("Error() = %q, want docker prefix", got)
+	}
+}
+
+func TestCLIErrorDefaultsBinaryToContainer(t *testing.T) {
+	err := &CLIError{Args: []string{"inspect", "x"}, ExitCode: 1}
+	if !strings.HasPrefix(err.Error(), "container inspect x:") {
+		t.Errorf("Error() = %q", err.Error())
 	}
 }
 

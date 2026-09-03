@@ -1,5 +1,5 @@
-// Package cli executes the Apple Container CLI (`container`) and
-// classifies its failures.
+// Package cli executes a container backend CLI (`container` or `docker`)
+// as a child process and classifies its failures.
 package cli
 
 import (
@@ -27,7 +27,7 @@ type Probe struct {
 	Hint string
 }
 
-// Runner executes one `container` CLI invocation.
+// Runner executes one backend CLI invocation.
 type Runner interface {
 	Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
@@ -54,15 +54,22 @@ func (r *ExecRunner) External() bool { return true }
 // ExternalBinary reports the binary ExecRunner spawns.
 func (r *ExecRunner) ExternalBinary() string { return r.Binary }
 
-// CLIError is a non-zero exit from the `container` CLI.
+// CLIError is a non-zero exit from a backend CLI.
 type CLIError struct {
+	// Binary is the CLI executable that failed (e.g. "container" or
+	// "docker"). Empty means the historical default of "container".
+	Binary   string
 	Args     []string
 	ExitCode int
 	Stderr   string
 }
 
 func (e *CLIError) Error() string {
-	msg := fmt.Sprintf("container %s: exit code %d", strings.Join(e.Args, " "), e.ExitCode)
+	bin := e.Binary
+	if bin == "" {
+		bin = "container"
+	}
+	msg := fmt.Sprintf("%s %s: exit code %d", bin, strings.Join(e.Args, " "), e.ExitCode)
 	if e.Stderr != "" {
 		msg += ": " + strings.TrimSpace(e.Stderr)
 	}
@@ -85,7 +92,8 @@ func (r *ExecRunner) binary() string {
 }
 
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	cmd := exec.CommandContext(ctx, r.binary(), args...)
+	bin := r.binary()
+	cmd := exec.CommandContext(ctx, bin, args...)
 	var stdout bytes.Buffer
 	stderr := &boundedBuffer{max: maxStderr}
 	cmd.Stdout = &stdout
@@ -97,11 +105,12 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	err := cmd.Run()
 	if err != nil {
 		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("container %s: %w", strings.Join(args, " "), ctx.Err())
+			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return stdout.Bytes(), stderr.Bytes(), &CLIError{
+				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
 				Stderr:   stderr.String(),

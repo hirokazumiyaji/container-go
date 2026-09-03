@@ -39,6 +39,8 @@ type engine interface {
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	stopArgs(id string, timeout *time.Duration) []string
 	deleteArgs(id string) []string
+	copyToArgs(id, hostPath, containerPath string) []string
+	copyFromArgs(id, containerPath, hostPath string) []string
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	logsArgs(id string, follow bool) []string
 	listArgs() []string

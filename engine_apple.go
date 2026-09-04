@@ -22,13 +22,13 @@ type appleEngine struct{}
 //   - image missing / container missing: ContainerizationError(.notFound)
 //     surfaces as "image not found: …" / "container not found: …"
 const (
-	appleStderrAlready    = "already"
-	appleStderrExist      = "exist"
-	appleStderrInUse      = "in use"
-	appleStderrTaken      = "taken"
-	appleStderrNotFound   = "not found"
-	appleStderrNoSuchObj  = "no such object"    // defensive; not observed on 1.3.0
-	appleStderrNoSuchCtr  = "no such container" // defensive; not observed on 1.3.0
+	appleStderrAlready   = "already"
+	appleStderrExist     = "exist"
+	appleStderrInUse     = "in use"
+	appleStderrTaken     = "taken"
+	appleStderrNotFound  = "not found"
+	appleStderrNoSuchObj = "no such object"    // defensive; not observed on 1.3.0
+	appleStderrNoSuchCtr = "no such container" // defensive; not observed on 1.3.0
 )
 
 func (appleEngine) name() string   { return "apple" }

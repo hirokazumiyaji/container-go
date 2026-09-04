@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -41,13 +42,16 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 
 type processStream struct {
 	io.ReadCloser
-	cmd *exec.Cmd
+	cmd  *exec.Cmd
+	once sync.Once
 }
 
 func (s *processStream) Close() error {
-	_ = s.cmd.Process.Kill()
-	_ = s.ReadCloser.Close()
-	// Reap the child; the error is the expected kill signal.
-	_ = s.cmd.Wait()
+	s.once.Do(func() {
+		_ = s.cmd.Process.Kill()
+		_ = s.ReadCloser.Close()
+		// Reap the child; the error is the expected kill signal.
+		_ = s.cmd.Wait()
+	})
 	return nil
 }

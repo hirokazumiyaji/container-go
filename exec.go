@@ -88,7 +88,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		if cli.IsCommandExit(err) && !isNotFound(err) {
 			var cliErr *cli.CLIError
 			errors.As(err, &cliErr)
-			return cliErr.ExitCode, io.MultiReader(output, bytes.NewReader([]byte(cliErr.Stderr))), nil
+			return cliErr.ExitCode, output, nil
 		}
 		return 0, nil, c.classify(ctx, err)
 	}

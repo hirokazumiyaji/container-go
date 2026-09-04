@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"slices"
@@ -27,7 +28,12 @@ func (e *execRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 				e.envFiles = append(e.envFiles, string(data))
 			}
 		}
-		return []byte(e.execStdout), []byte("stderr-part"), e.execErr
+		stderr := []byte("stderr-part")
+		var cliErr *cli.CLIError
+		if errors.As(e.execErr, &cliErr) {
+			stderr = []byte(cliErr.Stderr)
+		}
+		return []byte(e.execStdout), stderr, e.execErr
 	}
 	return e.fakeRunner.Run(ctx, args...)
 }
@@ -62,12 +68,16 @@ func TestExecReturnsCommandExitCodeWithoutError(t *testing.T) {
 	}
 	ctr := runTestContainer(t, f)
 
-	code, _, err := ctr.Exec(context.Background(), []string{"false"})
+	code, out, err := ctr.Exec(context.Background(), []string{"false"})
 	if err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
 	if code != 7 {
 		t.Errorf("exit code = %d, want 7", code)
+	}
+	data, _ := io.ReadAll(out)
+	if string(data) != "process failed" {
+		t.Errorf("output = %q, want %q", string(data), "process failed")
 	}
 }
 

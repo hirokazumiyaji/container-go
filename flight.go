@@ -35,12 +35,13 @@ func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error
 	g.mu.Unlock()
 
 	go func() {
+		defer func() {
+			g.mu.Lock()
+			delete(g.inflight, key)
+			g.mu.Unlock()
+			close(f.done)
+		}()
 		f.val, f.err = fn()
-		close(f.done)
-
-		g.mu.Lock()
-		delete(g.inflight, key)
-		g.mu.Unlock()
 	}()
 
 	return g.wait(ctx, f)

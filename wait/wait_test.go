@@ -440,3 +440,16 @@ func TestForAnySucceedsWhenOneSucceeds(t *testing.T) {
 		t.Fatalf("WaitUntilReady: %v", err)
 	}
 }
+
+func TestForExecRejectsEmptyCommand(t *testing.T) {
+	target := newFakeTarget()
+	s := ForExec(nil).WithStartupTimeout(60 * time.Second)
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error for empty command")
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("took %v, want immediate error", elapsed)
+	}
+}

@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -12,25 +13,47 @@ import (
 func TestFlightGroupSharesExecution(t *testing.T) {
 	var g flightGroup[int]
 	var calls atomic.Int32
+	started := make(chan struct{})
 	ready := make(chan struct{})
 
-	var wg sync.WaitGroup
-	results := make([]int, 5)
-	errs := make([]error, 5)
+	const n = 5
+	var joined atomic.Int32
+	allJoined := make(chan struct{})
+	g.onJoin = func(key string) {
+		if joined.Add(1) == n-1 {
+			close(allJoined)
+		}
+	}
 
-	for i := 0; i < 5; i++ {
+	var wg sync.WaitGroup
+	results := make([]int, n)
+	errs := make([]error, n)
+
+	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
 			results[idx], errs[idx] = g.do(context.Background(), "k", func() (int, error) {
 				calls.Add(1)
+				close(started)
 				<-ready
 				return 42, nil
 			})
 		}(i)
 	}
 
-	time.Sleep(50 * time.Millisecond)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never started")
+	}
+
+	select {
+	case <-allJoined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("waiters never joined in-flight entry")
+	}
+
 	close(ready)
 	wg.Wait()
 
@@ -49,19 +72,26 @@ func TestFlightGroupSharesExecution(t *testing.T) {
 
 func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 	var g flightGroup[string]
+	started := make(chan struct{})
 	block := make(chan struct{})
 
 	ctx1, cancel1 := context.WithCancel(context.Background())
 	done1 := make(chan error, 1)
 	go func() {
 		_, err := g.do(ctx1, "key", func() (string, error) {
+			close(started)
 			<-block
 			return "done", nil
 		})
 		done1 <- err
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never started")
+	}
+
 	cancel1()
 
 	select {
@@ -73,6 +103,11 @@ func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 		t.Fatal("first caller did not unblock on cancellation")
 	}
 
+	joined := make(chan struct{})
+	g.onJoin = func(key string) {
+		close(joined)
+	}
+
 	done2 := make(chan string, 1)
 	go func() {
 		val, _ := g.do(context.Background(), "key", func() (string, error) {
@@ -81,7 +116,12 @@ func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 		done2 <- val
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	select {
+	case <-joined:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second caller never joined in-flight entry")
+	}
+
 	close(block)
 
 	select {
@@ -91,5 +131,23 @@ func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("second caller timed out")
+	}
+}
+
+func TestFlightGroupRecoversFromPanic(t *testing.T) {
+	var g flightGroup[int]
+	_, err := g.do(context.Background(), "panic-key", func() (int, error) {
+		panic("flight crashed")
+	})
+	if err == nil || !strings.Contains(err.Error(), "flight panic: flight crashed") {
+		t.Fatalf("want panic error, got %v", err)
+	}
+
+	// Subsequent caller executes cleanly because the key was removed.
+	val, err := g.do(context.Background(), "panic-key", func() (int, error) {
+		return 99, nil
+	})
+	if err != nil || val != 99 {
+		t.Fatalf("subsequent call failed: val=%d, err=%v", val, err)
 	}
 }

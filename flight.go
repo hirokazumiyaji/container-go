@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"sync"
 )
 
@@ -13,6 +14,7 @@ import (
 type flightGroup[T any] struct {
 	mu       sync.Mutex
 	inflight map[string]*flight[T]
+	onJoin   func(key string) // test hook: invoked when a waiter joins an in-flight key
 }
 
 type flight[T any] struct {
@@ -27,7 +29,11 @@ func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error
 		g.inflight = map[string]*flight[T]{}
 	}
 	if f, ok := g.inflight[key]; ok {
+		onJoin := g.onJoin
 		g.mu.Unlock()
+		if onJoin != nil {
+			onJoin(key)
+		}
 		return g.wait(ctx, f)
 	}
 	f := &flight[T]{done: make(chan struct{})}
@@ -36,6 +42,9 @@ func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error
 
 	go func() {
 		defer func() {
+			if r := recover(); r != nil {
+				f.err = fmt.Errorf("flight panic: %v", r)
+			}
 			g.mu.Lock()
 			delete(g.inflight, key)
 			g.mu.Unlock()

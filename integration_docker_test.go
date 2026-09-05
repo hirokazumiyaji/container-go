@@ -507,3 +507,45 @@ func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 		t.Fatalf("len(output) = %d, want 131072", len(n))
 	}
 }
+
+// TestIntegrationDockerExecAppNotFoundIsResult covers #53: app stderr
+// containing "not found" must not be mistaken for a missing container.
+func TestIntegrationDockerExecAppNotFoundIsResult(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, _, err := ctr.Exec(ctx, []string{"sh", "-c", "echo 'record not found' >&2; exit 7"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want app result", err)
+	}
+	if code != 7 {
+		t.Fatalf("code = %d, want 7", code)
+	}
+}
+
+// TestIntegrationDockerExecMissingContainerIsError covers #53: exec on
+// a removed container must fail.
+func TestIntegrationDockerExecMissingContainerIsError(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if _, _, err := ctr.Exec(ctx, []string{"true"}); err == nil {
+		t.Fatal("want error for exec on missing container")
+	}
+}

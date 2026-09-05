@@ -82,15 +82,67 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
-	if err != nil {
-		// The CLI propagates the process exit code; treat it as a
-		// result unless the failure is about the container itself.
-		if cli.IsCommandExit(err) && !isNotFound(err) {
-			var cliErr *cli.CLIError
-			errors.As(err, &cliErr)
-			return cliErr.ExitCode, output, nil
-		}
+	if err == nil {
+		return 0, output, nil
+	}
+	if !cli.IsCommandExit(err) {
 		return 0, nil, c.classify(ctx, err)
 	}
-	return 0, output, nil
+	var cliErr *cli.CLIError
+	errors.As(err, &cliErr)
+	// App stderr alone must not decide infrastructure state. Only
+	// ambiguous failures pay for a verification inspect; clear app
+	// results return immediately with no extra CLI call.
+	if !isNotFound(err) && !maybeInfraExecErr(err) {
+		return cliErr.ExitCode, output, nil
+	}
+	if c.execContainerRunning(ctx) {
+		return cliErr.ExitCode, output, nil
+	}
+	return 0, nil, c.classify(ctx, err)
+}
+
+// maybeInfraExecErr reports whether an exec CLIError could be about the
+// execution substrate rather than the app process. Generic app output
+// returns false so normal non-zero exits cost no extra probe.
+func maybeInfraExecErr(err error) bool {
+	s, ok := execCLIStderr(err)
+	if !ok {
+		return true
+	}
+	for _, sub := range []string{
+		"daemon", "cannot connect", "connection refused", "xpc",
+		"backend", "socket", "is not running", "not running",
+		"stopped", "paused", "restarting", "removing", "no such",
+	} {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+func execCLIStderr(err error) (string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return "", false
+	}
+	return strings.ToLower(cliErr.Stderr), true
+}
+
+// execContainerRunning verifies via inspect that the container is still
+// running. App-level failures keep their exit code; missing, stopped,
+// or unreachable containers report an error.
+func (c *Container) execContainerRunning(ctx context.Context) bool {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	if err != nil {
+		return false
+	}
+	info, err := c.eng.parseInspect(stdout, c.id)
+	if err != nil {
+		return false
+	}
+	return info.state == StateRunning
 }

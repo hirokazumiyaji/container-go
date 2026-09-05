@@ -21,22 +21,6 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
-const testInspectJSON = `[
-  {
-    "id": "myctr",
-    "configuration": {
-      "id": "myctr",
-      "image": {"reference": "docker.io/library/redis:7-alpine"},
-      "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true"}
-    },
-    "status": {
-      "state": "running",
-      "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
-    }
-  }
-]`
-
 // fakeRunner records CLI calls and replays canned results.
 type fakeRunner struct {
 	mu          sync.Mutex
@@ -48,6 +32,7 @@ type fakeRunner struct {
 
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
+	creations    map[string]string // container name -> creation generation from run args
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -96,12 +81,47 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	switch args[0] {
 	case "run":
+		for i, a := range args {
+			if a == "--label" && i+1 < len(args) {
+				if v, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					name := ""
+					for j, b := range args {
+						if b == "--name" && j+1 < len(args) {
+							name = args[j+1]
+						}
+					}
+					if name != "" {
+						if f.creations == nil {
+							f.creations = map[string]string{}
+						}
+						f.creations[name] = v
+					}
+				}
+			}
+		}
 		return []byte(args[len(args)-1] + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
-			// Answer for whatever id was asked.
-			json = strings.ReplaceAll(testInspectJSON, "myctr", args[len(args)-1])
+			// Answer for whatever id was asked, echoing back the
+			// creation generation captured at run time so
+			// generation-verified deletes succeed.
+			name := args[len(args)-1]
+			json = fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "docker.io/library/redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+    },
+    "status": {
+      "state": "running",
+      "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
+    }
+  }
+]`, name, name, sessionID(), f.creations[name])
 		}
 		return []byte(json), nil, nil
 	default:

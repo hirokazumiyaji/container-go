@@ -212,6 +212,12 @@ func (dockerEngine) logsArgs(id string, follow bool) []string {
 	return []string{"logs", id}
 }
 
+// logsTailArgs bounds diagnostics at the CLI: last 1000 lines, then
+// trimmed to logTailLimit bytes in Go with a fixed-size ring.
+func (dockerEngine) logsTailArgs(id string) []string {
+	return []string{"logs", "--tail", "1000", id}
+}
+
 // listArgs filters daemon-side; the Docker CLI supports label and
 // status filters directly.
 func (dockerEngine) listArgs() []string {
@@ -227,11 +233,17 @@ func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
 	return splitNonEmptyLines(data), nil
 }
 
-func (dockerEngine) imageInspectArgs(image string) []string {
+func (dockerEngine) imageInspectArgs(image, platform string) []string {
+	if platform != "" {
+		return []string{"image", "inspect", "--platform", platform, image}
+	}
 	return []string{"image", "inspect", image}
 }
 
-func (dockerEngine) pullImageArgs(image string) []string {
+func (dockerEngine) pullImageArgs(image, platform string) []string {
+	if platform != "" {
+		return []string{"pull", "--platform", platform, image}
+	}
 	return []string{"pull", image}
 }
 
@@ -240,7 +252,7 @@ func (dockerEngine) imageMissing(err error) bool {
 	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
-func (dockerEngine) parseImageExists(data []byte) bool {
+func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 	var images []json.RawMessage
 	if err := json.Unmarshal(data, &images); err != nil {
 		return false

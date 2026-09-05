@@ -158,16 +158,16 @@ func TestImageMissingClassification(t *testing.T) {
 }
 
 func TestParseImageExists(t *testing.T) {
-	if (dockerEngine{}).parseImageExists([]byte(`[]`)) {
+	if (dockerEngine{}).parseImageExists([]byte(`[]`), "") {
 		t.Error("docker: empty array means absent")
 	}
-	if !(dockerEngine{}).parseImageExists([]byte(`[{"Id":"sha256:x"}]`)) {
+	if !(dockerEngine{}).parseImageExists([]byte(`[{"Id":"sha256:x"}]`), "") {
 		t.Error("docker: non-empty array means present")
 	}
-	if (appleEngine{}).parseImageExists([]byte(`[]`)) {
+	if (appleEngine{}).parseImageExists([]byte(`[]`), "") {
 		t.Error("apple: empty array means absent")
 	}
-	if !(appleEngine{}).parseImageExists([]byte(testImageInspectJSON)) {
+	if !(appleEngine{}).parseImageExists([]byte(testImageInspectJSON), "") {
 		t.Error("apple: non-empty array means present")
 	}
 }
@@ -330,8 +330,18 @@ func TestFlightGroupCancelledLeaderDoesNotAffectWaiters(t *testing.T) {
 
 func TestFlightKeySeparatesPullAndMissing(t *testing.T) {
 	eng := dockerEngine{}
-	if flightKey(eng, "redis:7-alpine", flightPull) == flightKey(eng, "redis:7-alpine", flightMissing) {
+	if flightKey(eng, "redis:7-alpine", flightPull, "") == flightKey(eng, "redis:7-alpine", flightMissing, "") {
 		t.Fatal("mandatory pull and missing-check keys must differ")
+	}
+}
+
+func TestFlightKeySeparatesPlatforms(t *testing.T) {
+	eng := dockerEngine{}
+	if flightKey(eng, "redis:7-alpine", flightMissing, "linux/amd64") == flightKey(eng, "redis:7-alpine", flightMissing, "linux/arm64") {
+		t.Fatal("different platforms must not share a flight")
+	}
+	if flightKey(eng, "redis:7-alpine", flightMissing, "") == flightKey(eng, "redis:7-alpine", flightMissing, "linux/amd64") {
+		t.Fatal("platform and no-platform must not share a flight")
 	}
 }
 

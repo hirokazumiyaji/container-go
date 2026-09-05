@@ -48,6 +48,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published: cfg.published,
 		reused:    true,
 		info:      info,
+		creation:  info.labels[creationLabel],
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -112,6 +113,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				published: cfg.published,
 				reused:    true,
 				info:      info,
+				creation:  info.labels[creationLabel],
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -129,6 +131,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		defer os.RemoveAll(dir)
 		envFile = path
 	}
+	if cfg.creation == "" {
+		cfg.creation = newCreationID()
+	}
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
@@ -140,6 +145,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) {
 			return nil, err
 		}
+		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
 
@@ -150,6 +156,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
+		creation:  cfg.creation,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -256,9 +263,10 @@ func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
 }
 
 // imagesCompatible reports whether a requested image reference matches
-// what inspect reported. Docker may expand short names to
-// docker.io/library/.... When the request pins a digest, that digest
-// must appear on the existing image.
+// what inspect reported. Short Docker Hub names are normalized
+// (docker.io/library/..., latest) before comparison; arbitrary
+// registry/namespace suffix matches are rejected. When the request pins
+// a digest, both the normalized base and the digest must match.
 func imagesCompatible(requested, actual string) bool {
 	if requested == "" || actual == "" {
 		return requested == actual
@@ -266,15 +274,60 @@ func imagesCompatible(requested, actual string) bool {
 	if requested == actual {
 		return true
 	}
-	if reqDigest := imageDigest(requested); reqDigest != "" {
-		return reqDigest == imageDigest(actual)
+	reqDigest := imageDigest(requested)
+	actDigest := imageDigest(actual)
+	if reqDigest != "" {
+		if reqDigest != actDigest {
+			return false
+		}
+		return normalizeImageRef(stripImageDigest(requested)) == normalizeImageRef(stripImageDigest(actual))
 	}
-	req := stripImageDigest(requested)
-	act := stripImageDigest(actual)
-	if req == act {
-		return true
+	req := normalizeImageRef(stripImageDigest(requested))
+	act := normalizeImageRef(stripImageDigest(actual))
+	return req == act
+}
+
+// normalizeImageRef expands Docker Hub short names to a canonical
+// registry/repo:tag form. The default registry is docker.io, the
+// default namespace for single-component repos is library, and the
+// default tag is latest.
+func normalizeImageRef(ref string) string {
+	tag := "latest"
+	name := ref
+	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
+		tag = name[i+1:]
+		name = name[:i]
+		if tag == "" {
+			tag = "latest"
+		}
 	}
-	return strings.HasSuffix(act, "/"+req) || strings.HasSuffix(req, "/"+act)
+	var registry, repo string
+	parts := strings.Split(name, "/")
+	switch {
+	case len(parts) == 1:
+		registry = "docker.io"
+		repo = "library/" + parts[0]
+	case len(parts) == 2 && !isRegistry(parts[0]):
+		registry = "docker.io"
+		repo = name
+	case isRegistry(parts[0]):
+		registry = parts[0]
+		repo = strings.Join(parts[1:], "/")
+		if registry == "docker.io" && !strings.Contains(repo, "/") {
+			repo = "library/" + repo
+		}
+	default:
+		registry = "docker.io"
+		repo = name
+	}
+	if repo == "" {
+		repo = name
+	}
+	return registry + "/" + repo + ":" + tag
+}
+
+func isRegistry(s string) bool {
+	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
 }
 
 func imageDigest(ref string) string {

@@ -88,7 +88,14 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	case <-found:
 		return nil
 	case err := <-scanDone:
-		if running, rErr := target.Running(context.WithoutCancel(ctx)); rErr == nil && !running {
+		// The wait deadline already fired or the stream ended; check
+		// container state with a bounded probe so a hung backend
+		// cannot stall diagnostics. WithoutCancel detaches from the
+		// expired wait deadline, WithTimeout re-bounds the probe.
+		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		running, rErr := target.Running(probeCtx)
+		probeCancel()
+		if rErr == nil && !running {
 			return fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern)
 		}
 		return fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %v)", s.pattern, err)

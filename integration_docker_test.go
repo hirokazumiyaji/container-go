@@ -361,3 +361,191 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 		t.Fatalf("running containers named %s: %v, want 1", name, lines)
 	}
 }
+
+// TestIntegrationDockerRunFailureCleansUp covers #48: a failed start
+// must not leave a created container behind.
+func TestIntegrationDockerRunFailureCleansUp(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-failclean-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	_, err := container.Run(ctx, "redis:7-alpine",
+		container.WithName(name),
+		container.WithPullPolicy(container.PullNever),
+		container.WithEntrypoint("/does-not-exist-audit"),
+	)
+	if err == nil {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+		t.Fatal("want error for bad entrypoint")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr == nil {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+		t.Fatalf("container still present after failed Run: %s", out)
+	}
+}
+
+// TestIntegrationDockerRunFailurePreservesConflict covers #48: a name
+// conflict must not delete the pre-existing container.
+func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-failkeep-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+
+	_, err = container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err == nil {
+		t.Fatal("want conflict error for duplicate name")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
+		t.Fatalf("existing container missing after conflict: %s / %v", out, inspectErr)
+	}
+}
+
+// TestIntegrationDockerStaleHandlePreservesReplacement covers #49: an
+// old handle must not delete a same-name replacement.
+func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-stale-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+	}()
+
+	oldCtr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate old: %v", err)
+	}
+	newCtr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	defer func() {
+		_ = newCtr.Terminate(context.Background())
+	}()
+	// Stale handle must refuse; replacement must survive.
+	if err := oldCtr.Terminate(ctx); err == nil {
+		t.Fatal("want error when stale handle deletes replacement")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
+		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)
+	}
+}
+
+// TestIntegrationDockerExecPreservesLargeStderr covers #52: success
+// output must not be truncated at 64 KiB.
+func TestIntegrationDockerExecPreservesLargeStderr(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "redis:7-alpine",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, out, err := ctr.Exec(ctx, []string{"sh", "-c", "head -c 131072 /dev/zero >&2"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if n, _ := io.ReadAll(out); len(n) != 131072 {
+		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}
+
+// TestIntegrationDockerExecPreservesLargeFailureOutput covers #52 for
+// non-zero exits.
+func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "redis:7-alpine",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, out, err := ctr.Exec(ctx, []string{"sh", "-c", "head -c 131072 /dev/zero >&2; exit 7"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 7 {
+		t.Fatalf("code = %d, want 7", code)
+	}
+	if n, _ := io.ReadAll(out); len(n) != 131072 {
+		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}
+
+// TestIntegrationDockerExecAppNotFoundIsResult covers #53: app stderr
+// containing "not found" must not be mistaken for a missing container.
+func TestIntegrationDockerExecAppNotFoundIsResult(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, _, err := ctr.Exec(ctx, []string{"sh", "-c", "echo 'record not found' >&2; exit 7"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want app result", err)
+	}
+	if code != 7 {
+		t.Fatalf("code = %d, want 7", code)
+	}
+}
+
+// TestIntegrationDockerExecMissingContainerIsError covers #53: exec on
+// a removed container must fail.
+func TestIntegrationDockerExecMissingContainerIsError(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if _, _, err := ctr.Exec(ctx, []string{"true"}); err == nil {
+		t.Fatal("want error for exec on missing container")
+	}
+}

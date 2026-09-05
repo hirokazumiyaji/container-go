@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os/exec"
+	"regexp"
 	"runtime"
 	"sync"
 )
@@ -18,19 +19,38 @@ import (
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script
 // itself disables globbing and quotes every expansion the IDs reach.
+// Each stdin line is "id|creation": before deleting, the script
+// inspects the current container and skips the delete when the
+// creation generation no longer matches, so a same-name replacement
+// created after registration survives the old reaper.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
-ids=""
-while IFS= read -r id; do
-  ids="$ids $id"
+entries=""
+while IFS= read -r line; do
+  entries="$entries $line"
 done
-for id in $ids; do
+for entry in $entries; do
+  id=${entry%%|*}
+  creation=${entry##*|}
+  if [ -n "$creation" ] && [ "$creation" != "$id" ]; then
+    if ! "$bin" inspect "$id" 2>/dev/null | grep -q "$creation"; then
+      continue
+    fi
+  fi
   "$bin" "$sub" --force "$id" >/dev/null 2>&1 || true
 done
 `
 
 const maxReaperSpawnFailures = 3
+
+// creationRE validates the hex generation ID passed to the reaper.
+var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
+
+type reaperEntry struct {
+	id       string
+	creation string
+}
 
 type reaper struct {
 	binary string
@@ -42,7 +62,7 @@ type reaper struct {
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	exited        chan struct{}
-	ids           []string
+	entries       []reaperEntry
 	spawnFailures int
 }
 
@@ -51,24 +71,38 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed.
-func (r *reaper) register(id string) error {
+// respawning the reaper process as needed. creation is the generation
+// ID from creationLabel; empty skips the generation check for
+// backward compatibility.
+func (r *reaper) register(id, creation string) error {
 	if !nameRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
+	if creation != "" && !creationRE.MatchString(creation) {
+		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.ids = append(r.ids, id)
+	entry := reaperEntry{id: id, creation: creation}
+	r.entries = append(r.entries, entry)
+	line := reaperLine(entry)
 	if r.stdin != nil {
-		if r.writeLocked(id) == nil {
+		if r.writeLocked(line) == nil {
 			return nil
 		}
 	}
 	return r.respawnAndReplayLocked()
 }
 
-func (r *reaper) writeLocked(id string) error {
-	_, err := io.WriteString(r.stdin, id+"\n")
+func reaperLine(e reaperEntry) string {
+	if e.creation == "" {
+		return e.id + "|"
+	}
+	return e.id + "|" + e.creation
+}
+
+func (r *reaper) writeLocked(line string) error {
+	_, err := io.WriteString(r.stdin, line+"\n")
 	return err
 }
 
@@ -81,8 +115,8 @@ func (r *reaper) respawnAndReplayLocked() error {
 			continue
 		}
 		replayed := true
-		for _, id := range r.ids {
-			if r.writeLocked(id) != nil {
+		for _, e := range r.entries {
+			if r.writeLocked(reaperLine(e)) != nil {
 				replayed = false
 				break
 			}
@@ -143,7 +177,7 @@ var (
 // process-wide reaper for its backend binary. Reaper trouble never
 // fails container startup. The reaper needs /bin/sh, so on Windows
 // this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id string) {
+func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
 	}
@@ -154,5 +188,5 @@ func registerWithGlobalReaper(binary, subcommand, id string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id)
+	_ = r.register(id, creation)
 }

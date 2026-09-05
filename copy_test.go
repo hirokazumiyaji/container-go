@@ -127,7 +127,7 @@ func TestWithFilesFailureRollsBack(t *testing.T) {
 	}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), withRunner(f),
+		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
 		WithFiles(File{HostPath: src, ContainerPath: "/x"}))
 	if err == nil {
 		t.Fatal("want error when file copy fails")

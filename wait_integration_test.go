@@ -51,7 +51,7 @@ func TestRunWaitFailureRollsBackAndAttachesLogs(t *testing.T) {
 	s := &recordingStrategy{err: errors.New("never became ready")}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), withRunner(logs), WithWaitStrategy(s))
+		WithName("myctr"), withRunner(logs), withEngine(appleEngine{}), WithWaitStrategy(s))
 	if err == nil {
 		t.Fatal("want error when wait strategy fails")
 	}

@@ -121,7 +121,7 @@ func TestRunReportsSystemNotRunningFromImageCheck(t *testing.T) {
 	// A downed backend surfaces during the image existence check,
 	// before any run command is built.
 	f := &fakeRunner{systemUp: false}
-	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"), withRunner(f))
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}

@@ -330,7 +330,7 @@ func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
 
 func TestRunReportsSystemNotRunning(t *testing.T) {
 	f := &fakeRunner{systemUp: false, failPrefix: "run"}
-	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"), withRunner(f))
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}

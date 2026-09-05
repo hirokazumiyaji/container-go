@@ -233,11 +233,17 @@ func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
 	return splitNonEmptyLines(data), nil
 }
 
-func (dockerEngine) imageInspectArgs(image string) []string {
+func (dockerEngine) imageInspectArgs(image, platform string) []string {
+	if platform != "" {
+		return []string{"image", "inspect", "--platform", platform, image}
+	}
 	return []string{"image", "inspect", image}
 }
 
-func (dockerEngine) pullImageArgs(image string) []string {
+func (dockerEngine) pullImageArgs(image, platform string) []string {
+	if platform != "" {
+		return []string{"pull", "--platform", platform, image}
+	}
 	return []string{"pull", image}
 }
 
@@ -246,7 +252,7 @@ func (dockerEngine) imageMissing(err error) bool {
 	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
-func (dockerEngine) parseImageExists(data []byte) bool {
+func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 	var images []json.RawMessage
 	if err := json.Unmarshal(data, &images); err != nil {
 		return false

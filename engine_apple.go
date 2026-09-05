@@ -1,6 +1,7 @@
 package container
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -146,11 +147,14 @@ func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
 	return ids, nil
 }
 
-func (appleEngine) imageInspectArgs(image string) []string {
+func (appleEngine) imageInspectArgs(image, _ string) []string {
 	return []string{"image", "inspect", image}
 }
 
-func (appleEngine) pullImageArgs(image string) []string {
+func (appleEngine) pullImageArgs(image, platform string) []string {
+	if platform != "" {
+		return []string{"image", "pull", "--platform", platform, image}
+	}
 	return []string{"image", "pull", image}
 }
 
@@ -159,12 +163,59 @@ func (appleEngine) imageMissing(err error) bool {
 	return appleStderrContains(err, appleStderrNotFound)
 }
 
-func (appleEngine) parseImageExists(data []byte) bool {
-	images, err := inspect.Decode(data)
-	if err != nil {
+func (appleEngine) parseImageExists(data []byte, platform string) bool {
+	var raw []json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
 		return false
 	}
-	return len(images) > 0
+	if platform == "" {
+		return true
+	}
+	var images []struct {
+		Variants []struct {
+			Platform struct {
+				Os           string `json:"os"`
+				Architecture string `json:"architecture"`
+				Variant      string `json:"variant"`
+			} `json:"platform"`
+		} `json:"variants"`
+	}
+	if err := json.Unmarshal(data, &images); err != nil {
+		return true
+	}
+	wantOS, wantArch, wantVariant := splitPlatform(platform)
+	for _, img := range images {
+		if len(img.Variants) == 0 {
+			return true
+		}
+		for _, v := range img.Variants {
+			if wantOS != "" && v.Platform.Os != "" && v.Platform.Os != wantOS {
+				continue
+			}
+			if wantArch != "" && v.Platform.Architecture != "" && v.Platform.Architecture != wantArch {
+				continue
+			}
+			if wantVariant != "" && v.Platform.Variant != "" && v.Platform.Variant != wantVariant {
+				continue
+			}
+			return true
+		}
+	}
+	return false
+}
+
+func splitPlatform(p string) (os, arch, variant string) {
+	parts := strings.Split(p, "/")
+	if len(parts) > 0 {
+		os = parts[0]
+	}
+	if len(parts) > 1 {
+		arch = parts[1]
+	}
+	if len(parts) > 2 {
+		variant = parts[2]
+	}
+	return os, arch, variant
 }
 
 func (appleEngine) listReuseGroupArgs(string) []string {

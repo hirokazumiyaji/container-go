@@ -70,12 +70,15 @@ type engine interface {
 	defaultHost() string
 	// imageInspectArgs inspects an image reference in the backend's
 	// local store; failure with imageMissing means the image is absent.
-	imageInspectArgs(image string) []string
-	// pullImageArgs fetches the image into the local store.
-	pullImageArgs(image string) []string
+	// When platform is set, the inspect targets that variant.
+	imageInspectArgs(image, platform string) []string
+	// pullImageArgs fetches the image into the local store. When
+	// platform is set, only that variant is fetched.
+	pullImageArgs(image, platform string) []string
 	// imageMissing reports whether a failed image inspect means the
 	// image is not in the local store.
 	imageMissing(err error) bool
-	// parseImageExists interprets image inspect output.
-	parseImageExists(data []byte) bool
+	// parseImageExists interprets image inspect output, considering the
+	// requested platform variant when set.
+	parseImageExists(data []byte, platform string) bool
 }

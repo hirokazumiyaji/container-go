@@ -54,10 +54,10 @@ func Pull(ctx context.Context, image string) error {
 		return err
 	}
 	r := &cli.ExecRunner{Binary: eng.binary()}
-	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull), func() error {
+	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, ""), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
-		_, _, err := r.Run(execCtx, eng.pullImageArgs(image)...)
+		_, _, err := r.Run(execCtx, eng.pullImageArgs(image, "")...)
 		if err != nil {
 			return cli.Classify(execCtx, r, err, eng.probe())
 		}
@@ -66,9 +66,10 @@ func Pull(ctx context.Context, image string) error {
 }
 
 // flightKey identifies the pull being aggregated: one backend, one
-// image, one operation kind.
-func flightKey(eng engine, image, op string) string {
-	return eng.name() + "\x00" + image + "\x00" + op
+// image, one operation kind, one platform. Same image with different
+// platforms must not share a flight.
+func flightKey(eng engine, image, op, platform string) string {
+	return eng.name() + "\x00" + image + "\x00" + op + "\x00" + platform
 }
 
 // imageFlights aggregates concurrent image fetches across the process.
@@ -78,55 +79,61 @@ var imageFlights flightGroup[struct{}]
 
 // ensureImage brings the image into the backend's local store according
 // to the pull policy. It runs once per concurrent set of Runs sharing
-// the image and operation: the first caller inspects and/or pulls, the
-// rest wait.
+// the image, operation, and platform: the first caller inspects and/or
+// pulls, the rest wait.
 func (c *config) ensureImage(ctx context.Context, image string) error {
+	platform := c.platform
 	switch c.pullPolicy {
 	case PullNever:
-		exists, err := imageExists(ctx, c.runner, c.eng, image)
+		exists, err := imageExists(ctx, c.runner, c.eng, image, platform)
 		if err != nil {
 			return err
 		}
 		if !exists {
+			if platform != "" {
+				return fmt.Errorf("%w: %s for platform %s", ErrImageNotFound, image, platform)
+			}
 			return fmt.Errorf("%w: %s", ErrImageNotFound, image)
 		}
 		return nil
 	case PullAlways:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull), func() error {
+		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
-			return pullImage(execCtx, c.runner, c.eng, image)
+			return pullImage(execCtx, c.runner, c.eng, image, platform)
 		})
 	default:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing), func() error {
+		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
-			exists, err := imageExists(execCtx, c.runner, c.eng, image)
+			exists, err := imageExists(execCtx, c.runner, c.eng, image, platform)
 			if err != nil || exists {
 				return err
 			}
-			return pullImage(execCtx, c.runner, c.eng, image)
+			return pullImage(execCtx, c.runner, c.eng, image, platform)
 		})
 	}
 }
 
-// imageExists reports whether the image is in the backend's store.
-func imageExists(ctx context.Context, r cli.Runner, eng engine, image string) (bool, error) {
+// imageExists reports whether the image (and requested platform
+// variant, when set) is in the backend's store.
+func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform string) (bool, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image)...)
+	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if err != nil {
 		if eng.imageMissing(err) {
 			return false, nil
 		}
 		return false, cli.Classify(ctx, r, err, eng.probe())
 	}
-	return eng.parseImageExists(stdout), nil
+	return eng.parseImageExists(stdout, platform), nil
 }
 
-// pullImage fetches the image through the backend CLI.
-func pullImage(ctx context.Context, r cli.Runner, eng engine, image string) error {
-	_, _, err := r.Run(ctx, eng.pullImageArgs(image)...)
+// pullImage fetches the image (and requested platform variant, when
+// set) through the backend CLI.
+func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform string) error {
+	_, _, err := r.Run(ctx, eng.pullImageArgs(image, platform)...)
 	if err != nil {
 		return cli.Classify(ctx, r, err, eng.probe())
 	}

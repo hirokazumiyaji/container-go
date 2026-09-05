@@ -98,3 +98,15 @@ func TestAppleParseImageExistsPlatform(t *testing.T) {
 		t.Error("empty platform must mean present")
 	}
 }
+
+func TestAppleParseImageExistsVariantMismatch(t *testing.T) {
+	// Variant-less image must not satisfy a variant-pinned request.
+	data := []byte(`[{"variants":[{"platform":{"os":"linux","architecture":"arm"}}]}]`)
+	if (appleEngine{}).parseImageExists(data, "linux/arm/v7") {
+		t.Error("variant-less arm must not match linux/arm/v7")
+	}
+	dataV7 := []byte(`[{"variants":[{"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`)
+	if !(appleEngine{}).parseImageExists(dataV7, "linux/arm/v7") {
+		t.Error("v7 must match linux/arm/v7")
+	}
+}

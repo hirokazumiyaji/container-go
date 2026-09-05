@@ -163,6 +163,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
+		if ctx.Err() != nil {
+			return err
+		}
 		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
 	}
 	return err

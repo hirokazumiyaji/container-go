@@ -210,15 +210,8 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return
 	}
 	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; !ok || actual != cfg.creation {
-			// Inspect may predate label support or the container may
-			// have been replaced between run and inspect; only delete
-			// when the generation matches. Missing label on an
-			// otherwise owned container is treated as owned for
-			// backward compatibility with pre-creation containers.
-			if ok {
-				return
-			}
+		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
+			return
 		}
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
@@ -303,9 +296,9 @@ func (c *Container) generationReplaced(ctx context.Context) bool {
 	}
 	actual, ok := info.labels[creationLabel]
 	if !ok || actual == "" {
-		// Pre-creation containers carry no generation; allow delete
-		// for backward compatibility.
-		return false
+		// An absent generation cannot prove ownership of this handle,
+		// so treat it as a replacement and refuse the delete.
+		return true
 	}
 	return actual != c.creation
 }

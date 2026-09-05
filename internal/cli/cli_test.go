@@ -262,6 +262,24 @@ func TestClassifyRespectsCallerCancel(t *testing.T) {
 	}
 }
 
+func TestClassifyPreservesOriginalWhenParentCancelsDuringProbe(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	r := &hangingProbeRunner{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-r.started
+		cancel()
+	}()
+	start := time.Now()
+	err := Classify(ctx, r, orig, appleProbe)
+	if !errors.Is(err, orig) {
+		t.Fatalf("error = %v, want original when parent cancels mid-probe", err)
+	}
+	if elapsed := time.Since(start); elapsed > 4*time.Second {
+		t.Fatalf("Classify took %v, want fast return on parent cancel", elapsed)
+	}
+}
+
 func TestIsCommandExit(t *testing.T) {
 	if !IsCommandExit(&CLIError{Args: []string{"exec"}, ExitCode: 1}) {
 		t.Error("CLIError should be a command exit")

@@ -78,7 +78,6 @@ func lastNBytes(r io.Reader, n int) string {
 		return ""
 	}
 	buf := make([]byte, n)
-	var total int
 	pos := 0
 	full := false
 	tmp := make([]byte, 32*1024)
@@ -98,7 +97,6 @@ func lastNBytes(r io.Reader, n int) string {
 				pos = 0
 				full = true
 			}
-			total += m
 		}
 		if err != nil {
 			break

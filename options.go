@@ -48,12 +48,15 @@ func newConfig() *config {
 }
 
 // allLabels merges the session labels the library always applies with
-// user-supplied ones.
+// user-supplied ones. Internal labels always win so callers cannot
+// override the generation used for safe cleanup.
 func (c *config) allLabels() map[string]string {
-	labels := map[string]string{
-		managedLabel: "true",
-		sessionLabel: sessionID(),
+	labels := map[string]string{}
+	for k, v := range c.labels {
+		labels[k] = v
 	}
+	labels[managedLabel] = "true"
+	labels[sessionLabel] = sessionID()
 	if c.creation != "" {
 		labels[creationLabel] = c.creation
 	}
@@ -62,9 +65,6 @@ func (c *config) allLabels() map[string]string {
 	}
 	if c.reuseGroup != "" {
 		labels[reuseGroupLabel] = c.reuseGroup
-	}
-	for k, v := range c.labels {
-		labels[k] = v
 	}
 	return labels
 }
@@ -250,12 +250,16 @@ func WithPublishedPort(spec string) Option {
 }
 
 // WithLabels adds labels on top of the session labels the library
-// always applies.
+// always applies. Internal labels are reserved and rejected.
 func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
 				return fmt.Errorf("invalid label key %q", k)
+			}
+			switch k {
+			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
+				return fmt.Errorf("label key %q is reserved", k)
 			}
 			if len(k)+len(v)+1 > 4096 {
 				return fmt.Errorf("label %s: key=value exceeds 4096 bytes", k)

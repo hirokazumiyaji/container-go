@@ -189,13 +189,13 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 			return true
 		}
 		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != "" && v.Platform.Os != wantOS {
+			if wantOS != "" && v.Platform.Os != wantOS {
 				continue
 			}
-			if wantArch != "" && v.Platform.Architecture != "" && v.Platform.Architecture != wantArch {
+			if wantArch != "" && v.Platform.Architecture != wantArch {
 				continue
 			}
-			if wantVariant != "" && v.Platform.Variant != "" && v.Platform.Variant != wantVariant {
+			if wantVariant != "" && v.Platform.Variant != wantVariant {
 				continue
 			}
 			return true

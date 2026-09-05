@@ -131,7 +131,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, err
 	}
 	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
-		return nil, cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, classified
 	}
 
 	// The reaper only backs real CLI containers; with an injected
@@ -169,6 +171,31 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 	}
 	return c, nil
+}
+
+// cleanupFailedCreate best-effort removes the container this Run left
+// behind after a failed create. It never deletes a pre-existing
+// same-name container: name conflicts are skipped, and only a container
+// carrying this process's managed+session labels is removed.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
+		return
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer cancel()
+	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	if err != nil {
+		return
+	}
+	if info.labels[managedLabel] != "true" {
+		return
+	}
+	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
+		return
+	}
+	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer delCancel()
+	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(cfg.name)...)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary

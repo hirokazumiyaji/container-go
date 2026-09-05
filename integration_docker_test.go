@@ -361,3 +361,57 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 		t.Fatalf("running containers named %s: %v, want 1", name, lines)
 	}
 }
+
+// TestIntegrationDockerRunFailureCleansUp covers #48: a failed start
+// must not leave a created container behind.
+func TestIntegrationDockerRunFailureCleansUp(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-failclean-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	_, err := container.Run(ctx, "redis:7-alpine",
+		container.WithName(name),
+		container.WithPullPolicy(container.PullNever),
+		container.WithEntrypoint("/does-not-exist-audit"),
+	)
+	if err == nil {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+		t.Fatal("want error for bad entrypoint")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr == nil {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+		t.Fatalf("container still present after failed Run: %s", out)
+	}
+}
+
+// TestIntegrationDockerRunFailurePreservesConflict covers #48: a name
+// conflict must not delete the pre-existing container.
+func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-failkeep-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	ctr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+
+	_, err = container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err == nil {
+		t.Fatal("want conflict error for duplicate name")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
+		t.Fatalf("existing container missing after conflict: %s / %v", out, inspectErr)
+	}
+}

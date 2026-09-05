@@ -140,6 +140,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) {
 			return nil, err
 		}
+		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
 

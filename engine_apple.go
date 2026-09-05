@@ -122,6 +122,10 @@ func (appleEngine) logsArgs(id string, follow bool) []string {
 	return []string{"logs", id}
 }
 
+func (appleEngine) logsTailArgs(id string) []string {
+	return []string{"logs", "-n", "1000", id}
+}
+
 func (appleEngine) listArgs() []string {
 	return []string{"ls", "--all", "--format", "json"}
 }

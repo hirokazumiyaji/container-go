@@ -212,6 +212,12 @@ func (dockerEngine) logsArgs(id string, follow bool) []string {
 	return []string{"logs", id}
 }
 
+// logsTailArgs bounds diagnostics at the CLI: last 1000 lines, then
+// trimmed to logTailLimit bytes in Go with a fixed-size ring.
+func (dockerEngine) logsTailArgs(id string) []string {
+	return []string{"logs", "--tail", "1000", id}
+}
+
 // listArgs filters daemon-side; the Docker CLI supports label and
 // status filters directly.
 func (dockerEngine) listArgs() []string {

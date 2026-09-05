@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -55,19 +56,59 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 const logTailLimit = 1024 * 1024
 
 // logTail fetches up to logTailLimit trailing bytes of the container's
-// logs for diagnostics. Failures yield an empty tail.
+// logs for diagnostics. It asks the backend for a bounded tail
+// (logsTailArgs) and keeps only the last bytes in a fixed-size ring,
+// so neither the CLI output nor the Go buffer grows with total log
+// size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	rc, err := c.Logs(ctx)
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
 	if err != nil {
 		return ""
 	}
-	defer rc.Close()
-	data, err := io.ReadAll(io.LimitReader(rc, logTailLimit+1))
-	if err != nil {
+	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+}
+
+// lastNBytes keeps only the trailing n bytes of r using a fixed-size
+// ring buffer.
+func lastNBytes(r io.Reader, n int) string {
+	if n <= 0 {
+		_, _ = io.Copy(io.Discard, r)
 		return ""
 	}
-	if len(data) > logTailLimit {
-		data = data[len(data)-logTailLimit:]
+	buf := make([]byte, n)
+	var total int
+	pos := 0
+	full := false
+	tmp := make([]byte, 32*1024)
+	for {
+		m, err := r.Read(tmp)
+		if m > 0 {
+			chunk := tmp[:m]
+			for len(chunk) > 0 {
+				space := n - pos
+				if len(chunk) < space {
+					copy(buf[pos:], chunk)
+					pos += len(chunk)
+					break
+				}
+				copy(buf[pos:], chunk[:space])
+				chunk = chunk[space:]
+				pos = 0
+				full = true
+			}
+			total += m
+		}
+		if err != nil {
+			break
+		}
 	}
-	return string(data)
+	if !full {
+		return string(buf[:pos])
+	}
+	out := make([]byte, n)
+	copy(out, buf[pos:])
+	copy(out[n-pos:], buf[:pos])
+	return string(out)
 }

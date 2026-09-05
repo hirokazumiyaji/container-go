@@ -43,6 +43,9 @@ type engine interface {
 	copyFromArgs(id, containerPath, hostPath string) []string
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	logsArgs(id string, follow bool) []string
+	// logsTailArgs fetches a bounded tail for diagnostics without
+	// pulling the full log stream.
+	logsTailArgs(id string) []string
 	listArgs() []string
 	// parseStoppedManaged extracts, from listArgs output, the IDs of
 	// stopped containers this library created.

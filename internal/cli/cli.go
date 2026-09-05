@@ -94,15 +94,17 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	var stdout bytes.Buffer
-	stderr := &boundedBuffer{max: maxStderr}
+	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
-	cmd.Stderr = stderr
+	cmd.Stderr = &stderr
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
 	err := cmd.Run()
+	// Output buffers are returned whole: success output and non-zero
+	// exec/log results must not be silently truncated. Only the
+	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
 		if ctx.Err() != nil {
 			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
@@ -113,12 +115,20 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
-				Stderr:   stderr.String(),
+				Stderr:   truncateStderr(stderr.String()),
 			}
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
+}
+
+// truncateStderr bounds the diagnostic copy kept in CLIError.
+func truncateStderr(s string) string {
+	if len(s) > maxStderr {
+		return s[:maxStderr]
+	}
+	return s
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process
@@ -145,23 +155,3 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	}
 	return err
 }
-
-// boundedBuffer keeps at most max bytes and discards the rest.
-type boundedBuffer struct {
-	buf bytes.Buffer
-	max int
-}
-
-func (b *boundedBuffer) Write(p []byte) (int, error) {
-	if room := b.max - b.buf.Len(); room > 0 {
-		if len(p) > room {
-			b.buf.Write(p[:room])
-		} else {
-			b.buf.Write(p)
-		}
-	}
-	return len(p), nil
-}
-
-func (b *boundedBuffer) Bytes() []byte  { return b.buf.Bytes() }
-func (b *boundedBuffer) String() string { return b.buf.String() }

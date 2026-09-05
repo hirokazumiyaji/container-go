@@ -455,3 +455,55 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)
 	}
 }
+
+// TestIntegrationDockerExecPreservesLargeStderr covers #52: success
+// output must not be truncated at 64 KiB.
+func TestIntegrationDockerExecPreservesLargeStderr(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "redis:7-alpine",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, out, err := ctr.Exec(ctx, []string{"sh", "-c", "head -c 131072 /dev/zero >&2"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if n, _ := io.ReadAll(out); len(n) != 131072 {
+		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}
+
+// TestIntegrationDockerExecPreservesLargeFailureOutput covers #52 for
+// non-zero exits.
+func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, "redis:7-alpine",
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+	code, out, err := ctr.Exec(ctx, []string{"sh", "-c", "head -c 131072 /dev/zero >&2; exit 7"})
+	if err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if code != 7 {
+		t.Fatalf("code = %d, want 7", code)
+	}
+	if n, _ := io.ReadAll(out); len(n) != 131072 {
+		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}

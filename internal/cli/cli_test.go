@@ -61,13 +61,55 @@ func TestExecRunnerCapsStderr(t *testing.T) {
 	// Emit ~1MiB of stderr, far beyond the 64KiB cap.
 	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; exit 1`)}
 
-	_, _, err := r.Run(context.Background(), "run")
+	stdout, stderr, err := r.Run(context.Background(), "run")
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
 		t.Fatalf("error = %v, want *CLIError", err)
 	}
 	if len(cliErr.Stderr) > maxStderr {
 		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	// The returned output buffers stay whole for exec/log results.
+	if len(stderr) <= maxStderr {
+		t.Errorf("len(returned stderr) = %d, want > %d", len(stderr), maxStderr)
+	}
+	_ = stdout
+}
+
+func TestExecRunnerPreservesLargeSuccessOutput(t *testing.T) {
+	// 128 KiB on each stream with exit 0 must come back whole.
+	r := &ExecRunner{Binary: writeStub(t, `head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2`)}
+	stdout, stderr, err := r.Run(context.Background(), "exec")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(stdout) != 131072 {
+		t.Errorf("len(stdout) = %d, want 131072", len(stdout))
+	}
+	if len(stderr) != 131072 {
+		t.Errorf("len(stderr) = %d, want 131072", len(stderr))
+	}
+}
+
+func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
+	// Non-zero exit still returns whole output; only CLIError is capped.
+	r := &ExecRunner{Binary: writeStub(t, `head -c 131072 /dev/zero; head -c 131072 /dev/zero >&2; exit 7`)}
+	stdout, stderr, err := r.Run(context.Background(), "exec")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if len(stdout) != 131072 {
+		t.Errorf("len(stdout) = %d, want 131072", len(stdout))
+	}
+	if len(stderr) != 131072 {
+		t.Errorf("len(returned stderr) = %d, want 131072", len(stderr))
+	}
+	if len(cliErr.Stderr) > maxStderr {
+		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	if cliErr.ExitCode != 7 {
+		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
 	}
 }
 

@@ -46,10 +46,10 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("ctr-one"); err != nil {
+	if err := r.register("ctr-one", ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two"); err != nil {
+	if err := r.register("ctr-two", ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -66,9 +66,12 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	defer r.closeStdin()
 
 	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
-		if err := r.register(id); err == nil {
+		if err := r.register(id, ""); err == nil {
 			t.Errorf("register(%q): want error", id)
 		}
+	}
+	if err := r.register("ctr-one", "not-hex"); err == nil {
+		t.Error("register bad creation: want error")
 	}
 }
 
@@ -76,7 +79,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("before-crash"); err != nil {
+	if err := r.register("before-crash", ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -84,7 +87,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash"); err != nil {
+	if err := r.register("after-crash", ""); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()

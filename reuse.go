@@ -48,6 +48,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published: cfg.published,
 		reused:    true,
 		info:      info,
+		creation:  info.labels[creationLabel],
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -112,6 +113,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				published: cfg.published,
 				reused:    true,
 				info:      info,
+				creation:  info.labels[creationLabel],
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -128,6 +130,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		}
 		defer os.RemoveAll(dir)
 		envFile = path
+	}
+	if cfg.creation == "" {
+		cfg.creation = newCreationID()
 	}
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
@@ -151,6 +156,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
+		creation:  cfg.creation,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))

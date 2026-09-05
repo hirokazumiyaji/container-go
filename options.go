@@ -36,6 +36,7 @@ type config struct {
 	pullPolicy   PullPolicy
 	reuse        bool
 	reuseGroup   string
+	creation     string
 }
 
 func newConfig() *config {
@@ -52,6 +53,9 @@ func (c *config) allLabels() map[string]string {
 	labels := map[string]string{
 		managedLabel: "true",
 		sessionLabel: sessionID(),
+	}
+	if c.creation != "" {
+		labels[creationLabel] = c.creation
 	}
 	if c.reuse {
 		labels[reuseLabel] = "true"

@@ -23,6 +23,7 @@ const (
 	sessionLabel    = "com.github.hirokazumiyaji.container-go.session"
 	reuseLabel      = "com.github.hirokazumiyaji.container-go.reuse"
 	reuseGroupLabel = "com.github.hirokazumiyaji.container-go.reuse-group"
+	creationLabel   = "com.github.hirokazumiyaji.container-go.creation"
 
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
@@ -50,6 +51,14 @@ func newContainerName() string {
 	return "containergo-" + hex.EncodeToString(b[:])
 }
 
+func newCreationID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic(fmt.Sprintf("container: read random creation id: %v", err))
+	}
+	return hex.EncodeToString(b[:])
+}
+
 // State is a container lifecycle state.
 type State string
 
@@ -72,6 +81,10 @@ type Container struct {
 	// and the watchdog reaper skip these so shared containers survive
 	// process exit. Explicit Terminate still removes them.
 	reused bool
+	// creation is the unique generation ID stored in creationLabel.
+	// Terminate and the reaper verify it before deleting so a stale
+	// handle never removes a same-name replacement.
+	creation string
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -111,6 +124,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if cfg.name == "" {
 		cfg.name = newContainerName()
 	}
+	cfg.creation = newCreationID()
 
 	var envFile string
 	if len(cfg.env) > 0 {
@@ -143,7 +157,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name)
+		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 	}
 
 	c := &Container{
@@ -152,6 +166,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		creation:  cfg.creation,
 	}
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
@@ -176,7 +191,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // cleanupFailedCreate best-effort removes the container this Run left
 // behind after a failed create. It never deletes a pre-existing
 // same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed.
+// carrying this process's managed+session labels is removed. When the
+// creation generation is known it must also match.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return
@@ -192,6 +208,18 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return
+	}
+	if cfg.creation != "" {
+		if actual, ok := info.labels[creationLabel]; !ok || actual != cfg.creation {
+			// Inspect may predate label support or the container may
+			// have been replaced between run and inspect; only delete
+			// when the generation matches. Missing label on an
+			// otherwise owned container is treated as owned for
+			// backward compatibility with pre-creation containers.
+			if ok {
+				return
+			}
+		}
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
@@ -243,8 +271,13 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 }
 
 // Terminate force-removes the container. Removing a container that no
-// longer exists is a success.
+// longer exists is a success. When this handle knows its creation
+// generation, a same-name replacement is never deleted: the inspect
+// generation must match before the delete is issued.
 func (c *Container) Terminate(ctx context.Context) error {
+	if c.creation != "" && c.generationReplaced(ctx) {
+		return fmt.Errorf("container %s was recreated; refusing to delete replaced container", c.id)
+	}
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(c.id)...)
@@ -252,6 +285,29 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return nil
 	}
 	return c.classify(ctx, err)
+}
+
+func (c *Container) generationReplaced(ctx context.Context) bool {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	if err != nil {
+		// Missing container means nothing to protect; let the delete
+		// run so idempotency holds. Other inspect failures fall
+		// through to the delete attempt as well.
+		return false
+	}
+	info, err := c.eng.parseInspect(stdout, c.id)
+	if err != nil {
+		return false
+	}
+	actual, ok := info.labels[creationLabel]
+	if !ok || actual == "" {
+		// Pre-creation containers carry no generation; allow delete
+		// for backward compatibility.
+		return false
+	}
+	return actual != c.creation
 }
 
 // ContainerIP returns the container's address on its first attached

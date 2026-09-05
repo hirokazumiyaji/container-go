@@ -415,3 +415,43 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 		t.Fatalf("existing container missing after conflict: %s / %v", out, inspectErr)
 	}
 }
+
+// TestIntegrationDockerStaleHandlePreservesReplacement covers #49: an
+// old handle must not delete a same-name replacement.
+func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-stale-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", name).Run()
+	}()
+
+	oldCtr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("first Run: %v", err)
+	}
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate old: %v", err)
+	}
+	newCtr, err := container.Run(ctx, "alpine:latest",
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("second Run: %v", err)
+	}
+	defer func() {
+		_ = newCtr.Terminate(context.Background())
+	}()
+	// Stale handle must refuse; replacement must survive.
+	if err := oldCtr.Terminate(ctx); err == nil {
+		t.Fatal("want error when stale handle deletes replacement")
+	}
+	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
+		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)
+	}
+}

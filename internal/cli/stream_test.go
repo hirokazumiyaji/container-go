@@ -79,3 +79,19 @@ func TestStreamHonorsContextCancellation(t *testing.T) {
 		}
 	}
 }
+
+func TestStreamCloseIsIdempotent(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `while true; do echo line; sleep 0.05; done`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}

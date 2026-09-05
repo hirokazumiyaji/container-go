@@ -136,3 +136,14 @@ func TestWithFilesFailureRollsBack(t *testing.T) {
 		t.Error("rollback delete not issued")
 	}
 }
+
+func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
+	f := &cpRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	for _, path := range []string{"/", "/etc/", "/foo/bar/"} {
+		if _, err := ctr.CopyFileFromContainer(context.Background(), path); err == nil {
+			t.Errorf("path %q: want error for root or directory path", path)
+		}
+	}
+}

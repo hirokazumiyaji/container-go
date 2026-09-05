@@ -424,6 +424,9 @@ func TestImagesCompatible(t *testing.T) {
 		{"redis:7-alpine@sha256:abc", "docker.io/library/redis:7-alpine@sha256:abc", true},
 		{"redis:7-alpine@sha256:new", "redis:7-alpine@sha256:old", false},
 		{"redis:7-alpine@sha256:abc", "redis:7-alpine", false},
+		{"evil/redis:7-alpine", "library/redis:7-alpine", false},
+		{"evil/redis:7-alpine", "docker.io/library/redis:7-alpine", false},
+		{"myorg/app:v1", "otherorg/app:v1", false},
 	}
 	for _, tc := range cases {
 		if got := imagesCompatible(tc.req, tc.act); got != tc.ok {

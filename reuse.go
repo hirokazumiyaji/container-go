@@ -274,10 +274,7 @@ func imagesCompatible(requested, actual string) bool {
 	if req == act {
 		return true
 	}
-	if strings.HasSuffix(act, "/"+req) || strings.HasSuffix(act, ":"+req) {
-		return true
-	}
-	return imageNameTag(req) == imageNameTag(act)
+	return strings.HasSuffix(act, "/"+req) || strings.HasSuffix(req, "/"+act)
 }
 
 func imageDigest(ref string) string {
@@ -291,13 +288,6 @@ func imageDigest(ref string) string {
 func stripImageDigest(ref string) string {
 	if i := strings.Index(ref, "@"); i >= 0 {
 		return ref[:i]
-	}
-	return ref
-}
-
-func imageNameTag(ref string) string {
-	if i := strings.LastIndex(ref, "/"); i >= 0 {
-		ref = ref[i+1:]
 	}
 	return ref
 }

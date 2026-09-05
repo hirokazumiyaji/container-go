@@ -222,6 +222,46 @@ func TestClassifyPassesThroughNil(t *testing.T) {
 	}
 }
 
+type hangingProbeRunner struct {
+	started chan struct{}
+}
+
+func (h *hangingProbeRunner) Run(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+	close(h.started)
+	<-ctx.Done()
+	return nil, nil, ctx.Err()
+}
+
+func TestClassifyProbeTimesOut(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	r := &hangingProbeRunner{started: make(chan struct{})}
+	start := time.Now()
+	err := Classify(context.Background(), r, orig, appleProbe)
+	elapsed := time.Since(start)
+	if !errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("Classify took %v, want finite probe timeout", elapsed)
+	}
+	select {
+	case <-r.started:
+	default:
+		t.Error("probe was not invoked")
+	}
+}
+
+func TestClassifyRespectsCallerCancel(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	r := &hangingProbeRunner{started: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := Classify(ctx, r, orig, appleProbe)
+	if !errors.Is(err, orig) {
+		t.Fatalf("error = %v, want original preserved on cancel", err)
+	}
+}
+
 func TestIsCommandExit(t *testing.T) {
 	if !IsCommandExit(&CLIError{Args: []string{"exec"}, ExitCode: 1}) {
 		t.Error("CLIError should be a command exit")

@@ -139,6 +139,11 @@ func IsCommandExit(err error) bool {
 	return errors.As(err, &e)
 }
 
+// probeTimeout bounds the diagnostic liveness check so a hung backend
+// cannot stall error handling forever. Caller cancellation still
+// aborts the probe via context propagation.
+const probeTimeout = 5 * time.Second
+
 // Classify augments a failed CLI call: if the backend does not answer
 // the probe, the failure is reported as ErrSystemNotRunning instead of
 // the original error.
@@ -150,7 +155,14 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if _, _, probeErr := r.Run(ctx, probe.Args...); probeErr != nil {
+	if ctx.Err() != nil {
+		// Caller already gave up; preserve the original failure
+		// instead of masking it with a probe cancellation.
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	defer cancel()
+	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
 		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
 	}
 	return err

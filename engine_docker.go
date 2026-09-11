@@ -50,7 +50,8 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
-// else publishes on loopback.
+// else publishes on loopback. Note: a `docker context` pointing at a
+// remote daemon is not detected; only DOCKER_HOST is honored.
 func (dockerEngine) defaultHost() string {
 	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
 		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
@@ -60,12 +61,46 @@ func (dockerEngine) defaultHost() string {
 	return "127.0.0.1"
 }
 
+// isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
+// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
+// the remote host is unreachable from the client.
+func isRemoteDockerHost() bool {
+	host := (dockerEngine{}).defaultHost()
+	return host != "127.0.0.1" && host != "::1" && host != "localhost"
+}
+
+// isLoopbackOrUnspecified reports addresses that mean "this host" and
+// must be rewritten to defaultHost() on a remote daemon.
+func isLoopbackOrUnspecified(addr string) bool {
+	switch addr {
+	case "", "0.0.0.0", "::", "127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost":
+		return true
+	}
+	return false
+}
+
+// dockerConnectHost rewrites loopback/unspecified binds to the
+// client-facing host. Locally this is a no-op (127.0.0.1); with
+// DOCKER_HOST=tcp://remote it returns the remote hostname.
+func dockerConnectHost(addr string, eng engine) string {
+	if isLoopbackOrUnspecified(addr) {
+		return eng.defaultHost()
+	}
+	return addr
+}
+
 func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// The pull policy fetches the image beforehand; --pull=never keeps
 	// the run command from pulling a second time behind our back.
 	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
 	// Publish every declared port the user did not publish explicitly
-	// to a daemon-assigned loopback port.
+	// to a daemon-assigned port. Locally this binds loopback; on a
+	// remote daemon (tcp:// DOCKER_HOST) it binds all interfaces so
+	// the client can reach it via defaultHost().
+	bindAddr := "127.0.0.1"
+	if isRemoteDockerHost() {
+		bindAddr = "0.0.0.0"
+	}
 	var extraPublish []string
 	for _, spec := range cfg.exposed {
 		published := false
@@ -76,7 +111,7 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 			}
 		}
 		if !published {
-			extraPublish = append(extraPublish, "127.0.0.1::"+spec.String())
+			extraPublish = append(extraPublish, bindAddr+"::"+spec.String())
 		}
 	}
 	return append(args, cfg.commonRunArgs(image, envFile, extraPublish)...)

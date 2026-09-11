@@ -94,3 +94,74 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 
 	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
 }
+
+func TestReaperScriptHasTimeoutAndAnchoredGrep(t *testing.T) {
+	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
+		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
+	}
+	if !strings.Contains(reaperScript, "grep -F") {
+		t.Error("reaper script must use grep -F for the generation check")
+	}
+	// The key must be part of the match, not just the bare value, so a
+	// digest collision cannot trigger deletion.
+	if !strings.Contains(reaperScript, `"$key"`) || !strings.Contains(reaperScript, `"$creation"`) {
+		t.Error("reaper script must match both the label key and the creation value")
+	}
+}
+
+func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	r.spawnFailures = 2
+	if err := r.register("ok", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	if r.spawnFailures != 0 {
+		t.Errorf("spawnFailures = %d, want 0 after success (consecutive counting)", r.spawnFailures)
+	}
+}
+
+func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	defer r.closeStdin()
+	if err := r.register("good-id", "0123456789abcdef"); err != nil {
+		t.Errorf("valid creation rejected: %v", err)
+	}
+	if err := r.register("good-id", "not-hex"); err == nil {
+		t.Error("invalid creation accepted")
+	}
+}
+
+func TestReaperGuardsDeleteByCreation(t *testing.T) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := dir + "/calls.log"
+	binPath := dir + "/container"
+	// Stub: inspect prints the creation it was told to know; delete is logged.
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then echo \"" + creationLabel + " 0123456789abcdef\"; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("guarded", "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := r.register("stale", "ffffffffffffffff"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force guarded")
+	// Stale generation must not be deleted; poll briefly to confirm absence.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "delete --force stale") {
+			t.Fatal("stale generation was deleted; want guard to skip it")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}

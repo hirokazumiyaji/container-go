@@ -54,6 +54,12 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1}
 	}
+	if args[0] == "version" || args[0] == "info" {
+		if f.systemUp {
+			return []byte("ok"), nil, nil
+		}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
+	}
 	// Image handling for both backends: docker inspects via
 	// `image inspect` and pulls via `pull`; apple uses
 	// `image inspect` / `image pull`.

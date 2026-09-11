@@ -75,7 +75,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if !isNotFound(err) {
 				return nil, err
 			}
-			ctr, createErr := reuseCreate(ctx, image, cfg)
+			// Creation carries its own runTimeout budget detached from
+			// the attach deadline: a leader pulling a large image must
+			// not be cut off after reuseAttachTimeout.
+			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
 				return ctr, nil
 			}
@@ -99,7 +102,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteNamed(ctx, cfg, cfg.name); err != nil {
+			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
 				return nil, err
 			}
 			recreated = true
@@ -135,7 +138,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		cfg.creation = newCreationID()
 	}
 
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	// The leader's pull and create get an independent runTimeout budget
+	// even when the caller's context carries a tighter attach deadline.
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
@@ -169,6 +174,31 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		}
 	}
 	return ctr, nil
+}
+
+// deleteStoppedReuse removes a stopped reuse container only when its
+// creation generation still matches the inspected one. A mismatch means
+// another process already recreated the name; the caller loops and
+// attaches to the fresh generation instead of deleting it.
+func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	expected := info.labels[creationLabel]
+	if expected == "" {
+		return deleteNamed(ctx, cfg, cfg.name)
+	}
+	fresh, err := inspectNamed(ctx, cfg, cfg.name)
+	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	if fresh.state != StateStopped {
+		return nil
+	}
+	if got := fresh.labels[creationLabel]; got != "" && got != expected {
+		return nil
+	}
+	return deleteNamed(ctx, cfg, cfg.name)
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {

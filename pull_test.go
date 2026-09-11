@@ -407,3 +407,101 @@ func TestEnsureImagePullAlwaysDoesNotJoinMissingFlight(t *testing.T) {
 		t.Errorf("pulls = %d, want 1 from PullAlways", base.pullCalls)
 	}
 }
+
+func TestPullWithSharesFlightAcrossConcurrentCallers(t *testing.T) {
+	base := newTestRunner()
+	eng := dockerEngine{}
+	release := make(chan struct{})
+	releaseStarted := make(chan struct{})
+	var once sync.Once
+	r := &hookRunner{
+		fakeRunner: base,
+		before: func(args []string) {
+			if args[0] == "pull" {
+				once.Do(func() { close(releaseStarted) })
+				<-release
+			}
+		},
+	}
+	const n = 10
+	errs := make([]error, n)
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs[i] = pullWith(context.Background(), r, eng, "redis:7-alpine")
+		}()
+	}
+	<-releaseStarted
+	// Let all waiters join the in-flight pull before releasing it.
+	time.Sleep(100 * time.Millisecond)
+	close(release)
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Fatalf("caller %d: %v", i, err)
+		}
+	}
+	if base.pullCalls != 1 {
+		t.Fatalf("pulls = %d, want 1 (shared flight)", base.pullCalls)
+	}
+}
+
+func TestPullWithClassifiesBackendDown(t *testing.T) {
+	f := &fakeRunner{systemUp: false}
+	if err := pullWith(context.Background(), f, dockerEngine{}, "redis:7-alpine"); !errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
+	}
+}
+
+func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
+	f := newTestRunner()
+	if err := Pull(context.Background(), "-bad"); err == nil {
+		t.Fatal("want error for invalid image")
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("CLI was called despite invalid image: %v", f.calls)
+	}
+}
+
+func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
+	f := newTestRunner()
+	// fakeRunner answers list calls with empty output by default; drive
+	// the parse/remove path through a stub runner instead.
+	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
+	if err != nil {
+		t.Fatalf("pruneReuseGroupWith: %v", err)
+	}
+	if len(removed) != 2 {
+		t.Errorf("removed = %v, want 2 ids", removed)
+	}
+	if r.listCalls != 1 || r.deleteCalls != 2 {
+		t.Errorf("list=%d delete=%d, want 1/2", r.listCalls, r.deleteCalls)
+	}
+	_ = f
+}
+
+type reuseGroupRunner struct {
+	ids         []string
+	listCalls   int
+	deleteCalls int
+}
+
+func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "ps":
+		r.listCalls++
+		// docker parseReuseGroupIDs splits lines; return the stub ids.
+		return []byte("a\nb\n"), nil, nil
+	case "ls":
+		r.listCalls++
+		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil
+	case "rm", "delete":
+		r.deleteCalls++
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}

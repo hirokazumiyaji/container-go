@@ -23,6 +23,7 @@ func dockerTestConfig(t *testing.T, opts ...Option) *config {
 }
 
 func TestDockerRunArgsAutoPublishExposedPorts(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
 	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp", "8080"))
 
 	args := dockerEngine{}.runArgs(cfg, "redis:7-alpine", "")
@@ -237,6 +238,53 @@ func TestDockerHostHonorsDockerHostEnv(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	if got := (dockerEngine{}).defaultHost(); got != "127.0.0.1" {
 		t.Errorf("defaultHost = %q, want 127.0.0.1", got)
+	}
+}
+
+func TestDockerRunArgsBindAllInterfacesOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://docker:2375")
+	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined := strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 0.0.0.0::6379/tcp") {
+		t.Errorf("remote auto-publish must bind 0.0.0.0: %s", joined)
+	}
+	if strings.Contains(joined, "127.0.0.1::6379") {
+		t.Errorf("remote must not bind loopback: %s", joined)
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	cfg = dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined = strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 127.0.0.1::6379/tcp") {
+		t.Errorf("local auto-publish must bind loopback: %s", joined)
+	}
+}
+
+func TestDockerEndpointsRewriteLoopbackOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d, WithExposedPorts("6379/tcp"))
+	// testdata binds 127.0.0.1:49153 on the daemon; the client must dial
+	// the remote host instead.
+	ep, err := ctr.Endpoint(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if ep != "10.0.0.5:49153" {
+		t.Errorf("Endpoint = %q, want 10.0.0.5:49153", ep)
+	}
+}
+
+func TestDockerConnectHostMapping(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	eng := dockerEngine{}
+	for _, addr := range []string{"", "0.0.0.0", "::", "127.0.0.1", "::1", "localhost"} {
+		if got := dockerConnectHost(addr, eng); got != "10.0.0.5" {
+			t.Errorf("dockerConnectHost(%q) = %q, want 10.0.0.5", addr, got)
+		}
+	}
+	if got := dockerConnectHost("192.168.1.10", eng); got != "192.168.1.10" {
+		t.Errorf("explicit host must pass through, got %q", got)
 	}
 }
 

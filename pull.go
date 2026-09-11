@@ -53,15 +53,16 @@ func Pull(ctx context.Context, image string) error {
 	if err != nil {
 		return err
 	}
-	r := &cli.ExecRunner{Binary: eng.binary()}
+	return pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image)
+}
+
+// pullWith is the fake-runner-driven core of Pull: the flight shares one
+// backend pull of the image, and failures go through Classify.
+func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error {
 	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, ""), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
-		_, _, err := r.Run(execCtx, eng.pullImageArgs(image, "")...)
-		if err != nil {
-			return cli.Classify(execCtx, r, err, eng.probe())
-		}
-		return nil
+		return pullImage(execCtx, r, eng, image, "")
 	})
 }
 

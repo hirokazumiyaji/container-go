@@ -134,8 +134,10 @@ provides:
 - `WithExposedPorts(ports ...string)`: declare the container ports
   (`"6379/tcp"` form) endpoints may resolve
 - `WithEnv(env map[string]string)`: environment variables
-- `WithCmd(cmd ...string)` / `WithEntrypoint(ep ...string)`: command
-  and entrypoint overrides
+- `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`:
+  command and entrypoint overrides. Entrypoint is a single token per
+  `docker run --entrypoint` semantics; pass multi-token commands via
+  `WithCmd`.
 - `WithWaitStrategy(s wait.Strategy)`: readiness detection
 - `WithName(name string)`: container name (default
   `containergo-<random hex>`)
@@ -164,11 +166,18 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
+func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
+
+`Exec` returns the exit code with combined stdout+stderr (a non-zero
+exit is a result, not an error); this is kept for v1 compatibility.
+`LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
+containers. `Terminate` is generation-guarded: it refuses to delete a
+name recycled by another process (see Reuse below).
 
 `Terminate` maps to `container delete --force` and is idempotent
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
@@ -216,11 +225,16 @@ provides:
   to the container IP succeeds
 - `wait.ForHTTP(path string)`: wait until an HTTP request via
   `net/http` matches the status predicate (2xx by default,
-  `WithStatusCodeMatcher` to change)
+  `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select
+  the target; `WithHeaders` / `WithBasicAuth` / `WithTLS` /
+  `WithTLSConfig` / `WithHTTPClient` cover auth, TLS, and custom
+  transports without breaking the default plain-HTTP probe.
 - `wait.ForExec(cmd []string)`: wait until `container exec` exits with
   an accepted code (0 by default)
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition
+  composition. Each child keeps its own `WithStartupTimeout`; bound the
+  whole composition with `context.WithTimeout` from the caller rather
+  than a synthetic composite deadline.
 
 Every strategy carries `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms). If the container transitions to
@@ -274,6 +288,25 @@ reaper (for debugging).
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
+
+## Reuse
+
+`WithReuse` turns `Run` into a get-or-create for a stable `WithName`
+(shared across processes). The compatibility check is intentionally
+narrow: image reference and declared/published ports only. `env`,
+`cmd`, and `mounts` differences attach silently to the existing
+container by design; callers needing isolation should use distinct
+names or reset state via `Exec`.
+
+Each creation carries a `creationLabel` generation (16-hex). `Terminate`
+and the stopped-recreate path compare generations and refuse to delete
+a replaced name, closing the inspect/delete race. The watchdog reaper
+stores the generation and guards deletion with an anchored `grep -F` on
+the label key and value; each backend call carries a 10-30s timeout via
+POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung daemon
+call cannot wedge the rest. The leader's own pull/create uses an
+independent `runTimeout` budget; `reuseAttachTimeout` bounds only
+attach polling for another process's container.
 
 ## Security design
 
@@ -425,12 +458,17 @@ port bindings (container port → host address and port).
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults
 to the published-port model testcontainers uses. Ports declared via
-`WithExposedPorts` are automatically published to random loopback
-ports (`-p 127.0.0.1::<port>`); `Host` returns `127.0.0.1` (or the
-host from a `tcp://` `DOCKER_HOST`) and `MappedPort` the assigned host
-port. The daemon assigns ports atomically at start, so the free-port
-race avoided on Apple Container does not reappear. The Apple backend's
-direct-IP default is unchanged.
+`WithExposedPorts` are automatically published to random ports:
+locally `-p 127.0.0.1::<port>`, on a remote daemon
+(`DOCKER_HOST=tcp://host`) `-p 0.0.0.0::<port>` so the client can reach
+it; `Host` returns `127.0.0.1` (or the host from a `tcp://`
+`DOCKER_HOST`) and `MappedPort` the assigned host port. Loopback and
+unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
+binding observed on a remote daemon still resolves to the remote host.
+Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
+daemon is not detected. The daemon assigns ports atomically at start,
+so the free-port race avoided on Apple Container does not reappear.
+The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for

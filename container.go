@@ -28,8 +28,14 @@ const (
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
 	runTimeout = 10 * time.Minute
-	// reuseAttachTimeout bounds waiting for another process's create
-	// to reach a usable state during WithReuse get-or-create.
+)
+
+// reuseAttachTimeout bounds waiting for another process's create to
+// reach a usable state during WithReuse get-or-create. It applies to
+// attach polling only; a leader's own image pull and create carry an
+// independent runTimeout budget. Vars (not consts) so tests can shrink
+// them.
+var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
 )
@@ -323,7 +329,11 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
 	if len(c.published) > 0 {
-		return c.published[0].connectAddr(), nil
+		addr := c.published[0].connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, nil
 	}
 	if c.eng.directIP() {
 		return c.ContainerIP(ctx)
@@ -355,7 +365,11 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	}
 	for _, p := range c.published {
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			return p.connectAddr(), p.hostPort, nil
+			addr := p.connectAddr()
+			if !c.eng.directIP() {
+				addr = dockerConnectHost(addr, c.eng)
+			}
+			return addr, p.hostPort, nil
 		}
 	}
 	if !slices.Contains(c.exposed, spec) {
@@ -375,11 +389,7 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
-			host := b.hostAddr
-			if host == "" || host == "0.0.0.0" || host == "::" {
-				host = c.eng.defaultHost()
-			}
-			return host, b.hostPort, nil
+			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
 		}
 	}
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
@@ -407,7 +417,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, c.classify(ctx, err)
+		return nil, wrapNotFound(c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

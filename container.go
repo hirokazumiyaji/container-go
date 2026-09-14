@@ -278,16 +278,26 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // generation must match, and the delete then targets the immutable ID
 // that inspect returned, so a replacement created after the check is
 // simply not found. Backends without an immutable ID (Apple Container)
-// fall back to the name.
+// fall back to the name. An inspect failure other than not-found aborts
+// the delete: without a verified generation, a name-based delete could
+// hit a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
 	target := c.id
 	if c.creation != "" {
-		uid, replaced := c.generationReplaced(ctx)
-		if replaced {
+		info, err := c.inspectFresh(ctx)
+		if isNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		}
+		// An absent generation cannot prove ownership of this handle,
+		// so it counts as a replacement too.
+		if info.labels[creationLabel] != c.creation {
 			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
-		if uid != "" {
-			target = uid
+		if info.uid != "" {
+			target = info.uid
 		}
 	}
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
@@ -297,35 +307,6 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return nil
 	}
 	return c.classify(ctx, err)
-}
-
-// generationReplaced reports whether the live container's generation
-// differs from this handle's, returning the live immutable ID when the
-// generation still matches.
-func (c *Container) generationReplaced(ctx context.Context) (uid string, replaced bool) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		// Missing container means nothing to protect; let the delete
-		// run so idempotency holds. Other inspect failures fall
-		// through to the delete attempt as well.
-		return "", false
-	}
-	info, err := c.eng.parseInspect(stdout, c.id)
-	if err != nil {
-		return "", false
-	}
-	actual, ok := info.labels[creationLabel]
-	if !ok || actual == "" {
-		// An absent generation cannot prove ownership of this handle,
-		// so treat it as a replacement and refuse the delete.
-		return "", true
-	}
-	if actual != c.creation {
-		return "", true
-	}
-	return info.uid, false
 }
 
 // ContainerIP returns the container's address on its first attached

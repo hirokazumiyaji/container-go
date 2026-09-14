@@ -3,7 +3,6 @@ package container
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 
@@ -89,9 +88,10 @@ func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to become ready") {
 		t.Errorf("error = %v, want wait-path failure after deferred inspect", err)
 	}
-	del := f.callWith("delete")
-	if del == nil || !slices.Contains(del, "--force") || !slices.Contains(del, "myctr") {
-		t.Errorf("rollback delete not issued: %v", f.calls)
+	// Rollback goes through Terminate, which fails closed when the
+	// generation cannot be verified: no name-based delete is issued.
+	if del := f.callWith("delete"); del != nil {
+		t.Errorf("rollback deleted without a verified generation: %v", del)
 	}
 }
 

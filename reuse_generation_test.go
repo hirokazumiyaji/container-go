@@ -80,54 +80,37 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	}
 }
 
-func TestDeleteStoppedReuseSkipsReplacementBetweenInspectAndDelete(t *testing.T) {
+func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state:  StateStopped,
 		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
-	r := &flipGenerationRunner{
-		firstCreation: "aaaaaaaaaaaaaaaa",
-		firstState:    "stopped",
-		laterCreation: "bbbbbbbbbbbbbbbb",
-		laterState:    "stopped",
-	}
-	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
+	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
 		t.Fatalf("deleteStoppedReuse = %v", err)
 	}
-	if r.deleteCalls != 0 {
-		t.Errorf("deleteCalls = %d, want 0 when generation flips before delete", r.deleteCalls)
+	// The delete must target the ID inspect returned, never the name,
+	// so a same-name replacement created after the check is not found.
+	if len(r.deleted) != 1 || r.deleted[0] != r.uid {
+		t.Errorf("deleted = %v, want [%s]", r.deleted, r.uid)
 	}
 }
 
-type flipGenerationRunner struct {
-	inspects      int
-	firstCreation string
-	firstState    string
-	laterCreation string
-	laterState    string
-	deleteCalls   int
+type dockerGenerationRunner struct {
+	creation string
+	uid      string
+	deleted  []string
 }
 
-func (g *flipGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		g.inspects++
-		creation, state := g.firstCreation, g.firstState
-		if g.inspects > 1 {
-			creation, state = g.laterCreation, g.laterState
-		}
-		labels := ""
-		if creation != "" {
-			labels = `,"labels":{"` + creationLabel + `":"` + creation + `"}`
-		}
-		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + state + `","networks":[]}}]`), nil, nil
-	case "system":
-		return []byte("running"), nil, nil
-	case "version":
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+	case "info":
 		return []byte("ok"), nil, nil
-	case "delete", "rm":
-		g.deleteCalls++
+	case "rm":
+		g.deleted = append(g.deleted, args[len(args)-1])
 		return nil, nil, nil
 	default:
 		return nil, nil, nil

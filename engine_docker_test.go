@@ -313,6 +313,34 @@ func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
 	}
 }
 
+func TestDockerRejectsLoopbackPublishOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	for _, spec := range []string{"127.0.0.1:18080:80", "[::1]:18080:80", "127.0.0.2:18080:80"} {
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"), withRunner(d), withEngine(dockerEngine{}), WithPublishedPort(spec))
+		if err == nil || !strings.Contains(err.Error(), "unreachable") {
+			t.Errorf("WithPublishedPort(%q) on remote daemon: err = %v, want unreachable rejection", spec, err)
+		}
+	}
+	if len(d.callWith("run")) != 0 {
+		t.Errorf("run must not be issued: %v", d.callWith("run"))
+	}
+	// Unspecified and non-loopback binds stay allowed.
+	for _, spec := range []string{"0.0.0.0:18080:80", "10.0.0.5:18080:80", "18080:80"} {
+		cfg := dockerTestConfig(t, WithPublishedPort(spec))
+		if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+			t.Errorf("checkConfig(%q) = %v, want nil", spec, err)
+		}
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	cfg := dockerTestConfig(t, WithPublishedPort("127.0.0.1:18080:80"))
+	if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+		t.Errorf("local loopback publish must be allowed: %v", err)
+	}
+}
+
 func TestDockerRunArgsKeepLoopbackOnLoopbackDOCKERHOST(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://127.0.0.2:2375")
 	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp"))

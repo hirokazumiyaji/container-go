@@ -95,17 +95,23 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
 }
 
-func TestReaperScriptHasTimeoutAndAnchoredGrep(t *testing.T) {
+func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
-	if !strings.Contains(reaperScript, "grep -F") {
-		t.Error("reaper script must use grep -F for the generation check")
+	// The creation label must be read as a structural JSON field, anchored
+	// at line start on the quoted key, and compared for exact equality.
+	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
+		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	// Key and value must be matched as one association so a bare hex
-	// collision in unrelated inspect text cannot authorize deletion.
-	if !strings.Contains(reaperScript, `"$key=$creation"`) {
-		t.Error("reaper script must match key=value association, not separate greps")
+	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+		t.Error("reaper script must compare the extracted generation exactly")
+	}
+}
+
+func TestBreQuoteEscapesLabelKey(t *testing.T) {
+	if got := breQuote("com.github.x-y"); got != `com\.github\.x-y` {
+		t.Errorf("breQuote = %q", got)
 	}
 }
 
@@ -142,7 +148,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	// Stub: inspect prints the creation it was told to know; delete is logged.
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo \"" + creationLabel + "=0123456789abcdef\"; fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -166,18 +172,21 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	}
 }
 
-func TestReaperRejectsDetachedKeyAndValueCollision(t *testing.T) {
+func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"
 	oldCreation := "0123456789abcdef"
-	// Inspect contains the label key and the old hex value separately
-	// (e.g. as a user label), but not as the creationLabel association.
+	// The live creation label differs; the old generation appears only
+	// inside user label values, in both key=value and (JSON-escaped)
+	// quoted forms, and under a look-alike key. None is the field.
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = \"inspect\" ]; then\n" +
-		"  echo '" + creationLabel + "=ffffffffffffffff'\n" +
-		"  echo 'user.label=" + oldCreation + "'\n" +
+		"  echo '  \"" + creationLabel + "\": \"ffffffffffffffff\",'\n" +
+		"  echo '  \"user.a\": \"" + creationLabel + "=" + oldCreation + "\",'\n" +
+		"  echo '  \"user.b\": \"\\\"" + creationLabel + "\\\": \\\"" + oldCreation + "\\\"\",'\n" +
+		"  echo '  \"" + strings.ReplaceAll(creationLabel, ".", "-") + "\": \"" + oldCreation + "\",'\n" +
 		"fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
@@ -187,12 +196,41 @@ func TestReaperRejectsDetachedKeyAndValueCollision(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
-	deadline := time.Now().Add(2 * time.Second)
+	waitForLogLines(t, logPath, "inspect ctr")
+	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		data, _ := os.ReadFile(logPath)
 		if strings.Contains(string(data), "delete --force ctr") {
-			t.Fatalf("reaper deleted on detached key/value collision: %q", data)
+			t.Fatalf("reaper deleted on label value collision: %q", data)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestReaperDeletesByImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/calls.log"
+	binPath := dir + "/docker"
+	creation := "0123456789abcdef"
+	uid := strings.Repeat("ab", 32)
+	// Docker-style inspect: the generation matches and an immutable Id is
+	// present, so the delete must target the Id rather than the name.
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then\n" +
+		"  echo '    \"Id\": \"" + uid + "\",'\n" +
+		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "rm")
+	if err := r.register("ctr", creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
+		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
 	}
 }

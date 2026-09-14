@@ -90,7 +90,7 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。`docker context` 経由のリモート指定は検知しません。割り当ては
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。`docker context` 経由のリモート指定は検知しません。割り当ては
 デーモンが起動時に原子的に行うため、こちらでも並列テストがポートを
 奪い合うことはありません。
 

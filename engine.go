@@ -10,6 +10,10 @@ import (
 type engineInfo struct {
 	state  State
 	labels map[string]string
+	// uid is the backend-assigned immutable identity (Docker's 64-hex
+	// Id). Empty when the backend addresses containers by name only
+	// (Apple Container), where a delete cannot be bound to a generation.
+	uid string
 	// image is the image reference the container was created from.
 	image string
 	// ip is the container's address on its first network; empty when
@@ -34,6 +38,9 @@ type engine interface {
 	name() string
 	binary() string
 	probe() cli.Probe
+	// checkConfig rejects option combinations this backend cannot
+	// honor before anything is created.
+	checkConfig(cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)

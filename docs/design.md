@@ -300,11 +300,15 @@ names or reset state via `Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path compare generations and refuse to delete
-a replaced name, closing the inspect/delete race. The watchdog reaper
-stores the generation and guards deletion with an anchored `grep -F` on
-the label key and value; each backend call carries a 10-30s timeout via
-POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung daemon
-call cannot wedge the rest. The leader's own pull/create uses an
+a replaced name; on Docker the delete then targets the immutable `Id`
+inspect returned, so a replacement created between check and delete is
+simply not found. Apple Container addresses containers by name only, so
+there the check-then-delete window cannot be closed. The watchdog
+reaper stores the generation, reads the label as a line-anchored JSON
+field (`"key": "value"`, never a substring), and likewise deletes by
+`Id` when inspect reports one; each backend call carries a 10-30s
+timeout via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one
+hung daemon call cannot wedge the rest. The leader's own pull/create uses an
 independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 
@@ -465,6 +469,9 @@ it; `Host` returns `127.0.0.1` (or the host from a `tcp://`
 `DOCKER_HOST`) and `MappedPort` the assigned host port. Loopback and
 unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
 binding observed on a remote daemon still resolves to the remote host.
+An explicit `WithPublishedPort` loopback bind on a remote daemon is
+rejected by `Run`: Docker would listen on the remote machine's loopback,
+which no client-side rewrite can reach.
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
 daemon is not detected. The daemon assigns ports atomically at start,
 so the free-port race avoided on Apple Container does not reappear.

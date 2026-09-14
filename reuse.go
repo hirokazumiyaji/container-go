@@ -176,42 +176,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	return ctr, nil
 }
 
-// deleteStoppedReuse removes a stopped reuse container only when its
-// creation generation still matches the inspected one. A mismatch means
+// deleteStoppedReuse removes a stopped reuse container through a
+// handle bound to its inspected generation, so Terminate re-checks the
+// generation and deletes by immutable ID. A replaced generation means
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
-	expected := info.labels[creationLabel]
-	if expected == "" {
-		return deleteNamed(ctx, cfg, cfg.name)
-	}
-	fresh, err := inspectNamed(ctx, cfg, cfg.name)
-	if err != nil {
-		if isNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	if fresh.state != StateStopped {
-		return nil
-	}
-	// An absent generation cannot prove ownership of the original
-	// handle, so treat it as a replacement and skip deletion.
-	got := fresh.labels[creationLabel]
-	if got != expected {
-		return nil
-	}
-	// Delete through a handle bound to the fresh generation so
-	// Terminate re-checks before issuing the name-based delete.
 	ctr := namedContainer(cfg, cfg.name)
-	ctr.creation = got
-	if err := ctr.Terminate(ctx); err != nil {
-		if errors.Is(err, ErrGenerationReplaced) {
-			return nil
-		}
-		return err
+	ctr.creation = info.labels[creationLabel]
+	err := ctr.Terminate(ctx)
+	if errors.Is(err, ErrGenerationReplaced) {
+		return nil
 	}
-	return nil
+	return err
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -230,10 +207,6 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
 	return namedContainer(cfg, id).inspectFresh(ctx)
-}
-
-func deleteNamed(ctx context.Context, cfg *config, id string) error {
-	return namedContainer(cfg, id).Terminate(ctx)
 }
 
 func namedContainer(cfg *config, id string) *Container {

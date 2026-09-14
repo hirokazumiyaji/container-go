@@ -124,6 +124,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.eng = eng
 	}
 	applyEngineBinary(cfg)
+	if err := cfg.eng.checkConfig(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}
@@ -272,21 +275,34 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // Terminate force-removes the container. Removing a container that no
 // longer exists is a success. When this handle knows its creation
 // generation, a same-name replacement is never deleted: the inspect
-// generation must match before the delete is issued.
+// generation must match, and the delete then targets the immutable ID
+// that inspect returned, so a replacement created after the check is
+// simply not found. Backends without an immutable ID (Apple Container)
+// fall back to the name.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.creation != "" && c.generationReplaced(ctx) {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	target := c.id
+	if c.creation != "" {
+		uid, replaced := c.generationReplaced(ctx)
+		if replaced {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		if uid != "" {
+			target = uid
+		}
 	}
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(c.id)...)
+	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if err == nil || isNotFound(err) {
 		return nil
 	}
 	return c.classify(ctx, err)
 }
 
-func (c *Container) generationReplaced(ctx context.Context) bool {
+// generationReplaced reports whether the live container's generation
+// differs from this handle's, returning the live immutable ID when the
+// generation still matches.
+func (c *Container) generationReplaced(ctx context.Context) (uid string, replaced bool) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
@@ -294,19 +310,22 @@ func (c *Container) generationReplaced(ctx context.Context) bool {
 		// Missing container means nothing to protect; let the delete
 		// run so idempotency holds. Other inspect failures fall
 		// through to the delete attempt as well.
-		return false
+		return "", false
 	}
 	info, err := c.eng.parseInspect(stdout, c.id)
 	if err != nil {
-		return false
+		return "", false
 	}
 	actual, ok := info.labels[creationLabel]
 	if !ok || actual == "" {
 		// An absent generation cannot prove ownership of this handle,
 		// so treat it as a replacement and refuse the delete.
-		return true
+		return "", true
 	}
-	return actual != c.creation
+	if actual != c.creation {
+		return "", true
+	}
+	return info.uid, false
 }
 
 // ContainerIP returns the container's address on its first attached

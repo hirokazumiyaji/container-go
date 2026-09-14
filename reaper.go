@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -24,10 +25,14 @@ import (
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
 // silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, deletion is guarded by matching
-// the creation label key and value together (key=value or JSON forms),
-// so a bare hex collision in unrelated inspect text cannot authorize
-// deletion.
+// When a creation generation is known, the script inspects first and
+// reads the creation label as a structural JSON field: the match is
+// anchored at line start on the quoted key, so label values or other
+// text containing the same characters cannot satisfy it. When inspect
+// also reports an immutable "Id" (Docker), the delete targets that ID
+// instead of the name, so a same-name replacement created after the
+// check is simply not found. Apple Container has no such ID; there the
+// delete necessarily goes by name.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -51,22 +56,34 @@ echo "$ids" | while IFS= read -r line; do
   id=${line%% *}
   creation=${line#* }
   [ "$id" = "$line" ] && creation=""
+  target="$id"
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
     ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    if ! grep -F -q "$key=$creation" "$tmp" 2>/dev/null \
-      && ! grep -F -q "\"$key\":\"$creation\"" "$tmp" 2>/dev/null \
-      && ! grep -F -q "\"$key\": \"$creation\"" "$tmp" 2>/dev/null; then
-      rm -f "$tmp"
-      continue
-    fi
+    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
+    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
+    [ "$got" = "$creation" ] || continue
+    [ -n "$uid" ] && target="$uid"
   fi
-  run_with_timeout "$bin" "$sub" --force "$id" || true
+  run_with_timeout "$bin" "$sub" --force "$target" || true
 done
 `
 
 const maxReaperSpawnFailures = 3
+
+// breQuote escapes a literal for use inside the reaper's sed basic
+// regular expression, so the label key's dots match only dots.
+func breQuote(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if strings.ContainsRune(`\.*[]^$/`, c) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
 
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -157,7 +174,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, creationLabel)
+	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

@@ -138,7 +138,7 @@ func TestReaperDeletesMatchingGeneration(t *testing.T) {
 	binPath := dir + "/ctr"
 	creation := "ffffffffffffffff"
 	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo \"" + creationLabel + "=" + creation + "\"; exit 0; fi\n" +
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\",'; exit 0; fi\n" +
 		"echo \"$@\" >> " + logPath + "\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)

@@ -41,6 +41,22 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
+// checkConfig rejects explicit loopback publish binds on a remote
+// daemon: Docker would listen on the remote machine's loopback, which
+// no rewrite of the client-facing address can make reachable.
+func (dockerEngine) checkConfig(cfg *config) error {
+	if !isRemoteDockerHost() {
+		return nil
+	}
+	// hostAddr is validated as an IP literal by parsePublishSpec.
+	for _, p := range cfg.published {
+		if p.hostAddr != "" && net.ParseIP(p.hostAddr).IsLoopback() {
+			return fmt.Errorf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw)
+		}
+	}
+	return nil
+}
+
 func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
@@ -136,6 +152,7 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
+	ID    string `json:"Id"`
 	Name  string `json:"Name"`
 	State struct {
 		Status string `json:"Status"`
@@ -169,6 +186,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
 		labels: c.Config.Labels,
+		uid:    c.ID,
 		image:  c.Config.Image,
 		ip:     c.NetworkSettings.IPAddress,
 	}

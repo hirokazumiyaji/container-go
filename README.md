@@ -99,6 +99,9 @@ e.g. `tcp://docker:2375` in CI) it binds all interfaces
 `127.0.0.1` (or the host from a `tcp://` `DOCKER_HOST`) and
 `MappedPort` returns the assigned port. Assignment happens atomically
 in the daemon, so parallel tests do not race over ports here either.
+With a remote daemon, an explicit `WithPublishedPort` bound to loopback
+(`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
+on the remote machine.
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
 daemon is not detected.
 

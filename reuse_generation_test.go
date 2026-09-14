@@ -80,6 +80,60 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	}
 }
 
+func TestDeleteStoppedReuseSkipsReplacementBetweenInspectAndDelete(t *testing.T) {
+	info := &engineInfo{
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+	}
+	r := &flipGenerationRunner{
+		firstCreation: "aaaaaaaaaaaaaaaa",
+		firstState:    "stopped",
+		laterCreation: "bbbbbbbbbbbbbbbb",
+		laterState:    "stopped",
+	}
+	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse = %v", err)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 when generation flips before delete", r.deleteCalls)
+	}
+}
+
+type flipGenerationRunner struct {
+	inspects      int
+	firstCreation string
+	firstState    string
+	laterCreation string
+	laterState    string
+	deleteCalls   int
+}
+
+func (g *flipGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		g.inspects++
+		creation, state := g.firstCreation, g.firstState
+		if g.inspects > 1 {
+			creation, state = g.laterCreation, g.laterState
+		}
+		labels := ""
+		if creation != "" {
+			labels = `,"labels":{"` + creationLabel + `":"` + creation + `"}`
+		}
+		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + state + `","networks":[]}}]`), nil, nil
+	case "system":
+		return []byte("running"), nil, nil
+	case "version":
+		return []byte("ok"), nil, nil
+	case "delete", "rm":
+		g.deleteCalls++
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
 type generationStateRunner struct {
 	creation    string
 	state       string

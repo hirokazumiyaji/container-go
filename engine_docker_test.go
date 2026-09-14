@@ -278,7 +278,7 @@ func TestDockerEndpointsRewriteLoopbackOnRemoteDaemon(t *testing.T) {
 func TestDockerConnectHostMapping(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
 	eng := dockerEngine{}
-	for _, addr := range []string{"", "0.0.0.0", "::", "127.0.0.1", "::1", "localhost"} {
+	for _, addr := range []string{"", "0.0.0.0", "::", "127.0.0.1", "127.0.0.2", "::1", "localhost"} {
 		if got := dockerConnectHost(addr, eng); got != "10.0.0.5" {
 			t.Errorf("dockerConnectHost(%q) = %q, want 10.0.0.5", addr, got)
 		}
@@ -297,6 +297,31 @@ func TestDockerConnectHostMapping(t *testing.T) {
 		if got := dockerConnectHost(addr, eng); got != addr {
 			t.Errorf("local explicit dockerConnectHost(%q) = %q, want preserved", addr, got)
 		}
+	}
+}
+
+func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
+	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375", "tcp://127.0.0.2:2375", "tcp://[::1]:2375"} {
+		t.Setenv("DOCKER_HOST", host)
+		if isRemoteDockerHost() {
+			t.Errorf("DOCKER_HOST=%q: want local (not remote)", host)
+		}
+	}
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	if !isRemoteDockerHost() {
+		t.Error("tcp://10.0.0.5:2375 must be remote")
+	}
+}
+
+func TestDockerRunArgsKeepLoopbackOnLoopbackDOCKERHOST(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://127.0.0.2:2375")
+	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined := strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 127.0.0.1::6379/tcp") {
+		t.Errorf("loopback DOCKER_HOST must keep loopback publish: %s", joined)
+	}
+	if strings.Contains(joined, "0.0.0.0::6379") {
+		t.Errorf("loopback DOCKER_HOST must not bind all interfaces: %s", joined)
 	}
 }
 

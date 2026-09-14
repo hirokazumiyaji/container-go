@@ -197,10 +197,21 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 	}
 	// An absent generation cannot prove ownership of the original
 	// handle, so treat it as a replacement and skip deletion.
-	if got := fresh.labels[creationLabel]; got != expected {
+	got := fresh.labels[creationLabel]
+	if got != expected {
 		return nil
 	}
-	return deleteNamed(ctx, cfg, cfg.name)
+	// Delete through a handle bound to the fresh generation so
+	// Terminate re-checks before issuing the name-based delete.
+	ctr := namedContainer(cfg, cfg.name)
+	ctr.creation = got
+	if err := ctr.Terminate(ctx); err != nil {
+		if errors.Is(err, ErrGenerationReplaced) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {

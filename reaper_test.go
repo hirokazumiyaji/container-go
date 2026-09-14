@@ -102,10 +102,10 @@ func TestReaperScriptHasTimeoutAndAnchoredGrep(t *testing.T) {
 	if !strings.Contains(reaperScript, "grep -F") {
 		t.Error("reaper script must use grep -F for the generation check")
 	}
-	// The key must be part of the match, not just the bare value, so a
-	// digest collision cannot trigger deletion.
-	if !strings.Contains(reaperScript, `"$key"`) || !strings.Contains(reaperScript, `"$creation"`) {
-		t.Error("reaper script must match both the label key and the creation value")
+	// Key and value must be matched as one association so a bare hex
+	// collision in unrelated inspect text cannot authorize deletion.
+	if !strings.Contains(reaperScript, `"$key=$creation"`) {
+		t.Error("reaper script must match key=value association, not separate greps")
 	}
 }
 
@@ -142,7 +142,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	// Stub: inspect prints the creation it was told to know; delete is logged.
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo \"" + creationLabel + " 0123456789abcdef\"; fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then echo \"" + creationLabel + "=0123456789abcdef\"; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -161,6 +161,37 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 		data, _ := os.ReadFile(logPath)
 		if strings.Contains(string(data), "delete --force stale") {
 			t.Fatal("stale generation was deleted; want guard to skip it")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestReaperRejectsDetachedKeyAndValueCollision(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/calls.log"
+	binPath := dir + "/container"
+	oldCreation := "0123456789abcdef"
+	// Inspect contains the label key and the old hex value separately
+	// (e.g. as a user label), but not as the creationLabel association.
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then\n" +
+		"  echo '" + creationLabel + "=ffffffffffffffff'\n" +
+		"  echo 'user.label=" + oldCreation + "'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("ctr", oldCreation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "delete --force ctr") {
+			t.Fatalf("reaper deleted on detached key/value collision: %q", data)
 		}
 		time.Sleep(50 * time.Millisecond)
 	}

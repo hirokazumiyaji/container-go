@@ -24,8 +24,10 @@ import (
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
 // silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, deletion is guarded by an
-// anchored grep -F on the creation label key and value.
+// When a creation generation is known, deletion is guarded by matching
+// the creation label key and value together (key=value or JSON forms),
+// so a bare hex collision in unrelated inspect text cannot authorize
+// deletion.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -52,8 +54,12 @@ echo "$ids" | while IFS= read -r line; do
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
     ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    grep -F -q "$key" "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
-    grep -F -q "$creation" "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+    if ! grep -F -q "$key=$creation" "$tmp" 2>/dev/null \
+      && ! grep -F -q "\"$key\":\"$creation\"" "$tmp" 2>/dev/null \
+      && ! grep -F -q "\"$key\": \"$creation\"" "$tmp" 2>/dev/null; then
+      rm -f "$tmp"
+      continue
+    fi
     rm -f "$tmp"
   fi
   run_with_timeout "$bin" "$sub" --force "$id" || true

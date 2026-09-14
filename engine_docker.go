@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
 	"strconv"
@@ -65,18 +66,22 @@ func (dockerEngine) defaultHost() string {
 // tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
 // the remote host is unreachable from the client.
 func isRemoteDockerHost() bool {
-	host := (dockerEngine{}).defaultHost()
-	return host != "127.0.0.1" && host != "::1" && host != "localhost"
+	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
-// must be rewritten to defaultHost() on a remote daemon.
+// must be rewritten to defaultHost() on a remote daemon. IP literals
+// use net.IP.IsLoopback / IsUnspecified so the full 127.0.0.0/8 and
+// ::1 ranges are covered, not only a few spellings.
 func isLoopbackOrUnspecified(addr string) bool {
-	switch addr {
-	case "", "0.0.0.0", "::", "127.0.0.1", "::1", "::ffff:127.0.0.1", "localhost":
+	if addr == "" || strings.EqualFold(addr, "localhost") {
 		return true
 	}
-	return false
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified()
 }
 
 // dockerConnectHost rewrites binds to the client-facing host. On a

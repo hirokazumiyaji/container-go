@@ -275,7 +275,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // generation must match before the delete is issued.
 func (c *Container) Terminate(ctx context.Context) error {
 	if c.creation != "" && c.generationReplaced(ctx) {
-		return fmt.Errorf("container %s was recreated; refusing to delete replaced container", c.id)
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()

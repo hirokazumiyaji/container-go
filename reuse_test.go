@@ -236,6 +236,29 @@ func TestReuseNameConflictFallsBackToAttach(t *testing.T) {
 	}
 }
 
+// TestReuseCreateNotFoundFallsBackToAttach covers Apple Container's
+// concurrent-create race: run fails with "container with ID … not found"
+// instead of "already exists", and reuse must re-inspect and attach.
+func TestReuseCreateNotFoundFallsBackToAttach(t *testing.T) {
+	f := &notFoundThenAttachRunner{fakeRunner: newTestRunner()}
+	f.imagePresent = true
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(),
+		withRunner(f), withEngine(appleEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctr.ID() != "myctr" {
+		t.Errorf("id = %q", ctr.ID())
+	}
+	if f.createAttempts < 1 {
+		t.Error("expected a create attempt before attach")
+	}
+	if f.callWith("delete") != nil {
+		t.Error("create not-found path must not delete another process's container")
+	}
+}
+
 type conflictThenAttachRunner struct {
 	*fakeRunner
 	createAttempts int
@@ -262,6 +285,37 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 		return nil, nil, &cli.CLIError{
 			Args: args, ExitCode: 1,
 			Stderr: `Error: already exists: container "myctr"`,
+		}
+	}
+	return nil, nil, nil
+}
+
+type notFoundThenAttachRunner struct {
+	*fakeRunner
+	createAttempts int
+	seenNotFound   atomic.Bool
+}
+
+func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	n.mu.Lock()
+	n.calls = append(n.calls, args)
+	n.mu.Unlock()
+
+	if args[0] == "image" {
+		return n.fakeRunner.Run(ctx, args...)
+	}
+	if args[0] == "inspect" {
+		if !n.seenNotFound.Load() {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+		}
+		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+	}
+	if args[0] == "run" {
+		n.createAttempts++
+		n.seenNotFound.Store(true)
+		return nil, nil, &cli.CLIError{
+			Args: args, ExitCode: 1,
+			Stderr: "Error: container with ID myctr not found\n",
 		}
 	}
 	return nil, nil, nil

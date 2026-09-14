@@ -83,7 +83,11 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if createErr == nil {
 				return ctr, nil
 			}
-			if cfg.eng.nameConflict(createErr) {
+			// nameConflict: another process won create. createRaceMissing
+			// covers Apple's concurrent-create race where run reaches
+			// "Starting container" then reports the ID as not found.
+			// Re-inspect and attach (or recreate) until the deadline.
+			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -150,7 +154,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) {
+		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
+			createRaceMissing(err) || createRaceMissing(classified) {
+			// Leave attach/retry to reuseEnsureContainer; do not delete
+			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
 		cleanupFailedCreate(ctx, cfg, err, classified)
@@ -221,6 +228,21 @@ func namedContainer(cfg *config, id string) *Container {
 		exposed:   cfg.exposed,
 		published: cfg.published,
 	}
+}
+
+// createRaceMissing reports a create/run failure that means the named
+// container vanished mid-start (Apple concurrent-create race), not a
+// generic "… not found" such as a missing entrypoint binary.
+func createRaceMissing(err error) bool {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
+		return true
+	}
+	return strings.Contains(s, "container not found")
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted

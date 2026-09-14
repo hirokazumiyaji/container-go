@@ -90,9 +90,7 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ループバックのランダムポートへ自動公開されます(testcontainers と同じ
-モデル)。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はその
-ホスト)、`MappedPort` は割り当てられたポートを返します。割り当ては
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。`docker context` 経由のリモート指定は検知しません。割り当ては
 デーモンが起動時に原子的に行うため、こちらでも並列テストがポートを
 奪い合うことはありません。
 
@@ -120,7 +118,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 wait.ForLog("Ready to accept connections")   // 部分一致。.AsRegexp()、.WithOccurrence(n)
 wait.ForListeningPort("6379/tcp")            // TCP 接続成功まで
 wait.ForExposedPort()                        // 最初に宣言したポート
-wait.ForHTTP("/health")                      // .WithPort、.WithMethod、.WithStatusCodeMatcher
+wait.ForHTTP("/health")                      // .WithPort、.WithMethod、.WithStatusCodeMatcher、.WithHeaders、.WithBasicAuth、.WithTLS/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成
 ```
@@ -173,7 +171,8 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
-- image / port が既存と不一致なら分かりやすいエラーを返す。
+- image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
+- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの

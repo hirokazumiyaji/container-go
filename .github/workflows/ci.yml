@@ -48,6 +48,15 @@ jobs:
         with:
           version: v2.13.0
 
+  govulncheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   # Docker is preinstalled on ubuntu-latest; Apple Container stays local-only.
   integration-docker:
     runs-on: ubuntu-latest

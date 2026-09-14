@@ -1,14 +1,16 @@
 //go:build integration
 
-// Package examples holds runnable usage examples. They need Apple
-// Container running: `container system start`, then
-// `go test -tags integration ./examples/`.
+// Package examples holds runnable usage examples. They need a backend:
+// Apple Container (`container system start`) or Docker (running daemon),
+// then `go test -tags integration ./examples/`.
 package examples
 
 import (
 	"context"
 	"net"
+	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 
@@ -18,11 +20,32 @@ import (
 
 func requireSystem(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("container"); err != nil {
-		t.Skip("container CLI not installed")
+	backend := os.Getenv("CONTAINERGO_BACKEND")
+	if backend == "" {
+		// Match detectEngineFor: darwin → Apple Container, else Docker.
+		if runtime.GOOS == "darwin" {
+			backend = "apple"
+		} else {
+			backend = "docker"
+		}
 	}
-	if err := exec.Command("container", "system", "status").Run(); err != nil {
-		t.Skip("apple container system service not running")
+	switch backend {
+	case "apple":
+		if _, err := exec.LookPath("container"); err != nil {
+			t.Skip("container CLI not installed")
+		}
+		if err := exec.Command("container", "system", "status").Run(); err != nil {
+			t.Skip("apple container system service not running")
+		}
+	case "docker":
+		if _, err := exec.LookPath("docker"); err != nil {
+			t.Skip("docker CLI not installed")
+		}
+		if err := exec.Command("docker", "info").Run(); err != nil {
+			t.Skip("docker daemon not running")
+		}
+	default:
+		t.Skipf("unknown CONTAINERGO_BACKEND=%q", backend)
 	}
 }
 

@@ -3,7 +3,6 @@ package container
 import (
 	"context"
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 
@@ -89,9 +88,30 @@ func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to become ready") {
 		t.Errorf("error = %v, want wait-path failure after deferred inspect", err)
 	}
-	del := f.callWith("delete")
-	if del == nil || !slices.Contains(del, "--force") || !slices.Contains(del, "myctr") {
-		t.Errorf("rollback delete not issued: %v", f.calls)
+	// Apple has no immutable ID, so rollback fails closed when the
+	// generation cannot be verified: no name-based delete, and the
+	// leaked container is reported instead of hidden.
+	if del := f.callWith("delete"); del != nil {
+		t.Errorf("rollback deleted without a verified generation: %v", del)
+	}
+	if !strings.Contains(err.Error(), "left behind") {
+		t.Errorf("error = %v, want the leaked container reported", err)
+	}
+}
+
+func TestRunRollbackDeletesByImmutableIDWhenInspectFails(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner(), failInspect: true}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(d), withEngine(dockerEngine{}),
+		WithExposedPorts("6379/tcp"),
+		WithWaitStrategy(endpointInspectStrategy{}),
+	)
+	if err == nil || strings.Contains(err.Error(), "left behind") {
+		t.Fatalf("err = %v, want wait failure with successful rollback", err)
+	}
+	// docker run printed the container ID; rollback needs no inspect.
+	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
+		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
 	}
 }
 

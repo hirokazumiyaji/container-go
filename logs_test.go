@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 // streamRunner adds a canned Stream implementation to fakeRunner.
@@ -96,5 +97,50 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 
 	if _, err := ctr.FollowLogs(context.Background()); err == nil {
 		t.Fatal("want error when runner cannot stream")
+	}
+}
+
+func TestLogsWithOptionsPassesTailAndSince(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+
+	since := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
+	rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Tail: 50, Since: since})
+	if err != nil {
+		t.Fatalf("LogsWithOptions: %v", err)
+	}
+	_ = rc.Close()
+
+	call := f.callWith("logs")
+	if call == nil {
+		t.Fatal("no logs call recorded")
+	}
+	joined := strings.Join(call, " ")
+	if !strings.Contains(joined, "--tail 50") {
+		t.Errorf("missing --tail 50: %v", call)
+	}
+	if !strings.Contains(joined, "--since") {
+		t.Errorf("missing --since: %v", call)
+	}
+	tailIdx := strings.Index(joined, "--tail")
+	idIdx := strings.LastIndex(joined, "myctr")
+	if tailIdx < 0 || idIdx < 0 || tailIdx > idIdx {
+		t.Errorf("flags must precede container id: %v", call)
+	}
+}
+
+func TestLogsDefaultsToUnbounded(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+	rc, err := ctr.Logs(context.Background())
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	_ = rc.Close()
+	joined := strings.Join(f.callWith("logs"), " ")
+	if strings.Contains(joined, "--tail") || strings.Contains(joined, "--since") {
+		t.Errorf("default Logs must not bound: %v", joined)
 	}
 }

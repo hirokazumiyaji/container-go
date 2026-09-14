@@ -60,6 +60,9 @@ func (c *config) allLabels() map[string]string {
 	if c.creation != "" {
 		labels[creationLabel] = c.creation
 	}
+	if c.creation != "" {
+		labels[creationLabel] = c.creation
+	}
 	if c.reuse {
 		labels[reuseLabel] = "true"
 	}
@@ -209,7 +212,9 @@ func WithCmd(cmd ...string) Option {
 	}
 }
 
-// WithEntrypoint overrides the image entrypoint.
+// WithEntrypoint overrides the image entrypoint. It is a single token
+// per `docker run --entrypoint` semantics; for multi-token commands use
+// WithCmd.
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
 		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {

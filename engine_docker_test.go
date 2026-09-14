@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
 	"strings"
@@ -23,6 +24,7 @@ func dockerTestConfig(t *testing.T, opts ...Option) *config {
 }
 
 func TestDockerRunArgsAutoPublishExposedPorts(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
 	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp", "8080"))
 
 	args := dockerEngine{}.runArgs(cfg, "redis:7-alpine", "")
@@ -158,9 +160,14 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 }
 
 // dockerRunner serves docker-shaped responses.
+// dockerFixtureID is the Id in testdata/docker_inspect_v29.json, which
+// `docker run --detach` also prints on stdout.
+const dockerFixtureID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 type dockerRunner struct {
 	*fakeRunner
 	inspectJSON []byte
+	failInspect bool
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -169,11 +176,45 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
-		return []byte("0f1e2d3c\n"), nil, nil
+		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
+		if d.failInspect {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+		}
 		return d.inspectJSON, nil, nil
 	default:
 		return nil, nil, nil
+	}
+}
+
+func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d)
+	if ctr.uid != dockerFixtureID {
+		t.Fatalf("uid = %q, want the ID docker run printed", ctr.uid)
+	}
+	inspects := len(d.calls)
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	// Delete by immutable ID needs no inspect: exactly one call follows.
+	if extra := d.calls[inspects:]; len(extra) != 1 || extra[0][0] != "rm" {
+		t.Errorf("Terminate issued %v, want a single rm", extra)
+	}
+	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
+		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	}
+}
+
+func TestDockerParseRunID(t *testing.T) {
+	e := dockerEngine{}
+	if got := e.parseRunID([]byte(dockerFixtureID + "\n")); got != dockerFixtureID {
+		t.Errorf("parseRunID = %q", got)
+	}
+	for _, out := range []string{"", "0f1e2d3c\n", "WARNING: something\n" + dockerFixtureID + "\n"} {
+		if got := e.parseRunID([]byte(out)); got != "" {
+			t.Errorf("parseRunID(%q) = %q, want empty", out, got)
+		}
 	}
 }
 
@@ -237,6 +278,118 @@ func TestDockerHostHonorsDockerHostEnv(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	if got := (dockerEngine{}).defaultHost(); got != "127.0.0.1" {
 		t.Errorf("defaultHost = %q, want 127.0.0.1", got)
+	}
+}
+
+func TestDockerRunArgsBindAllInterfacesOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://docker:2375")
+	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined := strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 0.0.0.0::6379/tcp") {
+		t.Errorf("remote auto-publish must bind 0.0.0.0: %s", joined)
+	}
+	if strings.Contains(joined, "127.0.0.1::6379") {
+		t.Errorf("remote must not bind loopback: %s", joined)
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	cfg = dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined = strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 127.0.0.1::6379/tcp") {
+		t.Errorf("local auto-publish must bind loopback: %s", joined)
+	}
+}
+
+func TestDockerEndpointsRewriteLoopbackOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d, WithExposedPorts("6379/tcp"))
+	// testdata binds 127.0.0.1:49153 on the daemon; the client must dial
+	// the remote host instead.
+	ep, err := ctr.Endpoint(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if ep != "10.0.0.5:49153" {
+		t.Errorf("Endpoint = %q, want 10.0.0.5:49153", ep)
+	}
+}
+
+func TestDockerConnectHostMapping(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	eng := dockerEngine{}
+	for _, addr := range []string{"", "0.0.0.0", "::", "127.0.0.1", "127.0.0.2", "::1", "localhost"} {
+		if got := dockerConnectHost(addr, eng); got != "10.0.0.5" {
+			t.Errorf("dockerConnectHost(%q) = %q, want 10.0.0.5", addr, got)
+		}
+	}
+	if got := dockerConnectHost("192.168.1.10", eng); got != "192.168.1.10" {
+		t.Errorf("explicit host must pass through, got %q", got)
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	for _, addr := range []string{"", "0.0.0.0", "::"} {
+		if got := dockerConnectHost(addr, eng); got != "127.0.0.1" {
+			t.Errorf("local unspecified dockerConnectHost(%q) = %q, want 127.0.0.1", addr, got)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1", "::1", "localhost"} {
+		if got := dockerConnectHost(addr, eng); got != addr {
+			t.Errorf("local explicit dockerConnectHost(%q) = %q, want preserved", addr, got)
+		}
+	}
+}
+
+func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
+	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375", "tcp://127.0.0.2:2375", "tcp://[::1]:2375"} {
+		t.Setenv("DOCKER_HOST", host)
+		if isRemoteDockerHost() {
+			t.Errorf("DOCKER_HOST=%q: want local (not remote)", host)
+		}
+	}
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	if !isRemoteDockerHost() {
+		t.Error("tcp://10.0.0.5:2375 must be remote")
+	}
+}
+
+func TestDockerRejectsLoopbackPublishOnRemoteDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	for _, spec := range []string{"127.0.0.1:18080:80", "[::1]:18080:80", "127.0.0.2:18080:80"} {
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"), withRunner(d), withEngine(dockerEngine{}), WithPublishedPort(spec))
+		if err == nil || !strings.Contains(err.Error(), "unreachable") {
+			t.Errorf("WithPublishedPort(%q) on remote daemon: err = %v, want unreachable rejection", spec, err)
+		}
+	}
+	if len(d.callWith("run")) != 0 {
+		t.Errorf("run must not be issued: %v", d.callWith("run"))
+	}
+	// Unspecified and non-loopback binds stay allowed.
+	for _, spec := range []string{"0.0.0.0:18080:80", "10.0.0.5:18080:80", "18080:80"} {
+		cfg := dockerTestConfig(t, WithPublishedPort(spec))
+		if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+			t.Errorf("checkConfig(%q) = %v, want nil", spec, err)
+		}
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	cfg := dockerTestConfig(t, WithPublishedPort("127.0.0.1:18080:80"))
+	if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+		t.Errorf("local loopback publish must be allowed: %v", err)
+	}
+}
+
+func TestDockerRunArgsKeepLoopbackOnLoopbackDOCKERHOST(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://127.0.0.2:2375")
+	cfg := dockerTestConfig(t, WithExposedPorts("6379/tcp"))
+	joined := strings.Join(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), " ")
+	if !strings.Contains(joined, "--publish 127.0.0.1::6379/tcp") {
+		t.Errorf("loopback DOCKER_HOST must keep loopback publish: %s", joined)
+	}
+	if strings.Contains(joined, "0.0.0.0::6379") {
+		t.Errorf("loopback DOCKER_HOST must not bind all interfaces: %s", joined)
 	}
 }
 

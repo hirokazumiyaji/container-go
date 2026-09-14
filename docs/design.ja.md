@@ -101,7 +101,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 
 - `WithExposedPorts(ports ...string)`：接続対象のコンテナポート(`"6379/tcp"` 形式)を宣言する
 - `WithEnv(env map[string]string)`：環境変数
-- `WithCmd(cmd ...string)` / `WithEntrypoint(ep ...string)`：コマンドとエントリポイントの上書き
+- `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`：コマンドとエントリポイントの上書き。entrypoint は `docker run --entrypoint` の仕様上 1 トークン。複数トークンは `WithCmd` に寄せる
 - `WithWaitStrategy(s wait.Strategy)`：起動完了の判定
 - `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
 - `WithLabels(labels map[string]string)`：追加ラベル
@@ -321,7 +321,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
-`WithExposedPorts` で宣言したポートは自動的に `127.0.0.1` のランダムポートへ公開し(`-p 127.0.0.1::<port>`)、`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。
+`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`docker context` 経由のリモート指定は検知できない。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 

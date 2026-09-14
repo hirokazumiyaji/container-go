@@ -91,11 +91,19 @@ binding's address when several publish host-IPs differ.
 
 **Docker backend**: the container IP is generally not reachable from
 the host (Docker Desktop), so ports declared via `WithExposedPorts` are
-automatically published to daemon-assigned loopback ports — the classic
-testcontainers model. `Host` returns `127.0.0.1` (or the host from a
-`tcp://` `DOCKER_HOST`) and `MappedPort` returns the assigned port.
-Assignment happens atomically in the daemon, so parallel tests do not
-race over ports here either.
+automatically published to daemon-assigned ports — the classic
+testcontainers model. Locally this binds loopback
+(`-p 127.0.0.1::<port>`); with `DOCKER_HOST=tcp://host` (remote daemon,
+e.g. `tcp://docker:2375` in CI) it binds all interfaces
+(`-p 0.0.0.0::<port>`) so the client can reach it. `Host` returns
+`127.0.0.1` (or the host from a `tcp://` `DOCKER_HOST`) and
+`MappedPort` returns the assigned port. Assignment happens atomically
+in the daemon, so parallel tests do not race over ports here either.
+With a remote daemon, an explicit `WithPublishedPort` bound to loopback
+(`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
+on the remote machine.
+Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
+daemon is not detected.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:
@@ -121,9 +129,9 @@ probed client-side by the `wait` package:
 wait.ForLog("Ready to accept connections")   // substring; .AsRegexp(), .WithOccurrence(n)
 wait.ForListeningPort("6379/tcp")            // TCP dial succeeds
 wait.ForExposedPort()                        // first declared port
-wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher
+wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
-wait.ForAll(...), wait.ForAny(...)           // composition
+wait.ForAll(...), wait.ForAny(...)           // composition (bound the whole with context.WithTimeout)
 ```
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
@@ -194,6 +202,12 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
+  Only image and ports are compared; `env` / `cmd` / `mounts`
+  differences attach silently by design (use distinct names when they
+  matter).
+- Each creation carries a generation label; `Terminate` and the
+  stopped-recreate path refuse to delete a replaced generation, and the
+  watchdog reaper guards deletion the same way.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.

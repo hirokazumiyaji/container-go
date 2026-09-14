@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strings"
 	"sync"
 )
 
@@ -19,30 +21,69 @@ import (
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script
 // itself disables globbing and quotes every expansion the IDs reach.
-// Each stdin line is "id|creation": before deleting, the script
-// inspects the current container and skips the delete when the
-// creation generation no longer matches, so a same-name replacement
-// created after registration survives the old reaper.
+// Each backend call runs with a per-entry timeout implemented with
+// background jobs and kill (timeout(1) is not standard on macOS), so a
+// hung daemon cannot wedge deletion of later entries. Failures stay
+// silent (|| true) by design: the reaper is last-resort insurance.
+// When a creation generation is known, the script inspects first and
+// reads the creation label as a structural JSON field: the match is
+// anchored at line start on the quoted key, so label values or other
+// text containing the same characters cannot satisfy it. When inspect
+// also reports an immutable "Id" (Docker), the delete targets that ID
+// instead of the name, so a same-name replacement created after the
+// check is simply not found. Apple Container has no such ID; there the
+// delete necessarily goes by name.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
-entries=""
+key="$3"
+ids=""
 while IFS= read -r line; do
-  entries="$entries $line"
+  ids="$ids
+$line"
 done
-for entry in $entries; do
-  id=${entry%%|*}
-  creation=${entry##*|}
-  if [ -n "$creation" ] && [ "$creation" != "$id" ]; then
-    if ! "$bin" inspect "$id" 2>/dev/null | grep -q "$creation"; then
-      continue
-    fi
+run_with_timeout() {
+  "$@" >/dev/null 2>&1 & pid=$!
+  (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
+  wait "$pid" 2>/dev/null
+  rc=$?
+  kill "$killer" 2>/dev/null
+  wait "$killer" 2>/dev/null
+  return $rc
+}
+echo "$ids" | while IFS= read -r line; do
+  [ -z "$line" ] && continue
+  id=${line%% *}
+  creation=${line#* }
+  [ "$id" = "$line" ] && creation=""
+  target="$id"
+  if [ -n "$creation" ]; then
+    tmp=$(mktemp 2>/dev/null) || continue
+    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
+    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
+    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
+    rm -f "$tmp"
+    [ "$got" = "$creation" ] || continue
+    [ -n "$uid" ] && target="$uid"
   fi
-  "$bin" "$sub" --force "$id" >/dev/null 2>&1 || true
+  run_with_timeout "$bin" "$sub" --force "$target" || true
 done
 `
 
 const maxReaperSpawnFailures = 3
+
+// breQuote escapes a literal for use inside the reaper's sed basic
+// regular expression, so the label key's dots match only dots.
+func breQuote(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if strings.ContainsRune(`\.*[]^$/`, c) {
+			b.WriteByte('\\')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
 
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
@@ -64,6 +105,7 @@ type reaper struct {
 	exited        chan struct{}
 	entries       []reaperEntry
 	spawnFailures int
+	gaveUp        bool
 }
 
 func newReaper(binary, subcommand string) *reaper {
@@ -85,29 +127,26 @@ func (r *reaper) register(id, creation string) error {
 	defer r.mu.Unlock()
 	entry := reaperEntry{id: id, creation: creation}
 	r.entries = append(r.entries, entry)
-	line := reaperLine(entry)
 	if r.stdin != nil {
-		if r.writeLocked(line) == nil {
+		if r.writeLocked(entry) == nil {
 			return nil
 		}
 	}
 	return r.respawnAndReplayLocked()
 }
 
-func reaperLine(e reaperEntry) string {
+func (r *reaper) writeLocked(e reaperEntry) error {
 	if e.creation == "" {
-		return e.id + "|"
+		_, err := io.WriteString(r.stdin, e.id+"\n")
+		return err
 	}
-	return e.id + "|" + e.creation
-}
-
-func (r *reaper) writeLocked(line string) error {
-	_, err := io.WriteString(r.stdin, line+"\n")
+	_, err := io.WriteString(r.stdin, e.id+" "+e.creation+"\n")
 	return err
 }
 
 // respawnAndReplayLocked starts a fresh reaper process and re-registers
-// every known ID with it.
+// every known ID with it. Success resets the consecutive-failure count;
+// giving up logs once so a permanently broken reaper is visible.
 func (r *reaper) respawnAndReplayLocked() error {
 	for r.spawnFailures < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
@@ -116,21 +155,26 @@ func (r *reaper) respawnAndReplayLocked() error {
 		}
 		replayed := true
 		for _, e := range r.entries {
-			if r.writeLocked(reaperLine(e)) != nil {
+			if r.writeLocked(e) != nil {
 				replayed = false
 				break
 			}
 		}
 		if replayed {
+			r.spawnFailures = 0
 			return nil
 		}
 		r.spawnFailures++
+	}
+	if !r.gaveUp {
+		r.gaveUp = true
+		log.Printf("container-go: reaper giving up after %d consecutive spawn failures (binary=%q)", maxReaperSpawnFailures, r.binary)
 	}
 	return errors.New("reaper: giving up after repeated spawn failures")
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand)
+	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

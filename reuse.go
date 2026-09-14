@@ -49,6 +49,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		reused:    true,
 		info:      info,
 		creation:  info.labels[creationLabel],
+		uid:       info.uid,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -75,7 +76,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if !isNotFound(err) {
 				return nil, err
 			}
-			ctr, createErr := reuseCreate(ctx, image, cfg)
+			// Creation carries its own runTimeout budget detached from
+			// the attach deadline: a leader pulling a large image must
+			// not be cut off after reuseAttachTimeout.
+			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
 				return ctr, nil
 			}
@@ -99,7 +103,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteNamed(ctx, cfg, cfg.name); err != nil {
+			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
 				return nil, err
 			}
 			recreated = true
@@ -114,6 +118,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				reused:    true,
 				info:      info,
 				creation:  info.labels[creationLabel],
+				uid:       info.uid,
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -135,12 +140,15 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		cfg.creation = newCreationID()
 	}
 
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	// The leader's pull and create get an independent runTimeout budget
+	// even when the caller's context carries a tighter attach deadline.
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) {
 			return nil, err
@@ -157,6 +165,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
+		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -169,6 +178,21 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		}
 	}
 	return ctr, nil
+}
+
+// deleteStoppedReuse removes a stopped reuse container through a
+// handle bound to its inspected generation, so Terminate re-checks the
+// generation and deletes by immutable ID. A replaced generation means
+// another process already recreated the name; the caller loops and
+// attaches to the fresh generation instead of deleting it.
+func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	ctr := namedContainer(cfg, cfg.name)
+	ctr.creation = info.labels[creationLabel]
+	err := ctr.Terminate(ctx)
+	if errors.Is(err, ErrGenerationReplaced) {
+		return nil
+	}
+	return err
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -187,10 +211,6 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
 	return namedContainer(cfg, id).inspectFresh(ctx)
-}
-
-func deleteNamed(ctx context.Context, cfg *config, id string) error {
-	return namedContainer(cfg, id).Terminate(ctx)
 }
 
 func namedContainer(cfg *config, id string) *Container {

@@ -28,8 +28,14 @@ const (
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
 	runTimeout = 10 * time.Minute
-	// reuseAttachTimeout bounds waiting for another process's create
-	// to reach a usable state during WithReuse get-or-create.
+)
+
+// reuseAttachTimeout bounds waiting for another process's create to
+// reach a usable state during WithReuse get-or-create. It applies to
+// attach polling only; a leader's own image pull and create carry an
+// independent runTimeout budget. Vars (not consts) so tests can shrink
+// them.
+var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
 )
@@ -83,8 +89,13 @@ type Container struct {
 	reused bool
 	// creation is the unique generation ID stored in creationLabel.
 	// Terminate and the reaper verify it before deleting so a stale
-	// handle never removes a same-name replacement.
+	// handle does not remove a same-name replacement made by this
+	// library; see Terminate for the limits of the name-based path.
 	creation string
+	// uid is the backend's immutable container ID when it has one
+	// (Docker). Deletes target it directly, which makes the generation
+	// check unnecessary: a replacement never shares it.
+	uid string
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -118,6 +129,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.eng = eng
 	}
 	applyEngineBinary(cfg)
+	if err := cfg.eng.checkConfig(cfg); err != nil {
+		return nil, err
+	}
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}
@@ -144,20 +158,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
-	}
-
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
-		}
-		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 	}
 
 	c := &Container{
@@ -167,25 +172,51 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
+		uid:       cfg.eng.parseRunID(stdout),
 	}
+	// The reaper only backs real CLI containers; with an injected
+	// test runner there is nothing external to clean up. With an
+	// immutable ID the reaper deletes by it and needs no generation.
+	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
+		bin := er.ExternalBinary()
+		if bin == "" {
+			bin = cfg.eng.binary()
+		}
+		if c.uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		} else {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		}
+	}
+
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = c.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, c.rollback(ctx, err)
 		}
 	}
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
 			tail := c.logTail(cleanupCtx)
-			_ = c.Terminate(cleanupCtx)
+			err = fmt.Errorf("container %s failed to become ready: %w", c.id, err)
 			if tail != "" {
-				return nil, fmt.Errorf("container %s failed to become ready: %w\ncontainer logs:\n%s", c.id, err, tail)
+				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, fmt.Errorf("container %s failed to become ready: %w", c.id, err)
+			return nil, c.rollback(ctx, err)
 		}
 	}
 	return c, nil
+}
+
+// rollback removes a container Run created but cannot return. A failed
+// removal is not hidden: without an immutable ID, Terminate refuses to
+// delete when it cannot verify the generation, and the caller must know
+// the container was left behind.
+func (c *Container) rollback(ctx context.Context, cause error) error {
+	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+	}
+	return cause
 }
 
 // cleanupFailedCreate best-effort removes the container this Run left
@@ -199,6 +230,11 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
+	unlock, err := lockName(cleanupCtx, cfg.name)
+	if err != nil {
+		return
+	}
+	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
 	if err != nil {
 		return
@@ -214,9 +250,13 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 			return
 		}
 	}
+	target := cfg.name
+	if info.uid != "" {
+		target = info.uid
+	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(cfg.name)...)
+	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -264,43 +304,53 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 }
 
 // Terminate force-removes the container. Removing a container that no
-// longer exists is a success. When this handle knows its creation
-// generation, a same-name replacement is never deleted: the inspect
-// generation must match before the delete is issued.
+// longer exists is a success. A handle with an immutable ID deletes by
+// it, so a same-name replacement is never touched. Without one (Apple
+// Container) the delete goes by name: the creation generation must
+// match a fresh inspect, and inspect and delete run under the per-name
+// lock so no other process using this library can delete and recreate
+// the name in between; an external `container delete` plus re-create
+// inside that window is not detectable by name (see lockName). An
+// inspect failure other than not-found aborts the delete rather than
+// risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.creation != "" && c.generationReplaced(ctx) {
-		return fmt.Errorf("container %s was recreated; refusing to delete replaced container", c.id)
+	if c.uid != "" {
+		return c.delete(ctx, c.uid)
 	}
+	if c.creation == "" {
+		return c.delete(ctx, c.id)
+	}
+	unlock, err := lockName(ctx, c.id)
+	if err != nil {
+		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+	}
+	defer unlock()
+	info, err := c.inspectFresh(ctx)
+	if isNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+	}
+	// An absent generation cannot prove ownership of this handle, so
+	// it counts as a replacement too.
+	if info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if info.uid != "" {
+		return c.delete(ctx, info.uid)
+	}
+	return c.delete(ctx, c.id)
+}
+
+func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(c.id)...)
+	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if err == nil || isNotFound(err) {
 		return nil
 	}
 	return c.classify(ctx, err)
-}
-
-func (c *Container) generationReplaced(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		// Missing container means nothing to protect; let the delete
-		// run so idempotency holds. Other inspect failures fall
-		// through to the delete attempt as well.
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, c.id)
-	if err != nil {
-		return false
-	}
-	actual, ok := info.labels[creationLabel]
-	if !ok || actual == "" {
-		// An absent generation cannot prove ownership of this handle,
-		// so treat it as a replacement and refuse the delete.
-		return true
-	}
-	return actual != c.creation
 }
 
 // ContainerIP returns the container's address on its first attached
@@ -323,7 +373,11 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
 	if len(c.published) > 0 {
-		return c.published[0].connectAddr(), nil
+		addr := c.published[0].connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, nil
 	}
 	if c.eng.directIP() {
 		return c.ContainerIP(ctx)
@@ -355,7 +409,11 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	}
 	for _, p := range c.published {
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			return p.connectAddr(), p.hostPort, nil
+			addr := p.connectAddr()
+			if !c.eng.directIP() {
+				addr = dockerConnectHost(addr, c.eng)
+			}
+			return addr, p.hostPort, nil
 		}
 	}
 	if !slices.Contains(c.exposed, spec) {
@@ -375,11 +433,7 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
-			host := b.hostAddr
-			if host == "" || host == "0.0.0.0" || host == "::" {
-				host = c.eng.defaultHost()
-			}
-			return host, b.hostPort, nil
+			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
 		}
 	}
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
@@ -399,6 +453,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	if c.uid == "" {
+		c.uid = info.uid
+	}
 	return info, nil
 }
 
@@ -407,7 +464,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, c.classify(ctx, err)
+		return nil, wrapNotFound(c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

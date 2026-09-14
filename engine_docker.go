@@ -4,8 +4,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,6 +42,22 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
+// checkConfig rejects explicit loopback publish binds on a remote
+// daemon: Docker would listen on the remote machine's loopback, which
+// no rewrite of the client-facing address can make reachable.
+func (dockerEngine) checkConfig(cfg *config) error {
+	if !isRemoteDockerHost() {
+		return nil
+	}
+	// hostAddr is validated as an IP literal by parsePublishSpec.
+	for _, p := range cfg.published {
+		if p.hostAddr != "" && net.ParseIP(p.hostAddr).IsLoopback() {
+			return fmt.Errorf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw)
+		}
+	}
+	return nil
+}
+
 func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
@@ -50,7 +68,8 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
-// else publishes on loopback.
+// else publishes on loopback. Note: a `docker context` pointing at a
+// remote daemon is not detected; only DOCKER_HOST is honored.
 func (dockerEngine) defaultHost() string {
 	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
 		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
@@ -60,12 +79,59 @@ func (dockerEngine) defaultHost() string {
 	return "127.0.0.1"
 }
 
+// isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
+// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
+// the remote host is unreachable from the client.
+func isRemoteDockerHost() bool {
+	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
+}
+
+// isLoopbackOrUnspecified reports addresses that mean "this host" and
+// must be rewritten to defaultHost() on a remote daemon. IP literals
+// use net.IP.IsLoopback / IsUnspecified so the full 127.0.0.0/8 and
+// ::1 ranges are covered, not only a few spellings.
+func isLoopbackOrUnspecified(addr string) bool {
+	if addr == "" || strings.EqualFold(addr, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(addr)
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified()
+}
+
+// dockerConnectHost rewrites binds to the client-facing host. On a
+// remote daemon, loopback and unspecified addresses become
+// defaultHost(). Locally, unspecified binds still map to defaultHost(),
+// but an explicit loopback (127.0.0.1, ::1, …) is preserved so an
+// IPv6-only published port stays reachable.
+func dockerConnectHost(addr string, eng engine) string {
+	if isRemoteDockerHost() {
+		if isLoopbackOrUnspecified(addr) {
+			return eng.defaultHost()
+		}
+		return addr
+	}
+	switch addr {
+	case "", "0.0.0.0", "::":
+		return eng.defaultHost()
+	}
+	return addr
+}
+
 func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// The pull policy fetches the image beforehand; --pull=never keeps
 	// the run command from pulling a second time behind our back.
 	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
 	// Publish every declared port the user did not publish explicitly
-	// to a daemon-assigned loopback port.
+	// to a daemon-assigned port. Locally this binds loopback; on a
+	// remote daemon (tcp:// DOCKER_HOST) it binds all interfaces so
+	// the client can reach it via defaultHost().
+	bindAddr := "127.0.0.1"
+	if isRemoteDockerHost() {
+		bindAddr = "0.0.0.0"
+	}
 	var extraPublish []string
 	for _, spec := range cfg.exposed {
 		published := false
@@ -76,10 +142,21 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 			}
 		}
 		if !published {
-			extraPublish = append(extraPublish, "127.0.0.1::"+spec.String())
+			extraPublish = append(extraPublish, bindAddr+"::"+spec.String())
 		}
 	}
 	return append(args, cfg.commonRunArgs(image, envFile, extraPublish)...)
+}
+
+// dockerIDRE matches the full container ID `docker run --detach` prints.
+var dockerIDRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func (dockerEngine) parseRunID(stdout []byte) string {
+	id := strings.TrimSpace(string(stdout))
+	if !dockerIDRE.MatchString(id) {
+		return ""
+	}
+	return id
 }
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
@@ -87,6 +164,7 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
+	ID    string `json:"Id"`
 	Name  string `json:"Name"`
 	State struct {
 		Status string `json:"Status"`
@@ -120,6 +198,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
 		labels: c.Config.Labels,
+		uid:    c.ID,
 		image:  c.Config.Image,
 		ip:     c.NetworkSettings.IPAddress,
 	}

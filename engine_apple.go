@@ -36,6 +36,8 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
+func (appleEngine) checkConfig(*config) error { return nil }
+
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {
@@ -46,6 +48,8 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 	args := []string{"run", "--detach", "--name", cfg.name}
 	return append(args, cfg.commonRunArgs(image, envFile, nil)...)
 }
+
+func (appleEngine) parseRunID([]byte) string { return "" }
 
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 

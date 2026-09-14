@@ -89,7 +89,8 @@ type Container struct {
 	reused bool
 	// creation is the unique generation ID stored in creationLabel.
 	// Terminate and the reaper verify it before deleting so a stale
-	// handle never removes a same-name replacement.
+	// handle does not remove a same-name replacement made by this
+	// library; see Terminate for the limits of the name-based path.
 	creation string
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
@@ -307,9 +308,11 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // it, so a same-name replacement is never touched. Without one (Apple
 // Container) the delete goes by name: the creation generation must
 // match a fresh inspect, and inspect and delete run under the per-name
-// cross-process lock so no other process can delete and recreate the
-// name in between. An inspect failure other than not-found aborts the
-// delete rather than risk a replacement.
+// lock so no other process using this library can delete and recreate
+// the name in between; an external `container delete` plus re-create
+// inside that window is not detectable by name (see lockName). An
+// inspect failure other than not-found aborts the delete rather than
+// risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)

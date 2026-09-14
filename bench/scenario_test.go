@@ -29,8 +29,8 @@ import (
 const iterations = 5
 
 const (
-	redisImage = "redis:7-alpine"
-	nginxImage = "nginx:alpine"
+	redisImage = "public.ecr.aws/docker/library/redis:7-alpine"
+	nginxImage = "public.ecr.aws/docker/library/nginx:alpine"
 )
 
 func requireDocker(t *testing.T) {

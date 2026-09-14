@@ -53,7 +53,7 @@ func TestExampleRedis(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "redis:7-alpine",
+	ctr, err := container.Run(ctx, integrationRedis,
 		container.WithExposedPorts("6379/tcp"),
 		container.WithEnv(map[string]string{"REDIS_ARGS": "--appendonly yes"}),
 		container.WithWaitStrategy(wait.ForAll(

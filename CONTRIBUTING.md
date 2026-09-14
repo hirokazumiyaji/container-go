@@ -13,7 +13,13 @@ make lint
 
 Run `make integration` or `make integration-docker` when you change backend
 behavior. Integration tests use the `integration` build tag and skip cleanly
-when the relevant CLI or daemon is unavailable.
+when the relevant CLI or daemon is unavailable. They pull images from the AWS
+public ECR Docker Hub mirror (`public.ecr.aws/docker/library/...`) to avoid
+anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
+and singleflight cases (`make bench-integration` covers those). Set
+`CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
+Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
+pull other Hub images locally.
 
 ## Pull requests
 

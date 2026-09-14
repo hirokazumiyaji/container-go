@@ -22,9 +22,13 @@ import (
 )
 
 // requireSystem skips unless the Apple Container CLI is installed and
-// its system service answers.
+// its system service answers. When CONTAINERGO_BACKEND is set to a
+// non-apple value, Apple integration tests are skipped.
 func requireSystem(t *testing.T) {
 	t.Helper()
+	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
+		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple integration", backend)
+	}
 	if _, err := exec.LookPath("container"); err != nil {
 		t.Skip("container CLI not installed")
 	}
@@ -37,7 +41,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "redis:7-alpine",
+	ctr, err := container.Run(ctx, integrationRedis,
 		container.WithExposedPorts("6379/tcp"),
 		container.WithWaitStrategy(wait.ForAll(
 			wait.ForLog("Ready to accept connections"),
@@ -112,7 +116,7 @@ func TestIntegrationPublishedPort(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "nginx:alpine",
+	ctr, err := container.Run(ctx, integrationNginx,
 		container.WithExposedPorts("80/tcp"),
 		container.WithPublishedPort("127.0.0.1:18080:80"),
 		container.WithWaitStrategy(wait.ForHTTP("/")),
@@ -148,7 +152,7 @@ func TestIntegrationParallelStarts(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ctr, err := container.Run(ctx, "alpine:latest",
+			ctr, err := container.Run(ctx, integrationAlpine,
 				container.WithCmd("sleep", "60"))
 			container.Cleanup(t, ctr)
 			if err != nil {
@@ -175,7 +179,7 @@ func TestIntegrationParallelStarts(t *testing.T) {
 func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		ctx := context.Background()
-		ctr, err := container.Run(ctx, "alpine:latest",
+		ctr, err := container.Run(ctx, integrationAlpine,
 			container.WithName(os.Getenv("CONTAINERGO_REAPER_NAME")),
 			container.WithCmd("sleep", "120"))
 		if err != nil {
@@ -257,7 +261,7 @@ func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "alpine:latest",
+	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithCmd("sleep", "60"),
 	)
 	container.Cleanup(t, ctr)
@@ -276,7 +280,7 @@ func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
 	}
 
 	name := fmt.Sprintf("containergo-lazy-%d", os.Getpid())
-	_, err = container.Run(ctx, "alpine:latest",
+	_, err = container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithExposedPorts("80/tcp"),
 		container.WithCmd("sleep", "60"),
@@ -298,7 +302,7 @@ func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
 	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
 		requireSystem(t)
 		ctx := context.Background()
-		ctr, err := container.Run(ctx, "redis:7-alpine",
+		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
 			container.WithReuse(),
 			container.WithReuseGroup("integration-reuse"),

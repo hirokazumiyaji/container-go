@@ -77,7 +77,8 @@ Both modules write JSON result docs and print a summary table:
 
 Variables to keep fixed across comparison runs:
 
-- the images (`redis:7-alpine`, `nginx:alpine`) and their digests
+- the images (`public.ecr.aws/docker/library/redis:7-alpine`,
+  `public.ecr.aws/docker/library/nginx:alpine`) and their digests
 - the readiness probe (`wait.ForListeningPort`)
 - the iteration count (5) and the parallelism (8)
 - backend CLI and daemon versions

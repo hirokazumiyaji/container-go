@@ -100,7 +100,7 @@ func TestIntegrationBenchCounting(t *testing.T) {
 			if !ok {
 				t.Fatalf("no engine for backend %s", b.Name)
 			}
-			image := "redis:7-alpine"
+			image := integrationRedis
 
 			doc := bench.Doc{Env: benchEnv(b)}
 			benchScenario(t, &doc, b, image, "run/cold", func(t *testing.T) {

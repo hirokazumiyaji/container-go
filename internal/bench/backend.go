@@ -2,6 +2,7 @@ package bench
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 )
@@ -85,9 +86,12 @@ func AppleBackend() Backend {
 }
 
 // Available skips the test when the backend's CLI or service is
-// missing.
+// missing, or when CONTAINERGO_BACKEND selects a different backend.
 func (b Backend) Available(tb testing.TB) {
 	tb.Helper()
+	if want := os.Getenv("CONTAINERGO_BACKEND"); want != "" && want != b.Name {
+		tb.Skipf("CONTAINERGO_BACKEND=%s; skipping %s", want, b.Name)
+	}
 	if _, err := exec.LookPath(b.Bin); err != nil {
 		tb.Skipf("%s CLI not installed", b.Name)
 	}

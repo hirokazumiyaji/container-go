@@ -17,7 +17,7 @@ func TestExampleNginx(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "nginx:alpine",
+	ctr, err := container.Run(ctx, integrationNginx,
 		container.WithExposedPorts("80/tcp"),
 		container.WithWaitStrategy(wait.ForHTTP("/")),
 	)

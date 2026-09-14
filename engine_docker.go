@@ -7,6 +7,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -145,6 +146,17 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 		}
 	}
 	return append(args, cfg.commonRunArgs(image, envFile, extraPublish)...)
+}
+
+// dockerIDRE matches the full container ID `docker run --detach` prints.
+var dockerIDRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
+
+func (dockerEngine) parseRunID(stdout []byte) string {
+	id := strings.TrimSpace(string(stdout))
+	if !dockerIDRE.MatchString(id) {
+		return ""
+	}
+	return id
 }
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }

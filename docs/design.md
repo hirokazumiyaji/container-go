@@ -299,16 +299,23 @@ container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
-and the stopped-recreate path compare generations and refuse to delete
-a replaced name; on Docker the delete then targets the immutable `Id`
-inspect returned, so a replacement created between check and delete is
-simply not found. Apple Container addresses containers by name only, so
-there the check-then-delete window cannot be closed. The watchdog
-reaper stores the generation, reads the label as a line-anchored JSON
-field (`"key": "value"`, never a substring), and likewise deletes by
-`Id` when inspect reports one; each backend call carries a 10-30s
-timeout via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one
-hung daemon call cannot wedge the rest. The leader's own pull/create uses an
+and the stopped-recreate path refuse to delete a replaced name. On
+Docker the handle keeps the immutable `Id` printed by `docker run` (or
+returned by inspect) and deletes by it, so no generation check is
+needed: a replacement never shares the ID. Apple Container addresses
+containers by name only, so there the delete is name-based: the
+generation must match a fresh inspect, and inspect plus delete run
+under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
+that every such delete in this library takes, so no cooperating
+process can delete and recreate the name in between. An inspect
+failure other than not-found aborts the delete (fail closed); `Run`'s
+rollback reports a container left behind that way in its error rather
+than hiding it. The watchdog reaper registers Docker containers by
+`Id`; for Apple it stores the generation, reads the label as a
+line-anchored JSON field (`"key": "value"`, never a substring), and
+skips deletion on mismatch. Each backend call carries a 10-30s timeout
+via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
+daemon call cannot wedge the rest. The leader's own pull/create uses an
 independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 

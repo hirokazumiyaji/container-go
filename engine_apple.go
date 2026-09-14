@@ -49,6 +49,8 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 	return append(args, cfg.commonRunArgs(image, envFile, nil)...)
 }
 
+func (appleEngine) parseRunID([]byte) string { return "" }
+
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {

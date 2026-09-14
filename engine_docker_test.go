@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
 	"strings"
@@ -159,9 +160,14 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 }
 
 // dockerRunner serves docker-shaped responses.
+// dockerFixtureID is the Id in testdata/docker_inspect_v29.json, which
+// `docker run --detach` also prints on stdout.
+const dockerFixtureID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 type dockerRunner struct {
 	*fakeRunner
 	inspectJSON []byte
+	failInspect bool
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -170,11 +176,45 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
-		return []byte("0f1e2d3c\n"), nil, nil
+		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
+		if d.failInspect {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+		}
 		return d.inspectJSON, nil, nil
 	default:
 		return nil, nil, nil
+	}
+}
+
+func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d)
+	if ctr.uid != dockerFixtureID {
+		t.Fatalf("uid = %q, want the ID docker run printed", ctr.uid)
+	}
+	inspects := len(d.calls)
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	// Delete by immutable ID needs no inspect: exactly one call follows.
+	if extra := d.calls[inspects:]; len(extra) != 1 || extra[0][0] != "rm" {
+		t.Errorf("Terminate issued %v, want a single rm", extra)
+	}
+	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
+		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	}
+}
+
+func TestDockerParseRunID(t *testing.T) {
+	e := dockerEngine{}
+	if got := e.parseRunID([]byte(dockerFixtureID + "\n")); got != dockerFixtureID {
+		t.Errorf("parseRunID = %q", got)
+	}
+	for _, out := range []string{"", "0f1e2d3c\n", "WARNING: something\n" + dockerFixtureID + "\n"} {
+		if got := e.parseRunID([]byte(out)); got != "" {
+			t.Errorf("parseRunID(%q) = %q, want empty", out, got)
+		}
 	}
 }
 

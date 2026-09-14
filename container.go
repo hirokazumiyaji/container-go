@@ -91,6 +91,10 @@ type Container struct {
 	// Terminate and the reaper verify it before deleting so a stale
 	// handle never removes a same-name replacement.
 	creation string
+	// uid is the backend's immutable container ID when it has one
+	// (Docker). Deletes target it directly, which makes the generation
+	// check unnecessary: a replacement never shares it.
+	uid string
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -153,20 +157,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
-	}
-
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
-		}
-		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 	}
 
 	c := &Container{
@@ -176,25 +171,51 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
+		uid:       cfg.eng.parseRunID(stdout),
 	}
+	// The reaper only backs real CLI containers; with an injected
+	// test runner there is nothing external to clean up. With an
+	// immutable ID the reaper deletes by it and needs no generation.
+	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
+		bin := er.ExternalBinary()
+		if bin == "" {
+			bin = cfg.eng.binary()
+		}
+		if c.uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		} else {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		}
+	}
+
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = c.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, c.rollback(ctx, err)
 		}
 	}
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
 			tail := c.logTail(cleanupCtx)
-			_ = c.Terminate(cleanupCtx)
+			err = fmt.Errorf("container %s failed to become ready: %w", c.id, err)
 			if tail != "" {
-				return nil, fmt.Errorf("container %s failed to become ready: %w\ncontainer logs:\n%s", c.id, err, tail)
+				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, fmt.Errorf("container %s failed to become ready: %w", c.id, err)
+			return nil, c.rollback(ctx, err)
 		}
 	}
 	return c, nil
+}
+
+// rollback removes a container Run created but cannot return. A failed
+// removal is not hidden: without an immutable ID, Terminate refuses to
+// delete when it cannot verify the generation, and the caller must know
+// the container was left behind.
+func (c *Container) rollback(ctx context.Context, cause error) error {
+	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+	}
+	return cause
 }
 
 // cleanupFailedCreate best-effort removes the container this Run left
@@ -208,6 +229,11 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
+	unlock, err := lockName(cleanupCtx, cfg.name)
+	if err != nil {
+		return
+	}
+	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
 	if err != nil {
 		return
@@ -223,9 +249,13 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 			return
 		}
 	}
+	target := cfg.name
+	if info.uid != "" {
+		target = info.uid
+	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(cfg.name)...)
+	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -273,33 +303,44 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 }
 
 // Terminate force-removes the container. Removing a container that no
-// longer exists is a success. When this handle knows its creation
-// generation, a same-name replacement is never deleted: the inspect
-// generation must match, and the delete then targets the immutable ID
-// that inspect returned, so a replacement created after the check is
-// simply not found. Backends without an immutable ID (Apple Container)
-// fall back to the name. An inspect failure other than not-found aborts
-// the delete: without a verified generation, a name-based delete could
-// hit a replacement.
+// longer exists is a success. A handle with an immutable ID deletes by
+// it, so a same-name replacement is never touched. Without one (Apple
+// Container) the delete goes by name: the creation generation must
+// match a fresh inspect, and inspect and delete run under the per-name
+// cross-process lock so no other process can delete and recreate the
+// name in between. An inspect failure other than not-found aborts the
+// delete rather than risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	target := c.id
-	if c.creation != "" {
-		info, err := c.inspectFresh(ctx)
-		if isNotFound(err) {
-			return nil
-		}
-		if err != nil {
-			return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
-		}
-		// An absent generation cannot prove ownership of this handle,
-		// so it counts as a replacement too.
-		if info.labels[creationLabel] != c.creation {
-			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-		}
-		if info.uid != "" {
-			target = info.uid
-		}
+	if c.uid != "" {
+		return c.delete(ctx, c.uid)
 	}
+	if c.creation == "" {
+		return c.delete(ctx, c.id)
+	}
+	unlock, err := lockName(ctx, c.id)
+	if err != nil {
+		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+	}
+	defer unlock()
+	info, err := c.inspectFresh(ctx)
+	if isNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+	}
+	// An absent generation cannot prove ownership of this handle, so
+	// it counts as a replacement too.
+	if info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if info.uid != "" {
+		return c.delete(ctx, info.uid)
+	}
+	return c.delete(ctx, c.id)
+}
+
+func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
@@ -409,6 +450,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	if c.uid == "" {
+		c.uid = info.uid
+	}
 	return info, nil
 }
 

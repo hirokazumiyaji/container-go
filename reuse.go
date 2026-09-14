@@ -49,6 +49,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		reused:    true,
 		info:      info,
 		creation:  info.labels[creationLabel],
+		uid:       info.uid,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -117,6 +118,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				reused:    true,
 				info:      info,
 				creation:  info.labels[creationLabel],
+				uid:       info.uid,
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -145,7 +147,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	if _, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...); err != nil {
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) {
 			return nil, err
@@ -162,6 +165,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
+		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))

@@ -42,6 +42,9 @@ type engine interface {
 	// honor before anything is created.
 	checkConfig(cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
+	// parseRunID extracts the immutable container ID from run output;
+	// empty when the backend has none (Apple Container prints the name).
+	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	stopArgs(id string, timeout *time.Duration) []string

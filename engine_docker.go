@@ -79,11 +79,20 @@ func isLoopbackOrUnspecified(addr string) bool {
 	return false
 }
 
-// dockerConnectHost rewrites loopback/unspecified binds to the
-// client-facing host. Locally this is a no-op (127.0.0.1); with
-// DOCKER_HOST=tcp://remote it returns the remote hostname.
+// dockerConnectHost rewrites binds to the client-facing host. On a
+// remote daemon, loopback and unspecified addresses become
+// defaultHost(). Locally, unspecified binds still map to defaultHost(),
+// but an explicit loopback (127.0.0.1, ::1, …) is preserved so an
+// IPv6-only published port stays reachable.
 func dockerConnectHost(addr string, eng engine) string {
-	if isLoopbackOrUnspecified(addr) {
+	if isRemoteDockerHost() {
+		if isLoopbackOrUnspecified(addr) {
+			return eng.defaultHost()
+		}
+		return addr
+	}
+	switch addr {
+	case "", "0.0.0.0", "::":
 		return eng.defaultHost()
 	}
 	return addr

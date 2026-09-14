@@ -10,6 +10,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
 
@@ -21,8 +22,8 @@ func requireSystem(t *testing.T) {
 	t.Helper()
 	backend := os.Getenv("CONTAINERGO_BACKEND")
 	if backend == "" {
-		// OS default: darwin gets Apple Container, others get Docker.
-		if _, err := exec.LookPath("container"); err == nil {
+		// Match detectEngineFor: darwin → Apple Container, else Docker.
+		if runtime.GOOS == "darwin" {
 			backend = "apple"
 		} else {
 			backend = "docker"

@@ -286,6 +286,18 @@ func TestDockerConnectHostMapping(t *testing.T) {
 	if got := dockerConnectHost("192.168.1.10", eng); got != "192.168.1.10" {
 		t.Errorf("explicit host must pass through, got %q", got)
 	}
+
+	t.Setenv("DOCKER_HOST", "")
+	for _, addr := range []string{"", "0.0.0.0", "::"} {
+		if got := dockerConnectHost(addr, eng); got != "127.0.0.1" {
+			t.Errorf("local unspecified dockerConnectHost(%q) = %q, want 127.0.0.1", addr, got)
+		}
+	}
+	for _, addr := range []string{"127.0.0.1", "::1", "localhost"} {
+		if got := dockerConnectHost(addr, eng); got != addr {
+			t.Errorf("local explicit dockerConnectHost(%q) = %q, want preserved", addr, got)
+		}
+	}
 }
 
 func TestDockerContainerIPComesFromInspect(t *testing.T) {

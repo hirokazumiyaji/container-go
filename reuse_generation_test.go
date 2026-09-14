@@ -65,6 +65,21 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	}
 }
 
+func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
+	info := &engineInfo{
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+	}
+	r := &generationStateRunner{creation: "", state: "stopped"}
+	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse = %v", err)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0 for unlabeled replacement", r.deleteCalls)
+	}
+}
+
 type generationStateRunner struct {
 	creation    string
 	state       string
@@ -74,7 +89,11 @@ type generationStateRunner struct {
 func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
+		labels := ""
+		if g.creation != "" {
+			labels = `,"labels":{"` + creationLabel + `":"` + g.creation + `"}`
+		}
+		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":

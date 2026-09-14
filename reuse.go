@@ -195,7 +195,9 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 	if fresh.state != StateStopped {
 		return nil
 	}
-	if got := fresh.labels[creationLabel]; got != "" && got != expected {
+	// An absent generation cannot prove ownership of the original
+	// handle, so treat it as a replacement and skip deletion.
+	if got := fresh.labels[creationLabel]; got != expected {
 		return nil
 	}
 	return deleteNamed(ctx, cfg, cfg.name)

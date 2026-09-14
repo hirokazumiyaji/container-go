@@ -246,9 +246,14 @@ Not supported (Apple Container has no equivalent, or out of scope):
 ```
 make test                # unit tests (no backend needed)
 make vet
-make integration         # all integration tests; each skips if its backend is unavailable
+make integration         # integration tests (skips bench/singleflight); each backend skips if unavailable
 make integration-docker  # Docker-backend integration tests only
+make bench-integration   # pull-heavy bench and singleflight scenarios
 ```
+
+Integration tests pull library images via `public.ecr.aws/docker/library/...`
+to avoid anonymous Docker Hub rate limits. Set `CONTAINERGO_BACKEND=apple` or
+`docker` to skip the other backend.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md))

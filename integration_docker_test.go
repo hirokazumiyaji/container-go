@@ -21,9 +21,13 @@ import (
 )
 
 // requireDocker skips unless the docker CLI and daemon are available,
-// and routes this test to the Docker backend.
+// and routes this test to the Docker backend. When CONTAINERGO_BACKEND
+// is set to a non-docker value, Docker integration tests are skipped.
 func requireDocker(t *testing.T) {
 	t.Helper()
+	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
+		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
+	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -37,7 +41,7 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "redis:7-alpine",
+	ctr, err := container.Run(ctx, integrationRedis,
 		container.WithExposedPorts("6379/tcp"),
 		container.WithWaitStrategy(wait.ForAll(
 			wait.ForLog("Ready to accept connections"),
@@ -122,7 +126,7 @@ func TestIntegrationDockerParallelStarts(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			ctr, err := container.Run(ctx, "alpine:latest",
+			ctr, err := container.Run(ctx, integrationAlpine,
 				container.WithCmd("sleep", "60"))
 			container.Cleanup(t, ctr)
 			if err != nil {
@@ -144,7 +148,7 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		// env-passed selection never reaches Run; pin it here.
 		os.Setenv("CONTAINERGO_BACKEND", "docker")
 		ctx := context.Background()
-		ctr, err := container.Run(ctx, "alpine:latest",
+		ctr, err := container.Run(ctx, integrationAlpine,
 			container.WithName(os.Getenv("CONTAINERGO_REAPER_NAME")),
 			container.WithCmd("sleep", "120"))
 		if err != nil {
@@ -220,7 +224,7 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 
-	ctr, err := container.Run(ctx, "alpine:latest",
+	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithCmd("sleep", "60"),
 	)
 	container.Cleanup(t, ctr)
@@ -239,7 +243,7 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 	}
 
 	name := fmt.Sprintf("containergo-lazy-%d", os.Getpid())
-	_, err = container.Run(ctx, "alpine:latest",
+	_, err = container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithExposedPorts("80/tcp"),
 		container.WithCmd("sleep", "60"),
@@ -264,7 +268,7 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
 		requireDocker(t)
 		ctx := context.Background()
-		ctr, err := container.Run(ctx, "redis:7-alpine",
+		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
 			container.WithReuse(),
 			container.WithReuseGroup("integration-reuse"),
@@ -370,7 +374,7 @@ func TestIntegrationDockerRunFailureCleansUp(t *testing.T) {
 	name := fmt.Sprintf("containergo-failclean-%d", os.Getpid())
 	_ = exec.Command("docker", "rm", "--force", name).Run()
 
-	_, err := container.Run(ctx, "redis:7-alpine",
+	_, err := container.Run(ctx, integrationRedis,
 		container.WithName(name),
 		container.WithPullPolicy(container.PullNever),
 		container.WithEntrypoint("/does-not-exist-audit"),
@@ -393,7 +397,7 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 	name := fmt.Sprintf("containergo-failkeep-%d", os.Getpid())
 	_ = exec.Command("docker", "rm", "--force", name).Run()
 
-	ctr, err := container.Run(ctx, "alpine:latest",
+	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithCmd("sleep", "60"),
 	)
@@ -404,7 +408,7 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 		_ = ctr.Terminate(context.Background())
 	}()
 
-	_, err = container.Run(ctx, "alpine:latest",
+	_, err = container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithCmd("sleep", "60"),
 	)
@@ -427,7 +431,7 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 		_ = exec.Command("docker", "rm", "--force", name).Run()
 	}()
 
-	oldCtr, err := container.Run(ctx, "alpine:latest",
+	oldCtr, err := container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithCmd("sleep", "60"),
 	)
@@ -437,7 +441,7 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	if err := oldCtr.Terminate(ctx); err != nil {
 		t.Fatalf("Terminate old: %v", err)
 	}
-	newCtr, err := container.Run(ctx, "alpine:latest",
+	newCtr, err := container.Run(ctx, integrationAlpine,
 		container.WithName(name),
 		container.WithCmd("sleep", "60"),
 	)
@@ -461,7 +465,7 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 func TestIntegrationDockerExecPreservesLargeStderr(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
-	ctr, err := container.Run(ctx, "redis:7-alpine",
+	ctr, err := container.Run(ctx, integrationRedis,
 		container.WithCmd("sleep", "60"),
 	)
 	if err != nil {
@@ -487,7 +491,7 @@ func TestIntegrationDockerExecPreservesLargeStderr(t *testing.T) {
 func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
-	ctr, err := container.Run(ctx, "redis:7-alpine",
+	ctr, err := container.Run(ctx, integrationRedis,
 		container.WithCmd("sleep", "60"),
 	)
 	if err != nil {
@@ -513,7 +517,7 @@ func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 func TestIntegrationDockerExecAppNotFoundIsResult(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
-	ctr, err := container.Run(ctx, "alpine:latest",
+	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithCmd("sleep", "60"),
 	)
 	if err != nil {
@@ -536,7 +540,7 @@ func TestIntegrationDockerExecAppNotFoundIsResult(t *testing.T) {
 func TestIntegrationDockerExecMissingContainerIsError(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
-	ctr, err := container.Run(ctx, "alpine:latest",
+	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithCmd("sleep", "60"),
 	)
 	if err != nil {

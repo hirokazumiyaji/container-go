@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
 	"testing"
 	"time"
@@ -14,6 +15,9 @@ import (
 
 func requireAppleCLI(t *testing.T) {
 	t.Helper()
+	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
+		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple CLI checks", backend)
+	}
 	if _, err := exec.LookPath("container"); err != nil {
 		t.Skip("container CLI not installed")
 	}
@@ -24,6 +28,9 @@ func requireAppleCLI(t *testing.T) {
 
 func requireDockerCLI(t *testing.T) {
 	t.Helper()
+	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
+		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker CLI checks", backend)
+	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -41,14 +48,14 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-compat-%d", time.Now().UnixNano())
 
-	if _, _, err := r.Run(ctx, "run", "--detach", "--name", name, "redis:7-alpine"); err != nil {
+	if _, _, err := r.Run(ctx, "run", "--detach", "--name", name, integrationRedis); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _, _ = r.Run(context.Background(), "delete", "--force", name)
 	})
 
-	_, _, conflictErr := r.Run(ctx, "run", "--detach", "--name", name, "redis:7-alpine")
+	_, _, conflictErr := r.Run(ctx, "run", "--detach", "--name", name, integrationRedis)
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
@@ -85,14 +92,14 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-compat-%d", time.Now().UnixNano())
 
-	if _, _, err := r.Run(ctx, "run", "-d", "--name", name, "redis:7-alpine"); err != nil {
+	if _, _, err := r.Run(ctx, "run", "-d", "--name", name, integrationRedis); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _, _ = r.Run(context.Background(), "rm", "--force", name)
 	})
 
-	_, _, conflictErr := r.Run(ctx, "run", "-d", "--name", name, "redis:7-alpine")
+	_, _, conflictErr := r.Run(ctx, "run", "-d", "--name", name, integrationRedis)
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}

@@ -210,9 +210,14 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 ```
 make test                # ユニットテスト(バックエンド不要)
 make vet
-make integration         # 統合テスト一式。バックエンドがなければ各自 skip
+make integration         # 統合テスト(bench/singleflight 除外)。バックエンドがなければ各自 skip
 make integration-docker  # Docker バックエンドの統合テストのみ
+make bench-integration   # pull が多い bench / singleflight
 ```
+
+統合テストのイメージは Docker Hub 匿名 pull 制限を避けるため
+`public.ecr.aws/docker/library/...` を使います。
+`CONTAINERGO_BACKEND=apple` または `docker` で片方だけ実行できます。
 
 設計ドキュメント: [docs/design.md](docs/design.md)(日本語版:
 [docs/design.ja.md](docs/design.ja.md))

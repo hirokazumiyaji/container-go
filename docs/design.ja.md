@@ -113,6 +113,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithNetwork(name string)`：接続先ネットワーク
 - `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
 
+`WithHostname` や `WithPrivileged` などのオプションは、Apple Container CLI に対応するフラグが存在しないため意図的に提供しない(両バックエンド共通でサポート可能な機能に限定する方針)。ログ転送には `FollowLogs` を直接利用する。
+
 ### Container ハンドル
 
 ```go
@@ -162,7 +164,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForListeningPort(port string)`：コンテナ IP の対象ポートへ `net.DialTimeout` が成功するまで待つ
 - `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
 待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。

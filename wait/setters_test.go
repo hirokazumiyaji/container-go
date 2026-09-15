@@ -56,6 +56,18 @@ func TestStrategySetters(t *testing.T) {
 			t.Errorf("exposed=%+v", s)
 		}
 	})
+	t.Run("ForAll WithStartupTimeout", func(t *testing.T) {
+		s := ForAll().WithStartupTimeout(time.Second)
+		if s.startupTimeout != time.Second {
+			t.Errorf("startupTimeout=%v", s.startupTimeout)
+		}
+	})
+	t.Run("ForAny WithStartupTimeout", func(t *testing.T) {
+		s := ForAny().WithStartupTimeout(time.Second)
+		if s.startupTimeout != time.Second {
+			t.Errorf("startupTimeout=%v", s.startupTimeout)
+		}
+	})
 }
 
 func TestForHTTPWithHeadersAndBasicAuth(t *testing.T) {

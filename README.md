@@ -131,11 +131,11 @@ wait.ForListeningPort("6379/tcp")            // TCP dial succeeds
 wait.ForExposedPort()                        // first declared port
 wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
-wait.ForAll(...), wait.ForAny(...)           // composition (bound the whole with context.WithTimeout)
+wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). Waiting fails fast if the container
+`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 

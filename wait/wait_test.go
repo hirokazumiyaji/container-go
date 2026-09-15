@@ -441,6 +441,44 @@ func TestForAnySucceedsWhenOneSucceeds(t *testing.T) {
 	}
 }
 
+func TestForAllWithStartupTimeout(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1" // dead port
+
+	s := ForAll(
+		ForListeningPort("6379/tcp").WithStartupTimeout(10*time.Second).WithPollInterval(20*time.Millisecond),
+		ForListeningPort("6380/tcp").WithStartupTimeout(10*time.Second).WithPollInterval(20*time.Millisecond),
+	).WithStartupTimeout(100 * time.Millisecond)
+
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error on timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v, want <= 2s", elapsed)
+	}
+}
+
+func TestForAnyWithStartupTimeout(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1" // dead port
+
+	s := ForAny(
+		ForListeningPort("6379/tcp").WithStartupTimeout(10*time.Second).WithPollInterval(20*time.Millisecond),
+		ForListeningPort("6380/tcp").WithStartupTimeout(10*time.Second).WithPollInterval(20*time.Millisecond),
+	).WithStartupTimeout(100 * time.Millisecond)
+
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error on timeout")
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Errorf("took %v, want <= 2s", elapsed)
+	}
+}
+
 func TestForExecRejectsEmptyCommand(t *testing.T) {
 	target := newFakeTarget()
 	s := ForExec(nil).WithStartupTimeout(60 * time.Second)

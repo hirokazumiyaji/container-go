@@ -153,6 +153,12 @@ provides:
 - `WithNetwork(name string)`: target network
 - `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
+Options like `WithHostname` or `WithPrivileged` are intentionally omitted
+because Apple Container CLI provides no corresponding flags; the option
+surface is restricted to backend-neutral capabilities supported across both
+backends. For log consumers, `FollowLogs` streams container logs directly
+to any destination without an extra option.
+
 ### The Container handle
 
 ```go
@@ -232,9 +238,9 @@ provides:
 - `wait.ForExec(cmd []string)`: wait until `container exec` exits with
   an accepted code (0 by default)
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition. Each child keeps its own `WithStartupTimeout`; bound the
-  whole composition with `context.WithTimeout` from the caller rather
-  than a synthetic composite deadline.
+  composition. Each child keeps its own `WithStartupTimeout`; the whole
+  composition can also be bounded with `WithStartupTimeout` (or
+  `context.WithTimeout` from the caller).
 
 Every strategy carries `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms). If the container transitions to

@@ -3,6 +3,7 @@ package wait
 import (
 	"context"
 	"errors"
+	"fmt"
 	"time"
 )
 
@@ -18,7 +19,8 @@ func ForAll(strategies ...Strategy) *AllStrategy {
 }
 
 // WithStartupTimeout bounds the total time spent waiting across all
-// strategies in the sequence.
+// strategies in the sequence. A non-positive d leaves the sequence
+// unbounded, relying on each strategy's own startup timeout.
 func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 	s.startupTimeout = d
 	return s
@@ -30,11 +32,17 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		ctx, cancel = context.WithTimeout(ctx, s.startupTimeout)
 		defer cancel()
 	}
-	for _, strategy := range s.strategies {
+	for i, strategy := range s.strategies {
 		if err := ctx.Err(); err != nil {
+			if s.startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err)
+			}
 			return err
 		}
 		if err := strategy.WaitUntilReady(ctx, target); err != nil {
+			if s.startupTimeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				return fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err)
+			}
 			return err
 		}
 	}
@@ -53,7 +61,8 @@ func ForAny(strategies ...Strategy) *AnyStrategy {
 }
 
 // WithStartupTimeout bounds the total time spent waiting for any
-// strategy to succeed.
+// strategy to succeed. A non-positive d leaves the wait unbounded,
+// relying on each strategy's own startup timeout.
 func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	s.startupTimeout = d
 	return s
@@ -78,11 +87,15 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	}
 	var errs []error
 	for range s.strategies {
-		err := <-results
-		if err == nil {
-			return nil
+		select {
+		case err := <-results:
+			if err == nil {
+				return nil
+			}
+			errs = append(errs, err)
+		case <-ctx.Done():
+			return errors.Join(append(errs, ctx.Err())...)
 		}
-		errs = append(errs, err)
 	}
 	return errors.Join(errs...)
 }

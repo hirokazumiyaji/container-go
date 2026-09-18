@@ -455,6 +455,9 @@ func TestForAllWithStartupTimeout(t *testing.T) {
 	if err == nil {
 		t.Fatal("want error on timeout")
 	}
+	if !strings.Contains(err.Error(), "wait for all: startup timeout") {
+		t.Errorf("error %q missing composite timeout context", err)
+	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("took %v, want <= 2s", elapsed)
 	}
@@ -473,6 +476,9 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 	err := s.WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("want error on timeout")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("error %v: want DeadlineExceeded", err)
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("took %v, want <= 2s", elapsed)

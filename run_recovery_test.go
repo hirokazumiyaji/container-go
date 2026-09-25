@@ -178,6 +178,45 @@ func TestIssue94MalformedDockerReuseRunCleansStoppedGenerationByUID(t *testing.T
 	closeMalformedRecoveryReaper(t, bin, reaper)
 }
 
+func TestIssue94MalformedDockerUnsafeReuseDoesNotRegisterReaper(t *testing.T) {
+	for _, state := range []string{"running", "paused"} {
+		t.Run(state, func(t *testing.T) {
+			t.Setenv("CONTAINERGO_KEEP", "")
+			bin, _ := writeReaperStub(t)
+			uid := strings.Repeat("d", 64)
+			base := newTestRunner()
+			base.imagePresent = true
+			runner := &issue94MalformedDockerRecoveryRunner{
+				fakeRunner: base,
+				binary:     bin,
+				uid:        uid,
+				state:      state,
+			}
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("malformed-reuse"), WithReuse(), withRunner(runner), withEngine(dockerEngine{}))
+			var cleanupErr *CleanupError
+			if ctr != nil || !errors.As(err, &cleanupErr) {
+				t.Fatalf("Run = (%v, %v), want CleanupError refusal", ctr, err)
+			}
+			runner.mu.Lock()
+			deleted := append([]string(nil), runner.deleted...)
+			runner.mu.Unlock()
+			if len(deleted) != 0 {
+				t.Fatalf("unsafe reuse generation was deleted: %v", deleted)
+			}
+			globalReapersMu.Lock()
+			reaper := globalReapers[bin]
+			globalReapersMu.Unlock()
+			if reaper != nil {
+				closeMalformedRecoveryReaper(t, bin, reaper)
+			}
+			if reaper != nil {
+				t.Fatal("unsafe reuse generation was registered with the reaper")
+			}
+		})
+	}
+}
+
 func closeMalformedRecoveryReaper(t *testing.T, binary string, r *reaper) {
 	t.Helper()
 	globalReapersMu.Lock()

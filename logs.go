@@ -72,11 +72,11 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	var target string
 	var unlock func()
 	var err error
-	if c.reused {
-		target, _, unlock, err = c.acquireCurrentTarget(ctx)
-	} else {
-		target, unlock, err = c.acquireUnverifiedTarget(ctx)
-	}
+	// FollowLogs is a long-lived operation. Reuse handles and every
+	// generation-bound Apple handle must verify the current name before
+	// opening the stream; only legacy unbound diagnostic handles retain
+	// the unverified one-call behavior.
+	target, unlock, err = c.acquireHandleTarget(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -86,18 +86,8 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
 	if usesNameAddressedDeletes(c.eng) {
-		wrapped := &unlockReadCloser{
-			ReadCloser: reader,
-			unlock:     unlock,
-			stop:       make(chan struct{}),
-		}
-		go func() {
-			select {
-			case <-ctx.Done():
-				wrapped.once.Do(wrapped.unlock)
-			case <-wrapped.stop:
-			}
-		}()
+		wrapped := newUnlockReadCloser(reader, unlock)
+		go wrapped.watchCancellation(ctx)
 		return wrapped, nil
 	}
 	unlock()
@@ -106,15 +96,52 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 
 type unlockReadCloser struct {
 	io.ReadCloser
-	once     sync.Once
-	stopOnce sync.Once
-	stop     chan struct{}
-	unlock   func()
+	closeOnce  sync.Once
+	closeDone  chan struct{}
+	closeErr   error
+	unlockOnce sync.Once
+	stopOnce   sync.Once
+	stop       chan struct{}
+	unlock     func()
+}
+
+func newUnlockReadCloser(reader io.ReadCloser, unlock func()) *unlockReadCloser {
+	return &unlockReadCloser{
+		ReadCloser: reader,
+		closeDone:  make(chan struct{}),
+		stop:       make(chan struct{}),
+		unlock:     unlock,
+	}
+}
+
+// closeStream serializes underlying Close calls and waits for the first
+// one to finish. The Apple name lock must remain held until the backend
+// stream has been closed and its child/process wait has completed.
+func (r *unlockReadCloser) closeStream() error {
+	r.closeOnce.Do(func() {
+		r.closeErr = r.ReadCloser.Close()
+		close(r.closeDone)
+	})
+	<-r.closeDone
+	return r.closeErr
+}
+
+func (r *unlockReadCloser) releaseLock() {
+	r.unlockOnce.Do(r.unlock)
+}
+
+func (r *unlockReadCloser) watchCancellation(ctx context.Context) {
+	select {
+	case <-ctx.Done():
+		_ = r.closeStream()
+		r.releaseLock()
+	case <-r.stop:
+	}
 }
 
 func (r *unlockReadCloser) Close() error {
-	err := r.ReadCloser.Close()
+	err := r.closeStream()
 	r.stopOnce.Do(func() { close(r.stop) })
-	r.once.Do(r.unlock)
+	r.releaseLock()
 	return err
 }

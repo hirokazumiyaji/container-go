@@ -2,12 +2,13 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -147,8 +148,11 @@ func TestDockerLifecycleArgs(t *testing.T) {
 
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
-	if got := e.listArgs(); !slices.Contains(got, "--filter") {
-		t.Errorf("listArgs = %v, want daemon-side filters", got)
+	if got := e.listArgs(); !slices.Contains(got, "--filter") || !slices.Contains(got, "--no-trunc") {
+		t.Errorf("listArgs = %v, want daemon-side filters and full IDs", got)
+	}
+	if got := e.listReuseGroupArgs("integration"); !slices.Contains(got, "--no-trunc") {
+		t.Errorf("listReuseGroupArgs = %v, want full IDs", got)
 	}
 	one := strings.Repeat("a", 64)
 	two := strings.Repeat("b", 64)

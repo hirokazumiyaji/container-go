@@ -416,6 +416,23 @@ func TestDockerDescriptorAndPlatformFailClosed(t *testing.T) {
 	}
 }
 
+func TestDockerPinnedIndexDigestSurvivesChildDescriptor(t *testing.T) {
+	uid := strings.Repeat("9", 64)
+	indexDigest := "sha256:" + strings.Repeat("1", 64)
+	childDigest := "sha256:" + strings.Repeat("2", 64)
+	data := []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"Config":{"Image":%q,"Labels":{}},"ImageManifestDescriptor":{"digest":%q,"platform":{"os":"linux","architecture":"arm64","variant":"v8"}}}]`, uid, "redis:7@"+indexDigest, childDigest))
+	info, err := (dockerEngine{}).parseInspect(data, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.image != "redis:7@"+indexDigest || info.imageDigest != indexDigest {
+		t.Fatalf("image identity = %q / %q, want pinned index %q", info.image, info.imageDigest, indexDigest)
+	}
+	if info.platform != "linux/arm64/v8" {
+		t.Fatalf("platform = %q, want child descriptor platform", info.platform)
+	}
+}
+
 func TestTransientPostRunInspectIsRetried(t *testing.T) {
 	oldDelay := inspectRetryDelay
 	inspectRetryDelay = time.Millisecond

@@ -216,9 +216,13 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 
 	image := c.Config.Image
 	imageDigestValue := imageDigest(image)
+	operatorPinned := validOCIDigest(imageDigestValue)
 	platform := c.Platform
 	if descriptor := c.ImageManifestDescriptor; descriptor != nil {
-		if validOCIDigest(descriptor.Digest) {
+		// Config.Image may be the operator-pinned multi-platform index
+		// digest. The child manifest descriptor still supplies platform
+		// metadata, but must not replace that pinned root identity.
+		if validOCIDigest(descriptor.Digest) && !operatorPinned {
 			imageDigestValue = descriptor.Digest
 			image = qualifyImageReference(image, descriptor.Digest)
 		}
@@ -339,7 +343,7 @@ func (dockerEngine) logsTailArgs(id string) []string {
 // status filters directly.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
 		"--format", "{{.ID}}",
@@ -455,7 +459,7 @@ func (dockerEngine) parseImageExists(data []byte, platform string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
 		"--format", "{{.ID}}",
 	}

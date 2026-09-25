@@ -33,8 +33,9 @@ func registerContainerReaper(cfg *config, c *Container) {
 // stdout did not contain a usable full container ID. Docker may have
 // created the container before the output was truncated or malformed, so
 // the only safe recovery is a name/generation ownership inspection. A
-// verified UID is registered with the reaper before cleanup is attempted;
-// every recovery failure is joined to the original run error.
+// verified UID is registered with the reaper after reuse ownership/state
+// checks and before cleanup is attempted; every recovery failure is joined
+// to the original run error.
 func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Container, error) {
 	if cause == nil {
 		cause = fmt.Errorf("run %s: backend did not return a full 64-hex container ID", cfg.name)
@@ -74,14 +75,12 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		return nil, cause
 	}
 
-	// Register before rm: if rm fails, the reaper still owns the verified
-	// UID and can retry after the process exits. A running reuse generation
-	// may already have been adopted by a peer, so register it for watchdog
-	// protection but refuse automatic deletion.
-	registerContainerReaper(cfg, ctr)
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
 	if cfg.reuse {
+		// A reuse generation is shared state. Refuse running, stopping,
+		// unknown, or otherwise unverifiable generations before adding an
+		// automatic-delete target to the reaper.
 		if info.state == StateRunning {
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name))
 		}
@@ -90,7 +89,8 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		}
 		// A stopped reuse generation can be adopted or replaced between
 		// the recovery lookup and rm. Reinspect the name and require the
-		// same owned UID and a stopped/created state before deleting it.
+		// same owned UID and a stopped/created state before registering or
+		// deleting it.
 		fresh, freshErr := ctr.inspectTargetFreshRetry(delCtx, cfg.name)
 		if isNotFound(freshErr) {
 			return nil, cause
@@ -105,6 +105,10 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation became %s; refusing automatic deletion", cfg.name, fresh.state))
 		}
 	}
+	// Register only after all ownership/state refusals above. If rm fails,
+	// the reaper still owns the verified UID and can retry after the process
+	// exits.
+	registerContainerReaper(cfg, ctr)
 	if err := ctr.delete(delCtx, ctr.immutableID()); err != nil {
 		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: cleanup: %w", cfg.name, err))
 	}

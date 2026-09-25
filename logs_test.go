@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
 	"slices"
 	"strings"
@@ -88,6 +89,82 @@ func TestFollowLogsStreamsAndPropagatesClose(t *testing.T) {
 	}
 	if !f.closed {
 		t.Error("Close not propagated to the underlying stream")
+	}
+}
+
+func TestFollowLogsVerifiesNonReuseAppleGeneration(t *testing.T) {
+	f := &streamRunner{fakeRunner: newTestRunner(), streamData: "streamed\n"}
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+
+	rc, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatalf("FollowLogs: %v", err)
+	}
+	defer rc.Close()
+	if f.callWith("inspect") == nil {
+		t.Fatal("non-reuse Apple FollowLogs did not inspect the handle generation")
+	}
+}
+
+func TestFollowLogsRejectsReplacedNonReuseAppleGeneration(t *testing.T) {
+	f := &streamRunner{fakeRunner: newTestRunner()}
+	f.inspectJSON = string(reviewAppleInspect("myctr", "running", "redis", "bbbbbbbbbbbbbbbb", "linux/amd64"))
+	ctr := &Container{id: "myctr", runner: f, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+
+	if _, err := ctr.FollowLogs(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("FollowLogs error = %v, want ErrGenerationReplaced", err)
+	}
+	if f.streamArgs != nil {
+		t.Fatalf("replaced generation opened a stream: %v", f.streamArgs)
+	}
+}
+
+type blockingCloseReader struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *blockingCloseReader) Read([]byte) (int, error) { return 0, io.EOF }
+
+func (r *blockingCloseReader) Close() error {
+	close(r.started)
+	<-r.release
+	return nil
+}
+
+func TestCancellationWaitsForStreamBeforeUnlockingAppleName(t *testing.T) {
+	reader := &blockingCloseReader{started: make(chan struct{}), release: make(chan struct{})}
+	unlocked := make(chan struct{})
+	wrapped := newUnlockReadCloser(reader, func() { close(unlocked) })
+	ctx, cancel := context.WithCancel(context.Background())
+	watchDone := make(chan struct{})
+	go func() {
+		wrapped.watchCancellation(ctx)
+		close(watchDone)
+	}()
+	cancel()
+
+	select {
+	case <-reader.started:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation did not close the wrapped stream")
+	}
+	select {
+	case <-unlocked:
+		t.Fatal("Apple name lock was released before the stream close completed")
+	default:
+	}
+	close(reader.release)
+	select {
+	case <-watchDone:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation watcher did not finish after stream close")
+	}
+	select {
+	case <-unlocked:
+	default:
+		t.Fatal("Apple name lock was not released after the stream closed")
 	}
 }
 

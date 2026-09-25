@@ -93,14 +93,17 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	var errs []error
 	for _, id := range ids {
 		var didRemove bool
-		if usesNameAddressedDeletes(eng) {
+		switch {
+		case usesImmutableIDs(eng):
+			didRemove, err = deleteImmutablePruneCandidate(ctx, r, eng, id, errKind, reuseGroup)
+		case usesNameAddressedDeletes(eng):
 			candidate, ok := listed[id]
 			if !ok {
 				err = fmt.Errorf("%s %s: list candidate metadata missing", errKind, id)
 			} else {
 				didRemove, err = pruneNamedCandidate(ctx, r, eng, candidate, errKind, reuseGroup)
 			}
-		} else {
+		default:
 			didRemove, err = deletePruneCandidate(ctx, r, eng, id, errKind)
 		}
 		if err != nil {
@@ -114,12 +117,43 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	return removed, errors.Join(errs...)
 }
 
+func deleteImmutablePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
+	if !dockerIDRE.MatchString(id) {
+		return false, fmt.Errorf("%s %s: list result is not a full immutable Docker ID", errKind, id)
+	}
+	ctr := &Container{id: id, runner: r, eng: eng}
+	fresh, err := ctr.inspectTargetFreshRetry(ctx, id)
+	if isNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, err)
+	}
+	if !pruneCandidateEligible(pruneCandidate{
+		id:         id,
+		labels:     fresh.labels,
+		creation:   fresh.labels[creationLabel],
+		state:      fresh.state,
+		reuseGroup: fresh.labels[reuseGroupLabel],
+	}, reuseGroup) {
+		return false, nil
+	}
+	if !dockerIDRE.MatchString(fresh.uid) || fresh.uid != id {
+		return false, nil
+	}
+	return deletePruneCandidate(ctx, r, eng, id, errKind)
+}
+
 func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
 	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer dCancel()
 	_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
-	if err != nil && !isNotFound(err) {
-		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
+	if err != nil {
+		classified := cli.Classify(ctx, r, err, eng.probe())
+		if isNotFound(classified) {
+			return true, nil
+		}
+		return false, fmt.Errorf("%s %s: %w", errKind, id, classified)
 	}
 	return true, nil
 }
@@ -142,9 +176,9 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(guardCtx)
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectTargetFreshRetry(guardCtx, candidate.id)
 	if isNotFound(err) {
-		return true, nil
+		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
@@ -152,11 +186,10 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
 		return false, nil
 	}
-	target := candidate.id
-	if fresh.uid != "" {
-		target = fresh.uid
-	}
-	return deletePruneCandidate(guardCtx, r, eng, target, errKind)
+	// Apple has no immutable ID: the name lock and the exact generation
+	// revalidation above are the delete proof.  Never substitute a
+	// backend-reported UID for a name-addressed Apple operation.
+	return deletePruneCandidate(guardCtx, r, eng, candidate.id, errKind)
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {

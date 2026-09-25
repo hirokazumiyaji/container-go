@@ -37,7 +37,9 @@ func WithFiles(files ...File) Option {
 // CopyToContainer copies a host file or directory into the running
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
-	return c.copyToContainerTarget(ctx, c.id, hostPath, containerPath)
+	return c.withCurrentTarget(ctx, func(target string) error {
+		return c.copyToContainerTarget(ctx, target, hostPath, containerPath)
+	})
 }
 
 func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath, containerPath string) error {
@@ -54,7 +56,7 @@ func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath,
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return wrapNotFound(c.classify(ctx, err))
 }
 
 // CopyFileFromContainer copies one file out of the running container
@@ -71,27 +73,32 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 	dst := filepath.Join(dir, filepath.Base(containerPath))
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, c.classify(ctx, err)
-	}
-	info, err := os.Stat(dst)
+	var result io.ReadCloser
+	err = c.withCurrentTarget(ctx, func(target string) error {
+		qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+		defer cancel()
+		if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
+			return wrapNotFound(c.classify(ctx, err))
+		}
+		info, err := os.Stat(dst)
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return fmt.Errorf("copy file from container %q: target is a directory", containerPath)
+		}
+		f, err := os.Open(dst)
+		if err != nil {
+			return err
+		}
+		result = &tempFileReader{File: f, dir: dir}
+		return nil
+	})
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	if info.IsDir() {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("copy file from container %q: target is a directory", containerPath)
-	}
-	f, err := os.Open(dst)
-	if err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
-	}
-	return &tempFileReader{File: f, dir: dir}, nil
+	return result, nil
 }
 
 type tempFileReader struct {

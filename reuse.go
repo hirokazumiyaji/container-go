@@ -27,8 +27,14 @@ func waitReusePoll(ctx context.Context) error {
 	}
 }
 
-func reuseFailureResult(ctr *Container, err error) (*Container, error) {
-	if keepContainers() {
+func reuseFailureResult(ctx context.Context, ctr *Container, err error) (*Container, error) {
+	if !keepContainers() || ctr == nil {
+		return nil, err
+	}
+	// Retention is useful for a copy/readiness failure only while the
+	// exact current generation is still running.  Never expose a stale,
+	// stopped, missing, or unverifiable handle to CONTAINERGO_KEEP callers.
+	if ctr.verifiedCurrentHandle(ctx, true) {
 		return ctr, err
 	}
 	return nil, err
@@ -59,16 +65,19 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 
 		base, err := reuseEnsureFlight(resolveCtx, image, cfg)
 		if err != nil {
-			// A retained failed create may carry a partial handle. Do not
-			// discard it when CONTAINERGO_KEEP explicitly asks callers to
-			// manage the retained generation themselves.
-			if base != nil && keepContainers() {
+			// A retained failed create may carry a partial handle, but
+			// KEEP still requires a fresh identity check before exposing
+			// it.  A failed/stopped/unverifiable generation is discarded.
+			if base != nil && keepContainers() && base.verifiedRetainedHandle(resolveCtx) {
 				return base, err
 			}
 			return nil, err
 		}
 		info, err := inspectNamed(resolveCtx, cfg, cfg.name)
 		if err != nil {
+			if errors.Is(err, ErrSystemNotRunning) {
+				return nil, err
+			}
 			if isNotFound(err) {
 				cfg.clearReuseCreated()
 				continue
@@ -87,8 +96,18 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteStoppedReuse(resolveCtx, cfg, info); err != nil {
+			removed, err := deleteStoppedReuseChecked(resolveCtx, cfg, info)
+			if err != nil {
 				return nil, err
+			}
+			if !removed {
+				// The generation may have been adopted or may be
+				// stopping. Re-inspect it; never turn a refusal into a
+				// create race.
+				if err := waitReusePoll(resolveCtx); err != nil {
+					return nil, err
+				}
+				continue
 			}
 			stoppedRecreated = true
 			cfg.clearReuseCreated()
@@ -110,6 +129,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		if err := checkReuseCompat(info, image, cfg); err != nil {
 			return nil, err
 		}
+		if usesImmutableIDs(base.eng) && !dockerIDRE.MatchString(info.uid) {
+			return nil, fmt.Errorf("reuse %s: backend did not report a full immutable Docker ID", cfg.name)
+		}
 		ctr := &Container{
 			id:        base.id,
 			runner:    base.runner,
@@ -119,28 +141,45 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			reused:    true,
 			info:      info,
 			creation:  info.labels[creationLabel],
-			uid:       info.uid,
 		}
+		ctr.rememberImmutableID(info.uid)
 		// File application is deliberately outside the shared ensure
 		// flight. Every caller, including the creator, applies its own
 		// files after the generation is known and its identity has been
 		// checked under the backend's safe target path.
 		if err := copyReuseFiles(resolveCtx, ctr, cfg.files); err != nil {
-			return reuseFailureResult(ctr, err)
+			return reuseFailureResult(resolveCtx, ctr, err)
 		}
 		if err := reuseWait(ctx, cfg, ctr); err != nil {
-			return reuseFailureResult(ctr, err)
+			return reuseFailureResult(ctx, ctr, err)
 		}
 
 		// A wait strategy or a concurrent replacement can outlive the
 		// inspect above. Never return a handle for a different, stopped,
 		// or otherwise changed generation.
-		fresh, err := ctr.inspectFresh(ctx)
+		unlock, err := lockReuseFinal(resolveCtx, cfg)
 		if err != nil {
-			return reuseFailureResult(ctr, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err))
+			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+		}
+		defer unlock()
+		// Docker handles still use their immutable UID for operations,
+		// but the final reuse check intentionally inspects the name to
+		// detect a same-name replacement generation. Apple is already
+		// holding the name lock here, so use a raw name inspect without
+		// recursively taking that lock.
+		fresh, err := ctr.inspectTargetFreshRetry(resolveCtx, ctr.id)
+		if err != nil {
+			// The operation itself failed and the final identity could not
+			// be proven.  KEEP must not return this handle.
+			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+		}
+		if usesNameAddressedDeletes(ctr.eng) {
+			if err := ctr.identityMatches(fresh); err != nil {
+				return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+			}
 		}
 		if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
-			return reuseFailureResult(ctr, err)
+			return nil, err
 		}
 		return ctr, nil
 	}
@@ -171,6 +210,10 @@ func (c *config) clearReuseCreated() {
 	c.reusedCreated = false
 	c.reusedCreatedUID = ""
 	c.reusedCreatedGeneration = ""
+	// A future create attempt must receive a new generation.  Keeping the
+	// old value here can make a retry label a stopped or replaced
+	// generation with the previous attempt's ownership token.
+	c.creation = ""
 }
 
 // reuseEnsureContainer creates or attaches to the named container
@@ -190,6 +233,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
+			if errors.Is(err, ErrSystemNotRunning) {
+				return nil, err
+			}
 			if !isNotFound(err) {
 				return nil, err
 			}
@@ -199,14 +245,18 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
 				cfg.reusedCreated = true
-				cfg.reusedCreatedUID = ctr.uid
+				cfg.reusedCreatedUID = ctr.immutableID()
 				cfg.reusedCreatedGeneration = ctr.creation
 				return ctr, nil
 			}
 			// nameConflict: another process won create. createRaceMissing
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
-			// Re-inspect and attach (or recreate) until the deadline.
+			// Re-inspect and attach (or recreate) until the deadline, but
+			// never turn a classified daemon outage into that retry loop.
+			if errors.Is(createErr, ErrSystemNotRunning) {
+				return nil, createErr
+			}
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
 				if err := waitReusePoll(ctx); err != nil {
 					return nil, err
@@ -234,16 +284,27 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
+			removed, err := deleteStoppedReuseChecked(ctx, cfg, info)
+			if err != nil {
 				return nil, err
 			}
+			if !removed {
+				if err := waitReusePoll(ctx); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			cfg.clearReuseCreated()
 			recreated = true
 			continue
 		case StateRunning:
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			return &Container{
+			if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(info.uid) {
+				return nil, fmt.Errorf("reuse %s: backend did not report a full immutable Docker ID", cfg.name)
+			}
+			ctr := &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
 				eng:       cfg.eng,
@@ -252,14 +313,50 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				reused:    true,
 				info:      info,
 				creation:  info.labels[creationLabel],
-				uid:       info.uid,
-			}, nil
+			}
+			ctr.rememberImmutableID(info.uid)
+			return ctr, nil
 		default:
 			if err := waitReusePoll(ctx); err != nil {
 				return nil, err
 			}
 		}
 	}
+}
+
+func initializeReuseHandle(ctx context.Context, cfg *config, ctr *Container) error {
+	if !usesNameAddressedDeletes(cfg.eng) {
+		info, err := ctr.cachedInfo(ctx)
+		if err != nil {
+			return err
+		}
+		if info.labels[managedLabel] != "true" || (cfg.reuse && info.labels[reuseLabel] != "true") ||
+			!creationRE.MatchString(cfg.creation) || info.labels[creationLabel] != cfg.creation {
+			return fmt.Errorf("reuse %s: %w: post-create generation could not be verified", cfg.name, ErrGenerationReplaced)
+		}
+		return nil
+	}
+
+	guardCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	unlock, err := lockName(guardCtx, cfg.name)
+	if err != nil {
+		return fmt.Errorf("reuse %s: lock post-create generation: %w", cfg.name, err)
+	}
+	defer unlock()
+	info, err := ctr.inspectTargetFreshRetry(guardCtx, cfg.name)
+	if err != nil {
+		return err
+	}
+	if err := ctr.identityMatches(info); err != nil {
+		return err
+	}
+	if (cfg.reuse && info.labels[reuseLabel] != "true") || !creationRE.MatchString(cfg.creation) ||
+		info.labels[creationLabel] != cfg.creation {
+		return fmt.Errorf("reuse %s: %w: post-create generation could not be verified", cfg.name, ErrGenerationReplaced)
+	}
+	ctr.info = info
+	return nil
 }
 
 func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
@@ -272,9 +369,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		defer os.RemoveAll(dir)
 		envFile = path
 	}
-	if cfg.creation == "" {
-		cfg.creation = newCreationID()
-	}
+	// Every actual create attempt gets a fresh generation, including a
+	// retry after a stale/missing generation was observed.  Reusing the
+	// previous value would let failed-create ownership or cleanup match
+	// the wrong attempt.
+	cfg.clearReuseCreated()
+	cfg.creation = newCreationID()
 
 	// The leader's pull and create get an independent runTimeout budget
 	// even when the caller's context carries a tighter attach deadline.
@@ -291,11 +391,17 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		if errors.Is(classified, ErrSystemNotRunning) {
+			// A daemon outage is terminal; retrying only turns one
+			// classified failure into repeated probes and create races.
+			return nil, classified
+		}
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
-			// a peer's in-flight container on a not-found race.
-			return nil, err
+			// a peer's in-flight container on a not-found race.  Return
+			// the classified chain so callers do not lose daemon errors.
+			return nil, classified
 		}
 		if keepContainers() {
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
@@ -305,20 +411,24 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, withCleanupError(classified, cleanupErr)
 	}
 
+	runID := cfg.eng.parseRunID(stdout)
 	ctr := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
-		reused:    true,
+		reused:    cfg.reuse,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
 	}
-	if _, err := ctr.cachedInfo(runCtx); err != nil {
+	ctr.rememberImmutableID(runID)
+	if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(ctr.immutableID()) {
+		return nil, fmt.Errorf("reuse %s: backend did not return a full immutable Docker ID", cfg.name)
+	}
+	if err := initializeReuseHandle(runCtx, cfg, ctr); err != nil {
 		// A reuse container is shared as soon as its name is published;
 		// do not let this caller remove a generation a peer may be using.
-		return reuseFailureResult(ctr, err)
+		return reuseFailureResult(ctx, ctr, err)
 	}
 	// WithFiles is applied by reuseRun after the shared ensure flight, not
 	// here. A caller-specific copy failure must not poison waiters.
@@ -328,6 +438,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 type reuseCopyIdentity struct {
 	uid      string
 	creation string
+	target   string
 }
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
@@ -351,27 +462,35 @@ func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 }
 
 func (c *Container) beginReuseCopy(ctx context.Context) (reuseCopyIdentity, string, func(), error) {
-	if c.uid != "" {
-		info, err := c.inspectFresh(ctx)
+	if usesImmutableIDs(c.eng) {
+		uid := c.immutableID()
+		if !dockerIDRE.MatchString(uid) {
+			return reuseCopyIdentity{}, "", nil, fmt.Errorf("container %s has no valid immutable Docker ID", c.id)
+		}
+		info, err := c.inspectTargetFreshRetry(ctx, uid)
 		if err != nil {
 			return reuseCopyIdentity{}, "", nil, err
 		}
-		if info.uid == "" || info.uid != c.uid {
+		if info.uid == "" || info.uid != uid {
 			return reuseCopyIdentity{}, "", nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
 		if info.state != StateRunning {
 			return reuseCopyIdentity{}, "", nil, fmt.Errorf("container state is %s before copy", info.state)
 		}
-		return reuseCopyIdentity{uid: c.uid}, c.uid, func() {}, nil
+		return reuseCopyIdentity{uid: uid, target: uid}, uid, func() {}, nil
 	}
 	if !creationRE.MatchString(c.creation) {
 		return reuseCopyIdentity{}, "", nil, fmt.Errorf("container has no valid creation generation")
 	}
-	unlock, err := lockName(ctx, c.id)
-	if err != nil {
-		return reuseCopyIdentity{}, "", nil, fmt.Errorf("lock name: %w", err)
+	unlock := func() {}
+	if usesNameAddressedDeletes(c.eng) {
+		var err error
+		unlock, err = lockName(ctx, c.id)
+		if err != nil {
+			return reuseCopyIdentity{}, "", nil, fmt.Errorf("lock name: %w", err)
+		}
 	}
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectTargetFreshRetry(ctx, c.id)
 	if err != nil {
 		unlock()
 		return reuseCopyIdentity{}, "", nil, err
@@ -380,15 +499,15 @@ func (c *Container) beginReuseCopy(ctx context.Context) (reuseCopyIdentity, stri
 		unlock()
 		return reuseCopyIdentity{}, "", nil, fmt.Errorf("container state is %s before copy", info.state)
 	}
-	if info.labels[creationLabel] != c.creation {
+	if err := c.identityMatches(info); err != nil {
 		unlock()
-		return reuseCopyIdentity{}, "", nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		return reuseCopyIdentity{}, "", nil, err
 	}
-	return reuseCopyIdentity{creation: c.creation}, c.id, unlock, nil
+	return reuseCopyIdentity{creation: c.creation, target: c.id}, c.id, unlock, nil
 }
 
 func (c *Container) verifyReuseCopyIdentity(ctx context.Context, identity reuseCopyIdentity) error {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectTargetFreshRetry(ctx, identity.target)
 	if err != nil {
 		return err
 	}
@@ -398,82 +517,112 @@ func (c *Container) verifyReuseCopyIdentity(ctx context.Context, identity reuseC
 		}
 		return nil
 	}
-	if info.labels[creationLabel] == "" || info.labels[creationLabel] != identity.creation {
+	if err := c.identityMatches(info); err != nil {
+		return err
+	}
+	if info.labels[creationLabel] != identity.creation {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	return nil
 }
 
 // deleteStoppedReuse removes a stopped reuse container only after
-// rechecking its state and generation under the backend's delete guard.
-// A generation that became running may already have been adopted by a
-// peer, so it is left in place and the caller re-inspects instead.
+// rechecking its state and identity.  The checked form reports whether a
+// delete actually happened; callers must re-inspect instead of assuming a
+// non-delete means the generation was removed.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	_, err := deleteStoppedReuseChecked(ctx, cfg, info)
+	return err
+}
+
+func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInfo) (bool, error) {
 	if err := checkReuseLabels(info, cfg); err != nil {
-		return err
+		return false, err
+	}
+	if info.state != StateStopped {
+		return false, nil
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+
+	if usesImmutableIDs(cfg.eng) {
+		if !dockerIDRE.MatchString(info.uid) {
+			return false, fmt.Errorf("reuse %s: stopped generation has no full immutable ID; refusing cleanup", cfg.name)
+		}
+		fresh, err := ctr.inspectTargetFreshRetry(ctx, info.uid)
+		if isNotFound(err) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+		}
+		if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped ||
+			checkReuseLabels(fresh, cfg) != nil {
+			return false, nil
+		}
+		if err := ctr.delete(ctx, fresh.uid); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
 
 	if usesNameAddressedDeletes(cfg.eng) {
 		guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
 		defer guardCancel()
 		unlock, err := lockName(guardCtx, cfg.name)
 		if err != nil {
-			return fmt.Errorf("reuse %s: lock stopped generation: %w", cfg.name, err)
+			return false, fmt.Errorf("reuse %s: lock stopped generation: %w", cfg.name, err)
 		}
 		defer unlock()
-		fresh, err := ctr.inspectFresh(guardCtx)
+		fresh, err := ctr.inspectTargetFreshRetry(guardCtx, cfg.name)
 		if isNotFound(err) {
-			return nil
+			return false, nil
 		}
 		if err != nil {
-			return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+			return false, fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
 		}
-		if err := checkReuseLabels(fresh, cfg); err != nil {
-			return nil
+		if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped ||
+			checkReuseLabels(fresh, cfg) != nil {
+			return false, nil
 		}
-		if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped {
-			return nil
+		if err := ctr.delete(guardCtx, cfg.name); err != nil {
+			return false, err
 		}
-		if fresh.uid != "" {
-			ctr.uid = fresh.uid
-		}
-		return ctr.delete(guardCtx, ctr.deleteTarget())
+		return true, nil
 	}
 
-	fresh, err := ctr.inspectFresh(ctx)
+	// Compatibility for small injected engines that have neither identity
+	// capability.  They retain the historical name behavior, but still
+	// require a stopped, matching generation before deletion.
+	fresh, err := ctr.inspectTargetFreshRetry(ctx, cfg.name)
 	if isNotFound(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+		return false, fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
 	}
-	if err := checkReuseLabels(fresh, cfg); err != nil {
-		return nil
+	if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped || checkReuseLabels(fresh, cfg) != nil {
+		return false, nil
 	}
-	if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped {
-		return nil
-	}
-	if fresh.uid != "" {
-		ctr.uid = fresh.uid
-	}
-	return ctr.delete(ctx, ctr.deleteTarget())
+	return true, ctr.delete(ctx, cfg.name)
 }
 
 func sameStoppedGeneration(before, fresh *engineInfo) bool {
-	if before == nil || fresh == nil || before.labels[creationLabel] == "" ||
-		before.labels[creationLabel] != fresh.labels[creationLabel] {
+	if before == nil || fresh == nil || before.state != StateStopped || fresh.state != StateStopped {
 		return false
 	}
-	return before.uid == "" || before.uid == fresh.uid
+	if before.uid != "" || fresh.uid != "" {
+		return dockerIDRE.MatchString(before.uid) && before.uid == fresh.uid
+	}
+	return creationRE.MatchString(before.labels[creationLabel]) &&
+		before.labels[creationLabel] == fresh.labels[creationLabel]
 }
 
-func (c *Container) deleteTarget() string {
-	if c.uid != "" {
-		return c.uid
+func classifyReuseError(ctx context.Context, cfg *config, err error) error {
+	if err == nil {
+		return nil
 	}
-	return c.id
+	return cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -481,6 +630,7 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return nil
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
+		err = classifyReuseError(ctx, cfg, err)
 		tail := ctr.logTail(context.WithoutCancel(ctx))
 		if tail != "" {
 			return fmt.Errorf("reuse %s failed to become ready: %w\ncontainer logs:\n%s", ctr.id, err, tail)
@@ -516,10 +666,14 @@ func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) err
 }
 
 func sameReuseGeneration(before, fresh *engineInfo) bool {
-	if before.uid != "" || fresh.uid != "" {
-		return before.uid != "" && before.uid == fresh.uid
+	if before == nil || fresh == nil {
+		return false
 	}
-	return before.labels[creationLabel] != "" && before.labels[creationLabel] == fresh.labels[creationLabel]
+	if before.uid != "" || fresh.uid != "" {
+		return dockerIDRE.MatchString(before.uid) && before.uid == fresh.uid
+	}
+	return creationRE.MatchString(before.labels[creationLabel]) &&
+		before.labels[creationLabel] == fresh.labels[creationLabel]
 }
 
 func sameReusePorts(before, fresh []boundPort) bool {
@@ -539,17 +693,25 @@ func sameReusePorts(before, fresh []boundPort) bool {
 	return true
 }
 
+func lockReuseFinal(ctx context.Context, cfg *config) (func(), error) {
+	if !usesNameAddressedDeletes(cfg.eng) {
+		return func() {}, nil
+	}
+	return lockName(ctx, cfg.name)
+}
+
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
 	return namedContainer(cfg, id).inspectFresh(ctx)
 }
 
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:        id,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
+		id:          id,
+		runner:      cfg.runner,
+		eng:         cfg.eng,
+		exposed:     cfg.exposed,
+		published:   cfg.published,
+		nameInspect: true,
 	}
 }
 
@@ -571,17 +733,92 @@ func createRaceMissing(err error) bool {
 // platformSelectorMatches compares the fields selected by the caller.
 // An omitted selector component is a wildcard; every component that the
 // caller does specify must be present in the backend's normalized value.
+func parsePlatformParts(value string) (osName, arch, variant string, ok bool) {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "", "", "", false
+	}
+	parts := strings.Split(value, "/")
+	if len(parts) > 3 {
+		return "", "", "", false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", "", "", false
+		}
+	}
+	if len(parts) > 0 {
+		osName = parts[0]
+	}
+	if len(parts) > 1 {
+		arch = parts[1]
+	}
+	if len(parts) > 2 {
+		variant = parts[2]
+	}
+	return osName, arch, variant, true
+}
+
 func platformSelectorMatches(requested, actual string) bool {
-	wantOS, wantArch, wantVariant := splitPlatform(strings.TrimSpace(requested))
-	gotOS, gotArch, gotVariant := splitPlatform(strings.TrimSpace(actual))
-	return (wantOS == "" || strings.EqualFold(wantOS, gotOS)) &&
-		(wantArch == "" || strings.EqualFold(wantArch, gotArch)) &&
+	if strings.TrimSpace(requested) == "" {
+		return true
+	}
+	wantOS, wantArch, wantVariant, wantOK := parsePlatformParts(requested)
+	if !wantOK {
+		return false
+	}
+	if wantArch == "" && wantVariant == "" {
+		// An OS-only selector is intentionally a wildcard for the
+		// architecture and variant. Older inspect formats may not
+		// report any platform at all, so absence cannot disprove it.
+		gotOS, _, _, gotOK := parsePlatformParts(actual)
+		return !gotOK || gotOS == "" || strings.EqualFold(wantOS, gotOS)
+	}
+	gotOS, gotArch, gotVariant, gotOK := parsePlatformParts(actual)
+	if !gotOK {
+		return false
+	}
+	return strings.EqualFold(wantOS, gotOS) &&
+		strings.EqualFold(wantArch, gotArch) &&
 		(wantVariant == "" || strings.EqualFold(wantVariant, gotVariant))
 }
 
+func platformSelectorUnverifiable(requested, actual string) bool {
+	if strings.TrimSpace(requested) == "" {
+		return false
+	}
+	wantOS, wantArch, wantVariant, wantOK := parsePlatformParts(requested)
+	if !wantOK {
+		return true
+	}
+	if wantArch == "" && wantVariant == "" {
+		return false
+	}
+	gotOS, gotArch, gotVariant, gotOK := parsePlatformParts(actual)
+	if !gotOK {
+		return true
+	}
+	if wantOS != "" && gotOS != "" && !strings.EqualFold(wantOS, gotOS) {
+		return false
+	}
+	if wantArch != "" && gotArch == "" {
+		return true
+	}
+	if wantVariant != "" && gotVariant == "" {
+		return true
+	}
+	return false
+}
+
 func samePlatformMetadata(a, b string) bool {
-	aOS, aArch, aVariant := splitPlatform(strings.TrimSpace(a))
-	bOS, bArch, bVariant := splitPlatform(strings.TrimSpace(b))
+	if strings.TrimSpace(a) == "" && strings.TrimSpace(b) == "" {
+		return true
+	}
+	aOS, aArch, aVariant, aOK := parsePlatformParts(a)
+	bOS, bArch, bVariant, bOK := parsePlatformParts(b)
+	if !aOK || !bOK {
+		return false
+	}
 	return strings.EqualFold(aOS, bOS) &&
 		strings.EqualFold(aArch, bArch) &&
 		strings.EqualFold(aVariant, bVariant)
@@ -598,14 +835,19 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	if err := checkReuseLabels(info, cfg); err != nil {
 		return err
 	}
+	if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(info.uid) {
+		return fmt.Errorf("reuse %s: existing container has no valid immutable ID", cfg.name)
+	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
 	}
-	if cfg.platform != "" && !platformSelectorMatches(cfg.platform, info.platform) {
-		if info.platform == "" {
+	if cfg.platform != "" {
+		if platformSelectorUnverifiable(cfg.platform, info.platform) {
 			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
 		}
-		return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
+		if !platformMatches(cfg.eng, cfg.platform, info.platform) {
+			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
+		}
 	}
 	return nil
 }

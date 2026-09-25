@@ -92,15 +92,17 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint triggers the deferred inspect once; later reads reuse it.
+	// Endpoint triggers an identity-checked inspect. Apple handles must
+	// recheck their name generation on later reads; Docker's UID cache is
+	// still reused.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 3 {
-		t.Fatalf("after cached Endpoint: calls = %d, want 3", got)
+	if got := r.count(); got != 4 {
+		t.Fatalf("after revalidated Endpoint: calls = %d, want 4", got)
 	}
 
 	// The wrapper forwards results unchanged.

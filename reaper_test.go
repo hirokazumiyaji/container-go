@@ -14,7 +14,8 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "calls.log")
 	binPath = filepath.Join(dir, "container")
-	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + managedLabel + "\": \"true\"'; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -40,6 +41,31 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("log %s = %q, want all of %q", path, data, wants)
+}
+
+func TestReaperDoesNotDeleteUngeneratedReuseContainer(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  echo '  \"" + managedLabel + "\": \"true\"'\n" +
+		"  echo '  \"" + reuseLabel + "\": \"true\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("ungenerated-reuse", ""); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	time.Sleep(300 * time.Millisecond)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force ungenerated-reuse") {
+		t.Fatalf("reaper deleted an ungenerated reuse generation: %q", data)
+	}
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
@@ -70,6 +96,11 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 			t.Errorf("register(%q): want error", id)
 		}
 	}
+	dockerReaper := newReaper(bin, "rm")
+	defer dockerReaper.closeStdin()
+	if err := dockerReaper.register("name-only", ""); err == nil {
+		t.Error("Docker reaper accepted a name instead of a full ID")
+	}
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
 	}
@@ -96,15 +127,16 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
-		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
+	if !strings.Contains(reaperScript, "deadline=$(( $(date +%s) + 30 ))") ||
+		!strings.Contains(reaperScript, "sleep 0.05") || !strings.Contains(reaperScript, "kill -9") {
+		t.Error("reaper script must bound each backend call with polling/deadline and kill -9 (no timeout(1))")
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
 	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
 		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || exit 0`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
 }
@@ -160,7 +192,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	// Stub: inspect prints the creation it was told to know; delete is logged.
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + managedLabel + "\": \"true\"'; echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +269,7 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "rm")
-	if err := r.register("ctr", creation); err != nil {
+	if err := r.register(uid, creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()

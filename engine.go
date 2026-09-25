@@ -13,6 +13,13 @@ func validOCIDigest(digest string) bool {
 	return ociDigestRE.MatchString(digest)
 }
 
+func qualifyImageReference(image, digest string) string {
+	if image == "" || !validOCIDigest(digest) {
+		return image
+	}
+	return stripImageDigest(image) + "@" + digest
+}
+
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
 	state  State
@@ -105,6 +112,9 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+	// platformCompatible compares a requested selector with the
+	// normalized platform reported by container inspect.
+	platformCompatible(selector, actual string) bool
 }
 
 // nameAddressedEngine is an optional backend capability. Keeping it
@@ -114,7 +124,31 @@ type nameAddressedEngine interface {
 	nameAddressedDeletes() bool
 }
 
+// immutableIDEngine is an optional backend capability for engines whose
+// containers are addressed by an immutable backend ID. It is deliberately
+// separate from engine so small test doubles that predate the capability
+// continue to use their historical name behavior.
+type immutableIDEngine interface {
+	immutableIDDeletes() bool
+}
+
 func usesNameAddressedDeletes(eng engine) bool {
 	capability, ok := eng.(nameAddressedEngine)
 	return ok && capability.nameAddressedDeletes()
+}
+
+func usesImmutableIDs(eng engine) bool {
+	capability, ok := eng.(immutableIDEngine)
+	return ok && capability.immutableIDDeletes()
+}
+
+type platformCompatibilityEngine interface {
+	platformCompatible(selector, actual string) bool
+}
+
+func platformMatches(eng engine, selector, actual string) bool {
+	if capability, ok := eng.(platformCompatibilityEngine); ok {
+		return capability.platformCompatible(selector, actual)
+	}
+	return platformSelectorMatches(selector, actual)
 }

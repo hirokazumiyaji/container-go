@@ -28,7 +28,7 @@ type generationRunner struct {
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":
@@ -129,6 +129,7 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state: StateStopped,
+		uid:   strings.Repeat("0f", 32),
 		labels: map[string]string{
 			managedLabel:  "true",
 			reuseLabel:    "true",
@@ -224,7 +225,7 @@ func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, 
 	case "inspect":
 		labels := ""
 		if g.creation != "" {
-			labels = `,"labels":{"` + creationLabel + `":"` + g.creation + `"}`
+			labels = `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}`
 		}
 		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":

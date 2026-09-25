@@ -185,42 +185,68 @@ func (appleEngine) imageMissing(err error) bool {
 	return appleStderrContains(err, appleStderrNotFound)
 }
 
+func (appleEngine) platformCompatible(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
+}
+
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
+	wantOS, wantArch, wantVariant := splitPlatform(platform)
+	osOnly := wantOS != "" && wantArch == "" && wantVariant == ""
 	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return osOnly
+	}
+	if len(raw) == 0 {
 		return false
 	}
 	if platform == "" {
 		return true
 	}
 	var images []struct {
+		Platform *struct {
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
+			Variant      string `json:"variant"`
+		} `json:"platform"`
 		Variants []struct {
 			Platform struct {
-				Os           string `json:"os"`
+				OS           string `json:"os"`
 				Architecture string `json:"architecture"`
 				Variant      string `json:"variant"`
 			} `json:"platform"`
 		} `json:"variants"`
 	}
 	if err := json.Unmarshal(data, &images); err != nil {
-		return true
+		// A bare OS selector retains the image-presence guarantee even
+		// when an older backend cannot provide variant metadata. An
+		// explicit architecture or variant remains fail-closed.
+		return osOnly
 	}
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
 	for _, img := range images {
+		if img.Platform != nil {
+			actual := formatInspectPlatform(img.Platform.OS, img.Platform.Architecture, img.Platform.Variant)
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
+			}
+		}
 		if len(img.Variants) == 0 {
-			return true
+			if osOnly {
+				return true
+			}
+			continue
 		}
 		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != wantOS {
-				continue
+			actual := formatInspectPlatform(
+				v.Platform.OS,
+				v.Platform.Architecture,
+				v.Platform.Variant,
+			)
+			if actual == "" && osOnly {
+				return true
 			}
-			if wantArch != "" && v.Platform.Architecture != wantArch {
-				continue
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
 			}
-			if wantVariant != "" && v.Platform.Variant != wantVariant {
-				continue
-			}
-			return true
 		}
 	}
 	return false

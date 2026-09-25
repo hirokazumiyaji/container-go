@@ -62,6 +62,9 @@ var ErrGenerationReplaced = errors.New("container was recreated; refusing to del
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {
+	if errors.Is(err, ErrSystemNotRunning) {
+		return false
+	}
 	if errors.Is(err, ErrContainerNotFound) {
 		return true
 	}

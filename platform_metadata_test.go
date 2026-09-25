@@ -41,6 +41,9 @@ func TestPlatformSelectorMatchesIndividualFields(t *testing.T) {
 			t.Errorf("platformSelectorMatches(%q, %q) = %v, want %v", tc.requested, tc.actual, got, tc.want)
 		}
 	}
+	if !platformSelectorMatches("linux", "") {
+		t.Error("an OS-only selector must remain a wildcard when architecture metadata is absent")
+	}
 }
 
 func TestReuseCarriesAppleDescriptorDigestIntoCompatibility(t *testing.T) {

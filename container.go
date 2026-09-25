@@ -98,8 +98,15 @@ type Container struct {
 	creation string
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it.
-	uid string
+	// check unnecessary: a replacement never shares it. Access it only
+	// through immutableID/rememberImmutableID after construction.
+	uid   string
+	uidMu sync.RWMutex
+
+	// nameInspect is set only on temporary lookup containers used to
+	// reconcile a reuse/failed-create name. A normal Docker handle must
+	// never inspect by its logical name.
+	nameInspect bool
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -178,6 +185,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, withCleanupError(classified, cleanupErr)
 	}
 
+	runID := cfg.eng.parseRunID(stdout)
 	c := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,
@@ -185,7 +193,14 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+	}
+	c.rememberImmutableID(runID)
+	if usesImmutableIDs(cfg.eng) {
+		if uid := c.immutableID(); !dockerIDRE.MatchString(uid) {
+			// Without the daemon-assigned ID there is no safe Docker
+			// delete target. Do not fall back to the user-visible name.
+			return nil, fmt.Errorf("run %s: backend did not return a full 64-hex container ID", cfg.name)
+		}
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -195,8 +210,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if usesImmutableIDs(cfg.eng) {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.immutableID(), "")
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -274,13 +289,18 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
-	if err != nil {
-		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
+
+	var unlock func()
+	var err error
+	if usesNameAddressedDeletes(cfg.eng) {
+		unlock, err = lockName(cleanupCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 	ctr := namedContainer(cfg, cfg.name)
-	info, err := ctr.inspectFresh(cleanupCtx)
+	info, err := ctr.inspectTargetFreshRetry(cleanupCtx, cfg.name)
 	if err != nil {
 		if isNotFound(err) {
 			return nil
@@ -306,8 +326,14 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if cfg.reuse && info.state == StateRunning {
 		return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
 	}
+	if cfg.reuse && info.state != StateStopped && info.state != StateCreated {
+		return fmt.Errorf("cleanup container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state)
+	}
 	target := cfg.name
-	if info.uid != "" {
+	if usesImmutableIDs(cfg.eng) {
+		if !dockerIDRE.MatchString(info.uid) {
+			return fmt.Errorf("cleanup container %s: backend did not report a full immutable ID", cfg.name)
+		}
 		target = info.uid
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
@@ -346,7 +372,7 @@ func (c *Container) classify(ctx context.Context, err error) error {
 
 // State returns the current lifecycle state.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectCurrent(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -358,8 +384,17 @@ func (c *Container) State(ctx context.Context) (State, error) {
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
-	return c.classify(ctx, err)
+	stopWithTarget := c.withCurrentTarget
+	if usesNameAddressedDeletes(c.eng) && !creationRE.MatchString(c.creation) {
+		// Preserve the legacy logical-name behavior for an unbound
+		// diagnostic handle, while every generation-bound handle still
+		// gets the full identity check.
+		stopWithTarget = c.withHandleTarget
+	}
+	return stopWithTarget(stopCtx, func(target string) error {
+		_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
+		return wrapNotFound(c.classify(ctx, err))
+	})
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -375,34 +410,33 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
-	if c.uid != "" && !usesNameAddressedDeletes(c.eng) {
-		return c.delete(ctx, c.uid)
-	}
-	if c.creation == "" {
-		if usesNameAddressedDeletes(c.eng) {
-			return fmt.Errorf("terminate %s: missing creation generation; refusing name-addressed delete", c.id)
+	if usesImmutableIDs(c.eng) {
+		uid := c.immutableID()
+		if !dockerIDRE.MatchString(uid) {
+			return fmt.Errorf("terminate %s: missing full immutable container ID; refusing name fallback", c.id)
 		}
+		return c.delete(ctx, uid)
+	}
+	if !usesNameAddressedDeletes(c.eng) {
 		return c.delete(ctx, c.id)
+	}
+	if !creationRE.MatchString(c.creation) {
+		return fmt.Errorf("terminate %s: missing creation generation; refusing name-addressed delete", c.id)
 	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
 		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectTargetFreshRetry(ctx, c.id)
 	if isNotFound(err) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
+	if err := c.identityMatches(info); err != nil {
+		return fmt.Errorf("terminate %s: %w", c.id, err)
 	}
 	return c.delete(ctx, c.id)
 }
@@ -411,10 +445,14 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil {
 		return nil
 	}
-	return c.classify(ctx, err)
+	classified := c.classify(ctx, err)
+	if isNotFound(classified) {
+		return nil
+	}
+	return classified
 }
 
 // ContainerIP returns the container's address on its first attached
@@ -503,34 +541,26 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns an identity-safe inspect result. Docker snapshots
+// are reusable because its UID is immutable; Apple snapshots are refreshed
+// under the name lock so a replacement generation cannot supply stale
+// network or port data.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	if c.info != nil && !usesNameAddressedDeletes(c.eng) {
+		if !usesImmutableIDs(c.eng) ||
+			(dockerIDRE.MatchString(c.immutableID()) && c.info.uid == c.immutableID()) {
+			return c.info, nil
+		}
 	}
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectCurrent(ctx)
 	if err != nil {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
+	c.rememberImmutableID(info.uid)
 	return info, nil
-}
-
-func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
-	}
-	return c.eng.parseInspect(stdout, c.id)
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

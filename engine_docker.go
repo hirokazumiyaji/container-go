@@ -42,6 +42,7 @@ func (dockerEngine) name() string               { return "docker" }
 func (dockerEngine) binary() string             { return "docker" }
 func (dockerEngine) directIP() bool             { return false }
 func (dockerEngine) nameAddressedDeletes() bool { return false }
+func (dockerEngine) immutableIDDeletes() bool   { return true }
 
 // checkConfig rejects explicit loopback publish binds on a remote
 // daemon: Docker would listen on the remote machine's loopback, which
@@ -164,12 +165,24 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
+type dockerPlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
+}
+
+type dockerManifestDescriptor struct {
+	Digest   string         `json:"digest"`
+	Platform dockerPlatform `json:"platform"`
+}
+
 type dockerInspect struct {
-	ID       string `json:"Id"`
-	Image    string `json:"Image"`
-	Name     string `json:"Name"`
-	Platform string `json:"Platform"`
-	State    struct {
+	ID                      string                    `json:"Id"`
+	Image                   string                    `json:"Image"`
+	Name                    string                    `json:"Name"`
+	Platform                string                    `json:"Platform"`
+	ImageManifestDescriptor *dockerManifestDescriptor `json:"ImageManifestDescriptor"`
+	State                   struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -197,14 +210,34 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("container %s not in inspect output", id)
 	}
 	c := containers[0]
+	if !dockerIDRE.MatchString(c.ID) {
+		return nil, fmt.Errorf("docker inspect returned invalid container ID %q", c.ID)
+	}
+
+	image := c.Config.Image
+	imageDigestValue := imageDigest(image)
+	platform := c.Platform
+	if descriptor := c.ImageManifestDescriptor; descriptor != nil {
+		if validOCIDigest(descriptor.Digest) {
+			imageDigestValue = descriptor.Digest
+			image = qualifyImageReference(image, descriptor.Digest)
+		}
+		if descriptorPlatform := formatInspectPlatform(
+			descriptor.Platform.OS,
+			descriptor.Platform.Architecture,
+			descriptor.Platform.Variant,
+		); descriptorPlatform != "" {
+			platform = descriptorPlatform
+		}
+	}
 
 	info := &engineInfo{
 		state:       dockerState(c.State.Status),
 		labels:      c.Config.Labels,
 		uid:         c.ID,
-		image:       c.Config.Image,
-		imageDigest: imageDigest(c.Config.Image),
-		platform:    c.Platform,
+		image:       image,
+		imageDigest: imageDigestValue,
+		platform:    platform,
 		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
@@ -306,15 +339,25 @@ func (dockerEngine) logsTailArgs(id string) []string {
 // status filters directly.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 
 func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerIDs(data)
+}
+
+func parseDockerIDs(data []byte) ([]string, error) {
+	ids := splitNonEmptyLines(data)
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker list returned non-ID container %q", id)
+		}
+	}
+	return ids, nil
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -336,24 +379,90 @@ func (dockerEngine) imageMissing(err error) bool {
 	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
-func (dockerEngine) parseImageExists(data []byte, _ string) bool {
-	var images []json.RawMessage
-	if err := json.Unmarshal(data, &images); err != nil {
+func (dockerEngine) platformCompatible(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
+}
+
+func (dockerEngine) parseImageExists(data []byte, platform string) bool {
+	var images []struct {
+		OS           string `json:"Os"`
+		Architecture string `json:"Architecture"`
+		Variant      string `json:"Variant"`
+		Descriptor   *struct {
+			Platform dockerPlatform `json:"platform"`
+		} `json:"Descriptor"`
+		ImageManifestDescriptor *struct {
+			Platform dockerPlatform `json:"platform"`
+		} `json:"ImageManifestDescriptor"`
+		Manifests []struct {
+			Descriptor *struct {
+				Platform dockerPlatform `json:"platform"`
+			} `json:"Descriptor"`
+		} `json:"Manifests"`
+	}
+	if err := json.Unmarshal(data, &images); err != nil || len(images) == 0 {
 		return false
 	}
-	return len(images) > 0
+	if platform == "" {
+		return true
+	}
+	wantOS, wantArch, wantVariant, selectorOK := parsePlatformParts(platform)
+	osOnly := selectorOK && wantOS != "" && wantArch == "" && wantVariant == ""
+	for _, image := range images {
+		actual := formatInspectPlatform(image.OS, image.Architecture, image.Variant)
+		if actual != "" && platformSelectorMatches(platform, actual) {
+			return true
+		}
+		if osOnly && actual == "" && image.Descriptor == nil && image.ImageManifestDescriptor == nil && len(image.Manifests) == 0 {
+			return true
+		}
+		if image.Descriptor != nil {
+			actual = formatInspectPlatform(
+				image.Descriptor.Platform.OS,
+				image.Descriptor.Platform.Architecture,
+				image.Descriptor.Platform.Variant,
+			)
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
+			}
+		}
+		if image.ImageManifestDescriptor != nil {
+			actual = formatInspectPlatform(
+				image.ImageManifestDescriptor.Platform.OS,
+				image.ImageManifestDescriptor.Platform.Architecture,
+				image.ImageManifestDescriptor.Platform.Variant,
+			)
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
+			}
+		}
+		for _, manifest := range image.Manifests {
+			if manifest.Descriptor == nil {
+				continue
+			}
+			actual = formatInspectPlatform(
+				manifest.Descriptor.Platform.OS,
+				manifest.Descriptor.Platform.Architecture,
+				manifest.Descriptor.Platform.Variant,
+			)
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerIDs(data)
 }
 
 // nameConflict matches Docker's duplicate container name error.

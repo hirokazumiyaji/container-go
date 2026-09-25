@@ -61,12 +61,14 @@ const logTailLimit = 1024 * 1024
 // so neither the CLI output nor the Go buffer grows with total log
 // size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
-	if err != nil {
-		return ""
-	}
+	var stdout, stderr []byte
+	_ = c.withHandleTarget(ctx, func(target string) error {
+		qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+		defer cancel()
+		var err error
+		stdout, stderr, err = c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
+		return err
+	})
 	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
 }
 

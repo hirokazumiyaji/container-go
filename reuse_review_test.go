@@ -129,6 +129,11 @@ func (r *reviewStoppedRunner) Run(ctx context.Context, args ...string) ([]byte, 
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		r.created = true
+		for i := range args {
+			if i+1 < len(args) && strings.HasPrefix(args[i+1], creationLabel+"=") {
+				r.createdGeneration = strings.TrimPrefix(args[i+1], creationLabel+"=")
+			}
+		}
 		r.mu.Unlock()
 		return []byte("myctr\n"), nil, nil
 	}

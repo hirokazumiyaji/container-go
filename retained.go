@@ -32,14 +32,18 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 
 	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(lookupCtx, cfg.name)
-	if err != nil {
-		return nil, fmt.Errorf("retained container %s: lock name: %w", cfg.name, err)
+	var unlock func()
+	var err error
+	if usesNameAddressedDeletes(cfg.eng) {
+		unlock, err = lockName(lookupCtx, cfg.name)
+		if err != nil {
+			return nil, fmt.Errorf("retained container %s: lock name: %w", cfg.name, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 
 	ctr := namedContainer(cfg, cfg.name)
-	info, err := ctr.inspectFresh(lookupCtx)
+	info, err := ctr.inspectTargetFreshRetry(lookupCtx, cfg.name)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, nil
@@ -49,12 +53,18 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 	if !failedCreateOwned(cfg, info) {
 		return nil, nil
 	}
+	if info.state != StateCreated && info.state != StateRunning {
+		return nil, nil
+	}
+	if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(info.uid) {
+		return nil, fmt.Errorf("retained container %s: backend did not report a full immutable ID", cfg.name)
+	}
 
 	ctr.reused = cfg.reuse
 	ctr.exposed = cfg.exposed
 	ctr.published = cfg.published
 	ctr.creation = cfg.creation
-	ctr.uid = info.uid
+	ctr.rememberImmutableID(info.uid)
 	ctr.info = info
 	return ctr, nil
 }
@@ -65,7 +75,7 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 // contract.
 func rollbackResult(ctx context.Context, c *Container, cause error) (*Container, error) {
 	err := c.rollback(ctx, cause)
-	if keepContainers() {
+	if keepContainers() && c.verifiedCurrentHandle(context.WithoutCancel(ctx), true) {
 		return c, err
 	}
 	return nil, err

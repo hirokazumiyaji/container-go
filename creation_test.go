@@ -149,8 +149,8 @@ func TestReaperDeletesMatchingGeneration(t *testing.T) {
 	binPath := dir + "/ctr"
 	creation := "ffffffffffffffff"
 	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\",'; exit 0; fi\n" +
-		"echo \"$@\" >> " + logPath + "\n"
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + managedLabel + "\": \"true\",'; echo '  \"" + creationLabel + "\": \"" + creation + "\",'; exit 0; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -158,6 +158,7 @@ func TestReaperDeletesMatchingGeneration(t *testing.T) {
 	if err := r.register("myctr", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
+
 	r.closeStdin()
 	waitForLogLines(t, logPath, "delete --force myctr")
 }

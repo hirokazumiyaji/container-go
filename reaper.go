@@ -27,21 +27,24 @@ import (
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
 // silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, the script inspects first and
-// reads the creation label as a structural JSON field: the match is
-// anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name. Name-addressed entries carry the
-// stable per-name lock path used by the library; the child acquires that
-// lock before inspect and delete, so a cooperating create/prune/cleanup
-// cannot replace the name in the middle of the guarded operation.
+// When a creation generation is known, the script captures inspect
+// output in memory and reads the creation label as a structural JSON
+// field: the match is anchored at line start on the quoted key, so label
+// values or other text containing the same characters cannot satisfy it.
+// Apple entries also require the managed marker. When inspect also
+// reports an immutable "Id" (Docker), the delete targets that ID instead
+// of the name, so a same-name replacement created after the check is
+// simply not found. Apple Container has no such ID; there the delete
+// necessarily goes by name. Name-addressed entries carry the stable
+// per-name lock path used by the library; the child acquires that lock
+// before inspect and delete, so a cooperating create/prune/cleanup cannot
+// replace the name in the middle of the guarded operation.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
+managed_key="$4"
+reuse_key="$5"
 ids=""
 tab=$(printf '\t')
 while IFS= read -r line; do
@@ -50,43 +53,113 @@ $line"
 done
 run_with_timeout() {
   "$@" >/dev/null 2>&1 & pid=$!
-  (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
+  deadline=$(( $(date +%s) + 30 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      kill -9 "$pid" 2>/dev/null
+      break
+    fi
+    sleep 0.05
+  done
   wait "$pid" 2>/dev/null
-  rc=$?
-  kill "$killer" 2>/dev/null
-  wait "$killer" 2>/dev/null
-  return $rc
+  return $?
 }
-run_locked() {
+run_capture_timeout() {
+  "$@" & pid=$!
+  deadline=$(( $(date +%s) + 10 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      kill -9 "$pid" 2>/dev/null
+      break
+    fi
+    sleep 0.05
+  done
+  wait "$pid" 2>/dev/null
+}
+run_guarded() {
   id="$1"
   creation="$2"
   lockpath="$3"
-  [ -n "$lockpath" ] || return 0
-  [ -L "$lockpath" ] && return 0
-  [ -f "$lockpath" ] || return 0
-  lockf_bin=$(command -v lockf 2>/dev/null) || return 0
-  [ -n "$lockf_bin" ] || return 0
-  REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
-    "$lockf_bin" -k -w -t 30 "$lockpath" sh -c '
-      id=$1
-      creation=$2
-      bin=$REAPER_BIN
-      sub=$REAPER_SUB
-      key=$REAPER_KEY
-      for once in 1; do
+  if [ -n "$lockpath" ]; then
+    [ -L "$lockpath" ] && return 0
+    [ -f "$lockpath" ] || return 0
+    lockf_bin=$(command -v lockf 2>/dev/null) || return 0
+    [ -n "$lockf_bin" ] || return 0
+  else
+    # Docker entries are addressed by a full immutable ID and do not
+    # need a name lock.  Apple entries always provide lockpath.
+    [ "$sub" = "rm" ] || return 0
+  fi
+  if [ -n "$lockpath" ]; then
+    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_MANAGED_KEY="$managed_key" REAPER_REUSE_KEY="$reuse_key" \
+      "$lockf_bin" -k -w -t 30 "$lockpath" sh -c '
+        id=$1
+        creation=$2
+        bin=$REAPER_BIN
+        sub=$REAPER_SUB
+        key=$REAPER_KEY
+        managed_key=$REAPER_MANAGED_KEY
+        reuse_key=$REAPER_REUSE_KEY
+        run_capture_timeout() {
+          "$@" & pid=$!
+          deadline=$(( $(date +%s) + 10 ))
+          while kill -0 "$pid" 2>/dev/null; do
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+              kill -9 "$pid" 2>/dev/null
+              break
+            fi
+            sleep 0.05
+          done
+          wait "$pid" 2>/dev/null
+        }
+        run_with_timeout() {
+          "$@" >/dev/null 2>&1 & pid=$!
+          deadline=$(( $(date +%s) + 30 ))
+          while kill -0 "$pid" 2>/dev/null; do
+            now=$(date +%s)
+            if [ "$now" -ge "$deadline" ]; then
+              kill -9 "$pid" 2>/dev/null
+              break
+            fi
+            sleep 0.05
+          done
+          wait "$pid" 2>/dev/null
+          return $?
+        }
         target="$id"
-        if [ -n "$creation" ]; then
-          tmp=$(mktemp 2>/dev/null) || exit 0
-          ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; exit 0; }
-          got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-          uid=$(sed -n "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-          rm -f "$tmp"
-          [ "$got" = "$creation" ] || continue
-          [ -n "$uid" ] && target="$uid"
+        metadata=$(run_capture_timeout "$bin" inspect "$id" 2>/dev/null) || exit 0
+        got_managed=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"$managed_key\"[[:space:]]*:[[:space:]]*\"true\".*/true/p" | head -n 1)
+        [ "$got_managed" = "true" ] || exit 0
+        if [ -z "$creation" ]; then
+          got_reuse=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"$reuse_key\"[[:space:]]*:[[:space:]]*\"true\".*/true/p" | head -n 1)
+          [ "$got_reuse" = "true" ] && exit 0
         fi
-        ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
-      done
-    ' sh "$id" "$creation" >/dev/null 2>&1 || true
+        if [ -n "$creation" ]; then
+          got=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" | head -n 1)
+          [ "$got" = "$creation" ] || exit 0
+        fi
+        uid=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/\1/p" | head -n 1)
+        if [ "$sub" = "rm" ]; then
+          [ -n "$uid" ] && [ "$uid" = "$id" ] || exit 0
+          target="$uid"
+        fi
+        run_with_timeout "$bin" "$sub" --force "$target" || true
+      ' sh "$id" "$creation" >/dev/null 2>&1 || true
+  else
+    target="$id"
+    metadata=$(run_capture_timeout "$bin" inspect "$id" 2>/dev/null) || return 0
+    if [ -n "$creation" ]; then
+      got=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" | head -n 1)
+      [ "$got" = "$creation" ] || return 0
+    fi
+    uid=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/\1/p" | head -n 1)
+    [ "$uid" = "$id" ] || return 0
+    target="$uid"
+    run_with_timeout "$bin" "$sub" --force "$target" || true
+  fi
 }
 printf '%s\n' "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -107,12 +180,11 @@ printf '%s\n' "$ids" | while IFS= read -r line; do
   case "$sub" in
     delete)
       [ -n "$lockpath" ] || continue
-      run_locked "$id" "$creation" "$lockpath"
+      run_guarded "$id" "$creation" "$lockpath"
       ;;
     rm)
       if [ -n "$creation" ]; then
-        [ -n "$lockpath" ] || continue
-        run_locked "$id" "$creation" "$lockpath"
+        run_guarded "$id" "$creation" "$lockpath"
       else
         [ -n "$lockpath" ] && continue
         run_with_timeout "$bin" "$sub" --force "$id" || true
@@ -147,8 +219,8 @@ var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 // immutable IDs are 64 hex characters, while Apple Container addresses
 // containers by its shorter name rule.
 func validReaperID(subcommand, id string) bool {
-	if nameRE.MatchString(id) {
-		return true
+	if subcommand == "delete" {
+		return nameRE.MatchString(id)
 	}
 	return subcommand == "rm" && dockerIDRE.MatchString(id)
 }
@@ -200,9 +272,10 @@ func (r *reaper) register(id, creation string) error {
 
 	lockPath := ""
 	// Apple deletes by name even when an old caller omitted the
-	// generation. Always prepare a lock for that subcommand so the shell
-	// protocol can never take an unlocked name-delete path.
-	if r.subcommand == "delete" || creation != "" {
+	// generation. Only that backend gets a name lock; Docker entries
+	// remain immutable-ID operations even when a legacy caller supplies
+	// a generation.
+	if r.subcommand == "delete" {
 		var err error
 		lockPath, err = reaperNameLockPath(id)
 		if err != nil {
@@ -236,7 +309,13 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 		}
 		line += "\t" + e.creation + "\t" + e.lockPath
 	} else if e.creation != "" {
-		return fmt.Errorf("reaper: missing name lock for %q", e.id)
+		if r.subcommand == "delete" {
+			return fmt.Errorf("reaper: missing name lock for %q", e.id)
+		}
+		// A legacy Docker generation guard has no name lock; retain
+		// the generation in the wire protocol while targeting the full
+		// immutable ID.
+		line += "\t" + e.creation + "\t"
 	}
 	n, err := io.WriteString(r.stdin, line+"\n")
 	if err == nil && n != len(line)+1 {
@@ -275,7 +354,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), breQuote(managedLabel), breQuote(reuseLabel))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

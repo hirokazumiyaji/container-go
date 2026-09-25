@@ -50,6 +50,7 @@ func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 // Cleanup registers best-effort container removal via tb.Cleanup. It is
 // nil-safe, so call it right after Run, before checking Run's error.
 func Cleanup(tb testing.TB, ctr *Container) {
+	tb.Helper()
 	registerCleanup(tb, ctr, false)
 }
 
@@ -57,6 +58,7 @@ func Cleanup(tb testing.TB, ctr *Container) {
 // failures. It is nil-safe and otherwise has the same reuse and
 // CONTAINERGO_KEEP behavior as Cleanup.
 func CleanupStrict(tb testing.TB, ctr *Container) {
+	tb.Helper()
 	registerCleanup(tb, ctr, true)
 }
 
@@ -134,11 +136,6 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		}
 	}
 	return removed, errors.Join(errs...)
-}
-
-//nolint:unused // retained for package-local callers using the pre-metadata helper
-func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
-	return pruneDockerCandidate(ctx, r, eng, id, errKind, "")
 }
 
 func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
@@ -275,49 +272,5 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
-	return true, nil
-}
-
-// pruneNamedCandidate is retained for package-local callers that have an
-// ID but no list-time snapshot. The main prune path uses the metadata-aware
-// variant above so a list/inspect race cannot authorize a stale name.
-//
-//nolint:unused // retained for package-local callers using the pre-metadata helper
-func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
-	if eng.name() != "apple" || !nameRE.MatchString(id) {
-		return false, nil
-	}
-	guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
-	defer guardCancel()
-	unlock, err := lockName(guardCtx, id)
-	if err != nil {
-		return false, fmt.Errorf("%s %s: lock name: %w", errKind, id, err)
-	}
-	defer unlock()
-	fresh, err := (&Container{id: id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
-	if isNotFoundFor(eng, err) {
-		unregisterContainerReaper(&config{runner: r, eng: eng, name: id}, id, "", "")
-		return false, nil
-	}
-	if err != nil {
-		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, err)
-	}
-	candidate := pruneCandidate{
-		id:         id,
-		labels:     fresh.labels,
-		creation:   fresh.labels[creationLabel],
-		state:      fresh.state,
-		managed:    fresh.labels[managedLabel] == "true",
-		reuse:      fresh.labels[reuseLabel] == "true",
-		reuseGroup: fresh.labels[reuseGroupLabel],
-	}
-	if !pruneCandidateEligible(candidate, reuseGroup) || fresh.uid != "" {
-		return false, nil
-	}
-	_, _, err = r.Run(guardCtx, eng.deleteArgs(id)...)
-	if err != nil && !isNotFoundFor(eng, err) {
-		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
-	}
-	unregisterContainerReaper(&config{runner: r, eng: eng, name: id, creation: candidate.creation}, id, candidate.creation, "")
 	return true, nil
 }

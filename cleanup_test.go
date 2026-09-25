@@ -244,12 +244,14 @@ func TestDockerPruneSelectsExitedAndDeadOnly(t *testing.T) {
 }
 
 type cleanupTBRecorder struct {
+	testing.TB
 	callbacks []func()
 	logs      []string
 	errors    []string
+	helpers   int
 }
 
-func (r *cleanupTBRecorder) Helper() {}
+func (r *cleanupTBRecorder) Helper() { r.helpers++ }
 
 func (r *cleanupTBRecorder) Cleanup(fn func()) {
 	r.callbacks = append(r.callbacks, fn)
@@ -261,6 +263,20 @@ func (r *cleanupTBRecorder) Logf(format string, args ...any) {
 
 func (r *cleanupTBRecorder) Errorf(format string, args ...any) {
 	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
+func TestCleanupFunctionsMarkThemselvesAsHelpers(t *testing.T) {
+	tb := &cleanupTBRecorder{}
+	Cleanup(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("Cleanup helper calls = %d, want exported and registration helpers", tb.helpers)
+	}
+
+	tb = &cleanupTBRecorder{}
+	CleanupStrict(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("CleanupStrict helper calls = %d, want exported and registration helpers", tb.helpers)
+	}
 }
 
 func TestCleanupStrictReportsCleanupFailure(t *testing.T) {

@@ -325,8 +325,10 @@ needed: a replacement never shares the ID. Apple Container addresses
 containers by name only, so there the delete is name-based: the
 generation must match a fresh inspect, and inspect plus delete run
 under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
-limited to cooperating processes using this library on the same host:
+that every such delete in this library takes. The reaper prefers `flock`
+so it coordinates with the Go `syscall.Flock` calls; hosts without
+`flock` fall back to `lockf`. That guarantee is limited to cooperating
+processes using this library on the same host:
 a direct `container delete` plus re-create by an external tool inside
 that window is indistinguishable by name, and closing it would need an
 immutable ID or an atomic conditional delete that Apple Container does

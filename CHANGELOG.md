@@ -27,6 +27,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary name in `CLIError` and neutralize `internal/cli` package docs.
 - Remove anonymous Docker volumes from every managed deletion path while
   preserving named volumes.
+- `Prune` and `PruneReuseGroup` now return immutable Docker container IDs
+  rather than names or abbreviated IDs.
 
 ## [0.2.0] - 2026-09-02
 

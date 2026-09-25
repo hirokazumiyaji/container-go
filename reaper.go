@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -45,9 +46,10 @@ case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 tab=$(printf '\t')
 
 # Keep the backend operation in a separate shell process. The same
-# operation is run either directly for an immutable ID or under lockf/
-# flock for a name-addressed generation. The fixed helper contains no
-# inspect output and is passed only validated IDs and options.
+# operation is run either directly for an immutable ID or under flock
+# (with lockf only as a fallback) for a name-addressed generation. The
+# fixed helper contains no inspect output and is passed only validated
+# IDs and options.
 entry_script=
 while IFS= read -r entry_line
 do
@@ -198,18 +200,6 @@ run_entry() {
   esac
   if [ -n "$entry_lock" ]; then
     [ -L "$entry_lock" ] && return 0
-    lockf_bin=$(command -v lockf 2>/dev/null) || lockf_bin=
-    case "$lockf_bin" in
-      /*) [ -x "$lockf_bin" ] || lockf_bin= ;;
-      *) lockf_bin= ;;
-    esac
-    if [ -n "$lockf_bin" ]; then
-      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
-      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
-        "$lockf_bin" -k -t 30 "$entry_lock" sh -c "$entry_script" reaper-entry \
-        "$entry_id" "$entry_creation" "$pending" "$@"
-      return $?
-    fi
     flock_bin=$(command -v flock 2>/dev/null) || flock_bin=
     case "$flock_bin" in
       /*) [ -x "$flock_bin" ] || flock_bin= ;;
@@ -219,6 +209,18 @@ run_entry() {
       REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
       REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
         "$flock_bin" -x "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@"
+      return $?
+    fi
+    lockf_bin=$(command -v lockf 2>/dev/null) || lockf_bin=
+    case "$lockf_bin" in
+      /*) [ -x "$lockf_bin" ] || lockf_bin= ;;
+      *) lockf_bin= ;;
+    esac
+    if [ -n "$lockf_bin" ]; then
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+        "$lockf_bin" -k -t 30 "$entry_lock" sh -c "$entry_script" reaper-entry \
         "$entry_id" "$entry_creation" "$pending" "$@"
       return $?
     else
@@ -275,6 +277,14 @@ const (
 	maxReaperSpawnFailures       = 3
 	defaultReaperTimeoutSeconds  = 30
 	defaultReaperPendingAttempts = 30
+
+	initialReaperSpawnBackoff = time.Second
+	maxReaperSpawnBackoff     = 30 * time.Second
+)
+
+var (
+	errReaperSpawnCooldown = errors.New("reaper: spawn retry cooldown active")
+	errReaperSpawnFailed   = errors.New("reaper: giving up after repeated spawn failures")
 )
 
 // breQuote escapes a literal for use inside the reaper's sed basic
@@ -321,11 +331,24 @@ type reaper struct {
 	entries       []reaperEntry
 	spawnFailures int
 	gaveUp        bool
+	gaveUpLogged  bool
 	closed        bool
+
+	// A failed recovery burst is retried only after a bounded cooldown.
+	// retryPending allows one immediate recovery attempt before the
+	// cooldown, which lets a transient launch failure recover without
+	// turning every subsequent registration into a hot retry loop.
+	retryPending bool
+	recovering   bool
+	retryAt      time.Time
+	retryLevel   int
 
 	// These are test seams. Production values are bounded defaults.
 	timeoutSeconds  int
 	pendingAttempts int
+	spawnCommand    func() (*exec.Cmd, error)
+	now             func() time.Time
+	retryBackoff    func(int) time.Duration
 }
 
 func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
@@ -638,6 +661,10 @@ func (r *reaper) unregister(id, creation string) error {
 	if stdin == nil || channelClosed(exited) {
 		r.removeEntryLocked(entry)
 		if r.entriesEmpty() {
+			// With no retained targets there is no fail-closed state to
+			// preserve; a later registration may start a fresh bounded
+			// recovery window immediately.
+			r.clearSpawnFailure()
 			r.stopCurrentProcess()
 		}
 		return nil
@@ -694,9 +721,83 @@ func writeReaperRemoval(stdin io.Writer, entry reaperEntry) error {
 
 func (r *reaper) clearSpawnFailure() {
 	r.mu.Lock()
+	r.clearSpawnFailureLocked()
+	r.mu.Unlock()
+}
+
+func (r *reaper) clearSpawnFailureLocked() {
 	r.spawnFailures = 0
 	r.gaveUp = false
-	r.mu.Unlock()
+	r.gaveUpLogged = false
+	r.retryPending = false
+	r.recovering = false
+	r.retryAt = time.Time{}
+	r.retryLevel = 0
+}
+
+func (r *reaper) nowLocked() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *reaper) retryBackoffLocked(level int) time.Duration {
+	if level < 1 {
+		level = 1
+	}
+	if r.retryBackoff != nil {
+		delay := r.retryBackoff(level)
+		if delay < 0 {
+			return 0
+		}
+		if delay > maxReaperSpawnBackoff {
+			return maxReaperSpawnBackoff
+		}
+		return delay
+	}
+	delay := initialReaperSpawnBackoff
+	for i := 1; i < level; i++ {
+		if delay >= maxReaperSpawnBackoff/2 {
+			return maxReaperSpawnBackoff
+		}
+		delay *= 2
+	}
+	if delay > maxReaperSpawnBackoff {
+		return maxReaperSpawnBackoff
+	}
+	return delay
+}
+
+// retryReadyLocked permits one immediate recovery burst after the first
+// failed burst, then applies exponential backoff if that recovery also
+// fails. A cooldown only suppresses a best-effort reaper attempt; entries
+// remain in memory and no destructive operation can run without a child.
+func (r *reaper) retryReadyLocked() bool {
+	if !r.gaveUp {
+		// Keep recovery possible for a state assembled by an older
+		// caller that reached the limit without setting gaveUp.
+		if r.spawnFailures >= maxReaperSpawnFailures {
+			r.spawnFailures = 0
+		}
+		return true
+	}
+	if r.retryPending {
+		r.retryPending = false
+		r.recovering = true
+		r.spawnFailures = 0
+		r.gaveUp = false
+		r.retryAt = time.Time{}
+		return true
+	}
+	if !r.retryAt.IsZero() && r.nowLocked().Before(r.retryAt) {
+		return false
+	}
+	r.recovering = true
+	r.spawnFailures = 0
+	r.gaveUp = false
+	r.retryAt = time.Time{}
+	return true
 }
 
 // respawnAndReplayLocked starts a replacement and replays all retained
@@ -709,22 +810,28 @@ func (r *reaper) respawnAndReplayLocked() error {
 		return errors.New("reaper: closed")
 	}
 	if len(r.entries) == 0 {
-		r.spawnFailures = 0
-		r.gaveUp = false
+		r.clearSpawnFailureLocked()
 		r.mu.Unlock()
 		return nil
+	}
+	if !r.retryReadyLocked() {
+		r.mu.Unlock()
+		return errReaperSpawnCooldown
 	}
 	entries := append([]reaperEntry(nil), r.entries...)
 	r.mu.Unlock()
 
+	var lastErr error
 	for r.spawnFailuresValue() < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
+			lastErr = err
 			r.recordSpawnFailure()
 			continue
 		}
 		replayed := true
 		for _, entry := range entries {
 			if err := r.writeCurrentEntry(entry); err != nil {
+				lastErr = err
 				replayed = false
 				break
 			}
@@ -736,13 +843,17 @@ func (r *reaper) respawnAndReplayLocked() error {
 		r.stopCurrentProcess()
 		r.recordSpawnFailure()
 	}
-	if !r.gaveUpValue() {
-		r.mu.Lock()
-		r.gaveUp = true
-		r.mu.Unlock()
-		log.Printf("container-go: reaper giving up after %d consecutive spawn failures (binary=%q)", maxReaperSpawnFailures, r.binary)
+	r.mu.Lock()
+	logGiveUp := !r.gaveUpLogged
+	r.gaveUpLogged = true
+	r.mu.Unlock()
+	if logGiveUp {
+		log.Printf("container-go: reaper giving up temporarily after %d consecutive spawn failures (binary=%q); a later registration will retry", maxReaperSpawnFailures, r.binary)
 	}
-	return errors.New("reaper: giving up after repeated spawn failures")
+	if lastErr == nil {
+		lastErr = errReaperSpawnFailed
+	}
+	return fmt.Errorf("%w: %v", errReaperSpawnFailed, lastErr)
 }
 
 func (r *reaper) spawnFailuresValue() int {
@@ -760,21 +871,51 @@ func (r *reaper) gaveUpValue() bool {
 func (r *reaper) recordSpawnFailure() {
 	r.mu.Lock()
 	r.spawnFailures++
+	if r.spawnFailures < maxReaperSpawnFailures {
+		r.mu.Unlock()
+		return
+	}
+	r.gaveUp = true
+	if r.recovering {
+		r.recovering = false
+		r.retryPending = false
+		if r.retryLevel < 32 {
+			r.retryLevel++
+		}
+		r.retryAt = r.nowLocked().Add(r.retryBackoffLocked(r.retryLevel))
+	} else {
+		// Leave one immediate recovery burst available. If that burst
+		// fails, recordSpawnFailure takes the cooldown path above.
+		r.retryPending = true
+		r.retryAt = time.Time{}
+	}
 	r.mu.Unlock()
 }
 
 func (r *reaper) spawnLocked() error {
-	timeout := r.timeoutSeconds
-	if timeout <= 0 {
-		timeout = defaultReaperTimeoutSeconds
+	var cmd *exec.Cmd
+	if r.spawnCommand != nil {
+		var err error
+		cmd, err = r.spawnCommand()
+		if err != nil {
+			return err
+		}
+	} else {
+		timeout := r.timeoutSeconds
+		if timeout <= 0 {
+			timeout = defaultReaperTimeoutSeconds
+		}
+		attempts := r.pendingAttempts
+		if attempts <= 0 {
+			attempts = 1
+		}
+		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
+		args = append(args, r.deleteFlags...)
+		cmd = exec.Command("/bin/sh", args...)
 	}
-	attempts := r.pendingAttempts
-	if attempts <= 0 {
-		attempts = 1
+	if cmd == nil {
+		return errors.New("reaper: nil spawn command")
 	}
-	args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
-	args = append(args, r.deleteFlags...)
-	cmd := exec.Command("/bin/sh", args...)
 	configureReaperProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

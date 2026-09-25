@@ -64,26 +64,29 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 // reuseRun so every concurrent caller applies its own configuration.
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	recreated := false
+	var lastInspectErr error
 
 	for {
 		if err := ctx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			if !isNotFoundFor(cfg.eng, err) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+				}
 				if !transientReuseInspectError(err) {
 					return nil, err
 				}
+				lastInspectErr = err
 				if err := waitForReusePoll(ctx); err != nil {
-					return nil, fmt.Errorf("reuse %s: inspect: %w", cfg.name, err)
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
 				continue
 			}
+			lastInspectErr = nil
 			// Creation carries its own runTimeout budget detached from
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
@@ -97,17 +100,18 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
 				if err := waitForReusePoll(ctx); err != nil {
-					return nil, err
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
 				continue
 			}
 			return nil, createErr
 		}
+		lastInspectErr = nil
 
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
 			if err := waitForReusePoll(ctx); err != nil {
-				return nil, err
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
 		case StateStopped:
@@ -141,7 +145,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			}, nil
 		default:
 			if err := waitForReusePoll(ctx); err != nil {
-				return nil, err
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 		}
 	}
@@ -234,22 +238,23 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	return ctr, nil
 }
 
-// deleteStoppedReuse removes a stopped reuse container only after
-// revalidating its ownership and generation. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// transientReuseInspectError reports whether an inspect failure is a
+// bounded, retryable backend hiccup. A context result or a classified
+// system outage is terminal: retrying it would hide the useful error
+// behind the attach timeout. Non-CLI runners are still supported when
+// their error text carries the same transient markers.
 func transientReuseInspectError(err error) bool {
-	if err == nil {
+	if err == nil || errors.Is(err, ErrSystemNotRunning) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+
+	message := err.Error()
 	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		// Test and embedding runners often report a transient failure
-		// without CLI metadata; the bounded attach deadline still keeps
-		// retrying safe.
-		return true
+	if errors.As(err, &cliErr) {
+		message = cliErr.Stderr
 	}
-	message := strings.ToLower(cliErr.Stderr)
+	message = strings.ToLower(message)
 	for _, marker := range []string{
 		"temporary", "temporarily", "try again", "timeout", "timed out",
 		"temporarily unavailable", "unavailable", "connection", "transport",
@@ -262,6 +267,31 @@ func transientReuseInspectError(err error) bool {
 	return false
 }
 
+// reuseInspectWaitError keeps both the context result and the last real
+// inspect failure available to callers. Multiple %w operands are
+// intentional: errors.Is must continue to recognize cancellation and
+// deadline errors without discarding the diagnostic that exhausted the
+// attach budget.
+func reuseInspectWaitError(name string, waitErr, lastInspectErr error) error {
+	if waitErr == nil {
+		return nil
+	}
+	if lastInspectErr == nil {
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, waitErr)
+		}
+		return waitErr
+	}
+	if errors.Is(waitErr, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container (last inspect error: %w): %w", name, lastInspectErr, waitErr)
+	}
+	return fmt.Errorf("reuse %s: %w (last inspect error: %w)", name, waitErr, lastInspectErr)
+}
+
+// deleteStoppedReuse removes a stopped reuse container only after
+// revalidating its ownership and generation. A replaced generation means
+// another process already recreated the name; the caller loops and
+// attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	_, err := deleteStoppedReuseResult(ctx, cfg, info)
 	return err

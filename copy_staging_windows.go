@@ -15,9 +15,16 @@ import (
 )
 
 func prepareCopyStagingRoot() (string, error) {
+	return prepareCopyStagingRootForSource(nil)
+}
+
+func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 	base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
 	if err != nil {
 		return "", fmt.Errorf("copy to container: locate per-user LocalAppData: %w", err)
+	}
+	if err := ensureCopyStagingOutsideSource(base, source); err != nil {
+		return "", err
 	}
 	appRoot := filepath.Join(base, "containergo")
 	if err := ensureWindowsPrivateCopyStagingDir(appRoot, true); err != nil {
@@ -76,10 +83,39 @@ func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
 	if reparse || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("%q is not a real directory", path)
 	}
+	if err := verifyCurrentUserOwner(file); err != nil {
+		return err
+	}
 	if err := setCurrentUserOnlyDACL(file); err != nil {
 		return err
 	}
+	if err := verifyCurrentUserOwner(file); err != nil {
+		return err
+	}
 	return verifyCurrentUserOnlyDACL(file)
+}
+
+func verifyCurrentUserOwner(file *os.File) error {
+	descriptor, err := windows.GetSecurityInfo(
+		windows.Handle(file.Fd()),
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION,
+	)
+	if err != nil {
+		return err
+	}
+	owner, _, err := descriptor.Owner()
+	if err != nil {
+		return err
+	}
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	if !windows.EqualSid(owner, user.User.Sid) {
+		return fmt.Errorf("staging directory is owned by a foreign SID")
+	}
+	return nil
 }
 
 func setCurrentUserOnlyDACL(file *os.File) error {

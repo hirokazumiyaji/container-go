@@ -7,9 +7,15 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func prepareCopyStagingRoot() (string, error) {
+	return prepareCopyStagingRootForSource(nil)
+}
+
+func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("copy to container: locate per-user cache: %w", err)
@@ -18,8 +24,8 @@ func prepareCopyStagingRoot() (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("copy to container: resolve per-user cache: %w", err)
 	}
-	if err := verifyCopyStagingBase(base); err != nil {
-		return "", fmt.Errorf("copy to container: verify per-user cache: %w", err)
+	if err := ensureCopyStagingBase(base, source); err != nil {
+		return "", fmt.Errorf("copy to container: ensure per-user cache: %w", err)
 	}
 
 	appRoot := filepath.Join(base, "containergo")
@@ -33,36 +39,95 @@ func prepareCopyStagingRoot() (string, error) {
 	return root, nil
 }
 
+func ensureCopyStagingBase(path string, source *openedCopySource) error {
+	if _, err := os.Lstat(path); err == nil {
+		if err := verifyCopyStagingBase(path); err != nil {
+			return err
+		}
+		return ensureCopyStagingOutsideSource(path, source)
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+
+	parentPath := filepath.Dir(path)
+	parent, reparse, err := openCopySource(parentPath)
+	if err != nil {
+		return fmt.Errorf("open parent of missing per-user cache %q: %w", path, err)
+	}
+	defer func() { _ = parent.Close() }()
+	parentInfo, err := parent.Stat()
+	if err != nil {
+		return err
+	}
+	if reparse || parentInfo.Mode()&os.ModeSymlink != 0 || !parentInfo.IsDir() {
+		return fmt.Errorf("parent of per-user cache %q is not a real directory", path)
+	}
+	if err := verifyCopyStagingAncestors(parent, parentInfo); err != nil {
+		return err
+	}
+	if err := ensureOpenCopyDirectoryOutsideSource(parent, reparse, source); err != nil {
+		return err
+	}
+	if err := unix.Mkdirat(int(parent.Fd()), filepath.Base(path), 0o700); err != nil && !os.IsExist(err) {
+		return err
+	}
+	if err := verifyCreatedCopyStagingBase(path); err != nil {
+		return err
+	}
+	if err := verifyCopyStagingBase(path); err != nil {
+		return err
+	}
+	return ensureCopyStagingOutsideSource(path, source)
+}
+
+func verifyCreatedCopyStagingBase(path string) error {
+	file, reparse, err := openCopySource(path)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
+	if err != nil {
+		return err
+	}
+	if reparse || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("%q is not a real directory", path)
+	}
+	if info.Mode().Perm() != 0o700 {
+		return fmt.Errorf("created per-user cache %q permissions are %04o, want 0700", path, info.Mode().Perm())
+	}
+	return nil
+}
+
 func verifyCopyStagingBase(path string) error {
 	file, reparse, err := openCopySource(path)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = file.Close() }()
 	info, err := file.Stat()
 	if err != nil {
-		_ = file.Close()
 		return err
 	}
 	if reparse || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		_ = file.Close()
 		return fmt.Errorf("%q is not a real directory", path)
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || int(stat.Uid) != os.Geteuid() {
-		_ = file.Close()
 		return fmt.Errorf("%q is not owned by the current user", path)
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		_ = file.Close()
 		return fmt.Errorf("%q is group- or world-writable", path)
 	}
 	return verifyCopyStagingAncestors(file, info)
 }
 
+// verifyCopyStagingAncestors owns neither base nor the parent handles it
+// opens while walking toward the filesystem root.
 func verifyCopyStagingAncestors(base *os.File, baseInfo os.FileInfo) error {
 	current := base
 	currentInfo := baseInfo
-	opened := []*os.File{base}
+	opened := make([]*os.File, 0, 8)
 	defer func() {
 		for _, file := range opened {
 			_ = file.Close()

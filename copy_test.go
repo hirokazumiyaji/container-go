@@ -365,6 +365,33 @@ func TestCopyToContainerClassifiesDisappearanceAndPreservesCause(t *testing.T) {
 	}
 }
 
+func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openers := defaultCopySourceOpeners
+	openers.open = func(path string) (*os.File, bool, error) {
+		file, reparse, err := openCopySource(path)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := os.Remove(path); err != nil {
+			_ = file.Close()
+			return nil, false, err
+		}
+		return file, reparse, nil
+	}
+
+	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	if !errors.Is(err, ErrCopySourceChanged) {
+		t.Fatalf("error = %v, want ErrCopySourceChanged", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error = %v, want preserved fs.ErrNotExist cause", err)
+	}
+}
+
 func TestWithFilesRejectsDirectory(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "tree")
 	if err := os.Mkdir(source, 0o700); err != nil {

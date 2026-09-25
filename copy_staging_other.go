@@ -3,6 +3,10 @@
 package container
 
 func prepareCopyStagingRoot() (string, error) {
+	return prepareCopyStagingRootForSource(nil)
+}
+
+func prepareCopyStagingRootForSource(*openedCopySource) (string, error) {
 	return "", unsupportedCopySource("copy staging")
 }
 

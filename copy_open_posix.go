@@ -11,6 +11,18 @@ import (
 
 const copySourceOpenFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
 
+func copySourceFileIdentity(file *os.File) (copySourceIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstat(int(file.Fd()), &stat); err != nil {
+		return copySourceIdentity{}, err
+	}
+	return copySourceIdentity{primary: uint64(stat.Dev), secondary: uint64(stat.Ino)}, nil
+}
+
+func sameCopySourceIdentity(first, second copySourceIdentity) bool {
+	return first.primary == second.primary && first.secondary == second.secondary
+}
+
 // openCopySource opens the final component without following links. O_NONBLOCK
 // keeps a raced FIFO from blocking before the handle can be validated.
 func openCopySource(path string) (*os.File, bool, error) {
@@ -37,4 +49,8 @@ func filepathJoinHandleName(parent *os.File, name string) string {
 
 func isCopySourceLinkError(err error) bool {
 	return errors.Is(err, unix.ELOOP)
+}
+
+func isCopySourceUnsupportedOpenError(err error) bool {
+	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENXIO)
 }

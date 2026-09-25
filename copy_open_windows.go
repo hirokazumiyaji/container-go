@@ -14,6 +14,21 @@ import (
 
 const copySourceShareMode = windows.FILE_SHARE_READ | windows.FILE_SHARE_WRITE | windows.FILE_SHARE_DELETE
 
+func copySourceFileIdentity(file *os.File) (copySourceIdentity, error) {
+	var info syscall.ByHandleFileInformation
+	if err := syscall.GetFileInformationByHandle(syscall.Handle(file.Fd()), &info); err != nil {
+		return copySourceIdentity{}, err
+	}
+	return copySourceIdentity{
+		primary:   uint64(info.VolumeSerialNumber),
+		secondary: uint64(info.FileIndexHigh)<<32 | uint64(info.FileIndexLow),
+	}, nil
+}
+
+func sameCopySourceIdentity(first, second copySourceIdentity) bool {
+	return first.primary == second.primary && first.secondary == second.secondary
+}
+
 // openCopySource opens the final component without following a reparse point.
 // Sharing delete lets a replacement race occur while the snapshot still reads
 // only the handle it opened and validated.
@@ -112,3 +127,5 @@ func windowsExtendedPath(path string) string {
 }
 
 func isCopySourceLinkError(error) bool { return false }
+
+func isCopySourceUnsupportedOpenError(error) bool { return false }

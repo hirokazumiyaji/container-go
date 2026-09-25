@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -26,6 +27,28 @@ func TestCopyToContainerRejectsFIFO(t *testing.T) {
 	}
 	if runner.callWith("cp") != nil {
 		t.Error("CLI was called for a FIFO source")
+	}
+}
+
+func TestCopyToContainerRejectsUnixSocket(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "socket")
+	listener, err := net.Listen("unix", source)
+	if err != nil {
+		t.Skipf("Unix socket unavailable: %v", err)
+	}
+	if unixListener, ok := listener.(*net.UnixListener); ok {
+		unixListener.SetUnlinkOnClose(true)
+	}
+	defer listener.Close()
+
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, runner)
+	err = ctr.CopyToContainer(context.Background(), source, "/tmp/socket")
+	if !errors.Is(err, ErrCopySourceUnsupported) {
+		t.Fatalf("error = %v, want ErrCopySourceUnsupported", err)
+	}
+	if runner.callWith("cp") != nil {
+		t.Error("CLI was called for a Unix socket source")
 	}
 }
 
@@ -110,8 +133,127 @@ func TestCopyStagingDoesNotFallBackToMutableConfiguredDirectories(t *testing.T) 
 		t.Fatal(err)
 	}
 
-	if dir, err := newCopyStagingDir(source); err == nil {
+	opened, err := openVerifiedCopySource(source, openCopySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.file.Close()
+	if dir, err := newCopyStagingDir(opened); err == nil {
 		_ = os.RemoveAll(dir)
 		t.Fatalf("newCopyStagingDir used an untrusted configured directory: %q", dir)
+	}
+}
+
+func TestSnapshotCopyDirectoryIgnoresPostOpenReplacementForStagingAncestry(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("environment-specific cache-directory test")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "tree")
+	original := filepath.Join(root, "original-tree")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "data.txt"), []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if runtime.GOOS == "darwin" {
+		t.Setenv("HOME", filepath.Join(source, "home"))
+	} else {
+		t.Setenv("XDG_CACHE_HOME", filepath.Join(source, "cache"))
+	}
+
+	opened, err := openVerifiedCopySource(source, openCopySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.file.Close()
+	if err := os.Rename(source, original); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if runtime.GOOS == "darwin" {
+		if err := os.MkdirAll(filepath.Join(source, "home", "Library"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	staging, err := newCopyStagingDir(opened)
+	if err != nil {
+		t.Fatalf("newCopyStagingDir followed post-open replacement: %v", err)
+	}
+	if err := cleanupCopyStagingDir(staging); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCopyStagingRejectsCacheInsideOpenedSourceBeforeCreate(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("environment-specific cache-directory test")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "tree")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var cache string
+	if runtime.GOOS == "darwin" {
+		home := filepath.Join(source, "home")
+		if err := os.MkdirAll(filepath.Join(home, "Library"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", home)
+		cache = filepath.Join(home, "Library", "Caches")
+	} else {
+		cache = filepath.Join(source, "cache")
+		t.Setenv("XDG_CACHE_HOME", cache)
+	}
+	opened, err := openVerifiedCopySource(source, openCopySource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer opened.file.Close()
+
+	if _, err := newCopyStagingDir(opened); err == nil {
+		t.Fatal("cache inside opened source was accepted")
+	}
+	if _, err := os.Lstat(cache); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("staging cache was created inside source: %v", err)
+	}
+}
+
+func TestCopyStagingCreatesMissingUserCacheBasePrivately(t *testing.T) {
+	if runtime.GOOS != "darwin" && runtime.GOOS != "linux" {
+		t.Skip("environment-specific cache-directory test")
+	}
+	root := t.TempDir()
+	var cache string
+	if runtime.GOOS == "darwin" {
+		home := filepath.Join(root, "home")
+		if err := os.MkdirAll(filepath.Join(home, "Library"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", home)
+		cache = filepath.Join(home, "Library", "Caches")
+	} else {
+		cache = filepath.Join(root, "cache")
+		t.Setenv("XDG_CACHE_HOME", cache)
+	}
+
+	if _, err := os.Lstat(cache); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("cache precondition failed: %v", err)
+	}
+	if _, err := prepareCopyStagingRoot(); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(cache)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("fresh cache permissions = %04o, want 0700", info.Mode().Perm())
 	}
 }

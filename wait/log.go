@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -50,6 +51,99 @@ type logScanResult struct {
 	err   error
 }
 
+type logScanState struct {
+	mu     sync.Mutex
+	result logScanResult
+	ready  bool
+}
+
+func (s *logScanState) publish(result logScanResult) {
+	s.mu.Lock()
+	s.result = result
+	s.ready = true
+	s.mu.Unlock()
+}
+
+func (s *logScanState) load() (logScanResult, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.result, s.ready
+}
+
+func receiveLogScanResult(results <-chan logScanResult, state *logScanState, done <-chan struct{}) (logScanResult, bool) {
+	// Prefer a result that was queued before the context completion.
+	select {
+	case result := <-results:
+		return result, true
+	default:
+	}
+	if result, ok := state.load(); ok {
+		return result, true
+	}
+
+	select {
+	case result := <-results:
+		return result, true
+	case <-done:
+		// The scanner may have published its result just before the
+		// context completed. Drain it before reporting the context.
+		select {
+		case result := <-results:
+			return result, true
+		default:
+		}
+		if result, ok := state.load(); ok {
+			return result, true
+		}
+	}
+	return logScanResult{}, false
+}
+
+func handleLogScanResult(callerCtx, waitCtx context.Context, timeout time.Duration, what string, target Target, result logScanResult) error {
+	// EOF and context completion can become ready together. Check the
+	// caller's context first, then the strategy deadline, before
+	// classifying EOF or starting a diagnostic probe.
+	if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
+		return contextErr
+	}
+	if result.found {
+		return nil
+	}
+
+	// The stream ended before the pattern appeared. Check the context
+	// again immediately before the diagnostic probe so a cancellation that
+	// raced with EOF cannot start a new probe.
+	if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
+		return contextErr
+	}
+	// Keep the caller's context as the probe base so a later cancellation or
+	// deadline also bounds diagnostics.
+	probeCtx, probeCancel := context.WithTimeout(callerCtx, 5*time.Second)
+	if probeErr := probeCtx.Err(); probeErr != nil {
+		probeCancel()
+		return waitContextError(what, probeErr, result.err)
+	}
+	running, rErr := target.Running(probeCtx)
+	probeCancel()
+	if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
+		return contextErr
+	}
+	if rErr == nil && !running {
+		message := what + ": container stopped before pattern appeared"
+		if result.err != nil {
+			message += fmt.Sprintf(" (read error: %v)", result.err)
+		}
+		return newWaitError(message, result.err)
+	}
+
+	message := what + ": log stream ended before pattern appeared"
+	if result.err != nil {
+		message += fmt.Sprintf(" (read error: %v)", result.err)
+		return newWaitError(message, result.err)
+	}
+	return newWaitError(message)
+}
+
 func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	timeout, _ := s.effective()
 	callerCtx := ctx
@@ -82,6 +176,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	defer stream.Close()
 
 	scanResult := make(chan logScanResult, 1)
+	scanState := &logScanState{}
 	go func() {
 		scanner := bufio.NewScanner(stream)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -89,54 +184,24 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		for scanner.Scan() {
 			count += match(scanner.Text())
 			if count >= s.occurrences {
-				scanResult <- logScanResult{found: true}
+				result := logScanResult{found: true}
+				scanState.publish(result)
+				scanResult <- result
 				return
 			}
 		}
-		scanResult <- logScanResult{err: scanner.Err()}
+		result := logScanResult{err: scanner.Err()}
+		scanState.publish(result)
+		scanResult <- result
 	}()
 
-	select {
-	case result := <-scanResult:
-		// EOF and context completion can become ready together. Check
-		// the caller's context first, then the strategy deadline, before
-		// classifying EOF or starting a diagnostic probe.
-		if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
-			return contextErr
-		}
-		if result.found {
-			return nil
-		}
-
-		// The stream ended before the pattern appeared. Keep the
-		// caller's context as the probe base so a later cancellation or
-		// deadline also bounds diagnostics.
-		probeCtx, probeCancel := context.WithTimeout(callerCtx, 5*time.Second)
-		running, rErr := target.Running(probeCtx)
-		probeCancel()
-		if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
-			return contextErr
-		}
-		if rErr == nil && !running {
-			message := what + ": container stopped before pattern appeared"
-			if result.err != nil {
-				message += fmt.Sprintf(" (read error: %v)", result.err)
-			}
-			return newWaitError(message, result.err)
-		}
-
-		message := what + ": log stream ended before pattern appeared"
-		if result.err != nil {
-			message += fmt.Sprintf(" (read error: %v)", result.err)
-			return newWaitError(message, result.err)
-		}
-		return newWaitError(message)
-	case <-waitCtx.Done():
-		if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, nil); contextErr != nil {
-			return contextErr
-		}
-		// waitCtx.Done was observed, so this is only a defensive
-		// fallback for unusual Context implementations.
-		return waitTimeoutError(what, timeout, nil)
+	if result, ok := receiveLogScanResult(scanResult, scanState, waitCtx.Done()); ok {
+		return handleLogScanResult(callerCtx, waitCtx, timeout, what, target, result)
 	}
+	if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, nil); contextErr != nil {
+		return contextErr
+	}
+	// waitCtx.Done was observed, so this is only a defensive fallback for
+	// unusual Context implementations.
+	return waitTimeoutError(what, timeout, nil)
 }

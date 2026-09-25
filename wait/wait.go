@@ -35,7 +35,9 @@ type Target interface {
 	ExecCommand(ctx context.Context, cmd []string) (int, error)
 }
 
-// Strategy waits until a started container is ready for use.
+// Strategy waits until a started container is ready for use. Implementations
+// must return when ctx is done so composite strategies can collect their final
+// error without extending the caller's cancellation contract indefinitely.
 type Strategy interface {
 	WaitUntilReady(ctx context.Context, target Target) error
 }
@@ -58,11 +60,34 @@ func (o options) effective() (timeout, interval time.Duration) {
 
 type waitError struct {
 	message string
+	primary error
 	causes  []error
 }
 
-func (e *waitError) Error() string   { return e.message }
-func (e *waitError) Unwrap() []error { return e.causes }
+func (e *waitError) Error() string { return e.message }
+
+// Unwrap keeps the context error as the conventional single cause for
+// callers that use errors.Unwrap. Is and As below expose every additional
+// cause without changing that compatibility.
+func (e *waitError) Unwrap() error { return e.primary }
+
+func (e *waitError) Is(target error) bool {
+	for _, cause := range e.causes {
+		if errors.Is(cause, target) {
+			return true
+		}
+	}
+	return false
+}
+
+func (e *waitError) As(target any) bool {
+	for _, cause := range e.causes {
+		if errors.As(cause, target) {
+			return true
+		}
+	}
+	return false
+}
 
 func newWaitError(message string, causes ...error) error {
 	filtered := make([]error, 0, len(causes))
@@ -71,7 +96,11 @@ func newWaitError(message string, causes ...error) error {
 			filtered = append(filtered, cause)
 		}
 	}
-	return &waitError{message: message, causes: filtered}
+	var primary error
+	if len(filtered) > 0 {
+		primary = filtered[0]
+	}
+	return &waitError{message: message, primary: primary, causes: filtered}
 }
 
 func waitContextError(what string, contextErr error, lastErr error) error {
@@ -137,9 +166,11 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		}
 
 		if err := check(waitCtx); err != nil {
-			// A context can end while the check is returning. Prefer
-			// that terminal cause over a check error so cancellation
-			// and deadlines remain visible to callers.
+			// The check can return a backend error at the same moment
+			// its context ends. Keep that error as the latest cause
+			// before classifying the terminal context.
+			lastErr = err
+
 			if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
 			}
@@ -150,7 +181,6 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				// help, so surface the error right away.
 				return fmt.Errorf("%s: %w", what, fatal.err)
 			}
-			lastErr = err
 		} else {
 			if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
@@ -162,6 +192,9 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			return terminalErr
 		}
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
 			lastStateCheck = time.Now()
 			running, err := target.Running(waitCtx)
 			if terminalErr := terminationErr(); terminalErr != nil {
@@ -180,6 +213,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			// and the probe retains caller cancellation as a bound.
 			if !checkRunning && callerCtx.Err() == nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
 				probeCtx, probeCancel := context.WithTimeout(callerCtx, stateCheckInterval)
+				if probeErr := probeCtx.Err(); probeErr != nil {
+					probeCancel()
+					return waitContextError(what, probeErr, lastErr)
+				}
 				running, err := target.Running(probeCtx)
 				probeCancel()
 				if callerErr := callerCtx.Err(); callerErr != nil {

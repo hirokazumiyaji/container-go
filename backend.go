@@ -1,7 +1,6 @@
 package container
 
 import (
-	"fmt"
 	"os"
 	"runtime"
 
@@ -36,10 +35,10 @@ func detectEngineFor(goos, value string) (engine, error) {
 		return dockerEngine{}, nil
 	case "apple":
 		if goos != "darwin" {
-			return nil, fmt.Errorf("%s=apple: Apple Container only runs on macOS (GOOS=%s)", backendEnv, goos)
+			return nil, invalidOption("backend", "Apple Container is available only on macOS")
 		}
 		return appleEngine{}, nil
 	default:
-		return nil, fmt.Errorf("invalid %s=%q: valid values are \"apple\" and \"docker\"", backendEnv, value)
+		return nil, invalidOption(backendEnv, "valid values are apple and docker")
 	}
 }

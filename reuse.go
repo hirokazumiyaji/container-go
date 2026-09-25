@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // reuseFlights collapses concurrent WithReuse get-or-create calls that
@@ -26,7 +27,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
 	if err != nil {
-		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(err)
 	}
 
 	info := base.info
@@ -37,7 +38,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(err)
 	}
 
 	ctr := &Container{
@@ -50,7 +51,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		info:              info,
 		creation:          info.labels[creationLabel],
 		uid:               info.uid,
-		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
+		diagnosticSecrets: uniqueStrings(append(append([]string(nil), base.diagnosticSecrets...), cfg.diagnosticSecrets...)),
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -67,7 +68,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 	for {
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
+				return nil, fmt.Errorf("reuse: timed out waiting for a usable container")
 			}
 			return nil, err
 		}
@@ -101,7 +102,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			continue
 		case StateStopped:
 			if recreated {
-				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
+				return nil, fmt.Errorf("reuse: container stayed stopped after recreate")
 			}
 			// Only recycle containers this library created for reuse
 			// with a compatible image; never delete foreign leftovers.
@@ -151,7 +152,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
 	if err := cfg.ensureImage(runCtx, image); err != nil {
-		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(err)
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
@@ -163,7 +164,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, cli.WithRedactor(classified, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(classified)
 	}
 
 	ctr := &Container{
@@ -210,10 +211,11 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return nil
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
-		tail := ctr.logTail(context.WithoutCancel(ctx))
-		safeErr := ctr.redactError(fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err))
+		values := wait.DiagnosticValues(cfg.waitStrategy)
+		tail := ctr.logTail(context.WithoutCancel(ctx), values...)
+		safeErr := ctr.publicError(fmt.Errorf("reuse failed to become ready: %w", err), values...)
 		if tail != "" {
-			return ctr.redactError(fmt.Errorf("%w; container logs: %s", safeErr, tail))
+			return ctr.publicError(fmt.Errorf("%w; container logs: %s", safeErr, tail), values...)
 		}
 		return safeErr
 	}
@@ -254,10 +256,10 @@ func createRaceMissing(err error) bool {
 // and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+		return fmt.Errorf("reuse: existing container was not created with WithReuse")
 	}
 	if !imagesCompatible(image, info.image) {
-		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+		return fmt.Errorf("reuse: image does not match existing image")
 	}
 	return nil
 }
@@ -272,13 +274,13 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	if !cfg.eng.directIP() {
 		for _, spec := range cfg.exposed {
 			if !hasBoundPort(info.bound, spec.port, spec.proto) {
-				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+				return fmt.Errorf("reuse: exposed port missing on existing container")
 			}
 		}
 	}
 	for _, p := range cfg.published {
 		if !hasPublishedBinding(info.bound, p) {
-			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
+			return fmt.Errorf("reuse: published port missing on existing container")
 		}
 	}
 	return nil
@@ -397,11 +399,11 @@ func stripImageDigest(ref string) string {
 // step; ordinary Prune still only removes stopped managed containers.
 func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if group == "" {
-		return nil, fmt.Errorf("reuse group must not be empty")
+		return nil, safePublicError(invalidOption("reuse group", "must not be empty"))
 	}
 	eng, err := detectEngine()
 	if err != nil {
-		return nil, err
+		return nil, safePublicError(err)
 	}
 	return pruneReuseGroupWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, group)
 }
@@ -409,5 +411,5 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
 	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group)
+	}, "prune reuse group "+group, group)
 }

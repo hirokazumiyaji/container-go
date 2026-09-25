@@ -364,8 +364,35 @@ the library has no credential input path.
 **No secrets in logs**. Debug logging of CLI argv never includes
 env-file contents. `CLIError.Error()` and readiness log tails additionally
 redact configured and secret-shaped values and escape terminal control
-characters before they reach CI output; callers that need the original
-CLI diagnostic must explicitly use `RawError()`.
+characters (including U+2028/U+2029) before they reach CI output; callers
+that need the original CLI diagnostic must explicitly use `RawError()`.
+The wait package exposes an optional diagnostic-value provider. HTTP
+headers and Basic-auth material, log patterns, exec commands, and requested
+ports are collected recursively (including `ForAll`/`ForAny`) and supplied
+to both normal and reuse log-tail diagnostics. A tail is redacted and
+sanitized before its final 1MiB truncation, so a secret split by an earlier
+boundary cannot survive as a suffix.
+
+Rejected options are rendered through value-free `ValidationError` or
+`OptionError` values at the public boundary; their original causes remain
+available through the unwrap chain.
+
+Structural detection covers underscore/dotted secret names, empty-user
+credential URLs, Basic base64, quoted and PEM multiline values, JWTs,
+cookies/signatures, and attached or aliased `-e`, volume, mount, publish,
+and filter arguments. Known values use boundary-aware replacement, while
+operation-context values are replaced even when adjacent to log text. Redactors are
+composable so a public-boundary context is never discarded by a later
+container or wait wrapper.
+
+`CLIError` remains an alias of the internal CLI type, preserving its
+keyed exported fields and `errors.As` identity. Safe wrappers carry
+unexported redactor/original state; this deliberately means external
+packages must use keyed `CLIError` literals rather than unkeyed literals.
+`errors.As` on a safe wrapper returns a redacted `*CLIError`, while
+`RawError()` is the explicit unredacted escape hatch. `ErrSystemNotRunning`
+retains the original operation and failed liveness-probe errors in its
+multi-error chain.
 
 ## Performance design
 
@@ -397,8 +424,9 @@ cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 Errors are discriminable with `errors.Is`/`errors.As`.
 
 - `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
+  `container system status` probe failed too; the typed classification
+  retains both the original and probe errors in its `errors.Is`/`As`
+  chain, while the message tells the user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`

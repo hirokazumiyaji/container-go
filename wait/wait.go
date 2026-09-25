@@ -87,7 +87,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
 			if running, err := target.Running(ctx); err == nil && !running {
-				return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr), values...)
+				if lastErr == nil {
+					return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: none)", what), values...)
+				}
+				return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %w)", what, lastErr), values...)
 			}
 		}
 
@@ -104,13 +107,22 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				running, err := target.Running(probeCtx)
 				probeCancel()
 				if err == nil && !running {
-					return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr), values...)
+					if lastErr == nil {
+						return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: none)", what), values...)
+					}
+					return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %w)", what, lastErr), values...)
 				}
 			}
 			if errors.Is(ctx.Err(), context.Canceled) {
-				return safeDiagnosticError(fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr), values...)
+				if lastErr == nil {
+					return safeDiagnosticError(fmt.Errorf("%s: %w (last error: none)", what, context.Canceled), values...)
+				}
+				return safeDiagnosticError(fmt.Errorf("%s: %w (last error: %w)", what, context.Canceled, lastErr), values...)
 			}
-			return safeDiagnosticError(fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr), values...)
+			if lastErr == nil {
+				return safeDiagnosticError(fmt.Errorf("%s: timed out after %v (last error: none)", what, timeout), values...)
+			}
+			return safeDiagnosticError(fmt.Errorf("%s: timed out after %v (last error: %w)", what, timeout, lastErr), values...)
 		case <-time.After(interval):
 		}
 	}

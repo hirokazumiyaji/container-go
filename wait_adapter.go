@@ -12,10 +12,12 @@ import (
 
 // WithWaitStrategy blocks Run until the strategy reports the container
 // ready. On failure the container is removed and the error carries a
-// tail of its logs.
+// redacted tail of its logs. Built-in strategies and composites expose
+// their request/command context through wait.DiagnosticValues.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
 		c.waitStrategy = s
+		c.waitDiagnosticSecrets = wait.DiagnosticValues(s)
 		return nil
 	}
 }
@@ -56,21 +58,21 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 // failures.
 const logTailLimit = 1024 * 1024
 
-// logTail fetches up to logTailLimit trailing bytes of the container's
-// logs for diagnostics. It asks the backend for a bounded tail
-// (logsTailArgs) and keeps only the last bytes in a fixed-size ring,
-// so neither the CLI output nor the Go buffer grows with total log
-// size. Failures yield an empty tail.
-func (c *Container) logTail(ctx context.Context) string {
+// logTail fetches the backend's bounded log snapshot, redacts and sanitizes
+// the complete snapshot, and only then applies the final byte cap. Taking the
+// tail before redaction can split a secret at the boundary and leave its
+// suffix in the diagnostic.
+func (c *Container) logTail(ctx context.Context, extra ...string) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
 	if err != nil {
 		return ""
 	}
-	tail := lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
-	tail = c.diagnosticRedactor().Text(tail)
-	return lastNBytes(strings.NewReader(tail), logTailLimit)
+	var raw bytes.Buffer
+	_, _ = raw.ReadFrom(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)))
+	safe := c.diagnosticRedactor(extra...).Text(raw.String())
+	return lastNBytes(strings.NewReader(safe), logTailLimit)
 }
 
 // lastNBytes keeps only the trailing n bytes of r using a fixed-size

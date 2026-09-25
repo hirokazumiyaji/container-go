@@ -52,7 +52,7 @@ func (dockerEngine) checkConfig(cfg *config) error {
 	// hostAddr is validated as an IP literal by parsePublishSpec.
 	for _, p := range cfg.published {
 		if p.hostAddr != "" && net.ParseIP(p.hostAddr).IsLoopback() {
-			return fmt.Errorf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw)
+			return invalidOption("published port", "loopback bind is unreachable on a remote Docker host")
 		}
 	}
 	return nil

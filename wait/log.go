@@ -45,6 +45,12 @@ func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
 	return s
 }
 
+// DiagnosticValues returns the log matcher that may be echoed in a failure.
+func (s *LogStrategy) DiagnosticValues() []string { return []string{s.pattern} }
+
+// DiagnosticSecrets is an alias for DiagnosticValues.
+func (s *LogStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	timeout, _ := s.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -98,7 +104,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		if rErr == nil && !running {
 			return safeDiagnosticError(fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern), s.pattern)
 		}
-		return safeDiagnosticError(fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %v)", s.pattern, err), s.pattern)
+		if err == nil {
+			return safeDiagnosticError(fmt.Errorf("wait for log %q: log stream ended before pattern appeared", s.pattern), s.pattern)
+		}
+		return safeDiagnosticError(fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %w)", s.pattern, err), s.pattern)
 	case <-ctx.Done():
 		return safeDiagnosticError(fmt.Errorf("wait for log %q: timed out after %v", s.pattern, timeout), s.pattern)
 	}

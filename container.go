@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -16,6 +17,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 const (
@@ -112,29 +114,33 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	cfg := newConfig()
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+			// Capture values from options that ran before a later option
+			// failed, while the validation error itself remains value-free.
+			cfg.rememberDiagnosticValues()
+			return nil, cfg.publicError(optionBoundaryError(err))
 		}
+		cfg.rememberDiagnosticValues()
 	}
-	cfg.diagnosticSecrets = append([]string(nil), cfg.diagnosticValues()...)
+	cfg.rememberDiagnosticValues()
 	if !imageRE.MatchString(image) {
-		return nil, cli.WithRedactor(fmt.Errorf("invalid image reference %q", image), cfg.diagnosticRedactor())
+		return nil, cfg.publicError(invalidOption("image reference", "must contain only registry, repository, tag, or digest characters"))
 	}
 	if cfg.reuse && cfg.name == "" {
-		return nil, cli.WithRedactor(fmt.Errorf("WithReuse requires WithName"), cfg.diagnosticRedactor())
+		return nil, cfg.publicError(invalidOption("reuse options", "WithReuse requires WithName"))
 	}
 	if cfg.reuseGroup != "" && !cfg.reuse {
-		return nil, cli.WithRedactor(fmt.Errorf("WithReuseGroup requires WithReuse"), cfg.diagnosticRedactor())
+		return nil, cfg.publicError(invalidOption("reuse options", "WithReuseGroup requires WithReuse"))
 	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()
 		if err != nil {
-			return nil, err
+			return nil, cfg.publicError(err)
 		}
 		cfg.eng = eng
 	}
 	applyEngineBinary(cfg)
 	if err := cfg.eng.checkConfig(cfg); err != nil {
-		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(err)
 	}
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
@@ -148,7 +154,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
-			return nil, err
+			return nil, cfg.publicError(err)
 		}
 		defer os.RemoveAll(dir)
 		envFile = path
@@ -160,13 +166,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// run command; both share the aggregated flight so concurrent Runs
 	// of the same image pull once.
 	if err := cfg.ensureImage(runCtx, image); err != nil {
-		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(err)
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, cli.WithRedactor(classified, cfg.diagnosticRedactor())
+		return nil, cfg.publicError(classified)
 	}
 
 	c := &Container{
@@ -202,10 +208,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
-			tail := c.logTail(cleanupCtx)
-			err = c.redactError(fmt.Errorf("container %s failed to become ready: %w", c.id, err))
+			waitValues := wait.DiagnosticValues(cfg.waitStrategy)
+			tail := c.logTail(cleanupCtx, waitValues...)
+			err = c.publicError(fmt.Errorf("container %s failed to become ready: %w", c.id, err), waitValues...)
 			if tail != "" {
-				err = c.redactError(fmt.Errorf("%w; container logs: %s", err, tail))
+				err = c.publicError(fmt.Errorf("%w; container logs: %s", err, tail), waitValues...)
 			}
 			return nil, c.rollback(ctx, err)
 		}
@@ -219,7 +226,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		return c.redactError(&rollbackError{cause: cause, cleanup: err, id: c.id})
 	}
 	return cause
 }
@@ -327,7 +334,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
-		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		return c.redactError(fmt.Errorf("terminate: lock name: %w", err), c.id)
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
@@ -335,12 +342,12 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		return c.redactError(fmt.Errorf("terminate: verify generation: %w", err), c.id)
 	}
 	// An absent generation cannot prove ownership of this handle, so
 	// it counts as a replacement too.
 	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		return c.redactError(fmt.Errorf("%w: container generation did not match", ErrGenerationReplaced), c.id)
 	}
 	if info.uid != "" {
 		return c.delete(ctx, info.uid)
@@ -364,10 +371,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	info, err := c.cachedInfo(ctx)
 	if err != nil {
-		return "", err
+		return "", c.redactError(err)
 	}
 	if info.ip == "" {
-		return "", fmt.Errorf("container %s has no reported IP address", c.id)
+		return "", c.redactError(errors.New("container has no reported IP address"), c.id, info.ip)
 	}
 	return info.ip, nil
 }
@@ -394,14 +401,14 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 // to the port clients should dial.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
 	_, p, err := c.resolve(ctx, port)
-	return p, err
+	return p, c.redactError(err, port)
 }
 
 // Endpoint returns "host:port" for a declared container port.
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 	host, p, err := c.resolve(ctx, port)
 	if err != nil {
-		return "", err
+		return "", c.redactError(err, port)
 	}
 	return net.JoinHostPort(host, strconv.Itoa(p)), nil
 }
@@ -410,7 +417,7 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 func (c *Container) resolve(ctx context.Context, port string) (string, int, error) {
 	spec, err := parsePortSpec(port)
 	if err != nil {
-		return "", 0, err
+		return "", 0, c.redactError(err, port)
 	}
 	for _, p := range c.published {
 		if p.containerPort == spec.port && p.proto == spec.proto {
@@ -422,26 +429,26 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 		}
 	}
 	if !slices.Contains(c.exposed, spec) {
-		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
+		return "", 0, c.redactError(fmt.Errorf("%w: %s", ErrPortNotExposed, spec), port)
 	}
 	if c.eng.directIP() {
 		ip, err := c.ContainerIP(ctx)
 		if err != nil {
-			return "", 0, err
+			return "", 0, c.redactError(err, port)
 		}
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
 	info, err := c.cachedInfo(ctx)
 	if err != nil {
-		return "", 0, err
+		return "", 0, c.redactError(err, port)
 	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
 			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
 		}
 	}
-	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
+	return "", 0, c.redactError(fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec), port)
 }
 
 // cachedInfo returns the first successful inspect result. Only fields

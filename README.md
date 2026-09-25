@@ -227,6 +227,13 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
+- `CLIError.Error()` and readiness log tails redact configured and
+  secret-shaped values, including wait HTTP headers/Basic auth, log
+  patterns, exec commands, and ports. `RawError()` is the explicit
+  unredacted escape hatch; `errors.As` on a safe error returns a
+  redacted `*CLIError`. `CLIError` remains a keyed-literal-compatible
+  alias, but its safe-wrapper state makes external unkeyed literals
+  unsupported.
 
 ## Differences from testcontainers-go
 

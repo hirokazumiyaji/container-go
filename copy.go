@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -56,11 +57,11 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, c.redactError(err, containerPath)
 	}
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, c.redactError(fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath), containerPath)
+		return nil, c.redactError(errors.New("copy file from container: cannot copy a directory or root as a single file"), containerPath)
 	}
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err, containerPath)
 	}
 	dst := filepath.Join(dir, filepath.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
@@ -72,16 +73,16 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	info, err := os.Stat(dst)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, c.redactError(err, containerPath, dst)
 	}
 	if info.IsDir() {
 		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("copy file from container %q: target is a directory", containerPath)
+		return nil, c.redactError(errors.New("copy file from container: target is a directory"), containerPath)
 	}
 	f, err := os.Open(dst)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, c.redactError(err, containerPath, dst)
 	}
 	return &tempFileReader{File: f, dir: dir}, nil
 }
@@ -101,10 +102,10 @@ func (r *tempFileReader) Close() error {
 // relies on: absolute, valid UTF-8, and free of NUL bytes.
 func validateContainerPath(p string) error {
 	if !strings.HasPrefix(p, "/") {
-		return fmt.Errorf("container path %q must be absolute", p)
+		return invalidOption("container path", "must be absolute")
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
-		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)
+		return invalidOption("container path", "must be valid UTF-8 without NUL bytes")
 	}
 	return nil
 }

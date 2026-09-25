@@ -145,17 +145,96 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 }
 
-func TestDockerParseStoppedManaged(t *testing.T) {
+func TestDockerListArgsUseImmutableIDs(t *testing.T) {
 	e := dockerEngine{}
-	if got := e.listArgs(); !slices.Contains(got, "--filter") {
-		t.Errorf("listArgs = %v, want daemon-side filters", got)
+	wantStopped := []string{
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
+		"--filter", "label=" + managedLabel + "=true",
+		"--filter", "status=exited",
 	}
-	candidates, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	if got := e.listArgs(); !slices.Equal(got, wantStopped) {
+		t.Errorf("listArgs = %v, want %v", got, wantStopped)
+	}
+	wantReuse := []string{
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
+		"--filter", "label=" + reuseGroupLabel + "=integration",
+	}
+	if got := e.listReuseGroupArgs("integration"); !slices.Equal(got, wantReuse) {
+		t.Errorf("listReuseGroupArgs = %v, want %v", got, wantReuse)
+	}
+}
+
+func TestDockerParsesOnlyImmutableListIDs(t *testing.T) {
+	first := strings.Repeat("a", 64)
+	second := strings.Repeat("b", 64)
+	candidates, err := (dockerEngine{}).parseStoppedManaged([]byte(first + "\n" + second + "\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(candidates) != 2 || candidates[0].id != "one" || candidates[1].id != "two" {
+	if len(candidates) != 2 || candidates[0].id != first || candidates[1].id != second {
 		t.Errorf("candidates = %+v", candidates)
+	}
+	candidates, err = (dockerEngine{}).parseReuseGroupIDs([]byte(first+"\n"), "integration")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].id != first {
+		t.Errorf("reuse candidates = %+v", candidates)
+	}
+	if _, err := (dockerEngine{}).parseStoppedManaged([]byte("same-name-replacement\n")); err == nil {
+		t.Fatal("parseStoppedManaged accepted a name instead of an immutable ID")
+	}
+}
+
+type dockerPruneListRunner struct {
+	*fakeRunner
+	listID string
+}
+
+func (d *dockerPruneListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ps" {
+		return []byte(d.listID + "\n"), nil, nil
+	}
+	return d.fakeRunner.Run(ctx, args...)
+}
+
+func TestDockerPruneDeletesListedImmutableID(t *testing.T) {
+	id := strings.Repeat("c", 64)
+	tests := []struct {
+		name  string
+		prune func(context.Context, *dockerPruneListRunner) ([]string, error)
+	}{
+		{
+			name: "Prune",
+			prune: func(ctx context.Context, r *dockerPruneListRunner) ([]string, error) {
+				return pruneWith(ctx, r, dockerEngine{})
+			},
+		},
+		{
+			name: "PruneReuseGroup",
+			prune: func(ctx context.Context, r *dockerPruneListRunner) ([]string, error) {
+				return pruneReuseGroupWith(ctx, r, dockerEngine{}, "integration")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &dockerPruneListRunner{fakeRunner: newTestRunner(), listID: id}
+			removed, err := tc.prune(context.Background(), r)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(removed, []string{id}) {
+				t.Fatalf("removed = %v, want [%s]", removed, id)
+			}
+			rm := r.callWith("rm")
+			if rm == nil || !slices.Equal(rm, []string{"rm", "--force", id}) {
+				t.Fatalf("rm = %v, want immutable ID %s", rm, id)
+			}
+			if r.callWith("inspect") != nil {
+				t.Fatal("Docker prune inspected a name-addressed candidate")
+			}
+		})
 	}
 }
 

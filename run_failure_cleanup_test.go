@@ -2,9 +2,11 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -13,9 +15,15 @@ import (
 // so cleanupFailedCreate can verify ownership.
 type failRunRunner struct {
 	*fakeRunner
-	runErr      error
-	inspectJSON string
-	deleted     []string
+	runErr          error
+	inspectJSON     string
+	inspectOwned    bool
+	inspectReuse    bool
+	inspectCreation string
+	blockInspect    bool
+	creation        string
+	deleteErr       error
+	deleted         []string
 }
 
 func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -23,25 +31,45 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for _, arg := range args {
+			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
+				r.creation = creation
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		r.mu.Unlock()
+		if r.blockInspect {
+			<-ctx.Done()
+			return nil, nil, ctx.Err()
+		}
+		if r.inspectOwned {
+			creation := r.inspectCreation
+			if creation == "" {
+				creation = r.creation
+			}
+			return []byte(ownedInspectJSON(args[len(args)-1], creation, r.inspectReuse)), nil, nil
+		}
 		return []byte(r.inspectJSON), nil, nil
 	case "delete", "rm":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		r.deleted = append(r.deleted, args[len(args)-1])
 		r.mu.Unlock()
-		return nil, nil, nil
+		return nil, nil, r.deleteErr
 	default:
 		return r.fakeRunner.Run(ctx, args...)
 	}
 }
 
-func ownedInspectJSON(name string) string {
+func ownedInspectJSON(name, creation string, reuse bool) string {
+	reuseLabelJSON := ""
+	if reuse {
+		reuseLabelJSON = fmt.Sprintf(",%q: \"true\"", reuseLabel)
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -51,12 +79,13 @@ func ownedInspectJSON(name string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": %q%s
       }
     },
     "status": {"state": "created", "networks": []}
   }
-]`, name, name, sessionID())
+]`, name, name, sessionID(), creation, reuseLabelJSON)
 }
 
 func foreignInspectJSON(name string) string {
@@ -78,9 +107,9 @@ func TestRunFailureCleansUpOwnedContainer(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
 	r := &failRunRunner{
-		fakeRunner:  base,
-		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
-		inspectJSON: ownedInspectJSON("myctr"),
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned: true,
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
@@ -99,7 +128,6 @@ func TestRunFailurePreservesNameConflict(t *testing.T) {
 		fakeRunner: base,
 		runErr: &cli.CLIError{Args: []string{"run"}, ExitCode: 1,
 			Stderr: `Error: already exists: container "myctr"`},
-		inspectJSON: ownedInspectJSON("myctr"),
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
@@ -129,13 +157,82 @@ func TestRunFailurePreservesForeignContainer(t *testing.T) {
 	}
 }
 
+func TestRunFailurePreservesReplacement(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:      base,
+		runErr:          &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned:    true,
+		inspectCreation: "bbbbbbbbbbbbbbbb",
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil || strings.Contains(err.Error(), "cleanup ") {
+		t.Fatalf("Run = %v, replacement should be a clean non-error", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no replacement delete", r.deleted)
+	}
+}
+
+func TestRunFailureJoinsCleanupTimeout(t *testing.T) {
+	oldTimeout := cleanupFailedCreateTimeout
+	cleanupFailedCreateTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { cleanupFailedCreateTimeout = oldTimeout })
+
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		blockInspect: true,
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if !errors.Is(err, context.DeadlineExceeded) || !strings.Contains(err.Error(), "cleanup myctr: inspect") {
+		t.Fatalf("Run = %v, want joined cleanup timeout", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v after cleanup timeout", r.deleted)
+	}
+}
+
+func TestRunFailureJoinsCleanupDeleteError(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned: true,
+		deleteErr:    &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: "delete failed"},
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil || !strings.Contains(err.Error(), "entrypoint not found") ||
+		!strings.Contains(err.Error(), "cleanup myctr: delete myctr") || !strings.Contains(err.Error(), "delete failed") {
+		t.Fatalf("Run = %v, want primary and cleanup errors", err)
+	}
+}
+
+func TestCleanupFailedCreateRequiresGeneration(t *testing.T) {
+	cfg := newConfig()
+	cfg.name = "legacy"
+	cfg.eng = appleEngine{}
+	cfg.runner = newTestRunner()
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "failed"}
+	if err := cleanupFailedCreate(context.Background(), cfg, runErr, runErr); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("cleanupFailedCreate = %v, want ErrGenerationReplaced", err)
+	}
+}
+
 func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
 	r := &failRunRunner{
-		fakeRunner:  base,
-		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
-		inspectJSON: ownedInspectJSON("myctr"),
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned: true,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -143,8 +240,12 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.runner = r
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
+	cfg.creation = "aaaaaaaaaaaaaaaa"
+	r.creation = cfg.creation
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
-	cleanupFailedCreate(ctx, cfg, runErr, runErr)
+	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
 	if len(r.deleted) != 1 {
 		t.Fatalf("deleted = %v, want cleanup even after cancel", r.deleted)
 	}
@@ -156,9 +257,10 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	// reuseCreate inspects first: report not-found once, then owned after failed run.
 	calls := 0
 	inner := &failRunRunner{
-		fakeRunner:  base,
-		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
-		inspectJSON: ownedInspectJSON("myctr"),
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned: true,
+		inspectReuse: true,
 	}
 	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -171,6 +273,26 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	}
 	if len(inner.deleted) != 1 {
 		t.Fatalf("deleted = %v, want cleanup", inner.deleted)
+	}
+}
+
+func TestReuseCreateFailureJoinsCleanupError(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	calls := 0
+	inner := &failRunRunner{
+		fakeRunner:   base,
+		runErr:       &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectOwned: true,
+		inspectReuse: true,
+		deleteErr:    &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: "delete failed"},
+	}
+	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), withRunner(wrapper), withEngine(appleEngine{}))
+	if err == nil || !strings.Contains(err.Error(), "entrypoint not found") ||
+		!strings.Contains(err.Error(), "cleanup myctr: delete myctr") {
+		t.Fatalf("Run = %v, want joined reuse create and cleanup errors", err)
 	}
 }
 

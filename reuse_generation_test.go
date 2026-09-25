@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -20,14 +22,44 @@ func TestTerminateRefusesReplacedGeneration(t *testing.T) {
 	}
 }
 
+func TestTerminateAppleRequiresCreation(t *testing.T) {
+	for _, creation := range []string{"", "not-a-generation"} {
+		t.Run(creation, func(t *testing.T) {
+			r := &generationRunner{creation: "bbbbbbbbbbbbbbbb"}
+			ctr := &Container{id: "legacy", runner: r, eng: appleEngine{}, creation: creation}
+			err := ctr.Terminate(context.Background())
+			if !errors.Is(err, ErrGenerationReplaced) {
+				t.Fatalf("Terminate = %v, want ErrGenerationReplaced", err)
+			}
+			if r.inspectCalls != 0 || r.deleteCalls != 0 {
+				t.Fatalf("inspect calls = %d, delete calls = %d; want no name mutation", r.inspectCalls, r.deleteCalls)
+			}
+		})
+	}
+}
+
+func TestTerminateDockerAllowsMissingCreationWithImmutableID(t *testing.T) {
+	uid := strings.Repeat("0f", 32)
+	r := &dockerGenerationRunner{uid: uid}
+	ctr := &Container{id: "shared", runner: r, eng: dockerEngine{}, uid: uid}
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate = %v", err)
+	}
+	if len(r.deleted) != 1 || r.deleted[0] != uid {
+		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
+	}
+}
+
 type generationRunner struct {
-	creation    string
-	deleteCalls int
+	creation     string
+	inspectCalls int
+	deleteCalls  int
 }
 
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
+		g.inspectCalls++
 		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
@@ -83,11 +115,13 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 }
 
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
+	uid := strings.Repeat("0f", 32)
 	info := &engineInfo{
 		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		labels: map[string]string{},
+		uid:    uid,
 	}
-	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
+	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
 		t.Fatalf("deleteStoppedReuse = %v", err)
@@ -188,6 +222,49 @@ func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, 
 		return nil, nil, nil
 	default:
 		return nil, nil, nil
+	}
+}
+
+type legacyReuseRunner struct {
+	state   string
+	calls   []string
+	deletes int
+}
+
+func (r *legacyReuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	r.calls = append(r.calls, args[0])
+	switch args[0] {
+	case "inspect":
+		data := fmt.Sprintf(`[{"id":"legacy","configuration":{"id":"legacy","image":{"reference":"redis:7-alpine"},"labels":{%q:"true"}},"status":{"state":%q,"networks":[]}}]`, reuseLabel, r.state)
+		return []byte(data), nil, nil
+	case "run":
+		return nil, nil, fmt.Errorf("legacy reuse container must not be replaced")
+	case "delete", "rm":
+		r.deletes++
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestWithReuseRejectsLegacyUnlabeledAppleContainer(t *testing.T) {
+	for _, state := range []State{StateRunning, StateStopped} {
+		t.Run(string(state), func(t *testing.T) {
+			r := &legacyReuseRunner{state: string(state)}
+			_, err := Run(context.Background(), "redis:7-alpine",
+				WithName("legacy"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
+			if !errors.Is(err, ErrGenerationReplaced) {
+				t.Fatalf("Run = %v, want ErrGenerationReplaced", err)
+			}
+			if r.deletes != 0 {
+				t.Fatalf("deletes = %d, want 0", r.deletes)
+			}
+			for _, call := range r.calls {
+				if call == "run" || call == "delete" {
+					t.Fatalf("calls = %v, legacy container was mutated", r.calls)
+				}
+			}
+		})
 	}
 }
 

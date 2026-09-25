@@ -1,7 +1,10 @@
+//go:build !windows
+
 package container
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,35 +28,34 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	return binPath, logPath
 }
 
-func waitForLogLines(t *testing.T, path string, wants ...string) {
+func writeReaperGenerationStub(t *testing.T, generations map[string]string) (binPath, logPath string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
-	var data []byte
-	for time.Now().Before(deadline) {
-		data, _ = os.ReadFile(path)
-		found := true
-		for _, w := range wants {
-			if !strings.Contains(string(data), w) {
-				found = false
-				break
-			}
-		}
-		if found {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	dir := t.TempDir()
+	logPath = filepath.Join(dir, "calls.log")
+	binPath = filepath.Join(dir, "container")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	script += "if [ \"$1\" = inspect ]; then\n  case \"$2\" in\n"
+	for name, creation := range generations {
+		script += fmt.Sprintf("    %s) printf '    %q: \"%%s\"\\n' %q ;;\n", name, creationLabel, creation)
 	}
-	t.Fatalf("log %s = %q, want all of %q", path, data, wants)
+	script += "  esac\nfi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binPath, logPath
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
-	bin, logPath := writeReaperStub(t)
+	bin, logPath := writeReaperGenerationStub(t, map[string]string{
+		"ctr-one": "0123456789abcdef",
+		"ctr-two": "fedcba9876543210",
+	})
 	r := newReaper(bin, "delete")
 
-	if err := r.register("ctr-one", ""); err != nil {
+	if err := r.register("ctr-one", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two", ""); err != nil {
+	if err := r.register("ctr-two", "fedcba9876543210"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -77,13 +79,19 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
 	}
+	if err := r.register("generationless", ""); err == nil {
+		t.Error("generation-less name delete: want error")
+	}
 }
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
-	bin, logPath := writeReaperStub(t)
+	bin, logPath := writeReaperGenerationStub(t, map[string]string{
+		"before-crash": "0123456789abcdef",
+		"after-crash":  "fedcba9876543210",
+	})
 	r := newReaper(bin, "delete")
 
-	if err := r.register("before-crash", ""); err != nil {
+	if err := r.register("before-crash", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -91,7 +99,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash", ""); err != nil {
+	if err := r.register("after-crash", "fedcba9876543210"); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()
@@ -116,18 +124,19 @@ func TestReaperFailsClosedWhenNameLockHelperIsUnavailable(t *testing.T) {
 func TestReaperDoesNotFollowReplacedLockSymlink(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	name := "reaper-symlink-" + newContainerName()
+	lockPaths, err := reaperNameLockPaths(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := lockPaths[len(lockPaths)-1]
 	r := newReaper(bin, "delete")
-	if err := r.register(name, ""); err != nil {
+	if err := r.register(name, "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	t.Cleanup(func() {
 		r.closeStdin()
 		waitForReaperExitForTest(t, r)
 	})
-	path, err := nameLockPath(name)
-	if err != nil {
-		t.Fatalf("nameLockPath: %v", err)
-	}
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -157,8 +166,67 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ]`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
-	if !strings.Contains(reaperScript, `lockf_bin=$(command -v lockf`) || !strings.Contains(reaperScript, `"$lockf_bin" -k -w -t 30 "$lockpath"`) {
-		t.Error("reaper script must hold the stable name lock across inspect and delete")
+	if !strings.Contains(reaperScript, `lockf_bin=$(command -v lockf`) ||
+		!strings.Contains(reaperScript, `"$lockf_bin" -k -t 30 "$lock1"`) ||
+		!strings.Contains(reaperScript, `"$lockf_bin" -k -t 30 "$lock2"`) {
+		t.Error("reaper script must hold all stable name locks across inspect and delete")
+	}
+	if strings.Contains(reaperScript, `"$lockf_bin" -k -w`) {
+		t.Error("reaper script must not use the non-portable lockf -w flag")
+	}
+}
+
+func TestReaperUsesPortableLockfFlags(t *testing.T) {
+	dir := t.TempDir()
+	lockfLog := filepath.Join(dir, "lockf-args.log")
+	lockfPath := filepath.Join(dir, "lockf")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$1" "$2" "$3" "$4" >> %q
+[ "$1" = "-k" ] || exit 91
+[ "$2" = "-t" ] || exit 92
+[ "$3" = "30" ] || exit 93
+shift 4
+exec "$@"
+`, lockfLog)
+	if err := os.WriteFile(lockfPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	name := "reaper-lockf-" + newContainerName()
+	creation := "0123456789abcdef"
+	bin, logPath := writeReaperGenerationStub(t, map[string]string{name: creation})
+	lockPaths, err := reaperNameLockPaths(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(bin, "delete")
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExitForTest(t, r)
+	})
+	if err := r.register(name, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForReaperExitForTest(t, r)
+	waitForLogLines(t, logPath, "delete --force "+name)
+
+	argsData, err := os.ReadFile(lockfLog)
+	if err != nil {
+		t.Fatalf("lockf helper was not called: %v", err)
+	}
+	args := strings.Split(strings.TrimSuffix(string(argsData), "\n"), "\n")
+	if len(args) != len(lockPaths)*4 {
+		t.Fatalf("lockf args = %q, want three four-field calls", args)
+	}
+	for i, path := range lockPaths {
+		want := []string{"-k", "-t", "30", path}
+		for j, value := range want {
+			if args[i*4+j] != value {
+				t.Fatalf("lockf call %d = %q, want %q", i+1, args[i*4:i*4+4], want)
+			}
+		}
 	}
 }
 
@@ -172,7 +240,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
-	if err := r.register("ok", ""); err != nil {
+	if err := r.register("ok", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
@@ -257,6 +325,20 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 			t.Fatalf("reaper deleted on label value collision: %q", data)
 		}
 		time.Sleep(50 * time.Millisecond)
+	}
+}
+
+func TestReaperAllowsGenerationlessImmutableID(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	uid := strings.Repeat("cd", 32)
+	r := newReaper(bin, "rm")
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("register immutable ID: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "inspect ") {
+		t.Fatalf("immutable ID unexpectedly inspected: %q", data)
 	}
 }
 

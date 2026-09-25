@@ -271,13 +271,14 @@ containers.
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
 `t.Cleanup` run, so an external **watchdog reaper** takes over. At
 library initialization one `/bin/sh` child is spawned; container IDs
-(and, for Apple entries, their stable lock paths) are registered by
-writing them down a pipe. When the parent dies, the pipe reaches EOF,
-and the reaper verifies each generation and runs
-`container delete --force` before exiting. Apple name-addressed entries
-hold the same stable, user-scoped lock as `Prune` and create across
-the reaper's inspect and delete; a missing lock or `lockf` helper makes
-that entry fail closed. While the parent lives the reaper does nothing
+(and, for name-addressed entries, their ordered lock paths) are
+registered by writing them down a pipe. When the parent dies, the pipe
+reaches EOF. Apple entries require a generation, verify it, and run
+`container delete --force` while holding the same legacy,
+transitional, and durable account-state locks as `Prune` and create. A
+missing lock or `lockf` helper makes that entry fail closed. Full
+immutable Docker IDs are the only generation-less entries. While the
+parent lives the reaper does nothing
 (deletion belongs to the normal path; the reaper is insurance). This
 mirrors container-rs's watchdog and covers SIGKILL, which no signal
 handler can.
@@ -317,22 +318,26 @@ narrow: image reference and declared/published ports only. `env`,
 container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
-Each creation carries a `creationLabel` generation (16-hex). `Terminate`
-and the stopped-recreate path refuse to delete a replaced name. On
-Docker the handle keeps the immutable `Id` printed by `docker run` (or
-returned by inspect) and deletes by it, so no generation check is
-needed: a replacement never shares the ID. Apple Container addresses
-containers by name only, so there the delete is name-based: the
-generation must match a fresh inspect, and inspect plus delete run
-under a per-name `flock` in a private, user-scoped cache directory
-(the filename is a SHA-256 digest of the name). The path does not
-depend on `TMPDIR`; existing lock files are retained because the
-kernel releases `flock` when a holder exits, while unlinking a live
-file could create a second inode. The lock file is opened with
-`O_NOFOLLOW` and its owner and `0600` permissions are checked. The
-create path takes the same lock around the `run` command, so a
-library peer cannot replace a name between a prune's checks and
-delete. `Prune` and `PruneReuseGroup` retain the list-time generation,
+Each creation carries a `creationLabel` generation (16-hex). Apple
+name-addressed `Terminate`, stopped-recreate, failed-create cleanup,
+and reaper paths fail closed when that generation is missing or does not
+match a fresh inspect. On Docker the handle keeps the immutable `Id`
+printed by `docker run` (or returned by inspect) and deletes by it, so a
+generation is optional only for a verified full ID; a replacement never
+shares that ID. Apple Container addresses containers by name only, so
+inspect plus delete run under a per-name `flock`. A package-local keyed
+lock first serializes goroutines, then the process acquires the legacy
+`TMPDIR`, transitional `UserCacheDir`, and canonical account-derived
+durable-state barriers in that fixed order. The canonical path ignores
+`HOME`, XDG variables, and `TMPDIR`; old barriers retain mixed-revision
+coordination. The filename is a SHA-256 digest of the name. Lock files
+are retained because the kernel releases `flock` when a holder exits,
+while unlinking a live file could create a second inode. Files are
+opened with `O_NOFOLLOW`; owner and `0600`/`0700` permissions are
+checked, and the opened inode must still be the file named by the path
+after flock acquisition. The create path takes the same locks around
+`run`, so a cooperating library peer cannot replace a name between a
+prune's checks and delete. `Prune` and `PruneReuseGroup` retain the list-time generation,
 managed/group labels, and state, and skip a candidate when any of them
 no longer match. That guarantee is limited to cooperating processes
 using this guarded name-lock protocol on the same host. A direct
@@ -341,12 +346,15 @@ inspect (including stop/start, label or generation changes, and
 delete/re-create) is not serialized and can change what the name
 addresses; closing it would need an immutable ID or an atomic
 conditional delete that Apple Container does not provide. An
-inspect failure other than not-found aborts the delete (fail closed);
-`Run`'s rollback reports a container left behind that way in its error
-rather than hiding it. The watchdog reaper uses the same stable lock
-for Apple name entries; if `lockf` or the prepared lock file is
-unavailable, it skips that entry rather than performing an unlocked
-delete. It registers Docker containers by `Id`; for Apple it stores
+inspect failure other than not-found aborts the delete (fail closed).
+Failed-create cleanup uses one bounded context for lock, exact ownership
+inspection, optional reaper registration, and delete; operational errors
+are joined to the original `Run` or reuse-create error rather than hidden.
+The watchdog reaper takes the same ordered barriers for Apple name entries;
+if `lockf` or any prepared lock file is unavailable, it skips that entry
+rather than performing an unlocked delete. Generation-less reaper entries
+are accepted only for full immutable Docker IDs. It registers Docker
+containers by `Id`; for Apple it stores
 the generation, reads the label as a line-anchored JSON field
 (`"key": "value"`, never a substring), and skips deletion on mismatch.
 Each backend call carries a 10-30s timeout via POSIX `sleep`/`kill`

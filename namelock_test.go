@@ -10,13 +10,16 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
 
-func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
+func TestNameLockPathIsStableAcrossLaunchEnvironments(t *testing.T) {
 	name := "lock-" + newContainerName()
 	first, err := nameLockPath(name)
 	if err != nil {
@@ -24,15 +27,40 @@ func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
 	}
 
 	t.Setenv("TMPDIR", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
 	second, err := nameLockPath(name)
 	if err != nil {
-		t.Fatalf("nameLockPath after TMPDIR change: %v", err)
+		t.Fatalf("nameLockPath after launch environment change: %v", err)
 	}
 	if first != second {
-		t.Fatalf("nameLockPath changed with TMPDIR: %q != %q", first, second)
+		t.Fatalf("nameLockPath changed with launch environment: %q != %q", first, second)
 	}
 	if strings.Contains(filepath.Base(first), name) {
 		t.Fatalf("lock filename %q contains the un-hashed name", filepath.Base(first))
+	}
+}
+
+func TestNameLockPathUsesAccountDerivedDurableState(t *testing.T) {
+	current, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateHome := filepath.Join(current.HomeDir, ".local", "state")
+	if runtime.GOOS == "darwin" {
+		stateHome = filepath.Join(current.HomeDir, "Library", "Application Support")
+	}
+	wantDir := filepath.Join(stateHome, "container-go", "locks")
+
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	path, err := nameLockPath("lock-" + newContainerName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := filepath.Dir(path); got != wantDir {
+		t.Fatalf("lock directory = %q, want durable account state %q", got, wantDir)
 	}
 }
 
@@ -125,6 +153,132 @@ func TestLockNameSerializesHolders(t *testing.T) {
 		t.Fatalf("lock after release: %v", err)
 	}
 	unlock2()
+}
+
+func TestLockNameWaitsForHistoricalLockBarriers(t *testing.T) {
+	resolvers := []struct {
+		name string
+		path func(string) (string, error)
+	}{
+		{name: "legacy temp", path: legacyNameLockPath},
+		{name: "transitional cache", path: transitionalNameLockPath},
+	}
+	for _, tc := range resolvers {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "lock-" + newContainerName()
+			path, err := tc.path(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			f, err := openNameLockPath(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+				_ = f.Close()
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = f.Close()
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+			defer cancel()
+			if _, err := lockName(ctx, name); !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("lockName with historical holder = %v, want deadline exceeded", err)
+			}
+		})
+	}
+}
+
+func TestLockNameRejectsHeldPathReplacement(t *testing.T) {
+	name := "lock-" + newContainerName()
+	path, err := nameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, nameLockFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	moved := path + ".opened"
+	var hookErr error
+	hooks := &nameLockHooks{afterAcquire: func(got string) {
+		if got != path || hookErr != nil {
+			return
+		}
+		if err := os.Rename(path, moved); err != nil {
+			hookErr = err
+			return
+		}
+		hookErr = os.WriteFile(path, nil, nameLockFilePerm)
+	}}
+	_, err = lockNameWithHooks(context.Background(), name, hooks)
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !strings.Contains(err.Error(), "replaced") {
+		t.Fatalf("lockName = %v, want replaced-inode refusal", err)
+	}
+	if _, err := os.Stat(moved); err != nil {
+		t.Fatalf("opened lock inode disappeared: %v", err)
+	}
+}
+
+func TestLockNameHoldsProcessLocalBarrier(t *testing.T) {
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lockName: %v", err)
+	}
+
+	processNameLocks.Lock()
+	held, ok := processNameLocks.byName[name]
+	references := 0
+	if ok {
+		references = held.references
+	}
+	processNameLocks.Unlock()
+	if !ok || references != 1 {
+		unlock()
+		t.Fatalf("process lock = present:%v references:%d, want one held reference", ok, references)
+	}
+
+	unlock()
+	processNameLocks.Lock()
+	_, leaked := processNameLocks.byName[name]
+	processNameLocks.Unlock()
+	if leaked {
+		t.Fatal("process lock entry remained after unlock")
+	}
+}
+
+func TestProcessNameLockIsContextAwareAndPerName(t *testing.T) {
+	firstName := "lock-" + newContainerName()
+	secondName := "lock-" + newContainerName()
+	unlockFirst, err := acquireProcessNameLock(context.Background(), firstName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlockFirst()
+
+	unlockSecond, err := acquireProcessNameLock(context.Background(), secondName)
+	if err != nil {
+		t.Fatalf("different name did not acquire independently: %v", err)
+	}
+	unlockSecond()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if _, err := acquireProcessNameLock(ctx, firstName); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("same-name waiter = %v, want deadline exceeded", err)
+	}
+
+	canceled, stop := context.WithCancel(context.Background())
+	stop()
+	if _, err := acquireProcessNameLock(canceled, "lock-"+newContainerName()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled acquisition = %v, want context canceled", err)
+	}
 }
 
 func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
@@ -237,11 +391,14 @@ func TestNameLockExcludesAnotherProcessAcrossTempDirs(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd.Stderr = os.Stderr
-	// A different process TMPDIR must not select a different lock inode.
+	// Different launch environments must not select a different lock
+	// inode for the same user and name.
 	cmd.Env = append(os.Environ(),
 		nameLockHelperEnv+"=1",
 		"CONTAINERGO_NAMELOCK_NAME="+name,
 		"TMPDIR="+t.TempDir(),
+		"HOME="+t.TempDir(),
+		"XDG_CACHE_HOME="+t.TempDir(),
 	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)

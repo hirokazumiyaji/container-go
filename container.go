@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -42,6 +43,9 @@ var (
 	// including waiting for another process' name lock. It is a var so tests
 	// can exercise the bounded cleanup contract without a long wait.
 	terminateTimeout = queryTimeout
+	// cleanupFailedCreateTimeout bounds lock acquisition, ownership
+	// inspection, reaper registration, and deletion as one operation.
+	cleanupFailedCreateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -106,8 +110,9 @@ type Container struct {
 }
 
 // Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
+// returns a handle to it. On failure after creation, it verifies and
+// removes the owned generation; cleanup failures are joined to the
+// original error. WithReuse switches to get-or-create; see
 // WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
@@ -168,8 +173,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, errors.Join(classified, cleanupErr)
 	}
 
 	c := &Container{
@@ -242,44 +247,84 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create. It never deletes a pre-existing same-name container: name
+// conflicts are skipped, and only a container carrying this process's
+// managed+session labels and the exact creation generation is removed. All
+// operational work shares one bounded context and is returned to Run so a
+// failed cleanup cannot be mistaken for a clean failure.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	if !creationRE.MatchString(cfg.creation) {
+		return fmt.Errorf("cleanup %s: %w: failed create has no valid creation generation", cfg.name, ErrGenerationReplaced)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cleanupFailedCreateTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
-	if err != nil {
-		return
+	if cfg.eng.nameAddressedDeletes() {
+		unlock, err := lockName(cleanupCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("cleanup %s: lock name: %w", cfg.name, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	if isNotFound(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup %s: inspect: %w", cfg.name, err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
-		}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return nil
 	}
+	actual, ok := info.labels[creationLabel]
+	if !ok || actual != cfg.creation {
+		return nil
+	}
+	if cfg.reuse && info.state == StateRunning {
+		return fmt.Errorf("cleanup %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
+	}
+
 	target := cfg.name
+	reaperCreation := cfg.creation
 	if info.uid != "" {
+		if !isImmutableContainerID(cfg.eng, info.uid) {
+			return fmt.Errorf("cleanup %s: inspect returned unverified immutable ID %q", cfg.name, info.uid)
+		}
 		target = info.uid
+		reaperCreation = ""
+	} else if !cfg.eng.nameAddressedDeletes() {
+		return fmt.Errorf("cleanup %s: %w: inspect returned no verified immutable ID", cfg.name, ErrGenerationReplaced)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
-	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+
+	// Registration happens only after exact ownership verification. This
+	// closes the process-death window between discovering an owned failed
+	// create and deleting it without ever registering a peer's container.
+	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() {
+		bin := er.ExternalBinary()
+		if bin == "" {
+			bin = cfg.eng.binary()
+		}
+		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), target, reaperCreation)
+	}
+
+	_, _, err = cfg.runner.Run(cleanupCtx, cfg.eng.deleteArgs(target)...)
+	if err == nil || isNotFound(err) {
+		return nil
+	}
+	err = cli.Classify(cleanupCtx, cfg.runner, err, cfg.eng.probe())
+	return fmt.Errorf("cleanup %s: delete %s: %w", cfg.name, target, err)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -329,29 +374,40 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // Terminate force-removes the container. Removing a container that no
 // longer exists is a success. A handle with an immutable ID deletes by
 // it, so a same-name replacement is never touched. Without one (Apple
-// Container) the delete goes by name: the creation generation must
-// match a fresh inspect, and inspect and delete run under the stable
-// per-name lock so no other process using the guarded protocol can
-// mutate the name in between. A direct `container` CLI call, an
-// unguarded library operation, or another external actor can still
-// change state, labels, generation, or the name target after inspect;
+// Container) the delete goes by name only when the handle has a valid
+// creation generation: a missing or malformed generation fails with
+// ErrGenerationReplaced. The generation must match a fresh inspect, and
+// inspect and delete run under the stable per-name lock so no other
+// process using the guarded protocol can mutate the name in between.
+// A direct `container` CLI call, an unguarded library operation, or
+// another external actor can still change state, labels, generation, or
+// the name target after inspect;
 // that point-in-time limitation is not detectable by name (see
 // lockName). An inspect failure other than not-found aborts the delete
 // rather than risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
-	if c.uid != "" {
+	if isImmutableContainerID(c.eng, c.uid) {
 		return c.delete(ctx, c.uid)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if !creationRE.MatchString(c.creation) {
+		if c.eng.nameAddressedDeletes() {
+			return fmt.Errorf("%w: %s has no valid creation generation", ErrGenerationReplaced, c.id)
+		}
+		return fmt.Errorf("%w: %s has no verified immutable container ID", ErrGenerationReplaced, c.id)
 	}
-	unlock, err := lockName(ctx, c.id)
-	if err != nil {
-		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+
+	unlock := func() {}
+	if c.eng.nameAddressedDeletes() {
+		var err error
+		unlock, err = lockName(ctx, c.id)
+		if err != nil {
+			return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		}
 	}
 	defer unlock()
+
 	info, err := c.inspectFresh(ctx)
 	if isNotFound(err) {
 		return nil
@@ -365,9 +421,19 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	if info.uid != "" {
-		return c.delete(ctx, info.uid)
+		if c.eng.nameAddressedDeletes() || isImmutableContainerID(c.eng, info.uid) {
+			return c.delete(ctx, info.uid)
+		}
+		return fmt.Errorf("%w: %s has no verified immutable container ID", ErrGenerationReplaced, c.id)
 	}
-	return c.delete(ctx, c.id)
+	if c.eng.nameAddressedDeletes() {
+		return c.delete(ctx, c.id)
+	}
+	return fmt.Errorf("%w: %s has no verified immutable container ID", ErrGenerationReplaced, c.id)
+}
+
+func isImmutableContainerID(eng engine, id string) bool {
+	return eng.name() == "docker" && dockerIDRE.MatchString(id)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {

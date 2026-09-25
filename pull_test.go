@@ -466,21 +466,20 @@ func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
 }
 
 func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
-	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	ids := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
+	r := &reuseGroupRunner{ids: ids}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
 	}
-	if len(removed) != 2 {
-		t.Errorf("removed = %v, want 2 ids", removed)
+	if !slices.Equal(removed, ids) {
+		t.Errorf("removed = %v, want %v", removed, ids)
 	}
 	if r.listCalls != 1 || r.deleteCalls != 2 {
 		t.Errorf("list=%d delete=%d, want 1/2", r.listCalls, r.deleteCalls)
 	}
-	_ = f
 }
 
 type reuseGroupRunner struct {
@@ -493,8 +492,8 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	switch args[0] {
 	case "ps":
 		r.listCalls++
-		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte("a\nb\n"), nil, nil
+		// docker parseReuseGroupIDs splits lines; return the stub IDs.
+		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

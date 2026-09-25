@@ -163,14 +163,16 @@ Three layers make sure containers do not outlive your tests:
 1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
-2. If `Run` fails partway, it removes whatever it created before
-   returning.
+2. If `Run` fails partway, it verifies and removes the owned generation
+   before returning. If lock, inspection, or deletion fails, that cleanup
+   error is joined to the original failure so a leaked container is visible.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. On Apple Container its name-addressed
-   delete takes the same stable, user-scoped lock as prune and create;
-   if that lock or the required `lockf` helper is unavailable, the
-   reaper skips the entry (fail closed). The reaper needs `/bin/sh`, so
+   delete requires a creation generation and takes the same ordered,
+   user-scoped lock barriers as prune and create; if any lock or the
+   required `lockf` helper is unavailable, the reaper skips the entry
+   (fail closed). The reaper needs `/bin/sh`, so
    it is unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
@@ -182,10 +184,13 @@ Extras:
   `com.github.hirokazumiyaji.container-go` label). On Apple Container,
   pruning re-inspects each candidate under a stable per-name lock and
   requires its generation, managed label, and state to still match at
-  that inspect. The lock lives in a private user-cache namespace, not
-  the process `TMPDIR`. The lock coordinates library operations that use
-  the guarded name-lock protocol, including the watchdog reaper, but it
-  cannot serialize direct `container` CLI calls or other unguarded
+  that inspect. Its canonical lock lives in a private, account-derived
+  durable state namespace, independent of `HOME`, XDG, and the process
+  `TMPDIR`; transitional legacy and cache lock barriers are retained for
+  compatibility with older cooperating revisions. The lock coordinates
+  library operations that use the guarded name-lock protocol, including
+  the watchdog reaper, but it cannot serialize direct `container` CLI
+  calls or other unguarded
   actors (for example, a concurrent `Stop`). Any state mutation after
   the inspect — stopping/starting, changing labels or generation,
   deleting/recreating, or otherwise changing what the name addresses —

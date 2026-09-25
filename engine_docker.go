@@ -297,23 +297,29 @@ func (dockerEngine) logsTailArgs(id string) []string {
 	return []string{"logs", "--tail", "1000", id}
 }
 
-// listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// listArgs filters daemon-side and emits full immutable IDs because
+// Docker prune deletes the exact container returned by the list.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+func parseDockerPruneIDs(data []byte) ([]pruneCandidate, error) {
 	var candidates []pruneCandidate
 	for _, id := range splitNonEmptyLines(data) {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker ps returned invalid container ID %q", id)
+		}
 		candidates = append(candidates, pruneCandidate{id: id, managed: true})
 	}
 	return candidates, nil
+}
+
+func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+	return parseDockerPruneIDs(data)
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -345,18 +351,13 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
-	var candidates []pruneCandidate
-	for _, id := range splitNonEmptyLines(data) {
-		candidates = append(candidates, pruneCandidate{id: id, managed: true})
-	}
-	return candidates, nil
+	return parseDockerPruneIDs(data)
 }
 
 func (dockerEngine) nameAddressedDeletes() bool { return false }

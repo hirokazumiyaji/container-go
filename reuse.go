@@ -163,8 +163,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, errors.Join(classified, cleanupErr)
 	}
 
 	ctr := &Container{
@@ -191,13 +191,14 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation, so Terminate re-checks the
-// generation and deletes by immutable ID. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// handle bound to its inspected generation and immutable ID, when the
+// backend has one. A replaced generation means another process already
+// recreated the name; the caller loops and attaches to the fresh
+// generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+	ctr.uid = info.uid
 	err := ctr.Terminate(ctx)
 	if errors.Is(err, ErrGenerationReplaced) {
 		return nil
@@ -248,11 +249,14 @@ func createRaceMissing(err error) bool {
 	return strings.Contains(s, "container not found")
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
+// checkReuseOwned reports whether an existing container may be attached
+// to or, when stopped, deleted and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if cfg.eng.nameAddressedDeletes() && !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: %w: existing container has no valid creation generation", cfg.name, ErrGenerationReplaced)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)

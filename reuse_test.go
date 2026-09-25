@@ -18,7 +18,8 @@ import (
 // run, then serves a reused-container inspect payload.
 type reuseCreateRunner struct {
 	*fakeRunner
-	created atomic.Bool
+	created  atomic.Bool
+	creation string
 }
 
 func newReuseCreateRunner() *reuseCreateRunner {
@@ -32,13 +33,21 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		created := r.created.Load()
+		creation := r.creation
 		r.mu.Unlock()
 		if !created {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
+		for _, arg := range args {
+			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
+				r.mu.Lock()
+				r.creation = creation
+				r.mu.Unlock()
+			}
+		}
 		r.created.Store(true)
 	}
 	return r.fakeRunner.Run(ctx, args...)
@@ -160,7 +169,11 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 	}
 }
 
-func reuseInspectJSON(id, state, image string) string {
+func reuseInspectJSON(id, state, image string, generations ...string) string {
+	creation := "aaaaaaaaaaaaaaaa"
+	if len(generations) > 0 {
+		creation = generations[0]
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -170,7 +183,8 @@ func reuseInspectJSON(id, state, image string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
     "status": {
@@ -178,7 +192,7 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {

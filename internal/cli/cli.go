@@ -35,7 +35,7 @@ type Runner interface {
 // ExternalRunner identifies runners that execute the CLI as real child
 // processes. container.Run registers containers started through such
 // runners with the orphan-cleanup reaper, so a runner that wraps an
-// ExecRunner forwards both methods to keep the production path intact
+// ExecRunner forwards these methods to keep the production path intact
 // under instrumentation. Test doubles that return canned results do
 // not implement the interface.
 type ExternalRunner interface {
@@ -46,6 +46,15 @@ type ExternalRunner interface {
 	// ExternalBinary is the binary those child processes execute, or
 	// "" when the runner defers to the engine's default.
 	ExternalBinary() string
+}
+
+// ParentDeathRunner is implemented by runners that can keep a backend
+// invocation tied to the lifetime of this process. It is optional so
+// injected test runners and existing wrappers remain source-compatible;
+// wrappers around ExecRunner should forward it.
+type ParentDeathRunner interface {
+	Runner
+	RunWithParentDeath(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
 
 // External reports that ExecRunner spawns real child processes.
@@ -76,8 +85,10 @@ func (e *CLIError) Error() string {
 	return msg
 }
 
-// ExecRunner runs the CLI as a child process. Arguments are passed as an
-// argv vector; no shell is involved.
+// ExecRunner runs the CLI as a child process. The normal Run path passes
+// arguments as an argv vector with no shell. RunWithParentDeath adds a
+// fixed supervisor shell whose backend arguments remain positional argv
+// values.
 type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
@@ -92,8 +103,37 @@ func (r *ExecRunner) binary() string {
 }
 
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	return r.run(ctx, false, args...)
+}
+
+// RunWithParentDeath runs the CLI behind a small supervisor that watches
+// a parent-owned pipe. If this process is killed without running Go
+// cleanup, the supervisor kills the backend process tree as well. The
+// optional interface is used only for the create call in container.Run;
+// all other calls retain the direct argv execution path.
+func (r *ExecRunner) RunWithParentDeath(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	return r.run(ctx, true, args...)
+}
+
+func (r *ExecRunner) run(ctx context.Context, parentDeath bool, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
-	cmd := exec.CommandContext(ctx, bin, args...)
+	var (
+		cmd        *exec.Cmd
+		closeGuard func()
+		err        error
+	)
+	if parentDeath {
+		cmd, closeGuard, err = commandWithParentDeath(ctx, bin, args)
+		if err != nil {
+			return nil, nil, err
+		}
+		configureProcessGroup(cmd)
+		cmd.Cancel = func() error { return killProcessGroup(cmd) }
+		defer closeGuard()
+	} else {
+		cmd = exec.CommandContext(ctx, bin, args...)
+	}
+
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -101,7 +141,7 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
+	err = cmd.Run()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.

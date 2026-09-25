@@ -36,6 +36,17 @@ func (r *countingRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 	return r.inner.Run(ctx, args...)
 }
 
+func (r *countingRunner) RunWithParentDeath(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.calls.Add(1)
+	r.mu.Lock()
+	r.args = append(r.args, args)
+	r.mu.Unlock()
+	if guarded, ok := r.inner.(cli.ParentDeathRunner); ok {
+		return guarded.RunWithParentDeath(ctx, args...)
+	}
+	return r.inner.Run(ctx, args...)
+}
+
 // Stream forwards to the inner runner when it supports streaming and
 // counts the spawned child process.
 func (r *countingRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {

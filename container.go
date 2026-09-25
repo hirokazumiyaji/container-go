@@ -162,7 +162,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// container. If this process dies immediately after run succeeds, the
 	// reaper can still find and delete only this exact generation.
 	preRegisterRunWithGlobalReaper(cfg)
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, _, err := runCreate(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
@@ -178,12 +178,18 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
+	// Tell the reaper that the backend create has completed. The entry is
+	// retained for parent-death cleanup, but it no longer needs the
+	// pending-create settling loop.
+	if bin, _, ok := runReaperTarget(cfg); ok {
+		_ = completePreRegistrationWithGlobalReaper(bin, cfg.name, cfg.creation)
+	}
 	// Keep Docker's existing immutable-ID insurance in addition to the
 	// pre-registration. The guarded name entry remains available if this
 	// best-effort update cannot reach the child.
 	if c.uid != "" {
 		if bin, subcommand, ok := runReaperTarget(cfg); ok {
-			registerWithGlobalReaper(bin, subcommand, c.uid, "")
+			_ = registerWithGlobalReaper(bin, subcommand, c.uid, "")
 		}
 	}
 
@@ -206,9 +212,22 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
+// runCreate uses the production runner's parent-death supervisor when it
+// is available. The fallback keeps injected/non-child runners compatible;
+// their pending reaper entry still gets the bounded create recheck.
+func runCreate(ctx context.Context, cfg *config, args ...string) ([]byte, []byte, error) {
+	if guarded, ok := cfg.runner.(cli.ParentDeathRunner); ok {
+		return guarded.RunWithParentDeath(ctx, args...)
+	}
+	return cfg.runner.Run(ctx, args...)
+}
+
 func preRegisterRunWithGlobalReaper(cfg *config) {
 	if bin, subcommand, ok := runReaperTarget(cfg); ok {
-		registerWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
+		// Registration is insurance, so a reaper failure must not turn a
+		// successful container start into a startup failure. The helper
+		// logs the invariant breach and retains the entry for a later retry.
+		_ = preRegisterWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
 	}
 }
 

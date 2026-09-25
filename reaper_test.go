@@ -1,11 +1,14 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -65,12 +68,88 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperDeletesRegisteredDockerIDOnEOF(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	id := strings.Repeat("ab", 32)
+
+	if err := r.register(id, ""); err != nil {
+		t.Fatalf("register Docker ID: %v", err)
+	}
+	r.closeStdin()
+
+	waitForLogLines(t, logPath, "rm --force "+id)
+}
+
+func TestRegisterWithGlobalReaperLogsValidationFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	binary := filepath.Join(t.TempDir(), "docker")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	if err := registerWithGlobalReaper(binary, "rm", "bad id", ""); err == nil {
+		t.Fatal("registration unexpectedly succeeded")
+	}
+
+	for _, want := range []string{
+		"container-go: reaper registration failed",
+		`invalid container id "bad id"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %q, want %q", logs.String(), want)
+		}
+	}
+}
+
+func TestPreRegisterWithGlobalReaperLogsValidationFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	binary := filepath.Join(t.TempDir(), "container")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	if err := preRegisterWithGlobalReaper(binary, "delete", "bad id", "0123456789abcdef"); err == nil {
+		t.Fatal("pre-registration unexpectedly succeeded")
+	}
+	if !strings.Contains(logs.String(), "reaper pre-registration failed") {
+		t.Fatalf("log = %q, want pre-registration error", logs.String())
+	}
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
 
-	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
+	for _, id := range []string{
+		"",
+		"bad id",
+		"a;b",
+		"x\ny",
+		"-leading",
+		strings.Repeat("a", 65),
+		strings.Repeat("A", 64),
+		strings.Repeat("g", 64),
+	} {
 		if err := r.register(id, ""); err == nil {
 			t.Errorf("register(%q): want error", id)
 		}
@@ -78,6 +157,65 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
 	}
+}
+
+func TestReaperCompletionStopsPendingRecheck(t *testing.T) {
+	bin, logPath, generationPath := writeGenerationReaperStub(t, false)
+	if err := os.WriteFile(generationPath, []byte("0123456789abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "delete")
+	if err := r.registerPending("completed", "0123456789abcdef"); err != nil {
+		t.Fatalf("pre-register: %v", err)
+	}
+	if err := r.completePending("completed", "0123456789abcdef"); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect completed", "delete --force completed")
+}
+
+func TestReaperPendingEntryRechecksLateCreate(t *testing.T) {
+	bin, logPath, generationPath := writeGenerationReaperStub(t, false)
+	if err := os.WriteFile(generationPath, []byte("0123456789abcdef"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "delete")
+	r.pendingAttempts = 3
+	if err := r.registerPending("late-create", "0123456789abcdef"); err != nil {
+		t.Fatalf("pre-register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect late-create", "delete --force late-create")
+}
+
+func TestReaperPendingEntryRechecksAfterCreateFinishes(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "container")
+	logPath := filepath.Join(dir, "calls.log")
+	createdPath := filepath.Join(dir, "created")
+	generationPath := filepath.Join(dir, "generation")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  if [ ! -e " + createdPath + " ]; then\n" +
+		"    : > " + createdPath + "\n" +
+		"    (sleep 1; printf '0123456789abcdef\\n' > " + generationPath + ") &\n" +
+		"    exit 1\n" +
+		"  fi\n" +
+		"  printf '    \"" + creationLabel + "\": \"%s\"\\n' \"$(cat " + generationPath + ")\"\n" +
+		"fi\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "delete")
+	r.pendingAttempts = 4
+	r.timeoutSeconds = 5
+	if err := r.registerPending("late-create", "0123456789abcdef"); err != nil {
+		t.Fatalf("pre-register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect late-create", "delete --force late-create")
 }
 
 func TestReaperRespawnsAndReplaysAfterUnexpectedExit(t *testing.T) {
@@ -199,6 +337,16 @@ func closeGlobalReaper(binary string) error {
 		return errors.New("reaper was not registered before run")
 	}
 	r.closeStdin()
+	r.mu.Lock()
+	exited := r.exited
+	r.mu.Unlock()
+	if exited != nil {
+		select {
+		case <-exited:
+		case <-time.After(5 * time.Second):
+			return errors.New("reaper did not finish after parent EOF")
+		}
+	}
 	return nil
 }
 
@@ -363,12 +511,18 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
+	if !strings.Contains(reaperScript, "set +m") || !strings.Contains(reaperScript, "kill_descendants") {
+		t.Error("reaper script must keep helpers in a killable process tree")
+	}
+	if !strings.Contains(reaperScript, `$1 == "P"`) || !strings.Contains(reaperScript, `$1 == "C"`) {
+		t.Error("reaper script must retain pending create state until completion")
+	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
 	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
 		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+	if !strings.Contains(reaperScript, `if [ "$got" != "$creation" ]; then`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
 }

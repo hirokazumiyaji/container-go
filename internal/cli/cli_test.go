@@ -57,6 +57,25 @@ func TestExecRunnerNonZeroExitReturnsCLIError(t *testing.T) {
 	}
 }
 
+func TestExecRunnerPreservesFailureStdout(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `echo "probe diagnostic"; echo "probe stderr" >&2; exit 1`)}
+
+	stdout, _, err := r.Run(context.Background(), "system", "status")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if got := string(stdout); got != "probe diagnostic\n" {
+		t.Errorf("raw stdout = %q, want %q", got, "probe diagnostic\\n")
+	}
+	if got := cliErr.Stdout; got != "probe diagnostic\n" {
+		t.Errorf("CLIError.Stdout = %q, want %q", got, "probe diagnostic\\n")
+	}
+	if !strings.Contains(cliErr.Error(), "probe diagnostic") {
+		t.Errorf("Error() = %q, want stdout diagnostic", cliErr.Error())
+	}
+}
+
 func TestExecRunnerCapsStderr(t *testing.T) {
 	// Emit ~1MiB of stderr, far beyond the 64KiB cap.
 	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; exit 1`)}
@@ -107,6 +126,9 @@ func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
 	}
 	if len(cliErr.Stderr) > maxStderr {
 		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	if len(cliErr.Stdout) > maxStderr {
+		t.Errorf("len(CLIError.Stdout) = %d, want <= %d", len(cliErr.Stdout), maxStderr)
 	}
 	if cliErr.ExitCode != 7 {
 		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
@@ -322,6 +344,34 @@ func TestClassifyPreservesOriginalWhenParentCancelsDuringProbe(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("Classify took %v, want fast return on parent cancel", elapsed)
+	}
+}
+
+func TestClassifyDoesNotAddSystemDownAfterPredicateCancellation(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	probe := Probe{
+		Args: []string{"system", "status"},
+		Hint: "run `container system start`",
+		IsUnavailable: func(error) bool {
+			cancel()
+			return true
+		},
+	}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	got := Classify(ctx, r, orig, probe)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, must not classify after caller cancellation", got)
+	}
+	for _, want := range []error{orig, probeErr, context.Canceled} {
+		if !errors.Is(got, want) {
+			t.Errorf("error = %v, want chain to include %v", got, want)
+		}
 	}
 }
 

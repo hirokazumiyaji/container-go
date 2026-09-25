@@ -22,7 +22,8 @@ import (
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Diagnostic substrings below are matched case-insensitively on the
+// CLIError stdout and stderr streams.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
 //   - image missing: "Error response from daemon: No such image: …"
@@ -69,11 +70,13 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 func dockerProbeUnavailable(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	if cli.IsNonLivenessError(err) {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
+	s, ok := cliDiagnosticText(err)
+	if !ok {
+		return false
+	}
 	for _, fragment := range []string{
 		"cannot connect to the docker daemon",
 		"is the docker daemon running",

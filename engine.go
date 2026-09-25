@@ -1,6 +1,8 @@
 package container
 
 import (
+	"errors"
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -91,4 +93,15 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+}
+
+// cliDiagnosticText returns the normalized diagnostic streams carried by
+// a CLIError. Some CLI liveness failures are reported on stdout rather
+// than stderr, so probe classifiers must inspect both streams.
+func cliDiagnosticText(err error) (string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return "", false
+	}
+	return strings.ToLower(strings.Join([]string{cliErr.Stdout, cliErr.Stderr}, "\n")), true
 }

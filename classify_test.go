@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -17,6 +18,34 @@ type classifyProbeRunner struct {
 func (r *classifyProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls = append(r.calls, strings.Join(args, " "))
 	return nil, nil, r.probeErr
+}
+
+func TestAppleSystemStatusRealStdoutClassifiesProbeFailure(t *testing.T) {
+	// Apple Container 1.3.0 reports this diagnostic on stdout while
+	// `system status` exits unsuccessfully.
+	stdout, err := os.ReadFile("testdata/apple_system_status_1.3.0.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeErr := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"system", "status"},
+		ExitCode: 1,
+		Stdout:   string(stdout),
+	}
+	original := &cli.CLIError{Binary: "container", Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	runner := &classifyProbeRunner{probeErr: probeErr}
+
+	got := cli.Classify(context.Background(), runner, original, appleEngine{}.probe())
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning from real Apple stdout", got)
+	}
+	if !errors.Is(got, original) || !errors.Is(got, probeErr) {
+		t.Fatalf("error = %v, want original and probe error chains", got)
+	}
+	if !strings.Contains(got.Error(), "apiserver is not running and not registered with launchd") {
+		t.Errorf("error = %q, want real Apple diagnostic", got)
+	}
 }
 
 func TestClassifyProbeFailureMatrix(t *testing.T) {
@@ -75,6 +104,42 @@ func TestClassifyProbeFailureMatrix(t *testing.T) {
 					},
 				},
 				{
+					name:           "TLS configuration",
+					originalStderr: "tls handshake timeout",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   backend.downStderr,
+					},
+				},
+				{
+					name:           "x509 certificate",
+					originalStderr: "x509: certificate signed by unknown authority",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   backend.downStderr,
+					},
+				},
+				{
+					name:           "credential helper",
+					originalStderr: "error getting credentials: docker-credential helper failed",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   backend.downStderr,
+					},
+				},
+				{
+					name:           "invalid flag",
+					originalStderr: "unknown flag: --not-a-real-flag",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   backend.downStderr,
+					},
+				},
+				{
 					name:           "probe permission error",
 					originalStderr: "command failed",
 					probeErr:       errors.New("permission denied"),
@@ -95,6 +160,42 @@ func TestClassifyProbeFailureMatrix(t *testing.T) {
 						Args:     backend.probe.Args,
 						ExitCode: 1,
 						Stderr:   "invalid configuration",
+					},
+				},
+				{
+					name:           "probe TLS CLI error",
+					originalStderr: "command failed",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   "tls handshake timeout: error during connect",
+					},
+				},
+				{
+					name:           "probe x509 CLI error",
+					originalStderr: "command failed",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   "x509: certificate signed by unknown authority",
+					},
+				},
+				{
+					name:           "probe credential helper CLI error",
+					originalStderr: "command failed",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   "error getting credentials - err: exit status 1",
+					},
+				},
+				{
+					name:           "probe invalid flag CLI error",
+					originalStderr: "command failed",
+					probeErr: &cli.CLIError{
+						Args:     backend.probe.Args,
+						ExitCode: 1,
+						Stderr:   "unknown flag: --not-a-real-flag",
 					},
 				},
 				{

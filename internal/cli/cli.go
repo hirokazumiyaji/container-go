@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// maxStderr bounds the stderr captured into a CLIError.
+// maxStderr bounds each diagnostic stream copied into a CLIError.
 const maxStderr = 64 * 1024
 
 // ErrSystemNotRunning reports that the container backend (Apple
@@ -67,7 +67,10 @@ type CLIError struct {
 	Binary   string
 	Args     []string
 	ExitCode int
-	Stderr   string
+	// Stdout and Stderr retain bounded diagnostic copies from a failed
+	// invocation. Raw output remains available from Runner.Run.
+	Stdout string
+	Stderr string
 }
 
 func (e *CLIError) Error() string {
@@ -78,6 +81,14 @@ func (e *CLIError) Error() string {
 	msg := fmt.Sprintf("%s %s: exit code %d", bin, strings.Join(e.Args, " "), e.ExitCode)
 	if e.Stderr != "" {
 		msg += ": " + strings.TrimSpace(e.Stderr)
+	}
+	if e.Stdout != "" {
+		if e.Stderr != "" {
+			msg += "; stdout: "
+		} else {
+			msg += ": "
+		}
+		msg += strings.TrimSpace(e.Stdout)
 	}
 	return msg
 }
@@ -121,6 +132,7 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
+				Stdout:   truncateOutput(stdout.String()),
 				Stderr:   truncateStderr(stderr.String()),
 			}
 		}
@@ -129,12 +141,17 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
-func truncateStderr(s string) string {
+// truncateOutput bounds a diagnostic copy kept in CLIError.
+func truncateOutput(s string) string {
 	if len(s) > maxStderr {
 		return s[:maxStderr]
 	}
 	return s
+}
+
+// truncateStderr bounds the stderr diagnostic copy kept in CLIError.
+func truncateStderr(s string) string {
+	return truncateOutput(s)
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process
@@ -162,59 +179,132 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if ctx.Err() != nil {
-		// Caller already gave up; preserve the original failure
-		// instead of masking it with a probe cancellation.
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// No probe is useful after the caller has given up. Keep the
+		// cancellation in the chain so callers can still distinguish it
+		// from the original command failure.
+		return errors.Join(err, ctxErr)
 	}
+
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
-		// A caller cancellation, or a non-liveness failure in the
-		// original command, must not be relabeled as a stopped
-		// backend. Join it with the probe result so neither
-		// diagnostic is discarded.
-		if ctx.Err() != nil || isNonLivenessError(err) {
-			return errors.Join(err, probeErr)
+	_, _, probeErr := r.Run(probeCtx, probe.Args...)
+	if probeErr == nil {
+		// A runner can return successfully just as the caller cancels.
+		// Do not lose that cancellation, but never invent a liveness
+		// failure for it.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(err, ctxErr)
 		}
-		// Check again immediately before adding a backend-specific
-		// sentinel so a cancellation racing with probe completion
-		// cannot be relabeled.
-		if ctx.Err() != nil {
-			return errors.Join(err, probeErr)
-		}
-		// A probe timeout is the bounded liveness check's timeout,
-		// not the caller's cancellation. Preserve the established
-		// ErrSystemNotRunning classification while retaining both
-		// errors in the chain.
-		if probeCtx.Err() == context.DeadlineExceeded {
-			return errors.Join(
-				fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint),
-				err,
-				probeErr,
-			)
-		}
-		// A direct cancellation or another non-liveness probe
-		// failure is not proof that the backend is down.
-		if isNonLivenessError(probeErr) {
-			return errors.Join(err, probeErr)
-		}
-		if probeUnavailable(probe, probeErr) {
-			return errors.Join(
-				fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint),
-				err,
-				probeErr,
-			)
-		}
-		// A failed probe is not proof that the backend is down. Keep
-		// both errors so callers can inspect permission/configuration
-		// failures without losing the original command error.
-		return errors.Join(err, probeErr)
+		return err
 	}
-	return err
+
+	// Cancellation takes precedence over every probe classification. It
+	// may race with the runner returning, so check it before inspecting
+	// the diagnostic and retain ctx.Err explicitly when the runner did
+	// not wrap it.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, probeErr, ctxErr)
+	}
+	if isNonLivenessError(err) {
+		// The command already identified a configuration, permission,
+		// TLS, or other client-side failure. A failed probe cannot
+		// replace that diagnosis with daemon-down.
+		return joinProbeFailure(ctx, err, probeErr)
+	}
+
+	// A timeout belonging to the bounded probe is evidence that the
+	// backend did not answer, unless the runner reported a distinct
+	// non-liveness error. A caller deadline was handled above.
+	if isProbeNonLiveness(probeCtx, probeErr) {
+		return joinProbeFailure(ctx, err, probeErr)
+	}
+	if probeCtx.Err() == context.DeadlineExceeded {
+		return classifySystemNotRunning(ctx, err, probeErr, probe.Hint)
+	}
+
+	// Check immediately before invoking a backend predicate. The
+	// predicate may be user-provided and can itself take time.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, probeErr, ctxErr)
+	}
+	unavailable := probeUnavailable(probe, probeErr)
+	// Check again after the predicate. In particular, a predicate that
+	// cancels the caller and then reports liveness must not win the
+	// race and add ErrSystemNotRunning.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, probeErr, ctxErr)
+	}
+	if unavailable {
+		return classifySystemNotRunning(ctx, err, probeErr, probe.Hint)
+	}
+
+	// A failed probe is not proof that the backend is down. Keep both
+	// errors so callers can inspect the original diagnostic.
+	return joinProbeFailure(ctx, err, probeErr)
+}
+
+func joinProbeFailure(ctx context.Context, original, probeErr error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(original, probeErr, ctxErr)
+	}
+	return errors.Join(original, probeErr)
+}
+
+func classifySystemNotRunning(ctx context.Context, original, probeErr error, hint string) error {
+	// Keep this check at the point where the sentinel is added. Context
+	// cancellation can race with all of the preceding diagnostics checks.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(original, probeErr, ctxErr)
+	}
+	classified := errors.Join(
+		fmt.Errorf("%w: %s", ErrSystemNotRunning, hint),
+		original,
+		probeErr,
+	)
+	// Building the joined error can itself race with cancellation. Do
+	// not return a daemon-down result if cancellation was observed while
+	// it was being assembled.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(original, probeErr, ctxErr)
+	}
+	return classified
+}
+
+func isProbeNonLiveness(probeCtx context.Context, err error) bool {
+	if !isNonLivenessError(err) {
+		return false
+	}
+	// A context deadline returned by the bounded probe is the timeout
+	// signal itself, not a reason to suppress the liveness sentinel.
+	// Keep a simultaneous client-side diagnostic non-liveness, though.
+	if probeCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
+		var cliErr *CLIError
+		if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
+			return true
+		}
+		return hasNonContextNonLivenessText(err)
+	}
+	return true
+}
+
+func hasNonContextNonLivenessText(err error) bool {
+	s := strings.ToLower(cliDiagnosticText(err))
+	for _, contextFragment := range []string{
+		"context deadline exceeded",
+		"deadline exceeded",
+		"context canceled",
+		"context cancelled",
+	} {
+		s = strings.ReplaceAll(s, contextFragment, "")
+	}
+	return containsNonLivenessText(s)
 }
 
 func probeUnavailable(probe Probe, err error) bool {
+	if isNonLivenessError(err) {
+		return false
+	}
 	if probe.IsUnavailable != nil {
 		return probe.IsUnavailable(err)
 	}
@@ -226,12 +316,14 @@ func defaultProbeUnavailable(err error) bool {
 	if !errors.As(err, &cliErr) {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
+	s := strings.ToLower(cliDiagnosticText(err))
 	for _, fragment := range []string{
 		"cannot connect",
 		"connection refused",
 		"xpc connection",
 		"system is not running",
+		"apiserver is not running",
+		"not registered with launchd",
 		"daemon is not running",
 		"is the docker daemon running",
 		"error during connect",
@@ -241,6 +333,21 @@ func defaultProbeUnavailable(err error) bool {
 		}
 	}
 	return false
+}
+
+func cliDiagnosticText(err error) string {
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		return strings.Join([]string{cliErr.Stdout, cliErr.Stderr}, "\n")
+	}
+	return err.Error()
+}
+
+// IsNonLivenessError reports whether err identifies a client-side
+// failure that must not be relabeled as a stopped backend. It is used
+// by backend-specific probe predicates as well as Classify.
+func IsNonLivenessError(err error) bool {
+	return isNonLivenessError(err)
 }
 
 // isNonLivenessError identifies failures that must not be relabeled
@@ -254,19 +361,16 @@ func isNonLivenessError(err error) bool {
 		return true
 	}
 	var cliErr *CLIError
-	if !errors.As(err, &cliErr) {
-		s := strings.ToLower(err.Error())
-		return containsNonLivenessText(s)
-	}
-	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
 		return true
 	}
-	return containsNonLivenessText(strings.ToLower(cliErr.Stderr))
+	return containsNonLivenessText(strings.ToLower(cliDiagnosticText(err)))
 }
 
 func containsNonLivenessText(s string) bool {
 	for _, fragment := range []string{
-		"permission denied",
+		// Permission and authorization failures.
+		"permission",
 		"operation not permitted",
 		"operation canceled",
 		"operation cancelled",
@@ -274,9 +378,11 @@ func containsNonLivenessText(s string) bool {
 		"eperm",
 		"access denied",
 		"not permitted",
+		"unauthorized",
+		"forbidden",
+		// Configuration and context failures.
+		"config",
 		"configuration",
-		"invalid config",
-		"config error",
 		"invalid context",
 		"unknown context",
 		"no such context",
@@ -285,6 +391,27 @@ func containsNonLivenessText(s string) bool {
 		"context canceled",
 		"context cancelled",
 		"deadline exceeded",
+		// TLS and certificate verification failures.
+		"tls",
+		"x509",
+		"certificate",
+		"unknown authority",
+		"handshake failure",
+		"http response to https",
+		// Credential-helper and registry authentication failures.
+		"credential",
+		"credentials",
+		"authentication failed",
+		// Invalid command-line flags/options.
+		"unknown flag",
+		"unknown shorthand flag",
+		"flag needs an argument",
+		"flag provided but not defined",
+		"invalid flag",
+		"unknown option",
+		"no such option",
+		"invalid option",
+		"invalid argument",
 	} {
 		if strings.Contains(s, fragment) {
 			return true

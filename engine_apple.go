@@ -16,7 +16,8 @@ import (
 type appleEngine struct{}
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Diagnostic substrings below are matched case-insensitively on the
+// CLIError stdout and stderr streams.
 // Sources (apple/container):
 //   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,
 //     message: "container with id \(id) already exists")
@@ -49,16 +50,20 @@ func (appleEngine) probe() cli.Probe {
 }
 
 func appleProbeUnavailable(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	if cli.IsNonLivenessError(err) {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
+	s, ok := cliDiagnosticText(err)
+	if !ok {
+		return false
+	}
 	for _, fragment := range []string{
 		"xpc connection",
 		"container-apiserver",
 		"system is not running",
 		"system service is not running",
+		"apiserver is not running",
+		"not registered with launchd",
 		"connection refused",
 	} {
 		if strings.Contains(s, fragment) {

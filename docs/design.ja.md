@@ -260,7 +260,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stdout/stderr の診断情報(各ストリーム上限 64KiB)を保持する
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

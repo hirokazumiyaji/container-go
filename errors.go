@@ -30,8 +30,9 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
-// ErrGenerationReplaced reports that Terminate refused to delete because
-// the live container's creation label no longer matches this handle.
+// ErrGenerationReplaced reports that a handle's immutable identity no
+// longer matches the live container. Destructive and endpoint operations
+// refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not

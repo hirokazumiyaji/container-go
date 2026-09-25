@@ -23,12 +23,14 @@ func TestMain(m *testing.M) {
 
 // fakeRunner records CLI calls and replays canned results.
 type fakeRunner struct {
-	mu          sync.Mutex
-	calls       [][]string
-	envFiles    []string // contents of --env-file captured at call time
-	inspectJSON string
-	failPrefix  string // fail calls whose first arg matches
-	systemUp    bool
+	mu               sync.Mutex
+	calls            [][]string
+	envFiles         []string // contents of --env-file captured at call time
+	inspectJSON      string
+	inspectResponses []string
+	inspectCalls     int
+	failPrefix       string // fail calls whose first arg matches
+	systemUp         bool
 
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
@@ -107,6 +109,14 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		}
 		return []byte(args[len(args)-1] + "\n"), nil, nil
 	case "inspect":
+		if len(f.inspectResponses) > 0 {
+			n := f.inspectCalls
+			f.inspectCalls++
+			if n >= len(f.inspectResponses) {
+				n = len(f.inspectResponses) - 1
+			}
+			return []byte(f.inspectResponses[n]), nil, nil
+		}
 		json := f.inspectJSON
 		if json == "" {
 			// Answer for whatever id was asked, echoing back the

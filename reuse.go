@@ -29,8 +29,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
+	// The ensure path caches immutable identity. Re-inspect when the
+	// compatibility check needs dynamic network or port bindings.
 	info := base.info
-	if info == nil {
+	if info == nil || len(cfg.published) > 0 || (!cfg.eng.directIP() && len(cfg.exposed) > 0) {
 		info, err = inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			return nil, err
@@ -47,7 +49,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		info:      info,
+		info:      immutableInfo(info),
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
 	}
@@ -120,7 +122,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				exposed:   cfg.exposed,
 				published: cfg.published,
 				reused:    true,
-				info:      info,
+				info:      immutableInfo(info),
 				creation:  info.labels[creationLabel],
 				uid:       info.uid,
 			}, nil

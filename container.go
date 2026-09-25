@@ -98,7 +98,7 @@ type Container struct {
 	uid string
 
 	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	info *engineInfo // immutable identity snapshot; never dynamic network data
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -287,7 +287,7 @@ func (c *Container) classify(ctx context.Context, err error) error {
 
 // State returns the current lifecycle state.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -357,7 +357,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 // network. With the Docker backend on Docker Desktop this address is
 // usually not reachable from the host; prefer Endpoint.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
-	info, err := c.cachedInfo(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -427,7 +427,7 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.cachedInfo(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", 0, err
 	}
@@ -439,9 +439,9 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns the first successful inspect result's immutable
+// identity. Network addresses, port bindings, and state are intentionally
+// not cached; use inspectDynamic for those values.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -452,11 +452,97 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
+	if err := c.updateIdentityLocked(info); err != nil {
+		return nil, err
+	}
+	return c.info, nil
+}
+
+// inspectDynamic reads lifecycle data on every call. This is important
+// because network attachment and host port assignment can change after a
+// container has already been inspected.
+func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.updateIdentityLocked(info); err != nil {
+		return nil, err
 	}
 	return info, nil
+}
+
+// updateIdentityLocked updates only the immutable identity cache. The
+// caller must hold c.mu.
+func (c *Container) updateIdentityLocked(info *engineInfo) error {
+	identity := immutableInfo(info)
+	cached := c.info
+	if cached != nil && !sameImmutableInfo(cached, identity) {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.uid != "" && c.uid != identity.uid {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.uid == "" && cached != nil && cached.uid != "" && cached.uid != identity.uid {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.creation != "" {
+		actual := identity.labels[creationLabel]
+		if actual != "" && actual != c.creation {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		// A name-only handle cannot distinguish a replacement when the
+		// backend omits the generation label. Once a generation has been
+		// observed, however, its disappearance is also a mismatch.
+		if actual == "" && c.uid == "" && cached != nil && cached.labels[creationLabel] != "" {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+	}
+	if cached == nil {
+		c.info = identity
+	} else {
+		c.info = mergeImmutableInfo(cached, identity)
+	}
+	if c.uid == "" {
+		c.uid = identity.uid
+	}
+	return nil
+}
+
+func sameImmutableInfo(a, b *engineInfo) bool {
+	if a.uid != "" && b.uid != "" && a.uid != b.uid {
+		return false
+	}
+	if a.image != "" && b.image != "" && a.image != b.image {
+		return false
+	}
+	for key, value := range a.labels {
+		if other, ok := b.labels[key]; ok && other != value {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeImmutableInfo(old, current *engineInfo) *engineInfo {
+	merged := immutableInfo(old)
+	if merged.uid == "" {
+		merged.uid = current.uid
+	}
+	if merged.image == "" {
+		merged.image = current.image
+	}
+	if len(current.labels) > 0 && merged.labels == nil {
+		merged.labels = make(map[string]string, len(current.labels))
+	}
+	for key, value := range current.labels {
+		if _, ok := merged.labels[key]; !ok {
+			merged.labels[key] = value
+		}
+	}
+	return merged
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

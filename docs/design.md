@@ -366,9 +366,10 @@ env-file contents.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
-`container run --detach` call. Immutable facts (config, labels,
-published ports) are cached from the first inspect; only the state is
-re-queried.
+`container run --detach` call. Immutable identity facts (backend ID,
+labels, and image) are cached from the first inspect; state, network
+addresses, and port bindings are re-inspected when needed because they
+can change during the container lifecycle.
 
 **Wait via connections, not subprocesses**. ForListeningPort and
 ForHTTP dial the container IP directly without spawning the CLI. Only

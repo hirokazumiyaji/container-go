@@ -1,6 +1,7 @@
 package container
 
 import (
+	"maps"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -29,6 +30,18 @@ type boundPort struct {
 	proto         string
 	hostAddr      string
 	hostPort      int
+}
+
+// immutableInfo copies only facts that identify the container or its
+// creation. State, IP addresses, and port bindings are deliberately
+// excluded because backends can change them during the container's
+// lifetime.
+func immutableInfo(info *engineInfo) *engineInfo {
+	return &engineInfo{
+		labels: maps.Clone(info.labels),
+		uid:    info.uid,
+		image:  info.image,
+	}
 }
 
 // engine encapsulates what differs between container backends: how CLI

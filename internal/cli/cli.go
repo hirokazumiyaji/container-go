@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -202,7 +203,11 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 			return stdout.Bytes(), stderr.Bytes(), commandErr
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			// Preserve a launch failure as well as the cancellation. A
+			// context wrapper alone loses the actionable missing-binary or
+			// permission diagnosis.
+			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			return stdout.Bytes(), stderr.Bytes(), errors.Join(contextErr, err)
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
@@ -243,21 +248,20 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
 	}
+	// Check the caller before the CLIError gate. Launch errors are not
+	// CLI failures, but cancellation still has to remain in their chain.
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return withContextError(ctx, err)
+	}
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
-		return err
-	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		// No probe is useful after the caller has given up. Keep the
-		// cancellation in the chain so callers can still distinguish it
-		// from the original command failure.
-		return errors.Join(err, ctxErr)
+		return withContextError(ctx, err)
 	}
 	// A timeout or signal reported by the operation itself is already a
 	// known termination result. Probing the backend after it would turn a
 	// useful operation error into a second, misleading operation.
 	if IsOperationTimeoutError(err) {
-		return err
+		return withContextError(ctx, err)
 	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
@@ -286,13 +290,19 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
-	if isNonLivenessError(err) {
-		// The command already identified a configuration, permission,
-		// TLS, or other client-side failure. A failed probe cannot
-		// replace that diagnosis with daemon-down.
+	if isNonLivenessError(err) &&
+		(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err)) {
+		// The command already identified a precise configuration,
+		// permission, TLS, or other client-side failure. A failed probe
+		// cannot replace that diagnosis with daemon-down.
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
-
+	// Configuration/authentication diagnostics can be attached to any
+	// joined probe branch. Check them before a liveness-looking branch or
+	// an explicit backend predicate can add the sentinel.
+	if IsProbeConfigurationError(probeErr) {
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
+	}
 	// A timeout belonging to the bounded probe is evidence that the
 	// backend did not answer, unless the runner reported a distinct
 	// non-liveness error. A caller deadline was handled above.
@@ -300,6 +310,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if probeCtx.Err() == context.DeadlineExceeded {
+		if isDefinitiveNonLivenessError(probeErr) {
+			return joinProbeFailure(ctx, probeCtx, err, probeErr)
+		}
 		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
 	}
 
@@ -355,8 +368,10 @@ func classifySystemNotRunning(ctx, probeCtx context.Context, original, probeErr 
 	return classified
 }
 
-// IsOperationTimeoutError reports whether err is a timeout, cancellation,
-// or signal-shaped operation failure rather than an application result.
+// IsOperationTimeoutError reports whether err has structured timeout,
+// cancellation, or signal evidence. Application stderr and argv are
+// deliberately not inspected: a command may legitimately print either
+// phrase while exiting as an ordinary application result.
 func IsOperationTimeoutError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) {
@@ -372,30 +387,7 @@ func IsOperationTimeoutError(err error) bool {
 	}
 	// A signal exit has no application status to report and cannot benefit
 	// from a liveness probe.
-	if cliErr.ExitCode < 0 {
-		return true
-	}
-	texts := []string{
-		strings.ToLower(cliDiagnosticText(err)),
-		strings.ToLower(err.Error()),
-	}
-	for _, text := range texts {
-		for _, fragment := range []string{
-			"context deadline exceeded",
-			"deadline exceeded",
-			"context canceled",
-			"context cancelled",
-			"operation timed out",
-			"operation timeout",
-			"command timed out",
-			"i/o timeout",
-		} {
-			if strings.Contains(text, fragment) {
-				return true
-			}
-		}
-	}
-	return false
+	return cliErr.ExitCode < 0
 }
 
 func isProbeNonLiveness(probeCtx context.Context, err error) bool {
@@ -405,18 +397,17 @@ func isProbeNonLiveness(probeCtx context.Context, err error) bool {
 	// A context deadline returned by the bounded probe is the timeout
 	// signal itself, not a reason to suppress the liveness sentinel.
 	// Keep a simultaneous client-side diagnostic non-liveness, though.
-	if probeCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded) {
-		var cliErr *CLIError
-		if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
-			return true
+	if errors.Is(err, context.DeadlineExceeded) {
+		if probeCtx.Err() == context.DeadlineExceeded {
+			return hasNonContextNonLivenessText(err)
 		}
-		return hasNonContextNonLivenessText(err)
+		return false
 	}
 	return true
 }
 
 func hasNonContextNonLivenessText(err error) bool {
-	s := strings.ToLower(cliDiagnosticText(err))
+	s := strings.ToLower(classificationText(err))
 	for _, contextFragment := range []string{
 		"context deadline exceeded",
 		"deadline exceeded",
@@ -443,9 +434,14 @@ func defaultProbeUnavailable(err error) bool {
 	if !errors.As(err, &cliErr) {
 		return false
 	}
-	s := strings.ToLower(cliDiagnosticText(err))
+	return defaultProbeUnavailableText(classificationText(err))
+}
+
+func defaultProbeUnavailableText(s string) bool {
+	s = strings.ToLower(s)
 	for _, fragment := range []string{
-		"cannot connect",
+		"cannot connect to the docker daemon",
+		"cannot connect to the container backend",
 		"connection refused",
 		"xpc connection",
 		"system is not running",
@@ -453,7 +449,7 @@ func defaultProbeUnavailable(err error) bool {
 		"not registered with launchd",
 		"daemon is not running",
 		"is the docker daemon running",
-		"error during connect",
+		"failed to connect to the docker daemon",
 	} {
 		if strings.Contains(s, fragment) {
 			return true
@@ -462,12 +458,65 @@ func defaultProbeUnavailable(err error) bool {
 	return false
 }
 
-func cliDiagnosticText(err error) string {
-	stdout, stderr, ok := DiagnosticText(err)
-	if !ok {
-		return err.Error()
+var endpointURI = regexp.MustCompile(`(?i)\b(unix|tcp|ssh|npipe|http|https)://[^\s"'<>]+`)
+
+func diagnosticText(err error) string {
+	if err == nil {
+		return ""
 	}
-	return strings.Join([]string{stdout, stderr}, "\n")
+	var parts []string
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil {
+			return
+		}
+		if diagnostic, ok := cur.(*diagnosticError); ok {
+			if diagnostic.stdout != "" {
+				parts = append(parts, diagnostic.stdout)
+			}
+			walk(diagnostic.cause)
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			if child := wrapped.Unwrap(); child != nil {
+				if _, joined := child.(interface{ Unwrap() []error }); joined {
+					walk(child)
+					return
+				}
+			}
+		}
+		var cliErr *CLIError
+		if errors.As(cur, &cliErr) {
+			stdout, stderr, ok := DiagnosticText(cur)
+			if ok {
+				if stdout != "" {
+					parts = append(parts, stdout)
+				}
+				if stderr != "" {
+					parts = append(parts, stderr)
+				}
+			}
+			return
+		}
+		if text := cur.Error(); text != "" {
+			parts = append(parts, text)
+		}
+		if unwrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(unwrapped.Unwrap())
+		}
+	}
+	walk(err)
+	return strings.Join(parts, "\n")
+}
+
+func classificationText(err error) string {
+	return endpointURI.ReplaceAllString(diagnosticText(err), " ")
 }
 
 // IsNonLivenessError reports whether err identifies a client-side
@@ -487,53 +536,117 @@ func isNonLivenessError(err error) bool {
 		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
 		return true
 	}
+	if IsProbeConfigurationError(err) {
+		return true
+	}
 	var cliErr *CLIError
 	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
 		return true
 	}
-	return containsNonLivenessText(strings.ToLower(cliDiagnosticText(err)))
+	return containsNonLivenessText(strings.ToLower(classificationText(err)))
 }
 
-func containsNonLivenessText(s string) bool {
+// IsProbeConfigurationError reports concrete transport, authentication,
+// and endpoint-configuration diagnostics that must not be classified as a
+// stopped backend. It intentionally matches diagnostic phrases, not bare
+// words such as "config", "credential", or "forbidden".
+func IsProbeConfigurationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(classificationText(err))
+	return containsConfigurationDiagnostic(s) ||
+		containsAuthenticationDiagnostic(s) ||
+		containsPermissionDiagnostic(s) ||
+		containsTransportDiagnostic(s) ||
+		containsContextDiagnostic(s) ||
+		containsInvalidOptionDiagnostic(s)
+}
+
+func containsConfigurationDiagnostic(s string) bool {
 	for _, fragment := range []string{
-		// Permission and authorization failures. Keep these as diagnostic
-		// phrases: bare "permission" can occur in an endpoint path.
-		"permission denied",
-		"insufficient permissions",
-		"operation not permitted",
-		"operation canceled",
-		"operation cancelled",
-		"eacces",
-		"eperm",
-		"access denied",
-		"not permitted",
-		"unauthorized",
-		"forbidden",
-		// Configuration and context failures. A bare "config" can be a
-		// legitimate directory or filename in a backend endpoint.
 		"invalid config",
 		"invalid configuration",
 		"config file",
-		"configuration file",
 		"config directory",
+		"config error",
+		"configuration file",
 		"configuration directory",
+		"configuration error",
+		"failed to load config",
+		"unable to load config",
+		"cannot load config",
+		"config not found",
+		"missing config",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsContextDiagnostic(s string) bool {
+	for _, fragment := range []string{
 		"invalid context",
 		"unknown context",
 		"no such context",
 		"context not found",
 		"context does not exist",
-		"context canceled",
-		"context cancelled",
-		"deadline exceeded",
-		// TLS and certificate verification failures. Keep the
-		// diagnostic-specific forms: bare "tls" and "x509" are valid
-		// endpoint hostname/path components.
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsAuthenticationDiagnostic(s string) bool {
+	for _, fragment := range []string{
+		"authentication required",
+		"authentication failed",
+		"error getting credentials",
+		"credentials not found",
+		"credential helper",
+		"401 unauthorized",
+		"403 forbidden",
+		"unauthorized: access denied",
+		"forbidden: access denied",
+		"access forbidden",
+		"permission forbidden",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsPermissionDiagnostic(s string) bool {
+	for _, fragment := range []string{
+		"permission denied",
+		"insufficient permissions",
+		"operation not permitted",
+		"eacces",
+		"eperm",
+		"access denied",
+		"not permitted",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsTransportDiagnostic(s string) bool {
+	for _, fragment := range []string{
 		"tls handshake",
-		"tls: ",
+		"tls:",
 		"tls alert",
 		"tls record",
 		"tls version",
-		"x509: ",
+		"x509:",
 		"x509 error",
 		"x509 certificate",
 		"certificate signed by unknown authority",
@@ -547,11 +660,21 @@ func containsNonLivenessText(s string) bool {
 		"unknown authority",
 		"handshake failure",
 		"http response to https",
-		// Credential-helper and registry authentication failures.
-		"credential",
-		"credentials",
-		"authentication failed",
-		// Invalid command-line flags/options.
+		"ssh handshake",
+		"ssh:",
+		"proxyconnect",
+		"proxy error",
+		"proxy:",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func containsInvalidOptionDiagnostic(s string) bool {
+	for _, fragment := range []string{
 		"unknown flag",
 		"unknown shorthand flag",
 		"flag needs an argument",
@@ -561,6 +684,46 @@ func containsNonLivenessText(s string) bool {
 		"no such option",
 		"invalid option",
 		"invalid argument",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func isDefinitiveNonLivenessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	if IsProbeConfigurationError(err) {
+		return true
+	}
+	var cliErr *CLIError
+	return errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
+}
+
+func containsNonLivenessText(s string) bool {
+	if containsPermissionDiagnostic(s) || containsConfigurationDiagnostic(s) ||
+		containsContextDiagnostic(s) || containsAuthenticationDiagnostic(s) ||
+		containsTransportDiagnostic(s) || containsInvalidOptionDiagnostic(s) {
+		return true
+	}
+	for _, fragment := range []string{
+		"operation canceled",
+		"operation cancelled",
+		"context canceled",
+		"context cancelled",
+		"deadline exceeded",
+		"container not found",
+		"image not found",
+		"no such container",
+		"no such object",
+		"no such image",
 	} {
 		if strings.Contains(s, fragment) {
 			return true

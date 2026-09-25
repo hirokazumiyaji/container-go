@@ -12,7 +12,7 @@ func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &inspectNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `No such object: myctr`},
+		err: &cli.CLIError{Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: myctr`},
 	}
 	// Clear cached info so inspectFresh runs.
 	ctr.info = nil
@@ -25,7 +25,7 @@ func TestExecWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Binary: "container", Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 	}
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Exec error = %v, want ErrContainerNotFound", err)
@@ -64,7 +64,7 @@ func TestCLIErrorAliasUsableWithErrorsAs(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Binary: "container", Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 	}
 	_, _, err := ctr.Exec(context.Background(), []string{"true"})
 	var cliErr *CLIError
@@ -80,7 +80,7 @@ func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"logs", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Binary: "container", Args: []string{"logs", "myctr"}, ExitCode: 1, Stderr: `Error: failed to get logs for container myctr: failed to open container logs: container with ID myctr not found`},
 	}
 	if _, err := ctr.Logs(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Logs error = %v, want ErrContainerNotFound", err)

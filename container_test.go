@@ -25,6 +25,7 @@ func TestMain(m *testing.M) {
 type fakeRunner struct {
 	mu          sync.Mutex
 	calls       [][]string
+	binary      string
 	envFiles    []string // contents of --env-file captured at call time
 	inspectJSON string
 	failPrefix  string // fail calls whose first arg matches
@@ -33,6 +34,13 @@ type fakeRunner struct {
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
 	creations    map[string]string // container name -> creation generation from run args
+}
+
+func (f *fakeRunner) binaryName() string {
+	if f.binary == "" {
+		return "container"
+	}
+	return f.binary
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -52,38 +60,38 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		if f.systemUp {
 			return []byte("running"), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
+		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {
 			return []byte("ok"), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
+		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
 	}
 	// Image handling for both backends: docker inspects via
 	// `image inspect` and pulls via `pull`; apple uses
 	// `image inspect` / `image pull`.
 	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
 		if !f.systemUp {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
+			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
 			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine (No such image)"}
+		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine\nError response from daemon: No such image: redis:7-alpine"}
 	}
 	if (args[0] == "image" && len(args) > 1 && args[1] == "pull") || args[0] == "pull" {
 		if !f.systemUp {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
+			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		f.imagePresent = true
 		f.pullCalls++
 		return nil, nil, nil
 	}
 	if f.failPrefix != "" && args[0] == f.failPrefix {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "injected failure"}
 	}
 	switch args[0] {
 	case "run":
@@ -145,7 +153,13 @@ func (f *fakeRunner) callWith(subcommand string) []string {
 }
 
 func newTestRunner() *fakeRunner {
-	return &fakeRunner{systemUp: true}
+	return &fakeRunner{systemUp: true, binary: "container"}
+}
+
+func newDockerTestRunner() *fakeRunner {
+	f := newTestRunner()
+	f.binary = "docker"
+	return f
 }
 
 func runTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
@@ -388,7 +402,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

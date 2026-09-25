@@ -1,7 +1,6 @@
 package container
 
 import (
-	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -70,6 +69,9 @@ type engine interface {
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
+	// containerMissing reports whether a backend command's diagnostic
+	// proves that the addressed container is absent.
+	containerMissing(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
 	// runs as `<binary> <subcommand> --force <id>`.
 	reaperSubcommand() string
@@ -92,15 +94,4 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
-}
-
-// cliDiagnosticText returns the normalized diagnostic streams carried by
-// a CLIError. Some CLI liveness failures are reported on stdout rather
-// than stderr, so probe classifiers must inspect both streams.
-func cliDiagnosticText(err error) (string, bool) {
-	stdout, stderr, ok := cli.DiagnosticText(err)
-	if !ok {
-		return "", false
-	}
-	return strings.ToLower(strings.Join([]string{stdout, stderr}, "\n")), true
 }

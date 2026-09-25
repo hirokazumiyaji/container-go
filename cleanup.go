@@ -58,7 +58,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
+		return nil, classifyError(ctx, r, err, eng)
 	}
 	ids, err := parse(stdout)
 	if err != nil {
@@ -71,7 +71,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isNotFoundFor(eng, err) {
 			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
 			continue
 		}

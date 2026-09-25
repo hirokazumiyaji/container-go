@@ -179,7 +179,7 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+			return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
 		return d.inspectJSON, nil, nil
 	default:

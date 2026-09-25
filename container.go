@@ -160,7 +160,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
@@ -282,7 +282,7 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 func (c *Container) ID() string { return c.id }
 
 func (c *Container) classify(ctx context.Context, err error) error {
-	return cli.Classify(ctx, c.runner, err, c.eng.probe())
+	return classifyError(ctx, c.runner, err, c.eng)
 }
 
 // State returns the current lifecycle state.
@@ -326,7 +326,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
+	if isNotFoundFor(c.eng, err) {
 		return nil
 	}
 	if err != nil {
@@ -347,7 +347,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isNotFoundFor(c.eng, err) {
 		return nil
 	}
 	return c.classify(ctx, err)
@@ -464,7 +464,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

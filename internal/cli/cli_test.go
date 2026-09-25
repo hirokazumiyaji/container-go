@@ -143,6 +143,23 @@ func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
 	}
 }
 
+func TestExecRunnerPreservesLaunchErrorAndCancellation(t *testing.T) {
+	r := &ExecRunner{Binary: filepath.Join(t.TempDir(), "missing-cli")}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, _, err := r.Run(ctx, "version")
+	if err == nil {
+		t.Fatal("Run returned nil error")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if !strings.Contains(err.Error(), "missing-cli") {
+		t.Fatalf("error = %v, want original launch diagnostic", err)
+	}
+}
+
 func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
 
@@ -362,6 +379,15 @@ func (r *issue104RecordingProbeRunner) Run(_ context.Context, _ ...string) ([]by
 	return nil, nil, r.err
 }
 
+type issue104JoinedProbeRunner struct {
+	err    error
+	stdout string
+}
+
+func (r *issue104JoinedProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+	return []byte(r.stdout), nil, r.err
+}
+
 func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
 	original := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command timed out"}
 	operationErr := errors.Join(original, context.DeadlineExceeded)
@@ -379,17 +405,62 @@ func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
 	}
 }
 
-func TestIsOperationTimeoutErrorRecognizesCLITimeoutText(t *testing.T) {
-	for _, stderr := range []string{
-		"i/o timeout",
-		"command timed out",
-	} {
-		t.Run(stderr, func(t *testing.T) {
-			err := &CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: stderr}
-			if !IsOperationTimeoutError(err) {
-				t.Fatalf("IsOperationTimeoutError(%q) = false, want true", stderr)
+type timeoutTestError struct{}
+
+func (timeoutTestError) Error() string { return "typed timeout" }
+func (timeoutTestError) Timeout() bool { return true }
+
+func TestIsOperationTimeoutErrorUsesStructuredEvidence(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "context canceled", err: context.Canceled, want: true},
+		{name: "context deadline", err: context.DeadlineExceeded, want: true},
+		{name: "typed timeout", err: timeoutTestError{}, want: true},
+		{name: "signal CLI exit", err: &CLIError{Args: []string{"exec"}, ExitCode: -1}, want: true},
+		{
+			name: "application stderr",
+			err:  &CLIError{Args: []string{"exec", "myctr", "query"}, ExitCode: 7, Stderr: "i/o timeout"},
+		},
+		{
+			name: "application argv",
+			err:  &CLIError{Args: []string{"exec", "myctr", "command timed out"}, ExitCode: 7, Stderr: "application failed"},
+		},
+		{
+			name: "ordinary non-zero CLI exit",
+			err:  &CLIError{Args: []string{"exec", "myctr", "query"}, ExitCode: 7, Stderr: "application failed"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsOperationTimeoutError(tc.err); got != tc.want {
+				t.Fatalf("IsOperationTimeoutError(%v) = %t, want %t", tc.err, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestClassifyJoinedProbeConfigurationVetoesLiveness(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	liveness := &CLIError{
+		Args: []string{"version"}, ExitCode: 1,
+		Stderr: "cannot connect to the Docker daemon",
+	}
+	probeErr := errors.Join(liveness, errors.New("x509: certificate signed by unknown authority"))
+	runner := &issue104JoinedProbeRunner{err: probeErr, stdout: "probe stdout"}
+	probe := Probe{
+		Args: []string{"version"}, Hint: "start the daemon",
+		IsUnavailable: func(error) bool { return true },
+	}
+
+	got := Classify(context.Background(), runner, orig, probe)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, joined configuration branch must veto liveness", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, liveness) {
+		t.Fatalf("error = %v, want original and probe error chains", got)
 	}
 }
 

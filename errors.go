@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -36,19 +37,79 @@ var ErrContainerNotFound = errors.New("container not found")
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not
-// exist. Matching substrings live on each engine (see engine_*.go).
+// exist. It is retained for callers that do not have an engine context;
+// the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, ErrContainerNotFound) {
 		return true
 	}
-	return appleEngine{}.containerMissing(err) || dockerEngine{}.containerMissing(err)
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	if cliErr.Binary != "" {
+		if cliBinaryMatches(cliErr.Binary, "docker") {
+			return (dockerEngine{}).containerMissing(err)
+		}
+		return (appleEngine{}).containerMissing(err)
+	}
+	// Empty Binary is the historical default `container` executable.
+	return (appleEngine{}).containerMissing(err)
+}
+
+// isNotFoundFor applies the selected backend's classifier. Keeping this
+// separate from isNotFound prevents a Docker error from being accepted by
+// an Apple operation (and vice versa) when callers do have engine context.
+func isNotFoundFor(eng engine, err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		return true
+	}
+	if eng == nil {
+		return isNotFound(err)
+	}
+	return eng.containerMissing(err)
 }
 
 // wrapNotFound converts a classified CLI not-found failure into
 // ErrContainerNotFound so errors.Is works from the root package.
 func wrapNotFound(err error) error {
-	if err == nil || !isNotFound(err) || errors.Is(err, ErrContainerNotFound) {
+	return wrapNotFoundFor(nil, err)
+}
+
+// wrapNotFoundFor applies the selected backend before converting a
+// classified CLI not-found failure into ErrContainerNotFound.
+func wrapNotFoundFor(eng engine, err error) error {
+	if err == nil || !isNotFoundFor(eng, err) || errors.Is(err, ErrContainerNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+// classifyError applies the backend liveness contract, while refusing to
+// probe an ambiguous application message such as a generic "container not
+// found" from a run/exec process. The original CLIError is then returned
+// unchanged even if a runner would report its probe as unavailable.
+func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) error {
+	if err == nil {
+		return nil
+	}
+	if eng == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			return errors.Join(err, ctxErr)
+		}
+		return wrapNotFound(err)
+	}
+	if isAmbiguousApplicationError(eng, err) {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			return errors.Join(err, ctxErr)
+		}
+		return err
+	}
+	return cli.Classify(ctx, r, err, eng.probe())
 }

@@ -122,7 +122,7 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			execErr:    &cli.CLIError{Binary: "container", Args: []string{"exec"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 		},
 	}
 	ctr := runTestContainer(t, f)
@@ -138,7 +138,7 @@ type execMissingRunner struct {
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+		return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: `Error: container not found: myctr`}
 	}
 	return m.execRunner.Run(ctx, args...)
 }
@@ -159,22 +159,55 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 }
 
-func TestExecReturnsOperationTimeoutAsInfrastructureError(t *testing.T) {
+func TestExecReturnsStructuredOperationTimeoutAsInfrastructureError(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "partial stdout",
+		execErr: errors.Join(
+			&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command failed"},
+			context.DeadlineExceeded,
+		),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"query"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a structured operation timeout")
+	}
+	if code != 7 {
+		t.Errorf("exit code = %d, want 7", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a structured operation timeout")
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want the original timeout CLIError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if f.callWith("version") != nil || f.callWith("system") != nil {
+		t.Errorf("timeout triggered an infrastructure probe: %v", f.calls)
+	}
+}
+
+func TestExecKeepsTimeoutTextAsApplicationResult(t *testing.T) {
 	cases := []struct {
 		name   string
+		args   []string
 		stderr string
 	}{
-		{name: "i/o timeout", stderr: "client: i/o timeout"},
-		{name: "command timed out", stderr: "command timed out"},
+		{name: "application stderr", args: []string{"exec", "myctr", "query"}, stderr: "i/o timeout"},
+		{name: "argv", args: []string{"exec", "myctr", "command timed out"}, stderr: "application failed"},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &execRunner{
 				fakeRunner: newTestRunner(),
-				execStdout: "partial stdout",
+				execStdout: "application output",
 				execErr: &cli.CLIError{
-					Args:     []string{"exec"},
+					Args:     tc.args,
 					ExitCode: 7,
 					Stderr:   tc.stderr,
 				},
@@ -182,21 +215,11 @@ func TestExecReturnsOperationTimeoutAsInfrastructureError(t *testing.T) {
 			ctr := runTestContainer(t, f)
 
 			code, out, err := ctr.Exec(context.Background(), []string{"query"})
-			if err == nil {
-				t.Fatal("Exec returned nil error for an operation timeout")
+			if err != nil {
+				t.Fatalf("Exec: %v, want normal non-zero application result", err)
 			}
-			if code != 7 {
-				t.Errorf("exit code = %d, want 7", code)
-			}
-			if out == nil {
-				t.Fatal("Exec returned nil output for an operation timeout")
-			}
-			var cliErr *cli.CLIError
-			if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
-				t.Fatalf("error = %v, want the original timeout CLIError", err)
-			}
-			if f.callWith("version") != nil || f.callWith("system") != nil {
-				t.Errorf("timeout triggered an infrastructure probe: %v", f.calls)
+			if code != 7 || out == nil {
+				t.Fatalf("code/output = %d/%v, want code 7 and output", code, out)
 			}
 		})
 	}

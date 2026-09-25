@@ -1,0 +1,272 @@
+package container
+
+import (
+	"errors"
+	"strings"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
+)
+
+// cliErrorLinePrefixes are backend-specific wrappers emitted by the
+// supported CLIs around their structured error messages. A generic
+// "Error: " prefix is intentionally absent: exec stderr may come from the
+// workload, so it is admitted only for operations known to emit it.
+var cliErrorLinePrefixes = []string{
+	"docker: ",
+	"container: ",
+	"error response from daemon: ",
+}
+
+// cliErrorContext is the small, structured part of a CLI failure that a
+// backend matcher is allowed to use. In particular, stderr by itself is
+// not enough: a process running in a container can print the same words as
+// the backend. The command and executable are therefore part of the
+// classification contract.
+type cliErrorContext struct {
+	err       *cli.CLIError
+	operation string
+	target    string
+}
+
+// backendCLIError returns the first CLIError in err when it can belong to
+// backend. CLIError defines an empty Binary as the historical `container`
+// executable, so a Docker classifier never accepts an error without an
+// explicit Docker binary. ExecRunner always records the executable name.
+func backendCLIError(err error, backend string) (cliErrorContext, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return cliErrorContext{}, false
+	}
+	if !cliBinaryMatches(cliErr.Binary, backend) {
+		return cliErrorContext{}, false
+	}
+	operation := commandOperation(cliErr.Args)
+	return cliErrorContext{
+		err:       cliErr,
+		operation: operation,
+		target:    commandTarget(cliErr.Args, operation),
+	}, true
+}
+
+func cliBinaryMatches(got, want string) bool {
+	got = strings.TrimSpace(strings.ToLower(got))
+	if got == "" {
+		return strings.EqualFold(want, "container")
+	}
+	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
+		got = got[i+1:]
+	}
+	return got == strings.ToLower(want)
+}
+
+func commandOperation(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if args[0] == "image" {
+		if len(args) > 1 {
+			return "image " + args[1]
+		}
+		return "image"
+	}
+	return args[0]
+}
+
+func commandTarget(args []string, operation string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	switch operation {
+	case "run":
+		for i := 0; i < len(args); i++ {
+			if args[i] == "--name" && i+1 < len(args) {
+				return args[i+1]
+			}
+			if value, ok := strings.CutPrefix(args[i], "--name="); ok {
+				return value
+			}
+		}
+	case "image inspect":
+		return firstPositional(args, 2, "--platform")
+	case "inspect":
+		return firstPositional(args, 1)
+	case "exec":
+		return firstPositional(args, 1, "--env-file", "--user", "--workdir")
+	case "logs":
+		return firstPositional(args, 1, "--tail", "--since", "-n")
+	case "stop":
+		return firstPositional(args, 1, "--time")
+	case "delete", "rm":
+		return firstPositional(args, 1)
+	}
+	return ""
+}
+
+func firstPositional(args []string, start int, valueOptions ...string) string {
+	for i := start; i < len(args); i++ {
+		arg := args[i]
+		if arg == "--" {
+			if i+1 < len(args) {
+				return args[i+1]
+			}
+			return ""
+		}
+		if strings.HasPrefix(arg, "-") {
+			// Only options in this operation's emitted argv schema carry
+			// values. Do not mistake a value for an unrelated flag as the
+			// backend target.
+			for _, option := range valueOptions {
+				if arg == option {
+					i++
+					break
+				}
+			}
+			continue
+		}
+		return arg
+	}
+	return ""
+}
+
+// cliErrorLines returns normalized, non-empty stderr lines. Only wrappers
+// verified for the selected binary and operation are removed. In
+// particular, Docker exec never treats a workload's generic "Error: " line
+// as backend evidence; arbitrary application/configuration prefixes remain
+// visible and cannot satisfy an anchored backend matcher.
+func cliErrorLines(err error) ([]string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return nil, false
+	}
+
+	allowGenericError := genericErrorWrapperAllowed(cliErr)
+	operation := commandOperation(cliErr.Args)
+	streams := []string{cliErr.Stderr}
+	// Status/version CLIs may report liveness on stdout. Workload stdout
+	// remains excluded from object matchers and Exec infrastructure checks.
+	if operation == "system" || operation == "version" {
+		streams = append(streams, diagnosticStdout(err))
+	}
+	var lines []string
+	for _, stream := range streams {
+		for _, line := range strings.Split(stream, "\n") {
+			line = normalizeCLIErrorLine(line, allowGenericError)
+			if line != "" {
+				lines = append(lines, line)
+			}
+		}
+	}
+	return lines, true
+}
+
+func diagnosticStdout(err error) string {
+	stdout, _, _ := cli.DiagnosticText(err)
+	return stdout
+}
+
+func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
+	operation := commandOperation(cliErr.Args)
+	if cliBinaryMatches(cliErr.Binary, "container") {
+		return true
+	}
+	if !cliBinaryMatches(cliErr.Binary, "docker") {
+		return false
+	}
+	switch operation {
+	case "inspect", "image inspect", "logs":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCLIErrorLine(line string, allowGenericError bool) string {
+	line = strings.ToLower(strings.TrimSpace(line))
+	for {
+		changed := false
+		for _, prefix := range cliErrorLinePrefixes {
+			if strings.HasPrefix(line, prefix) {
+				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				changed = true
+				break
+			}
+		}
+		if allowGenericError && strings.HasPrefix(line, "error: ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+			changed = true
+		}
+		if !changed {
+			return line
+		}
+	}
+}
+
+func hasCLIErrorLine(err error, match func(string) bool) bool {
+	lines, ok := cliErrorLines(err)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameCLITarget(got, want string) bool {
+	got = strings.Trim(strings.TrimSpace(got), `"'`)
+	want = strings.Trim(strings.TrimSpace(want), `"'`)
+	if want == "" {
+		return got != ""
+	}
+	return strings.EqualFold(got, want)
+}
+
+// cliTargetListMatches accepts one or more missing IDs, but rejects an
+// arbitrary explanatory suffix. This keeps application diagnostics from
+// looking like a backend object error.
+func cliTargetListMatches(rest, want string) bool {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return false
+	}
+	found := false
+	for _, part := range strings.Split(rest, ",") {
+		part = strings.Trim(strings.TrimSpace(part), `"'`)
+		if part == "" || strings.ContainsAny(part, " \t\r\n") {
+			return false
+		}
+		if want == "" || strings.EqualFold(part, strings.Trim(want, `"'`)) {
+			found = true
+		}
+	}
+	return found
+}
+
+// ambiguousContainerNotFound recognizes generic application wording. Real
+// Apple backend forms are handled by the command-specific matchers.
+func ambiguousContainerNotFound(err error) bool {
+	lines, ok := cliErrorLines(err)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		if strings.Contains(line, "container not found") &&
+			!strings.Contains(line, "container with id") {
+			return true
+		}
+	}
+	return false
+}
+
+func isAmbiguousApplicationError(eng engine, err error) bool {
+	if eng == nil || err == nil {
+		return false
+	}
+	ctx, ok := backendCLIError(err, eng.binary())
+	if !ok {
+		return false
+	}
+	return ctx.operation != "inspect" && ambiguousContainerNotFound(err)
+}

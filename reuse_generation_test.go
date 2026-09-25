@@ -100,7 +100,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 }
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: `Error: container not found: myctr`}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)
@@ -132,7 +132,7 @@ type inspectErrorRunner struct {
 func (g *inspectErrorRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: g.stderr}
+		return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: g.stderr}
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":

@@ -18,7 +18,16 @@ type classifyProbeRunner struct {
 
 func (r *classifyProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls = append(r.calls, strings.Join(args, " "))
-	return []byte(r.probeStdout), nil, r.probeErr
+	err := r.probeErr
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) && cliErr.Binary == "" {
+		if len(args) > 0 && args[0] == "version" {
+			cliErr.Binary = "docker"
+		} else {
+			cliErr.Binary = "container"
+		}
+	}
+	return []byte(r.probeStdout), nil, err
 }
 
 func TestAppleSystemStatusRealStdoutClassifiesProbeFailure(t *testing.T) {
@@ -149,6 +158,28 @@ func TestDockerProbeUnavailableRequiresStructuredDesktopPhrase(t *testing.T) {
 				t.Fatalf("dockerProbeUnavailable(%q) = true, want false", stderr)
 			}
 		})
+	}
+}
+
+func TestClassifyExplicitProbeDoesNotTreatBareConfigAsNonLiveness(t *testing.T) {
+	orig := &cli.CLIError{
+		Binary: "container", Args: []string{"run", "--name", "myctr"},
+		ExitCode: 1, Stderr: "configuration changed while the command was running",
+	}
+	probeErr := &cli.CLIError{
+		Binary: "container", Args: []string{"system", "status"},
+		ExitCode: 1, Stderr: "XPC connection error",
+	}
+	runner := &classifyProbeRunner{probeErr: probeErr}
+	probe := appleEngine{}.probe()
+	probe.IsUnavailable = func(error) bool { return true }
+
+	got := cli.Classify(context.Background(), runner, orig, probe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want explicit probe liveness evidence", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("error = %v, want original and probe chains", got)
 	}
 }
 

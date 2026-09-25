@@ -12,7 +12,7 @@ type engineInfo struct {
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
-	// (Apple Container), where a delete cannot be bound to a generation.
+	// (Apple Container), so its operations remain name-based.
 	uid string
 	// image is the image reference the container was created from.
 	image string

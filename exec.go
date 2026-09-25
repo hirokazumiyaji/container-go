@@ -80,7 +80,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.operationTarget(), cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
@@ -136,7 +136,8 @@ func execCLIStderr(err error) (string, bool) {
 func (c *Container) execContainerRunning(ctx context.Context) bool {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.operationTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return false
 	}

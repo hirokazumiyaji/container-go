@@ -420,8 +420,9 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 	}
 }
 
-// TestIntegrationDockerStaleHandlePreservesReplacement covers #49: an
-// old handle must not delete a same-name replacement.
+// TestIntegrationDockerStaleHandlePreservesReplacement covers #74: every
+// backend operation on an old handle must use its immutable ID, so a
+// same-name replacement remains untouched.
 func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -438,6 +439,9 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
+	if oldCtr.ID() != name {
+		t.Fatalf("ID() = %q, want logical name %q", oldCtr.ID(), name)
+	}
 	if err := oldCtr.Terminate(ctx); err != nil {
 		t.Fatalf("Terminate old: %v", err)
 	}
@@ -451,12 +455,47 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+
+	marker := filepath.Join(t.TempDir(), "replacement.txt")
+	if err := os.WriteFile(marker, []byte("replacement data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := newCtr.CopyToContainer(ctx, marker, "/tmp/replacement.txt"); err != nil {
+		t.Fatalf("seed replacement file: %v", err)
+	}
+
+	if _, err := oldCtr.State(ctx); err == nil {
+		t.Error("stale State succeeded; it inspected the replacement")
+	}
+	if _, _, err := oldCtr.Exec(ctx, []string{"sh", "-c", "printf stale > /tmp/stale-exec.txt"}); err == nil {
+		t.Error("stale Exec succeeded; it executed in the replacement")
+	}
+	if err := oldCtr.CopyToContainer(ctx, marker, "/tmp/stale-copy.txt"); err == nil {
+		t.Error("stale CopyToContainer succeeded; it wrote to the replacement")
+	}
+	if _, err := oldCtr.CopyFileFromContainer(ctx, "/tmp/replacement.txt"); err == nil {
+		t.Error("stale CopyFileFromContainer succeeded; it read from the replacement")
+	}
+	if _, err := oldCtr.Logs(ctx); err == nil {
+		t.Error("stale Logs succeeded; it read the replacement logs")
+	}
+	if err := oldCtr.Stop(ctx, nil); err == nil {
+		t.Error("stale Stop succeeded; it stopped the replacement")
+	}
+	// A missing immutable target is idempotently removed, not an error.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Errorf("stale Terminate = %v, want idempotent success", err)
+	}
+
+	if state, err := newCtr.State(ctx); err != nil || state != container.StateRunning {
+		t.Fatalf("replacement state = %q, err = %v; want running", state, err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
-		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)
+		t.Fatalf("replacement missing after stale operations: %s / %v", out, inspectErr)
+	}
+	code, _, err := newCtr.Exec(ctx, []string{"sh", "-c", "test ! -e /tmp/stale-exec.txt && test ! -e /tmp/stale-copy.txt"})
+	if err != nil || code != 0 {
+		t.Fatalf("stale operation side effects remain: code=%d err=%v", code, err)
 	}
 }
 

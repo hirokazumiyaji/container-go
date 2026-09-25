@@ -93,8 +93,8 @@ type Container struct {
 	// library; see Terminate for the limits of the name-based path.
 	creation string
 	// uid is the backend's immutable container ID when it has one
-	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it.
+	// (Docker). Backend operations target it directly, so a stale
+	// handle cannot affect a same-name replacement.
 	uid string
 
 	mu   sync.Mutex
@@ -278,8 +278,19 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 	return path, dir, nil
 }
 
-// ID returns the container ID (identical to its name).
+// ID returns the container's logical name, preserving the public
+// handle contract even when Docker also has an immutable ID.
 func (c *Container) ID() string { return c.id }
+
+// operationTarget returns the backend identifier for this handle.
+// Docker handles use the immutable ID when it is available; Apple
+// Container has no such ID and continues to use the logical name.
+func (c *Container) operationTarget() string {
+	if c.uid != "" {
+		return c.uid
+	}
+	return c.id
+}
 
 func (c *Container) classify(ctx context.Context, err error) error {
 	return cli.Classify(ctx, c.runner, err, c.eng.probe())
@@ -299,7 +310,7 @@ func (c *Container) State(ctx context.Context) (State, error) {
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.operationTarget(), timeout)...)
 	return c.classify(ctx, err)
 }
 
@@ -462,7 +473,8 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.operationTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}

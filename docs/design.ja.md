@@ -110,7 +110,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
-- `WithNetwork(name string)`：接続先ネットワーク。Docker で省略した場合は `bridge`
+- `WithNetwork(name string)`：接続先ネットワーク。Docker で省略した場合は daemon が選ぶ既定 network (Linux では `bridge`、native Windows では `nat`)
 - `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
 
 `WithHostname` や `WithPrivileged` などのオプションは、Apple Container CLI に対応するフラグが存在しないため意図的に提供しない(両バックエンド共通でサポート可能な機能に限定する方針)。ログ転送には `FollowLogs` を直接利用する。
@@ -156,16 +156,33 @@ Docker の `host` と `none` モードは、このライブラリが管理する
 作成できません。
 `Internal: true` または isolated bridge gateway mode の外部遮断
 ネットワークも、同じ endpoint 契約の対象です。
-`Run` は image やコンテナを操作する前に指定 network を inspect し、
-これらの network と `WithExposedPorts` または `WithPublishedPort` を
-組み合わせた場合は `*ConfigError` を返します。
+明示的に指定した default 以外の network では、`Run` は image やコンテナを
+操作する前に指定 network を inspect し、これらの network と
+`WithExposedPorts` または `WithPublishedPort` を組み合わせた場合は
+`*ConfigError` を返します。
+`host` と `none` の publish 組み合わせは起動前に拒否されます。
 
 ポート指定なしの host モードは利用できます。
 `Host` はクライアントから見たデーモンの host を返しますが、
 `MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
-none モードには到達可能な host がないため、`Host` はエラーを返します。
-endpoint 解決は、要求した publish 文字列ではなく、network mode と
-inspect の実際の host binding を照合します。
+none モードには到達可能な host がないため、`Host` は
+`ErrNoReachableHost` と一致するエラーを返します。
+endpoint 解決は、要求した publish 文字列ではなく、要求した mode と inspect
+の実際の network mode、host binding を照合します。
+実行時の network 不一致は `ErrNetworkMismatch` で判別できます。
+
+`WithNetwork` を省略した場合は `--network bridge` を合成せず、daemon の
+platform default (Linux では `bridge`、native Windows では `nat`) に委譲します。
+inspect の特別な `HostConfig.NetworkMode == "default"` は
+`NetworkSettings.Networks` の具体的な network 名と照合するため、既存の
+default コンテナを再利用できても、省略指定を `host`、`none`、任意の名前付き
+network の wildcard にはしません。
+
+Docker の handle は `docker run --detach` が返した immutable な container ID
+を保持します。Host、endpoint、lifecycle、reuse の inspect はその ID を対象
+にして返された identity を検証します。network、IP、port binding は dynamic
+data であり、操作ごとに更新されます。cache するのは UID、image、label などの
+immutable identity だけです。
 
 IP アドレスは `netip` で正規化します。
 展開した IPv6 loopback や `::` は Docker inspect の出力と正しく
@@ -184,8 +201,12 @@ remote host へ書き換えても、デーモン側の loopback には到達で�
 
 Docker の `WithReuse` は、image、宣言済み port、`WithNetwork` の network
 identity を比較します。
-`WithNetwork` 省略時の identity は `bridge` であり、`host`、`none`、
-名前付き network の wildcard ではありません。
+`WithNetwork` 省略時の identity は daemon の platform default であり、
+inspect の `default` mode を実際の network 名 (`bridge` または `nat`) と
+照合します。
+`host`、`none`、名前付き network の wildcard ではありません。
+互換性チェックの直前と handle を返す直前に immutable Docker UID で
+再 inspect します。
 inspect に network mode が無い場合も互換性なしとして拒否します。
 リモートデーモンの既存 loopback binding は
 `ErrEndpointUnreachable` として拒否します。
@@ -359,6 +380,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
 プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
 正規化した情報には、状態(running / stopped / stopping / unknown への写像)、ラベル、immutable identity、image、コンテナ IP、Docker network mode、公開ポートの束縛(コンテナポート → ホストアドレスとポート)を含める。
+状態、IP、network、port binding は dynamic data として inspect のたびに更新し、cache には immutable identity のみを保持する。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。

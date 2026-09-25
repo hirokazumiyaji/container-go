@@ -15,6 +15,15 @@ func TestErrPortNotExposedDescribesAllFailureCases(t *testing.T) {
 	}
 }
 
+func TestDockerNetworkErrorsAreDiscriminable(t *testing.T) {
+	if err := dockerNetworkModeError("bridge", "host", nil); !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("mode error = %v, want ErrNetworkMismatch", err)
+	}
+	if err := dockerNetworkEndpointError("none"); !errors.Is(err, ErrPortNotExposed) || !errors.Is(err, ErrNoReachableHost) {
+		t.Fatalf("none endpoint error = %v, want port and host sentinels", err)
+	}
+}
+
 func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

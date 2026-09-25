@@ -13,7 +13,7 @@ type engineInfo struct {
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
-	// (Apple Container), where a delete cannot be bound to a generation.
+	// (Apple Container), where operations remain name-based.
 	uid string
 	// image is the image reference the container was created from.
 	image string
@@ -24,6 +24,10 @@ type engineInfo struct {
 	// this to distinguish a real host binding from a request that the
 	// daemon discarded (for example, -p with host networking).
 	networkMode string
+	// networkNames contains the actual attached network names reported by
+	// Docker. It resolves the API's special "default" mode to the daemon's
+	// concrete default network (bridge on Linux, nat on Windows).
+	networkNames []string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort

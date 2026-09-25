@@ -15,28 +15,29 @@ import (
 type Option func(*config) error
 
 type config struct {
-	runner       cli.Runner
-	eng          engine
-	name         string
-	env          map[string]string
-	cmd          []string
-	entrypoint   string
-	exposed      []portSpec
-	published    []publishSpec
-	labels       map[string]string
-	mounts       []Mount
-	files        []File
-	waitStrategy wait.Strategy
-	cpus         int
-	memory       string
-	user         string
-	workdir      string
-	network      string
-	platform     string
-	pullPolicy   PullPolicy
-	reuse        bool
-	reuseGroup   string
-	creation     string
+	runner          cli.Runner
+	eng             engine
+	name            string
+	env             map[string]string
+	cmd             []string
+	entrypoint      string
+	exposed         []portSpec
+	published       []publishSpec
+	labels          map[string]string
+	mounts          []Mount
+	files           []File
+	waitStrategy    wait.Strategy
+	cpus            int
+	memory          string
+	user            string
+	workdir         string
+	network         string
+	networkExplicit bool
+	platform        string
+	pullPolicy      PullPolicy
+	reuse           bool
+	reuseGroup      string
+	creation        string
 }
 
 func newConfig() *config {
@@ -106,7 +107,7 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	if c.workdir != "" {
 		args = append(args, "--workdir", c.workdir)
 	}
-	if c.network != "" {
+	if c.networkExplicit && c.network != "" {
 		args = append(args, "--network", c.network)
 	}
 	if c.platform != "" {
@@ -345,17 +346,19 @@ func WithWorkingDir(dir string) Option {
 	}
 }
 
-// WithNetwork selects a network. Omitting it uses Docker's default
-// bridge network (and Apple Container's default network). Docker's
-// "host" and "none" modes and externally isolated networks cannot be
-// combined with WithExposedPorts or WithPublishedPort; the Docker
-// backend rejects those combinations before creating the container.
+// WithNetwork selects a network. Omitting it leaves Docker's
+// daemon-selected default unchanged (bridge on Linux and nat on native
+// Windows). Docker's "host" and "none" modes and externally isolated
+// networks cannot be combined with WithExposedPorts or WithPublishedPort;
+// the Docker backend rejects those combinations before creating the
+// container.
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
 			return fmt.Errorf("invalid network name %q", name)
 		}
 		c.network = name
+		c.networkExplicit = true
 		return nil
 	}
 }

@@ -29,30 +29,52 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	info := base.info
-	if info == nil {
-		info, err = inspectNamed(ctx, cfg, cfg.name)
-		if err != nil {
-			return nil, err
-		}
+	// The ensure result may have been inspected before a peer changed
+	// network or port state. Once Docker has supplied an immutable ID,
+	// every compatibility inspect must target that ID rather than the
+	// reusable name.
+	info, err := inspectReuseBase(ctx, base, cfg)
+	if err != nil {
+		return nil, err
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
 		return nil, err
 	}
 
 	ctr := &Container{
-		id:        base.id,
-		runner:    base.runner,
-		eng:       base.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		network:   cfg.network,
-		reused:    true,
-		info:      info,
-		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		id:              base.id,
+		runner:          base.runner,
+		eng:             base.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		reused:          true,
+		info:            immutableInfo(info),
+		creation:        info.labels[creationLabel],
+		uid:             info.uid,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		return nil, err
+	}
+
+	// A readiness wait can outlive the generation returned by the
+	// ensure. Re-inspect by the immutable ID and repeat compatibility checks
+	// before exposing the handle.
+	fresh, err := ctr.inspectDynamic(ctx)
+	if err != nil {
+		if isNotFound(err) {
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+		}
+		return nil, err
+	}
+	if fresh.state != StateRunning {
+		return nil, fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
+	}
+	if err := checkReuseOwned(fresh, image, cfg); err != nil {
+		return nil, err
+	}
+	if err := checkReuseCompat(fresh, image, cfg); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -115,16 +137,17 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			continue
 		case StateRunning:
 			return &Container{
-				id:        cfg.name,
-				runner:    cfg.runner,
-				eng:       cfg.eng,
-				exposed:   cfg.exposed,
-				published: cfg.published,
-				network:   cfg.network,
-				reused:    true,
-				info:      info,
-				creation:  info.labels[creationLabel],
-				uid:       info.uid,
+				id:              cfg.name,
+				runner:          cfg.runner,
+				eng:             cfg.eng,
+				exposed:         cfg.exposed,
+				published:       cfg.published,
+				network:         cfg.network,
+				networkExplicit: cfg.networkExplicit,
+				reused:          true,
+				info:            immutableInfo(info),
+				creation:        info.labels[creationLabel],
+				uid:             info.uid,
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -167,15 +190,16 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 
 	ctr := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		network:   cfg.network,
-		reused:    true,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		reused:          true,
+		creation:        cfg.creation,
+		uid:             cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -223,14 +247,27 @@ func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, err
 	return namedContainer(cfg, id).inspectFresh(ctx)
 }
 
+func inspectReuseBase(ctx context.Context, base *Container, cfg *config) (*engineInfo, error) {
+	ctr := namedContainer(cfg, cfg.name)
+	if base != nil {
+		ctr.runner = base.runner
+		ctr.eng = base.eng
+		if base.uid != "" {
+			ctr.uid = base.uid
+		}
+	}
+	return ctr.inspectFresh(ctx)
+}
+
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:        id,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		network:   cfg.network,
+		id:              id,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
 	}
 }
 
@@ -266,7 +303,11 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 		return err
 	}
 	if cfg.eng.name() == "docker" {
-		if err := dockerNetworkModeError(cfg.network, info.networkMode); err != nil {
+		requested := cfg.network
+		if !cfg.networkExplicit {
+			requested = ""
+		}
+		if err := dockerNetworkModeError(requested, info.networkMode, info.networkNames); err != nil {
 			return fmt.Errorf("reuse %s: %w", cfg.name, err)
 		}
 		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {

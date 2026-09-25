@@ -106,24 +106,37 @@ Docker の `host` と `none` モードは、このライブラリが管理する
 作成できません。
 `Internal: true` または isolated bridge gateway mode の外部遮断
 ネットワークも同じです。
-`Run` は image の pull やコンテナ作成より先に Docker network を inspect
-し、これらのネットワークと `WithExposedPorts` または
-`WithPublishedPort` を組み合わせた場合は `*ConfigError` を返します。
+明示的に指定した default 以外の network では、`Run` は image の pull や
+コンテナ作成より先にその network を inspect し、これらのネットワークと
+`WithExposedPorts` または `WithPublishedPort` を組み合わせた場合は
+`*ConfigError` を返します。
 このエラーは `ErrInvalidConfig` と一致します。
+`host` と `none` の publish 組み合わせは、image やコンテナを起動する前に
+拒否されます。
 
 ポート指定なしの host モードは利用できます。
 `Host` はクライアントから見たデーモンの host を返しますが、
 `MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
 ライブラリが宣言して束縛したポートが必要です。
-`none` モードには到達可能な host がないため、`Host` はエラーを返します。
+`none` モードには到達可能な host がないため、`Host` は
+`ErrNoReachableHost` と一致するエラーを返します。
 Docker 側で host networking が無効な場合は、推測した endpoint ではなく
 バックエンド CLI の開始エラーを返します。
+実行時の network 不一致は `ErrNetworkMismatch` で判別できます。
 
-Docker で `WithNetwork` を省略した場合は、既定の `bridge` network として
-扱います。
-`WithReuse` では、この network が既存コンテナと一致する必要があり、
-省略指定は `host`、`none`、任意の名前付き network の wildcard には
-なりません。
+`WithNetwork` を省略した場合、Docker CLI に `--network` を渡さず、
+daemon の platform デフォルトに委譲します
+(Linux では `bridge`、native Windows では `nat`)。
+`Host` と endpoint 解決では inspect の実際の mode と
+`NetworkSettings.Networks` を使います。
+既存のコンテナが Docker の特別な `default` mode を返す場合も、実際の
+network 名に正規化して再利用します。
+`WithReuse` は一致する daemon default を受け付けますが、省略指定を
+`host`、`none`、任意の名前付き network の wildcard にはしません。
+Docker の handle は `run` が返した immutable な container ID を保持し、
+endpoint、Host、lifecycle、reuse の inspect はその ID を対象にします。
+network、IP、binding などの dynamic データは毎回更新され、古い snapshot
+は再利用されません。
 
 `docker context` 経由のリモート指定は検知しません。
 割り当てはデーモンが起動時に原子的に行うため、並列テストがポートを奪い合う
@@ -208,8 +221,10 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   場合は削除せずエラーを返す。
 - image / port が既存と不一致なら分かりやすいエラーを返す。
   Docker では network も一致する必要があります。
-  `WithNetwork` 省略時は `bridge` として扱い、`host`、`none`、名前付き
-  network は wildcard にしません。
+  `WithNetwork` 省略時は daemon の platform default を `default` として
+  扱い、inspect の `NetworkSettings.Networks` から `bridge` (Linux) または
+  `nat` (native Windows) を照合します。`host`、`none`、名前付き network は
+  wildcard にしません。
   `env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様です。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを

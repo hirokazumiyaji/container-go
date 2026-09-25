@@ -41,7 +41,7 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	args := c.eng.logsArgs(c.id, false)
+	args := c.eng.logsArgs(c.operationTarget(), false)
 	if extra := opts.args(); len(extra) > 0 {
 		// Insert --tail/--since before the container ID (last arg).
 		args = append(args[:len(args)-1], append(extra, args[len(args)-1])...)
@@ -63,5 +63,5 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	return s.Stream(ctx, c.eng.logsArgs(c.operationTarget(), true)...)
 }

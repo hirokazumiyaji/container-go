@@ -108,23 +108,34 @@ host address.
 
 Docker's `host` and `none` modes cannot create library-managed port
 bindings. Externally isolated networks (`Internal: true` or an isolated
-bridge gateway mode) are rejected as well. `Run` inspects the requested
-Docker network before pulling or creating anything and returns a
-`*ConfigError` (matching `ErrInvalidConfig`) when either
+bridge gateway mode) are rejected as well. For an explicitly selected
+non-default network, `Run` inspects it before pulling or creating anything
+and returns a `*ConfigError` (matching `ErrInvalidConfig`) when either
 `WithExposedPorts` or `WithPublishedPort` is combined with one of these
-networks.
+networks. `host` and `none` publish combinations are rejected before any
+image or container command.
 
 Host mode remains available without port options. `Host` returns the
 client-facing daemon host, but `MappedPort` and `Endpoint` do not invent
 a host-namespace service port: they require a port declared and bound by
 this library. `none` mode has no reachable host, so `Host` returns an
-error. If a Docker installation disables host networking, the backend
-CLI start error is returned rather than a fabricated endpoint.
+error matching `ErrNoReachableHost`. If a Docker installation disables
+host networking, the backend CLI start error is returned rather than a
+fabricated endpoint. Runtime network mismatches match
+`ErrNetworkMismatch`.
 
-For Docker, omitting `WithNetwork` means the default `bridge` network.
-`WithReuse` requires that network identity to match the existing
-container; an omitted option is not a wildcard for `host`, `none`, or a
-named network.
+When `WithNetwork` is omitted, the Docker CLI is left without a
+`--network` argument so the daemon chooses its platform default (`bridge`
+on Linux, `nat` on native Windows). Endpoint and Host resolution uses the
+actual mode and `NetworkSettings.Networks` from inspect; a pre-existing
+container reporting Docker's special `default` mode is canonicalized
+against that actual network. `WithReuse` is therefore compatible with a
+matching daemon default, but never treats an omitted option as a wildcard
+for `host`, `none`, or an arbitrary named network. Docker handles retain
+the immutable container ID returned by `run`, and endpoint, Host, lifecycle,
+and reuse operations inspect that ID; dynamic network, IP, and binding
+data are refreshed on every operation rather than served from a stale
+snapshot.
 
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
 daemon is not detected.
@@ -227,8 +238,11 @@ Contract:
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
   Docker also requires the requested network identity to match. Omitted
-  `WithNetwork` means `bridge`; `host`, `none`, and named networks are
-  not wildcards. `env` / `cmd` / `mounts` differences still attach
+  `WithNetwork` means the daemon default; inspect's `default` mode is
+  resolved against `NetworkSettings.Networks` (`bridge` on Linux, `nat` on
+  native Windows). `host`, `none`, and named networks are not wildcards.
+  Reuse re-inspects by immutable UID before compatibility checks and before
+  returning the handle. `env` / `cmd` / `mounts` differences still attach
   silently by design (use distinct names when they matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the

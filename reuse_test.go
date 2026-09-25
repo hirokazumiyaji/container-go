@@ -465,6 +465,106 @@ func (c *createdThenRunningRunner) Run(ctx context.Context, args ...string) ([]b
 	return c.fakeRunner.Run(ctx, args...)
 }
 
+func TestDockerReuseAcceptsPreExistingDaemonDefault(t *testing.T) {
+	runner := &staticDockerReuseRunner{fakeRunner: newTestRunner()}
+	runner.imagePresent = true
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(),
+		withRunner(runner), withEngine(dockerEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if ctr.network != "" || ctr.networkExplicit {
+		t.Fatalf("handle network = %q explicit=%t, want daemon default", ctr.network, ctr.networkExplicit)
+	}
+}
+
+type staticDockerReuseRunner struct {
+	*fakeRunner
+}
+
+func (r *staticDockerReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "inspect" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return []byte(dockerReuseInspectJSON(dockerNetworkDefault)), nil, nil
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestDockerReuseRechecksNetworkAfterEnsure(t *testing.T) {
+	runner := &networkChangingDockerReuseRunner{fakeRunner: newTestRunner()}
+	runner.imagePresent = true
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), WithNetwork("bridge"),
+		withRunner(runner), withEngine(dockerEngine{}))
+	if !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("Run error = %v, want ErrNetworkMismatch", err)
+	}
+	runner.mu.Lock()
+	calls := append([][]string(nil), runner.calls...)
+	runner.mu.Unlock()
+	inspectCalls := 0
+	for _, call := range calls {
+		if len(call) > 0 && call[0] == "inspect" {
+			if inspectCalls > 0 && call[len(call)-1] != dockerFixtureID {
+				t.Errorf("reuse compatibility inspect target = %q, want immutable Docker ID", call[len(call)-1])
+			}
+			inspectCalls++
+		}
+	}
+	if inspectCalls < 3 {
+		t.Fatalf("inspect calls = %d, want compatibility and post-wait rechecks", inspectCalls)
+	}
+}
+
+type networkChangingDockerReuseRunner struct {
+	*fakeRunner
+}
+
+func dockerReuseInspectJSON(mode string) string {
+	return fmt.Sprintf(`[
+  {
+    "Id": %q,
+    "Name": "/myctr",
+    "State": {"Status": "running"},
+    "Config": {
+      "Image": "redis:7-alpine",
+      "Labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.reuse": "true"
+      }
+    },
+    "HostConfig": {"NetworkMode": %q},
+    "NetworkSettings": {
+      "Ports": {},
+      "Networks": {"bridge": {"IPAddress": "172.17.0.2"}}
+    }
+  }
+]`, dockerFixtureID, mode)
+}
+
+func (r *networkChangingDockerReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "inspect" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		count := 0
+		for _, call := range r.calls {
+			if len(call) > 0 && call[0] == "inspect" {
+				count++
+			}
+		}
+		r.mu.Unlock()
+		mode := "bridge"
+		if count >= 3 {
+			mode = "host"
+		}
+		return []byte(dockerReuseInspectJSON(mode)), nil, nil
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
 func TestImagesCompatible(t *testing.T) {
 	cases := []struct {
 		req, act string

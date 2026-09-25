@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,127 @@ func requireDocker(t *testing.T) {
 		t.Skip("docker daemon not running")
 	}
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
+}
+
+func dockerServerOS(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Os}}").Output()
+	if err != nil {
+		t.Skipf("cannot determine Docker server OS: %v", err)
+	}
+	serverOS := strings.ToLower(strings.TrimSpace(string(out)))
+	if serverOS == "" {
+		t.Skip("Docker server did not report an OS")
+	}
+	return serverOS
+}
+
+func dockerHostNetworkUnavailable(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "host") &&
+		(strings.Contains(message, "not supported") ||
+			strings.Contains(message, "not enabled") ||
+			strings.Contains(message, "unable to start") ||
+			strings.Contains(message, "not available"))
+}
+
+func TestIntegrationDockerHostNetworkNoPublish(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("host networking integration requires a Linux daemon, got %q", serverOS)
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("host"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		if dockerHostNetworkUnavailable(err) {
+			t.Skipf("Docker host networking is unavailable: %v", err)
+		}
+		t.Fatalf("host-mode Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil {
+		t.Fatalf("host-mode Host: %v", err)
+	}
+	if host == "" {
+		t.Fatal("host-mode Host returned an empty address")
+	}
+	if _, err := ctr.Endpoint(ctx, "80/tcp"); !errors.Is(err, container.ErrPortNotExposed) {
+		t.Fatalf("host-mode Endpoint error = %v, want ErrPortNotExposed", err)
+	}
+}
+
+func TestIntegrationDockerHostAndNonePublishRejectedBeforeCreate(t *testing.T) {
+	requireDocker(t)
+	for _, network := range []string{"host", "none"} {
+		t.Run(network, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-reject-%s-%d", network, time.Now().UnixNano())
+			ctr, err := container.Run(context.Background(), integrationAlpine,
+				container.WithName(name),
+				container.WithNetwork(network),
+				container.WithPublishedPort("127.0.0.1:18080:80/tcp"),
+			)
+			container.Cleanup(t, ctr)
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) || configErr.Network != network {
+				t.Fatalf("Run error = %v, want *ConfigError for %s", err, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Fatalf("container was created despite %s publish rejection: %s", network, out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerNoneNetwork(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("none-network integration requires a Linux daemon, got %q", serverOS)
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("none"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("none-mode Run: %v", err)
+	}
+	if _, err := ctr.Host(ctx); !errors.Is(err, container.ErrNoReachableHost) {
+		t.Fatalf("none-mode Host error = %v, want ErrNoReachableHost", err)
+	}
+}
+
+func TestIntegrationDockerWindowsNATDefault(t *testing.T) {
+	requireDocker(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows Docker integration")
+	}
+	if serverOS := dockerServerOS(t); serverOS != "windows" {
+		t.Skipf("Windows NAT integration requires a Windows daemon, got %q", serverOS)
+	}
+	image := os.Getenv("CONTAINERGO_WINDOWS_TEST_IMAGE")
+	if image == "" {
+		t.Skip("set CONTAINERGO_WINDOWS_TEST_IMAGE to a small Windows image")
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, image,
+		container.WithNetwork("nat"),
+		container.WithCmd("cmd", "/C", "ping -n 10 127.0.0.1 >NUL"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Windows NAT Run: %v", err)
+	}
+	if host, err := ctr.Host(ctx); err != nil || host == "" {
+		t.Fatalf("Windows NAT Host = %q, err = %v", host, err)
+	}
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {

@@ -150,8 +150,8 @@ provides:
 - `WithCPUs(n int)` / `WithMemory(size string)`: resource limits
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory
-- `WithNetwork(name string)`: target network; Docker's omitted default is
-  the `bridge` network
+- `WithNetwork(name string)`: target network; when omitted, Docker keeps
+  its daemon-selected default (`bridge` on Linux, `nat` on native Windows)
 - `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
 Options like `WithHostname` or `WithPrivileged` are intentionally omitted
@@ -219,16 +219,33 @@ Docker's `host` and `none` network modes cannot create
 library-managed port bindings.
 Externally isolated networks (`Internal: true` or an isolated bridge
 gateway mode) are rejected for the same endpoint contract.
-`Run` inspects the requested network before any image or container
-command and returns `*ConfigError` when either `WithExposedPorts` or
-`WithPublishedPort` is combined with an incompatible network.
+For an explicitly selected non-default network, `Run` inspects it before
+any image or container command and returns `*ConfigError` when either
+`WithExposedPorts` or `WithPublishedPort` is combined with an incompatible
+network. `host` and `none` publish combinations are rejected before
+startup.
 
 Host mode without port declarations remains available.
 `Host` returns the client-facing daemon host, while `MappedPort` and
 `Endpoint` refuse to infer a service port from the host namespace.
-None mode has no reachable host, so `Host` returns an error.
-Endpoint resolution verifies both the requested/actual network mode and
-the inspected binding instead of trusting the publish string.
+None mode has no reachable host, so `Host` returns an error matching
+`ErrNoReachableHost`. Endpoint resolution verifies both the requested and
+actual network mode and the inspected binding instead of trusting the
+publish string; mismatches match `ErrNetworkMismatch`.
+
+When `WithNetwork` is omitted, Docker receives no synthesized
+`--network bridge` flag. The daemon chooses its platform default
+(`bridge` on Linux, `nat` on native Windows). Inspect's special
+`HostConfig.NetworkMode == "default"` is matched against the concrete
+names in `NetworkSettings.Networks`, so a pre-existing default container
+can be reused without treating omission as a wildcard for `host`, `none`,
+or arbitrary named networks.
+
+Docker handles retain the immutable ID printed by `docker run --detach`.
+Inspect for Host, Endpoint, lifecycle operations, and reuse targets that
+ID and validates the returned identity. Network, IP, and port-binding
+fields are dynamic and are refreshed for every operation; only immutable
+identity (UID, image, and labels) is cached.
 
 IP addresses are canonicalized with `netip`, so expanded IPv6 loopback
 and `::` compare correctly with Docker inspect output.
@@ -327,9 +344,13 @@ volumes must be named, and their lifecycle belongs to the caller.
 (shared across processes).
 The compatibility check compares the image reference, declared and
 published ports, and the Docker network identity.
-An omitted Docker `WithNetwork` means `bridge`; it is not a wildcard
-for `host`, `none`, or a named network.
-Missing network-mode inspect data also fails closed.
+An omitted Docker `WithNetwork` means the daemon-selected default. Docker's
+special `default` inspect mode is resolved against the actual network names
+(`bridge` on Linux, `nat` on native Windows), rather than being assumed to
+be `bridge`; omission is not a wildcard for `host`, `none`, or a named
+network.
+Reuse re-inspects by immutable Docker UID before compatibility checks and
+again before returning the handle.
 A loopback binding inspected on a remote daemon fails with
 `ErrEndpointUnreachable`.
 `env`, `cmd`, and `mounts` differences attach silently to the existing
@@ -398,9 +419,11 @@ env-file contents.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
-`container run --detach` call. Immutable facts (config, labels,
-published ports) are cached from the first inspect; only the state is
-re-queried.
+`container run --detach` call. The immutable UID, image, and label identity
+is cached after validation, while endpoint, Host, lifecycle, and reuse
+operations refresh dynamic network, IP, state, and port-binding data from
+inspect. This avoids stale endpoint data without treating published ports
+as immutable.
 
 **Wait via connections, not subprocesses**. ForListeningPort and
 ForHTTP dial the container IP directly without spawning the CLI. Only

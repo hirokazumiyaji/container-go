@@ -59,6 +59,13 @@ var ErrPortNotExposed = errors.New("port is not declared or has no usable host b
 // be reached by this client, such as loopback on a remote Docker daemon.
 var ErrEndpointUnreachable = errors.New("container endpoint is unreachable")
 
+// ErrNetworkMismatch reports that the network reported by inspect does
+// not match the network requested for the handle.
+var ErrNetworkMismatch = errors.New("container network mode does not match the requested network")
+
+// ErrNoReachableHost reports a backend network that has no host endpoint.
+var ErrNoReachableHost = errors.New("container has no reachable host")
+
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
 // is absent.
@@ -69,8 +76,9 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
-// ErrGenerationReplaced reports that Terminate refused to delete because
-// the live container's creation label no longer matches this handle.
+// ErrGenerationReplaced reports that a handle's immutable identity or
+// generation no longer matches the live container. Destructive and endpoint
+// operations refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not

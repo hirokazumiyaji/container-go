@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,8 +38,11 @@ const (
 	dockerStderrNoSuchObj    = "no such object"
 	dockerStderrNoSuchCtr    = "no such container"
 
-	dockerNetworkHost = "host"
-	dockerNetworkNone = "none"
+	dockerNetworkHost    = "host"
+	dockerNetworkNone    = "none"
+	dockerNetworkDefault = "default"
+	dockerNetworkBridge  = "bridge"
+	dockerNetworkNAT     = "nat"
 )
 
 func (dockerEngine) name() string   { return "docker" }
@@ -51,12 +55,16 @@ func (dockerEngine) directIP() bool { return false }
 // the host endpoints promised by WithExposedPorts or
 // WithPublishedPort.
 func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
-	if !dockerNetworkAllowsPublish(cfg.network) {
+	network := cfg.network
+	if !cfg.networkExplicit {
+		network = ""
+	}
+	if !dockerNetworkAllowsPublish(network) {
 		if len(cfg.published) > 0 {
-			return dockerPublishOptionError(cfg.network, "WithPublishedPort")
+			return dockerPublishOptionError(network, "WithPublishedPort")
 		}
 		if len(cfg.exposed) > 0 {
-			return dockerPublishOptionError(cfg.network, "WithExposedPorts")
+			return dockerPublishOptionError(network, "WithExposedPorts")
 		}
 	}
 	if isRemoteDockerHost() {
@@ -65,7 +73,7 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 			if ipIsLoopback(p.hostAddr) {
 				err := &ConfigError{
 					Backend: "docker",
-					Network: cfg.network,
+					Network: network,
 					Option:  "WithPublishedPort",
 					Detail:  fmt.Sprintf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw),
 				}
@@ -79,15 +87,15 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	} else if len(cfg.exposed) > 0 {
 		option = "WithExposedPorts"
 	}
-	if option != "" {
-		network, err := inspectDockerNetwork(ctx, cfg)
+	if option != "" && network != "" && network != dockerNetworkDefault {
+		networkInfo, err := inspectDockerNetwork(ctx, cfg)
 		if err != nil {
 			return err
 		}
-		if reason := dockerNetworkIsolationReason(network); reason != "" {
+		if reason := dockerNetworkIsolationReason(networkInfo); reason != "" {
 			return &ConfigError{
 				Backend: "docker",
-				Network: cfg.network,
+				Network: network,
 				Option:  option,
 				Detail:  reason + " networks are externally isolated; this library cannot create a reachable published endpoint on them",
 			}
@@ -152,31 +160,63 @@ func dockerPublishOptionError(mode, option string) error {
 }
 
 // dockerNetworkAllowsPublish reports whether Docker can create a
-// host-side binding for a port in the requested network mode. Named and
-// bridge networks can publish ports; host and none cannot.
+// host-side binding for a port in the requested network mode. An empty
+// mode is the daemon-selected default; named, bridge, and nat networks
+// can publish ports, while host and none cannot.
 func dockerNetworkAllowsPublish(mode string) bool {
 	return mode != dockerNetworkHost && mode != dockerNetworkNone
 }
 
 // dockerNetworkModesMatch compares the requested mode with the mode
-// reported by inspect. The identity is exact so a user-defined network
-// named "default" cannot impersonate Docker's built-in bridge. Empty
-// values are intentionally incompatible: reuse and endpoint resolution
-// fail closed rather than treating missing inspect data as a wildcard.
-func dockerNetworkModesMatch(requested, actual string) bool {
+// reported by inspect. Docker represents an omitted --network as the
+// special mode "default"; the attached network names provide the concrete
+// default identity (bridge on Linux, nat on Windows). An omitted request
+// is only compatible with that daemon default, never with host, none, or
+// an arbitrary user-defined network.
+func dockerNetworkModesMatch(requested, actual string, nameSets ...[]string) bool {
 	requested = strings.TrimSpace(requested)
 	actual = strings.TrimSpace(actual)
-	if requested == "" || actual == "" {
+	var actualNames []string
+	if len(nameSets) > 0 {
+		actualNames = nameSets[0]
+	}
+	if actual == "" {
 		return false
+	}
+
+	if actual == dockerNetworkDefault {
+		if len(actualNames) == 0 {
+			return false
+		}
+		if requested == "" || requested == dockerNetworkDefault {
+			return true
+		}
+		return containsNetworkName(actualNames, requested)
+	}
+
+	if requested == "" {
+		return actual == dockerNetworkBridge || actual == dockerNetworkNAT
+	}
+	if requested == dockerNetworkDefault {
+		return actual == dockerNetworkBridge || actual == dockerNetworkNAT
 	}
 	return requested == actual
 }
 
-func dockerNetworkModeError(requested, actual string) error {
-	if dockerNetworkModesMatch(requested, actual) {
+func containsNetworkName(names []string, want string) bool {
+	for _, name := range names {
+		if strings.TrimSpace(name) == want {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerNetworkModeError(requested, actual string, nameSets ...[]string) error {
+	if dockerNetworkModesMatch(requested, actual, nameSets...) {
 		return nil
 	}
-	return fmt.Errorf("requested Docker network mode %q, but inspect reported %q", requested, actual)
+	return fmt.Errorf("%w: requested Docker network mode %q, but inspect reported %q", ErrNetworkMismatch, requested, actual)
 }
 
 func dockerNetworkEndpointError(mode string) error {
@@ -184,7 +224,10 @@ func dockerNetworkEndpointError(mode string) error {
 	case dockerNetworkHost:
 		return fmt.Errorf("%w: Docker host networking has no library-managed host port binding; Host returns the daemon host, but Endpoint does not infer a port", ErrPortNotExposed)
 	case dockerNetworkNone:
-		return fmt.Errorf("%w: Docker network mode %q has no network interface for a host port binding", ErrPortNotExposed, mode)
+		return errors.Join(
+			fmt.Errorf("%w: Docker network mode %q has no network interface for a host port binding", ErrPortNotExposed, mode),
+			fmt.Errorf("%w: Docker network mode %q has no reachable host", ErrNoReachableHost, mode),
+		)
 	default:
 		return nil
 	}
@@ -278,9 +321,14 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// method. Keep the argv builder safe for direct backend tests too:
 	// host and none networks must never receive a -p flag.
 	runCfg := cfg
-	publishable := dockerNetworkAllowsPublish(cfg.network)
-	if !publishable {
+	if !cfg.networkExplicit {
 		copy := *cfg
+		copy.network = ""
+		runCfg = &copy
+	}
+	publishable := dockerNetworkAllowsPublish(runCfg.network)
+	if !publishable {
+		copy := *runCfg
 		copy.published = nil
 		runCfg = &copy
 	}
@@ -342,23 +390,45 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
-func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	match := -1
+	for i, c := range containers {
+		if c.ID != "" && c.ID == target {
+			match = i
+			break
+		}
 	}
-	c := containers[0]
+	if match < 0 && !dockerIDRE.MatchString(target) {
+		for i, c := range containers {
+			if strings.TrimPrefix(c.Name, "/") == target {
+				match = i
+				break
+			}
+		}
+	}
+	if match < 0 {
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
+	}
+	c := containers[match]
+
+	networkNames := make([]string, 0, len(c.NetworkSettings.Networks))
+	for name := range c.NetworkSettings.Networks {
+		networkNames = append(networkNames, name)
+	}
+	sort.Strings(networkNames)
 
 	info := &engineInfo{
-		state:       dockerState(c.State.Status),
-		labels:      c.Config.Labels,
-		uid:         c.ID,
-		image:       c.Config.Image,
-		ip:          c.NetworkSettings.IPAddress,
-		networkMode: c.HostConfig.NetworkMode,
+		state:        dockerState(c.State.Status),
+		labels:       c.Config.Labels,
+		uid:          c.ID,
+		image:        c.Config.Image,
+		ip:           c.NetworkSettings.IPAddress,
+		networkMode:  c.HostConfig.NetworkMode,
+		networkNames: networkNames,
 	}
 	if info.networkMode == "" {
 		// HostConfig.NetworkMode is present in current Docker inspect
@@ -376,9 +446,9 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 	}
 	if info.ip == "" {
-		for _, n := range c.NetworkSettings.Networks {
-			if n.IPAddress != "" {
-				info.ip = n.IPAddress
+		for _, name := range networkNames {
+			if ip := c.NetworkSettings.Networks[name].IPAddress; ip != "" {
+				info.ip = ip
 				break
 			}
 		}

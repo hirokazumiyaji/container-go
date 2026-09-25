@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `ConfigError` / `ErrInvalidConfig` for backend-incompatible options
-  and `ErrEndpointUnreachable` for unusable inspected bindings.
+- Add `ConfigError` / `ErrInvalidConfig` for backend-incompatible options,
+  `ErrEndpointUnreachable` for unusable inspected bindings, and
+  `ErrNetworkMismatch` / `ErrNoReachableHost` for runtime network failures.
 - Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
@@ -19,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Reject Docker host, none, internal, and isolated networks before
-  published endpoint creation; make Docker reuse network matching exact
-  with omitted `WithNetwork` meaning `bridge`.
+  published endpoint creation; leave omitted `WithNetwork` to the
+  daemon default and resolve Docker's `default` mode from actual
+  `NetworkSettings.Networks`. Refresh dynamic inspect data through the
+  immutable Docker UID for endpoint, Host, lifecycle, and reuse operations.
 - Canonicalize IPv6 bindings and preserve address family in endpoint
   resolution, including fail-closed remote-daemon loopback handling.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and

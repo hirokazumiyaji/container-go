@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,85 +13,78 @@ import (
 	"time"
 )
 
-func TestStreamCloseKillsDescendants(t *testing.T) {
+func TestStreamCloseTerminatesDescendants(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, `sleep 30 & child=$!; printf '%s\n' "$child" > "$1"; wait "$child"`)
+	stub := writeStub(t, descendantScript(`wait "$child"`))
 	stream, err := (&ExecRunner{Binary: stub}).Stream(context.Background(), pidFile)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-	ps := stream.(*processStream)
-	descendantPID := 0
 	t.Cleanup(func() {
 		_ = stream.Close()
-		if descendantPID > 1 {
-			if p, findErr := os.FindProcess(descendantPID); findErr == nil {
-				_ = p.Kill()
-			}
-		}
+		_ = writeDescendantStopFile(pidFile)
 	})
-	descendantPID = waitForDescendantPID(t, pidFile)
+	descendantPID := waitForDescendantPID(t, pidFile)
 
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
 	select {
-	case <-ps.waitDone:
+	case <-stream.(*processStream).waitDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("direct child was not reaped after Close")
 	}
-	assertStreamProcessReaped(t, descendantPID)
+	// A process group signal terminates descendants, but it does not reap
+	// them. Accept a zombie here: the platform init/subreaper owns that
+	// responsibility once the direct child is gone.
+	assertStreamProcessTerminated(t, descendantPID)
 }
 
-func TestStreamCloseKillsDescendantsAfterParentExit(t *testing.T) {
+func TestStreamCloseAfterParentExitDoesNotWaitForDescendant(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, `sleep 30 & child=$!; printf '%s\n' "$child" > "$1"; exit 0`)
+	stub := writeStub(t, descendantScript(`exit 0`))
 	stream, err := (&ExecRunner{Binary: stub}).Stream(context.Background(), pidFile)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	ps := stream.(*processStream)
-	descendantPID := 0
 	t.Cleanup(func() {
 		_ = stream.Close()
-		if descendantPID > 1 {
-			if p, findErr := os.FindProcess(descendantPID); findErr == nil {
-				_ = p.Kill()
-			}
-		}
+		_ = writeDescendantStopFile(pidFile)
 	})
-	descendantPID = waitForDescendantPID(t, pidFile)
+	descendantPID := waitForDescendantPID(t, pidFile)
 	select {
 	case <-ps.waitDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("direct child was not reaped")
 	}
 
+	// Once the direct child is reaped, Close must not use its PID/PGID
+	// again. Closing the source descriptors still lets Close return even
+	// when a descendant inherited those descriptors.
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
 	}
-	assertStreamProcessReaped(t, descendantPID)
+	if err := writeDescendantStopFile(pidFile); err != nil {
+		t.Fatalf("stop descendant: %v", err)
+	}
+	assertStreamProcessTerminated(t, descendantPID)
 }
 
-func TestStreamCancellationKillsDescendantsWithoutReadOrClose(t *testing.T) {
+func TestStreamCancellationTerminatesDescendantsWithoutReadOrClose(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, `sleep 30 & child=$!; printf '%s\n' "$child" > "$1"; wait "$child"`)
+	stub := writeStub(t, descendantScript(`wait "$child"`))
 	ctx, cancel := context.WithCancel(context.Background())
 	stream, err := (&ExecRunner{Binary: stub}).Stream(ctx, pidFile)
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	ps := stream.(*processStream)
-	descendantPID := 0
 	t.Cleanup(func() {
 		_ = stream.Close()
-		if descendantPID > 1 {
-			if p, findErr := os.FindProcess(descendantPID); findErr == nil {
-				_ = p.Kill()
-			}
-		}
+		_ = writeDescendantStopFile(pidFile)
 	})
-	descendantPID = waitForDescendantPID(t, pidFile)
+	descendantPID := waitForDescendantPID(t, pidFile)
 
 	cancel()
 	select {
@@ -98,12 +92,20 @@ func TestStreamCancellationKillsDescendantsWithoutReadOrClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("direct child was not reaped after cancellation")
 	}
-	assertStreamProcessReaped(t, descendantPID)
+	assertStreamProcessTerminated(t, descendantPID)
+}
+
+func descendantScript(action string) string {
+	return `done="$1.done"; (while [ ! -f "$done" ]; do sleep 0.05; done) & child=$!; printf '%s\n' "$child" > "$1"; ` + action
+}
+
+func writeDescendantStopFile(pidFile string) error {
+	return os.WriteFile(pidFile+".done", nil, 0o600)
 }
 
 func waitForDescendantPID(t *testing.T, path string) int {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(path)
 		if err == nil {
@@ -116,4 +118,24 @@ func waitForDescendantPID(t *testing.T, path string) int {
 	}
 	t.Fatalf("descendant PID was not written to %s", path)
 	return 0
+}
+
+func processState(pid int) (string, error) {
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+func assertStreamProcessTerminated(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	state := ""
+	for time.Now().Before(deadline) {
+		var err error
+		state, err = processState(pid)
+		if err != nil || state == "" || strings.HasPrefix(state, "Z") {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d was not terminated (state %q)", pid, state)
 }

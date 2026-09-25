@@ -15,13 +15,28 @@ import (
 
 // Streamer starts a long-lived CLI invocation (e.g. `logs --follow`)
 // and exposes its combined stdout and stderr as a stream. A terminal
-// process failure is returned by Read. Closing the stream terminates the
-// child process and its process group.
+// process failure is returned by Read after Stream has returned. Closing
+// the stream terminates the direct CLI child. On platforms with process
+// groups it also makes a best-effort attempt to terminate descendants
+// while that child is owned; this package does not reap those descendants.
+// Once the direct child is reaped, Close does not signal its former group.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
 
+// Stream starts a long-lived CLI invocation. Startup errors are returned
+// directly; after a stream is returned, terminal process errors are
+// delivered by Read.
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
+	return r.stream(ctx, streamHooks{}, args...)
+}
+
+type streamHooks struct {
+	afterStart func(*processStream)
+	terminate  func(*exec.Cmd) error
+}
+
+func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...string) (io.ReadCloser, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = 3 * time.Second
@@ -42,20 +57,24 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 	pr, pw := io.Pipe()
+	terminateTree := hooks.terminate
+	if terminateTree == nil {
+		terminateTree = terminateProcessTree
+	}
 	stream := &processStream{
-		ReadCloser:  pr,
-		cmd:         cmd,
-		ctx:         ctx,
-		binary:      bin,
-		args:        append([]string(nil), args...),
-		output:      pw,
-		stderr:      &tailBuffer{},
-		stdoutRead:  stdoutRead,
-		stderrRead:  stderrRead,
-		stdoutWrite: stdoutWrite,
-		stderrWrite: stderrWrite,
-		waitDone:    make(chan struct{}),
-		pumpsDone:   make(chan struct{}),
+		ReadCloser:    pr,
+		cmd:           cmd,
+		ctx:           ctx,
+		binary:        bin,
+		args:          append([]string(nil), args...),
+		output:        pw,
+		stderr:        &tailBuffer{},
+		stdoutRead:    stdoutRead,
+		stderrRead:    stderrRead,
+		startDone:     make(chan struct{}),
+		waitDone:      make(chan struct{}),
+		pumpsDone:     make(chan struct{}),
+		terminateTree: terminateTree,
 	}
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderrWrite
@@ -63,18 +82,38 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	// is the callback used by exec.CommandContext's context watcher.
 	cmd.Cancel = stream.cancel
 	if err := cmd.Start(); err != nil {
+		// Start does not return a usable process on failure. Close the
+		// ownership barrier anyway so no lifecycle caller can wait forever.
+		close(stream.startDone)
+		_ = stdoutWrite.Close()
+		_ = stderrWrite.Close()
 		_ = pr.Close()
 		_ = pw.Close()
 		stream.closeSourceFiles()
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 
-	// The child owns inherited copies of the write ends. Closing the
-	// parent's copies lets the pumps observe EOF when the child exits.
+	// The child owns inherited copies of the write ends. Close the
+	// parent copies explicitly; they remain local to this function and are
+	// deliberately not stored in processStream, so cancellation can never
+	// race ownership of them.
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
-	stream.stdoutWrite = nil
-	stream.stderrWrite = nil
+
+	// Publish ownership only after Start has returned successfully. A
+	// context cancellation delivered by os/exec waits on startDone before
+	// it is allowed to signal the process tree.
+	stream.stateMu.Lock()
+	stream.started = true
+	stream.stateMu.Unlock()
+	close(stream.startDone)
+
+	// The hook is nil in production. It gives package tests a precise
+	// cancellation-during-start interleaving without changing the public
+	// API or relying on scheduler timing.
+	if hooks.afterStart != nil {
+		hooks.afterStart(stream)
+	}
 
 	stream.pumpWG.Add(2)
 	go stream.pump(stdoutRead, false)
@@ -101,10 +140,15 @@ type processStream struct {
 	output *io.PipeWriter
 	stderr *tailBuffer
 
-	stdoutRead  *os.File
-	stderrRead  *os.File
-	stdoutWrite *os.File
-	stderrWrite *os.File
+	// stdoutRead and stderrRead belong to the stream after construction.
+	// The matching write ends are local to Stream and are never stored
+	// here; this keeps endpoint ownership immutable across cancellation.
+	stdoutRead *os.File
+	stderrRead *os.File
+
+	// startDone is closed after a successful Start and state publication.
+	// It prevents a context callback from inspecting a half-started Cmd.
+	startDone chan struct{}
 
 	waitOnce sync.Once
 	waitDone chan struct{}
@@ -121,9 +165,12 @@ type processStream struct {
 
 	terminateOnce sync.Once
 	terminateErr  error
+	terminateTree func(*exec.Cmd) error
 
 	closeOnce sync.Once
 	stateMu   sync.Mutex
+	started   bool
+	reaped    bool
 	closed    bool
 	cancelled bool
 	ctxErr    error
@@ -161,6 +208,10 @@ func (s *processStream) wait() {
 		s.stateMu.Lock()
 		s.waitErr = err
 		s.ctxErr = ctxErr
+		// Cmd.Wait has returned, so this process is no longer ours to
+		// signal. In particular, never use its PID/PGID after this point:
+		// the kernel may immediately reuse either identifier.
+		s.reaped = true
 		s.stateMu.Unlock()
 		close(s.waitDone)
 	})
@@ -179,20 +230,38 @@ func (s *processStream) requestTermination(cancelled bool) error {
 	}
 	s.stateMu.Unlock()
 
+	// Start owns cmd.Process until it has published a successful start.
+	// Waiting on the barrier also makes cancellation before Start returns
+	// safe without reading a concurrently initialized exec.Cmd.
+	<-s.startDone
+	s.stateMu.Lock()
+	if !s.started || s.reaped {
+		s.stateMu.Unlock()
+		s.closeReader()
+		s.closeSourceFiles()
+		return os.ErrProcessDone
+	}
+
+	// Serialize the ownership check with the tree signal. Once Wait marks
+	// the child reaped, a delayed Close or context callback observes the
+	// reaped flag and cannot signal a stale PID/PGID.
+	s.terminateOnce.Do(func() {
+		s.terminateErr = s.terminateTree(s.cmd)
+	})
+	terminateErr := s.terminateErr
+	s.stateMu.Unlock()
+
 	// Kill the whole process group first so an output-heavy descendant
 	// cannot keep the CLI alive. closeSourceFiles then releases pumps that
 	// may be blocked writing to the public reader.
-	s.terminateOnce.Do(func() {
-		s.terminateErr = terminateProcessTree(s.cmd)
-	})
 	s.closeReader()
 	s.closeSourceFiles()
-	return s.terminateErr
+	return terminateErr
 }
 
 func (s *processStream) closeSourceFiles() {
 	s.sourceCloseOnce.Do(func() {
-		for _, f := range []*os.File{s.stdoutRead, s.stderrRead, s.stdoutWrite, s.stderrWrite} {
+		for _, f := range []*os.File{s.stdoutRead, s.stderrRead} {
 			if f != nil {
 				_ = f.Close()
 			}

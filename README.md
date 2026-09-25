@@ -139,6 +139,25 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 
+### Streaming logs
+
+`FollowLogs` returns an `io.ReadCloser` after the backend CLI starts. Read
+until EOF; if the CLI later exits unsuccessfully, the terminal error (and
+its `CLIError` details) is returned by `Read`, not by `FollowLogs`. Calling
+`Close` or cancelling the context is an intentional termination; a
+subsequent `Read` may return EOF or the context error instead.
+
+The library always waits for and reaps the direct CLI child. On Unix-like
+systems it also makes a best-effort attempt to terminate descendants in
+that child's process group, but it does not reap descendants: a descendant
+that becomes a zombie is the platform init/subreaper's responsibility.
+If the direct child has already exited and been reaped, Close does not
+signal its former process group, so descendants may outlive it. Detached
+or reparented descendants are outside the group guarantee. On Windows,
+`taskkill /T` is the best-effort descendant boundary; on other platforms
+only the direct child is covered. Do not rely on descendant cleanup when
+a CLI deliberately detaches helpers.
+
 ## Image pulls
 
 `Run` checks the image before starting and fetches it when missing

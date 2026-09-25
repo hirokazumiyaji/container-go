@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"os/exec"
 	"runtime"
 	"strconv"
@@ -189,7 +190,7 @@ func TestStreamReapsChildAfterExitWithoutReadOrClose(t *testing.T) {
 	if got := ps.waitCalls.Load(); got != 1 {
 		t.Fatalf("wait calls = %d, want exactly one", got)
 	}
-	assertStreamProcessReaped(t, pid)
+	assertStreamDirectChildReaped(t, pid)
 }
 
 func TestStreamReapsChildAfterCancellationWithoutClose(t *testing.T) {
@@ -210,10 +211,86 @@ func TestStreamReapsChildAfterCancellationWithoutClose(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("child was not reaped after cancellation without a Read or Close")
 	}
-	assertStreamProcessReaped(t, pid)
+	assertStreamDirectChildReaped(t, pid)
 	_, readErr := io.ReadAll(stream)
 	if !errors.Is(readErr, context.Canceled) {
 		t.Fatalf("ReadAll error = %v, want context.Canceled", readErr)
+	}
+}
+
+func TestStreamCancellationDuringStartUsesImmutableEndpointOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	terminateEntered := make(chan struct{})
+	releaseTerminate := make(chan struct{})
+	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
+	hooks := streamHooks{
+		afterStart: func(*processStream) {
+			cancel()
+			select {
+			case <-terminateEntered:
+			case <-time.After(5 * time.Second):
+				t.Errorf("context cancellation did not reach process termination")
+			}
+		},
+		terminate: func(cmd *exec.Cmd) error {
+			close(terminateEntered)
+			<-releaseTerminate
+			return terminateProcessTree(cmd)
+		},
+	}
+
+	stream, err := r.stream(ctx, hooks, "logs", "--follow", "x")
+	close(releaseTerminate)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped after cancellation during start")
+	}
+	if _, err := io.ReadAll(stream); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
+	}
+}
+
+func TestStreamDelayedCloseAndCancelDoNotSignalAfterReap(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	signaled := make(chan struct{}, 1)
+	r := &ExecRunner{Binary: writeStub(t, `exit 0`)}
+	hooks := streamHooks{
+		terminate: func(*exec.Cmd) error {
+			signaled <- struct{}{}
+			return nil
+		},
+	}
+	stream, err := r.stream(ctx, hooks, "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	// Simulate a context callback and a caller Close arriving after the
+	// direct child has been waited. Neither may signal the old PID/PGID.
+	cancel()
+	if err := ps.requestTermination(true); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("late cancellation error = %v, want os.ErrProcessDone", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	select {
+	case <-signaled:
+		t.Fatal("late lifecycle operation signaled a reaped process")
+	default:
 	}
 }
 
@@ -267,10 +344,10 @@ func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
 	if got := ps.waitCalls.Load(); got != 1 {
 		t.Fatalf("wait calls = %d, want exactly one", got)
 	}
-	assertStreamProcessReaped(t, pid)
+	assertStreamDirectChildReaped(t, pid)
 }
 
-func assertStreamProcessReaped(t *testing.T, pid int) {
+func assertStreamDirectChildReaped(t *testing.T, pid int) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("the process-state probe uses Unix ps; Windows termination is guarded by taskkill")

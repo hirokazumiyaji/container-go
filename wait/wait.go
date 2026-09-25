@@ -28,7 +28,8 @@ type Target interface {
 	Endpoint(ctx context.Context, port string) (string, error)
 	// Running reports whether the container is still running.
 	Running(ctx context.Context) (bool, error)
-	// FollowLogs streams log output; Close releases the stream.
+	// FollowLogs streams log output; Close releases the stream. A
+	// terminal CLI failure is returned by Read after the stream starts.
 	FollowLogs(ctx context.Context) (io.ReadCloser, error)
 	// ExecCommand runs a command in the container and returns its
 	// exit code.

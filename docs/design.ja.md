@@ -128,6 +128,7 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
+func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
@@ -246,12 +247,25 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 ホストポートを消費しない既定設計により、並列数の上限はホストのリソースだけで決まる。
 
 **ストリームを有限に保つ**。
-`Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
+`FollowLogs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返す。
+`Close` またはコンテキスト取消では、直接の CLI 子プロセスを終了して回収します。
+Unix 系では子プロセスのグループへベストエフォートの終了信号を送りますが、子孫は回収しません。
+子孫がゾンビになった場合の回収は OS の init または subreaper の責務です。
+直接の子が既に回収済みなら、`Close` は元のプロセスグループに信号を送らないため、子孫が生き残ることがあります。
+デタッチや再親付けされた子孫はグループの保証外です。
+Windows では Job Object ではなく `taskkill /T` によるベストエフォートの境界を使います。
+その他の対応 OS では直接の子だけを対象とします。
 ForLog が診断用に保持するログは 1MiB を上限とする。
+
+ストリームのエラーは 2 つの段階に分かれる。
+`Stream` と公開 API の `FollowLogs` は起動エラーを返す。
+ストリームを返した後の CLI 終了エラーは `Read` から返るため、呼び出し側は必ず EOF まで読む必要がある。
+`Close` とコンテキスト取消は意図的な終了経路なので、EOF またはコンテキストエラーになることがある。
 
 **すべての CLI 呼び出しに期限を付ける**。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
-コンテキスト取消時は子プロセスへ SIGKILL を送って回収し、ゾンビとハングを残さない。
+コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。
+子孫へのグループ信号または `taskkill` はベストエフォートであり、子孫の回収を保証するものではない。
 
 ## エラー処理
 
@@ -298,7 +312,7 @@ type Runner interface {
 本番コードが非 nil を前提とする依存には、テストでも必ず実体(フェイク)を渡す。
 
 **統合テスト**：ビルドタグ `integration` で分離し、実機(macOS 26、Apple Container 起動済み)でのみ実行する。
-起動、接続、exec、コピー、クリーンアップ、watchdog(子プロセスを SIGKILL してリーパーの動作を確認)を通しで検証する。
+起動、接続、exec、コピー、クリーンアップ、watchdog(テストプロセスを SIGKILL してから登録済みコンテナを削除するか観察)を通しで検証する。
 テスト冒頭で `container system status` を確認し、未起動なら skip する。
 
 **CI**：ユニットテストと `go vet` はプッシュごとに GitHub Actions(macos ランナーで可、Apple Container 不要)で実行する。

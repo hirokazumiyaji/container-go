@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -48,32 +47,48 @@ func (appleEngine) probe() cli.Probe {
 }
 
 func appleProbeUnavailable(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "system" {
+	branches := backendCLIErrorBranches(err, "container")
+	if len(branches) == 0 {
 		return false
 	}
-	if cli.IsProbeConfigurationError(err) || cli.IsNonLivenessError(err) {
+	// A reachable daemon can fail for client-side configuration or
+	// authentication reasons. Those diagnostics veto every probe branch.
+	if cli.IsProbeConfigurationError(err) {
 		return false
 	}
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
-		for _, fragment := range []string{
-			"xpc connection",
-			"container-apiserver",
-			"plugins are unavailable",
-			"start the container system services",
-			"system is not running",
-			"system service is not running",
-			"apiserver is not running",
-			"not registered with launchd",
-			"connection refused",
-		} {
-			if strings.Contains(line, fragment) {
+	for _, branch := range branches {
+		if branch.ctx.operation != "system" {
+			continue
+		}
+		stderr, stdout := branchLines(branch, true)
+		for _, line := range stderr {
+			if appleProbeLivenessText(line) {
 				return true
 			}
+		}
+		for _, line := range stdout {
+			if appleProbeLivenessText(line) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func appleProbeLivenessText(line string) bool {
+	for _, fragment := range []string{
+		"xpc connection",
+		"container-apiserver",
+		"plugins are unavailable",
+		"start the container system services",
+		"system is not running",
+		"system service is not running",
+		"apiserver is not running",
+		"not registered with launchd",
+		"connection refused",
+	} {
+		if strings.Contains(line, fragment) {
+			return true
 		}
 	}
 	return false
@@ -89,12 +104,15 @@ func (appleEngine) parseRunID([]byte) string { return "" }
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, newInspectTargetNotFound(id, "empty inspect output")
+	}
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
 	for _, c := range containers {
-		if c.ID != id {
+		if !appleInspectTargetMatches(c, id) {
 			continue
 		}
 		info := &engineInfo{
@@ -115,7 +133,20 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, newInspectTargetNotFound(id, "inspect output did not contain the requested target")
+}
+
+func appleInspectTargetMatches(c inspect.Container, target string) bool {
+	target = strings.TrimPrefix(strings.TrimSpace(target), "/")
+	if target == "" {
+		return false
+	}
+	for _, value := range []string{c.ID, c.Name, c.Configuration.ID, c.Configuration.Name} {
+		if strings.TrimPrefix(strings.TrimSpace(value), "/") == target {
+			return true
+		}
+	}
+	return false
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
@@ -200,14 +231,15 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 // imageMissing matches only Apple's image-inspect error. A pull failure
 // with similar text is not evidence that the local image check was missing.
 func (appleEngine) imageMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "image inspect" {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		if branch.ctx.operation != "image inspect" {
+			continue
+		}
+		if hasBranchImageLine(branch, appleStderrImageNotFound, branch.ctx.target, true) {
+			return true
+		}
 	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		rest, ok := strings.CutPrefix(line, appleStderrImageNotFound)
-		return ok && cliTargetListMatches(rest, ctx.target)
-	})
+	return false
 }
 
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
@@ -287,13 +319,17 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 // create/run command. Other commands may legitimately contain the words
 // "already" or "exists" in application/configuration diagnostics.
 func (appleEngine) nameConflict(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "run" {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		if branch.ctx.operation != "run" {
+			continue
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			return appleNameConflictLine(line, branch.ctx.target)
+		}) {
+			return true
+		}
 	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		return appleNameConflictLine(line, ctx.target)
-	})
+	return false
 }
 
 func appleNameConflictLine(line, target string) bool {
@@ -315,35 +351,42 @@ func appleNameConflictLine(line, target string) bool {
 // an absent container. The command and target are required so an app that
 // prints "container not found" cannot be mistaken for a backend result.
 func (appleEngine) containerMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		switch branch.ctx.operation {
+		case "inspect":
+			if hasBranchLine(branch, func(line string) bool {
+				rest, ok := strings.CutPrefix(line, "container not found:")
+				return ok && cliTargetListMatches(rest, branch.ctx.target)
+			}) {
+				return true
+			}
+		case "exec":
+			if hasBranchLine(branch, func(line string) bool {
+				return appleExecMissingLine(line, branch.ctx.target)
+			}) {
+				return true
+			}
+		case "stop":
+			if hasBranchLine(branch, func(line string) bool {
+				return appleStateMissingLine(line, branch.ctx.target, "failed to stop container:")
+			}) {
+				return true
+			}
+		case "delete", "rm":
+			if hasBranchLine(branch, func(line string) bool {
+				return appleStateMissingLine(line, branch.ctx.target, "failed to delete container:")
+			}) {
+				return true
+			}
+		case "logs":
+			if hasBranchLine(branch, func(line string) bool {
+				return appleLogsMissingLine(line, branch.ctx.target)
+			}) {
+				return true
+			}
+		}
 	}
-	switch ctx.operation {
-	case "inspect":
-		return hasCLIErrorLine(err, func(line string) bool {
-			rest, ok := strings.CutPrefix(line, "container not found:")
-			return ok && cliTargetListMatches(rest, ctx.target)
-		})
-	case "exec":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleExecMissingLine(line, ctx.target)
-		})
-	case "stop":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleStateMissingLine(line, ctx.target, "failed to stop container:")
-		})
-	case "delete", "rm":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleStateMissingLine(line, ctx.target, "failed to delete container:")
-		})
-	case "logs":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleLogsMissingLine(line, ctx.target)
-		})
-	default:
-		return false
-	}
+	return false
 }
 
 func appleExecMissingLine(line, target string) bool {

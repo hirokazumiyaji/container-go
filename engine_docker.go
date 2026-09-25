@@ -70,32 +70,46 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 func dockerProbeUnavailable(err error) bool {
-	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "version" {
+	branches := backendCLIErrorBranches(err, "docker")
+	if len(branches) == 0 {
 		return false
 	}
 	// A reachable daemon can fail the client for TLS, certificate, SSH,
 	// proxy, authentication, or endpoint-configuration reasons. None of
 	// those failures prove that the daemon is stopped.
-	if cli.IsProbeConfigurationError(err) || cli.IsNonLivenessError(err) {
+	if cli.IsProbeConfigurationError(err) {
 		return false
 	}
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
-		if dockerDesktopStartupFailure(line) {
-			return true
+	for _, branch := range branches {
+		if branch.ctx.operation != "version" {
+			continue
 		}
-		for _, fragment := range []string{
-			"cannot connect to the docker daemon",
-			"is the docker daemon running",
-			"connection refused",
-		} {
-			if strings.Contains(line, fragment) {
+		stderr, stdout := branchLines(branch, true)
+		for _, line := range stderr {
+			if dockerProbeLivenessText(line) {
 				return true
 			}
+		}
+		for _, line := range stdout {
+			if dockerProbeLivenessText(line) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func dockerProbeLivenessText(line string) bool {
+	if dockerDesktopStartupFailure(line) {
+		return true
+	}
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"connection refused",
+	} {
+		if strings.Contains(line, fragment) {
+			return true
 		}
 	}
 	return false
@@ -229,14 +243,25 @@ type dockerInspect struct {
 }
 
 func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, newInspectTargetNotFound(id, "empty inspect output")
+	}
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	var c dockerInspect
+	found := false
+	for _, candidate := range containers {
+		if dockerInspectTargetMatches(candidate, id) {
+			c = candidate
+			found = true
+			break
+		}
 	}
-	c := containers[0]
+	if !found {
+		return nil, newInspectTargetNotFound(id, "inspect output did not contain the requested target")
+	}
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
@@ -272,6 +297,22 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+func dockerInspectTargetMatches(c dockerInspect, target string) bool {
+	target = strings.TrimPrefix(strings.TrimSpace(target), "/")
+	if target == "" {
+		return false
+	}
+	if dockerIDMatches(c.ID, target) {
+		return true
+	}
+	return strings.TrimPrefix(strings.TrimSpace(c.Name), "/") == target
+}
+
+func dockerIDMatches(got, want string) bool {
+	return strings.TrimPrefix(strings.TrimSpace(got), "sha256:") ==
+		strings.TrimPrefix(strings.TrimSpace(want), "sha256:")
 }
 
 // dockerState maps Docker's status vocabulary onto State.
@@ -372,14 +413,15 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 // imageMissing matches only Docker's image-inspect response. Pull errors
 // and arbitrary application output are not local-store absence evidence.
 func (dockerEngine) imageMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "image inspect" {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "docker") {
+		if branch.ctx.operation != "image inspect" {
+			continue
+		}
+		if hasBranchImageLine(branch, dockerStderrNoSuchImage, branch.ctx.target, true) {
+			return true
+		}
 	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		rest, ok := strings.CutPrefix(line, dockerStderrNoSuchImage)
-		return ok && cliTargetListMatches(rest, ctx.target)
-	})
+	return false
 }
 
 func (dockerEngine) parseImageExists(data []byte, _ string) bool {
@@ -406,13 +448,17 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 // create/run command. A delete or application command containing the same
 // words is not evidence that this library lost a name race.
 func (dockerEngine) nameConflict(err error) bool {
-	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "run" {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "docker") {
+		if branch.ctx.operation != "run" {
+			continue
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			return dockerNameConflictLine(line, branch.ctx.target)
+		}) {
+			return true
+		}
 	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		return dockerNameConflictLine(line, ctx.target)
-	})
+	return false
 }
 
 func dockerNameConflictLine(line, target string) bool {
@@ -444,21 +490,22 @@ func sameDockerContainerName(got, want string) bool {
 // response. Docker uses "no such object" for inspect and "no such
 // container" for the lifecycle/stream commands.
 func (dockerEngine) containerMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "docker")
-	if !ok {
-		return false
+	for _, branch := range backendCLIErrorBranches(err, "docker") {
+		prefix := ""
+		switch branch.ctx.operation {
+		case "inspect":
+			prefix = dockerStderrNoSuchObj
+		case "exec", "stop", "rm", "logs":
+			prefix = dockerStderrNoSuchCtr
+		default:
+			continue
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			rest, ok := strings.CutPrefix(line, prefix)
+			return ok && cliTargetListMatches(rest, branch.ctx.target)
+		}) {
+			return true
+		}
 	}
-	prefix := ""
-	switch ctx.operation {
-	case "inspect":
-		prefix = dockerStderrNoSuchObj
-	case "exec", "stop", "rm", "logs":
-		prefix = dockerStderrNoSuchCtr
-	default:
-		return false
-	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		rest, ok := strings.CutPrefix(line, prefix)
-		return ok && cliTargetListMatches(rest, ctx.target)
-	})
+	return false
 }

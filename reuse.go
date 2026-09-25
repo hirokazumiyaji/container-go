@@ -236,25 +236,29 @@ func namedContainer(cfg *config, id string) *Container {
 // it is commonly emitted by the application process and must remain an
 // ordinary original error.
 func createRaceMissing(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "run" {
-		return false
-	}
-	return hasCLIErrorLine(err, func(line string) bool {
-		if appleIDMissingLine(line, ctx.target) {
-			return true
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		if branch.ctx.operation != "run" {
+			continue
 		}
-		for _, wrapper := range []string{
-			"failed to bootstrap container:",
-			"failed to run container:",
-		} {
-			rest, found := strings.CutPrefix(line, wrapper)
-			if found && appleIDMissingLine(strings.TrimSpace(rest), ctx.target) {
+		if hasBranchLine(branch, func(line string) bool {
+			if appleIDMissingLine(line, branch.ctx.target) {
 				return true
 			}
+			for _, wrapper := range []string{
+				"failed to bootstrap container:",
+				"failed to run container:",
+			} {
+				rest, found := strings.CutPrefix(line, wrapper)
+				if found && appleIDMissingLine(strings.TrimSpace(rest), branch.ctx.target) {
+					return true
+				}
+			}
+			return false
+		}) {
+			return true
 		}
-		return false
-	})
+	}
+	return false
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted

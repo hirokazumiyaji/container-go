@@ -342,6 +342,7 @@ func TestClassifyProbeFailureMatrix(t *testing.T) {
 					name:           "probe deadline error",
 					originalStderr: "command failed",
 					probeErr:       context.DeadlineExceeded,
+					wantSystemDown: true,
 				},
 			}
 

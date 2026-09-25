@@ -36,11 +36,35 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+var errInspectTargetNotFound = errors.New("inspect target not found")
+
+type inspectTargetNotFoundError struct {
+	target string
+	detail string
+}
+
+func (e *inspectTargetNotFoundError) Error() string {
+	if e.detail == "" {
+		return fmt.Sprintf("inspect target %q not found", e.target)
+	}
+	return fmt.Sprintf("inspect target %q not found: %s", e.target, e.detail)
+}
+
+func (e *inspectTargetNotFoundError) Unwrap() error { return errInspectTargetNotFound }
+
+func newInspectTargetNotFound(target, detail string) error {
+	return &inspectTargetNotFoundError{target: target, detail: detail}
+}
+
+func wrapInspectTargetNotFound(err error) error {
+	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. It is retained for callers that do not have an engine context;
 // the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
-	if err == nil {
+	if err == nil || cli.IsDefinitiveNonLivenessError(err) {
 		return false
 	}
 	if errors.Is(err, ErrContainerNotFound) {
@@ -64,7 +88,10 @@ func isNotFound(err error) bool {
 // separate from isNotFound prevents a Docker error from being accepted by
 // an Apple operation (and vice versa) when callers do have engine context.
 func isNotFoundFor(eng engine, err error) bool {
-	if err == nil {
+	if err == nil || cli.IsDefinitiveNonLivenessError(err) {
+		return false
+	}
+	if eng != nil && isAmbiguousApplicationError(eng, err) {
 		return false
 	}
 	if errors.Is(err, ErrContainerNotFound) {

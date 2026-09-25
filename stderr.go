@@ -28,24 +28,61 @@ type cliErrorContext struct {
 	target    string
 }
 
-// backendCLIError returns the first CLIError in err when it can belong to
-// backend. CLIError defines an empty Binary as the historical `container`
-// executable, so a Docker classifier never accepts an error without an
-// explicit Docker binary. ExecRunner always records the executable name.
-func backendCLIError(err error, backend string) (cliErrorContext, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return cliErrorContext{}, false
+type cliErrorBranch struct {
+	ctx    cliErrorContext
+	stdout string
+	stderr string
+}
+
+// backendCLIErrorBranches returns every matching CLIError branch in an
+// error tree. A definitive joined client-side failure vetoes all absence
+// matching before any branch is considered. Stdout is retained on matching
+// branches because diagnosticError carries it as a side channel while
+// preserving the public CLIError shape.
+func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
+	if err == nil || cli.IsDefinitiveNonLivenessError(err) {
+		return nil
 	}
-	if !cliBinaryMatches(cliErr.Binary, backend) {
-		return cliErrorContext{}, false
+	var branches []cliErrorBranch
+	var walk func(error, string)
+	walk = func(cur error, inheritedStdout string) {
+		if cur == nil {
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" && inheritedStdout == "" {
+				inheritedStdout = stdout
+			}
+			for _, child := range joined.Unwrap() {
+				walk(child, inheritedStdout)
+			}
+			return
+		}
+		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" && inheritedStdout == "" {
+			inheritedStdout = stdout
+		}
+		if cliErr, ok := cur.(*cli.CLIError); ok {
+			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
+				return
+			}
+			operation := commandOperation(cliErr.Args)
+			branches = append(branches, cliErrorBranch{
+				ctx: cliErrorContext{
+					err:       cliErr,
+					operation: operation,
+					target:    commandTarget(cliErr.Args, operation),
+				},
+				stdout: inheritedStdout,
+				stderr: cliErr.Stderr,
+			})
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap(), inheritedStdout)
+		}
 	}
-	operation := commandOperation(cliErr.Args)
-	return cliErrorContext{
-		err:       cliErr,
-		operation: operation,
-		target:    commandTarget(cliErr.Args, operation),
-	}, true
+	walk(err, "")
+	return branches
 }
 
 func cliBinaryMatches(got, want string) bool {
@@ -128,40 +165,23 @@ func firstPositional(args []string, start int, valueOptions ...string) string {
 	return ""
 }
 
-// cliErrorLines returns normalized, non-empty stderr lines. Only wrappers
-// verified for the selected binary and operation are removed. In
-// particular, Docker exec never treats a workload's generic "Error: " line
-// as backend evidence; arbitrary application/configuration prefixes remain
-// visible and cannot satisfy an anchored backend matcher.
-func cliErrorLines(err error) ([]string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return nil, false
+func branchLines(branch cliErrorBranch, includeStdout bool) (stderr, stdout []string) {
+	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+	for _, line := range strings.Split(branch.stderr, "\n") {
+		line = normalizeCLIErrorLine(line, allowGenericError)
+		if line != "" {
+			stderr = append(stderr, line)
+		}
 	}
-
-	allowGenericError := genericErrorWrapperAllowed(cliErr)
-	operation := commandOperation(cliErr.Args)
-	streams := []string{cliErr.Stderr}
-	// Status/version CLIs may report liveness on stdout. Workload stdout
-	// remains excluded from object matchers and Exec infrastructure checks.
-	if operation == "system" || operation == "version" {
-		streams = append(streams, diagnosticStdout(err))
-	}
-	var lines []string
-	for _, stream := range streams {
-		for _, line := range strings.Split(stream, "\n") {
+	if includeStdout {
+		for _, line := range strings.Split(branch.stdout, "\n") {
 			line = normalizeCLIErrorLine(line, allowGenericError)
 			if line != "" {
-				lines = append(lines, line)
+				stdout = append(stdout, line)
 			}
 		}
 	}
-	return lines, true
-}
-
-func diagnosticStdout(err error) string {
-	stdout, _, _ := cli.DiagnosticText(err)
-	return stdout
+	return stderr, stdout
 }
 
 func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
@@ -180,19 +200,23 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	}
 }
 
-func normalizeCLIErrorLine(line string, allowGenericError bool) string {
-	line = strings.ToLower(strings.TrimSpace(line))
+// trimCLIErrorWrapper removes only verified CLI wrappers while preserving
+// the case of the diagnostic payload. Image target comparisons need that
+// case; backend phrase matching can use normalizeCLIErrorLine below.
+func trimCLIErrorWrapper(line string, allowGenericError bool) string {
+	line = strings.TrimSpace(line)
 	for {
+		lower := strings.ToLower(line)
 		changed := false
 		for _, prefix := range cliErrorLinePrefixes {
-			if strings.HasPrefix(line, prefix) {
-				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if strings.HasPrefix(lower, prefix) {
+				line = strings.TrimSpace(line[len(prefix):])
 				changed = true
 				break
 			}
 		}
-		if allowGenericError && strings.HasPrefix(line, "error: ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+		if allowGenericError && strings.HasPrefix(lower, "error: ") {
+			line = strings.TrimSpace(line[len("error: "):])
 			changed = true
 		}
 		if !changed {
@@ -201,13 +225,34 @@ func normalizeCLIErrorLine(line string, allowGenericError bool) string {
 	}
 }
 
-func hasCLIErrorLine(err error, match func(string) bool) bool {
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
+func normalizeCLIErrorLine(line string, allowGenericError bool) string {
+	return strings.ToLower(trimCLIErrorWrapper(line, allowGenericError))
+}
+
+func hasBranchLine(branch cliErrorBranch, match func(string) bool) bool {
+	stderr, _ := branchLines(branch, false)
+	for _, line := range stderr {
 		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBranchImageLine(branch cliErrorBranch, prefix, target string, exact bool) bool {
+	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+	for _, raw := range strings.Split(branch.stderr, "\n") {
+		line := trimCLIErrorWrapper(raw, allowGenericError)
+		lower := strings.ToLower(line)
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		rest := line[len(prefix):]
+		if exact {
+			if cliTargetListExactMatches(rest, target) {
+				return true
+			}
+		} else if cliTargetListMatches(rest, target) {
 			return true
 		}
 	}
@@ -224,49 +269,100 @@ func sameCLITarget(got, want string) bool {
 }
 
 // cliTargetListMatches accepts one or more missing IDs, but rejects an
-// arbitrary explanatory suffix. This keeps application diagnostics from
-// looking like a backend object error.
+// arbitrary explanatory suffix. Container identifiers are matched
+// case-insensitively for compatibility with backend display formatting.
 func cliTargetListMatches(rest, want string) bool {
+	return cliTargetListMatchesWith(rest, want, strings.EqualFold)
+}
+
+// cliTargetListExactMatches is used for image references, whose target
+// spelling is case-sensitive.
+func cliTargetListExactMatches(rest, want string) bool {
+	return cliTargetListMatchesWith(rest, want, func(a, b string) bool { return a == b })
+}
+
+func cliTargetListMatchesWith(rest, want string, equal func(string, string) bool) bool {
 	rest = strings.TrimSpace(rest)
 	if rest == "" {
 		return false
 	}
 	found := false
+	want = strings.Trim(want, `"'`)
 	for _, part := range strings.Split(rest, ",") {
 		part = strings.Trim(strings.TrimSpace(part), `"'`)
 		if part == "" || strings.ContainsAny(part, " \t\r\n") {
 			return false
 		}
-		if want == "" || strings.EqualFold(part, strings.Trim(want, `"'`)) {
+		if want == "" || equal(part, want) {
 			found = true
 		}
 	}
 	return found
 }
 
-// ambiguousContainerNotFound recognizes generic application wording. Real
-// Apple backend forms are handled by the command-specific matchers.
-func ambiguousContainerNotFound(err error) bool {
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
-		if strings.Contains(line, "container not found") &&
-			!strings.Contains(line, "container with id") {
+// ambiguousNoSuchLine recognizes application wording that resembles an
+// object-absence message without satisfying the selected backend's
+// command-specific matcher.
+func ambiguousNoSuchLine(line string) bool {
+	line = strings.ToLower(line)
+	for _, fragment := range []string{
+		"container not found",
+		"no such container",
+		"no such object",
+		"image not found",
+		"no such image",
+	} {
+		if strings.Contains(line, fragment) {
 			return true
 		}
 	}
 	return false
 }
 
+func hasNonCLIAmbiguousObjectText(err error) bool {
+	if err == nil || errors.Is(err, ErrContainerNotFound) {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if hasNonCLIAmbiguousObjectText(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if _, ok := err.(*cli.CLIError); ok {
+		return false
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return false
+	}
+	if ambiguousNoSuchLine(err.Error()) {
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return hasNonCLIAmbiguousObjectText(wrapped.Unwrap())
+	}
+	return false
+}
+
 func isAmbiguousApplicationError(eng engine, err error) bool {
-	if eng == nil || err == nil {
+	if eng == nil || err == nil || cli.IsDefinitiveNonLivenessError(err) {
 		return false
 	}
-	ctx, ok := backendCLIError(err, eng.binary())
-	if !ok {
-		return false
+	branches := backendCLIErrorBranches(err, eng.binary())
+	if len(branches) == 0 {
+		return hasNonCLIAmbiguousObjectText(err)
 	}
-	return ctx.operation != "inspect" && ambiguousContainerNotFound(err)
+	for _, branch := range branches {
+		verified := eng.containerMissing(branch.ctx.err) || eng.imageMissing(branch.ctx.err) || eng.nameConflict(branch.ctx.err)
+		if verified || createRaceMissing(branch.ctx.err) {
+			continue
+		}
+		if hasBranchLine(branch, ambiguousNoSuchLine) {
+			return true
+		}
+	}
+	return hasNonCLIAmbiguousObjectText(err)
 }

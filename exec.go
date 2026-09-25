@@ -110,16 +110,27 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if cli.IsOperationTimeoutError(err) {
 		return cliErr.ExitCode, output, c.classify(ctx, err)
 	}
+	// Textual cancellation, permission, and configuration diagnostics are
+	// structured client-side failures even when the CLI also reports a
+	// positive application-style status. Do not turn them into a normal
+	// application result.
+	if cli.IsDefinitiveNonLivenessError(err) {
+		return cliErr.ExitCode, output, err
+	}
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFoundFor(c.eng, err) && !maybeInfraExecErr(c.eng, err) {
 		return cliErr.ExitCode, output, nil
 	}
-	if c.execContainerRunning(ctx) {
+	verification := c.verifyExecContainer(ctx)
+	if verification.err == nil && verification.state == StateRunning {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	if verification.err != nil {
+		return 0, nil, errors.Join(err, verification.err)
+	}
+	return 0, nil, errors.Join(err, &execInspectionStateError{state: verification.state})
 }
 
 func isExecContextError(err error) bool {
@@ -130,41 +141,93 @@ func isExecContextError(err error) bool {
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
 func maybeInfraExecErr(eng engine, err error) bool {
-	ctx, ok := backendCLIError(err, eng.binary())
-	if !ok || ctx.operation != "exec" {
-		return false
-	}
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return true
-	}
-	for _, line := range lines {
-		for _, sub := range []string{
-			"daemon", "cannot connect", "connection refused", "xpc",
-			"backend", "socket", "system is not running", "is not running",
-			"stopped", "paused", "restarting", "removing",
-		} {
-			if strings.Contains(line, sub) {
-				return true
+	for _, branch := range backendCLIErrorBranches(err, eng.binary()) {
+		if branch.ctx.operation != "exec" {
+			continue
+		}
+		stderr, _ := branchLines(branch, false)
+		if len(stderr) == 0 {
+			return true
+		}
+		for _, line := range stderr {
+			for _, sub := range []string{
+				"daemon", "cannot connect", "connection refused", "xpc",
+				"backend", "socket", "system is not running", "is not running",
+				"stopped", "paused", "restarting", "removing",
+			} {
+				if strings.Contains(line, sub) {
+					return true
+				}
 			}
 		}
 	}
 	return false
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context) bool {
+type execInspection struct {
+	state State
+	err   error
+}
+
+type execInspectionStateError struct {
+	state State
+}
+
+type execInspectEmptyError struct {
+	target string
+}
+
+func (e *execInspectEmptyError) Error() string {
+	return fmt.Sprintf("exec verification: empty inspect output for %q", e.target)
+}
+
+func (e *execInspectionStateError) Error() string {
+	return fmt.Sprintf("exec verification: container state is %s", e.state)
+}
+
+// verifyExecContainer returns both the verified state and the precise
+// verification error. A false state is not enough to turn a failure into
+// ErrContainerNotFound: only a structured backend absence is wrapped as
+// such. Parse, empty-output, cancellation, permission, configuration, and
+// transport failures remain visible to the caller.
+func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return false
+		return execInspection{
+			state: StateUnknown,
+			err:   wrapNotFoundFor(c.eng, c.classify(qCtx, err)),
+		}
+	}
+	if len(bytes.TrimSpace(stdout)) == 0 {
+		return execInspection{
+			state: StateUnknown,
+			err:   &execInspectEmptyError{target: c.id},
+		}
 	}
 	info, err := c.eng.parseInspect(stdout, c.id)
 	if err != nil {
-		return false
+		if errors.Is(err, errInspectTargetNotFound) {
+			return execInspection{state: StateUnknown, err: wrapInspectTargetNotFound(err)}
+		}
+		return execInspection{state: StateUnknown, err: err}
 	}
-	return info.state == StateRunning
+	if info == nil {
+		return execInspection{
+			state: StateUnknown,
+			err:   fmt.Errorf("exec verification: inspect returned no state"),
+		}
+	}
+	return execInspection{state: info.state}
+}
+
+// execContainerRunning is retained for package-local compatibility. New
+// verification paths use verifyExecContainer so they do not lose the
+// typed state or error.
+//
+//nolint:unused
+func (c *Container) execContainerRunning(ctx context.Context) bool {
+	result := c.verifyExecContainer(ctx)
+	return result.err == nil && result.state == StateRunning
 }

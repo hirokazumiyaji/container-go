@@ -12,11 +12,14 @@ import (
 // Container is one element of the array both commands emit.
 type Container struct {
 	ID            string        `json:"id"`
+	Name          string        `json:"name"`
 	Configuration Configuration `json:"configuration"`
 	Status        Status        `json:"status"`
 }
 
 type Configuration struct {
+	ID             string            `json:"id"`
+	Name           string            `json:"name"`
 	Image          Image             `json:"image"`
 	Labels         map[string]string `json:"labels"`
 	PublishedPorts []PublishedPort   `json:"publishedPorts"`

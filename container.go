@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -466,7 +467,11 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, c.id)
+	if errors.Is(err, errInspectTargetNotFound) {
+		return nil, wrapInspectTargetNotFound(err)
+	}
+	return info, err
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

@@ -291,7 +291,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if isNonLivenessError(err) &&
-		(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err)) {
+		(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err) || isAmbiguousObjectError(err)) {
 		// The command already identified a precise configuration,
 		// permission, TLS, or other client-side failure. A failed probe
 		// cannot replace that diagnosis with daemon-down.
@@ -302,6 +302,13 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	// an explicit backend predicate can add the sentinel.
 	if IsProbeConfigurationError(probeErr) {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
+	}
+	// A returned deadline is the bounded probe's liveness evidence when
+	// it is the only cause. A joined permission, configuration, or
+	// cancellation cause is a client-side veto and must remain a joined
+	// ordinary failure instead.
+	if isReturnedProbeTimeout(probeErr) && !probeVetoError(probeErr) {
+		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
 	}
 	// A timeout belonging to the bounded probe is evidence that the
 	// backend did not answer, unless the runner reported a distinct
@@ -398,25 +405,43 @@ func isProbeNonLiveness(probeCtx context.Context, err error) bool {
 	// signal itself, not a reason to suppress the liveness sentinel.
 	// Keep a simultaneous client-side diagnostic non-liveness, though.
 	if errors.Is(err, context.DeadlineExceeded) {
-		if probeCtx.Err() == context.DeadlineExceeded {
-			return hasNonContextNonLivenessText(err)
-		}
-		return false
+		return probeVetoError(err)
 	}
 	return true
 }
 
-func hasNonContextNonLivenessText(err error) bool {
+func isReturnedProbeTimeout(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	return errors.As(err, &timeoutErr) && timeoutErr.Timeout()
+}
+
+func probeVetoError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	if IsProbeConfigurationError(err) {
+		return true
+	}
 	s := strings.ToLower(classificationText(err))
-	for _, contextFragment := range []string{
+	for _, fragment := range []string{
 		"context deadline exceeded",
 		"deadline exceeded",
 		"context canceled",
 		"context cancelled",
 	} {
-		s = strings.ReplaceAll(s, contextFragment, "")
+		s = strings.ReplaceAll(s, fragment, "")
 	}
-	return containsNonLivenessText(s)
+	return containsPermissionDiagnostic(s) || containsConfigurationDiagnostic(s) ||
+		containsAuthenticationDiagnostic(s) || containsTransportDiagnostic(s) ||
+		containsContextDiagnostic(s) || containsInvalidOptionDiagnostic(s) ||
+		containsCancellationDiagnostic(s)
 }
 
 func probeUnavailable(probe Probe, err error) bool {
@@ -526,6 +551,14 @@ func IsNonLivenessError(err error) bool {
 	return isNonLivenessError(err)
 }
 
+// IsDefinitiveNonLivenessError reports a concrete client-side failure
+// that must veto backend object-absence and liveness classification. It
+// deliberately excludes ambiguous object wording so a verified backend
+// absence can still be recognized on its own.
+func IsDefinitiveNonLivenessError(err error) bool {
+	return isDefinitiveNonLivenessError(err)
+}
+
 // isNonLivenessError identifies failures that must not be relabeled
 // as a stopped backend, even when the probe happens to fail too.
 func isNonLivenessError(err error) bool {
@@ -534,6 +567,10 @@ func isNonLivenessError(err error) bool {
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 		return true
 	}
 	if IsProbeConfigurationError(err) {
@@ -553,6 +590,10 @@ func isNonLivenessError(err error) bool {
 func IsProbeConfigurationError(err error) bool {
 	if err == nil {
 		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
 	}
 	s := strings.ToLower(classificationText(err))
 	return containsConfigurationDiagnostic(s) ||
@@ -692,6 +733,22 @@ func containsInvalidOptionDiagnostic(s string) bool {
 	return false
 }
 
+func isAmbiguousObjectError(err error) bool {
+	s := strings.ToLower(classificationText(err))
+	for _, fragment := range []string{
+		"container not found",
+		"no such container",
+		"no such object",
+		"image not found",
+		"no such image",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func isDefinitiveNonLivenessError(err error) bool {
 	if err == nil {
 		return false
@@ -700,17 +757,44 @@ func isDefinitiveNonLivenessError(err error) bool {
 		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
 		return true
 	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
 	if IsProbeConfigurationError(err) {
+		return true
+	}
+	if containsCancellationDiagnostic(strings.ToLower(classificationText(err))) {
 		return true
 	}
 	var cliErr *CLIError
 	return errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
 }
 
+func containsCancellationDiagnostic(s string) bool {
+	for _, fragment := range []string{
+		"context canceled",
+		"context cancelled",
+		"deadline exceeded",
+		"operation canceled",
+		"operation cancelled",
+		"command canceled",
+		"command cancelled",
+		"request canceled",
+		"request cancelled",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 func containsNonLivenessText(s string) bool {
 	if containsPermissionDiagnostic(s) || containsConfigurationDiagnostic(s) ||
 		containsContextDiagnostic(s) || containsAuthenticationDiagnostic(s) ||
-		containsTransportDiagnostic(s) || containsInvalidOptionDiagnostic(s) {
+		containsTransportDiagnostic(s) || containsInvalidOptionDiagnostic(s) ||
+		containsCancellationDiagnostic(s) {
 		return true
 	}
 	for _, fragment := range []string{

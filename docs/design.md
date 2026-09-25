@@ -12,6 +12,18 @@ it is not a promise that every phase is still a current API or roadmap.
 The public API and behavior described in the current sections come from
 the implementation and its tests.
 
+The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
+development after that tag. The `v0.2.0` module requires Go 1.27 or
+later; this checkout requires Go 1.23 or later. The released API and the
+current development API are not interchangeable: `LogsOptions` /
+`LogsWithOptions`, the additional `wait.ForHTTP` setters, exported
+`wait.AllStrategy` / `AnyStrategy` with composite `WithStartupTimeout`,
+and the root `CLIError`, `ErrContainerNotFound`, and
+`ErrGenerationReplaced` symbols are development additions after
+`v0.2.0`. The core `Run`, options, lifecycle, endpoints, `Exec`, `Logs`,
+`FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and
+original wait strategies were present in `v0.2.0`.
+
 ## Purpose
 
 **container-go** is a testcontainers-style Go library backed by Apple
@@ -40,8 +52,8 @@ The design decisions below rest on these properties of Apple Container
 (verified against v1.2.x–1.3.x; fixtures cover 1.2.2 and 1.3.0).
 
 - Host requirement: macOS 26 or later on Apple Silicon.
-- Each container boots as a lightweight VM with a real IP on a vmnet
-  bridge (default network `default`, `192.168.64.0/24`). The host can
+- By default, each container boots as a lightweight VM with a real IP on
+  a vmnet bridge (network `default`, `192.168.64.0/24`). The host can
   reach that IP directly, so port publishing (`--publish`) is optional.
 - Everything is operable through the `container` CLI. `ls --format json`
   and `inspect` emit machine-readable JSON (additive fields are ignored
@@ -109,6 +121,16 @@ Module path `github.com/hirokazumiyaji/container-go`, root package
 ### Basic usage
 
 ```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+    "github.com/hirokazumiyaji/container-go/wait"
+)
+
 func TestRedis(t *testing.T) {
     ctx := context.Background()
 
@@ -132,7 +154,9 @@ func TestRedis(t *testing.T) {
 
 ### Run and options
 
-```go
+The following is a signature inventory, not an executable source file:
+
+```text
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
@@ -140,7 +164,7 @@ When `Run` needs to create a container, it applies the pull policy
 before starting it and then completes the wait strategy. The default
 `PullMissing` policy inspects the local image store and issues an
 explicit pull only when the image is absent. `PullAlways` issues an
-explicit pull request for every invocation, and `PullNever` only
+explicit pull for every new-container attempt, and `PullNever` only
 inspects and returns
 `ErrImageNotFound` when the image is absent. Docker's run command also
 passes `--pull=never`, so a pull is not duplicated by the CLI. If a
@@ -148,12 +172,18 @@ post-start operation or wait fails on the non-reuse path, `Run` rolls
 back the container it created before returning the error. Reuse has
 the separate shared-lifetime contract described below.
 
-Options use the functional options pattern. The current options are:
+Options use the functional options pattern. The following inventory
+describes the current development checkout. The core options listed here
+were already available in `v0.2.0`; the additional `LogsOptions` /
+`LogsWithOptions` API and the additional HTTP and composite-wait setters
+described below are not.
 
 - `WithExposedPorts(ports ...string)`: declare the container ports
   (`"6379/tcp"` form) that `MappedPort` and `Endpoint` may resolve.
   Docker automatically publishes these ports; Apple Container resolves
-  them through the container IP by default.
+  them through the container IP by default. On Apple, this is a
+  handle-side endpoint declaration rather than a separate backend
+  `--expose` flag.
 - `WithEnv(env map[string]string)`: environment variables, passed
   through a temporary file rather than command-line values.
 - `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`:
@@ -191,7 +221,10 @@ snapshots.
 
 ### The Container handle
 
-```go
+The following signature inventory includes current-development methods. It is
+not an executable source file:
+
+```text
 type Container struct {
     // unexported fields omitted
 }
@@ -218,11 +251,15 @@ than an infrastructure error; a stopped or unreachable container can
 still return an error. `WithExecEnv`, `WithExecUser`, and
 `WithExecWorkDir` configure an individual exec invocation; environment
 values use the same temporary-file mechanism as `WithEnv`. `Logs` and
-`LogsWithOptions` return finite snapshots, and `FollowLogs` streams
-until its reader is closed or its context is cancelled. `LogsOptions` currently exposes `Tail` and
-`Since` for bounding snapshots. `Terminate` is generation-guarded: it
-refuses to delete a name recycled by another process (see Reuse
-below).
+`LogsWithOptions` return a finite snapshot because the backend command
+finishes, but they do not impose a byte limit by themselves: `Logs`
+requests all output, while `LogsOptions{Tail, Since}` requests a
+backend-selected line or time window when set, whose size still depends
+on the container output. `FollowLogs` is intentionally an unbounded stream and
+continues until its reader is closed or its context is cancelled.
+`LogsOptions` and `LogsWithOptions` are current-development APIs, not
+part of `v0.2.0`. `Terminate` is generation-guarded: it refuses to
+delete a name recycled by another process (see Reuse below).
 
 `Terminate` maps to `container delete --force` on Apple Container and
 `docker rm --force` on Docker, and is idempotent when the container is
@@ -256,8 +293,9 @@ given host address and `MappedPort` the host port.
 
 `MappedPort` and `Endpoint` return `ErrPortNotExposed` for ports that
 are neither declared via `WithExposedPorts` nor explicitly published.
-The declarations also feed wait strategies (the default port of
-`ForListeningPort`, for example).
+The declarations also feed wait strategies: `ForExposedPort` uses the
+first declared port, and an empty `Target.Endpoint` port selects that same
+first declaration.
 
 ## Wait strategies
 
@@ -276,66 +314,97 @@ provides:
 - `wait.ForHTTP(path)`: send an HTTP request to the resolved endpoint
   until its status matches (2xx by default; change it with
   `WithStatusCodeMatcher`). `WithPort` and `WithMethod` select the
-  target; `WithHeaders`, `WithHeader`, `WithBasicAuth`, `WithTLS`,
-  `WithTLSConfig`, and `WithHTTPClient` configure authentication, TLS,
-  or the HTTP client.
+  target. The current development checkout also adds `WithHeaders`,
+  `WithHeader`, `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and
+  `WithHTTPClient`; these setters are not in `v0.2.0`.
 - `wait.ForExec(cmd)`: run a command through the backend CLI until it
   exits with an accepted code (0 by default).
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
-  composition. Child strategies keep their own settings. The composite
+  composition. Child strategies keep their own settings. In the current
+  development checkout, the exported `AllStrategy` and `AnyStrategy`
   types expose `WithStartupTimeout` to bound the whole composition;
-  they do not expose `WithPollInterval`.
+  they do not expose `WithPollInterval`. The `v0.2.0` functions return
+  an interface without a composite timeout setter.
 
 The primitive strategies default to a 60-second startup timeout.
 `ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms;
 `ForExec` polls every 250ms. The current `ForLog` type also exposes
 `WithPollInterval`, but it has no effect because it consumes a stream.
-If a container stops while a connection or HTTP strategy is waiting,
-the wait fails without burning the full timeout. A failed non-reuse
-`Run` wait rolls the container back and attaches a log tail capped at
-1MiB to the error; a reuse wait leaves the shared container in place.
+Connection and HTTP strategies check the stopped state at most once per
+second. `ForExec` does not fail fast while polling; it checks the
+container state when its wait deadline expires. `ForLog` reports a
+stopped container when its stream ends before the pattern appears. A
+failed non-reuse `Run` wait rolls the container back and, when the
+bounded log fetch succeeds, attaches a log tail capped at 1MiB to the
+error; a reuse wait leaves the shared container in place.
 
-The strategy interface:
+The strategy contract is:
 
-```go
+```text
 type Strategy interface {
     WaitUntilReady(ctx context.Context, target Target) error
 }
 ```
 
-`Target` is a small interface (container IP, declared ports, log
-reader, exec, state query) implemented by adapting
-`*container.Container`. The dependency points from `container` to
-`wait`, never back, avoiding an import cycle.
+`Target` is a small interface exposing `Endpoint`, `Running`,
+`FollowLogs`, and `ExecCommand`. `*container.Container` is adapted to
+it. `Target` does not expose `ContainerIP`; connection strategies use the
+resolved endpoint, which is the right abstraction for both direct-IP
+Apple Container and published-port Docker. The dependency points from
+`container` to `wait`, never back, avoiding an import cycle.
 
 ## Cleanup
 
-The library has normal and best-effort abnormal-exit paths.
+The library has separate normal, rollback, failed-create, and
+best-effort abnormal-exit paths. Their error visibility is intentionally
+different.
 
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
 `t.Cleanup`. `TerminateContainer(ctr)` is the nil-safe deferred-style
-helper. On the non-reuse path, if `Run` fails after creating a
-container, its rollback tries to remove that container and reports a
-deletion failure instead of hiding it. Reused containers follow the
-shared-lifetime contract below.
+helper. A termination error from `Cleanup` is sent to the test log;
+`TerminateContainer` returns its error to the caller.
 
-**Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
-`t.Cleanup` run. When the first real CLI container is registered, the
-library lazily starts one external `/bin/sh` watchdog reaper and writes
-registered IDs to its pipe. When the parent closes the pipe, the
-reaper attempts a force-delete for each registered ID and exits. The
-reaper is insurance, not a transactional guarantee: spawn and delete
-failures are best-effort, and it is unavailable on Windows. It does
-nothing while the parent is alive, and its per-entry backend calls
-are bounded by a POSIX `sleep`/`kill` timeout.
+**Post-create rollback**: when a non-reuse `Run` fails while copying
+files or waiting for readiness, it calls `Terminate` for the handle it
+created. If that deletion fails, the returned error includes the
+original failure and a message saying that the container was left
+behind. A wait error also includes a log tail when the bounded log fetch
+succeeds.
 
-For Docker, the reaper is given the immutable container ID when one is
-available; registration is best-effort and a failed registration does
-not fail `Run`. Apple Container has no separate immutable ID, so the
-reaper stores the creation generation and checks the creation label
-before deleting by name. The name-based guarantee is limited to
-cooperating processes using this library on the same host; an external
-CLI delete/recreate cannot be distinguished by name.
+**Failed create**: if the backend `run` command itself fails,
+`cleanupFailedCreate` makes a separate best-effort attempt. It skips
+name conflicts, and only inspects and deletes a container carrying this
+process's managed and session labels. When the creation label is present,
+it must match this run; an absent label is not a mismatch in this
+best-effort path. Errors from its lock, inspect, or delete operations are
+not joined to the returned `Run` error.
+
+**Abnormal exit**: when the parent process exits and its reaper pipe
+closes, an external `/bin/sh` watchdog attempts force-deletion. An
+uncaught process-terminating panic, `SIGKILL`, and `os.Exit` close the
+pipe; a recovered panic does not. The reaper does nothing while the
+parent is alive. It is insurance, not a transactional guarantee, and it
+is unavailable on Windows. Registration and per-entry delete errors are
+not returned to `Run`; repeated spawn failures are logged once after the
+retry limit, and delete failures are ignored by the shell. Each backend
+call is bounded by a POSIX `sleep`/`kill` timeout.
+
+The reaper is started lazily for a real CLI container on the non-reuse
+path. Apple Container has no separate immutable ID, so its entries use
+the container name and creation generation. The reaper checks the
+creation label before deleting by name. That name-based guarantee is
+limited to cooperating processes using this library on the same host; an
+external CLI delete/recreate cannot be distinguished by name.
+
+The Docker branch is prepared to use the immutable 64-hex ID returned by
+`docker run`, but this checkout does not yet accept that ID in
+`reaper.register`; it accepts only Apple-style names. The normal Docker
+`run --detach` path therefore cannot register that ID with the reaper on
+this base. If a backend returns no parseable ID, `Run` falls back to the
+name-and-generation path. Issue #73 must be stacked for the Docker-ID
+registration path to work. After #73, Docker entries use the immutable ID
+and `docker rm --force`; normal Docker `Terminate` and rollback handles can
+use the ID independently.
 
 **Session labels**: every created container carries
 
@@ -351,7 +420,7 @@ can apply the same filter daemon-side.
 
 Setting `CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`,
 and reaper registration. It does not change an explicit
-`Container.Terminate` or the rollback path in `Run`.
+`Container.Terminate`, post-create rollback, or failed-create cleanup.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -361,11 +430,17 @@ volumes must be named, and their lifecycle belongs to the caller.
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes on the same host). An existing container
 must have been created with `WithReuse`, and every caller reruns its
-readiness strategy. The compatibility check is intentionally narrow:
-image reference and declared/published ports only. `env`, `cmd`, and
-`mounts` differences attach silently to the existing container by
-design; callers needing isolation should use distinct names or reset
-state via `Exec`.
+readiness strategy. Image compatibility is checked on both backends.
+Port compatibility is backend-specific. Docker compares auto-published
+bindings for `WithExposedPorts` and checks explicit `WithPublishedPort`
+bindings. Apple checks explicit published bindings, but the library's
+Apple inspect model does not retain `WithExposedPorts` declarations, so
+those declarations cannot be compared. Each Apple caller uses its own
+exposed-port declaration against the shared container IP; use distinct
+names when those declarations must be isolated. `env`, `cmd`, and `mounts`
+differences attach silently to the existing container by design;
+callers needing isolation should use distinct names or reset state via
+`Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
@@ -383,13 +458,14 @@ immutable ID or an atomic conditional delete that Apple Container does
 not provide. An inspect
 failure other than not-found aborts the delete (fail closed); `Run`'s
 rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Docker containers by
-`Id`; for Apple it stores the generation, reads the label as a
-line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each backend call carries a 10-30s timeout
-via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
-daemon call cannot wedge the rest. The leader's own pull/create uses an
-independent `runTimeout` budget; `reuseAttachTimeout` bounds only
+than hiding it. The watchdog reaper registers Apple containers by name and generation,
+reading the label as a line-anchored JSON field (`"key": "value"`, never a
+substring), and skips deletion on mismatch. The current base does not
+register Docker's immutable ID with the reaper; issue #73 is required
+before Docker reaper entries can use `Id`. Each backend call carries a
+10-30s timeout via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so
+one hung daemon call cannot wedge the rest. The leader's own pull/create
+uses an independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 
 ## Security design
@@ -401,10 +477,12 @@ As a library that spawns subprocesses, these rules hold.
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates Apple-style names against
-`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before writing them to the pipe.
-Reaper registration failures are ignored. The two layers together
-leave no command injection through registered IDs.
+expansions). On this base, the library validates reaper targets as
+Apple-style names matching `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
+writing them to the pipe. After issue #73, the same validation will also
+accept a full lowercase 64-hex Docker ID. Reaper registration failures
+are ignored. The two layers together leave no command injection through
+registered IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -448,10 +526,12 @@ lock for container creation (reaper ID registration takes a mutex for
 a one-line write). Apple Container consumes no host ports by default;
 Docker's daemon assigns published ports atomically.
 
-**Keep streams bounded**. `Logs` and `LogsWithOptions` buffer a finite
-snapshot. `FollowLogs` is intentionally a stream; closing its
-`io.ReadCloser` or cancelling its context terminates the CLI process.
-The wait-failure diagnostic tail is capped at 1MiB.
+**Bound snapshots only when requested**. `Logs` and `LogsWithOptions`
+finish a finite CLI snapshot, but `Logs` can buffer all available output
+and `LogsWithOptions` limits by the requested line or time window rather
+than a byte cap. `FollowLogs` is intentionally an unbounded stream;
+closing its `io.ReadCloser` or cancelling its context terminates the CLI
+process. The wait-failure diagnostic tail is capped at 1MiB.
 
 **Apply operation-specific deadlines**. Most query-like operations
 (inspect, copy, snapshot logs, delete, and prune) use a 30-second
@@ -482,13 +562,18 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   remove a same-name replacement.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and stderr (the diagnostic stderr copy is
-  capped at 64KiB).
+  capped at 64KiB). The root `CLIError` alias is a current-development
+  addition and is not part of `v0.2.0`.
+- `ErrContainerNotFound` and `ErrGenerationReplaced` are also
+  current-development additions.
 
-When a non-reuse `Run` fails on a wait timeout, the returned error
-includes a bounded container-log tail, and rollback deletion follows.
-A rollback deletion failure is included in the returned error rather
-than hidden. Reuse reports the wait failure while leaving the shared
-container in place.
+When a non-reuse `Run` fails after a successful backend `run`, the
+post-create rollback error is returned. If rollback deletion fails, its
+message says that the container was left behind. A failed backend `run`
+uses the separate best-effort `cleanupFailedCreate` path; its cleanup
+errors are not joined to the original classified error. Reaper
+registration and deletion errors are likewise not returned. Reuse
+reports the wait failure while leaving the shared container in place.
 
 The library never runs `container system start` itself: the command
 can prompt interactively for a kernel install, which a test library
@@ -529,7 +614,9 @@ The `internal/cli` runner is an interface; tests inject a fake. It is
 an internal package, so external users should depend on the public
 root and `wait` packages rather than importing it.
 
-```go
+The internal runner contract is:
+
+```text
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
@@ -541,8 +628,10 @@ type Runner interface {
 argv assembly, JSON decoding, error classification, and wait strategy
 logic without a real backend. Dependencies that production code assumes
 non-nil receive real fakes in tests, never nil. The non-integration
-`examples/compile_test.go` type-checks the public calls used in the
-README and this design without starting a backend.
+`examples/compile_test.go` extracts every fenced `go` block from both
+language versions of the README and both design documents, parses it, and
+compiles it in a temporary module with a local `replace` to this checkout.
+The `text` signature inventories are intentionally not executable.
 
 **Integration tests** use the `integration` build tag. The root suite
 contains Apple Container and Docker lifecycle, connection, exec, copy,
@@ -561,7 +650,7 @@ the hosted Linux runners do not provide the Apple Container service or
 the required host environment. `CONTAINERGO_BACKEND=apple` or
 `CONTAINERGO_BACKEND=docker` can select one backend locally.
 
-## Backends (v0.2)
+## Backends (v0.2 and current development)
 
 v0.1 was Apple Container only. v0.2 adds a Docker backend so the same
 API works on Linux and Windows.
@@ -613,9 +702,11 @@ The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for
-Docker). The reaper depends on `/bin/sh` and thus does not run on
-Windows; Windows relies on the normal cleanup paths (`Cleanup`,
-rollback) only. `Prune` can use daemon-side filters on Docker
+Docker). It depends on `/bin/sh` and does not run on Windows; Windows
+relies on `Cleanup` and the normal rollback paths. On this checkout the
+Docker-ID registration prerequisite (#73) is not yet present, so the
+Docker reaper path is not active even though normal Docker handles use
+the immutable ID. `Prune` can use daemon-side filters on Docker
 (`--filter label=... --filter status=exited`).
 
 **Liveness detection**: the probe command switches per backend
@@ -647,17 +738,20 @@ These are deliberately recorded rather than implied by the current API:
   conditional delete from the backend.
 - **Remote Docker detection**: only `DOCKER_HOST=tcp://...` is used
   for endpoint selection. A remote Docker context is not detected.
-- **Reuse compatibility**: image and ports are checked, while `env`,
-  `cmd`, and `mounts` differences intentionally attach. Whether a
-  future release should compare more configuration is an open product
-  decision; callers needing isolation should use distinct names.
+- **Reuse compatibility**: image is checked on both backends. Docker
+  also checks published port bindings; Apple cannot compare
+  `WithExposedPorts` declarations because they are not retained in its
+  inspect data. `env`, `cmd`, and `mounts` differences intentionally
+  attach. Whether a future release should compare more configuration is
+  an open product decision; callers needing isolation should use
+  distinct names.
 - **Logger injection**: no public logger hook exists. Adding one would
   require a separate API and a decision about what command data may be
   exposed.
 - **Reaper registration**: registration is best-effort and currently
-  uses name-oriented validation. A registration failure is ignored and
-  normal cleanup remains the fallback; whether to broaden accepted
-  backend IDs is unresolved.
+  accepts only Apple-style names. Docker's full ID requires the #73
+  prerequisite before it can be registered. A registration failure is
+  ignored and normal cleanup remains the fallback.
 - **`ForLog.WithPollInterval`**: the current setter has no effect because
   log readiness is stream-based. Whether to remove it or give it
   different semantics is unresolved.

@@ -10,6 +10,18 @@ English (primary): [design.md](design.md)
 「実装フェーズ」の節は初期設計の歴史として残るが、現在の API や今後のロードマップを約束するものではない。
 現在の節で説明する公開 API と動作は、実装とテストを基準にしている。
 
+最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
+このチェックアウトはそのタグより後の開発版です。
+`v0.2.0` モジュールには Go 1.27 以降が必要ですが、現在のチェックアウトには
+Go 1.23 以降が必要です。リリース版 API と現在の開発版 API は同じもの
+ではありません。`LogsOptions` / `LogsWithOptions`、追加された
+`wait.ForHTTP` の setter、公開型 `wait.AllStrategy` / `AnyStrategy` と
+合成 strategy の `WithStartupTimeout`、root の `CLIError`、
+`ErrContainerNotFound`、`ErrGenerationReplaced` は `v0.2.0` 以降の
+開発版追加です。基本の `Run`、options、lifecycle、endpoint、`Exec`、
+`Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、backend 選択、
+元の wait strategy は `v0.2.0` に存在しています。
+
 ## 目的
 
 **container-go** は、Apple Container（[apple/container](https://github.com/apple/container)）と Docker をバックエンドとする testcontainers スタイルの Go ライブラリである。
@@ -30,7 +42,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 v1.2.x–1.3.x で確認し、フィクスチャは 1.2.2 と 1.3.0 を対象とする。
 
 - ホスト要件は macOS 26 以降かつ Apple Silicon である。
-- 各コンテナは軽量 VM として起動し、vmnet ブリッジ（既定ネットワークは `default`、`192.168.64.0/24`）上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開（`--publish`）は必須ではない。
+- 既定では、各コンテナは軽量 VM として起動し、vmnet ブリッジ（network は `default`、`192.168.64.0/24`）上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開（`--publish`）は必須ではない。
 - すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返し、追加フィールドは `internal/inspect` が無視する。
 - CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗し、`container system status` で状態を確認する。
 - コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` に一致し、1 文字から 63 文字までである。
@@ -77,6 +89,16 @@ API の形は testcontainers-go（v0.44 系）の新 API に寄せる。
 ### 基本的な使い方
 
 ```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+    "github.com/hirokazumiyaji/container-go/wait"
+)
+
 func TestRedis(t *testing.T) {
     ctx := context.Background()
 
@@ -100,21 +122,26 @@ func TestRedis(t *testing.T) {
 
 ### Run とオプション
 
-```go
+以下はシグネチャの一覧であり、実行する source file ではありません。
+
+```text
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
 コンテナを新規作成する必要がある場合、`Run` は起動前に pull policy を適用してから待機戦略を完了する。
 既定の `PullMissing` はローカルイメージストアを検査し、イメージがないときだけ明示的に pull する。
-`PullAlways` は呼び出しごとに明示的な pull を要求し、`PullNever` は検査だけを行い、イメージがない場合は `ErrImageNotFound` を返す。
+`PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求し、`PullNever` は検査だけを行い、イメージがない場合は `ErrImageNotFound` を返す。
 Docker の run コマンドには `--pull=never` を渡すため、CLI が pull を重複させない。
 起動後の操作や待機が再利用でない経路で失敗した場合は、作成したコンテナをロールバックしてからエラーを返す。
 Reuse の共有ライフタイムは後述の別契約で扱う。
 
 オプションは functional options で提供する。
-現在のオプションは次のとおりである。
+以下は現在の開発チェックアウトの API 一覧である。
+ここで列挙した基本 option は `v0.2.0` にもあった。
+後述する `LogsOptions` / `LogsWithOptions`、追加 HTTP setter、
+合成 wait の setter は `v0.2.0` にはなかった。
 
-- `WithExposedPorts(ports ...string)`：接続対象のコンテナポート（`"6379/tcp"` 形式）を宣言する。`MappedPort` と `Endpoint` はこの宣言を解決に使える。Docker は宣言したポートを自動公開し、Apple Container は既定でコンテナ IP から解決する。
+- `WithExposedPorts(ports ...string)`：接続対象のコンテナポート（`"6379/tcp"` 形式）を宣言する。`MappedPort` と `Endpoint` はこの宣言を解決に使える。Docker は宣言したポートを自動公開し、Apple Container は既定でコンテナ IP から解決する。Apple ではこれは handle 側の endpoint 宣言であり、backend に別の `--expose` flag を渡さない。
 - `WithEnv(env map[string]string)`：環境変数を設定する。値はコマンドライン引数ではなく一時ファイル経由で渡す。
 - `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`：コマンドとエントリポイントの上書き。エントリポイントは `docker run --entrypoint` の仕様どおり 1 トークンとする。複数トークンは `WithCmd` を使う。
 - `WithWaitStrategy(s wait.Strategy)`：起動完了の判定方法を指定する。
@@ -137,7 +164,10 @@ Reuse の共有ライフタイムは後述の別契約で扱う。
 
 ### Container ハンドル
 
-```go
+以下のシグネシャ一覧には現在の開発版メソッドも含まれます。実行する
+source file ではありません。
+
+```text
 type Container struct {
     // unexported fields omitted
 }
@@ -162,9 +192,7 @@ func (c *Container) Terminate(ctx context.Context) error
 実行中コンテナで実行したコマンドが 0 以外で終了した場合、その終了コードはインフラエラーではなく結果として返す。
 停止中または到達できないコンテナの操作はエラーを返すことがある。
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
-`Logs` と `LogsWithOptions` は有限のスナップショットを返し、`FollowLogs` はリーダーを閉じるか context をキャンセルするまでストリームする。
-`LogsOptions` は現在 `Tail` と `Since` を公开し、スナップショットを制限する。
-`Terminate` は世代ガードを持ち、別のプロセスが名前を再利用したコンテナを削除しない（後述の Reuse を参照）。
+`Logs` と `LogsWithOptions` は backend command が終了するため有限のスナップショットを返すが、単体で byte 上限は課さない。`Logs` は全出力を要求し、`LogsOptions{Tail, Since}` は `Tail` または `Since` を指定したときに行数または時間の範囲を要求するため、実際の大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `v0.2.0` にはない現在の開発 API である。`Terminate` は世代ガードを持ち、別のプロセスが名前を再利用したコンテナを削除しない（後述の Reuse を参照）。
 
 `Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。
 コンテナが既にない場合は成功として扱い、冪等である。
@@ -186,7 +214,7 @@ Apple Container ではこの方式を既定にしない。
 公開すると `Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
 
 `MappedPort` と `Endpoint` は、`WithExposedPorts` で宣言したポートと明示的に公開したポートだけを解決する。
-宣言は待機戦略にも使われる（`ForListeningPort` の既定ポートなど）。
+宣言は wait strategy にも使われる。`ForExposedPort` は最初に宣言したポートを使い、`Target.Endpoint` の空 port も同じ最初の宣言を選ぶ。
 
 ## 待機戦略
 
@@ -196,38 +224,67 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForLog(pattern)`：`FollowLogs` のストリームを読み、部分文字列（`AsRegexp` による正規表現も可）が現れるまで待つ。照合は行単位で行い、`WithOccurrence(n)` で出現回数を指定できる。ストリーム方式なので poll 方式ではない。
 - `wait.ForListeningPort(port)`：解決したエンドポイントへの TCP 接続が成功するまで poll する。
 - `wait.ForExposedPort()`：`WithExposedPorts` で最初に宣言したポートを使う。
-- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定し、`WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` で認証、TLS、HTTP クライアントを設定する。
+- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。
 - `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。
-- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。合成型は `WithStartupTimeout` で全体を制限できるが、`WithPollInterval` は公開しない。
+- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。
 
-基本戦略の起動タイムアウトは既定 60 秒である。
+基本 strategy の起動タイムアウトは既定 60 秒である。
 `ForListeningPort`、`ForExposedPort`、`ForHTTP` は既定 100 ミリ秒で poll し、`ForExec` は既定 250 ミリ秒で poll する。
-現在の `ForLog` 型にも `WithPollInterval` があるが、ストリームを読むため効果がない。
-接続または HTTP の待機中にコンテナが停止した場合は、タイムアウトを使い切らずに失敗する。
-再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、1MiB 上限のログ末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
+現在の `ForLog` 型にも `WithPollInterval` があるが、stream を読むため効果がない。
+接続・HTTP strategy は最大 1 秒間隔で停止状態を調べる。`ForExec` は poll 中に fail-fast せず、wait の期限到来時にコンテナ状態を調べる。`ForLog` は pattern が出る前に stream が終了した場合に停止を報告する。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
 
-戦略インターフェースは次のとおりである。
+strategy の契約は次のとおりです。
 
-```go
+```text
 type Strategy interface {
     WaitUntilReady(ctx context.Context, target Target) error
 }
 ```
 
-`Target` はコンテナ IP、宣言済みポート、ログリーダー、exec、状態照会を提供する小さなインターフェースであり、`*container.Container` を `container.Run` が適合させる。
-依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避けられる。
+`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`container.Run` が `*container.Container` を適合させる。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避けられる。
 
 ## クリーンアップ
 
-ライブラリは通常の終了経路と、異常終了時のベストエフォート経路を用意する。
+ライブラリには通常の終了、作成後の rollback、create 失敗、異常終了の
+別経路がある。
+各経路でエラーの見え方は異なる。
 
-**通常経路**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で削除を登録する。`TerminateContainer(ctr)` は nil 安全な defer 形式である。再利用でない経路で `Run` がコンテナ作成後に失敗した場合は、ロールバックで削除を試み、削除に失敗した場合はそのエラーを隠さず返す。再利用コンテナは後述の共有ライフタイム契約に従う。
+**通常の cleanup**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を
+登録する。`TerminateContainer(ctr)` は nil 安全な defer 形式である。
+`Cleanup` の終了エラーはテストの log に残り、`TerminateContainer` は
+エラーを呼び出し元へ返す。
 
-**異常終了（SIGKILL、パニック、`os.Exit`）**：defer も `t.Cleanup` も実行されない。最初の実 CLI コンテナを登録したときに、ライブラリは外部 `/bin/sh` の watchdog リーパーを遅延起動し、登録済み ID をパイプへ書く。親プロセスのパイプが閉じられると、リーパーは各 ID の強制削除を試みて終了する。リーパーは保険であり、トランザクション保証ではない。起動と削除はベストエフォートで、Windows では利用できない。親プロセスが生きている間は何もせず、各バックエンド呼び出しは POSIX の `sleep` と `kill` による期限で制限される。
+**作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
+途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、
+返り値には元の失敗とコンテナが残ったことを示すメッセージを含める。wait の
+失敗では、上限付き log の取得が成功した場合だけ log 末尾も付ける。
 
-Docker では不変のコンテナ ID があればリーパーに渡す。登録はベストエフォートで、登録に失敗しても `Run` は失敗させない。
-Apple Container には別の不変 ID がないため、作成世代と生成ラベルを保存し、名前で削除する前にラベルを検査する。
-名前ベースの保証は同じホストでこのライブラリを使う協調プロセスに限られる。外部 CLI による delete と再作成は名前では区別できない。
+**create 失敗**：backend の `run` command 自体が失敗した場合、
+`cleanupFailedCreate` が別の best-effort 経路で処理する。name conflict はスキップし、この process の managed / session label を持つコンテナだけを inspect する。creation label がある場合はこの run と一致해야 하지만、この best-effort 経路では label がないことを不一致とは扱わない。lock、inspect、delete の error は `Run` の返り値に連結されない。
+
+**異常終了**：親 process が終了して reaper pipe が閉じられると、外部
+`/bin/sh` の watchdog が強制削除を試みる。process を終了させる未 recover の
+panic、`SIGKILL`、`os.Exit` では pipe が閉じる。recover した panic では閉じない。
+親が生きている間、reaper は何もしない。reaper は保険であり、トランザクション
+保証ではなく、Windows では利用できない。登録 error と各 entry の delete error
+は `Run` に返らない。spawn failure が retry 上限に達した場合は一度だけ log に
+残り、delete failure は shell が無視する。backend 呼び出しには POSIX の
+`sleep` / `kill` による期限がある。
+
+reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
+Apple Container には別の不変 ID がないため、entry はコンテナ名と creation
+generation を使う。reaper は名前で削除する前に creation label を検査する。
+名前ベースの保証は同じ host で本 library を使う協調 process に限られる。
+外部 CLI による delete / recreate は名前では区別できない。
+
+Docker 側は `docker run` が返す不変の 64 桁 hex ID を使う準備をしている。
+ただし、この checkout の `reaper.register` はまだ Apple 形式の名前だけを
+受け付ける。そのため、通常の Docker `run --detach` 経路では現在の base の
+reaper に Docker ID を登録できない。backend が解析可能な ID を返さない
+場合だけ、`Run` は name と generation の経路にフォールバックする。
+Docker-ID 登録経路には issue #73 を stack する必要がある。#73 適用後は
+Docker entry が不変 ID を使い `docker rm --force` で削除する。通常の
+Docker `Terminate` と rollback handle は ID を独立して利用できる。
 
 **セッションラベル**：作成するコンテナには次のラベルを付ける。
 
@@ -243,7 +300,7 @@ Apple CLI にはラベルフィルタがないため、孤児の掃除は `conta
 
 ## Reuse
 
-`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じホストのプロセス間で行う。既存コンテナは `WithReuse` で作成されていればよく、各呼び出しは自分の待機戦略を再実行する。互換性チェックは意図的に狭く、image 参照と宣言または公開したポートだけを比較する。`env`、`cmd`、`mounts` の差は既存コンテナへ黙って attach する。分離が必要なら異なる名前を使うか、`Exec` で状態を初期化する。
+`WithReuse` は安定した `WithName` に対する `Run` を get-or-create にする。共有は同じ host の process 間で行う。既存コンテナは `WithReuse` で作成されていればよく、各呼び出しは自分の wait strategy を再実行する。image 互換性は両 backend で検査する。port 互換性は backend ごとに異なる。Docker は `WithExposedPorts` の自動公開 binding と明示的な `WithPublishedPort` binding を比較する。Apple は明示的な published binding を比較するが、library の Apple inspect model に `WithExposedPorts` の宣言が残らないため、その宣言は比較できない。Apple の各呼び出しは自分の exposed-port 宣言を共有コンテナ IP へ使う。宣言を分離したい場合は名前を変える。`env`、`cmd`、`mounts` の差は既存コンテナへ黙って attach する。分離が必要なら異なる名前を使うか、`Exec` で状態を初期化する。
 
 各作成には 16 桁の 16 進数 `creationLabel` 世代を付ける。
 `Terminate` と停止済み再作成経路は、置き換わった世代の削除を拒否する。
@@ -253,16 +310,17 @@ inspect と削除は一時ディレクトリ内の名前単位 `flock`（`contai
 この保証は同じホストで本ライブラリを使う協調プロセスに限られる。
 外部ツールが同じ窓で `container delete` と再作成を実行しても名前では区別できず、解決には不変 ID または Apple Container が提供しない原子的な条件付き削除が必要になる。
 not-found 以外の inspect 失敗は fail closed として削除を中止し、`Run` のロールバックは結果のエラーにコンテナが残ったことを含める。
-watchdog リーパーは Docker では `Id`、Apple では世代を登録し、ラベルを行頭固定の JSON フィールドとして読む。
+watchdog reaper は Apple コンテナを名前と generation で登録し、label を行頭固定の JSON field として読む。
 ラベルの部分文字列では一致にせず、世代が違えば削除しない。
-各バックエンド呼び出しは POSIX の `sleep` と `kill` による 10–30 秒の期限を持ち、1 つの daemon 呼び出しが後続を妨げない。
-リーダーの pull と create は独立した `runTimeout` 予算を使い、`reuseAttachTimeout` は別プロセスのコンテナへの attach polling だけを制限する。
+現在の base は Docker の immutable ID を reaper に登録しない。Docker reaper entry が `Id` を使うには issue #73 が必要である。
+各 backend 呼び出しは POSIX の `sleep` と `kill` による 10–30 秒の期限を持ち、1 つの daemon 呼び出しが後続を妨げない。
+リーダーの pull と create は独立した `runTimeout` 予算を使い、`reuseAttachTimeout` は別 process のコンテナへの attach polling だけを制限する。
 
 ## セキュリティ設計
 
 外部プロセスを起動するライブラリとして、次の原則を守る。
 
-**シェルを経由しない**。すべての CLI 呼び出しは `exec.Command` に引数配列を渡し、シェル文字列を組み立てない。唯一の例外は watchdog リーパーのシェルスクリプトである。本文は固定文字列で、コンテナ ID は stdin のデータとしてだけ渡す。スクリプトは `set -f`、`IFS=`、`read -r`、変数のクォートで語分割とグロブ展開を封じる。ライブラリは Apple 形式の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` を検証してからパイプへ書く。リーパー登録の失敗は無視する。二重の防御により、登録された ID 経由のコマンド注入を成立させない。
+**シェルを経由しない**。すべての CLI 呼び出しは `exec.Command` に引数配列を渡し、シェル文字列を組み立てない。唯一の例外は watchdog reaper の shell script である。本文は固定文字列で、container ID は stdin data としてだけ渡す。script は `set -f`、`IFS=`、`read -r`、変数の quote で word splitting と glob 展開を封じる。現在の base では、reaper target を Apple 形式の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` として検証してから pipe へ書く。issue #73 適用後は、同じ検証で完全な小文字 64 桁 hex Docker ID も受け付ける。reaper 登録 error は無視する。二重の防御により、登録された ID 経由の command injection を成立させない。
 
 **環境変数を argv に載せない**。`--env key=value` を使うと、値がプロセス一覧（`ps`）から見える。データベースパスワードなど秘密情報を環境変数で渡す用途による情報漏洩を避けるため、ライブラリは `os.MkdirTemp` の mode 0600 ファイルへ環境変数を書き、`--env-file` で渡して起動後に削除する。
 
@@ -280,7 +338,7 @@ watchdog リーパーは Docker では `Id`、Apple では世代を登録し、�
 
 **並列起動を妨げない**。コンテナ作成にグローバルロックを置かない（reaper の ID 登録だけ 1 行の書き込みにミューテックスを使う）。Apple Container は既定でホストポートを消費せず、Docker はデーモンが公開ポートを原子的に割り当てる。
 
-**ストリームを有限に保つ**。`Logs` と `LogsWithOptions` は有限のスナップショットをバッファする。`FollowLogs` は意図的にストリームであり、`io.ReadCloser` を閉じたり context をキャンセルしたりすると CLI プロセスを終了する。待機失敗時の診断ログ末尾は 1MiB 上限である。
+**要求された範囲だけスナップショットを制限する**。`Logs` と `LogsWithOptions` は有限の CLI snapshot を完了するが、`Logs` は利用可能な全出力を buffer でき、`LogsWithOptions` は byte 上限ではなく指定した行数または時間の範囲で制限する。`FollowLogs` は意図的に上限のない stream であり、`io.ReadCloser` を閉じるか context をキャンセルすると CLI process を終了する。wait failure の診断 log 末尾は 1MiB 上限である。
 
 **操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`Exec` のコマンド呼び出しと `FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。
 
@@ -293,9 +351,10 @@ watchdog リーパーは Docker では `Id`、Apple では世代を登録し、�
 - `ErrImageNotFound`：`PullNever` の `Run` でローカルイメージが見つからなかった場合。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：世代ガード付き削除が同じ名前の置き換えを削除しなかった場合。
-- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。
+- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
+- `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
 
-再利用でない `Run` が待機タイムアウトで失敗した場合、返り値には上限付きコンテナログ末尾を含め、ロールバック削除を行う。ロールバック削除の失敗も返り値のエラーに含め、隠さない。再利用の場合は待機エラーを返し、共有コンテナはそのまま残す。
+backend の `run` が成功した後に非 reuse `Run` が失敗した場合、作成後の rollback error を返す。rollback 削除にも失敗すると、コンテナが残ったことを message に含める。backend の `run` 自体の失敗は別の best-effort `cleanupFailedCreate` 経路を使い、その cleanup error は元の classified error に連結しない。reaper の登録・削除 error も返さない。Reuse は wait error を返し、共有コンテナは残す。
 
 ライブラリ自身が `container system start` を実行することはない。このコマンドはカーネルインストールで対話プロンプトを出しうるため、テストライブラリが暗黙に実行してよい操作ではない。
 
@@ -332,7 +391,9 @@ container-go/
 `internal/cli` の runner はインターフェースであり、テストではフェイク実装を注入する。
 `internal` パッケージは外部 API ではないため、利用者は root と `wait` の公開パッケージに依存する。
 
-```go
+内部 runner の契約は次のとおりです。
+
+```text
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
@@ -340,13 +401,13 @@ type Runner interface {
 
 ## テスト戦略
 
-**ユニットテスト**では、固定 JSON を返すフェイク `Runner` を注入し、実機なしで argv 組み立て、JSON デコード、エラー分類、待機戦略のロジックを検証する。本番コードが非 nil を前提とする依存には、テストでもフェイク実装を渡す。integration タグなしの `examples/compile_test.go` は、バックエンドを起動せずに README とこの設計文書で使う公開 API 呼び出しを型検査する。
+**ユニットテスト**では、固定 JSON を返すフェイク `Runner` を注入し、実機なしで argv 組み立て、JSON デコード、エラー分類、wait strategy のロジックを検証する。本番 code が非 nil を前提とする依存には、テストでもフェイク実装を渡す。integration tag のない `examples/compile_test.go` は、README の英語版・日本語版と design document の両方から fence された `go` block をすべて抽出し、parse して一時 module 内で compile する。一時 module は現在の checkout へのローカル `replace` を使う。`text` のシグネシャ一覧は実行対象ではない。
 
 **統合テスト**は `integration` build tag を使う。root のテストスイートには Apple Container と Docker のライフサイクル、接続、exec、copy、cleanup、Reuse、watchdog のケースがある。各バックエンドの helper は先に CLI とサービスを確認し、利用できなければ skip する。`make integration` は両バックエンドを実行して pull が重い bench と singleflight を除外し、`make integration-docker` は Docker を選択する。`make bench-integration` は pull が重いシナリオと独立したベンチマークモジュールを実行する。
 
 **CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.23.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck` を実行する。同じ runner で Docker 統合テストの行列も実行する。Apple Container 統合テストは意図的にローカル専用である。GitHub の Linux runner には Apple Container サービスと必要なホスト環境がない。ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
 
-## バックエンド（v0.2）
+## バックエンド（v0.2 と現在の開発版）
 
 v0.1 は Apple Container 専用だった。
 v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ API を使う。
@@ -370,7 +431,7 @@ Docker はリモートマシンの loopback でしか listen せず、クライ�
 デーモンが起動時にポートを原子的に割り当てるため、Apple Container で避けた空きポートの競合は再び起こらない。
 Apple バックエンドの直接 IP の既定は変えない。
 
-**Cleanup の違い**：watchdog reaper は backend ごとに delete subcommand を切り替える（Apple は `delete --force`、Docker は `rm --force`）。reaper は `/bin/sh` に依存するため Windows では動かず、Windows は通常の cleanup 経路（`Cleanup`、rollback）に依存する。`Prune` は Docker で daemon 側 filter（`--filter label=... --filter status=exited`）を利用できる。
+**Cleanup の違い**：watchdog reaper は backend ごとに delete subcommand を切り替える（Apple は `delete --force`、Docker は `rm --force`）。`/bin/sh` に依存するため Windows では動かず、Windows は `Cleanup` と通常の rollback 経路に依存する。現在の checkout には Docker-ID 登録の前提条件（#73）がないため、通常の Docker handle が不変 ID を使う場合でも、reaper の entry には登録されません。`Prune` は Docker で daemon 側 filter（`--filter label=... --filter status=exited`）を利用できる。
 
 **liveness detection**：probe command は backend ごとに切り替える（Apple は `system status`、Docker は `version --format {{.Server.Version}}`）。
 
@@ -388,9 +449,9 @@ Apple バックエンドの直接 IP の既定は変えない。
 
 - **Apple の名前ベース削除**：作成世代チェックは同じ host で本ライブラリを使う協調プロセスを保護するが、同じ窓で外部の CLI が delete して再作成した場合には区別できない。この制約を解消するには backend の不変 ID または原子的な条件付き削除が必要である。
 - **remote Docker の検出**：endpoint 選択に使うのは `DOCKER_HOST=tcp://...` だけである。remote Docker context は検出しない。
-- **Reuse の互換性**：image と port は比較し、`env`、`cmd`、`mounts` の差は意図的に attach する。今後の release で設定を比較すべきかは未解決の製品上の決定であり、分離が必要なら別の名前を使う。
+- **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`env`、`cmd`、`mounts` の差は意図的に attach する。今後の release で設定を比較すべきかは未解決の製品上の決定であり、分離が必要なら別の名前を使う。
 - **logger injection**：公開 logger hook は存在しない。追加するには新しい API と、公開できるコマンドデータの範囲を決める決定が必要である。
-- **リーパー登録**：登録はベストエフォートで、現在は名前優先の検証を使う。登録に失敗しても無視され、通常の cleanup が残る。バックエンド ID の受理範囲を広げるかは未解決である。
+- **reaper 登録**：登録は best-effort で、現在は Apple 形式の名前だけを受け付ける。Docker の full ID を登録するには #73 の前提条件が必要である。登録 error は無視され、通常の cleanup が残る。
 - **`ForLog.WithPollInterval`**：現在のセッターはログの待機がストリーム方式なので効果がない。削除するか別の意味を与えるかは未解決である。
 - **Docker Engine API の直接化**：現在のベンチマークの決定は延期する。CLI latency や別の要件が合意した閾値を超えた場合にだけ再検討する。
 

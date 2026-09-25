@@ -30,6 +30,22 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 	if !failedCreateOwned(cfg, info) {
 		return nil, nil
 	}
+	if cfg.reuse {
+		identity := imageFromInfo(info)
+		if !identity.pinned {
+			return nil, nil
+		}
+		requested := cfg.preparedImage
+		original := info.image
+		if !cfg.imagePrepared {
+			requested = identity
+		} else {
+			original = requested.reference
+		}
+		if !requested.pinned || checkReuseOwnedIdentity(info, requested, original, cfg) != nil {
+			return nil, nil
+		}
+	}
 	ctr.reused = cfg.reuse
 	ctr.exposed = cfg.exposed
 	ctr.published = cfg.published
@@ -51,7 +67,11 @@ func rollbackResult(ctx context.Context, ctr *Container, cause error) (*Containe
 }
 
 func reuseFailureResult(ctr *Container, err error) (*Container, error) {
-	if keepContainers() {
+	// A reusable create that failed post-create validation has not yet
+	// crossed the ownership/image proof boundary required for a handoff.
+	// KEEP must retain the backend object, but it must not manufacture an
+	// unverified reuse handle for the caller.
+	if keepContainers() && ctr != nil && !ctr.reused {
 		return ctr, err
 	}
 	return nil, err

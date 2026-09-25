@@ -1,22 +1,16 @@
 //go:build aix
 
+//nolint:unused // retained for platform-specific process-identity tests
 package container
 
-import (
-	"errors"
-	"syscall"
-)
+import "errors"
 
-// AIX exposes Setpgid and supports negative-PID kill, but the Go syscall
-// package does not expose Getpgid. Probe the group before signaling it;
-// a missing group is handled as a direct-process kill by the caller.
+// AIX does not expose Getpgid through the Go syscall package. The
+// production cleanup path uses the owned process handle and does not
+// signal a process group; this probe remains for platform-specific tests.
 func reaperProcessGroupID(pid int) (int, error) {
-	err := syscall.Kill(-pid, syscall.Signal(0))
-	if err == nil {
-		return pid, nil
+	if pid <= 0 {
+		return 0, errors.New("reaper: invalid process-group probe pid")
 	}
-	if errors.Is(err, syscall.ESRCH) {
-		return 0, nil
-	}
-	return 0, err
+	return 0, errors.New("reaper: process-group probing is unsupported on aix")
 }

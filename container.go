@@ -248,7 +248,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if imageIdentity.pinned {
 		info, inspectErr := c.inspectFresh(ctx)
 		if inspectErr != nil {
-			return nil, c.rollback(ctx, inspectErr)
+			return rollbackResult(ctx, c, inspectErr)
 		}
 		if err := verifyContainerImageIdentity(c, info); err != nil {
 			return rollbackResult(ctx, c, err)
@@ -273,12 +273,25 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. KEEP skips
+// deletion and cancels any watchdog ownership. A failed removal is not
+// hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container
+// was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
-	if c == nil || c.reused {
+	if c == nil {
+		return cause
+	}
+	if keepContainers() {
+		c.inspectMu.RLock()
+		uid := c.uid
+		c.inspectMu.RUnlock()
+		if err := cancelReuseReaperHandoff(c.runner, c.eng, c.id, uid, c.id); err != nil {
+			return withCleanupError(cause, err)
+		}
+		return cause
+	}
+	if c.reused {
 		return cause
 	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
@@ -344,8 +357,10 @@ func failedCreateOwned(cfg *config, info *engineInfo) bool {
 		info.labels[creationLabel] != cfg.creation {
 		return false
 	}
-	if cfg.reuse && info.labels[reuseLabel] != "true" {
-		return false
+	if cfg.reuse {
+		if info.labels[reuseLabel] != "true" || !imageFromInfo(info).pinned {
+			return false
+		}
 	}
 	return validateReuseIdentity(cfg.eng, info) == nil
 }

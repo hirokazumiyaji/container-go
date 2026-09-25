@@ -169,7 +169,47 @@ func platformParts(platform string) (os, arch, variant string) {
 			return "", "", ""
 		}
 	}
-	return splitPlatform(normalized)
+	osName, architecture, variant := splitPlatform(normalized)
+	return canonicalOCIPlatform(osName, architecture, variant)
+}
+
+// canonicalOCIPlatform normalizes common OCI architecture spellings and
+// their unambiguous default variants before shared platform comparisons.
+func canonicalOCIPlatform(osName, architecture, variant string) (string, string, string) {
+	osName = strings.ToLower(strings.TrimSpace(osName))
+	architecture = strings.ToLower(strings.TrimSpace(architecture))
+	variant = strings.ToLower(strings.TrimSpace(variant))
+	switch architecture {
+	case "x86_64", "x86-64", "amd64":
+		architecture = "amd64"
+		if variant == "v1" || variant == "1" {
+			variant = ""
+		}
+	case "aarch64", "arm64":
+		architecture = "arm64"
+		if variant == "" || variant == "v8" || variant == "8" {
+			variant = "v8"
+		}
+	case "armhf":
+		architecture = "arm"
+		if variant == "" {
+			variant = "v7"
+		}
+	case "armel":
+		architecture = "arm"
+		if variant == "" {
+			variant = "v6"
+		}
+	case "arm":
+		// The generic arm architecture has no portable default variant;
+		// keep it empty so a requested variant is not guessed.
+	case "i386", "i486", "i586", "i686", "386":
+		architecture = "386"
+		if variant == "v1" || variant == "1" {
+			variant = ""
+		}
+	}
+	return osName, architecture, variant
 }
 
 func validPlatformValue(platform string) bool {

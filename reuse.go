@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"log"
 	"net/netip"
 	"os"
 	"strings"
@@ -27,6 +26,21 @@ func waitReusePoll(ctx context.Context) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+func cancelReuseReaperHandoff(runner cli.Runner, eng engine, name, uid, logicalName string) error {
+	er, ok := runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return nil
+	}
+	binary := er.ExternalBinary()
+	if binary == "" {
+		binary = eng.binary()
+	}
+	if err := unregisterHandoffWithGlobalReaper(binary, eng.reaperSubcommand(), name, uid); err != nil {
+		return fmt.Errorf("reuse %s: cancel reaper ownership: %w", logicalName, err)
+	}
+	return nil
 }
 
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
@@ -134,6 +148,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	ctr.uid = fresh.uid
 	ctr.bootstrap = false
 	ctr.inspectMu.Unlock()
+
+	// A reused generation is handed off to the caller, not owned by the
+	// watchdog. This also removes an older normal-run entry for the same
+	// logical name/UID, so a subsequent parent death cannot delete a
+	// successfully attached shared container.
+	if err := cancelReuseReaperHandoff(ctr.runner, ctr.eng, ctr.id, ctr.uid, cfg.name); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -292,19 +314,15 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		defer os.RemoveAll(dir)
 		envFile = path
 	}
-	if cfg.creation == "" {
-		cfg.creation = newCreationID()
-	}
-	reaperBin := ""
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		reaperBin = er.ExternalBinary()
-		if reaperBin == "" {
-			reaperBin = cfg.eng.binary()
-		}
-		if err := preRegisterWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation); err != nil {
-			log.Printf("container-go: reaper pre-registration failed: %v", err)
-		}
-	}
+	// Every actual backend create gets a new generation. A retry after
+	// a name conflict, ambiguous failure, or stopped-container deletion
+	// must not reuse the generation carried by an old handle.
+	cfg.creation = newCreationID()
+	// Keep the resolved image available to failed-create verification.
+	// In particular, KEEP must compare the retained handle with the image
+	// requested for this attempt rather than validating info against itself.
+	cfg.preparedImage = resolvedImage
+	cfg.imagePrepared = true
 
 	// The leader's create gets an independent runTimeout budget even
 	// when the caller's context carries a tighter attach deadline.
@@ -326,22 +344,11 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
 			return retained, withCleanupError(classified, retainedErr)
 		}
-		// A reused create may have been published before the CLI
-		// reported its error. Never infer ownership from an ambiguous
-		// failure and delete the shared generation automatically.
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
-	if reaperBin != "" {
-		if cfg.eng.name() == "docker" && validDockerUID(uid) {
-			if err := promotePendingDockerIDWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, uid); err != nil {
-				log.Printf("container-go: reaper immutable-ID promotion failed: %v", err)
-			}
-		} else if err := completePendingWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation); err != nil {
-			log.Printf("container-go: reaper completion failed: %v", err)
-		}
-	}
 	ctr := &Container{
 		id:                cfg.name,
 		runner:            cfg.runner,
@@ -369,6 +376,9 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		return reuseFailureResult(ctr, err)
 	}
 	cfg.markReuseCreated(ctr)
+	if err := cancelReuseReaperHandoff(ctr.runner, ctr.eng, ctr.id, ctr.uid, cfg.name); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -421,6 +431,9 @@ func (c *Container) copyReuseFile(ctx context.Context, f File) error {
 // lock. A changed generation is left for the next ensure iteration; a
 // same-generation running container is never force-deleted.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if keepContainers() {
+		return fmt.Errorf("reuse %s: stopped container retained because CONTAINERGO_KEEP=1", cfg.name)
+	}
 	if info == nil || info.labels[managedLabel] != "true" ||
 		info.labels[reuseLabel] != "true" ||
 		!validCreationGeneration(info.labels[creationLabel]) ||

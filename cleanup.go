@@ -142,6 +142,12 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	if candidate.id == "" || !nameRE.MatchString(candidate.id) {
 		return false, nil
 	}
+	// A name-addressed delete is safe only when the list snapshot already
+	// carries a valid generation. A later inspect cannot prove which
+	// generation was selected by an incomplete/malformed list result.
+	if eng.nameAddressedDeletes() && !validCreationGeneration(candidate.creation) {
+		return false, nil
+	}
 
 	// Keep the lock, fresh inspect, and delete in one critical section.
 	// The create paths in this package take the same lock, so a library

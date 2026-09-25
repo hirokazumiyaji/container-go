@@ -232,22 +232,48 @@ func resolveNameLocks(name string) (resolvedNameLocks, error) {
 // reaperNameLockPaths prepares every lock inode before the shell reaper
 // receives it. The reaper protocol is fail-closed and acquires the paths
 // in the same legacy-to-durable order as lockName.
+//
+//nolint:unused // compatibility helper for callers that only need paths
 func reaperNameLockPaths(name string) ([]string, error) {
+	paths, _, err := reaperNameLockMetadata(name)
+	return paths, err
+}
+
+func reaperLockIdentity(f *os.File) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", errors.New("lock file inode metadata is unavailable")
+	}
+	return fmt.Sprintf("%d:%d:%d", stat.Dev, stat.Ino, stat.Uid), nil
+}
+
+func reaperNameLockMetadata(name string) ([]string, []string, error) {
 	resolved, err := resolveNameLocks(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	paths := resolved.ordered()
+	identities := make([]string, 0, len(paths))
 	for _, path := range paths {
 		f, err := openNameLockPath(path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := f.Close(); err != nil {
-			return nil, err
+		identity, identityErr := reaperLockIdentity(f)
+		closeErr := f.Close()
+		if identityErr != nil {
+			return nil, nil, identityErr
 		}
+		if closeErr != nil {
+			return nil, nil, closeErr
+		}
+		identities = append(identities, identity)
 	}
-	return paths, nil
+	return paths, identities, nil
 }
 
 type nameLockHooks struct {

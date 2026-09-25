@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -60,6 +61,44 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	return io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))), nil
 }
 
+// lockedLogStream keeps an Apple name lock for the entire lifetime of a
+// followed log stream. Releasing it when FollowLogs returns would let a
+// replacement acquire the name while the stream is still addressing it.
+type lockedLogStream struct {
+	io.ReadCloser
+	unlock    func()
+	done      chan struct{}
+	once      sync.Once
+	closeOnce sync.Once
+	closeErr  error
+}
+
+func (s *lockedLogStream) release() {
+	s.once.Do(func() {
+		close(s.done)
+		s.unlock()
+	})
+}
+
+func (s *lockedLogStream) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if err != nil {
+		s.release()
+	}
+	return n, err
+}
+
+func (s *lockedLogStream) closeUnderlying() error {
+	s.closeOnce.Do(func() { s.closeErr = s.ReadCloser.Close() })
+	return s.closeErr
+}
+
+func (s *lockedLogStream) Close() error {
+	err := s.closeUnderlying()
+	s.release()
+	return err
+}
+
 // FollowLogs streams the container's log output until Close is called
 // or the context is cancelled. Close terminates the underlying CLI
 // process.
@@ -72,6 +111,23 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
-	return s.Stream(ctx, c.eng.logsArgs(target, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	if stream == nil {
+		unlock()
+		return nil, errors.New("logs: streaming runner returned a nil stream")
+	}
+	locked := &lockedLogStream{ReadCloser: stream, unlock: unlock, done: make(chan struct{})}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = locked.closeUnderlying()
+			locked.release()
+		case <-locked.done:
+		}
+	}()
+	return locked, nil
 }

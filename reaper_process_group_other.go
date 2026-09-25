@@ -10,7 +10,7 @@ import (
 func prepareReaperCommand(*exec.Cmd) {}
 
 func killReaperCommand(_ context.Context, cmd *exec.Cmd) error {
-	if cmd.Process == nil {
+	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
 	return cmd.Process.Kill()

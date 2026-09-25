@@ -182,8 +182,10 @@ func (c *Container) Terminate(ctx context.Context) error
 `Exec` returns the exit code with combined stdout+stderr (a non-zero
 exit is a result, not an error); this is kept for v1 compatibility.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
-containers. `Terminate` is generation-guarded: it refuses to delete a
-name recycled by another process (see Reuse below).
+containers. `FollowLogs` keeps the Apple name lock for the entire stream
+and releases it on EOF, cancellation, or `Close`. `Terminate` is
+generation-guarded: it refuses to delete a name recycled by another
+process (see Reuse below).
 
 `Terminate` maps to `container delete --force` and is idempotent
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
@@ -289,8 +291,10 @@ The CLI has no label filter, so orphan sweeps filter
 removes stopped containers carrying the managed label from any
 session.
 
-Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
-reaper (for debugging).
+Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup`, failed-create
+rollback, stopped-reuse recycling, and the reaper (for debugging). A
+retained reusable handle is returned only after its ownership, generation,
+and image identity have been verified.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -308,11 +312,16 @@ Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
 Docker the handle keeps the immutable `Id` printed by `docker run` (or
 returned by inspect) and deletes by it, so no generation check is
-needed: a replacement never shares the ID. Apple Container addresses
+needed: a replacement never shares the ID. A reused generation is not
+registered with the watchdog; a successful handoff removes any inherited
+name/UID entry before returning the handle. Failed reusable creates are
+cleaned only when a fresh, exact ownership and created/stopped-state
+check succeeds; running or ambiguous generations are retained. Apple
+Container addresses
 containers by name only, so there the delete is name-based: the
 generation must match a fresh inspect, and inspect plus delete run
-under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
+under stable per-name lock barriers (including the account-scoped
+lock path) that every such delete in this library takes. That guarantee is
 limited to cooperating processes using this library on the same host:
 a direct `container delete` plus re-create by an external tool inside
 that window is indistinguishable by name, and closing it would need an
@@ -323,9 +332,12 @@ rollback reports a container left behind that way in its error rather
 than hiding it. The watchdog reaper registers Docker containers by
 `Id`; for Apple it stores the generation, reads the label as a
 line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each backend call carries a 10-30s timeout
-via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
-daemon call cannot wedge the rest. The leader's own pull/create uses an
+skips deletion on mismatch. Name-addressed entries also pass the lock
+file's device, inode, and UID to the reaper; replacement or metadata
+mismatch fails closed. Each backend call carries a 10-30s timeout via
+POSIX `sleep`/an owned positive-PID check (no `timeout(1)` dependency)
+so one hung daemon call cannot wedge the rest without signaling a
+recycled process group. The leader's own pull/create uses an
 independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 

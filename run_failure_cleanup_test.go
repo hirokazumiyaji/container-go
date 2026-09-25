@@ -56,7 +56,7 @@ func ownedInspectJSON(name string) string {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "redis:7-alpine"},
+      "image": {"reference": "redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
@@ -76,7 +76,7 @@ func foreignInspectJSON(name string) string {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "redis:7-alpine"},
+      "image": {"reference": "redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
       "publishedPorts": [],
       "labels": {"com.github.hirokazumiyaji.container-go": "true"}
     },
@@ -163,7 +163,7 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	}
 }
 
-func TestReuseCreateFailureRetainsAmbiguousGeneration(t *testing.T) {
+func TestReuseCreateFailureCleansExactStoppedGeneration(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
 	// reuseCreate inspects first: report not-found once, then owned after failed run.
@@ -182,8 +182,48 @@ func TestReuseCreateFailureRetainsAmbiguousGeneration(t *testing.T) {
 	if !strings.Contains(err.Error(), "entrypoint") {
 		t.Fatalf("error = %v, want run failure", err)
 	}
+	if len(inner.deleted) != 1 {
+		t.Fatalf("deleted = %v, exact reusable generation should be cleaned", inner.deleted)
+	}
+}
+
+func TestReuseCreateFailureRetainsRunningGeneration(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	inner := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectJSON: strings.Replace(ownedInspectJSON("myctr"), `"state": "created"`, `"state": "running"`, 1),
+	}
+	calls := 0
+	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), withRunner(wrapper), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want error")
+	}
 	if len(inner.deleted) != 0 {
-		t.Fatalf("deleted = %v, reused ambiguous generation must be retained", inner.deleted)
+		t.Fatalf("deleted = %v, running generation must be retained", inner.deleted)
+	}
+}
+
+func TestReuseCreateFailureRetainsForeignGeneration(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	inner := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "port bind failed"},
+		inspectJSON: foreignInspectJSON("myctr"),
+	}
+	calls := 0
+	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), withRunner(wrapper), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if len(inner.deleted) != 0 {
+		t.Fatalf("deleted = %v, foreign generation must be retained", inner.deleted)
 	}
 }
 

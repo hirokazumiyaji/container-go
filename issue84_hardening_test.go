@@ -75,6 +75,23 @@ func TestIssue84PlatformResolutionOnlyMatchesOSOnly(t *testing.T) {
 	}
 }
 
+func TestIssue84PlatformAliasesAndDefaultsCompareCanonically(t *testing.T) {
+	cases := [][2]string{
+		{"linux/arm64", "linux/aarch64/v8"},
+		{"linux/amd64", "linux/x86_64/v1"},
+		{"linux/arm/v7", "linux/armhf"},
+		{"linux/arm/v6", "linux/armel"},
+	}
+	for _, pair := range cases {
+		if err := checkPlatformCompatibility(pair[0], pair[1]); err != nil {
+			t.Errorf("platform %q vs %q: %v", pair[0], pair[1], err)
+		}
+		if !samePlatform(pair[0], pair[1]) {
+			t.Errorf("samePlatform(%q, %q) = false", pair[0], pair[1])
+		}
+	}
+}
+
 func TestIssue84ExplicitPublishedAddressFailsClosed(t *testing.T) {
 	p := publishSpec{containerPort: 80, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 18080}
 	if hasPublishedBinding([]boundPort{{containerPort: 80, proto: "tcp", hostPort: 18080}}, p) {

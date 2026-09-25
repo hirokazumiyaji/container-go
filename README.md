@@ -163,8 +163,9 @@ Three layers make sure containers do not outlive your tests:
 1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
-2. If `Run` fails partway, it removes whatever it created before
-   returning.
+2. If `Run` fails partway, it removes an owned, stopped/created
+   generation before returning. Ambiguous, running, or foreign reusable
+   generations are retained for inspection.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
@@ -209,8 +210,10 @@ Contract:
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
-  handles so other packages keep working. Explicit `ctr.Terminate` still
-  removes the shared container — only do that when nothing else needs it.
+  handles so other packages keep working. A successful reuse handoff also
+  removes any inherited watchdog entry for that name/UID. Explicit
+  `ctr.Terminate` still removes the shared container — only do that when
+  nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). Ordinary `Prune` still
   only deletes stopped managed containers.

@@ -3,9 +3,13 @@
 package container
 
 import (
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -132,6 +136,63 @@ func TestReaperPromotesPendingDockerEntryToImmutableID(t *testing.T) {
 	waitForLogLines(t, logPath, "rm --force "+uid)
 }
 
+type reaperDeadlineWriter struct {
+	deadline time.Time
+}
+
+func (w *reaperDeadlineWriter) SetWriteDeadline(deadline time.Time) error {
+	w.deadline = deadline
+	return nil
+}
+
+func (w *reaperDeadlineWriter) Write(p []byte) (int, error) {
+	if wait := time.Until(w.deadline); wait > 0 {
+		time.Sleep(wait)
+		return 0, os.ErrDeadlineExceeded
+	}
+	return len(p), nil
+}
+
+func TestReaperRegistrationWritesAreBounded(t *testing.T) {
+	w := &reaperDeadlineWriter{}
+	start := time.Now()
+	if err := writeReaperLine(w, "A\\n", 20*time.Millisecond); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("write error = %v, want deadline error", err)
+	}
+	if elapsed := time.Since(start); elapsed > 250*time.Millisecond {
+		t.Fatalf("bounded write took %s", elapsed)
+	}
+}
+
+func TestReaperFailsClosedWhenLockInodeIsReplaced(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("replace-lock", "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	path := r.entries[0].lockPaths[0]
+	r.mu.Unlock()
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	time.Sleep(150 * time.Millisecond)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force replace-lock") {
+		t.Fatalf("reaper deleted through a replaced lock inode: %q", data)
+	}
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
@@ -169,9 +230,55 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	waitForLogLines(t, logPath, "rm --force "+before, "rm --force "+after)
 }
 
+func TestReaperStopsOldChildBeforeReplay(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	defer r.closeStdin()
+	var starts atomic.Int32
+	var firstPID int
+	r.command = func() *exec.Cmd {
+		starts.Add(1)
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	uid := strings.Repeat("9", 64)
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("initial register: %v", err)
+	}
+	r.mu.Lock()
+	firstPID = r.cmd.Process.Pid
+	r.mu.Unlock()
+
+	r.opMu.Lock()
+	r.mu.Lock()
+	err := r.respawnAndReplayLocked()
+	r.mu.Unlock()
+	r.opMu.Unlock()
+	if err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	if starts.Load() != 2 {
+		t.Fatalf("spawn count = %d, want old child retired and one replay child", starts.Load())
+	}
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(firstPID, 0); errors.Is(err, syscall.ESRCH) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("old reaper child %d was not terminated before replay", firstPID)
+}
+
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, `sleep "$timeout"`) || !strings.Contains(reaperScript, "kill -9") {
+	if !strings.Contains(reaperScript, `sleep "$timeout"`) ||
+		(!strings.Contains(reaperScript, "kill -9") && !strings.Contains(reaperScript, `kill "-$signal"`)) {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
+	}
+	if strings.Contains(reaperScript, "kill -9 "+"-") {
+		t.Error("reaper script must not signal a recyclable process-group ID")
+	}
+	if !strings.Contains(reaperScript, "ps_bin") || !strings.Contains(reaperScript, "-o lstart=") || !strings.Contains(reaperScript, "kill_owned_descendants") {
+		t.Error("reaper script must verify positive child identity before cleanup")
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.

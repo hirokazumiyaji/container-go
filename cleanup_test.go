@@ -133,6 +133,35 @@ func TestDockerPruneIDListRevalidatesOwnershipAndGroup(t *testing.T) {
 	}
 }
 
+func TestApplePruneRequiresListTimeGeneration(t *testing.T) {
+	r := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
+	removed, err := pruneNamedCandidate(context.Background(), r, appleEngine{}, pruneCandidate{id: "managed-stopped", state: StateStopped, managed: true}, "prune", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if removed || len(r.calls) != 0 {
+		t.Fatalf("removed=%v calls=%v; missing list generation must fail before inspect/delete", removed, r.calls)
+	}
+}
+
+func TestAppleReuseGroupRequiresListTimeGeneration(t *testing.T) {
+	r := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
+	removed, err := pruneListed(context.Background(), r, appleEngine{}, []string{"list"}, func([]byte) ([]pruneCandidate, error) {
+		return []pruneCandidate{{id: "managed-stopped", state: StateStopped, managed: true, reuseGroup: "ci"}}, nil
+	}, "prune reuse group ci", "ci")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want none without list-time generation", removed)
+	}
+	for _, call := range r.calls {
+		if len(call) > 0 && (call[0] == "inspect" || call[0] == "delete") {
+			t.Fatalf("missing list generation reached name operation: %v", call)
+		}
+	}
+}
+
 func TestSessionLabelValueIsValid(t *testing.T) {
 	id := sessionID()
 	if len(id) != 16 || strings.ToLower(id) != id {

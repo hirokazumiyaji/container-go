@@ -91,6 +91,61 @@ func TestFollowLogsStreamsAndPropagatesClose(t *testing.T) {
 	}
 }
 
+func TestFollowLogsHoldsAppleNameLockUntilTerminal(t *testing.T) {
+	f := &streamRunner{fakeRunner: newTestRunner(), streamData: "streamed\n"}
+	ctr := runTestContainer(t, f)
+	rc, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	probeCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	if unlock, err := lockName(probeCtx, ctr.id); err == nil {
+		unlock()
+		t.Fatal("Apple name lock was released before FollowLogs reached terminal state")
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := lockName(context.Background(), ctr.id)
+	if err != nil {
+		t.Fatalf("name lock remained held after EOF: %v", err)
+	}
+	unlock()
+}
+
+type blockingStreamRunner struct {
+	*fakeRunner
+	reader *io.PipeReader
+	writer *io.PipeWriter
+}
+
+func (r *blockingStreamRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	return r.reader, nil
+}
+
+func TestFollowLogsReleasesAppleLockOnContextCancellation(t *testing.T) {
+	reader, writer := io.Pipe()
+	f := &blockingStreamRunner{fakeRunner: newTestRunner(), reader: reader, writer: writer}
+	ctr := runTestContainer(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	rc, err := ctr.FollowLogs(ctx)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	cancel()
+	probeCtx, probeCancel := context.WithTimeout(context.Background(), time.Second)
+	defer probeCancel()
+	unlock, err := lockName(probeCtx, ctr.id)
+	if err != nil {
+		t.Fatalf("name lock remained held after context cancellation: %v", err)
+	}
+	unlock()
+	_ = rc.Close()
+	_ = writer.Close()
+}
+
 func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 	f := newTestRunner() // no Stream method
 	ctr := runTestContainer(t, f)

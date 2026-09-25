@@ -75,11 +75,23 @@ var (
 
 	// completedEnvCleanups preserves the proof needed to make repeated
 	// cleanup calls idempotent after active ownership has been cleared.
-	completedEnvCleanups sync.Map // map[string]completedEnvCleanup
+	completedEnvCleanups     sync.Map // map[string]completedEnvCleanup
+	completedEnvCleanupMu    sync.Mutex
+	completedEnvCleanupOrder []string
+	completedEnvCleanupKeys  map[string]struct{}
+	completedEnvCleanupLimit = 1024
 
-	// Test hook: runs after the staging directory is renamed and before
-	// active ownership is published.
+	// Test hook: runs immediately after the final ownership state is
+	// published, before post-rename identity checks.
 	envFileAfterRenameHook func()
+
+	// Test hook: runs after staging ownership is published and before its
+	// first fallible identity check.
+	envFileAfterStagingPublishHook func(string)
+
+	// Test hook: runs after the initial child allowlist validation and
+	// immediately before a child is unlinked.
+	envFileBeforeChildUnlinkHook func(string)
 )
 
 type activeEnvFile struct {
@@ -90,6 +102,8 @@ type activeEnvFile struct {
 	root     string
 	path     string
 	original string
+	staging  string
+	removed  bool
 	pending  bool
 }
 
@@ -104,14 +118,49 @@ func recordCompletedEnvCleanup(state *activeEnvFile) {
 	}
 	completed := completedEnvCleanup{root: state.root, rootInfo: state.rootInfo}
 	if state.original != "" {
-		completedEnvCleanups.Store(state.original, completed)
+		storeCompletedEnvCleanup(state.original, completed)
 	}
 	if state.path != "" && state.path != state.original {
-		completedEnvCleanups.Store(state.path, completed)
+		storeCompletedEnvCleanup(state.path, completed)
+	}
+}
+
+func storeCompletedEnvCleanup(key string, completed completedEnvCleanup) {
+	if key == "" {
+		return
+	}
+	completedEnvCleanupMu.Lock()
+	defer completedEnvCleanupMu.Unlock()
+	if completedEnvCleanupKeys == nil {
+		completedEnvCleanupKeys = make(map[string]struct{})
+	}
+	if _, exists := completedEnvCleanupKeys[key]; exists {
+		for i, existing := range completedEnvCleanupOrder {
+			if existing == key {
+				completedEnvCleanupOrder = append(completedEnvCleanupOrder[:i], completedEnvCleanupOrder[i+1:]...)
+				break
+			}
+		}
+	} else {
+		completedEnvCleanupKeys[key] = struct{}{}
+	}
+	completedEnvCleanupOrder = append(completedEnvCleanupOrder, key)
+	completedEnvCleanups.Store(key, completed)
+	limit := completedEnvCleanupLimit
+	if limit < 1 {
+		limit = 1
+	}
+	for len(completedEnvCleanupOrder) > limit {
+		oldest := completedEnvCleanupOrder[0]
+		completedEnvCleanupOrder = completedEnvCleanupOrder[1:]
+		delete(completedEnvCleanupKeys, oldest)
+		completedEnvCleanups.Delete(oldest)
 	}
 }
 
 func loadCompletedEnvCleanup(dir string) (completedEnvCleanup, bool) {
+	completedEnvCleanupMu.Lock()
+	defer completedEnvCleanupMu.Unlock()
 	value, ok := completedEnvCleanups.Load(dir)
 	if !ok {
 		return completedEnvCleanup{}, false
@@ -273,7 +322,7 @@ func writeEnvFileAtWithRootContextRunner(ctx context.Context, base string, env m
 		// the caller must perform a later retry.
 		if dir != "" {
 			cleanupCtx, cancel := context.WithTimeout(operationCtx, envCleanupDeferredTimeout)
-			cleanupErr := cleanupEnvFileAtWithRetryContext(cleanupCtx, base, dir, removeExpectedEnvChildren)
+			cleanupErr := cleanupEnvFileAtWithRetryContextBound(cleanupCtx, base, dir)
 			cancel()
 			if cleanupErr != nil {
 				return path, dir, errors.Join(err, cleanupErr)
@@ -302,56 +351,66 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	if err != nil {
 		return "", "", err
 	}
-	keep := false
-	published := false
-	cleanupDir := staging
-	var lock *os.File
-	defer func() {
-		if keep || published {
-			return
-		}
-		var cleanupErr error
-		if lock != nil {
-			cleanupErr = closeEnvFileLock(lock)
-		}
-		// Staging cleanup is also constrained to the exact child
-		// allowlist. RemoveAll would turn a same-user race or a corrupted
-		// staging entry into an unintended recursive delete.
-		if removeErr := removeExpectedEnvChildren(cleanupDir); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-			cleanupErr = errors.Join(cleanupErr, removeErr)
-		}
-		err = errors.Join(err, cleanupErr)
-	}()
 
+	// Publish staging ownership before chmod, marker creation, lock setup,
+	// or any other fallible cleanup/validation. A caller that receives an
+	// error can therefore retry the exact directory even if the process
+	// loses the staging path during finalization.
+	state := &activeEnvFile{
+		rootInfo: rootInfo,
+		root:     root,
+		path:     staging,
+		original: staging,
+		staging:  staging,
+		pending:  true,
+	}
+	activeEnvFiles.Store(staging, state)
+	pendingEnvCleanups.Store(staging, state)
+	path = filepath.Join(staging, envFileName)
+	dir = staging
+	if hook := envFileAfterStagingPublishHook; hook != nil {
+		hook(staging)
+	}
+
+	stagingInfo, err := os.Lstat(staging)
+	if err != nil {
+		return path, dir, err
+	}
+	state.mu.Lock()
+	state.dirInfo = stagingInfo
+	state.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := chmodEnvDirectory(staging); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := validatePrivateDirectory(staging); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := writeEnvMarker(filepath.Join(staging, envFileDirMarkerName), envFileDirMarker); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 
 	lockPath := filepath.Join(staging, envFileLockName)
-	lock, err = openEnvFileNoFollow(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, envFileMode)
+	lock, err := openEnvFileNoFollow(lockPath, os.O_CREATE|os.O_EXCL|os.O_RDWR, envFileMode)
 	if err != nil {
-		return "", "", err
+		return path, dir, err
 	}
+	state.mu.Lock()
+	state.lock = lock
+	state.mu.Unlock()
 	if err := lock.Chmod(envFileMode); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := validatePrivateRegularFile(lockPath); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := acquireEnvFileLock(lock); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 
 	var b []byte
@@ -366,77 +425,79 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	envPath := filepath.Join(staging, envFileName)
 	f, err := openEnvFileNoFollow(envPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, envFileMode)
 	if err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := f.Chmod(envFileMode); err != nil {
 		_ = f.Close()
-		return "", "", err
+		return path, dir, err
 	}
 	n, writeErr := f.Write(b)
 	closeErr := f.Close()
 	if writeErr != nil {
-		return "", "", writeErr
+		return path, dir, writeErr
 	}
 	if n != len(b) {
-		return "", "", io.ErrShortWrite
+		return path, dir, io.ErrShortWrite
 	}
 	if closeErr != nil {
-		return "", "", closeErr
+		return path, dir, closeErr
 	}
 	if err := validatePrivateRegularFile(envPath); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if err := ctx.Err(); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 
 	suffix := strings.TrimPrefix(filepath.Base(staging), envFileStagingPrefix)
 	if suffix == "" {
-		return "", "", fmt.Errorf("%w: invalid staging directory name %q", errUnsafeEnvFile, staging)
+		return path, dir, fmt.Errorf("%w: invalid staging directory name %q", errUnsafeEnvFile, staging)
 	}
-	dir = filepath.Join(root, envFileDirPrefix+suffix)
-	if _, err := os.Lstat(dir); !errors.Is(err, os.ErrNotExist) {
+	finalDir := filepath.Join(root, envFileDirPrefix+suffix)
+	if _, err := os.Lstat(finalDir); !errors.Is(err, os.ErrNotExist) {
 		if err != nil {
-			return "", "", err
+			return path, dir, err
 		}
-		return "", "", fmt.Errorf("%w: environment directory %q already exists", errUnsafeEnvFile, dir)
+		return path, dir, fmt.Errorf("%w: environment directory %q already exists", errUnsafeEnvFile, finalDir)
 	}
 	currentRootInfo, err := os.Lstat(root)
 	if err != nil {
-		return "", "", err
+		return path, dir, err
 	}
 	if !os.SameFile(rootInfo, currentRootInfo) {
-		return "", "", fmt.Errorf("%w: environment root %q was replaced before publication", errUnsafeEnvFile, root)
+		return path, dir, fmt.Errorf("%w: environment root %q was replaced before publication", errUnsafeEnvFile, root)
 	}
-	stagingInfo, err := os.Lstat(staging)
+	currentStagingInfo, err := os.Lstat(staging)
 	if err != nil {
-		return "", "", err
+		return path, dir, err
 	}
+	state.mu.Lock()
+	if state.dirInfo == nil || !os.SameFile(state.dirInfo, currentStagingInfo) {
+		state.mu.Unlock()
+		return path, dir, fmt.Errorf("%w: staging directory %q was replaced before publication", errUnsafeEnvFile, staging)
+	}
+	state.mu.Unlock()
 	if err := ctx.Err(); err != nil {
-		return "", "", err
+		return path, dir, err
 	}
-	if err := os.Rename(staging, dir); err != nil {
-		return "", "", err
+	if err := os.Rename(staging, finalDir); err != nil {
+		return path, dir, err
 	}
-	cleanupDir = dir
-	path = filepath.Join(dir, envFileName)
+
+	// Transfer the already-published ownership state to the final path
+	// before any post-rename identity check. The old staging key remains
+	// mapped until successful finalization so an error cannot orphan it.
+	state.mu.Lock()
+	state.path = finalDir
+	state.original = finalDir
+	state.mu.Unlock()
+	activeEnvFiles.Store(finalDir, state)
+	pendingEnvCleanups.Store(finalDir, state)
+	dir = finalDir
+	path = filepath.Join(finalDir, envFileName)
 	if hook := envFileAfterRenameHook; hook != nil {
 		hook()
 	}
-
-	// Publish ownership immediately after the rename. The following
-	// identity checks are fallible; an error here must leave the state and
-	// lock available to the caller's cleanup retry.
-	state := &activeEnvFile{
-		lock:     lock,
-		dirInfo:  stagingInfo,
-		rootInfo: rootInfo,
-		root:     root,
-		path:     dir,
-		original: dir,
-	}
-	activeEnvFiles.Store(dir, state)
-	published = true
 
 	currentRootInfo, err = os.Lstat(root)
 	if err != nil {
@@ -445,18 +506,25 @@ func createEnvFileContext(ctx context.Context, root string, env map[string]strin
 	if !os.SameFile(rootInfo, currentRootInfo) {
 		return path, dir, fmt.Errorf("%w: environment root %q was replaced after publication", errUnsafeEnvFile, root)
 	}
-	dirInfo, err := os.Lstat(dir)
+	finalInfo, err := os.Lstat(finalDir)
 	if err != nil {
-		return path, dir, fmt.Errorf("%w: environment directory %q is unavailable after publication: %v", errUnsafeEnvFile, dir, err)
+		return path, dir, fmt.Errorf("%w: environment directory %q is unavailable after publication: %v", errUnsafeEnvFile, finalDir, err)
 	}
-	if !os.SameFile(stagingInfo, dirInfo) {
-		return path, dir, fmt.Errorf("%w: environment directory %q changed during publication", errUnsafeEnvFile, dir)
+	state.mu.Lock()
+	if state.dirInfo == nil || !os.SameFile(state.dirInfo, finalInfo) {
+		state.mu.Unlock()
+		return path, dir, fmt.Errorf("%w: environment directory %q changed during publication", errUnsafeEnvFile, finalDir)
 	}
-	state.dirInfo = dirInfo
+	state.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return path, dir, err
 	}
-	keep = true
+	state.mu.Lock()
+	state.pending = false
+	state.mu.Unlock()
+	deleteEnvCleanupStateKey(staging, state)
+	deleteEnvCleanupStateKey(finalDir, state)
+	activeEnvFiles.Store(finalDir, state)
 	return path, dir, nil
 }
 
@@ -543,7 +611,7 @@ func cleanupEnvFile(dir string) error {
 }
 
 func cleanupEnvFileContext(ctx context.Context, dir string) error {
-	return cleanupEnvFileAtContext(ctx, "", dir, removeExpectedEnvChildren)
+	return cleanupEnvFileAtWithCloseContextBound(ctx, "", dir, removeExpectedEnvChildren, closeEnvFileLock)
 }
 
 func cleanupEnvFileAt(base, dir string, removeAll func(string) error) error {
@@ -554,11 +622,23 @@ func cleanupEnvFileAtContext(ctx context.Context, base, dir string, removeAll fu
 	return cleanupEnvFileAtWithCloseContext(ctx, base, dir, removeAll, closeEnvFileLock)
 }
 
+func cleanupEnvFileAtContextBound(ctx context.Context, base, dir string) error {
+	return cleanupEnvFileAtWithCloseContextBound(ctx, base, dir, removeExpectedEnvChildren, closeEnvFileLock)
+}
+
 func cleanupEnvFileAtWithClose(base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
 	return cleanupEnvFileAtWithCloseContext(context.Background(), base, dir, removeAll, closeLock)
 }
 
 func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
+	return cleanupEnvFileAtWithCloseContextMode(ctx, base, dir, removeAll, closeLock, false)
+}
+
+func cleanupEnvFileAtWithCloseContextBound(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
+	return cleanupEnvFileAtWithCloseContextMode(ctx, base, dir, removeAll, closeLock, true)
+}
+
+func cleanupEnvFileAtWithCloseContextMode(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error, bindDirInfo bool) error {
 	if dir == "" {
 		return nil
 	}
@@ -622,14 +702,16 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 				return fmt.Errorf("%w: environment root %q was replaced", errUnsafeEnvFile, root)
 			}
 		}
-		state.rootInfo = currentRootInfo
+		if !ownedState {
+			state.rootInfo = currentRootInfo
+		}
 		info, err := os.Lstat(dir)
 		if errors.Is(err, os.ErrNotExist) {
 			// A pending state whose lock was already released may have
 			// completed removal before a late error was reported. Without
 			// that durable state, a missing path is uncertain: the old root
 			// may still contain the secret under a renamed path.
-			if state.pending && state.lock == nil {
+			if state.pending && state.lock == nil && state.removed && state.dirInfo != nil {
 				pathMissing = true
 				return nil
 			}
@@ -651,11 +733,17 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 		if state.root != "" && state.root != root {
 			return fmt.Errorf("%w: environment directory %q belongs to another root", errUnsafeEnvFile, dir)
 		}
-		if state.dirInfo != nil && !os.SameFile(state.dirInfo, info) {
-			return fmt.Errorf("%w: environment directory %q was replaced", errUnsafeEnvFile, dir)
+		if ownedState {
+			if state.dirInfo == nil {
+				return fmt.Errorf("%w: environment directory %q has no recorded identity", errUnsafeEnvFile, dir)
+			}
+			if !os.SameFile(state.dirInfo, info) {
+				return fmt.Errorf("%w: environment directory %q was replaced", errUnsafeEnvFile, dir)
+			}
+		} else {
+			state.dirInfo = info
 		}
 		state.root = root
-		state.dirInfo = info
 		state.path = dir
 		if state.original == "" {
 			state.original = original
@@ -733,8 +821,15 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 				dir = tombstone
 				renamed = true
 				state.path = dir
-				if tombstoneInfo, statErr := os.Lstat(dir); statErr == nil {
-					state.dirInfo = tombstoneInfo
+				tombstoneInfo, statErr := os.Lstat(dir)
+				if statErr != nil {
+					return statErr
+				}
+				if state.dirInfo == nil {
+					return fmt.Errorf("%w: environment directory %q has no validated identity after tombstone rename", errUnsafeEnvFile, dir)
+				}
+				if !os.SameFile(state.dirInfo, tombstoneInfo) {
+					return fmt.Errorf("%w: environment directory %q changed during tombstone rename", errUnsafeEnvFile, dir)
 				}
 			}
 			if renameErr != nil {
@@ -743,9 +838,17 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 		}
 
 		removeStarted = true
-		if err := removeAll(dir); err != nil {
+		if bindDirInfo {
+			if state.dirInfo == nil {
+				return fmt.Errorf("%w: environment directory %q has no validated identity for removal", errUnsafeEnvFile, dir)
+			}
+			if err := removeExpectedEnvChildrenAt(dir, state.dirInfo); err != nil {
+				return err
+			}
+		} else if err := removeAll(dir); err != nil {
 			return err
 		}
+		state.removed = true
 		return rootCtx.Err()
 	}, closeEnvFileLock)
 
@@ -775,7 +878,11 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 	if info, err := os.Lstat(dir); err == nil {
 		dirExists = true
 		if state != nil {
-			state.dirInfo = info
+			if state.dirInfo == nil {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%w: environment directory %q has no validated identity", errUnsafeEnvFile, dir))
+			} else if !os.SameFile(state.dirInfo, info) {
+				cleanupErr = errors.Join(cleanupErr, fmt.Errorf("%w: environment directory %q was replaced during cleanup", errUnsafeEnvFile, dir))
+			}
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
 		cleanupErr = errors.Join(cleanupErr, err)
@@ -807,9 +914,9 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 				if state.path != state.original {
 					pendingEnvCleanups.Store(state.path, state)
 				}
-				activeEnvFiles.Delete(state.original)
+				deleteEnvCleanupActiveKey(state.original, state)
 				if state.path != state.original {
-					activeEnvFiles.Delete(state.path)
+					deleteEnvCleanupActiveKey(state.path, state)
 				}
 			} else if wasPending {
 				// A pending retry that still cannot make progress stays
@@ -818,16 +925,16 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 				if state.path != state.original {
 					pendingEnvCleanups.Store(state.path, state)
 				}
-				activeEnvFiles.Delete(state.original)
+				deleteEnvCleanupActiveKey(state.original, state)
 				if state.path != state.original {
-					activeEnvFiles.Delete(state.path)
+					deleteEnvCleanupActiveKey(state.path, state)
 				}
 			} else {
 				// Validation failed before the hand-off. Keep the live
 				// writer state intact rather than weakening marker checks on
 				// a later retry.
 				activeEnvFiles.Store(state.original, state)
-				pendingEnvCleanups.Delete(state.original)
+				deleteEnvCleanupPendingKey(state.original, state)
 			}
 		}
 	}
@@ -847,10 +954,19 @@ func cleanupEnvFileAfterUseContext(ctx context.Context, dir string) error {
 }
 
 func cleanupEnvFileWithRetryContext(ctx context.Context, base, dir string) error {
-	return cleanupEnvFileAtWithRetryContext(ctx, base, dir, removeExpectedEnvChildren)
+	return cleanupEnvFileAtWithRetryContextBound(ctx, base, dir)
 }
 
+func cleanupEnvFileAtWithRetryContextBound(ctx context.Context, base, dir string) error {
+	return cleanupEnvFileAtWithRetryContextMode(ctx, base, dir, removeExpectedEnvChildren, true)
+}
+
+//nolint:unused
 func cleanupEnvFileAtWithRetryContext(ctx context.Context, base, dir string, removeAll func(string) error) error {
+	return cleanupEnvFileAtWithRetryContextMode(ctx, base, dir, removeAll, false)
+}
+
+func cleanupEnvFileAtWithRetryContextMode(ctx context.Context, base, dir string, removeAll func(string) error, bindDirInfo bool) error {
 	if dir == "" {
 		return nil
 	}
@@ -865,11 +981,16 @@ func cleanupEnvFileAtWithRetryContext(ctx context.Context, base, dir string, rem
 		attempts = 1
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		if err := cleanupEnvFileAtContext(retryCtx, base, dir, removeAll); err == nil {
-			return nil
+		var err error
+		if bindDirInfo {
+			err = cleanupEnvFileAtContextBound(retryCtx, base, dir)
 		} else {
-			errs = append(errs, err)
+			err = cleanupEnvFileAtContext(retryCtx, base, dir, removeAll)
 		}
+		if err == nil {
+			return nil
+		}
+		errs = append(errs, err)
 		if attempt+1 < attempts {
 			timer := time.NewTimer(envCleanupRetryInterval)
 			select {
@@ -908,7 +1029,7 @@ func retryEnvFileCleanupWithError(dir *string) error {
 		state.mu.Unlock()
 	}
 	retryCtx, cancel := context.WithTimeout(context.Background(), envCleanupDeferredTimeout)
-	err := cleanupEnvFileAtWithRetryContext(retryCtx, base, value, removeExpectedEnvChildren)
+	err := cleanupEnvFileAtWithRetryContextBound(retryCtx, base, value)
 	cancel()
 	if err == nil {
 		*dir = ""
@@ -971,7 +1092,7 @@ func scheduleEnvCleanupRetry(dir string) {
 			if base == "" {
 				err = cleanupEnvFileContext(ctx, dir)
 			} else {
-				err = cleanupEnvFileAtContext(ctx, base, dir, removeExpectedEnvChildren)
+				err = cleanupEnvFileAtContextBound(ctx, base, dir)
 			}
 			if err == nil {
 				return
@@ -1083,7 +1204,7 @@ func drainPendingEnvCleanupsContext(ctx context.Context, pending []pendingEnvCle
 		if item.base == "" {
 			err = cleanupEnvFileContext(ctx, item.dir)
 		} else {
-			err = cleanupEnvFileAtContext(ctx, item.base, item.dir, removeExpectedEnvChildren)
+			err = cleanupEnvFileAtContextBound(ctx, item.base, item.dir)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -1116,6 +1237,25 @@ func loadEnvCleanupState(dir string) *activeEnvFile {
 	return nil
 }
 
+func deleteEnvCleanupActiveKey(key string, state *activeEnvFile) {
+	if key == "" || state == nil {
+		return
+	}
+	activeEnvFiles.CompareAndDelete(key, state)
+}
+
+func deleteEnvCleanupPendingKey(key string, state *activeEnvFile) {
+	if key == "" || state == nil {
+		return
+	}
+	pendingEnvCleanups.CompareAndDelete(key, state)
+}
+
+func deleteEnvCleanupStateKey(key string, state *activeEnvFile) {
+	deleteEnvCleanupActiveKey(key, state)
+	deleteEnvCleanupPendingKey(key, state)
+}
+
 func clearEnvCleanupState(state *activeEnvFile) {
 	if state == nil {
 		return
@@ -1129,14 +1269,9 @@ func clearEnvCleanupStateLocked(state *activeEnvFile) {
 	if state == nil {
 		return
 	}
-	if state.original != "" {
-		activeEnvFiles.Delete(state.original)
-		pendingEnvCleanups.Delete(state.original)
-	}
-	if state.path != "" {
-		activeEnvFiles.Delete(state.path)
-		pendingEnvCleanups.Delete(state.path)
-	}
+	deleteEnvCleanupStateKey(state.original, state)
+	deleteEnvCleanupStateKey(state.path, state)
+	deleteEnvCleanupStateKey(state.staging, state)
 }
 
 func validateEnvCleanupPath(root, dir string) error {
@@ -1339,6 +1474,12 @@ func withEnvFileRootContextWithCloseCallback(ctx context.Context, base string, f
 			return errors.Join(callbackErr, postCallbackErr)
 		}
 		return postCallbackErr
+	}
+	if _, markerErr := validateHeldRootMarker(marker, markerPath); markerErr != nil {
+		if callbackErr != nil {
+			return errors.Join(callbackErr, markerErr)
+		}
+		return markerErr
 	}
 	if callbackErr != nil {
 		return callbackErr
@@ -1841,7 +1982,7 @@ func removeStaleLockedEnvDir(dir string, dirInfo os.FileInfo) (err error) {
 			return err
 		}
 	}
-	return removeExpectedEnvChildren(tombstone)
+	return removeExpectedEnvChildrenAt(tombstone, dirInfo)
 }
 
 func removeStaleTombstoneEnvDir(dir string, dirInfo os.FileInfo) (err error) {
@@ -1864,7 +2005,7 @@ func removeStaleTombstoneEnvDir(dir string, dirInfo os.FileInfo) (err error) {
 		if !os.SameFile(dirInfo, current) {
 			return fmt.Errorf("%w: tombstone %q was replaced", errUnsafeEnvFile, dir)
 		}
-		return removeExpectedEnvChildren(dir)
+		return removeExpectedEnvChildrenAt(dir, dirInfo)
 	}
 	if err != nil {
 		return err
@@ -1891,7 +2032,7 @@ func removeStaleTombstoneEnvDir(dir string, dirInfo os.FileInfo) (err error) {
 	if !os.SameFile(dirInfo, currentDirInfo) || !os.SameFile(lockInfo, currentLockInfo) {
 		return fmt.Errorf("%w: tombstone %q was replaced during validation", errUnsafeEnvFile, dir)
 	}
-	return removeExpectedEnvChildren(dir)
+	return removeExpectedEnvChildrenAt(dir, dirInfo)
 }
 
 func removeStaleStagingEnvDir(dir string, dirInfo os.FileInfo) error {
@@ -1944,7 +2085,7 @@ func removeStaleStagingEnvDir(dir string, dirInfo os.FileInfo) error {
 		if err != nil {
 			return err
 		}
-		return removeExpectedEnvChildren(tombstone)
+		return removeExpectedEnvChildrenAt(tombstone, dirInfo)
 	}
 	if lockErr != nil {
 		return lockErr
@@ -1960,43 +2101,58 @@ func removeStaleStagingEnvDir(dir string, dirInfo os.FileInfo) error {
 	return removeStaleLockedEnvDir(dir, dirInfo)
 }
 
-func validateExpectedEnvChildren(dir string) error {
+func validatedExpectedEnvChildren(dir string) (map[string]os.FileInfo, error) {
+	return validatedExpectedEnvChildrenAt(dir, nil)
+}
+
+func validatedExpectedEnvChildrenAt(dir string, expectedDirInfo os.FileInfo) (map[string]os.FileInfo, error) {
 	info, err := os.Lstat(dir)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if expectedDirInfo != nil && !os.SameFile(expectedDirInfo, info) {
+		return nil, fmt.Errorf("%w: environment directory %q was replaced before child validation", errUnsafeEnvFile, dir)
 	}
 	if err := validatePrivateDirectoryInfo(dir, info); err != nil {
-		return err
+		return nil, err
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	allowed := map[string]bool{
 		envFileName:          true,
 		envFileLockName:      true,
 		envFileDirMarkerName: true,
 	}
+	validated := make(map[string]os.FileInfo, len(entries))
 	for _, entry := range entries {
 		if !allowed[entry.Name()] {
-			return fmt.Errorf("%w: environment directory %q contains unexpected child %q", errUnsafeEnvFile, dir, entry.Name())
+			return nil, fmt.Errorf("%w: environment directory %q contains unexpected child %q", errUnsafeEnvFile, dir, entry.Name())
 		}
 		path := filepath.Join(dir, entry.Name())
-		info, err := os.Lstat(path)
+		childInfo, err := os.Lstat(path)
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-			return fmt.Errorf("%w: environment child %q is not a regular file", errUnsafeEnvFile, path)
+		if err := validatePrivateRegularInfo(path, childInfo); err != nil {
+			return nil, err
 		}
-		if err := validateEnvOwnership(info, currentEnvFileUID(), envFileMode); err != nil {
-			return err
-		}
+		validated[entry.Name()] = childInfo
 	}
-	return nil
+	return validated, nil
+}
+
+func validateExpectedEnvChildren(dir string) error {
+	_, err := validatedExpectedEnvChildren(dir)
+	return err
 }
 
 func removeExpectedEnvChildren(dir string) error {
+	return removeExpectedEnvChildrenAt(dir, nil)
+}
+
+func removeExpectedEnvChildrenAt(dir string, expectedDirInfo os.FileInfo) error {
 	// Validate the complete allowlist first. Never use RemoveAll here:
 	// a foreign child added after validation must make cleanup fail
 	// closed rather than be recursively deleted.
@@ -2004,14 +2160,18 @@ func removeExpectedEnvChildren(dir string) error {
 	if err != nil {
 		return err
 	}
-	if err := validatePrivateDirectoryInfo(dir, dirInfo); err != nil {
-		return err
+	if expectedDirInfo != nil && !os.SameFile(expectedDirInfo, dirInfo) {
+		return fmt.Errorf("%w: environment directory %q was replaced before removal", errUnsafeEnvFile, dir)
 	}
-	if err := validateExpectedEnvChildren(dir); err != nil {
+	validated, err := validatedExpectedEnvChildrenAt(dir, dirInfo)
+	if err != nil {
 		return err
 	}
 	for _, name := range []string{envFileName, envFileDirMarkerName, envFileLockName} {
 		path := filepath.Join(dir, name)
+		if hook := envFileBeforeChildUnlinkHook; hook != nil {
+			hook(path)
+		}
 		info, err := os.Lstat(path)
 		if errors.Is(err, os.ErrNotExist) {
 			continue
@@ -2019,8 +2179,15 @@ func removeExpectedEnvChildren(dir string) error {
 		if err != nil {
 			return err
 		}
-		if err := validateEnvOwnership(info, currentEnvFileUID(), envFileMode); err != nil {
+		expected, ok := validated[name]
+		if !ok {
+			return fmt.Errorf("%w: environment child %q appeared after validation", errUnsafeEnvFile, path)
+		}
+		if err := validatePrivateRegularInfo(path, info); err != nil {
 			return err
+		}
+		if !os.SameFile(expected, info) {
+			return fmt.Errorf("%w: environment child %q was replaced during removal", errUnsafeEnvFile, path)
 		}
 		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -2029,14 +2196,17 @@ func removeExpectedEnvChildren(dir string) error {
 	current, err := os.Lstat(dir)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return fmt.Errorf("%w: environment directory %q disappeared during removal", errUnsafeEnvFile, dir)
 		}
 		return err
 	}
 	if !os.SameFile(dirInfo, current) {
 		return fmt.Errorf("%w: environment directory %q was replaced during removal", errUnsafeEnvFile, dir)
 	}
-	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := os.Remove(dir); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: environment directory %q disappeared during removal", errUnsafeEnvFile, dir)
+		}
 		return err
 	}
 	return nil

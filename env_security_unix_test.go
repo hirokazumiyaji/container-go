@@ -421,6 +421,52 @@ func TestIssue97PublishesOwnershipBeforeRootReplacement(t *testing.T) {
 	_ = os.RemoveAll(root)
 }
 
+func TestIssue97PublishesStagingOwnershipBeforeValidationFailure(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, envFileRootName)
+	if err := withEnvFileRoot(base, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	oldHook := envFileAfterStagingPublishHook
+	var moved string
+	envFileAfterStagingPublishHook = func(staging string) {
+		moved = staging + "-moved"
+		_ = os.Rename(staging, moved)
+	}
+	defer func() { envFileAfterStagingPublishHook = oldHook }()
+
+	path, dir, err := createEnvFile(root, map[string]string{"TOKEN": "secret"})
+	if err == nil {
+		t.Fatal("create unexpectedly succeeded after staging path replacement")
+	}
+	if path == "" || dir == "" {
+		t.Fatalf("create result = (%q, %q), want actual staging path for retry", path, dir)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("pre-publication failure dropped staging ownership")
+	}
+	if err := cleanupEnvFile(dir); err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("missing unpublished staging path error = %v, want unsafe error", err)
+	}
+	if loadEnvCleanupState(dir) == nil {
+		t.Fatal("missing unpublished staging path cleared ownership")
+	}
+	state.mu.Lock()
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if lock != nil {
+		_ = closeEnvFileLock(lock)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(moved)
+	_ = os.RemoveAll(dir)
+}
+
 func TestIssue97RejectsRootReplacementAfterCallback(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
@@ -438,6 +484,30 @@ func TestIssue97RejectsRootReplacementAfterCallback(t *testing.T) {
 		t.Fatalf("callback root replacement error = %v, want safety error", err)
 	}
 	_ = os.RemoveAll(oldRoot)
+	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
+}
+
+func TestIssue97RejectsRootMarkerReplacementAfterCallback(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	var oldMarker string
+	err := withEnvFileRootContextWithCallback(context.Background(), base, func(_ context.Context, root string) error {
+		marker := filepath.Join(root, envFileRootMarkerName)
+		oldMarker = marker + "-old"
+		if err := os.Rename(marker, oldMarker); err != nil {
+			return err
+		}
+		if err := os.WriteFile(marker, []byte(envFileRootLockMarker), envFileMode); err != nil {
+			return err
+		}
+		return os.Chmod(marker, envFileMode)
+	})
+	if err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("marker replacement error = %v, want safety error", err)
+	}
+	_ = os.RemoveAll(oldMarker)
 	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
 }
 
@@ -509,6 +579,127 @@ func TestIssue97CleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
 	clearEnvCleanupState(state)
 	_ = os.RemoveAll(dir)
 	_ = os.RemoveAll(root)
+}
+
+func TestIssue97ChildReplacementSurvivesRemoval(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	for _, replacementDirectory := range []bool{false, true} {
+		name := "file"
+		if replacementDirectory {
+			name = "directory"
+		}
+		t.Run(name, func(t *testing.T) {
+			isolateEnvFileRoot(t)
+			_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldHook := envFileBeforeChildUnlinkHook
+			replaced := false
+			var replacementPath string
+			envFileBeforeChildUnlinkHook = func(path string) {
+				if replaced || filepath.Base(path) != envFileName {
+					return
+				}
+				replaced = true
+				replacementPath = path
+				_ = os.Remove(path)
+				if replacementDirectory {
+					_ = os.Mkdir(path, envDirMode)
+				} else {
+					_ = os.WriteFile(path, []byte("replacement"), envFileMode)
+				}
+			}
+			defer func() { envFileBeforeChildUnlinkHook = oldHook }()
+			err = cleanupEnvFile(dir)
+			if err == nil || !errors.Is(err, errUnsafeEnvFile) {
+				t.Fatalf("cleanup error = %v, want replacement safety error", err)
+			}
+			if _, statErr := os.Lstat(replacementPath); statErr != nil {
+				t.Fatalf("replacement child was removed: %v", statErr)
+			}
+			state := loadEnvCleanupState(dir)
+			if state == nil {
+				t.Fatal("replacement failure dropped cleanup ownership")
+			}
+			state.mu.Lock()
+			lock := state.lock
+			state.lock = nil
+			state.mu.Unlock()
+			if lock != nil {
+				_ = closeEnvFileLock(lock)
+			}
+			clearEnvCleanupState(state)
+			_ = os.RemoveAll(dir)
+		})
+	}
+}
+
+func TestIssue97CleanupDoesNotAdoptReplacedDirectory(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	isolateEnvFileRoot(t)
+	_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("write did not publish env ownership")
+	}
+	state.mu.Lock()
+	oldDirInfo := state.dirInfo
+	state.mu.Unlock()
+	if oldDirInfo == nil {
+		t.Fatal("published state has no directory identity")
+	}
+	oldHook := envFileBeforeChildUnlinkHook
+	var replacementPath, movedPath string
+	envFileBeforeChildUnlinkHook = func(path string) {
+		if filepath.Base(path) != envFileName || replacementPath != "" {
+			return
+		}
+		parent := filepath.Dir(path)
+		movedPath = parent + "-old"
+		if err := os.Rename(parent, movedPath); err != nil {
+			t.Fatalf("move original cleanup directory: %v", err)
+		}
+		if err := os.Mkdir(parent, envDirMode); err != nil {
+			t.Fatalf("create replacement cleanup directory: %v", err)
+		}
+		replacementPath = parent
+	}
+	defer func() { envFileBeforeChildUnlinkHook = oldHook }()
+	if err := cleanupEnvFile(dir); err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("cleanup error = %v, want directory replacement safety error", err)
+	}
+	if replacementPath == "" {
+		t.Fatal("directory replacement hook did not run")
+	}
+	if _, err := os.Lstat(replacementPath); err != nil {
+		t.Fatalf("replacement directory was removed: %v", err)
+	}
+	state = loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("directory replacement failure dropped cleanup ownership")
+	}
+	state.mu.Lock()
+	retainedInfo := state.dirInfo
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if retainedInfo == nil || !os.SameFile(oldDirInfo, retainedInfo) {
+		t.Fatal("cleanup adopted the replacement directory identity")
+	}
+	if lock != nil {
+		_ = closeEnvFileLock(lock)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(movedPath)
+	_ = os.RemoveAll(replacementPath)
 }
 
 func TestIssue97PendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
@@ -703,6 +894,122 @@ func (r *reuseEnvCleanupFailureRunner) Run(ctx context.Context, args ...string) 
 		}
 	}
 	return r.reuseCreateRunner.Run(ctx, args...)
+}
+
+type issue97ReuseCopyBarrierRunner struct {
+	*reuseCreateRunner
+	copyStarted chan struct{}
+	copyRelease chan struct{}
+	runOnce     atomic.Bool
+	copyOnce    atomic.Bool
+	envPath     string
+}
+
+func (r *issue97ReuseCopyBarrierRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 {
+		return r.reuseCreateRunner.Run(ctx, args...)
+	}
+	if args[0] == "run" && r.runOnce.CompareAndSwap(false, true) {
+		for i, arg := range args {
+			if arg == "--env-file" && i+1 < len(args) {
+				r.envPath = args[i+1]
+				_ = os.Remove(filepath.Join(filepath.Dir(r.envPath), envFileDirMarkerName))
+				break
+			}
+		}
+	}
+	if args[0] == "cp" && r.copyOnce.CompareAndSwap(false, true) {
+		close(r.copyStarted)
+		<-r.copyRelease
+	}
+	return r.reuseCreateRunner.Run(ctx, args...)
+}
+
+func TestIssue97ReuseWarningCompletesFileSetupBeforePublishingFlight(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	isolateEnvFileRoot(t)
+	hostFile := filepath.Join(t.TempDir(), "host.txt")
+	if err := os.WriteFile(hostFile, []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &issue97ReuseCopyBarrierRunner{
+		reuseCreateRunner: newReuseCreateRunner(),
+		copyStarted:       make(chan struct{}),
+		copyRelease:       make(chan struct{}),
+	}
+	leaderResult := make(chan struct {
+		ctr *Container
+		err error
+	}, 1)
+	go func() {
+		ctr, err := Run(context.Background(), "redis:7-alpine",
+			WithName("warning-files"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}),
+			WithFiles(File{HostPath: hostFile, ContainerPath: "/tmp/host"}),
+			withRunner(runner), withEngine(appleEngine{}))
+		leaderResult <- struct {
+			ctr *Container
+			err error
+		}{ctr, err}
+	}()
+	select {
+	case <-runner.copyStarted:
+	case <-time.After(time.Second):
+		t.Fatal("reuse leader did not reach file copy")
+	}
+
+	oldJoin := reuseFlights.onJoin
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	reuseFlights.onJoin = func(string) { joinOnce.Do(func() { close(joined) }) }
+	defer func() { reuseFlights.onJoin = oldJoin }()
+	waiterResult := make(chan struct {
+		ctr *Container
+		err error
+	}, 1)
+	go func() {
+		ctr, err := Run(context.Background(), "redis:7-alpine",
+			WithName("warning-files"), WithReuse(),
+			withRunner(runner), withEngine(appleEngine{}))
+		waiterResult <- struct {
+			ctr *Container
+			err error
+		}{ctr, err}
+	}()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("reuse waiter did not join the in-flight setup")
+	}
+	select {
+	case result := <-waiterResult:
+		t.Fatalf("waiter completed before file copy: (%v, %v)", result.ctr, result.err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(runner.copyRelease)
+
+	leader := <-leaderResult
+	if leader.ctr == nil || leader.err == nil {
+		t.Fatalf("leader result = (%v, %v), want handle plus cleanup warning", leader.ctr, leader.err)
+	}
+	waiter := <-waiterResult
+	if waiter.ctr == nil || waiter.err != nil {
+		t.Fatalf("waiter result = (%v, %v), want successful fully initialized handle", waiter.ctr, waiter.err)
+	}
+
+	dir := filepath.Dir(runner.envPath)
+	if state := loadEnvCleanupState(dir); state != nil {
+		state.mu.Lock()
+		lock := state.lock
+		state.lock = nil
+		state.mu.Unlock()
+		if lock != nil {
+			_ = closeEnvFileLock(lock)
+		}
+		clearEnvCleanupState(state)
+	}
+	_ = os.RemoveAll(dir)
 }
 
 func TestPublicReuseReturnsHandleWhenEnvCleanupFails(t *testing.T) {

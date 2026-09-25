@@ -252,12 +252,15 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	if envCleanupErr != nil {
+	if envCleanupErr != nil && len(cfg.files) == 0 {
 		// The handle is usable, but no further post-create operation may
 		// run while the secret artifact remains. The deferred retry keeps
 		// ownership and the flight layer carries this as a warning.
 		return ctr, &reuseCleanupWarning{err: envCleanupErr}
 	}
+	// A warning with configured files must not publish the shared flight
+	// before the required setup has completed. Finish the bounded inspect
+	// and copy work first; any setup failure remains a failed flight.
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
 		if cleanupErr != nil {
@@ -273,6 +276,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 			}
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
+	}
+	if envCleanupErr != nil {
+		return ctr, &reuseCleanupWarning{err: envCleanupErr}
 	}
 	return ctr, nil
 }

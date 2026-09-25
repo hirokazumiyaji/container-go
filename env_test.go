@@ -13,6 +13,53 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
+func TestCompletedEnvCleanupStateIsBounded(t *testing.T) {
+	oldLimit := completedEnvCleanupLimit
+	completedEnvCleanupLimit = 3
+	reset := func() {
+		completedEnvCleanupMu.Lock()
+		completedEnvCleanups.Range(func(key, _ any) bool {
+			completedEnvCleanups.Delete(key)
+			return true
+		})
+		completedEnvCleanupOrder = nil
+		completedEnvCleanupKeys = nil
+		completedEnvCleanupMu.Unlock()
+	}
+	reset()
+	t.Cleanup(func() {
+		reset()
+		completedEnvCleanupLimit = oldLimit
+	})
+
+	root := t.TempDir()
+	info, err := os.Stat(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{
+		filepath.Join(root, "one"),
+		filepath.Join(root, "two"),
+		filepath.Join(root, "three"),
+		filepath.Join(root, "four"),
+		filepath.Join(root, "five"),
+	}
+	for _, path := range paths {
+		recordCompletedEnvCleanup(&activeEnvFile{
+			root:     root,
+			rootInfo: info,
+			path:     path,
+			original: path,
+		})
+	}
+	if _, ok := loadCompletedEnvCleanup(paths[0]); ok {
+		t.Fatal("oldest completed cleanup was not evicted")
+	}
+	if _, ok := loadCompletedEnvCleanup(paths[len(paths)-1]); !ok {
+		t.Fatal("newest completed cleanup was not retained")
+	}
+}
+
 func TestBoundedEnvContextCapsLongerCallerDeadline(t *testing.T) {
 	oldTimeout := envFileSecurityTimeout
 	envFileSecurityTimeout = 20 * time.Millisecond

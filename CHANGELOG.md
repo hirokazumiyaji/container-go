@@ -17,7 +17,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Validate wait strategies and declared ports before image pulls, classify
-  terminal log-stream errors, and de-duplicate replayed log occurrences.
+  terminal log-stream errors, retry transient state probes, preserve exposed-port
+  declaration order, and bound replay de-duplication state.
 - Clarify streaming log behavior: startup failures are returned by
   `FollowLogs`, terminal CLI failures are delivered by `Read`, and
   process-group descendants are only best-effort terminated (the direct

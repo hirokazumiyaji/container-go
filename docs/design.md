@@ -217,8 +217,12 @@ given host address and `MappedPort` the host port.
 
 `MappedPort` errors with `ErrPortNotExposed` for ports not declared
 via `WithExposedPorts`. `ForExposedPort` and an HTTP probe without
-`WithPort` select the first declared **TCP** port; a UDP-only
-container is not an implicit TCP target.
+`WithPort` scan `WithExposedPorts` in declaration order and select its first
+**TCP** entry. They scan `WithPublishedPort` only when no exposed TCP port
+exists; an explicit binding therefore does not reorder exposed declarations.
+A port without `/tcp` is canonicalized to TCP for validation, and
+numerically equivalent text such as `080` and `80` identifies the same port.
+A UDP-only container is not an implicit TCP target.
 
 ## Wait strategies
 
@@ -252,7 +256,9 @@ without reconnecting and cannot be satisfied by a matching line.
 `WithOccurrence(n)` requires a positive count, matches per line, and
 counts across reconnects after de-duplicating the replayed log prefix.
 The prefix contract assumes `FollowLogs` replays append-only history;
-identical lines at different positions remain separate events.
+identical lines at different positions remain separate events. Replay state
+stores the prefix length and a fixed-size rolling tail of line fingerprints,
+so memory use is independent of total log volume.
 `ForAll` / `ForAny` validate nested strategies recursively. Their
 `WithStartupTimeout` bounds the whole composition when positive; zero or
 negative retains the historical unbounded behavior.

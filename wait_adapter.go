@@ -31,17 +31,19 @@ func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
 		// Port probes are TCP-only. A UDP declaration must not silently
 		// become the target of an implicit ForExposedPort/ForHTTP probe.
-		// Prefer explicit published bindings, matching Container.resolve.
-		for _, published := range t.c.published {
-			if published.proto == "tcp" {
-				port = strconv.Itoa(published.containerPort) + "/" + published.proto
+		// Exposed declarations retain their order even when another port
+		// has an explicit host binding; published-only containers fall back
+		// to their first TCP binding.
+		for _, exposed := range t.c.exposed {
+			if exposed.proto == "tcp" {
+				port = exposed.String()
 				break
 			}
 		}
 		if port == "" {
-			for _, exposed := range t.c.exposed {
-				if exposed.proto == "tcp" {
-					port = exposed.String()
+			for _, published := range t.c.published {
+				if published.proto == "tcp" {
+					port = strconv.Itoa(published.containerPort) + "/" + published.proto
 					break
 				}
 			}

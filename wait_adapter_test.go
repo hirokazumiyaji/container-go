@@ -43,6 +43,33 @@ func TestWaitImplicitPortSelectsOnlyTCP(t *testing.T) {
 	}
 }
 
+func TestWaitImplicitPortPreservesExposedDeclarationOrder(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f,
+		WithExposedPorts("80/tcp"),
+		WithPublishedPort("127.0.0.1:18081:8081/tcp"),
+	)
+	endpoint, err := (waitTarget{c: ctr}).Endpoint(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if endpoint != "192.168.64.3:80" {
+		t.Fatalf("endpoint = %q, want first declared exposed TCP port", endpoint)
+	}
+}
+
+func TestWaitImplicitPortFallsBackToPublishedTCP(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f, WithPublishedPort("127.0.0.1:18081:8081/tcp"))
+	endpoint, err := (waitTarget{c: ctr}).Endpoint(context.Background(), "")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if endpoint != "127.0.0.1:18081" {
+		t.Fatalf("endpoint = %q, want published-only TCP port", endpoint)
+	}
+}
+
 func TestWaitImplicitPortRejectsUDPOnlyContainer(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f, WithExposedPorts("53/udp"))

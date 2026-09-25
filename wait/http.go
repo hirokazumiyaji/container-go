@@ -26,8 +26,8 @@ type HTTPStrategy struct {
 	httpClient    *http.Client
 }
 
-// ForHTTP waits for a plain-HTTP endpoint at path (on the first
-// declared port unless WithPort is used) to return 2xx.
+// ForHTTP waits for a plain-HTTP endpoint at path (on the first declared
+// TCP port unless WithPort is used) to return 2xx.
 func ForHTTP(path string) *HTTPStrategy {
 	return &HTTPStrategy{path: path, method: http.MethodGet}
 }

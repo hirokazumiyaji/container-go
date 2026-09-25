@@ -14,6 +14,7 @@ import (
 
 const (
 	maxLogLineSize       = 1024 * 1024
+	maxLogReplayLines    = 4096
 	terminalSettleWindow = 5 * time.Millisecond
 )
 
@@ -82,18 +83,39 @@ type logScanResult struct {
 	terminalErr error
 	count       int
 	lines       [][sha256.Size]byte
+	lineStart   int
+	lineCount   int
 }
 
 type logReplay struct {
-	previous [][sha256.Size]byte
-	count    int
+	previous      [][sha256.Size]byte
+	previousStart int
+	previousLines int
+	count         int
 }
 
-func (r logReplay) matchesPrevious(index int, line string) bool {
-	if index >= len(r.previous) {
+// matchesPrevious reports whether index is in the replayed prefix. Only a
+// rolling tail of line fingerprints is retained; older positions are part
+// of the replay under FollowLogs' append-only history contract.
+func (r logReplay) matchesPrevious(index int, line [sha256.Size]byte) bool {
+	if index >= r.previousLines || len(r.previous) == 0 {
 		return false
 	}
-	return r.previous[index] == sha256.Sum256([]byte(line))
+	tailStart := r.previousLines - len(r.previous)
+	if index < tailStart {
+		return true
+	}
+	position := (r.previousStart + index - tailStart) % len(r.previous)
+	return r.previous[position] == line
+}
+
+func appendReplayLine(lines [][sha256.Size]byte, start *int, line [sha256.Size]byte) [][sha256.Size]byte {
+	if len(lines) < maxLogReplayLines {
+		return append(lines, line)
+	}
+	lines[*start] = line
+	*start = (*start + 1) % maxLogReplayLines
+	return lines
 }
 
 // scanLogStream reads a complete stream unless the requested number of
@@ -105,35 +127,52 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 	go func() {
 		reader := bufio.NewReader(stream)
 		var lines [][sha256.Size]byte
+		lineStart := 0
+		observedLines := 0
+		lineCount := replay.previousLines
 		count := replay.count
+		replaying := true
+		result := func(found bool, scanErr, terminalErr error) logScanResult {
+			return logScanResult{
+				found:       found,
+				err:         scanErr,
+				terminalErr: terminalErr,
+				count:       count,
+				lines:       lines,
+				lineStart:   lineStart,
+				lineCount:   lineCount,
+			}
+		}
 		for {
 			line, err := readLogLine(reader)
 			if len(line) > 0 {
-				index := len(lines)
-				lines = append(lines, sha256.Sum256([]byte(line)))
-				if !replay.matchesPrevious(index, line) {
-					count += match(line)
+				hash := sha256.Sum256([]byte(line))
+				if replaying && !replay.matchesPrevious(observedLines, hash) {
+					replaying = false
+					lineCount = observedLines
 				}
+				if !replaying {
+					count += match(line)
+					lineCount++
+				}
+				lines = appendReplayLine(lines, &lineStart, hash)
+				observedLines++
 			}
 			if err != nil {
 				if isPermanentCheckError(err) || isTerminalStreamError(err) {
-					results <- logScanResult{err: err, count: count, lines: lines}
+					results <- result(false, err, nil)
 					return
 				}
 				if errors.Is(err, io.EOF) {
-					if count >= occurrences {
-						results <- logScanResult{found: true, count: count, lines: lines}
-					} else {
-						results <- logScanResult{count: count, lines: lines}
-					}
+					results <- result(count >= occurrences, nil, nil)
 					return
 				}
-				results <- logScanResult{err: err, count: count, lines: lines}
+				results <- result(false, err, nil)
 				return
 			}
 			if count >= occurrences {
 				terminalErr := settleLogReader(ctx, reader)
-				results <- logScanResult{found: true, terminalErr: terminalErr, count: count, lines: lines}
+				results <- result(true, nil, terminalErr)
 				return
 			}
 		}
@@ -241,8 +280,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		match = func(line string) int { return strings.Count(line, s.pattern) }
 	}
 
-	var previous [][sha256.Size]byte
-	var count int
+	var replay logReplay
 	var lastErr error
 	for {
 		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr); terminalErr != nil {
@@ -257,7 +295,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			return wrapWaitCause(what, err, lastErr)
 		}
 
-		result := scanLogStream(waitCtx, stream, match, s.occurrences, logReplay{previous: previous, count: count})
+		result := scanLogStream(waitCtx, stream, match, s.occurrences, replay)
 		if result.found {
 			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr); terminalErr != nil {
 				_ = stream.Close()
@@ -282,8 +320,12 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			return nil
 		}
 
-		previous = result.lines
-		count = result.count
+		replay = logReplay{
+			previous:      result.lines,
+			previousStart: result.lineStart,
+			previousLines: result.lineCount,
+			count:         result.count,
+		}
 		if result.err != nil {
 			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, result.err)); terminalErr != nil {
 				return terminalErr
@@ -311,7 +353,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			return terminalErr
 		}
 		if runningErr != nil {
-			if isPermanentCheckError(runningErr) || isTerminalStreamError(runningErr) {
+			// A CLIError here came from the independent state probe, not
+			// from the log stream. Only typed permanent state errors stop
+			// the wait; transient daemon/inspect failures remain causes and
+			// are retried with the next log connection.
+			if isPermanentCheckError(runningErr) {
 				return wrapWaitCause(what, runningErr, lastErr)
 			}
 			lastErr = joinNonNil(lastErr, runningErr)

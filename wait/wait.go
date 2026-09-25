@@ -25,8 +25,9 @@ const (
 // is adapted to it by container.Run.
 type Target interface {
 	// Endpoint resolves a declared container port ("6379/tcp") to a
-	// dialable "host:port". An empty port means the first declared TCP
-	// port for the built-in strategies.
+	// dialable "host:port". An empty port asks the built-in adapter for
+	// its first exposed TCP declaration, falling back to a published TCP
+	// declaration.
 	Endpoint(ctx context.Context, port string) (string, error)
 	// Running reports whether the container is still running.
 	Running(ctx context.Context) (bool, error)

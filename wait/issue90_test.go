@@ -17,6 +17,7 @@ type issue90Target struct {
 	endpointErr   error
 	endpointCalls atomic.Int32
 	runningCalls  atomic.Int32
+	runningErrs   []error
 	followCalls   atomic.Int32
 	execCalls     atomic.Int32
 	execErr       error
@@ -29,7 +30,10 @@ func (t *issue90Target) Endpoint(context.Context, string) (string, error) {
 }
 
 func (t *issue90Target) Running(context.Context) (bool, error) {
-	t.runningCalls.Add(1)
+	call := int(t.runningCalls.Add(1)) - 1
+	if call < len(t.runningErrs) && t.runningErrs[call] != nil {
+		return false, t.runningErrs[call]
+	}
 	return true, nil
 }
 
@@ -273,6 +277,97 @@ func TestForLogPollIntervalReconnects(t *testing.T) {
 	}
 }
 
+func TestForLogReconnectsAfterTransientStateProbeError(t *testing.T) {
+	stateErr := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"inspect", "myctr"},
+		ExitCode: 1,
+		Stderr:   "temporary daemon failure",
+	}
+	target := &issue90Target{
+		runningErrs: []error{stateErr},
+		logs: []io.ReadCloser{
+			io.NopCloser(strings.NewReader("starting\n")),
+			io.NopCloser(strings.NewReader("ready\n")),
+		},
+	}
+	if err := ForLog("ready").
+		WithPollInterval(time.Millisecond).
+		WithStartupTimeout(time.Second).
+		WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.followCalls.Load(); got != 2 {
+		t.Fatalf("FollowLogs calls = %d, want reconnect after transient state error", got)
+	}
+}
+
+func TestScanLogStreamBoundsReplayState(t *testing.T) {
+	const lineCount = 10_000
+	stream := io.NopCloser(strings.NewReader(strings.Repeat("history\n", lineCount)))
+	result := scanLogStream(
+		context.Background(),
+		stream,
+		func(string) int { return 0 },
+		1,
+		logReplay{},
+	)
+	if result.err != nil {
+		t.Fatalf("scanLogStream: %v", result.err)
+	}
+	if got := len(result.lines); got > 4096 {
+		t.Fatalf("replay lines = %d, want bounded to at most 4096", got)
+	}
+	if result.lineCount != lineCount {
+		t.Fatalf("line count = %d, want %d", result.lineCount, lineCount)
+	}
+}
+
+func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
+	const lineCount = 10_000
+	history := "ready\n" + strings.Repeat("history\n", lineCount-1)
+	first := scanLogStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(history)),
+		func(string) int { return 0 },
+		1,
+		logReplay{},
+	)
+	if first.err != nil {
+		t.Fatalf("first scan: %v", first.err)
+	}
+	replay := logReplay{
+		previous:      first.lines,
+		previousStart: first.lineStart,
+		previousLines: first.lineCount,
+		count:         first.count,
+	}
+	matches := 0
+	second := scanLogStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader(history+"ready\nready\n")),
+		func(line string) int {
+			lineMatches := strings.Count(line, "ready")
+			matches += lineMatches
+			return lineMatches
+		},
+		2,
+		replay,
+	)
+	if second.err != nil {
+		t.Fatalf("second scan: %v", second.err)
+	}
+	if !second.found {
+		t.Fatal("two new occurrences after the replayed prefix were not found")
+	}
+	if matches != 2 {
+		t.Fatalf("ready matches = %d, want replayed occurrence excluded", matches)
+	}
+	if second.lineCount != lineCount+2 {
+		t.Fatalf("line count = %d, want %d", second.lineCount, lineCount+2)
+	}
+}
+
 func TestForAllValidatesChildrenBeforeRunning(t *testing.T) {
 	target := &issue90Target{}
 	err := ForAll(
@@ -399,5 +494,34 @@ func TestValidateWithPortsChecksDeclarationsRecursively(t *testing.T) {
 	}
 	if err := ValidateWithPorts(ForHTTP("/").WithPort("8080/tcp"), []string{"80/tcp"}); !errors.Is(err, ErrPortNotExposed) {
 		t.Fatalf("missing explicit port error = %v, want ErrPortNotExposed", err)
+	}
+}
+
+func TestCanonicalPortSpecNormalizesNumericText(t *testing.T) {
+	tests := map[string]string{
+		"80":        "80/tcp",
+		"080/tcp":   "80/tcp",
+		"00053":     "53/tcp",
+		"00053/udp": "53/udp",
+	}
+	for input, want := range tests {
+		t.Run(input, func(t *testing.T) {
+			got, err := canonicalPortSpec(input)
+			if err != nil {
+				t.Fatalf("canonicalPortSpec(%q): %v", input, err)
+			}
+			if got != want {
+				t.Fatalf("canonicalPortSpec(%q) = %q, want %q", input, got, want)
+			}
+		})
+	}
+}
+
+func TestValidateWithPortsMatchesCanonicalPortText(t *testing.T) {
+	if err := ValidateWithPorts(ForListeningPort("00080"), []string{"80/tcp"}); err != nil {
+		t.Fatalf("leading-zero strategy port: %v", err)
+	}
+	if err := ValidateWithPorts(ForHTTP("/").WithPort("80"), []string{"00080/tcp"}); err != nil {
+		t.Fatalf("leading-zero declaration: %v", err)
 	}
 }

@@ -190,7 +190,11 @@ func canonicalPortSpec(port string) (string, error) {
 	if !hasProto {
 		proto = "tcp"
 	}
-	return portPart + "/" + proto, nil
+	n, err := strconv.Atoi(portPart)
+	if err != nil {
+		return "", err
+	}
+	return strconv.Itoa(n) + "/" + proto, nil
 }
 
 func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error {

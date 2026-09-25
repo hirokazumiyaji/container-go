@@ -123,6 +123,13 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
+ポートの暗黙選択は `WithExposedPorts` を宣言順に走査し、最初の TCP
+ポートを使います。公開済みの TCP ポートは、公開宣言された TCP ポートが
+ない場合だけ調べます。そのため、別のポートを `WithPublishedPort` で公開
+しても、公開宣言の順序は変わりません。
+`/tcp` を省略したポート仕様は検証時に TCP として正規化します。
+`080` と `80` のような数値として等しい表記も、同じ宣言と一致します。
+
 各 leaf 戦略の `WithStartupTimeout` は 0 なら 60 秒、
 `WithPollInterval` は 0 なら 100 ミリ秒です(`ForExec` のみ 250 ミリ秒)。
 `ForLog.WithPollInterval` は、logs ストリームが正常に EOF した後の
@@ -132,6 +139,8 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 履歴の共通接頭辞を重複排除してから、新しく観測した行だけを加算します。
 この契約は `FollowLogs` が追記専用の履歴を再接続ごとに再生することを
 前提とし、位置が異なる同一行は別イベントとして数えます。
+再生済み接頭辞の行数と、上限を定めた行フィンガープリントのローリングウィンドウだけを保持します。
+観測したログ量が増えても、待機のメモリ使用量は増えません。
 `ForAll` / `ForAny` は入れ子の戦略を再帰的に検証します。合成の
 `WithStartupTimeout` は正の値なら全体の上限、0 または負の値では従来の
 互換契約どおり無制限です。

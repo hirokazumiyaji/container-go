@@ -243,6 +243,8 @@ func WithExposedPorts(ports ...string) Option {
 // WithPublishedPort publishes a container port on the host
 // ("[host-ip:]host-port:container-port[/proto]"). Without it, endpoints
 // resolve to the container's own IP, which needs no host port at all.
+// Publishing a port does not reorder WithExposedPorts declarations used by
+// implicit wait probes.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)

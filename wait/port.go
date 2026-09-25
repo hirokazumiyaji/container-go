@@ -21,8 +21,9 @@ func ForListeningPort(port string) *HostPortStrategy {
 	return &HostPortStrategy{port: port, portSet: true}
 }
 
-// ForExposedPort waits on the first port declared via
-// WithExposedPorts.
+// ForExposedPort waits on the first TCP port declared via
+// WithExposedPorts, falling back to the first published TCP port when
+// the container has no exposed TCP port.
 func ForExposedPort() *HostPortStrategy {
 	return &HostPortStrategy{}
 }

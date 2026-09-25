@@ -134,6 +134,13 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
+Implicit port selection scans `WithExposedPorts` in declaration order and
+uses its first TCP entry. It scans `WithPublishedPort` only when no exposed
+TCP port exists, so publishing another port does not reorder exposed
+declarations. Port specs without `/tcp` are canonicalized to TCP for
+validation, and numerically equivalent spellings such as `080` and `80`
+match the same declaration.
+
 Every leaf strategy accepts `WithStartupTimeout` (zero means 60s) and
 `WithPollInterval` (zero means 100ms, except `ForExec`, which defaults
 to 250ms). `ForLog.WithPollInterval` is the delay before reconnecting
@@ -143,7 +150,9 @@ is returned without reconnecting or accepting a matching line.
 and counts across reconnects after the replayed prefix is de-duplicated.
 This prefix contract assumes `FollowLogs` replays the append-only history
 on each reconnect; repeated identical lines at different positions remain
-separate events.
+separate events. Replay bookkeeping keeps the prefix length plus a bounded
+rolling fingerprint tail, so the amount of observed logs does not grow the
+wait's memory use.
 `ForAll` and `ForAny` validate nested strategies recursively. Their
 `WithStartupTimeout` is the total composition timeout when positive;
 zero or a negative value retains the historical unbounded behavior.

@@ -18,7 +18,41 @@ func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
 	// another backend; tests opting in use t.Setenv.
 	os.Unsetenv("CONTAINERGO_BACKEND")
-	os.Exit(m.Run())
+
+	// Keep all three lock namespaces inside one disposable directory. A
+	// subprocess test sets CONTAINERGO_LOCK_INHERIT=1 so it reuses this
+	// namespace instead of creating a second one in its own TestMain.
+	root := ""
+	if os.Getenv("CONTAINERGO_LOCK_INHERIT") != "1" {
+		var err error
+		root, err = os.MkdirTemp("", "containergo-lock-test-")
+		if err != nil {
+			panic(err)
+		}
+		for _, namespace := range []struct {
+			name string
+			key  string
+		}{
+			{name: "tmp", key: "TMPDIR"},
+			{name: "cache", key: "XDG_CACHE_HOME"},
+			{name: "state", key: "XDG_STATE_HOME"},
+		} {
+			dir := root + string(os.PathSeparator) + namespace.name
+			if err := os.Mkdir(dir, 0o700); err != nil {
+				_ = os.RemoveAll(root)
+				panic(err)
+			}
+			if err := os.Setenv(namespace.key, dir); err != nil {
+				_ = os.RemoveAll(root)
+				panic(err)
+			}
+		}
+	}
+	code := m.Run()
+	if root != "" {
+		_ = os.RemoveAll(root)
+	}
+	os.Exit(code)
 }
 
 // fakeRunner records CLI calls and replays canned results.

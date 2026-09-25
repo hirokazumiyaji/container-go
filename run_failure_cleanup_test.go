@@ -2,7 +2,11 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -144,9 +148,76 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
-	cleanupFailedCreate(ctx, cfg, runErr, runErr)
+	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
 	if len(r.deleted) != 1 {
 		t.Fatalf("deleted = %v, want cleanup even after cancel", r.deleted)
+	}
+}
+
+func TestRunFailureSurfacesCleanupLockFailure(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Apple name locks are unavailable on Windows")
+	}
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+	base := newTestRunner()
+	base.imagePresent = true
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      runErr,
+		inspectJSON: ownedInspectJSON("myctr"),
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil || !strings.Contains(err.Error(), "entrypoint not found") {
+		t.Fatalf("Run error = %v, want original run failure", err)
+	}
+	if !errors.Is(err, ErrNameLockCompatibility) ||
+		!strings.Contains(err.Error(), "cleanup myctr: lock name") ||
+		!strings.Contains(err.Error(), "transitional user cache directory") {
+		t.Fatalf("Run error = %v, want surfaced cleanup lock failure", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete without compatibility lock", r.deleted)
+	}
+}
+
+func TestCleanupFailedCreateDockerSkipsNameLock(t *testing.T) {
+	stateFile := filepath.Join(t.TempDir(), "not-a-state-directory")
+	if err := os.WriteFile(stateFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", stateFile)
+	const id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	inspectJSON := fmt.Sprintf(`[{
+		"Id": %q,
+		"Name": "/myctr",
+		"Config": {"Labels": {
+			%q: "true",
+			%q: %q
+		}},
+		"State": {"Status": "exited"},
+		"NetworkSettings": {}
+	}]`, id, managedLabel, sessionLabel, sessionID())
+	r := &failRunRunner{
+		fakeRunner:  newTestRunner(),
+		inspectJSON: inspectJSON,
+		runErr:      fmt.Errorf("create failed"),
+	}
+	cfg := &config{
+		name:     "myctr",
+		creation: "aaaaaaaaaaaaaaaa",
+		runner:   r,
+		eng:      dockerEngine{},
+	}
+	if err := cleanupFailedCreate(context.Background(), cfg, r.runErr, r.runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
+	if len(r.deleted) != 1 || r.deleted[0] != id {
+		t.Fatalf("deleted = %v, want immutable ID [%s]", r.deleted, id)
 	}
 }
 

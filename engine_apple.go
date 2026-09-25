@@ -50,6 +50,7 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 }
 
 func (appleEngine) parseRunID([]byte) string { return "" }
+func (appleEngine) immutableID() bool        { return false }
 
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 

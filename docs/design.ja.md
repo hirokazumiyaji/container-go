@@ -206,6 +206,30 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 匿名ボリュームは `--rm` でも残る仕様のため、本ライブラリは匿名ボリュームを作らない。
 ボリュームが必要な場合は名前付きで作らせ、ライフサイクルは利用者に委ねる。
 
+## Apple Container の名前ロック
+
+Apple Container ではコンテナ ID が名前であるため、`inspect` と `delete` の間で同じ名前が再生成される可能性がある。
+生成ラベルの検証と削除は、名前ごとの `flock` の下で実行する。
+新しい実装は、親リビジョンの `TMPDIR` ロック、UserCacheDir を使う初版ハードニングのロック、永続するユーザー state ディレクトリのロックを、この順で取得する。
+移行用ロックの解決または取得に失敗した場合は、臨界領域へ入らず互換性エラーを返す。
+state のファイル名は名前の SHA-256 ダイジェストであり、`TMPDIR` や cache が異なっても新しい実装彼此は同じ state inode を使う。
+すべてのロックファイルは `O_NOFOLLOW` で開き、ファイル種別、所有者、`0600`、path と open fd の inode 一致を `flock` の前後で確認する。
+state ディレクトリは所有者と置換可能性を検索し、sticky bit を持つ標準の temporary root は sticky 規則で保護されるため受け入れる。
+Docker は immutable ID で削除するため、名前ロックを取得しない。
+
+最近使用した state ロックファイルは保持し、他の協力プロセスが保持する inode は unlink しない。
+namespace の maintenance `flock` は、新しい呼び出しの open から `flock` までの窓と cleanup を分離する。
+cleanup は 1 回の取得ごとに最大 258 件（name-lock 256 件と maintenance 1 件）を調べ、最大 32 件だけを削除する。
+7 日より古いファイルは削除対象であり、256 件の上限を超えた場合は他のプロセスが使用していないファイルなら早く削除できる。
+非 blocking exclusive `flock` を取得できない候補は skip するため、保持中の inode は cleanup 対象にならない。
+旧実装と併存できるあいだは、移行用ロックファイルを cleanup しない。
+
+外部の `container delete` と再作成は、この lock を使わず、名前だけでは検出できない。
+`Terminate` と `TerminateContainer` は、各段階へ 30 秒ずつ割り当てるのではなく、lock 取得、inspect、delete を一つの既定 30 秒の aggregate budget で実行する。
+`cleanupFailedCreate` も lock 取得と backend 処理に一つの 30 秒 budget を使う。
+呼び出し元が指定した短い deadline は、この aggregate budget を上書きしない。
+lock や directory の失敗は `Run` のエラーへ join し、cleanup がコンテナを残した事实を隠さない。
+
 ## セキュリティ設計
 
 外部プロセス起動を伴うライブラリとして、次の原則を守る。
@@ -259,6 +283,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
+- `ErrNameLockCompatibility`：移行用 lock namespace を確立できないため，名前指定の処理を実行しなかった
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 

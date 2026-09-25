@@ -45,6 +45,9 @@ type engine interface {
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).
 	parseRunID(stdout []byte) string
+	// immutableID reports whether backend inspection/deletes can address a
+	// specific generation without a name lock.
+	immutableID() bool
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	stopArgs(id string, timeout *time.Duration) []string

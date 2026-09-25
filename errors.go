@@ -34,6 +34,11 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrNameLockCompatibility reports that a name-addressed operation could
+// not establish every lock namespace required during a rolling migration.
+// Callers should treat the operation as not performed.
+var ErrNameLockCompatibility = errors.New("name lock compatibility")
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {

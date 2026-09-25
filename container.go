@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -165,7 +166,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr != nil {
+			return nil, errors.Join(classified, cleanupErr)
+		}
 		return nil, classified
 	}
 
@@ -223,44 +227,53 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create. It never deletes a pre-existing same-name container: name
+// conflicts are skipped, and only a container carrying this process's
+// managed+session labels is removed. When the creation generation is known
+// it must also match. Lock setup and all backend work share one timeout;
+// failures are returned so Run cannot silently leave an owned container.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
-	if err != nil {
-		return
+	if !cfg.eng.immutableID() {
+		unlock, err := lockName(cleanupCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("cleanup %s: lock name: %w", cfg.name, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	if isNotFound(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup %s: inspect: %w", cfg.name, err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.creation != "" {
 		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
+			return nil
 		}
 	}
 	target := cfg.name
 	if info.uid != "" {
 		target = info.uid
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
-	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	_, _, err = cfg.runner.Run(cleanupCtx, cfg.eng.deleteArgs(target)...)
+	if err == nil || isNotFound(err) {
+		return nil
+	}
+	err = cli.Classify(cleanupCtx, cfg.runner, err, cfg.eng.probe())
+	return fmt.Errorf("cleanup %s: delete %s: %w", cfg.name, target, err)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary

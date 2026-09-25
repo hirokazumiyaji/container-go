@@ -159,6 +159,8 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
+func (dockerEngine) immutableID() bool { return true }
+
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 // dockerInspect mirrors the fields of `docker inspect` output this

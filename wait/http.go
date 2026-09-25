@@ -3,8 +3,11 @@ package wait
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
+	"strings"
 	"time"
 )
 
@@ -85,9 +88,10 @@ func (s *HTTPStrategy) WithTLSConfig(cfg *tls.Config) *HTTPStrategy {
 	return s
 }
 
-// WithHTTPClient delegates transport and timeouts to the caller.
-// WithTLS/WithTLSConfig still select the https scheme; the custom
-// client supplies the TLS config (for example httptest.NewTLSServer).
+// WithHTTPClient delegates transport, proxy, redirect, and timeout
+// policy to the caller. WithTLS/WithTLSConfig still select the https
+// scheme; the custom client supplies the TLS config (for example
+// httptest.NewTLSServer).
 func (s *HTTPStrategy) WithHTTPClient(c *http.Client) *HTTPStrategy {
 	s.httpClient = c
 	return s
@@ -110,14 +114,8 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	}
 	client := s.httpClient
 	if client == nil {
-		if s.tlsConfig != nil {
-			client = &http.Client{
-				Timeout:   3 * time.Second,
-				Transport: &http.Transport{TLSClientConfig: s.tlsConfig},
-			}
-		} else {
-			client = &http.Client{Timeout: 3 * time.Second}
-		}
+		client = newDefaultHTTPClient(s.tlsConfig)
+		defer client.CloseIdleConnections()
 	}
 	scheme := "http"
 	if s.useTLS {
@@ -129,7 +127,12 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		if err != nil {
 			return err
 		}
-		req, err := http.NewRequestWithContext(ctx, s.method, scheme+"://"+endpoint+s.path, nil)
+		path := s.path
+		if !strings.HasPrefix(path, "/") {
+			path = "/" + path
+		}
+		probeURL := (&url.URL{Scheme: scheme, Host: endpoint, Path: path}).String()
+		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, nil)
 		if err != nil {
 			return err
 		}
@@ -149,4 +152,47 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		}
 		return nil
 	}, true)
+}
+
+func newDefaultHTTPClient(tlsConfig *tls.Config) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	if tlsConfig != nil {
+		transport.TLSClientConfig = tlsConfig.Clone()
+	}
+	return &http.Client{
+		Transport:     transport,
+		CheckRedirect: checkHTTPProbeRedirect,
+		Timeout:       3 * time.Second,
+	}
+}
+
+func checkHTTPProbeRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return errors.New("stopped after 10 redirects")
+	}
+	if !sameOrigin(via[0].URL, req.URL) {
+		return http.ErrUseLastResponse
+	}
+	return nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return strings.EqualFold(a.Scheme, b.Scheme) &&
+		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		effectivePort(a) == effectivePort(b)
+}
+
+func effectivePort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http":
+		return "80"
+	case "https":
+		return "443"
+	default:
+		return ""
+	}
 }

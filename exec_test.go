@@ -695,17 +695,17 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 	}{
 		{
 			name: "i/o timeout",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout"},
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout", OperationTimeout: true},
 			code: 7,
 		},
 		{
 			name: "command timed out",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 8, Stderr: "command timed out"},
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 8, Stderr: "command timed out", OperationTimeout: true},
 			code: 8,
 		},
 		{
 			name: "operation timed out",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 9, Stderr: "operation timed out"},
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 9, Stderr: "operation timed out", OperationTimeout: true},
 			code: 9,
 		},
 		{
@@ -738,6 +738,30 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 				t.Fatalf("timeout/signal triggered a verification probe: %v", f.calls)
 			}
 		})
+	}
+}
+
+func TestExecDoesNotClassifyTimeoutTextFromStderr(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "application output",
+		execErr: &cli.CLIError{
+			Args:     []string{"exec", "myctr"},
+			ExitCode: 7,
+			Stderr:   "application failed: i/o timeout",
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"query"})
+	if err != nil {
+		t.Fatalf("Exec returned infrastructure error for application stderr: %v", err)
+	}
+	if code != 7 || out == nil {
+		t.Fatalf("code/output = %d/%v, want application status 7 and output", code, out)
+	}
+	if f.callWith("inspect") != nil {
+		t.Fatalf("application stderr triggered a verification probe: %v", f.calls)
 	}
 }
 

@@ -12,13 +12,23 @@ import (
 // command. A tree is published only after cmd.Start has returned successfully
 // and is closed only after the sole cmd.Wait call has returned.
 type processTree interface {
-	terminate(*exec.Cmd) error
+	terminate(*exec.Cmd) terminationResult
 	close()
+}
+
+type terminationResult struct {
+	// active is true only when the implementation proved that the direct
+	// child was still active when termination was attempted. A successful
+	// operation on an already-empty/zombie job is not active evidence.
+	active bool
+	err    error
 }
 
 // RunStatus describes what the local command lifecycle actually observed.
 // Reaped is the fact that cmd.Wait returned; it is deliberately separate from
-// whether cancellation won the race with that wait.
+// whether cancellation won the race with that wait. TerminatedByCancellation
+// is set only after a platform implementation proved the direct child was
+// active and successfully accepted a termination action.
 type RunStatus struct {
 	Started                  bool
 	Reaped                   bool
@@ -183,49 +193,48 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 		// makes cancellation before publication harmless and deterministic.
 		<-l.startDone
 
+		// Keep the lifecycle lock through the termination decision and
+		// platform call. Wait cannot mark the child reaped between the active
+		// check and the signal, so numeric handles and job state cannot race
+		// the sole Wait owner.
 		l.mu.Lock()
+		defer l.mu.Unlock()
 		if contextTermination {
 			l.cancelRequested = true
 		}
 		if !l.started || l.startFailed || l.reaped {
-			l.mu.Unlock()
 			l.terminateErr = os.ErrProcessDone
 			return
 		}
-		tree := l.tree
-		cmd := l.cmd
-		l.mu.Unlock()
 
-		if tree == nil {
-			// The direct handle is synchronized with the sole Wait call and
-			// cannot be redirected to a reused PID.
-			l.terminateErr = cmd.Process.Kill()
+		var result terminationResult
+		if l.tree == nil {
+			result = terminateDirectProcess(l.cmd)
 		} else {
-			// Platform trees use the direct process handle (or a Job Object
-			// handle) as their identity gate before any group-wide operation.
-			l.terminateErr = tree.terminate(cmd)
+			result = l.tree.terminate(l.cmd)
 		}
-		if contextTermination && l.terminateErr == nil {
-			l.mu.Lock()
+		l.terminateErr = result.err
+		if contextTermination && result.err == nil && result.active {
 			l.terminatedByCancellation = true
-			l.mu.Unlock()
 		}
 	})
-	return l.terminateErr
+	l.mu.Lock()
+	err := l.terminateErr
+	l.mu.Unlock()
+	return err
 }
 
 type directProcessTree struct{}
 
-func (directProcessTree) terminate(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
-	}
-	return cmd.Process.Kill()
+func (directProcessTree) terminate(cmd *exec.Cmd) terminationResult {
+	return terminateDirectProcess(cmd)
 }
 
 func (directProcessTree) close() {}
 
 type processTreeFunc func(*exec.Cmd) error
 
-func (f processTreeFunc) terminate(cmd *exec.Cmd) error { return f(cmd) }
-func (processTreeFunc) close()                          {}
+func (f processTreeFunc) terminate(cmd *exec.Cmd) terminationResult {
+	return terminationResult{active: true, err: f(cmd)}
+}
+func (processTreeFunc) close() {}

@@ -118,6 +118,30 @@ func TestStreamReapsChildAfterExitWithoutReadOrClose(t *testing.T) {
 	}
 }
 
+func TestTerminalErrorDrainsStderrWithoutPublicReader(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'first stderr\\n' >&2; sleep 0.05; printf 'terminal stderr\\n' >&2; exit 17`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	terminal := ps.TerminalError()
+	var cliErr *CLIError
+	if !errors.As(terminal, &cliErr) || cliErr.ExitCode != 17 {
+		t.Fatalf("terminal error = %v, want CLIError status 17", terminal)
+	}
+	if !strings.Contains(cliErr.Stderr, "terminal stderr") {
+		t.Fatalf("terminal stderr = %q, want drained final diagnostic", cliErr.Stderr)
+	}
+}
+
 func TestStreamReadPreservesCLIErrorWhenCancellationRacesExit(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

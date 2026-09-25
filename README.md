@@ -161,26 +161,37 @@ and stderr produced before the failure.
 
 Cancellation is owned by the local command lifecycle. On Unix-like systems a
 best-effort process-group termination is attempted only while the direct child
-handle still owns the process; once that child is reaped, no former numeric
-process-group ID is used. On Windows, a lifecycle-owned Job Object handle
-provides the descendant boundary, with direct-child fallback when assignment
-is unavailable. Neither boundary claims remote container-process termination.
+handle still owns the process; the direct child is also killed after the group
+signal because it may have changed process groups. Once that child is reaped,
+no former numeric process-group ID is used. On Windows, a lifecycle-owned Job
+Object handle provides the descendant boundary, with direct-child fallback when
+assignment is unavailable. Job assignment happens after `Start`; descendants
+created during that short post-Start attachment window are outside the job
+boundary. Neither boundary claims remote container-process termination.
 Neither supported backend CLI exposes a common kill operation for an exec
 instance. When a context error actually races with a launched command, Exec
 returns an `*ExecTerminationError` (`errors.Is(err,
 ErrExecTerminationUnsupported)`) instead of claiming that the
-container-side process stopped. Classification does not depend on the
-local exit status: in particular, Windows `Process.Kill` may report the
-killed process as exit code `1`, and that status remains visible without
-suppressing the typed error. A deadline consumed later by a verification
-inspect does not by itself produce `ExecTerminationError`. The backend-side
-process may still be running; callers must terminate the container or use a
-backend-specific cleanup path.
+container-side process stopped. A successful empty-job or already-finished
+child termination is not active-process evidence. Classification does not
+depend on the local exit status: in particular, Windows `Process.Kill` may
+report the killed process as exit code `1`, and that status remains visible
+without suppressing the typed error. A deadline consumed later by a
+verification inspect does not by itself produce `ExecTerminationError`. The
+backend-side process may still be running; callers must terminate the
+container or use a backend-specific cleanup path.
 
 `FollowLogs` returns startup failures directly. After a stream is returned,
 read it to EOF: terminal CLI failures (including a CLI status racing context
 cancellation) are reported by `Read`. `Close` and context cancellation are
 intentional termination paths and may instead produce EOF or a context error.
+If a descendant retains stdout/stderr after the direct child exits, the stream
+uses a bounded drain and then closes its endpoints so EOF cannot wait forever.
+`ForLog` observes terminal stream errors before accepting a match, preserves
+terminal/context errors with `errors.Join`/`%w`, and does not detach a state
+probe after cancellation. Timeout classification uses structured context,
+`Timeout() bool`, signal, or `CLIError.OperationTimeout` evidence; arbitrary
+workload stderr is treated as application output.
 
 ## Image pulls
 

@@ -147,7 +147,9 @@ CLI が返した終了コードが利用できる場合は、最初の戻り値�
 command の起動中 실제로 context error が競合した場合だけ、その分類は終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
 後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
-context 取消時は直接の command lifecycle が所有する間だけ Unix の local CLI process group を停止します。直接の子を回収した後は古い process group ID に signal を送りません。Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。
+context 取消時は直接の command lifecycle が所有する間だけ Unix の local CLI process group を停止します。直接の子を回収した後は古い process group ID に signal を送りません。group signal の後は直接の子にも kill を送ります。
+Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。
+Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
 backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
 process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。
 したがって error が non-nil でも reader を読む。
@@ -264,10 +266,14 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
+直接 child の終了後に descendant が stdout/stderr を保持しても、stream は制限時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
+`ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
+cancel 後に caller context から外した state probe を開始しません。
 ForLog が診断用に保持するログは 1MiB を上限とする。
 
 **有限の CLI 呼び出しに期限を付ける**。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系と public Exec は 30 秒、pull を伴う run は 10 分)を持つ。
+timeout の分類は structured context、`Timeout() bool`、signal、`CLIError.OperationTimeout` の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。
 `Exec` は有限・バッファリング操作であり、`WithExecTimeout(0)` は意図的な
 長時間実行 command のための明示的な escape hatch とする(その場合でも
 cancellable な context を併用する)。正の `WithExecTimeout` は指定値と

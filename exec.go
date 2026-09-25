@@ -195,9 +195,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return finish(0, wrapNotFound(c.classify(execCtx, err)))
 	}
 
-	// A timeout-shaped command exit is an operation failure, not an
-	// application result. Classify preserves the original diagnostic and
-	// does not issue a misleading liveness probe.
+	// A command exit with structured timeout evidence is an operation
+	// failure, not an application result. Classify preserves the original
+	// diagnostic and does not issue a misleading liveness probe.
 	if cli.IsOperationTimeoutError(err) {
 		return finish(cliErr.ExitCode, wrapNotFound(c.classify(execCtx, err)))
 	}

@@ -63,6 +63,10 @@ type CLIError struct {
 	Args     []string
 	ExitCode int
 	Stderr   string
+	// OperationTimeout is structured evidence supplied by the lifecycle or
+	// runner. Free-form stderr is application output and is not used to
+	// classify an operation timeout.
+	OperationTimeout bool
 }
 
 func (e *CLIError) Error() string {
@@ -111,6 +115,9 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 		lifecycle.failStart()
 		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
 	}
+	// On Windows, newProcessTree attaches the Job Object after Start; the
+	// short attachment-window limitation is documented by that platform
+	// implementation.
 	tree, treeErr := newProcessTree(cmd)
 	if treeErr != nil {
 		// A platform tree is an enhancement. The direct process handle
@@ -143,11 +150,13 @@ func commandError(ctx context.Context, bin string, args []string, stderr []byte,
 			// local cancellation actually terminated the process.
 			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
+		operationTimeout := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), os.ErrDeadlineExceeded)
 		cliErr := &CLIError{
-			Binary:   bin,
-			Args:     args,
-			ExitCode: exitCode,
-			Stderr:   truncateStderr(string(stderr)),
+			Binary:           bin,
+			Args:             args,
+			ExitCode:         exitCode,
+			Stderr:           truncateStderr(string(stderr)),
+			OperationTimeout: operationTimeout,
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// The process did produce an exit status, but cancellation
@@ -162,10 +171,9 @@ func commandError(ctx context.Context, bin string, args []string, stderr []byte,
 	return err
 }
 
-// IsOperationTimeoutError reports whether err is a timeout, cancellation,
-// or signal-shaped operation failure rather than an application result.
-// Backend CLIs do not all expose these conditions as context errors, so
-// the structured error and the bounded diagnostic text are both checked.
+// IsOperationTimeoutError reports whether err has structured timeout,
+// cancellation, or signal evidence rather than an application result.
+// Free-form command stderr is never used as timeout evidence.
 func IsOperationTimeoutError(err error) bool {
 	if err == nil {
 		return false
@@ -190,30 +198,10 @@ func IsOperationTimeoutError(err error) bool {
 	if cliErr.ExitCode < 0 {
 		return true
 	}
-	// Only backend stderr is diagnostic evidence. CLIError.Error/Args may
-	// contain arbitrary application text or command arguments and must not
-	// turn an ordinary exit into an infrastructure timeout.
-	return hasOperationTimeoutText(cliErr.Stderr)
-}
-
-func hasOperationTimeoutText(value string) bool {
-	text := strings.ToLower(value)
-	for _, fragment := range []string{
-		"context deadline exceeded",
-		"deadline exceeded",
-		"context canceled",
-		"context cancelled",
-		"operation timed out",
-		"operation timeout",
-		"command timed out",
-		"command/operation timed out",
-		"i/o timeout",
-	} {
-		if strings.Contains(text, fragment) {
-			return true
-		}
-	}
-	return false
+	// The lifecycle may attach structured timeout evidence while preserving
+	// a positive application exit status. Never infer classification from
+	// arbitrary workload stderr.
+	return cliErr.OperationTimeout
 }
 
 // truncateStderr bounds the diagnostic copy kept in CLIError. Keep the

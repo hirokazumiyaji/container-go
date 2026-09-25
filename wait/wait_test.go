@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,14 +150,177 @@ func TestForLogAsRegexp(t *testing.T) {
 	}
 }
 
+type terminalLogStream struct {
+	io.ReadCloser
+	done     chan struct{}
+	terminal error
+}
+
+func (s *terminalLogStream) Close() error          { return s.ReadCloser.Close() }
+func (s *terminalLogStream) Done() <-chan struct{} { return s.done }
+func (s *terminalLogStream) TerminalError() error  { return s.terminal }
+
+func TestForLogObservesTerminalStreamErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("logs CLI exited after emitting match")
+	done := make(chan struct{})
+	close(done)
+	target := newFakeTarget()
+	target.logs = &terminalLogStream{
+		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
+		done:       done,
+		terminal:   terminal,
+	}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want terminal stream error", err)
+	}
+}
+
+type delayedTerminalLogReader struct {
+	reader    io.Reader
+	done      chan struct{}
+	closeOnce sync.Once
+	terminal  error
+}
+
+func (r *delayedTerminalLogReader) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+func (r *delayedTerminalLogReader) Close() error          { return nil }
+func (r *delayedTerminalLogReader) Done() <-chan struct{} { return r.done }
+func (r *delayedTerminalLogReader) TerminalError() error  { return r.terminal }
+func (r *delayedTerminalLogReader) finish()               { r.closeOnce.Do(func() { close(r.done) }) }
+
+func TestForLogSettlesTerminalErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("terminal CLI failure after match")
+	reader := &delayedTerminalLogReader{
+		reader:   strings.NewReader("ready\n"),
+		done:     make(chan struct{}),
+		terminal: terminal,
+	}
+	time.AfterFunc(time.Millisecond, reader.finish)
+	target := newFakeTarget()
+	target.logs = reader
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want terminal error", err)
+	}
+}
+
+func TestForLogPreservesTerminalAndContextErrors(t *testing.T) {
+	terminal := errors.New("terminal CLI failure")
+	done := make(chan struct{})
+	close(done)
+	target := newFakeTarget()
+	target.logs = &terminalLogStream{
+		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
+		done:       done,
+		terminal:   terminal,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, terminal) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForLog error = %v, want terminal and context errors", err)
+	}
+}
+
+type errorAfterLogReader struct {
+	io.Reader
+	err error
+}
+
+func (r *errorAfterLogReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		return n, r.err
+	}
+	return n, err
+}
+func (r *errorAfterLogReader) Close() error { return nil }
+
+func TestForLogPreservesReaderErrorAfterMatch(t *testing.T) {
+	readErr := errors.New("log reader failed after matching line")
+	target := newFakeTarget()
+	target.logs = &errorAfterLogReader{Reader: strings.NewReader("ready\n"), err: readErr}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want reader error", err)
+	}
+}
+
+func TestForLogDoesNotProbeAfterReaderFailure(t *testing.T) {
+	readErr := errors.New("log reader failed")
+	target := newFakeTarget()
+	target.logs = &errorAfterLogReader{Reader: strings.NewReader("not ready\n"), err: readErr}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want reader error", err)
+	}
+	if calls := target.runningCalls.Load(); calls != 0 {
+		t.Fatalf("Running calls after reader failure = %d, want 0", calls)
+	}
+}
+
+type cancelAwareLogStream struct {
+	ctx    context.Context
+	closed chan struct{}
+}
+
+func (s *cancelAwareLogStream) Read([]byte) (int, error) {
+	<-s.ctx.Done()
+	return 0, s.ctx.Err()
+}
+func (s *cancelAwareLogStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+type forLogProbeTarget struct {
+	*fakeTarget
+	streamStarted chan struct{}
+}
+
+func (t *forLogProbeTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	stream := &cancelAwareLogStream{ctx: ctx, closed: make(chan struct{})}
+	close(t.streamStarted)
+	return stream, nil
+}
+
+func TestForAnyCancellationDoesNotStartDetachedRunningProbe(t *testing.T) {
+	target := &forLogProbeTarget{fakeTarget: newFakeTarget(), streamStarted: make(chan struct{})}
+	loser := ForLog("never").WithStartupTimeout(5 * time.Second)
+	winner := &issue116ForAnyWinner{loserStarted: target.streamStarted}
+
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("ForAny: %v", err)
+	}
+	if calls := target.runningCalls.Load(); calls != 0 {
+		t.Fatalf("Running calls after canceled ForLog loser = %d, want 0", calls)
+	}
+}
+
 func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target := newFakeTarget()
 	pr, _ := io.Pipe() // never written, never closed
 	target.logs = pr
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
-	if err := s.WaitUntilReady(context.Background(), target); err == nil {
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
 		t.Fatal("want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 }
 

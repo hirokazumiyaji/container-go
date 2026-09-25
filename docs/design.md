@@ -202,13 +202,19 @@ produce `ExecTerminationError`.
 Cancellation is owned by the local command lifecycle. Unix process-group
 termination is attempted only while the direct child handle still owns
 the process; after the child is reaped, no former numeric group ID is
-used. Windows uses a lifecycle-owned Job Object handle, with direct-child
-fallback when assignment is unavailable. The supported backend CLIs do
-not expose a common exec-instance kill operation, so Exec returns
-`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
-rather than claiming that the daemon-side process stopped. Callers must
-terminate the container or use backend-specific cleanup. Callers must
-read the output reader even when the error is non-nil.
+used. The direct child is also killed after the group signal because it
+may have changed process groups. Windows uses a lifecycle-owned Job
+Object handle, with direct-child fallback when assignment is unavailable.
+Assignment occurs after `Start`; descendants created during that short
+post-Start attachment window are outside the Job Object boundary. The
+supported backend CLIs do not expose a common exec-instance kill
+operation, so Exec returns `*ExecTerminationError` (also
+`errors.Is(..., ErrExecTerminationUnsupported)`) rather than claiming
+that the daemon-side process stopped. A successful empty-job or
+already-finished-child termination is not treated as active-process
+evidence. Callers must terminate the container or use backend-specific
+cleanup. Callers must read the output reader even when the error is
+non-nil.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -414,13 +420,19 @@ and reaps the direct CLI child. Unix process-group termination is gated
 by the direct process handle, while Windows uses a lifecycle-owned Job
 Object handle with direct-child fallback. The library does not reap
 detached descendants, and detached/reparented helpers are outside the
-boundary. ForLog's diagnostic buffer caps at 1MiB.
+boundary. After the direct child exits, stream endpoint pumps receive a
+bounded drain window and are then closed, so descendants retaining
+stdout/stderr cannot block EOF indefinitely. ForLog observes a terminal
+stream error before accepting a match and preserves context/terminal
+errors with `errors.Join`/`%w`. Its diagnostic buffer caps at 1MiB.
 
 A stream has two error phases. `Stream` (and the public `FollowLogs`
 wrapper) returns startup errors. Once a stream has been returned, a
 terminal CLI failure is delivered by `Read`; callers must read the stream
 to observe `CLIError` details. `Close` and context cancellation are
 intentional terminal paths and may instead produce EOF or a context error.
+ForLog uses the caller's context for its bounded state probe and does not
+start a detached probe after cancellation.
 
 **Deadline every finite CLI call**. Every call honors `context` and
 carries a default timeout (30s for queries and public Exec, 10min for
@@ -428,8 +440,10 @@ pull-bearing runs). `Exec` is finite and buffered by design;
 `WithExecTimeout(0)` is the explicit escape hatch for an intentional
 long-running command, which should still use a cancellable context.
 A positive `WithExecTimeout` uses the earlier of its value and the
-caller's deadline. This local process-tree ownership does not imply that
-a remote exec process was killed.
+caller's deadline. Timeout classification uses structured context,
+`Timeout() bool`, signal, or `CLIError.OperationTimeout` evidence; arbitrary workload
+stderr is never interpreted as a timeout. This local process-tree
+ownership does not imply that a remote exec process was killed.
 
 ## Error handling
 

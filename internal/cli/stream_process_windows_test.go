@@ -12,6 +12,27 @@ import (
 	"time"
 )
 
+func TestWindowsEmptyJobTerminationDoesNotClaimActiveChild(t *testing.T) {
+	cmd := exec.Command("cmd.exe", "/D", "/C", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cmd.exe is unavailable: %v", err)
+	}
+	tree, err := newProcessTree(cmd)
+	if err != nil {
+		_ = cmd.Wait()
+		t.Skipf("Windows Job Object assignment is unavailable on this host: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		tree.close()
+		t.Fatal(err)
+	}
+	result := tree.terminate(cmd)
+	tree.close()
+	if result.active || result.err == nil {
+		t.Fatalf("termination result = %+v, want inactive/process-done", result)
+	}
+}
+
 func TestStreamCloseTerminatesWindowsDescendants(t *testing.T) {
 	cmdPath, err := exec.LookPath("cmd.exe")
 	if err != nil {

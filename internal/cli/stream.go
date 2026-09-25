@@ -81,6 +81,7 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		startDone:      lifecycle.startDone,
 		waitDone:       lifecycle.waitDone,
 		pumpsDone:      make(chan struct{}),
+		drainDone:      make(chan struct{}),
 		cancelObserved: hooks.cancelObserved,
 	}
 	cmd.Stdout = stdoutWrite
@@ -186,6 +187,9 @@ type processStream struct {
 	outputCloseOnce sync.Once
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
+	drainOnce       sync.Once
+	drainDone       chan struct{}
+	terminalDrain   atomic.Bool
 
 	closeOnce           sync.Once
 	stateMu             sync.Mutex
@@ -198,15 +202,23 @@ type processStream struct {
 // streamOutput retains a rolling stderr diagnostic while forwarding the
 // bytes to the public stream.
 type streamOutput struct {
-	output io.Writer
-	stderr *tailBuffer
+	output        io.Writer
+	stderr        *tailBuffer
+	terminalDrain *atomic.Bool
 }
 
 func (w *streamOutput) Write(p []byte) (int, error) {
 	if _, err := w.stderr.Write(p); err != nil {
 		return 0, err
 	}
-	return w.output.Write(p)
+	n, err := w.output.Write(p)
+	if err != nil && w.terminalDrain.Load() {
+		// Once the direct child has exited, the public reader is no longer
+		// needed for diagnostics. Keep consuming the inherited stderr pipe
+		// even when the public pipe was closed to release backpressure.
+		return len(p), nil
+	}
+	return n, err
 }
 
 // tailBuffer is a bounded rolling diagnostic buffer. It always reports a
@@ -245,17 +257,70 @@ func (s *processStream) pump(r *os.File, stderr bool) {
 	}
 	var output io.Writer = s.output
 	if stderr {
-		output = &streamOutput{output: s.output, stderr: s.stderr}
+		output = &streamOutput{output: s.output, stderr: s.stderr, terminalDrain: &s.terminalDrain}
 	}
 	_, _ = io.Copy(output, r)
 }
+
+const (
+	streamDrainTimeout       = 250 * time.Millisecond
+	streamSourceCloseTimeout = 100 * time.Millisecond
+)
 
 func (s *processStream) wait() {
 	s.waitOnce.Do(func() {
 		s.waitCalls.Add(1)
 		s.lifecycle.wait()
+		_ = s.Drain(s.ctx)
 	})
 	<-s.waitDone
+}
+
+// Drain completes the output pumps after the direct child has exited. It
+// first gives naturally completing pumps a bounded grace period, then closes
+// the public writer and source endpoints so descendants retaining inherited
+// descriptors cannot block EOF indefinitely. The stderr pump continues
+// recording its tail after the public writer is closed.
+func (s *processStream) Drain(ctx context.Context) error {
+	drainCtx, cancel := context.WithTimeout(ctx, streamDrainTimeout)
+	defer cancel()
+
+	s.drainOnce.Do(func() {
+		go func() {
+			timer := time.NewTimer(streamDrainTimeout)
+			defer timer.Stop()
+			closeSources := func(immediate bool) {
+				s.terminalDrain.Store(true)
+				s.outputCloseOnce.Do(func() { _ = s.output.Close() })
+				if immediate {
+					s.closeSourceFiles()
+					<-s.pumpsDone
+					return
+				}
+				sourceTimer := time.NewTimer(streamSourceCloseTimeout)
+				defer sourceTimer.Stop()
+				select {
+				case <-s.pumpsDone:
+				case <-sourceTimer.C:
+					s.closeSourceFiles()
+					<-s.pumpsDone
+				}
+			}
+			select {
+			case <-s.pumpsDone:
+			case <-timer.C:
+				closeSources(false)
+			case <-drainCtx.Done():
+				closeSources(true)
+			}
+			close(s.drainDone)
+		}()
+	})
+	<-s.drainDone
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *processStream) cancel() error {

@@ -19,9 +19,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Give each CLI invocation one lifecycle owner for Start/Wait/termination;
-  Unix group signals are gated by the direct process handle, Windows uses a
-  Job Object handle with a direct-child fallback, and ForAny bounds loser
-  draining with a grace period.
+  Unix group signals are gated by the direct process handle and always follow
+  with a direct-child kill, Windows uses a lifecycle-owned Job Object handle
+  with active-child evidence and a direct-child fallback, and ForAny bounds
+  loser draining with a grace period.
+- Bound log-stream endpoint draining, settle terminal errors before accepting
+  ForLog matches, and use structured timeout evidence instead of workload
+  stderr text.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

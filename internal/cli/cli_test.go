@@ -180,6 +180,86 @@ func TestExecRunnerReportsWhetherLocalProcessStarted(t *testing.T) {
 	}
 }
 
+type inactiveTerminationTree struct{}
+
+func (inactiveTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
+	_ = cmd.Process.Kill()
+	return terminationResult{active: false}
+}
+func (inactiveTerminationTree) close() {}
+
+func TestLifecycleDoesNotMarkEmptyTerminationAsActive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.Command(writeStub(t, `sleep 5`))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	lifecycle.publishStart(inactiveTerminationTree{})
+	if err := lifecycle.terminate(true); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	lifecycle.wait()
+	if status := lifecycle.status(); status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, empty/inactive termination must not claim active child", status)
+	}
+}
+
+type blockingTerminationTree struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (t *blockingTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
+	close(t.entered)
+	<-t.release
+	_ = cmd.Process.Kill()
+	return terminationResult{active: true}
+}
+func (t *blockingTerminationTree) close() {}
+
+func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
+	ctx := context.Background()
+	cmd := exec.Command(writeStub(t, `sleep 5`))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tree := &blockingTerminationTree{entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-tree.release:
+		default:
+			close(tree.release)
+		}
+	}()
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	lifecycle.publishStart(tree)
+
+	waitDone := make(chan struct{})
+	go func() {
+		lifecycle.wait()
+		close(waitDone)
+	}()
+	terminateDone := make(chan struct{})
+	go func() {
+		_ = lifecycle.terminate(true)
+		close(terminateDone)
+	}()
+	<-tree.entered
+	select {
+	case <-waitDone:
+		t.Fatal("wait completed before termination released the lifecycle")
+	default:
+	}
+	close(tree.release)
+	<-terminateDone
+	<-waitDone
+	if status := lifecycle.status(); !status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, want active cancellation termination", status)
+	}
+}
+
 func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -362,7 +442,7 @@ func (r *cliTimeoutProbeRunner) Run(context.Context, ...string) ([]byte, []byte,
 	return nil, nil, &CLIError{ExitCode: 1, Stderr: "probe failed"}
 }
 
-func TestIsOperationTimeoutErrorUsesStructuredAndStderrEvidence(t *testing.T) {
+func TestIsOperationTimeoutErrorUsesStructuredEvidence(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
@@ -371,12 +451,13 @@ func TestIsOperationTimeoutErrorUsesStructuredAndStderrEvidence(t *testing.T) {
 		{name: "context", err: context.DeadlineExceeded, want: true},
 		{name: "timeout interface", err: timeoutInterfaceError{}, want: true},
 		{name: "negative status", err: &CLIError{ExitCode: -1}, want: true},
-		{name: "i/o timeout", err: &CLIError{ExitCode: 7, Stderr: "client: i/o timeout"}, want: true},
-		{name: "command timed out", err: &CLIError{ExitCode: 7, Stderr: "command timed out"}, want: true},
-		{name: "operation timed out", err: &CLIError{ExitCode: 7, Stderr: "operation timed out"}, want: true},
+		{name: "i/o timeout", err: &CLIError{ExitCode: 7, Stderr: "client: i/o timeout"}, want: false},
+		{name: "command timed out", err: &CLIError{ExitCode: 7, Stderr: "command timed out"}, want: false},
+		{name: "operation timed out", err: &CLIError{ExitCode: 7, Stderr: "operation timed out"}, want: false},
 		{name: "plain diagnostic", err: errors.New("operation timed out"), want: false},
 		{name: "application argv", err: &CLIError{Args: []string{"exec", "command timed out"}, ExitCode: 7, Stderr: "application failed"}, want: false},
-		{name: "application stderr", err: &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "i/o timeout"}, want: true},
+		{name: "application stderr", err: &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "i/o timeout"}, want: false},
+		{name: "structured timeout", err: &CLIError{ExitCode: 7, OperationTimeout: true}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -388,7 +469,7 @@ func TestIsOperationTimeoutErrorUsesStructuredAndStderrEvidence(t *testing.T) {
 }
 
 func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
-	original := &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command timed out"}
+	original := &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command timed out", OperationTimeout: true}
 	probe := &cliTimeoutProbeRunner{}
 	got := Classify(context.Background(), probe, original, Probe{Args: []string{"version"}, Hint: "start daemon"})
 	if !errors.Is(got, original) {

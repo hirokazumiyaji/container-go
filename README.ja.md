@@ -145,17 +145,22 @@ command の非ゼロ終了は結果であり、backend、timeout、cancellation 
 CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
 いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
 
-context error によって local CLI が終了した場合、直接の command lifecycle が所有する間だけ Unix の process group をベストエフォートで停止します。直接の子を回収した後は、古い process group ID には signal を送りません。Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
+context error によって local CLI が終了した場合、直接の command lifecycle が所有する間だけ Unix の process group をベストエフォートで停止します。直接の子を回収した後は、古い process group ID には signal を送りません。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。
+Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
+Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
 backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、command の起動中に context error が実際に競合した場合だけ `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
 この分類は local の終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
 後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 backend 側 process が残っている可能性があるため、caller は container を terminate するか backend 固有の cleanup を実行してください。
 
-`FollowLogs` は起動エラーを直接返します。ストリームを返した後は EOF まで
-`Read` してください。CLI の終端エラー(CLI status と context cancel が競合した
-場合も含む)は `Read` から返ります。`Close` と context cancel は意図的な終了
-経路なので、EOF または context error になることがあります。
+`FollowLogs` は起動エラーを直接返します。ストリームを返した後は EOF まで `Read` してください。
+CLI の終端エラー(CLI status と context cancel が競合した場合も含む)は `Read` から返ります。
+`Close` と context cancel は意図的な終了経路なので、EOF または context error になることがあります。
+直接 child 終了後に descendant が stdout/stderr を保持しても、stream は 제한時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
+`ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
+cancel 後に caller context から外した state probe を開始しません。
+timeout の分類は structured context、`Timeout() bool`、signal、`CLIError.OperationTimeout` の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しません。
 
 ## クリーンアップの契約
 

@@ -30,9 +30,9 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
-// ErrGenerationReplaced reports that an operation could not prove that the
-// live container is the original generation and therefore failed closed.
-var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+// ErrGenerationReplaced reports that an operation could not prove it was
+// acting on the original verified container and therefore failed closed.
+var ErrGenerationReplaced = errors.New("operation requires the original verified container")
 
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).

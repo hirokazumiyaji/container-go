@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -15,8 +16,33 @@ func TestTerminateRefusesReplacedGeneration(t *testing.T) {
 	ctr.runner = &generationRunner{
 		creation: "bbbbbbbbbbbbbbbb",
 	}
-	if err := ctr.Terminate(context.Background()); err == nil || !strings.Contains(err.Error(), "replaced") {
-		t.Fatalf("Terminate = %v, want replaced-generation refusal", err)
+	if err := ctr.Terminate(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("Terminate = %v, want ErrGenerationReplaced", err)
+	}
+}
+
+func TestTerminateRejectsMissingOrInvalidGeneration(t *testing.T) {
+	for _, generation := range []string{"", "not-a-generation"} {
+		t.Run(generation, func(t *testing.T) {
+			r := &generationRunner{creation: generation}
+			ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: generation}
+			if err := ctr.Terminate(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
+				t.Fatalf("Terminate = %v, want ErrGenerationReplaced", err)
+			}
+			if r.deleteCalls != 0 {
+				t.Fatalf("deleteCalls = %d, want 0 for an unverifiable generation", r.deleteCalls)
+			}
+		})
+	}
+}
+
+func TestErrGenerationReplacedDescribesOriginalContainer(t *testing.T) {
+	got := ErrGenerationReplaced.Error()
+	if !strings.Contains(got, "original verified container") {
+		t.Fatalf("ErrGenerationReplaced = %q, want original-container wording", got)
+	}
+	if strings.Contains(strings.ToLower(got), "delete") {
+		t.Fatalf("ErrGenerationReplaced = %q, want operation-level wording", got)
 	}
 }
 
@@ -117,8 +143,8 @@ func TestTerminateFailsClosedWhenInspectFails(t *testing.T) {
 	r := &inspectErrorRunner{stderr: "daemon unavailable"}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	err := ctr.Terminate(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "verify generation") {
-		t.Fatalf("Terminate = %v, want verify-generation failure", err)
+	if !errors.Is(err, ErrGenerationReplaced) || !strings.Contains(err.Error(), "verify generation") {
+		t.Fatalf("Terminate = %v, want ErrGenerationReplaced and verify-generation failure", err)
 	}
 	// Without a verified generation a name-based delete could hit a
 	// same-name replacement, so none may be issued.

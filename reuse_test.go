@@ -170,7 +170,8 @@ func reuseInspectJSON(id, state, image string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": "0123456789abcdef"
       }
     },
     "status": {

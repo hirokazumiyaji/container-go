@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -62,10 +63,8 @@ func TestTerminateRefusesReplacedContainer(t *testing.T) {
 		id: "myctr", runner: g, eng: appleEngine{},
 		creation: oldCreation,
 	}
-	if err := ctr.Terminate(context.Background()); err == nil {
-		t.Fatal("want error for replaced container")
-	} else if !strings.Contains(err.Error(), "recreated") {
-		t.Fatalf("error = %v, want recreated", err)
+	if err := ctr.Terminate(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("error = %v, want ErrGenerationReplaced", err)
 	}
 	if len(g.deleted) != 0 {
 		t.Fatalf("deleted = %v, want no delete", g.deleted)

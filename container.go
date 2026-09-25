@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -354,28 +355,34 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 }
 
 // Terminate force-removes the container. Removing a container that no
-// longer exists is a success. A handle with an immutable ID deletes by
-// it, so a same-name replacement is never touched. Without one (Apple
-// Container) the delete goes by name: the creation generation must
-// match a fresh inspect, and inspect and delete run under the per-name
-// lock so no other process using this library can delete and recreate
-// the name in between; an external `container delete` plus re-create
-// inside that window is not detectable by name (see lockName). An
-// inspect failure other than not-found aborts the delete rather than
-// risk a replacement.
+// longer exists is a success. A Docker handle with a verified immutable
+// ID deletes by that ID, so a same-name replacement is never touched.
+// Apple Container is name-addressed: it deletes by name only after the
+// handle's creation generation matches a fresh inspect, and inspect and
+// delete run under the per-name lock so no other process using this
+// library can delete and recreate the name in between. An external
+// `container delete` plus re-create inside that window is not detectable
+// by name (see lockName). An unverifiable generation fails closed with
+// ErrGenerationReplaced rather than authorizing a name-based delete.
 func (c *Container) Terminate(ctx context.Context) error {
 	target, err := c.inspectTarget(ctx)
 	if err != nil {
 		return fmt.Errorf("terminate %s: %w", c.id, err)
 	}
-	if requiresImmutableID(c.eng) && !dockerIDRE.MatchString(target) {
-		return fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
-	}
-	if target != c.id {
+	if requiresImmutableID(c.eng) {
+		if !dockerIDRE.MatchString(target) {
+			return fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
+		}
+		// This is the only compatibility path that does not need a
+		// creation generation: the full backend ID cannot name a
+		// replacement.
 		return c.delete(ctx, target)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if target != c.id {
+		return fmt.Errorf("%w: %s has no verified operation target", ErrGenerationReplaced, c.id)
+	}
+	if !creationRE.MatchString(c.creation) {
+		return fmt.Errorf("%w: %s has missing or invalid creation generation", ErrGenerationReplaced, c.id)
 	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
@@ -387,15 +394,15 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		}
+		return fmt.Errorf("terminate %s: verify generation: %w", c.id, errors.Join(ErrGenerationReplaced, err))
 	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
+	// An absent or mismatched generation cannot prove ownership of this
+	// handle, so it counts as a replacement too.
 	if info.labels[creationLabel] != c.creation {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
 	}
 	return c.delete(ctx, c.id)
 }

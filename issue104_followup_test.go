@@ -26,6 +26,26 @@ type issue104FollowupPruneRunner struct {
 	deleteErr error
 }
 
+type issue104ReplacementDockerRunner struct {
+	inspects int
+	deleted  []string
+}
+
+func (r *issue104ReplacementDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		r.inspects++
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"running"},"Config":{"Labels":{%q:%q}},"NetworkSettings":{}}]`, strings.Repeat("b", 64), creationLabel, strings.Repeat("b", 16))), nil, nil
+	case "rm":
+		r.deleted = append(r.deleted, args[len(args)-1])
+		return nil, nil, nil
+	case "version":
+		return []byte("version"), nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
 func (r *issue104FollowupPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && (args[0] == "ps" || args[0] == "ls") {
 		return nil, nil, nil
@@ -55,6 +75,80 @@ func TestExec126ShortcutUsesSelectedCurrentBranch(t *testing.T) {
 	code, _, err := ctr.Exec(context.Background(), []string{"app"})
 	if err != nil || code != 23 {
 		t.Fatalf("Exec = %d/%v, want selected current workload result", code, err)
+	}
+}
+
+func TestFailedDockerTerminateDoesNotPromoteReplacementUID(t *testing.T) {
+	runner := &issue104ReplacementDockerRunner{}
+	ctr := &Container{
+		id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: dockerEngine{},
+	}
+	for i := range 2 {
+		err := ctr.Terminate(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "recreated") {
+			t.Fatalf("Terminate call %d error = %v, want replacement refusal", i+1, err)
+		}
+	}
+	if ctr.immutableUID() != "" {
+		t.Fatalf("replacement UID was promoted: %s", ctr.immutableUID())
+	}
+	if len(runner.deleted) != 0 {
+		t.Fatalf("replacement was deleted: %v", runner.deleted)
+	}
+	if runner.inspects != 2 {
+		t.Fatalf("inspect calls = %d, want one generation check per Terminate", runner.inspects)
+	}
+}
+
+func TestExecVerificationDoesNotPromoteUnprovenDockerUID(t *testing.T) {
+	runner := &issue104ReplacementDockerRunner{}
+	ctr := &Container{
+		id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: dockerEngine{},
+	}
+	verification := ctr.verifyExecContainer(context.Background())
+	if verification.err != nil || verification.state != StateRunning {
+		t.Fatalf("verification = %+v, want running replacement observation", verification)
+	}
+	if ctr.immutableUID() != "" {
+		t.Fatalf("unverified replacement UID was promoted: %s", ctr.immutableUID())
+	}
+}
+
+func TestInspectDetailJoinedWithSentinelIsOperationAbsence(t *testing.T) {
+	detail := newInspectTargetNotFound("myctr", "inspect output did not contain the requested target")
+	if !isNotFoundForOperation(dockerEngine{}, errors.Join(ErrContainerNotFound, detail), "inspect", "myctr") {
+		t.Fatal("matching inspect detail was not treated as corroborating absence")
+	}
+	other := newInspectTargetNotFound("other", "inspect output did not contain the requested target")
+	if isNotFoundForOperation(dockerEngine{}, errors.Join(ErrContainerNotFound, other), "inspect", "myctr") {
+		t.Fatal("nonmatching inspect detail suppressed the requested target")
+	}
+	unrelated := errors.Join(ErrContainerNotFound, detail, errors.New("permission denied"))
+	if isNotFoundForOperation(dockerEngine{}, unrelated, "inspect", "myctr") {
+		t.Fatal("unrelated joined failure overrode inspect absence")
+	}
+}
+
+func TestTerminateTreatsEmptyAndMismatchedInspectAsAbsent(t *testing.T) {
+	otherUID := strings.Repeat("d", 64)
+	cases := []struct {
+		name string
+		data string
+	}{
+		{name: "empty array", data: "[]"},
+		{name: "nonmatching inspect", data: fmt.Sprintf(`[{"Id":%q,"Name":"/other","State":{"Status":"running"},"Config":{},"NetworkSettings":{}}]`, otherUID)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runner := &issue104FreshDockerRunner{inspectJSON: []byte(tc.data)}
+			ctr := &Container{id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: dockerEngine{}}
+			if err := ctr.Terminate(context.Background()); err != nil {
+				t.Fatalf("Terminate with absent inspect result = %v, want nil", err)
+			}
+			if ctr.immutableUID() != "" || len(runner.calls) != 1 {
+				t.Fatalf("absence promoted UID or issued extra calls: uid=%q calls=%v", ctr.immutableUID(), runner.calls)
+			}
+		})
 	}
 }
 

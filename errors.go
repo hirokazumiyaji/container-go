@@ -159,6 +159,15 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 		return true
 	}
 	selected := matchingCLIErrorBranches(err, eng.binary(), operation, targets...)
+	if operation == "inspect" {
+		found, conflict := inspectAbsenceStatus(eng, err, firstTarget(targets))
+		if conflict {
+			return false
+		}
+		if found && len(selected) == 0 {
+			return true
+		}
+	}
 	if len(selected) == 0 {
 		return false
 	}
@@ -170,6 +179,59 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 	collectNonCLIErrorBranches(err, &nonCLI)
 	parts = append(parts, nonCLI...)
 	return isNotFoundFor(eng, errors.Join(parts...))
+}
+
+func firstTarget(targets []string) string {
+	for _, target := range targets {
+		if target != "" {
+			return target
+		}
+	}
+	return ""
+}
+
+func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict bool) {
+	if err == nil {
+		return false, false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			childFound, childConflict := inspectAbsenceStatus(eng, child, target)
+			found = found || childFound
+			conflict = conflict || childConflict
+		}
+		return found, conflict
+	}
+	if detail, ok := err.(*inspectTargetNotFoundError); ok {
+		if target == "" || sameCLITarget(detail.target, target) {
+			return true, false
+		}
+		return false, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return inspectAbsenceStatus(eng, wrapped.Unwrap(), target)
+	}
+	if err == errInspectTargetNotFound {
+		return target == "", target != ""
+	}
+	if err == ErrContainerNotFound {
+		return false, false
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
+			return false, true
+		}
+		operation := commandOperation(cliErr.Args)
+		if operation != "inspect" || (target != "" && !sameCLITarget(commandTarget(cliErr.Args, operation), target)) {
+			return false, true
+		}
+		if eng.containerMissing(cliErr) {
+			return true, false
+		}
+		return false, true
+	}
+	return false, true
 }
 
 func engineForCLIError(err *cli.CLIError) engine {

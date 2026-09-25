@@ -320,6 +320,11 @@ func (c *Container) setImmutableUID(uid string) {
 	c.uidMu.Unlock()
 }
 
+func (c *Container) dockerGenerationMatches(info *engineInfo) bool {
+	return c.eng != nil && c.eng.name() == "docker" && c.creation != "" &&
+		info != nil && info.labels[creationLabel] == c.creation
+}
+
 func (c *Container) classify(ctx context.Context, err error) error {
 	return classifyError(ctx, c.runner, err, c.eng)
 }
@@ -396,6 +401,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	if c.eng.name() == "docker" && info.uid == "" {
 		return fmt.Errorf("terminate %s: inspect returned no immutable Docker ID", c.id)
+	}
+	if c.dockerGenerationMatches(info) {
+		c.setImmutableUID(info.uid)
 	}
 	if info.uid != "" {
 		return c.delete(ctx, info.uid)
@@ -506,7 +514,6 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.info != nil {
-		c.setImmutableUID(c.info.uid)
 		return c.info, nil
 	}
 	info, err := c.inspectFresh(ctx)
@@ -514,7 +521,6 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	c.setImmutableUID(info.uid)
 	return info, nil
 }
 
@@ -529,9 +535,6 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	info, err := c.eng.parseInspect(stdout, target)
 	if errors.Is(err, errInspectTargetNotFound) {
 		return nil, wrapInspectTargetNotFound(err)
-	}
-	if err == nil && info != nil {
-		c.setImmutableUID(info.uid)
 	}
 	return info, err
 }

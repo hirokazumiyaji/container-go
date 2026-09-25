@@ -2,11 +2,16 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // streamRunner adds a canned Stream implementation to fakeRunner.
@@ -143,4 +148,47 @@ func TestLogsDefaultsToUnbounded(t *testing.T) {
 	if strings.Contains(joined, "--tail") || strings.Contains(joined, "--since") {
 		t.Errorf("default Logs must not bound: %v", joined)
 	}
+}
+
+func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
+	r := &cli.ExecRunner{Binary: writeFollowLogsStub(t)}
+	ctr := &Container{id: "myctr", runner: r, eng: dockerEngine{}}
+
+	stream, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatalf("FollowLogs: %v", err)
+	}
+	defer stream.Close()
+
+	_, readErr := io.ReadAll(stream)
+	if !errors.Is(readErr, ErrContainerNotFound) {
+		t.Fatalf("read error = %v, want ErrContainerNotFound", readErr)
+	}
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("read error = %v, want *CLIError", readErr)
+	}
+	if cliErr.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", cliErr.ExitCode)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+		t.Errorf("Stderr = %q, want not-found diagnostic", cliErr.Stderr)
+	}
+}
+
+func writeFollowLogsStub(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "docker")
+	script := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '29.7\n'
+  exit 0
+fi
+printf 'Error response from daemon: No such container: myctr\n' >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }

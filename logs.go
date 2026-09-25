@@ -63,5 +63,27 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	if err != nil {
+		return nil, wrapNotFound(c.classify(ctx, err))
+	}
+	return &classifyingStream{
+		ReadCloser: stream,
+		ctx:        ctx,
+		container:  c,
+	}, nil
+}
+
+type classifyingStream struct {
+	io.ReadCloser
+	ctx       context.Context
+	container *Container
+}
+
+func (s *classifyingStream) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	return n, wrapNotFound(s.container.classify(s.ctx, err))
 }

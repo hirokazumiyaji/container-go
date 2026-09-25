@@ -3,7 +3,12 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
+	"io"
+	"os/exec"
+	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -94,4 +99,150 @@ func TestStreamCloseIsIdempotent(t *testing.T) {
 	if err := stream.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
+}
+
+func TestStreamReturnsTerminalExitErrorAndStderr(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'log line\n'; printf 'terminal stderr\n' >&2; exit 17`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	data, readErr := io.ReadAll(stream)
+	if !strings.Contains(string(data), "log line") {
+		t.Errorf("stream data = %q, want log output", data)
+	}
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("read error = %v, want *CLIError", readErr)
+	}
+	if cliErr.ExitCode != 17 {
+		t.Errorf("ExitCode = %d, want 17", cliErr.ExitCode)
+	}
+	if !strings.Contains(cliErr.Stderr, "terminal stderr") {
+		t.Errorf("Stderr = %q, want terminal diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestStreamReturnsTerminalSignalError(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'signal stderr\n' >&2; kill -TERM $$`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	_, readErr := io.ReadAll(stream)
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("read error = %v, want *CLIError", readErr)
+	}
+	if cliErr.ExitCode >= 0 {
+		t.Errorf("ExitCode = %d, want signal exit", cliErr.ExitCode)
+	}
+	if !strings.Contains(cliErr.Stderr, "signal stderr") {
+		t.Errorf("Stderr = %q, want signal diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestStreamReapsChildAfterEOFWithoutClose(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'line\n'`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	pid := ps.cmd.Process.Pid
+	t.Cleanup(func() { _ = stream.Close() })
+
+	if _, err := io.ReadAll(stream); err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	assertStreamProcessReaped(t, pid)
+}
+
+func TestStreamReapsChildAfterCancellationWithoutClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ExecRunner{Binary: writeStub(t, `while true; do printf 'line\n'; done`)}
+	stream, err := r.Stream(ctx, "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	pid := ps.cmd.Process.Pid
+	t.Cleanup(func() { _ = stream.Close() })
+
+	cancel()
+	_, readErr := io.ReadAll(stream)
+	if !errors.Is(readErr, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", readErr)
+	}
+	assertStreamProcessReaped(t, pid)
+}
+
+func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ExecRunner{Binary: writeStub(t, `printf 'line\n'; sleep 0.1; exit 0`)}
+	stream, err := r.Stream(ctx, "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	pid := ps.cmd.Process.Pid
+	t.Cleanup(func() { _ = stream.Close() })
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(3)
+		go func() {
+			defer wg.Done()
+			<-start
+			_ = stream.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			cancel()
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			_, _ = stream.Read(make([]byte, 32))
+		}()
+	}
+	close(start)
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("concurrent lifecycle operations did not finish")
+	}
+	if ps.cmd.ProcessState == nil {
+		t.Fatal("child was not waited")
+	}
+	assertStreamProcessReaped(t, pid)
+}
+
+func assertStreamProcessReaped(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+		if err != nil || strings.TrimSpace(string(out)) == "" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("process %d was not reaped", pid)
 }

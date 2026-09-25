@@ -26,8 +26,8 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 var ErrImageNotFound = errors.New("image not found in local store")
 
 // ErrContainerNotFound reports that the container does not exist.
-// Inspect, State, Exec, and Logs wrap it with %w so callers can use
-// errors.Is instead of matching CLI stderr text.
+// Inspect, State, Exec, Logs, and FollowLogs wrap it with %w so callers
+// can use errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
 // ErrGenerationReplaced reports that Terminate refused to delete because

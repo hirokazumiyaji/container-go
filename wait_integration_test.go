@@ -88,9 +88,10 @@ func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to become ready") {
 		t.Errorf("error = %v, want wait-path failure after deferred inspect", err)
 	}
-	// Apple has no immutable ID, so rollback fails closed when the
-	// generation cannot be verified: no name-based delete, and the
-	// leaked container is reported instead of hidden.
+	// This non-reuse Apple handle has a creation generation but no
+	// immutable ID, so rollback refuses the name delete when inspection
+	// cannot verify the generation. The leaked container is reported
+	// instead of hidden; this is not a general reuse guarantee.
 	if del := f.callWith("delete"); del != nil {
 		t.Errorf("rollback deleted without a verified generation: %v", del)
 	}

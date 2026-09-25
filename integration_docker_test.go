@@ -420,8 +420,9 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 	}
 }
 
-// TestIntegrationDockerStaleHandlePreservesReplacement covers #49: an
-// old handle must not delete a same-name replacement.
+// TestIntegrationDockerStaleHandlePreservesReplacement covers the current
+// Docker deletion contract: an old handle must not delete a same-name
+// replacement. Broader stale-operation targeting is tracked by #74.
 func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -451,9 +452,11 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+	// A stale Docker handle still targets its old immutable ID. Terminate
+	// is idempotent when that ID is gone, and it cannot delete the
+	// same-name replacement.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("stale Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)

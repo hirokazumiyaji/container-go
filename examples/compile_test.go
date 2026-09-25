@@ -10,14 +10,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-type documentationSnippet struct {
-	file   string
-	line   int
-	source string
+type documentationBlock struct {
+	file     string
+	line     int
+	language string
+	source   string
 }
 
 func TestDocumentationExamplesCompile(t *testing.T) {
@@ -29,15 +31,22 @@ func TestDocumentationExamplesCompile(t *testing.T) {
 		filepath.Join(root, "docs", "design.ja.md"),
 	}
 
-	var snippets []documentationSnippet
+	var blocks []documentationBlock
 	for _, doc := range docs {
-		docSnippets := readDocumentationSnippets(t, doc)
-		if len(docSnippets) == 0 {
+		docBlocks := readDocumentationBlocks(t, doc)
+		hasGo := false
+		for _, block := range docBlocks {
+			if block.language == "go" {
+				hasGo = true
+				break
+			}
+		}
+		if !hasGo {
 			t.Fatalf("%s has no standalone Go examples", doc)
 		}
-		snippets = append(snippets, docSnippets...)
+		blocks = append(blocks, docBlocks...)
 	}
-	compileDocumentationSnippets(t, root, snippets)
+	compileDocumentationBlocks(t, root, blocks)
 }
 
 func TestDocumentationExamplesHaveEnglishJapaneseParity(t *testing.T) {
@@ -47,18 +56,31 @@ func TestDocumentationExamplesHaveEnglishJapaneseParity(t *testing.T) {
 		{filepath.Join(root, "docs", "design.md"), filepath.Join(root, "docs", "design.ja.md")},
 	}
 	for _, pair := range pairs {
-		english := readDocumentationSnippets(t, pair[0])
-		japanese := readDocumentationSnippets(t, pair[1])
+		english := readDocumentationBlocks(t, pair[0])
+		japanese := readDocumentationBlocks(t, pair[1])
 		if len(english) != len(japanese) {
-			t.Fatalf("%s and %s have %d and %d Go examples", pair[0], pair[1], len(english), len(japanese))
+			t.Fatalf("%s and %s have %d and %d fenced code blocks", pair[0], pair[1], len(english), len(japanese))
 		}
 		for i := range english {
-			want := normalizedGoSource(t, english[i])
-			got := normalizedGoSource(t, japanese[i])
+			if english[i].language != japanese[i].language {
+				t.Errorf("%s and %s code block %d use %q and %q", pair[0], pair[1], i+1, english[i].language, japanese[i].language)
+				continue
+			}
+			want := normalizedDocumentationBlock(t, english[i])
+			got := normalizedDocumentationBlock(t, japanese[i])
 			if !bytes.Equal(want, got) {
-				t.Errorf("%s and %s Go example %d differ after comments are removed", pair[0], pair[1], i+1)
+				t.Errorf("%s and %s code block %d differ after comments are removed", pair[0], pair[1], i+1)
 			}
 		}
+	}
+}
+
+func TestDocumentationModuleQuotesLocalReplacePath(t *testing.T) {
+	root := filepath.Join("checkout with spaces", "container-go")
+	got := documentationModule(root)
+	want := `replace github.com/hirokazumiyaji/container-go => "` + filepath.ToSlash(root) + `"`
+	if !strings.Contains(got, want) {
+		t.Fatalf("temporary go.mod does not quote local replace path:\n%s", got)
 	}
 }
 
@@ -71,14 +93,14 @@ func documentationRoot(t *testing.T) string {
 	return filepath.Clean(filepath.Join(filepath.Dir(file), ".."))
 }
 
-func readDocumentationSnippets(t *testing.T, path string) []documentationSnippet {
+func readDocumentationBlocks(t *testing.T, path string) []documentationBlock {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatalf("read %s: %v", path, err)
 	}
 	lines := strings.Split(string(data), "\n")
-	var snippets []documentationSnippet
+	var blocks []documentationBlock
 	inFence := false
 	language := ""
 	startLine := 0
@@ -95,53 +117,96 @@ func readDocumentationSnippets(t *testing.T, path string) []documentationSnippet
 			start = i + 1
 			continue
 		}
-		if language == "go" {
-			snippets = append(snippets, documentationSnippet{
-				file:   path,
-				line:   startLine,
-				source: strings.Join(lines[start:i], "\n"),
-			})
-		}
+		blocks = append(blocks, documentationBlock{
+			file:     path,
+			line:     startLine,
+			language: language,
+			source:   strings.Join(lines[start:i], "\n"),
+		})
 		inFence = false
 	}
 	if inFence {
 		t.Fatalf("%s has an unclosed fenced code block", path)
 	}
-	return snippets
+	return blocks
 }
 
-func normalizedGoSource(t *testing.T, snippet documentationSnippet) []byte {
+func normalizedDocumentationBlock(t *testing.T, block documentationBlock) []byte {
 	t.Helper()
-	file, err := parser.ParseFile(token.NewFileSet(), snippet.file, snippet.source, parser.ParseComments)
+	if block.language == "go" {
+		return normalizedGoSource(t, block)
+	}
+	return normalizedTextSource(block.source)
+}
+
+func normalizedGoSource(t *testing.T, block documentationBlock) []byte {
+	t.Helper()
+	file, err := parser.ParseFile(token.NewFileSet(), block.file, block.source, parser.ParseComments)
 	if err != nil {
-		t.Fatalf("parse %s:%d: %v", snippet.file, snippet.line, err)
+		t.Fatalf("parse %s:%d: %v", block.file, block.line, err)
 	}
 	file.Comments = nil
 	var out bytes.Buffer
 	if err := printer.Fprint(&out, token.NewFileSet(), file); err != nil {
-		t.Fatalf("format %s:%d: %v", snippet.file, snippet.line, err)
+		t.Fatalf("format %s:%d: %v", block.file, block.line, err)
 	}
 	return out.Bytes()
 }
 
-func compileDocumentationSnippets(t *testing.T, root string, snippets []documentationSnippet) {
+func normalizedTextSource(source string) []byte {
+	var lines []string
+	for _, line := range strings.Split(source, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "#") {
+			continue
+		}
+		for _, marker := range []string{" //", "\t//", " #", "\t#"} {
+			if i := strings.Index(line, marker); i >= 0 {
+				line = strings.TrimSpace(line[:i])
+				break
+			}
+		}
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return []byte(strings.Join(lines, "\n"))
+}
+
+func documentationModule(root string) string {
+	return fmt.Sprintf("module documentation-example\n\ngo 1.23.0\n\nrequire github.com/hirokazumiyaji/container-go v0.0.0\n\nreplace github.com/hirokazumiyaji/container-go => %s\n", strconv.Quote(filepath.ToSlash(root)))
+}
+
+func compileDocumentationBlocks(t *testing.T, root string, blocks []documentationBlock) {
 	t.Helper()
 	dir := t.TempDir()
-	module := "module documentation-example\n\ngo 1.23.0\n\nrequire github.com/hirokazumiyaji/container-go v0.0.0\n\nreplace github.com/hirokazumiyaji/container-go => " + filepath.ToSlash(root) + "\n"
+	module := documentationModule(root)
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(module), 0o600); err != nil {
 		t.Fatalf("write temporary go.mod: %v", err)
 	}
-	for i, snippet := range snippets {
-		if _, err := parser.ParseFile(token.NewFileSet(), snippet.file, snippet.source, 0); err != nil {
-			t.Fatalf("parse %s:%d: %v", snippet.file, snippet.line, err)
+
+	compiled := 0
+	for _, block := range blocks {
+		if block.language != "go" {
+			continue
 		}
-		snippetDir := filepath.Join(dir, fmt.Sprintf("snippet-%03d", i+1))
+		if _, err := parser.ParseFile(token.NewFileSet(), block.file, block.source, 0); err != nil {
+			t.Fatalf("parse %s:%d: %v", block.file, block.line, err)
+		}
+		compiled++
+		snippetDir := filepath.Join(dir, fmt.Sprintf("snippet-%03d", compiled))
 		if err := os.Mkdir(snippetDir, 0o700); err != nil {
 			t.Fatalf("create temporary example directory: %v", err)
 		}
-		if err := os.WriteFile(filepath.Join(snippetDir, "example.go"), []byte(snippet.source), 0o600); err != nil {
+		if err := os.WriteFile(filepath.Join(snippetDir, "example.go"), []byte(block.source), 0o600); err != nil {
 			t.Fatalf("write temporary example: %v", err)
 		}
+	}
+	if compiled == 0 {
+		t.Fatal("documentation contains no Go blocks to compile")
 	}
 
 	cmd := exec.Command("go", "test", "-run", "^$", "./...")

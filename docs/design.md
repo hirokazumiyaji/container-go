@@ -12,6 +12,14 @@ it is not a promise that every phase is still a current API or roadmap.
 The public API and behavior described in the current sections come from
 the implementation and its tests.
 
+This checkout is not a merge of the follow-up issue branches that harden
+backend-specific behavior. Apple log options depend on #82, dynamic
+endpoint refreshes depend on #85, reuse ownership and final generation
+verification depend on #83 and #84, stale Docker operation targeting
+depends on #74, and Docker dead-state pruning depends on #113. The
+current sections describe the behavior before those changes; they do not
+promise the follow-up contracts.
+
 The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The `v0.2.0` module requires Go 1.27 or
 later; this checkout requires Go 1.23 or later. The released API and the
@@ -199,8 +207,10 @@ described below are not.
 - `WithFiles(files ...File)`: files copied into the running container
   after start; a copy failure rolls back `Run`.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
-  It is optional because Apple Container uses a direct IP and Docker
-  auto-publishes exposed ports.
+  Apple normally uses the container's direct IP, while Docker
+  auto-publishes ports declared with `WithExposedPorts` to
+  daemon-assigned host ports. Use an explicit binding when a caller
+  needs a specific host port.
 - `WithPullPolicy(policy PullPolicy)`: choose `PullMissing` (default),
   `PullAlways`, or `PullNever`.
 - `WithReuse()`: make a named `Run` a get-or-create operation.
@@ -251,15 +261,22 @@ than an infrastructure error; a stopped or unreachable container can
 still return an error. `WithExecEnv`, `WithExecUser`, and
 `WithExecWorkDir` configure an individual exec invocation; environment
 values use the same temporary-file mechanism as `WithEnv`. `Logs` and
-`LogsWithOptions` return a finite snapshot because the backend command
-finishes, but they do not impose a byte limit by themselves: `Logs`
-requests all output, while `LogsOptions{Tail, Since}` requests a
-backend-selected line or time window when set, whose size still depends
-on the container output. `FollowLogs` is intentionally an unbounded stream and
-continues until its reader is closed or its context is cancelled.
-`LogsOptions` and `LogsWithOptions` are current-development APIs, not
-part of `v0.2.0`. `Terminate` is generation-guarded: it refuses to
-delete a name recycled by another process (see Reuse below).
+a supported `LogsWithOptions` call return a finite snapshot because the
+backend command finishes, but neither imposes a byte limit by itself.
+`Logs` requests all output. `LogsOptions` is backend-specific: Docker
+supports `Tail` and `Since`, while Apple Container 1.2.x–1.3.x uses
+`-n` for a tail and has no `--since` option. This checkout still sends
+Docker-style `--tail` and `--since` arguments to Apple, so
+`LogsWithOptions` is not backend-neutral here; #82 must be applied before
+Apple support can be documented as a capability. The #82 change is intended
+to map `Tail` to Apple's `-n` and reject `Since` as unsupported. A requested
+window's size still depends on the container output. `FollowLogs` is intentionally
+an unbounded stream and continues until its reader is closed or its
+context is cancelled. `LogsOptions` and `LogsWithOptions` are
+current-development APIs, not part of `v0.2.0`. `Terminate` is
+generation-guarded for handles with a generation, but the current reuse
+and empty-generation paths have limitations described under Reuse and
+tracked by #83 and #84.
 
 `Terminate` maps to `container delete --force` on Apple Container and
 `docker rm --force` on Docker, and is idempotent when the container is
@@ -292,10 +309,17 @@ unreachable in a given setup), publish explicitly with
 given host address and `MappedPort` the host port.
 
 `MappedPort` and `Endpoint` return `ErrPortNotExposed` for ports that
-are neither declared via `WithExposedPorts` nor explicitly published.
-The declarations also feed wait strategies: `ForExposedPort` uses the
-first declared port, and an empty `Target.Endpoint` port selects that same
-first declaration.
+are neither declared via `WithExposedPorts` nor explicitly published, or
+for a declared port with no usable host binding. The declarations also
+feed wait strategies: `ForExposedPort` uses the first declared port, and
+an empty `Target.Endpoint` port selects that same first declaration.
+
+The current implementation caches the first successful inspect used by
+endpoint-related methods. That record includes the container IP and
+host-side bindings, although either can change during the container's
+lifetime. `State` uses a fresh inspect, but an endpoint result can
+therefore be stale. This is a snapshot behavior, not an immutability
+guarantee; #85 tracks refreshing dynamic endpoint data.
 
 ## Wait strategies
 
@@ -376,8 +400,9 @@ succeeds.
 name conflicts, and only inspects and deletes a container carrying this
 process's managed and session labels. When the creation label is present,
 it must match this run; an absent label is not a mismatch in this
-best-effort path. Errors from its lock, inspect, or delete operations are
-not joined to the returned `Run` error.
+best-effort path. This is not a general replacement guarantee; #83 tracks
+closing the missing-generation path. Errors from its lock, inspect, or delete
+operations are not joined to the returned `Run` error.
 
 **Abnormal exit**: when the parent process exits and its reaper pipe
 closes, an external `/bin/sh` watchdog attempts force-deletion. An
@@ -414,9 +439,11 @@ use the ID independently.
 - a creation generation label, and, for reuse, the reuse/group labels
 
 The Apple CLI has no label filter, so orphan sweeps filter
-`container ls -a --format json` client-side. `Prune(ctx)` removes
-stopped containers carrying the managed label from any session. Docker
-can apply the same filter daemon-side.
+`container ls -a --format json` client-side. `Prune(ctx)` removes the
+containers selected by the active backend's managed filter. Apple selects
+the stopped state. The current Docker filter selects the exited state
+only, so Docker dead-state containers remain until #113 is applied;
+running and created containers are not selected.
 
 Setting `CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`,
 and reaper registration. It does not change an explicit
@@ -429,8 +456,10 @@ volumes must be named, and their lifecycle belongs to the caller.
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes on the same host). An existing container
-must have been created with `WithReuse`, and every caller reruns its
-readiness strategy. Image compatibility is checked on both backends.
+must carry the current `WithReuse` marker, and every caller reruns its
+readiness strategy. The current check does not require every ownership
+or generation label; #83 tracks the stricter boundary. Image compatibility
+is checked on both backends.
 Port compatibility is backend-specific. Docker compares auto-published
 bindings for `WithExposedPorts` and checks explicit `WithPublishedPort`
 bindings. Apple checks explicit published bindings, but the library's
@@ -442,31 +471,38 @@ differences attach silently to the existing container by design;
 callers needing isolation should use distinct names or reset state via
 `Exec`.
 
-Each creation carries a `creationLabel` generation (16-hex). `Terminate`
-and the stopped-recreate path refuse to delete a replaced name. On
-Docker the handle keeps the immutable `Id` printed by `docker run` (or
-returned by inspect) and deletes by it, so no generation check is
-needed: a replacement never shares the ID. Apple Container addresses
-containers by name only, so there the delete is name-based: the
-generation must match a fresh inspect, and inspect plus delete run
-under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
-limited to cooperating processes using this library on the same host:
-a direct `container delete` plus re-create by an external tool inside
-that window is indistinguishable by name, and closing it would need an
-immutable ID or an atomic conditional delete that Apple Container does
-not provide. An inspect
-failure other than not-found aborts the delete (fail closed); `Run`'s
-rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Apple containers by name and generation,
-reading the label as a line-anchored JSON field (`"key": "value"`, never a
-substring), and skips deletion on mismatch. The current base does not
-register Docker's immutable ID with the reaper; issue #73 is required
-before Docker reaper entries can use `Id`. Each backend call carries a
-10-30s timeout via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so
-one hung daemon call cannot wedge the rest. The leader's own pull/create
-uses an independent `runTimeout` budget; `reuseAttachTimeout` bounds only
-attach polling for another process's container.
+Each creation by this checkout normally carries a `creationLabel`
+(16-hex). The current reuse path is narrower than that label suggests:
+`checkReuseOwned` requires the reuse marker and a compatible image, but
+does not require the managed or creation label. A stopped container with
+an empty inspected generation can therefore reach a name-based delete
+path. `Terminate` performs a fresh generation check only when its handle
+has a non-empty generation; an empty-generation handle takes the legacy
+name-delete path. `reuseRun` also does not re-inspect after its readiness
+strategy returns, so a replacement can occur during the wait. Issues #83
+and #84 track the ownership checks and final generation verification.
+
+For a handle with a valid non-empty generation, the Apple path checks a
+fresh inspect and runs inspect plus delete under a per-name `flock` in the
+temp directory (`containergo-<name>.lock`). That protects cooperating
+processes using this library on the same host, but it cannot distinguish
+an external `container delete` plus re-create in the same window. Docker
+handles that retain the immutable `Id` printed by `docker run` (or
+returned by inspect) delete by that ID, so a same-name replacement does
+not share the deletion target. Other Docker operations on the current
+base still address the logical name; #74 tracks using the immutable ID
+for those operations as well. These are different protections; the
+current base does not make reuse a general fail-closed guarantee. The
+watchdog reaper
+registers Apple containers by name and generation, reads the label as a
+line-anchored JSON field (`"key": "value"`, never a substring), and skips
+deletion on mismatch. The current base does not register Docker's
+immutable ID with the reaper; issue #73 is required before Docker reaper
+entries can use `Id`. Each backend call carries a 10-30s timeout via
+POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung daemon call
+cannot wedge the rest. The leader's own pull/create uses an independent
+`runTimeout` budget; `reuseAttachTimeout` bounds only attach polling for
+another process's container.
 
 ## Security design
 
@@ -511,9 +547,12 @@ standard-log message if it cannot be started after repeated attempts.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one backend
-`run --detach` call. Immutable facts (configuration, labels, image,
-network address, and published ports) are cached from the first
-inspect; state is re-queried when requested.
+`run --detach` call. The first successful inspect is cached and reused by
+endpoint-related paths for performance. The current cache also retains the
+container IP and host-side bindings, even though those values are dynamic;
+`State` and some lifecycle operations re-inspect. This is a stale-data
+limitation, not an immutability guarantee; #85 tracks refreshing dynamic
+endpoint data.
 
 **Wait via connections where possible**. `ForListeningPort` and
 `ForHTTP` use the resolved endpoint directly. `ForExec` and state
@@ -526,10 +565,13 @@ lock for container creation (reaper ID registration takes a mutex for
 a one-line write). Apple Container consumes no host ports by default;
 Docker's daemon assigns published ports atomically.
 
-**Bound snapshots only when requested**. `Logs` and `LogsWithOptions`
-finish a finite CLI snapshot, but `Logs` can buffer all available output
-and `LogsWithOptions` limits by the requested line or time window rather
-than a byte cap. `FollowLogs` is intentionally an unbounded stream;
+**Bound snapshots only when requested**. `Logs` and a supported
+`LogsWithOptions` call finish a finite CLI snapshot, but `Logs` can buffer
+all available output. `LogsOptions{Tail, Since}` is backend-specific:
+Docker accepts both options, while Apple Container 1.2.x–1.3.x uses `-n`
+for Tail and has no Since option. The current checkout still sends Docker
+flag spellings to Apple, so the option contract is pending #82. Neither
+path adds a byte cap. `FollowLogs` is intentionally an unbounded stream;
 closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 
@@ -558,8 +600,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrImageNotFound`: `Run` with `PullNever` found no local image.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.
-- `ErrGenerationReplaced`: a generation-guarded delete refused to
-  remove a same-name replacement.
+- `ErrGenerationReplaced`: a delete-time generation check found a
+  same-name replacement. The current reuse path does not perform the
+  final post-readiness check tracked by #83 and #84.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and stderr (the diagnostic stderr copy is
   capped at 64KiB). The root `CLIError` alias is a current-development
@@ -628,9 +671,10 @@ type Runner interface {
 argv assembly, JSON decoding, error classification, and wait strategy
 logic without a real backend. Dependencies that production code assumes
 non-nil receive real fakes in tests, never nil. The non-integration
-`examples/compile_test.go` extracts every fenced `go` block from both
-language versions of the README and both design documents, parses it, and
-compiles it in a temporary module with a local `replace` to this checkout.
+`examples/compile_test.go` extracts every fenced code block from both
+language versions of the README and both design documents, compares the
+paired blocks after removing comments, parses the `go` blocks, and compiles
+them in a temporary module with a quoted local `replace` to this checkout.
 The `text` signature inventories are intentionally not executable.
 
 **Integration tests** use the `integration` build tag. The root suite
@@ -672,9 +716,11 @@ resolution stay the docker CLI's job.
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
 normalized record holds state (mapped onto running / stopped /
-stopping / created / unknown), labels, image reference, immutable
-backend ID when available, container IP, and host-side port bindings
-(container port → host address and port).
+stopping / created / unknown), labels, image reference, a backend ID
+when available, container IP, and host-side port bindings (container port
+→ host address and port). The backend ID is the stable identity; IP
+addresses and bindings are dynamic, even though the current endpoint cache
+retains them.
 
 **Image handling**: both backends implement the pull policy through
 explicit image inspection and pull commands. The Docker run argv adds
@@ -706,8 +752,9 @@ Docker). It depends on `/bin/sh` and does not run on Windows; Windows
 relies on `Cleanup` and the normal rollback paths. On this checkout the
 Docker-ID registration prerequisite (#73) is not yet present, so the
 Docker reaper path is not active even though normal Docker handles use
-the immutable ID. `Prune` can use daemon-side filters on Docker
-(`--filter label=... --filter status=exited`).
+the immutable ID. `Prune` uses daemon-side filters on Docker, but the
+current filter selects only `status=exited`; Docker's `dead` state is
+not selected until #113 is applied.
 
 **Liveness detection**: the probe command switches per backend
 (`system status` for Apple, `version --format {{.Server.Version}}` for
@@ -731,10 +778,12 @@ Docker).
 
 These are deliberately recorded rather than implied by the current API:
 
-- **Apple name-based deletion**: the creation-generation check protects
-  cooperating processes using this library on one host, but cannot
-  distinguish an external CLI delete/recreate in the same window.
-  Closing that gap requires an immutable identity or an atomic
+- **Apple name-based deletion**: a non-empty, matching creation-generation
+  check protects cooperating processes using this library on one host, but
+  the current base still permits empty-generation name deletes and cannot
+  distinguish an external CLI delete/recreate in the same window. Issues
+  #83 and #84 track the ownership and final-verification gaps; closing
+  the external race requires an immutable identity or an atomic
   conditional delete from the backend.
 - **Remote Docker detection**: only `DOCKER_HOST=tcp://...` is used
   for endpoint selection. A remote Docker context is not detected.

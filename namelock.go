@@ -14,13 +14,14 @@ import (
 // lockName serializes generation-checked, name-addressed deletes of one
 // container name across processes on this host. Apple Container has no
 // immutable container ID, so an inspect-then-delete by name is only
-// safe if no other process can delete and recreate the name in between;
-// every such delete in this library takes this lock first. That covers
-// cooperating processes using this library only: a direct `container`
-// CLI invocation or another implementation does not take the lock and
-// can still replace the name inside the window. Closing that would
-// need an immutable ID or an atomic conditional delete from the
-// backend, which Apple Container does not offer. The lock file lives
+// safe for a non-empty, matching generation if no other process can
+// delete and recreate the name in between. The generation-checked paths
+// in this library take this lock first; an empty-generation legacy path
+// does not. That covers cooperating processes using this library only:
+// a direct `container` CLI invocation or another implementation does not
+// take the lock and can still replace the name inside the window. Closing
+// that would need an immutable ID or an atomic conditional delete from
+// the backend, which Apple Container does not offer. The lock file lives
 // in the temp directory and is never removed, since removing it would
 // race with a concurrent locker.
 func lockName(ctx context.Context, name string) (unlock func(), err error) {

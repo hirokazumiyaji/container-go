@@ -298,7 +298,8 @@ func (dockerEngine) logsTailArgs(id string) []string {
 }
 
 // listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// status filters directly. This base selects exited containers only;
+// adding dead-state selection is tracked by issue #113.
 func (dockerEngine) listArgs() []string {
 	return []string{
 		"ps", "--all", "--quiet",

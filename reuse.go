@@ -102,8 +102,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
 			}
-			// Only recycle containers this library created for reuse
-			// with a compatible image; never delete foreign leftovers.
+			// Recycle only after the current reuse-marker and image
+			// compatibility checks. Those checks do not yet require
+			// every ownership/generation label; issue #83 tracks the
+			// stricter ownership boundary.
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
@@ -188,10 +190,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation, so Terminate re-checks the
-// generation and deletes by immutable ID. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// handle carrying the generation from its inspect. A populated generation
+// makes Terminate re-check the name before deleting; a Docker inspect can
+// also supply an immutable ID. The current base does not require a
+// generation for every pre-existing reuse container, so an empty generation
+// can fall back to a name delete. Issue #83 tracks closing that fail-open
+// path.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
@@ -245,11 +249,14 @@ func createRaceMissing(err error) bool {
 	return strings.Contains(s, "container not found")
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
+// checkReuseOwned reports whether an existing container may be adopted
+// or deleted for this reuse request. On this base it requires the reuse
+// marker and a compatible image, but not every ownership/generation
+// label. Issues #83 and #84 track the stricter ownership check and the
+// final generation verification after readiness.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+		return fmt.Errorf("reuse %s: existing container lacks the WithReuse marker", cfg.name)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
@@ -389,7 +396,8 @@ func stripImageDigest(ref string) string {
 
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
-// step; ordinary Prune still only removes stopped managed containers.
+// step. Ordinary Prune uses the backend-specific stopped filter; on the
+// current Docker backend that filter is exited-only pending issue #113.
 func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if group == "" {
 		return nil, fmt.Errorf("reuse group must not be empty")

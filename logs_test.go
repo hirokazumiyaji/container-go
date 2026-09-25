@@ -100,10 +100,9 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 	}
 }
 
-func TestLogsWithOptionsPassesTailAndSince(t *testing.T) {
+func TestDockerLogsWithOptionsPassesTailAndSince(t *testing.T) {
 	f := newTestRunner()
-	ctr := runTestContainer(t, f)
-	f.calls = nil
+	ctr := &Container{id: "myctr", runner: f, eng: dockerEngine{}}
 
 	since := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
 	rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Tail: 50, Since: since})
@@ -113,20 +112,9 @@ func TestLogsWithOptionsPassesTailAndSince(t *testing.T) {
 	_ = rc.Close()
 
 	call := f.callWith("logs")
-	if call == nil {
-		t.Fatal("no logs call recorded")
-	}
-	joined := strings.Join(call, " ")
-	if !strings.Contains(joined, "--tail 50") {
-		t.Errorf("missing --tail 50: %v", call)
-	}
-	if !strings.Contains(joined, "--since") {
-		t.Errorf("missing --since: %v", call)
-	}
-	tailIdx := strings.Index(joined, "--tail")
-	idIdx := strings.LastIndex(joined, "myctr")
-	if tailIdx < 0 || idIdx < 0 || tailIdx > idIdx {
-		t.Errorf("flags must precede container id: %v", call)
+	want := []string{"logs", "--tail", "50", "--since", since.Format(time.RFC3339), "myctr"}
+	if !slices.Equal(call, want) {
+		t.Errorf("logs args = %v, want %v", call, want)
 	}
 }
 

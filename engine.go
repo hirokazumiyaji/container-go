@@ -16,11 +16,12 @@ type engineInfo struct {
 	uid string
 	// image is the image reference the container was created from.
 	image string
-	// ip is the container's address on its first network; empty when
-	// the backend did not report one.
+	// ip is the container's address on its first network; it can change
+	// after the first inspect and may therefore be stale when cached.
 	ip string
-	// bound lists host-side bindings of container ports, as reported
-	// by the backend (Docker's randomly assigned ports land here).
+	// bound lists host-side bindings of container ports, as reported by
+	// the backend. Docker-assigned bindings can change or appear later,
+	// so this field is dynamic even though the current cache stores it.
 	bound []boundPort
 }
 
@@ -58,7 +59,9 @@ type engine interface {
 	logsTailArgs(id string) []string
 	listArgs() []string
 	// parseStoppedManaged extracts, from listArgs output, the IDs of
-	// stopped containers this library created.
+	// containers selected by the backend's stopped-container filter.
+	// Docker currently selects exited containers; dead-state selection
+	// is tracked separately by issue #113.
 	parseStoppedManaged(data []byte) ([]string, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.

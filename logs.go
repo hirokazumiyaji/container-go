@@ -11,9 +11,14 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// LogsOptions bounds a Logs snapshot. Tail keeps the last N lines
-// (0 means all); Since drops entries older than the timestamp. Both
-// map to the backend CLI's --tail/--since flags.
+// LogsOptions describes an optional window for a log snapshot. Tail keeps
+// the last N lines (0 means all); Since drops entries older than the
+// timestamp. The current checkout translates both options to the
+// Docker-style --tail/--since arguments for either engine. Docker supports
+// those flags. Apple Container 1.2.x–1.3.x uses -n for a tail but has no
+// --since option; issue #82 is intended to map Tail to -n and reject
+// Since with an explicit unsupported-capability result. Until #82 is
+// applied, non-empty LogsWithOptions options are reliable for Docker only.
 type LogsOptions struct {
 	Tail  int
 	Since time.Time
@@ -35,9 +40,11 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 	return c.LogsWithOptions(ctx, LogsOptions{})
 }
 
-// LogsWithOptions returns a bounded snapshot of the container's log
-// output. Long-lived reuse containers can grow unbounded logs, so
-// prefer Tail for diagnostics.
+// LogsWithOptions returns a finite snapshot of the container's log
+// output. The options are backend-specific; see LogsOptions. On this
+// checkout Apple Container still receives Docker-style option names, so
+// Apple support is pending issue #82. A snapshot is not byte-bounded, and
+// long-lived reuse containers can grow without a requested window.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()

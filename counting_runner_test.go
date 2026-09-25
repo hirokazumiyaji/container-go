@@ -93,6 +93,8 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 		t.Fatalf("Endpoint: %v", err)
 	}
 	// Endpoint triggers the deferred inspect once; later reads reuse it.
+	// This pins the current cache behavior, not dynamic freshness; #85
+	// tracks refreshing endpoint data.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}

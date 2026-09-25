@@ -23,11 +23,34 @@ Go のテストから使い捨てコンテナを起動できます。サード�
 | `wait.ForHTTP` のヘッダー、認証、TLS、独自クライアント設定 | なし | あり |
 | 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
 | root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
-| 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | あり。ただし後述の Docker reaper の前提条件がある |
+| 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | 一部実装済み。以下の後続 issue の制約を参照 |
 
 以下の説明で「現在の開発」と記した節以外は、現行チェックアウトの動作を説明します。
 タグ付き `v0.2.0` の API については、バージョン表を確認してください。
 コード例は単独ファイルとしてリポジトリのドキュメントテストがコンパイルします。
+
+このチェックアウトは、バックエンド固有の動作を改修する後続 issue の
+修正を統合した状態ではありません。特に次の制限があります。
+
+- Apple の `LogsWithOptions` は現在 Docker 形式の `--tail` と
+  `--since` を渡します。Apple Container は tail に `-n` を使い、
+  `--since` を提供しません。Apple の機能を文書化する前に #82 を
+  適用する必要があります。
+- endpoint 解決は最初の inspect をキャッシュし、IP アドレスと host
+  binding も含めます。この値は変わることがあるため、古い値を返す
+  ことがあります。動的な endpoint データの更新は #85 が担当します。
+- reuse は既存コンテナですべての ownership / generation label を
+  要求せず、readiness 後に generation を再確認しません。generation が
+  ない場合は name ベースの delete に到達する可能性があります。#83 と
+  #84 がこれらの fail-open 経路を扱います。
+- Docker の handle は delete では immutable ID を使いますが、他の backend
+  operation は現在 logical name を対象にします。そのため stale handle が
+  同じ名前の置き換えを inspect または変更する可能性があります。#74 が
+  operation target の修正を担当します。
+- Docker の `Prune` は現在 exited コンテナだけを選び、dead 状態は
+  選びません。dead 状態の対応は #113 が担当します。
+
+以下の節は、後続ブランチの動作ではなく、現在の上限を説明します。
 
 ```go
 package docexample
@@ -188,9 +211,18 @@ func TestPublishedEndpoint(t *testing.T) {
 ```
 
 `MappedPort` と `Endpoint` は `WithExposedPorts` で宣言したポートと、明示的に
-公開したポートを解決します。`ContainerIP` は別の診断用 API であり、wait
-package が使う値ではありません。Docker Desktop ではコンテナ IP に到達できない
-ことが多いため、クライアントには `Endpoint` を優先してください。
+公開したポートを解決します。ポートが未宣言、または宣言済みポートに利用できる
+host binding がない場合は `ErrPortNotExposed` を返します。`ContainerIP` は別の
+診断用 API であり、wait package が使う値ではありません。Docker Desktop では
+コンテナ IP に到達できないことが多いため、クライアントには `Endpoint` を優先
+してください。
+
+現在のチェックアウトでは、endpoint 関連メソッドが最初の inspect を
+キャッシュします。キャッシュにはコンテナ IP と host 側 binding が
+含まれますが、どちらも container の lifecycle 中に変更されます。`State`
+は新しい inspect を実行しますが、endpoint の結果には古い値が
+含まれることがあります。この値は immutable な事実ではなく snapshot
+として扱い、動的データの更新は #85 が担当します。
 
 ## 待機戦略
 
@@ -261,16 +293,27 @@ func DevelopmentWaitOptions() {
 
 ## ログ
 
-`Logs` と `LogsWithOptions` は CLI process が終了するため有限のスナップショットを返しますが、単体で byte 上限は課しません。
-`Logs` は利用可能な出力をすべて要求し、`LogsWithOptions{Tail, Since}` は `Tail` または `Since` を指定したときに行数または時間の範囲を指定します。ただし、その範囲の大きさはコンテナ出力に依存します。長時間・大量出力のコンテナでは `Tail` を使ってください。
+`Logs` と、成功する `LogsWithOptions` 呼び出しは CLI process が終了するため
+有限のスナップショットを返しますが、単体で byte 上限は課しません。
+`Logs` は利用可能な出力をすべて要求します。`LogsOptions` は backend
+固有です。Docker は `Tail` と `Since` の両方を受け付けます。Apple
+Container 1.2.x–1.3.x は tail に `-n` を使い、`--since` は
+実装していません。このチェックアウトは Apple にも Docker 形式の
+`--tail` と `--since` を渡すため、`LogsWithOptions` はここでは
+backend 中立ではありません。#82 を適用するまで Apple では
+`Logs` を使ってください。#82 の変更は `Tail` を Apple の `-n` に
+対応させ、`Since` を unsupported として拒否する予定です。範囲を指定
+しても大きさはコンテナ出力に依存し、`LogsWithOptions` は byte 上限を
+追加しません。
 `FollowLogs` はストリーミングする `io.ReadCloser` を返し、Close するか
 context をキャンセルするとバックエンド CLI を停止します。`ForLog` は
 `FollowLogs` を使い、`Logs` は新しい出力を追尾しません。
 `LogsOptions` と `LogsWithOptions` は開発版 API であり、`v0.2.0` には
 ありません。
 
-次の開発版 example は、`v0.2.0` 以降に追加された log stream、exec option、
-公開 error symbol も示します。
+次の例は Docker 固有です。`v0.2.0` 以降に追加された log stream、exec
+option、公開 error symbol も示しますが、Apple の
+`LogsWithOptions` の例ではありません。
 
 ```go
 package docexample
@@ -283,7 +326,7 @@ import (
     container "github.com/hirokazumiyaji/container-go"
 )
 
-func DevelopmentLogOptions(ctx context.Context, ctr *container.Container) error {
+func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
     logs, err := ctr.LogsWithOptions(ctx, container.LogsOptions{
         Tail:  10,
         Since: time.Now(),
@@ -373,9 +416,10 @@ func PullPolicy(ctx context.Context) {
    `cleanupFailedCreate` は、この process の managed / session label を
    持つコンテナだけを inspect します。creation label がある場合はこの
    run と一致する必要があります。ただし、この best-effort 経路では
-   label がないことを不一致とは扱いません。lock、inspect、delete の
-   error は `Run` の返り値に連結されません。name conflict はこの経路
-   では削除しません。
+   現在は label がないことも許容します。これは replacement を防ぐ
+   一般的な保証ではなく、#83 が missing-generation 経路を扱います。
+   lock、inspect、delete の error は `Run` の返り値に連結されません。
+   name conflict はこの経路では削除しません。
 4. **異常終了**: 親 process が終了して reaper pipe が閉じられると、
    best-effort watchdog が強制削除を試みます。process を終了させる
    panic、`SIGKILL`、`os.Exit` でも pipe は閉じます。recover した panic では
@@ -401,9 +445,11 @@ delete failure は shell が無視します。reaper の動作を cleanup の成
 作成後の失敗に対する rollback、create 失敗後の best-effort cleanup の
 動作は変えません。
 
-`container.Prune(ctx)` は過去 session を含め、本 library が作成した停止済み
-コンテナ（`com.github.hirokazumiyaji.container-go` label 付き）を削除します。
-実行中コンテナは削除しません。
+`container.Prune(ctx)` は、現在の backend の filter が選ぶ、本 library が
+作成したコンテナを削除します。Apple は managed コンテナのうち stopped
+状態を選びます。Docker は現在 managed コンテナのうち exited 状態だけ
+を選ぶため、dead 状態のコンテナは #113 を適用するまで削除されません。
+この filter は running または created 状態を選びません。
 
 ## Reuse（テスト / process 間でのコンテナ共有）
 
@@ -442,11 +488,12 @@ func TestReuse(t *testing.T) {
 契約:
 
 - `WithName` 必須。readiness strategy は attach 時も必ず再実行する。
-- 既存コンテナは `WithReuse` で作成され、互換性のある image である必要が
-  ある。create 競合による name conflict は成功として扱い、既存へ attach
-  する。
-- 停止済み残骸は削除して再作成する。running のまま ready にならない場合は
-  削除せず error を返す。
+- 既存コンテナは `WithReuse` marker を持ち、互換性のある image である
+  必要があります。create 競合による name conflict は成功として扱い、
+  既存へ attach します。
+- 停止済みコンテナは、現在の reuse marker と image の check に
+  合格した場合だけ削除・再作成の対象にする。running のまま ready に
+  ならない場合は削除せず error を返す。
 - image 互換性は両 backend で検査する。port の互換性は backend ごとに
   異なる。Docker は自動公開された exposed-port binding と明示的な
   publication を比較する。Apple は明示的な published binding を比較するが、
@@ -455,16 +502,22 @@ func TestReuse(t *testing.T) {
   宣言を共有コンテナ IP へ適用するので、宣言を分離したい場合は名前を変える。
 - `env` / `cmd` / `mounts` の差は既存へ黙って attach する。重要な設定は
   別の名前を使う。
-- 各作成は generation label を持つ。`Terminate` と stopped 再作成経路は
-  置き換わった generation の削除を拒否する。名前ベースの guard は同じ
-  host で本 library を使う process 間の協調に限られる。外部 CLI による
-  delete / recreate は対象外。Docker handle は利用可能な immutable ID を
-  使う。
+- このチェックアウトが作成するコンテナは通常 generation label を持ちます。
+  ただし、既存の reuse コンテナでは現在の check が managed label と
+  creation label のすべてを要求せず、`WithReuse` marker と互換 image
+  だけを要求します。generation が空の場合、name ベースの delete に
+  到達する可能性があります。現在の code は readiness 後に generation
+  を再確認しません。#83 と #84 がこれらの fail-open 経路を扱います。
+  適用されるまでは、reuse を信頼できない same-name replacement への
+  保護として扱わないでください。Docker の delete handle は利用可能な
+  immutable ID を使いますが、他の operation は #74 を適用するまで logical
+  name を使います。
 - `Cleanup` / `TerminateContainer` / watchdog reaper は reused handle を
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを削除できる。
 - `container.PruneReuseGroup(ctx, "integration")` はその group の
   コンテナを強制削除する（CI teardown）。group は再利用 key ではなく
-  label である。通常の `Prune` は停止済み管理対象だけを削除する。
+  label である。通常の `Prune` は上記の backend filter を使い、現在の
+  Docker backend では exited コンテナだけが対象で、dead は対象外である。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使って
@@ -513,8 +566,10 @@ test、race test、lint、`govulncheck` を実行します。同じ runner で D
 integration test の行列も実行します。Apple Container integration は
 GitHub ホストランナーに service がないためローカル専用です。
 integration tag のないドキュメント test は、この README の英語版・日本語版
-と design document の単独 Go example を抽出してコンパイルします。tag付き
-`examples/` の example が実 backend を動かします。
+と design document の fenced code block をすべて抽出し、対応する block を
+コメント除去後に比較します。Go block は引用符付きローカル `replace` を持つ
+一時 module 内でコンパイルします。tag付き `examples/` の example が実
+backend を動かします。
 
 Design document: [docs/design.md](docs/design.md)（日本語版:
 [docs/design.ja.md](docs/design.ja.md)）。設計ドキュメントの「実装フェーズ」は

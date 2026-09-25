@@ -88,9 +88,9 @@ type Container struct {
 	// process exit. Explicit Terminate still removes them.
 	reused bool
 	// creation is the unique generation ID stored in creationLabel.
-	// Terminate and the reaper verify it before deleting so a stale
-	// handle does not remove a same-name replacement made by this
-	// library; see Terminate for the limits of the name-based path.
+	// A non-empty generation is checked by Terminate before a
+	// generation-guarded name delete; empty legacy handles still take
+	// the name path. See Terminate and issues #83/#84 for the limits.
 	creation string
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
@@ -98,7 +98,7 @@ type Container struct {
 	uid string
 
 	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	info *engineInfo // cached first inspect; currently also retains dynamic IP and bindings
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -209,9 +209,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 }
 
 // rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// removal is not hidden: the caller must know when the container was
+// left behind. Without an immutable ID, a valid generation is checked
+// before name deletion; an empty generation currently takes the legacy
+// name path, so the generation guarantee is not universal.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
 		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
@@ -219,11 +220,13 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
+// cleanupFailedCreate best-effort considers the container this Run left
+// behind after a failed create. It skips name conflicts and only considers
+// a container carrying this process's managed+session labels. If the
+// creation label is present it must also match; an absent label is
+// currently accepted in this best-effort path, not treated as proof that
+// the handle owns the live name. Issue #83 tracks closing that fail-open
+// case.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return
@@ -278,7 +281,9 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 	return path, dir, nil
 }
 
-// ID returns the container ID (identical to its name).
+// ID returns the handle's logical container ID, which is the configured
+// name. Docker also retains an immutable backend ID internally, but that
+// backend identity is not exposed through this method.
 func (c *Container) ID() string { return c.id }
 
 func (c *Container) classify(ctx context.Context, err error) error {
@@ -305,14 +310,14 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 
 // Terminate force-removes the container. Removing a container that no
 // longer exists is a success. A handle with an immutable ID deletes by
-// it, so a same-name replacement is never touched. Without one (Apple
-// Container) the delete goes by name: the creation generation must
-// match a fresh inspect, and inspect and delete run under the per-name
-// lock so no other process using this library can delete and recreate
-// the name in between; an external `container delete` plus re-create
-// inside that window is not detectable by name (see lockName). An
-// inspect failure other than not-found aborts the delete rather than
-// risk a replacement.
+// it, so a same-name replacement is never touched. For a name-addressed
+// handle with a non-empty creation generation, Terminate requires a
+// matching fresh inspect and holds the per-name lock across inspect and
+// delete. A handle with an empty generation currently takes the legacy
+// name-delete path, so it does not provide that replacement check; issues
+// #83 and #84 track the reuse and generation gaps. An external
+// `container delete` plus re-create inside the lock window is not
+// detectable by name.
 func (c *Container) Terminate(ctx context.Context) error {
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
@@ -355,7 +360,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 
 // ContainerIP returns the container's address on its first attached
 // network. With the Docker backend on Docker Desktop this address is
-// usually not reachable from the host; prefer Endpoint.
+// usually not reachable from the host; prefer Endpoint. On this checkout
+// the first successful endpoint inspect is cached, so a later network
+// change can leave this value stale; issue #85 tracks refreshing dynamic
+// endpoint data.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	info, err := c.cachedInfo(ctx)
 	if err != nil {
@@ -371,6 +379,8 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // published ports use different host IPs, prefer Endpoint for the
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
+// Endpoint-related values may come from the first cached inspect on this
+// checkout and can be stale; issue #85 tracks refreshing dynamic data.
 func (c *Container) Host(ctx context.Context) (string, error) {
 	if len(c.published) > 0 {
 		addr := c.published[0].connectAddr()
@@ -386,13 +396,18 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
-// to the port clients should dial.
+// to the port clients should dial. On this checkout a daemon-assigned
+// binding may come from the first cached inspect and can be stale; issue
+// #85 tracks refreshing dynamic endpoint data.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
 	_, p, err := c.resolve(ctx, port)
 	return p, err
 }
 
-// Endpoint returns "host:port" for a declared container port.
+// Endpoint returns "host:port" for a declared container port. On this
+// checkout the first successful endpoint inspect is cached, so an IP or
+// daemon-assigned host port can be stale after a network or binding change;
+// issue #85 tracks refreshing dynamic endpoint data.
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 	host, p, err := c.resolve(ctx, port)
 	if err != nil {
@@ -439,9 +454,11 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns the first successful inspect result. The current
+// implementation stores the whole record, including dynamic IP and port
+// bindings, so endpoint-related callers can observe stale data after a
+// lifecycle or network change. Issue #85 tracks separating immutable
+// identity from dynamic endpoint data and refreshing the latter.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

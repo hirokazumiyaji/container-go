@@ -22,12 +22,36 @@ requires Go 1.27 or later.
 | `wait.ForHTTP` header, authentication, TLS, and custom-client setters | Not available | Available |
 | Exported `wait.AllStrategy` / `AnyStrategy` and composite `WithStartupTimeout` | Not available | Available |
 | Root `CLIError`, `ErrContainerNotFound`, and `ErrGenerationReplaced` | Not available | Available |
-| Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Available, subject to the Docker reaper prerequisite below |
+| Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Partially implemented; see the follow-up issue boundaries below |
 
 Unless a section explicitly says “current development”, descriptions of
 behavior describe this checkout rather than the tagged `v0.2.0` release.
 The code examples are standalone files and are compile-checked by the
 repository's documentation test.
+
+This checkout is not a merge of the follow-up issue branches that harden
+backend-specific behavior. In particular:
+
+- Apple `LogsWithOptions` currently uses Docker-style `--tail` and
+  `--since` arguments. Apple Container uses `-n` for a tail and has no
+  `--since` option; #82 must be applied before Apple support can be
+  documented as a capability.
+- Endpoint resolution caches the first successful inspect, including an IP
+  address and host bindings. Those values can change and may be stale; #85
+  tracks refreshing dynamic endpoint data.
+- Reuse does not require every ownership/generation label on an existing
+  container and does not re-check the generation after readiness. A missing
+  generation can reach a name-based delete path; #83 and #84 track those
+  fail-open paths.
+- A Docker handle currently uses its immutable ID for deletion, but other
+  backend operations still address the logical name. A stale handle can
+  therefore inspect or modify a same-name replacement; #74 tracks the
+  operation-target fix.
+- Docker `Prune` currently selects exited containers, not containers in the
+  dead state; #113 tracks dead-state coverage.
+
+The sections below describe these current limitations rather than the
+behavior of those follow-up branches.
 
 ```go
 package docexample
@@ -190,10 +214,18 @@ func TestPublishedEndpoint(t *testing.T) {
 ```
 
 `MappedPort` and `Endpoint` resolve ports declared via
-`WithExposedPorts` or explicitly published ports. `ContainerIP` is a
-separate diagnostic/API method; it is not what the wait package uses.
-Prefer `Endpoint` for clients because Docker Desktop usually does not make
-a container IP reachable from the host.
+`WithExposedPorts` or explicitly published ports. They return
+`ErrPortNotExposed` when a port is undeclared or a declared port has no
+usable host binding. `ContainerIP` is a separate diagnostic/API method; it
+is not what the wait package uses. Prefer `Endpoint` for clients because
+Docker Desktop usually does not make a container IP reachable from the host.
+
+On this checkout, the first successful inspect is cached and reused by
+endpoint-related methods. The cached record includes the container IP and
+host-side bindings, even though both can change during the container's
+lifetime. `State` performs a fresh inspect, but an endpoint result can
+therefore be stale. Treat these values as a snapshot rather than as
+immutable facts; issue #85 tracks the refresh fix.
 
 ## Wait strategies
 
@@ -268,19 +300,24 @@ described below.
 
 ## Logs
 
-`Logs` and `LogsWithOptions` return a finite snapshot because the CLI
-process finishes, but neither method imposes a byte limit by itself.
-`Logs` requests all available output; `LogsWithOptions{Tail, Since}`
-requests a time or line window when `Tail` or `Since` is set; the
-resulting size still depends on the container's output. Use `Tail` for
-a long-lived or noisy container.
-`FollowLogs` returns a streaming `io.ReadCloser`; close it or cancel its
-context to stop the backend CLI. `ForLog` uses `FollowLogs`, while
-`Logs` does not follow new output. `LogsOptions` and `LogsWithOptions`
-are current-development APIs, not part of `v0.2.0`.
+`Logs` and a supported `LogsWithOptions` call return a finite snapshot
+because the CLI process finishes, but neither method imposes a byte limit
+by itself. `Logs` requests all available output. `LogsOptions` is
+backend-specific: Docker supports both `Tail` and `Since`. Apple Container
+1.2.x–1.3.x uses `-n` for a tail and has no `--since` option, while this
+checkout still sends the Docker-style `--tail` and `--since` spellings to
+Apple. `LogsWithOptions` is therefore not backend-neutral here; use `Logs`
+on Apple until #82 is applied. The #82 change is intended to map `Tail` to
+Apple's `-n` and reject `Since` as unsupported. A requested window can still
+produce output whose size depends on the container, and `LogsWithOptions`
+does not add a byte cap. `FollowLogs` returns a streaming `io.ReadCloser`; close it or
+cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`, while
+`Logs` does not follow new output. `LogsOptions` and `LogsWithOptions` are
+current-development APIs, not part of `v0.2.0`.
 
-This current-development example also shows the log stream, exec options,
-and public error symbols added after `v0.2.0`:
+The example below is Docker-specific. It also shows the log stream, exec
+options, and public error symbols added after `v0.2.0`; it is not an Apple
+`LogsWithOptions` example.
 
 ```go
 package docexample
@@ -293,7 +330,7 @@ import (
     container "github.com/hirokazumiyaji/container-go"
 )
 
-func DevelopmentLogOptions(ctx context.Context, ctr *container.Container) error {
+func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
     logs, err := ctr.LogsWithOptions(ctx, container.LogsOptions{
         Tail:  10,
         Since: time.Now(),
@@ -384,9 +421,10 @@ different error visibility.
    best-effort `cleanupFailedCreate` path only inspects and deletes a
    container carrying this process's managed/session labels. When the
    creation label is present, it must match this run; an absent label is
-   not a mismatch in this best-effort path. Its lock, inspect, and
-   delete errors are not joined to the returned `Run` error. A name
-   conflict is never cleaned up this way.
+   currently accepted in this best-effort path. That is not a general
+   replacement guarantee; #83 tracks closing the missing-generation path.
+   Its lock, inspect, and delete errors are not joined to the returned
+   `Run` error. A name conflict is never cleaned up this way.
 4. **Abnormal exit**: when the parent process exits and its reaper pipe
    closes, a best-effort watchdog attempts force-deletion. An uncaught
    process-terminating panic, `SIGKILL`, and `os.Exit` close the pipe; a recovered panic
@@ -416,10 +454,12 @@ registration so containers can be inspected during debugging. It does not
 change explicit `Container.Terminate`, rollback after a post-create
 failure, or the best-effort failed-create cleanup.
 
-`container.Prune(ctx)` removes stopped containers this library created in
-any previous session (they carry the
-`com.github.hirokazumiyaji.container-go` label). It does not remove
-running containers.
+`container.Prune(ctx)` removes containers this library created that are
+selected by the active backend's filter. Apple selects managed containers
+in the stopped state. Docker currently selects managed containers in the
+exited state only, so a Docker container in the dead state is not removed
+until #113 is applied. The filter does not select running or created
+containers.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -458,11 +498,12 @@ func TestReuse(t *testing.T) {
 Contract:
 
 - `WithName` is required; readiness strategies always re-run.
-- An existing container must have been created with `WithReuse` and have
-  a compatible image. Name conflicts from a racing create are treated as
+- An existing container must carry the `WithReuse` marker and have a
+  compatible image. Name conflicts from a racing create are treated as
   success and attach.
-- Stopped leftovers are deleted and recreated; a running container that
-  never becomes ready is left alone and returns an error.
+- A stopped container is considered for deletion and recreation only
+  after the current reuse-marker and image checks pass. A running container
+  that never becomes ready is left alone and returns an error.
 - Image compatibility is checked on both backends. Port compatibility is
   backend-specific: Docker compares auto-published exposed-port bindings
   and explicit publications. Apple compares explicit published bindings,
@@ -473,18 +514,24 @@ Contract:
   isolated.
 - `env` / `cmd` / `mounts` differences attach silently by design; use
   distinct names when they matter.
-- Each creation carries a generation label; `Terminate` and the
-  stopped-recreate path refuse to delete a replaced generation. The
-  name-based guard is limited to processes using this library on the same
-  host; an external CLI delete/recreate is outside that guarantee. Docker
-  handles can use the immutable Docker ID when it is available.
+- Containers created by this checkout normally carry a generation label.
+  For an existing reuse container, the current checks require the
+  `WithReuse` marker and a compatible image, but do not require the
+  managed or creation label. An empty generation can therefore reach a
+  name-based delete path, and the current code does not perform a final
+  generation re-check after readiness. Issues #83 and #84 track closing
+  these fail-open paths. Until they are applied, do not treat reuse as a
+  protection against an untrusted same-name replacement. Docker deletion
+  handles use the immutable Docker ID when it is available, but other
+  operations still use the logical name until #74 is applied.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). The group is a label,
-  not part of the reuse key. Ordinary `Prune` still only deletes stopped
-  managed containers.
+  not part of the reuse key. Ordinary `Prune` uses the backend filter
+  described above; on the current Docker backend that means exited
+  containers, not dead ones.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup
@@ -534,9 +581,10 @@ GitHub Actions runs unit tests and race tests on `ubuntu-latest` with Go
 also runs the Docker integration matrix on `ubuntu-latest`; Apple
 Container integration remains a local test because the hosted runners do
 not provide that service. The non-integration documentation test extracts
-and compiles the standalone Go examples in both language versions of this
-README and in the design document; the tagged examples under `examples/`
-exercise a real backend.
+all fenced code blocks from both language versions of this README and the
+design document, compares paired blocks after removing comments, and
+compiles the Go blocks in a temporary module with a quoted local
+`replace`. The tagged examples under `examples/` exercise a real backend.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md)). The implementation phases in that

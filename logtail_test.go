@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -65,12 +66,12 @@ func TestLastNBytesKeepsTail(t *testing.T) {
 
 func TestLogsTailArgsBounded(t *testing.T) {
 	docker := dockerEngine{}.logsTailArgs("myctr")
-	joined := strings.Join(docker, " ")
-	if !strings.Contains(joined, "--tail") {
-		t.Errorf("docker tail args = %v, want --tail", docker)
+	if !slices.Equal(docker, []string{"logs", "--tail", "1000", "myctr"}) {
+		t.Errorf("docker tail args = %v", docker)
 	}
+
 	apple := appleEngine{}.logsTailArgs("myctr")
-	if len(apple) == 0 || apple[0] != "logs" {
+	if !slices.Equal(apple, []string{"logs", "-n", "1000", "myctr"}) {
 		t.Errorf("apple tail args = %v", apple)
 	}
 }

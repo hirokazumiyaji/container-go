@@ -49,7 +49,8 @@ func newConfig() *config {
 
 // allLabels merges the session labels the library always applies with
 // user-supplied ones. Internal labels always win so callers cannot
-// override the generation used for safe cleanup.
+// override the generation metadata used by cleanup paths; the current
+// reuse paths still have the limitations described in issue #83.
 func (c *config) allLabels() map[string]string {
 	labels := map[string]string{}
 	for k, v := range c.labels {
@@ -240,9 +241,12 @@ func WithExposedPorts(ports ...string) Option {
 	}
 }
 
-// WithPublishedPort publishes a container port on the host
-// ("[host-ip:]host-port:container-port[/proto]"). Without it, endpoints
-// resolve to the container's own IP, which needs no host port at all.
+// WithPublishedPort explicitly publishes a container port on the host
+// ("[host-ip:]host-port:container-port[/proto]"). Apple normally uses
+// the container's own IP, while Docker auto-publishes ports declared with
+// WithExposedPorts to daemon-assigned host ports. Use WithPublishedPort
+// when a caller needs a specific host binding; on a remote Docker daemon a
+// loopback bind is rejected because it would listen on the remote machine.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)

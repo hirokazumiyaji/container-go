@@ -38,8 +38,11 @@ func Cleanup(tb testing.TB, ctr *Container) {
 	})
 }
 
-// Prune removes stopped containers created by this library, from any
-// session. It returns the IDs it removed.
+// Prune removes containers created by this library that are selected by
+// the active backend's list filter. Apple selects managed containers in
+// the stopped state. The current Docker filter selects managed containers
+// in the exited state only; dead-state selection is tracked by issue #113.
+// It returns the IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {

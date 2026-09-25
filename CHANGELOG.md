@@ -15,7 +15,9 @@ release note explicitly says otherwise. The current checkout requires Go
 ### Added
 
 - Add `LogsOptions` and `LogsWithOptions` for requesting a snapshot
-  window with `Tail` and `Since`.
+  window with `Tail` and `Since`. Docker supports both options; the
+  Apple-specific mapping and unsupported `Since` behavior are tracked by
+  issue #82 and are not backend-neutral in this checkout.
 - Add `wait.ForHTTP` header, basic-auth, TLS, TLS-config, and custom
   HTTP-client setters.
 - Export `wait.AllStrategy` and `wait.AnyStrategy` and add
@@ -36,7 +38,8 @@ release note explicitly says otherwise. The current checkout requires Go
   logger API references, and mark implementation phases as historical.
 - Add a non-backend documentation test that extracts and compiles the
   actual standalone Go examples in both language versions of the README and
-  design documents.
+  design documents. The test compares all paired fenced blocks after removing
+  comments and quotes the local `replace` path in its temporary module.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Consolidate image and reuse single-flight state in the generic
@@ -44,15 +47,27 @@ release note explicitly says otherwise. The current checkout requires Go
 - Deduplicate reuse/cleanup helpers (including `inspectNamed`, prune loops,
   and Docker line splitting), hoist `memoryRE`, and document `Host` vs
   `Endpoint` when publish host-IPs differ.
+- Clarify `WithPublishedPort` and `ErrPortNotExposed` documentation for
+  Docker auto-publishing and missing host bindings.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
 
-### Cross-issue prerequisite
+### Cross-issue prerequisites
 
 - The current base's reaper registration still accepts only Apple-style
   names. Docker's full immutable ID cannot be registered until issue #73
   is stacked. The current README and design document call out this
   prerequisite; the normal Docker handle/rollback path is separate.
+- Apple `LogsWithOptions` needs issue #82 before `Tail` and `Since` can be
+  documented as backend-specific capabilities.
+- Dynamic endpoint cache refresh is tracked by issue #85; the current
+  first-inspect cache can expose stale IP or binding data.
+- Reuse ownership and final generation verification are tracked by issues
+  #83 and #84; this base still has missing-generation and post-wait
+  fail-open paths.
+- Docker deletion uses an immutable ID on this base, but other operations
+  still address the logical name; #74 tracks the stale-handle fix.
+- Docker `Prune` does not select dead containers until issue #113.
 
 ## [0.2.0] - 2026-09-02
 

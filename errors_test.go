@@ -8,14 +8,21 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+func TestErrPortNotExposedDescribesUndeclaredAndUnboundPorts(t *testing.T) {
+	const want = "port is not declared or has no usable host binding"
+	if got := ErrPortNotExposed.Error(); got != want {
+		t.Fatalf("ErrPortNotExposed = %q, want %q", got, want)
+	}
+}
+
 func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &inspectNotFoundRunner{
 		err: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `No such object: myctr`},
 	}
-	// Clear cached info so inspectFresh runs.
-	ctr.info = nil
+	// State uses a fresh inspect even when a handle already has cached
+	// endpoint information.
 	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
 	}

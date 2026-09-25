@@ -17,9 +17,10 @@ type CLIError = cli.CLIError
 // `container system start`; for Docker, start the Docker daemon.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
-// ErrPortNotExposed reports a port that was not declared via
-// WithExposedPorts.
-var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
+// ErrPortNotExposed reports a port that was neither declared with
+// WithExposedPorts nor explicitly published, or for which the backend
+// reported no usable host binding.
+var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
@@ -31,8 +32,11 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
-// ErrGenerationReplaced reports that Terminate refused to delete because
-// the live container's creation label no longer matches this handle.
+// ErrGenerationReplaced reports that a delete-time generation check
+// found a live container whose creation label no longer matches the
+// handle. Current reuse does not perform a final generation check after
+// readiness; issues #83 and #84 track that and the missing-generation
+// cleanup paths.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not

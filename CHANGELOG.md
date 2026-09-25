@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
-  versions; centralize stderr matchers on each engine with source comments;
+- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x;
+  copy-out requires 29.7.0+) CLI versions; centralize stderr matchers on
+  each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
 
@@ -33,6 +34,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fail closed.
 - Reject backslashes in container paths so Windows Docker path
   normalization cannot reinterpret a literal path component.
+- Require Docker client and server 29.7.0 or newer for safe
+  `CopyFileFromContainer`; older or unverifiable versions fail closed before
+  temporary-directory creation or `docker cp`.
 
 ## [0.2.0] - 2026-09-02
 

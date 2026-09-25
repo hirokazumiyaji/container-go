@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -73,6 +74,70 @@ func TestCopyFileFromContainerHonorsCanceledContextBeforeOpen(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("canceled copy blocked while opening a FIFO")
+	}
+}
+
+type cancelAfterCopyRunner struct {
+	*cpRunner
+	cancel context.CancelFunc
+}
+
+func (r *cancelAfterCopyRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	stdout, stderr, err := r.cpRunner.Run(ctx, args...)
+	if err == nil && len(args) > 0 && args[0] == "cp" {
+		r.cancel()
+	}
+	return stdout, stderr, err
+}
+
+func TestCopyFileFromContainerHonorsCancellationAfterCopyBeforeFIFOOpen(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("TMP", root)
+	t.Setenv("TEMP", root)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(dst string) error {
+			return syscall.Mkfifo(dst, 0o600)
+		},
+	}
+	runner := &cancelAfterCopyRunner{cpRunner: f, cancel: cancel}
+	ctr := runCopyDockerTestContainer(t, runner)
+
+	result := make(chan struct {
+		rc  io.ReadCloser
+		err error
+	}, 1)
+	go func() {
+		rc, err := ctr.CopyFileFromContainer(ctx, "/container/fifo")
+		result <- struct {
+			rc  io.ReadCloser
+			err error
+		}{rc: rc, err: err}
+	}()
+
+	select {
+	case got := <-result:
+		if got.rc != nil {
+			_ = got.rc.Close()
+			t.Fatal("canceled copy returned a reader")
+		}
+		if !errors.Is(got.err, context.Canceled) {
+			t.Fatalf("canceled copy error = %v, want context.Canceled", got.err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled copy blocked while opening a FIFO after copy")
+	}
+
+	call := f.callWith("cp")
+	if len(call) < 3 {
+		t.Fatalf("copy call = %v", call)
+	}
+	if _, statErr := os.Stat(call[2]); !os.IsNotExist(statErr) {
+		t.Errorf("temporary copy %q remains after cancellation: %v", call[2], statErr)
 	}
 }
 

@@ -40,9 +40,10 @@ var ErrGenerationReplaced = errors.New("container was recreated; refusing to del
 var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
 
 // ErrCopyFileFromContainerUnsupported reports that the selected backend
-// or host cannot safely perform a file copy-out. The method fails before
-// invoking its CLI when the backend or host cannot preserve and validate
-// file types.
+// or host cannot safely perform a file copy-out. This includes Docker
+// client/server versions below the supported copy-out minimum. The method
+// fails before invoking `cp` when the backend, host, or version cannot
+// preserve and validate file types.
 var ErrCopyFileFromContainerUnsupported = errors.New("CopyFileFromContainer is not safely supported by this backend or host")
 
 // isNotFound reports whether a CLI failure means the container does not

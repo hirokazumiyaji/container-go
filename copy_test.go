@@ -13,12 +13,16 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+const defaultTestDockerVersion = `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`
+
 // cpRunner materializes files for container-to-host copies.
 type cpRunner struct {
 	*fakeRunner
-	fileContent string
-	materialize func(dst string) error
-	containerID string
+	fileContent   string
+	materialize   func(dst string) error
+	containerID   string
+	versionOutput string
+	versionErr    error
 }
 
 func (c *cpRunner) isContainerSpec(arg string) bool {
@@ -30,6 +34,17 @@ func (c *cpRunner) isContainerSpec(arg string) bool {
 }
 
 func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "version" {
+		c.calls = append(c.calls, args)
+		if c.versionErr != nil {
+			return nil, nil, c.versionErr
+		}
+		output := c.versionOutput
+		if output == "" {
+			output = defaultTestDockerVersion
+		}
+		return []byte(output), nil, nil
+	}
 	if args[0] == "cp" {
 		c.calls = append(c.calls, args)
 		if c.failPrefix == "cp" {
@@ -75,6 +90,92 @@ func TestCopyFileFromContainerRejectsAppleBackendBeforeCLI(t *testing.T) {
 	}
 	if call := f.callWith("cp"); call != nil {
 		t.Fatalf("Apple copy-out invoked CLI: %v", call)
+	}
+}
+
+func TestCopyFileFromContainerRejectsUnsupportedDockerVersionBeforeCopy(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	cases := []struct {
+		name   string
+		output string
+		err    error
+	}{
+		{
+			name:   "client",
+			output: `{"Client":{"Version":"29.6.9"},"Server":{"Version":"29.7.0"}}`,
+		},
+		{
+			name:   "server",
+			output: `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.6.9"}}`,
+		},
+		{
+			name:   "malformed",
+			output: `{"Client":{"Version":"29.7.0"}}`,
+		},
+		{
+			name: "probe failure",
+			err:  errors.New("version unavailable"),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			t.Setenv("TMPDIR", root)
+			t.Setenv("TMP", root)
+			t.Setenv("TEMP", root)
+
+			f := &cpRunner{
+				fakeRunner:    newTestRunner(),
+				versionOutput: tc.output,
+				versionErr:    tc.err,
+			}
+			ctr := runCopyDockerTestContainer(t, f)
+
+			rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/result.txt")
+			if rc != nil {
+				_ = rc.Close()
+				t.Fatal("unsupported Docker version returned a reader")
+			}
+			if !errors.Is(err, ErrCopyFileFromContainerUnsupported) {
+				t.Fatalf("error = %v, want ErrCopyFileFromContainerUnsupported", err)
+			}
+			if call := f.callWith("cp"); call != nil {
+				t.Fatalf("unsupported Docker version invoked copy: %v", call)
+			}
+			if call := f.callWith("version"); call == nil {
+				t.Fatal("Docker version was not checked")
+			}
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatalf("read temp root: %v", err)
+			}
+			if len(entries) != 0 {
+				t.Fatalf("unsupported Docker version left temp entries: %v", entries)
+			}
+		})
+	}
+}
+
+func TestCopyFileFromContainerAcceptsMinimumDockerVersion(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	f := &cpRunner{
+		fakeRunner:    newTestRunner(),
+		fileContent:   "minimum version",
+		versionOutput: `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`,
+	}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/result.txt")
+	if err != nil {
+		t.Fatalf("CopyFileFromContainer: %v", err)
+	}
+	defer rc.Close()
+	data, err := io.ReadAll(rc)
+	if err != nil {
+		t.Fatalf("read copied file: %v", err)
+	}
+	if string(data) != "minimum version" {
+		t.Errorf("copied content = %q", data)
 	}
 }
 

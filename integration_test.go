@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -172,6 +173,9 @@ func TestIntegrationParallelStarts(t *testing.T) {
 // child (no defers, no signal handlers run) and then watches the
 // watchdog reaper remove the container.
 func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple watchdog integration requires Darwin")
+	}
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationAlpine,

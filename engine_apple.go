@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -110,6 +111,10 @@ func (appleEngine) checkCopyFileFromContainer() error {
 		"%w: Apple Container cp has no type-preserving/no-follow copy-out mode",
 		ErrCopyFileFromContainerUnsupported,
 	)
+}
+
+func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner) error {
+	return appleEngine{}.checkCopyFileFromContainer()
 }
 
 func (appleEngine) reaperSubcommand() string { return "delete" }

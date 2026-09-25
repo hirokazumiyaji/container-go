@@ -53,9 +53,11 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 // CopyFileFromContainer copies one regular file out of the running
 // container and returns its content. It is supported by the Docker
 // backend when the host can open copied files without following links or
-// blocking on special files. Apple Container, unsupported hosts, and
-// Windows Go 1.23 through 1.25 return ErrCopyFileFromContainerUnsupported
-// before invoking the copy-out CLI. Close releases the temporary copy.
+// blocking on special files. Docker copy-out also requires client and
+// server versions >=29.7.0. Apple Container, unsupported hosts, unsupported
+// Docker versions, and Windows Go 1.23 through 1.25 return
+// ErrCopyFileFromContainerUnsupported before invoking the backend's
+// copy-out command. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err
@@ -73,6 +75,9 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 	if err := checkCopyFileOpenCapability(); err != nil {
+		return nil, err
+	}
+	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner); err != nil {
 		return nil, err
 	}
 

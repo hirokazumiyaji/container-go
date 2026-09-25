@@ -36,4 +36,7 @@ func TestWindowsCopyFileOpenFailsClosedBeforeGo126(t *testing.T) {
 	if call := runner.callWith("cp"); call != nil {
 		t.Fatalf("unsafe Windows toolchain invoked copy-out CLI: %v", call)
 	}
+	if call := runner.callWith("version"); call != nil {
+		t.Fatalf("unsafe Windows toolchain invoked version CLI: %v", call)
+	}
 }

@@ -3,7 +3,7 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.23+
 
 ## Purpose
 
@@ -54,9 +54,10 @@ The design decisions below rest on these properties of Apple Container
   has no type-preserving/no-follow mode: observed versions can dereference
   or consume symlinks, FIFOs, and device nodes before the host can inspect
   the result. `CopyFileFromContainer` therefore fails closed on Apple
-  Container with `ErrCopyFileFromContainerUnsupported`; Docker retains the
-  host-side Lstat/open checks where the host supports the required flags,
-  and otherwise fails closed.
+  Container with `ErrCopyFileFromContainerUnsupported`; Docker requires
+  client and server versions >=29.7.0 for the type-preserving extractor,
+  then retains the host-side Lstat/open checks where the host supports the
+  required flags, and otherwise fails closed.
 - `--rm` removal leaves anonymous volumes behind.
 - Error classification depends on CLI stderr substrings owned by
   `engine_apple.go` (name conflict, image/container missing). Those
@@ -202,11 +203,14 @@ is a regular file, but does not claim that every Docker host can represent
 every container file type. Apple Container's CLI cannot preserve or reject
 all source file types before the host opens the result, so the method
 returns `ErrCopyFileFromContainerUnsupported` without invoking `container
-cp`. Hosts without no-follow/nonblocking file-open support fail closed
-with the same error. On Windows, Go 1.23 through 1.25 do not propagate the
-required Windows file flags through `os.OpenFile`, so Docker copy-out
-requires Go 1.26 or newer. `CopyToContainer` remains available on both
-backends.
+cp`. Docker copy-out requires both the client and server to be at least
+29.7.0; the method verifies those versions before creating its private
+temporary directory or invoking `docker cp`, and fails closed with the same
+error if verification fails. Hosts without no-follow/nonblocking file-open
+support fail closed with the same error. On Windows, Go 1.23 through 1.25 do
+not propagate the required Windows file flags through `os.OpenFile`, so
+Docker copy-out requires Go 1.26 or newer. `CopyToContainer` remains
+available on both backends.
 
 ## Connection endpoints
 
@@ -420,8 +424,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
   file
 - `ErrCopyFileFromContainerUnsupported`: the selected backend or host
-  cannot perform a type-safe copy-out (Apple Container, hosts without
-  the required open flags, or Windows Go 1.23 through 1.25)
+  cannot perform a type-safe copy-out (Apple Container, Docker client or
+  server below 29.7.0, hosts without the required open flags, or Windows
+  Go 1.23 through 1.25)
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
 
@@ -465,15 +470,18 @@ strategy logic without real hardware. Dependencies that production
 code assumes non-nil get real fakes in tests, never nil.
 
 **Integration tests**: split off behind the `integration` build tag
-and run only on real hardware (macOS 26 with Apple Container up). They
-cover startup, connection, exec, copy, cleanup, and the watchdog
-(SIGKILL a child process, watch the reaper act). They check
-`container system status` first and skip when the service is down.
+and run against real backends. Apple tests require macOS 26 with Apple
+Container up; Docker tests require a running Docker daemon. The Apple
+watchdog test is Darwin-only, and Windows runtime integration is not run
+by the repository's Linux-only CI jobs. They check backend availability
+first and skip when the daemon or service is down. They cover startup,
+connection, exec, copy, normal cleanup, and the Darwin watchdog. Windows
+copy-out must be verified manually with Go 1.26+ and Docker client/server
+29.7.0+.
 
-**CI**: unit tests and `go vet` run in GitHub Actions per push (no
-Apple Container needed). GitHub-hosted runners are unlikely to run the
-integration tests (macOS version and nested-virtualization limits), so
-those stay local as `make integration`.
+**CI**: unit, race, vet, lint, and Docker integration jobs run on Ubuntu;
+Apple integration remains local because its service and host requirements
+are not available in those runners. No Windows runtime job is configured.
 
 ## Backends (v0.2)
 

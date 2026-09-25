@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -54,6 +55,9 @@ type engine interface {
 	// checkCopyFileFromContainer rejects backends whose copy-out cannot
 	// preserve file types and reject links/special files before host open.
 	checkCopyFileFromContainer() error
+	// checkCopyFileFromContainerVersion verifies backend-specific
+	// minimum versions before a copy-out creates a private temp directory.
+	checkCopyFileFromContainerVersion(context.Context, cli.Runner) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	logsArgs(id string, follow bool) []string
 	// logsTailArgs fetches a bounded tail for diagnostics without

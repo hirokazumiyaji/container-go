@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -21,7 +22,8 @@ import (
 // ports and endpoints resolve to those.
 type dockerEngine struct{}
 
-// Verified against Docker Engine / CLI 29.x (local: 29.7.2).
+// Verified against Docker Engine / CLI 29.x (local: 29.7.2); copy-out
+// requires client/server 29.7.0 or newer.
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
@@ -36,6 +38,10 @@ const (
 	dockerStderrNotFound     = "not found"
 	dockerStderrNoSuchObj    = "no such object"
 	dockerStderrNoSuchCtr    = "no such container"
+
+	// Docker 29.7.0 is the first client/server combination accepted for
+	// this copy-out contract. Older cp extractors fail closed.
+	dockerCopyOutMinimumVersion = "29.7.0"
 )
 
 func (dockerEngine) name() string   { return "docker" }
@@ -268,6 +274,137 @@ func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 }
 
 func (dockerEngine) checkCopyFileFromContainer() error { return nil }
+
+type dockerVersionOutput struct {
+	Client struct {
+		Version string `json:"Version"`
+	} `json:"Client"`
+	Server struct {
+		Version string `json:"Version"`
+	} `json:"Server"`
+}
+
+type dockerVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func (v dockerVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+}
+
+func (v dockerVersion) less(other dockerVersion) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}
+
+func parseDockerVersion(raw string) (dockerVersion, error) {
+	original := strings.TrimSpace(raw)
+	value := strings.TrimPrefix(original, "v")
+	if value == "" || value[0] < '0' || value[0] > '9' {
+		return dockerVersion{}, fmt.Errorf("version %q has a non-numeric component", original)
+	}
+	if i := strings.IndexAny(value, "-+"); i >= 0 {
+		suffix := strings.ToLower(value[i+1:])
+		for _, marker := range []string{"alpha", "beta", "rc", "pre"} {
+			if strings.HasPrefix(suffix, marker) {
+				return dockerVersion{}, fmt.Errorf("version %q is a prerelease", original)
+			}
+		}
+		value = value[:i]
+	}
+	parts := strings.Split(value, ".")
+	if len(parts) != 3 {
+		return dockerVersion{}, fmt.Errorf("version %q is not major.minor.patch", original)
+	}
+	var version dockerVersion
+	values := []*int{&version.major, &version.minor, &version.patch}
+	for i, part := range parts {
+		if part == "" {
+			return dockerVersion{}, fmt.Errorf("version %q has an empty component", original)
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return dockerVersion{}, fmt.Errorf("version %q has a non-numeric component", original)
+			}
+		}
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return dockerVersion{}, fmt.Errorf("version %q: %w", original, err)
+		}
+		*values[i] = n
+	}
+	return version, nil
+}
+
+func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
+	var output dockerVersionOutput
+	if err := json.Unmarshal(data, &output); err != nil {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("decode Docker version output: %w", err)
+	}
+	clientRaw := strings.TrimSpace(output.Client.Version)
+	serverRaw := strings.TrimSpace(output.Server.Version)
+	if clientRaw == "" {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("docker client version is empty")
+	}
+	if serverRaw == "" {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("docker server version is empty")
+	}
+	client, err := parseDockerVersion(clientRaw)
+	if err != nil {
+		return dockerVersion{}, dockerVersion{}, err
+	}
+	server, err := parseDockerVersion(serverRaw)
+	if err != nil {
+		return dockerVersion{}, dockerVersion{}, err
+	}
+	return client, server, nil
+}
+
+// checkCopyFileFromContainerVersion verifies both ends of the Docker
+// client/daemon connection before any private destination is created.
+func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner) error {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if qCtx.Err() != nil {
+			return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
+		}
+		return fmt.Errorf("%w: cannot verify Docker client/server version: %w", ErrCopyFileFromContainerUnsupported, err)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if qCtx.Err() != nil {
+		return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
+	}
+
+	client, server, err := parseDockerVersionPair(stdout)
+	if err != nil {
+		return fmt.Errorf("%w: invalid Docker client/server version: %v", ErrCopyFileFromContainerUnsupported, err)
+	}
+	minimum := dockerVersion{major: 29, minor: 7, patch: 0}
+	if client.less(minimum) || server.less(minimum) {
+		return fmt.Errorf(
+			"%w: Docker client/server must both be >=%s (got %s/%s)",
+			ErrCopyFileFromContainerUnsupported,
+			dockerCopyOutMinimumVersion,
+			client,
+			server,
+		)
+	}
+	return nil
+}
 
 func (dockerEngine) reaperSubcommand() string { return "rm" }
 

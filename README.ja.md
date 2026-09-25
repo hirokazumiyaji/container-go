@@ -29,8 +29,8 @@ func TestRedis(t *testing.T) {
 | OS | 既定バックエンド | 要件 |
 |---|---|---|
 | macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) 1.2.x(`container system start` 実行済み) |
-| Linux | Docker | docker CLI + 稼働中のデーモン |
-| Windows | Docker | docker CLI + 稼働中のデーモン(watchdog リーパーなし。後述) |
+| Linux | Docker | docker CLI + 稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要 |
+| Windows | Docker | docker CLI + 稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要(watchdog リーパーなし。後述) |
 
 macOS で Docker(Docker Desktop など)を使う場合は
 `CONTAINERGO_BACKEND=docker` を、Apple Container を明示する場合は
@@ -48,7 +48,7 @@ inspect JSON 形状):
 | バックエンド | 確認済みバージョン |
 |---|---|
 | Apple Container | 1.2.x–1.3.x |
-| Docker Engine / CLI | 29.x |
+| Docker Engine / CLI | 29.x。安全な copy-out には client/server 29.7.0 以上が必要 |
 
 新しい CLI ではエラー文言や JSON フィールドが変わる可能性があります。
 `engine_apple.go` / `engine_docker.go` 先頭の stderr マッチャと、
@@ -69,7 +69,13 @@ container file type を表現できるとは主張しません。Apple Container
 1.25 が該当するため、Docker の copy-out には Go 1.26 以降を使ってください。
 macOS で安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` を
 使ってください。コピー API に渡すコンテナパスは `/` 区切りの POSIX 絶対パス
-であり、バックスラッシュは拒否されます。
+であり、バックスラッシュは拒否されます。Docker の copy-out には Docker client と
+server の両方がバージョン 29.7.0 以上必要です。メソッドは private な一時
+ディレクトリの作成や `docker cp` の実行前に両方のバージョンを確認し、最低
+バージョンを確認できない場合は `ErrCopyFileFromContainerUnsupported` を返します。
+CI の unit と Docker integration job は Linux のみを対象とするため、Windows
+の runtime coverage は手動で、Go 1.26 以上と Docker client/server 29.7.0 以上を
+使って実行してください。
 
 ## インストール
 

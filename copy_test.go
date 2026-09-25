@@ -147,3 +147,65 @@ func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
 		}
 	}
 }
+
+func dockerCopyTestContainer(r *cpRunner) *Container {
+	return &Container{
+		id:     "myctr",
+		uid:    dockerFixtureID,
+		runner: r,
+		eng:    dockerEngine{},
+	}
+}
+
+func TestDockerCopyUsesImmutableContainerID(t *testing.T) {
+	f := &cpRunner{fakeRunner: newTestRunner()}
+	ctr := dockerCopyTestContainer(f)
+	src := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(src, []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := ctr.CopyToContainer(context.Background(), src, "/tmp/input.txt"); err != nil {
+		t.Fatalf("CopyToContainer: %v", err)
+	}
+	call := f.callWith("cp")
+	if len(call) != 3 || call[1] != src || call[2] != dockerFixtureID+":/tmp/input.txt" {
+		t.Fatalf("copy-to args = %v, want immutable target %q", call, dockerFixtureID)
+	}
+
+	f.calls = nil
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/tmp/output.txt")
+	if err != nil {
+		t.Fatalf("CopyFileFromContainer: %v", err)
+	}
+	_ = rc.Close()
+	call = f.callWith("cp")
+	if len(call) != 3 || call[1] != dockerFixtureID+":/tmp/output.txt" {
+		t.Fatalf("copy-from args = %v, want immutable target %q", call, dockerFixtureID)
+	}
+}
+
+func TestDockerCopyFailsClosedWithoutImmutableContainerID(t *testing.T) {
+	for _, uid := range []string{"", "not-an-immutable-id"} {
+		t.Run(uid, func(t *testing.T) {
+			f := &cpRunner{fakeRunner: newTestRunner()}
+			ctr := &Container{id: "myctr", uid: uid, runner: f, eng: dockerEngine{}}
+			src := filepath.Join(t.TempDir(), "input.txt")
+			if err := os.WriteFile(src, []byte("input"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := ctr.CopyToContainer(context.Background(), src, "/tmp/input.txt"); err == nil {
+				t.Fatal("copy-to unexpectedly succeeded without a verified immutable ID")
+			}
+			if len(f.callWith("cp")) != 0 {
+				t.Fatal("copy-to issued a CLI call without a verified immutable ID")
+			}
+			if _, err := ctr.CopyFileFromContainer(context.Background(), "/tmp/output.txt"); err == nil {
+				t.Fatal("copy-from unexpectedly succeeded without a verified immutable ID")
+			}
+			if len(f.callWith("cp")) != 0 {
+				t.Fatal("copy-from issued a CLI call without a verified immutable ID")
+			}
+		})
+	}
+}

@@ -42,8 +42,10 @@ func Cleanup(tb testing.TB, ctr *Container) {
 // the active backend's list filter. Apple selects managed containers in
 // the stopped state. The current Docker filter selects managed containers
 // in the exited state only; dead-state selection is tracked by issue #113.
-// It returns the backend list identifiers it removed; Docker currently
-// returns container names.
+// On Apple, the current list-to-delete path does not re-inspect each
+// candidate under the per-name lock, so a same-name replacement can race
+// the delete; #98 tracks that cleanup gap. It returns the backend list
+// identifiers it removed; Docker currently returns container names.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
@@ -57,7 +59,10 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 }
 
 // pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. errKind prefixes per-ID delete failures ("prune", …).
+// each one. On the current Apple path, the list result is used for the
+// subsequent name delete without a fresh inspect/name-lock critical
+// section; #98 tracks that race. errKind prefixes per-ID delete failures
+// ("prune", …).
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()

@@ -64,9 +64,10 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 - Dynamic endpoint cache refresh is tracked by issue #85; the current
   first-inspect cache can expose stale IP or binding data.
 - Reuse ownership and final generation verification are tracked by issues
-  #83 and #84; reaper coordination with the Apple name lock is tracked by
-  #98. This base still has missing-generation, post-wait, and reaper-lock
-  fail-open paths.
+  #83 and #84; #94 tracks ignored WithFiles/PullAlways side effects on
+  reuse attach; #98 tracks the Apple Prune list-to-delete race and
+  missing fresh revalidation. This base still has missing-generation,
+  post-wait, and prune fail-open paths.
 - Docker deletion uses an immutable ID on this base, but other operations
   still address the logical name; #74 tracks the stale-handle fix.
 - Docker `Prune` does not select dead containers until issue #113.
@@ -75,6 +76,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 - `Stop` timeout validation/rounding is pending #89; wait error-chain
   normalization is pending #92; public option validation gaps are tracked
   by #102; reaper staging exposure and mitigation are tracked by #111.
+- Successful missing inspect classification is pending #103; liveness
+  error-chain flattening is tracked by #104; Apple PullNever capability
+  handling is pending #112.
 
 ## [0.2.0] - 2026-09-02
 

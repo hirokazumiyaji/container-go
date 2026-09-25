@@ -397,9 +397,11 @@ func stripImageDigest(ref string) string {
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
 // step. It currently validates only that the group is non-empty; its
-// grammar is weaker than WithReuseGroup (#102). Ordinary Prune uses the
-// backend-specific stopped filter; on the current Docker backend that
-// filter is exited-only pending issue #113.
+// grammar is weaker than WithReuseGroup (#102). On Apple, the current
+// list-to-delete path does not re-inspect candidates under the per-name
+// lock; #98 tracks that race. Ordinary Prune uses the backend-specific
+// stopped filter; on the current Docker backend that filter is
+// exited-only pending issue #113.
 func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if group == "" {
 		return nil, fmt.Errorf("reuse group must not be empty")

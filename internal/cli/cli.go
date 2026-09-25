@@ -18,7 +18,8 @@ const maxStderr = 64 * 1024
 // ErrSystemNotRunning reports that a backend CLI command returned a
 // non-zero exit status and its follow-up liveness probe also failed.
 // Missing or unlaunchable CLI binaries remain launch errors and are not
-// classified as this value.
+// classified as this value. When classification wraps this sentinel, the
+// current implementation flattens the original CLI error into text (#104).
 var ErrSystemNotRunning = errors.New("container backend is not running")
 
 // Probe is the backend-specific liveness check Classify runs after a
@@ -148,7 +149,8 @@ const probeTimeout = 5 * time.Second
 
 // Classify augments a failed CLI call: if the backend does not answer
 // the probe, the failure is reported as ErrSystemNotRunning instead of
-// the original error.
+// the original error. The current wrapper formats the original error with
+// %v, so its *CLIError chain is flattened into text (#104).
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil

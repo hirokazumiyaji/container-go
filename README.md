@@ -50,8 +50,11 @@ backend-specific behavior. In particular:
   operation-target fix.
 - Docker `Prune` currently selects exited containers, not containers in the
   dead state; #113 tracks dead-state coverage.
-- The external Apple reaper does not take the per-name lock; #98 tracks
-  coordinating that inspect/delete window with ordinary library paths.
+- Apple `Prune` and `PruneReuseGroup` currently use a list-to-delete path
+  without fresh candidate revalidation or the per-name lock; #98 tracks
+  that Apple cleanup race.
+- `WithReuse` attach callers currently ignore `WithFiles` and `PullAlways`;
+  #94 tracks those creation-only side effects.
 - Windows Docker bind sources and remote Docker bind-source semantics are
   not supported by the current validation path; #76 tracks host-path and
   remote-mount handling.
@@ -60,8 +63,15 @@ backend-specific behavior. In particular:
   currently passed to a TCP dial; #77 tracks protocol validation.
 - `Stop` converts non-nil durations to whole seconds by truncation and does
   not reject negative or extreme values; #89 tracks timeout validation.
+- Apple `PullNever` is currently a best-effort backend precheck, not a
+  no-fetch guarantee; #112 tracks strict Apple capability handling.
 - Wait timeout/cancellation errors are not uniformly preserved in the
   error chain; #92 tracks the built-in strategy error contract.
+- A failed liveness probe currently flattens the original `*CLIError` into
+  an `ErrSystemNotRunning` message; #104 tracks error-chain preservation.
+- A successful inspect response with no matching target may return a
+  generic error rather than `ErrContainerNotFound`; #103 tracks that
+  classification gap.
 - Public option validation is partial: negative log tails, zero memory,
   unknown mount types, and reuse-group grammar are not uniformly rejected;
   #102 tracks the typed validation work.
@@ -417,6 +427,11 @@ func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
 }
 ```
 
+These error checks are path-specific: a liveness-classified error may
+flatten the original `*CLIError` into text (#104), and a successful inspect
+response with no matching target may not produce
+`ErrContainerNotFound` (#103).
+
 ## Image pulls
 
 When `Run` needs to create a container, it applies an explicit pull policy
@@ -425,9 +440,13 @@ before starting it:
 - `PullMissing` (the default) inspects the local image store and runs an
   explicit pull only when the image is absent.
 - `PullAlways` requests an explicit pull for every new-container
-  attempt.
-- `PullNever` only inspects; it returns `ErrImageNotFound` before
-  starting when the image is absent.
+  attempt. On a `WithReuse` attach, the current checkout does not run
+  this side effect (#94).
+- `PullNever` is backend-specific: the current checkout performs a
+  best-effort precheck and returns `ErrImageNotFound` when it finds no
+  image. Docker also passes `--pull=never` and therefore has the strict
+  no-fetch path; Apple Container has no equivalent run-time switch, so
+  its precheck is not a no-fetch guarantee (#112).
 
 Concurrent operations in one process share a pull for the same backend,
 image, platform, and operation. A cancelled waiter stops waiting, but the
@@ -441,20 +460,36 @@ package docexample
 import (
     "context"
     "errors"
+    "testing"
 
     container "github.com/hirokazumiyaji/container-go"
 )
 
-func PullPolicy(ctx context.Context) {
-    _, err := container.Run(ctx, "redis:7-alpine",
+func PullPolicy(ctx context.Context, t testing.TB) {
+    always, err := container.Run(ctx, "redis:7-alpine",
         container.WithPullPolicy(container.PullAlways))
-    _ = errors.Is(err, container.ErrImageNotFound)
+    container.Cleanup(t, always)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    never, err := container.Run(ctx, "redis:7-alpine",
+        container.WithPullPolicy(container.PullNever))
+    container.Cleanup(t, never)
+    if errors.Is(err, container.ErrImageNotFound) {
+        return
+    }
+    if err != nil {
+        t.Fatal(err)
+    }
+
     _ = container.Pull(ctx, "redis:7-alpine")
 }
 ```
 
-`PullNever` fails before starting when the image is absent, so callers can
-use `errors.Is(err, container.ErrImageNotFound)`.
+The example registers cleanup before checking either `Run` error. On the
+current checkout, `PullNever`'s `ErrImageNotFound` is backend-specific and
+best-effort on Apple; it is not an unconditional no-fetch guarantee (#112).
 
 ## Cleanup contract
 
@@ -522,7 +557,9 @@ selected by the active backend's filter. Apple selects managed containers
 in the stopped state. Docker currently selects managed containers in the
 exited state only, so a Docker container in the dead state is not removed
 until #113 is applied. The filter does not select running or created
-containers.
+containers. On Apple, the current `Prune` and `PruneReuseGroup` list-to-delete
+path does not re-inspect each candidate under the per-name lock before
+deleting its name; a replacement can race that delete (#98).
 
 ## Reuse (shared containers across tests/processes)
 
@@ -576,7 +613,9 @@ Contract:
   container IP, so use distinct names when those declarations must be
   isolated.
 - `env` / `cmd` / `mounts` differences attach silently by design; use
-  distinct names when they matter.
+  distinct names when they matter. On the current checkout, `WithFiles`
+  and `PullAlways` are applied only by the reuse creation path and are
+  ignored by an attach caller (#94).
 - Containers created by this checkout normally carry a generation label.
   For an existing reuse container, the current checks require the
   `WithReuse` marker and a compatible image, but do not require the
@@ -590,15 +629,17 @@ Contract:
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
-- The per-name `flock` protects ordinary library delete/cleanup paths, but
-  the external reaper does not take that lock; its inspect/delete window
-  can still race a same-name replacement. Treat the generation guard as
-  incomplete until #83/#84 and the reaper coordination in #98 are applied.
+- The per-name `flock` protects the generation-checked ordinary
+  `Terminate`/failed-create cleanup paths. It does not cover the current
+  Apple `Prune`/`PruneReuseGroup` list-to-delete path, which lacks fresh
+  candidate revalidation (#98), or the external reaper's separate
+  inspect/delete window. Treat those paths as uncoordinated.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). The group is a label,
-  not part of the reuse key. Ordinary `Prune` uses the backend filter
-  described above; on the current Docker backend that means exited
-  containers, not dead ones.
+  not part of the reuse key. On Apple, the current list-to-delete path has
+  the same missing fresh revalidation/name-lock boundary as `Prune` (#98).
+  Ordinary `Prune` uses the backend filter described above; on the current
+  Docker backend that means exited containers, not dead ones.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup

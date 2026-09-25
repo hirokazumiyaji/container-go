@@ -50,8 +50,11 @@ Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
   operation target の修正を担当します。
 - Docker の `Prune` は現在 exited コンテナだけを選び、dead 状態は
   選びません。dead 状態の対応は #113 が担当します。
-- Apple の外部 reaper は per-name lock を取らないため、inspect / delete
-  window と通常の library path の coordination は #98 が担当します。
+- Apple の `Prune` と `PruneReuseGroup` は現在、fresh candidate validation や
+  per-name lock なしの list-to-delete path を使う。#98 が Apple cleanup race を
+  担当する。
+- 現在の `WithReuse` attach caller は `WithFiles` と `PullAlways` を無視する。
+  #94 がこれらの creation-only side effect を担当する。
 - Windows Docker の bind source と remote Docker の bind source semantics は
   現在の validation path では扱えていません。#76 が host path と remote mount を
   担当します。
@@ -61,8 +64,15 @@ Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
   担当します。
 - `Stop` の非 nil timeout は whole second へ truncation し、negative や極端な値を
   reject しません。#89 が timeout validation を担当します。
+- Apple の `PullNever` は現在 best-effort な backend precheck であり、no-fetch
+  保証ではない。#112 が strict な Apple capability handling を担当する。
 - wait の timeout/cancellation error は error chain に一様に保持されません。#92 が
   built-in strategy の error contract を担当します。
+- liveness probe failure は元の `*CLIError` を `ErrSystemNotRunning` の message に
+  flatten する。#104 が error chain の保持を担当する。
+- target に一致する entry がない successful inspect response は
+  `ErrContainerNotFound` ではなく generic error を返す場合がある。#103 がその
+  classification gap を担当する。
 - public option の validation は部分的です。negative log tail、zero memory、unknown
   mount type、reuse-group grammar は一様に reject されません。#102 が typed validation を
   担当します。
@@ -411,6 +421,11 @@ func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
 }
 ```
 
+これらの error check は path ごとに異なる。liveness 分類では元の
+`*CLIError` が text に flatten される場合があり（#104）、target に一致する
+entry がない successful inspect response は `ErrContainerNotFound` を返さない
+ことがある（#103）。
+
 ## イメージの pull
 
 コンテナを新規作成する必要がある場合、`Run` は起動前に明示的な pull policy
@@ -419,8 +434,12 @@ func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
 - `PullMissing`（既定値）はローカルストアを検査し、イメージがないときだけ
   明示的に pull します。
 - `PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求します。
-- `PullNever` は検査だけを行い、イメージがない場合は起動前に
-  `ErrImageNotFound` を返します。
+  現在の `WithReuse` attach ではこの side effect を実行しません（#94）。
+- `PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck
+  を行い、image がない場合は `ErrImageNotFound` を返します。Docker は
+  `--pull=never` も渡すため strict な no-fetch 経路がありますが、Apple Container
+  には同等の run-time switch がないため precheck は no-fetch 保証ではありません
+  （#112）。
 
 同じプロセスの並行処理は、バックエンド、イメージ、プラットフォーム、操作の
 種類が同じ pull を共有します。待機中の呼び出し元がキャンセルされても、共有
@@ -434,20 +453,36 @@ package docexample
 import (
     "context"
     "errors"
+    "testing"
 
     container "github.com/hirokazumiyaji/container-go"
 )
 
-func PullPolicy(ctx context.Context) {
-    _, err := container.Run(ctx, "redis:7-alpine",
+func PullPolicy(ctx context.Context, t testing.TB) {
+    always, err := container.Run(ctx, "redis:7-alpine",
         container.WithPullPolicy(container.PullAlways))
-    _ = errors.Is(err, container.ErrImageNotFound)
+    container.Cleanup(t, always)
+    if err != nil {
+        t.Fatal(err)
+    }
+
+    never, err := container.Run(ctx, "redis:7-alpine",
+        container.WithPullPolicy(container.PullNever))
+    container.Cleanup(t, never)
+    if errors.Is(err, container.ErrImageNotFound) {
+        return
+    }
+    if err != nil {
+        t.Fatal(err)
+    }
+
     _ = container.Pull(ctx, "redis:7-alpine")
 }
 ```
 
-`PullNever` はイメージがない場合、起動前に失敗します。
-呼び出し元は `errors.Is(err, container.ErrImageNotFound)` を使えます。
+例は `Run` の error を確認する前に cleanup を登録する。現在のチェックアウトでは
+`PullNever` の `ErrImageNotFound` は backend 固有であり、Apple では best-effort
+である。Apple の no-fetch 保証ではない（#112）。
 
 ## クリーンアップの契約
 
@@ -508,7 +543,10 @@ listing し、affected time window に限定してください。file content �
 作成したコンテナを削除します。Apple は managed コンテナのうち stopped
 状態を選びます。Docker は現在 managed コンテナのうち exited 状態だけ
 を選ぶため、dead 状態のコンテナは #113 を適用するまで削除されません。
-この filter は running または created 状態を選びません。
+この filter は running または created 状態を選びません。Apple では現在の
+`Prune` と `PruneReuseGroup` の list-to-delete path が、per-name lock の中で
+candidate を fresh inspect せず name を delete するため、replacement が
+競合する可能性があります（#98）。
 
 ## Reuse（テスト / process 間でのコンテナ共有）
 
@@ -560,7 +598,8 @@ func TestReuse(t *testing.T) {
   それを比較できない。Apple では新しい handle ごとに自分の exposed-port
   宣言を共有コンテナ IP へ適用するので、宣言を分離したい場合は名前を変える。
 - `env` / `cmd` / `mounts` の差は既存へ黙って attach する。重要な設定は
-  別の名前を使う。
+  別の名前を使う。現在のチェックアウトでは `WithFiles` と `PullAlways` は
+  reuse creation path だけで適用され、attach caller では無視される（#94）。
 - このチェックアウトが作成するコンテナは通常 generation label を持ちます。
   ただし、既存の reuse コンテナでは現在の check が managed label と
   creation label のすべてを要求せず、`WithReuse` marker と互換 image
@@ -573,14 +612,17 @@ func TestReuse(t *testing.T) {
   name を使います。
 - `Cleanup` / `TerminateContainer` / watchdog reaper は reused handle を
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを削除できる。
-- 名前単位の `flock` は通常の library delete / cleanup 経路を保護するが、
-  外部 reaper はその lock を取らない。reaper の inspect / delete window は
-  same-name replacement と競合する。#83/#84 と #98 の reaper coordination が
-  適用されるまで generation guard を不完全として扱う。
+- 名前単位の `flock` は generation-checked な通常の `Terminate` /
+  failed-create cleanup 経路を保護する。現在の Apple `Prune` /
+  `PruneReuseGroup` list-to-delete path は fresh candidate validation がなく、
+  外部 reaper の inspect / delete window にもこの lock は使われないため、
+  これらの経路は協調していないものとして扱う（prune は #98）。
 - `container.PruneReuseGroup(ctx, "integration")` はその group の
   コンテナを強制削除する（CI teardown）。group は再利用 key ではなく
-  label である。通常の `Prune` は上記の backend filter を使い、現在の
-  Docker backend では exited コンテナだけが対象で、dead は対象外である。
+  label である。Apple では現在の list-to-delete path が `Prune` と同じ
+  fresh revalidation / per-name lock の欠落を持つ（#98）。通常の `Prune` は
+  上記の backend filter を使い、現在の Docker backend では exited コンテナ
+  だけが対象で、dead は対象外である。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使って

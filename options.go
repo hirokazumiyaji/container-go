@@ -122,10 +122,12 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 
 // WithReuse enables process- and cross-process get-or-create for a
 // stable WithName. Concurrent Run calls with the same name share one
-// container; readiness strategies always re-run against it. Returned
-// handles are shared: Cleanup, TerminateContainer, and the watchdog
-// reaper do not remove them. Explicit Terminate still does — only use
-// it when no other process still needs the container.
+// container; readiness strategies always re-run against it. On this
+// checkout, WithFiles and PullAlways are applied by the reuse creation
+// path, but are ignored when attaching to an existing shared container
+// (#94). Returned handles are shared: Cleanup, TerminateContainer, and
+// the watchdog reaper do not remove them. Explicit Terminate still does
+// — only use it when no other process still needs the container.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

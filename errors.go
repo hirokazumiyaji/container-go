@@ -8,8 +8,9 @@ import (
 )
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
-// internal/cli.CLIError so callers can use errors.As without importing
-// an internal package.
+// internal/cli.CLIError so callers can use errors.As when the error is
+// retained in the chain; the current liveness wrapper may flatten it
+// into text instead (#104).
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that a backend CLI command returned a
@@ -17,6 +18,8 @@ type CLIError = cli.CLIError
 // Apple Container, start the system service with `container system start`;
 // for Docker, start the Docker daemon. Missing or unlaunchable CLI
 // binaries are launch errors and are not classified as ErrSystemNotRunning.
+// The current classifier renders the original CLI error into the wrapper's
+// text rather than preserving it as an unwrap target (#104).
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was neither declared with
@@ -24,14 +27,17 @@ var ErrSystemNotRunning = cli.ErrSystemNotRunning
 // reported no usable host binding.
 var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
 
-// ErrImageNotFound reports that an image is not in the backend's local
-// store. Run returns it when the pull policy is PullNever and the image
-// is absent.
+// ErrImageNotFound reports that the current backend precheck did not find
+// an image in its local store. Run returns it for PullNever when that
+// precheck reports the image absent; on Apple this is a best-effort
+// backend-specific precheck, not a no-fetch guarantee (#112).
 var ErrImageNotFound = errors.New("image not found in local store")
 
-// ErrContainerNotFound reports that the container does not exist.
-// Inspect, State, Exec, and Logs wrap it with %w so callers can use
-// errors.Is instead of matching CLI stderr text.
+// ErrContainerNotFound reports a classified CLI failure that identifies a
+// missing container. Inspect, State, Exec, and Logs wrap that failure with
+// %w when the backend reports not-found text. A successful inspect response
+// with no matching target is not guaranteed to produce this sentinel; the
+// current parsers may return a generic error (#103).
 var ErrContainerNotFound = errors.New("container not found")
 
 // ErrGenerationReplaced reports that a delete-time generation check
@@ -51,7 +57,8 @@ func isNotFound(err error) bool {
 }
 
 // wrapNotFound converts a classified CLI not-found failure into
-// ErrContainerNotFound so errors.Is works from the root package.
+// ErrContainerNotFound so errors.Is works from the root package. It does
+// not normalize a successful empty or mismatched inspect result (#103).
 func wrapNotFound(err error) error {
 	if err == nil || !isNotFound(err) || errors.Is(err, ErrContainerNotFound) {
 		return err

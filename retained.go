@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 )
 
@@ -60,10 +61,24 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 
 func rollbackResult(ctx context.Context, ctr *Container, cause error) (*Container, error) {
 	err := ctr.rollback(ctx, cause)
-	if keepContainers() {
-		return ctr, err
+	if !keepContainers() || ctr == nil {
+		return nil, err
 	}
-	return nil, err
+
+	// A handle is a useful KEEP result only after the post-create target has
+	// been inspected and bound to the expected generation (and platform).
+	// In particular, a failed first inspect/platform resolution must not
+	// publish a constructed handle that has never passed those checks.
+	verifyCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer cancel()
+	info, verifyErr := ctr.inspectFresh(verifyCtx)
+	if verifyErr == nil {
+		verifyErr = verifyContainerImageIdentity(ctr, info)
+	}
+	if verifyErr != nil {
+		return nil, errors.Join(err, fmt.Errorf("verify retained container %s: %w", ctr.id, verifyErr))
+	}
+	return ctr, err
 }
 
 func reuseFailureResult(ctr *Container, err error) (*Container, error) {

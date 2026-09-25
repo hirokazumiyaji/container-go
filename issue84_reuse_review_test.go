@@ -86,13 +86,17 @@ func (r *keepPostCreateRunner) Run(ctx context.Context, args ...string) ([]byte,
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestKeepPreventsRollbackDeletionAndReturnsHandle(t *testing.T) {
+func TestKeepNeverReturnsUnverifiedPostCreateHandle(t *testing.T) {
 	t.Setenv("CONTAINERGO_KEEP", "1")
 	f := &keepPostCreateRunner{fakeRunner: newTestRunner()}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("keep-post-create"), withRunner(f), withEngine(appleEngine{}))
-	if err == nil || ctr == nil {
-		t.Fatalf("Run = (%v, %v), want retained handle and error", ctr, err)
+	if err == nil || ctr != nil {
+		t.Fatalf("Run = (%v, %v), want nil handle and joined verification error", ctr, err)
+	}
+	if !strings.Contains(err.Error(), "injected post-create inspect failure") ||
+		!strings.Contains(err.Error(), "verify retained container") {
+		t.Fatalf("error = %v, want original and verification errors", err)
 	}
 	if len(f.calls) == 0 {
 		t.Fatal("runner was not called")

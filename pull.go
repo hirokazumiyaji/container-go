@@ -421,10 +421,11 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 		return identity, nil
 	}
 	if c.eng.name() == "apple" && isRepositoryDigestReference(image) {
-		if c.allowMutableImageTag {
-			return mutableImageReference(image, identity), nil
-		}
-		return imageIdentity{}, fmt.Errorf("%w: %s (Apple name@digest is a mutable alias; use WithAllowMutableImageTag to opt into running it)", ErrImageIdentityUnavailable, image)
+		// A caller-supplied digest is an identity claim, not a mutable
+		// tag. The compatibility option may authorize a genuinely
+		// identity-less tag, but it must never turn an unverified
+		// name@digest request into a runnable alias.
+		return imageIdentity{}, fmt.Errorf("%w: %s (Apple identity-less name@digest cannot be verified; use a verified image identity)", ErrImageIdentityUnavailable, image)
 	}
 	// A successful identity-less Apple inspect cannot establish that a
 	// caller-pinned digest is the local image. Mutable tags remain

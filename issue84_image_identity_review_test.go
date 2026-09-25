@@ -133,3 +133,11 @@ func TestIssue84ApplePinnedDigestMismatchNeverUsesMutableFallback(t *testing.T) 
 		t.Fatalf("error = %v, want ErrImageIdentityMismatch", err)
 	}
 }
+
+func TestIssue84AppleIdentitylessDigestNeverUsesMutableFallback(t *testing.T) {
+	requested := "registry.example/team/demo:stable@" + issue84ImageRoot
+	cfg := &config{eng: appleEngine{}, allowMutableImageTag: true}
+	if _, err := cfg.pinImage(requested, imageIdentity{}); !errors.Is(err, ErrImageIdentityUnavailable) {
+		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
+	}
+}

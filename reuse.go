@@ -35,7 +35,7 @@ func waitReusePoll(ctx context.Context) error {
 	}
 }
 
-func cancelReuseReaperHandoff(runner cli.Runner, eng engine, name, uid, logicalName string) error {
+func cancelReuseReaperHandoffWithGeneration(runner cli.Runner, eng engine, name, creation, uid, logicalName string) error {
 	er, ok := runner.(cli.ExternalRunner)
 	if !ok || !er.External() {
 		return nil
@@ -44,7 +44,7 @@ func cancelReuseReaperHandoff(runner cli.Runner, eng engine, name, uid, logicalN
 	if binary == "" {
 		binary = eng.binary()
 	}
-	if err := unregisterHandoffWithGlobalReaper(binary, eng.reaperSubcommand(), name, uid); err != nil {
+	if err := unregisterReuseHandoffWithGlobalReaper(binary, eng.reaperSubcommand(), name, creation, uid); err != nil {
 		return fmt.Errorf("reuse %s: cancel reaper ownership: %w", logicalName, err)
 	}
 	return nil
@@ -160,7 +160,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// watchdog. This also removes an older normal-run entry for the same
 	// logical name/UID, so a subsequent parent death cannot delete a
 	// successfully attached shared container.
-	if err := cancelReuseReaperHandoff(ctr.runner, ctr.eng, ctr.id, ctr.uid, cfg.name); err != nil {
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, cfg.name); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -380,7 +380,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		return reuseValidationFailure(ctx, cfg, ctr, resolvedImage, err)
 	}
 	cfg.markReuseCreated(ctr)
-	if err := cancelReuseReaperHandoff(ctr.runner, ctr.eng, ctr.id, ctr.uid, cfg.name); err != nil {
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, cfg.name); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -415,7 +415,7 @@ func reuseHandleOnError(ctx context.Context, cfg *config, ctr *Container, origin
 	if err := verifyContainerImageIdentity(ctr, info); err != nil {
 		return nil, withCleanupError(cause, err)
 	}
-	if err := cancelReuseReaperHandoff(ctr.runner, ctr.eng, ctr.id, ctr.uid, ctr.id); err != nil {
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, ctr.id); err != nil {
 		return nil, withCleanupError(cause, err)
 	}
 	ctr.mu.Lock()
@@ -433,7 +433,7 @@ func reuseValidationFailure(ctx context.Context, cfg *config, ctr *Container, ex
 	if keepContainers() {
 		partial, verifyErr := retainedFailedCreate(ctx, cfg, cause, cause)
 		if partial != nil && verifyErr == nil {
-			if err := cancelReuseReaperHandoff(partial.runner, partial.eng, partial.id, partial.uid, partial.id); err != nil {
+			if err := cancelReuseReaperHandoffWithGeneration(partial.runner, partial.eng, partial.id, partial.creation, partial.uid, partial.id); err != nil {
 				return nil, withCleanupError(cause, err)
 			}
 			return partial, cause

@@ -170,16 +170,23 @@ func TestReaperEntryMemoryIsBounded(t *testing.T) {
 	r.command = func() *exec.Cmd {
 		return exec.Command("/bin/sh", "-c", "while IFS= read -r line; do case \"$line\" in R#containergo-retire:*) echo \"containergo-reaper-ack:${line#R#containergo-retire:}\";; esac; done")
 	}
-	for i := 0; i < maxReaperEntries+20; i++ {
+	for i := 0; i < maxReaperEntries; i++ {
 		if err := r.register(fmt.Sprintf("%064x", i+1), ""); err != nil {
 			t.Fatalf("register %d: %v", i, err)
 		}
 	}
+	overflowID := fmt.Sprintf("%064x", maxReaperEntries+1)
+	if err := r.register(overflowID, ""); err == nil || !strings.Contains(err.Error(), "capacity exhausted") {
+		t.Fatalf("overflow registration error = %v, want explicit capacity failure", err)
+	}
 	r.mu.Lock()
-	entries := len(r.entries)
+	entries := append([]reaperEntry(nil), r.entries...)
 	r.mu.Unlock()
-	if entries > maxReaperEntries {
-		t.Fatalf("reaper retained %d entries, cap is %d", entries, maxReaperEntries)
+	if len(entries) != maxReaperEntries {
+		t.Fatalf("reaper retained %d entries after overflow, want %d", len(entries), maxReaperEntries)
+	}
+	if entries[0].id != fmt.Sprintf("%064x", 1) || entries[len(entries)-1].id != fmt.Sprintf("%064x", maxReaperEntries) {
+		t.Fatalf("overflow changed live entries: first=%q last=%q", entries[0].id, entries[len(entries)-1].id)
 	}
 	r.closeStdin()
 }

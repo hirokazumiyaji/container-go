@@ -71,6 +71,7 @@ case "$stat_bin" in
   *) stat_bin= ;;
 esac
 ids=""
+delete_disabled=0
 while IFS= read -r line; do
   case "$line" in
     R#containergo-retire:*)
@@ -81,8 +82,10 @@ while IFS= read -r line; do
       continue
       ;;
     Q#containergo-quiesce:*)
-      # Stop before EOF so an unrelated respawn cannot execute the still-live
-      # entries that the replacement child will replay.
+      # Set the no-delete state before acknowledging. The parent may close
+      # the pipe immediately after the acknowledgement, so this barrier must
+      # be the child's final observable action before it exits.
+      delete_disabled=1
       printf 'containergo-reaper-ack:%s\n' "${line#Q#containergo-quiesce:}"
       exit 0
       ;;
@@ -90,6 +93,7 @@ while IFS= read -r line; do
   ids="$ids
 $line"
 done
+[ "$delete_disabled" = 1 ] && exit 0
 kill_owned_pid() {
   pid="$1"
   owner="$2"
@@ -479,26 +483,12 @@ func (r *reaper) registerPending(id, creation string) error {
 }
 
 func (r *reaper) makeRoomLocked(needed int) error {
-	excess := len(r.entries) + needed - maxReaperEntries
-	if excess <= 0 {
+	if needed <= 0 {
 		return nil
 	}
-	if excess > len(r.entries) {
-		return errors.New("reaper: entry capacity is exhausted")
+	if len(r.entries) > maxReaperEntries-needed {
+		return fmt.Errorf("reaper: entry capacity exhausted (%d live entries, limit %d)", len(r.entries), maxReaperEntries)
 	}
-	if r.stdin != nil && !channelClosed(r.exited) {
-		for i := 0; i < excess; i++ {
-			if err := writeReaperCancellation(r.stdin, r.entries[i]); err != nil {
-				return err
-			}
-		}
-		if err := r.acknowledgeRetirementLocked(); err != nil {
-			return err
-		}
-		r.retiredPending = true
-		r.retirementAcked = true
-	}
-	r.entries = r.entries[excess:]
 	return nil
 }
 
@@ -659,11 +649,40 @@ func (r *reaper) acknowledgeRetirementLocked() error {
 	return r.acknowledgeCommandLocked("R#containergo-retire:")
 }
 
-func (r *reaper) unregisterHandoff(name, uid string) error {
+func handoffIdentity(values []string) (creation, uid string) {
+	switch len(values) {
+	case 0:
+		return "", ""
+	case 1:
+		// The original package-local helper accepted only a UID. Keep that
+		// call shape useful while all production callers pass both fields.
+		return "", values[0]
+	default:
+		return values[0], values[1]
+	}
+}
+
+func (r *reaper) unregisterHandoff(name string, identity ...string) error {
+	creation, uid := handoffIdentity(identity)
+	return r.unregisterHandoffWithMode(name, creation, uid, false)
+}
+
+// unregisterReuseHandoff retires the verified reuse generation and any
+// settled name-addressed watchdog entry for the same logical name. The
+// latter cannot coexist with the freshly verified generation and would
+// otherwise leave stale ownership behind. Pending entries are retained:
+// they may belong to a concurrent create that has not replaced the target
+// yet.
+func (r *reaper) unregisterReuseHandoff(name, creation, uid string) error {
+	return r.unregisterHandoffWithMode(name, creation, uid, true)
+}
+
+func (r *reaper) unregisterHandoffWithMode(name, creation, uid string, removeSettledNameEntries bool) error {
 	validName := nameRE.MatchString(name)
 	validUID := r.subcommand == "rm" && dockerIDRE.MatchString(uid)
-	if !validName && !validUID {
-		return fmt.Errorf("reaper: invalid handoff identity %q/%q", name, uid)
+	validCreation := creation == "" || creationRE.MatchString(creation)
+	if (!validName && !validUID) || !validCreation {
+		return fmt.Errorf("reaper: invalid handoff identity %q/%q/%q", name, creation, uid)
 	}
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
@@ -678,7 +697,16 @@ func (r *reaper) unregisterHandoff(name, uid string) error {
 	kept := make([]reaperEntry, 0, len(r.entries))
 	removed := make([]reaperEntry, 0)
 	for _, entry := range r.entries {
-		if entry.id == name || (uid != "" && entry.id == uid) {
+		// A promoted Docker entry no longer carries the name/generation
+		// pair; its immutable UID is the only safe retirement key. For a
+		// name-addressed entry, exact generation matching protects a
+		// different live same-name generation. A verified reuse handoff
+		// may additionally remove settled entries from older generations.
+		matchesUID := validUID && entry.id == uid
+		matchesNameGeneration := validName && validCreation && creation != "" &&
+			entry.id == name && (entry.creation == creation ||
+			(removeSettledNameEntries && !entry.pending))
+		if matchesUID || matchesNameGeneration {
 			removed = append(removed, entry)
 		} else {
 			kept = append(kept, entry)
@@ -1280,13 +1308,22 @@ func promotePendingDockerIDWithGlobalReaper(binary, subcommand, name, creation, 
 	return nil
 }
 
-func retireReaperEntry(binary, subcommand, name, uid string) {
-	if err := unregisterHandoffWithGlobalReaper(binary, subcommand, name, uid); err != nil {
+func retireReaperEntry(binary, subcommand, name string, identity ...string) {
+	if err := unregisterHandoffWithGlobalReaper(binary, subcommand, name, identity...); err != nil {
 		log.Printf("container-go: reaper retirement failed (binary=%q): %v", binary, err)
 	}
 }
 
-func unregisterHandoffWithGlobalReaper(binary, subcommand, name, uid string) error {
+func unregisterHandoffWithGlobalReaper(binary, subcommand, name string, identity ...string) error {
+	creation, uid := handoffIdentity(identity)
+	return unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid, false)
+}
+
+func unregisterReuseHandoffWithGlobalReaper(binary, subcommand, name, creation, uid string) error {
+	return unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid, true)
+}
+
+func unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid string, reuseHandoff bool) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -1299,7 +1336,13 @@ func unregisterHandoffWithGlobalReaper(binary, subcommand, name, uid string) err
 	if r.subcommand != subcommand {
 		return fmt.Errorf("reaper: subcommand mismatch for %q: have %q, want %q", binary, r.subcommand, subcommand)
 	}
-	if err := r.unregisterHandoff(name, uid); err != nil {
+	var err error
+	if reuseHandoff {
+		err = r.unregisterReuseHandoff(name, creation, uid)
+	} else {
+		err = r.unregisterHandoff(name, creation, uid)
+	}
+	if err != nil {
 		log.Printf("container-go: reaper handoff cleanup failed (binary=%q): %v", binary, err)
 		return err
 	}

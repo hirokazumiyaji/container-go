@@ -205,7 +205,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err != nil {
 		if !attempted {
 			if reaperBin != "" {
-				retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+				retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, "")
 			}
 			return nil, err
 		}
@@ -216,7 +216,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		if cleanupErr == nil && reaperBin != "" {
-			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, "")
 		}
 		return nil, withCleanupError(classified, cleanupErr)
 	}
@@ -235,7 +235,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
 		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
 		if cleanupErr == nil && reaperBin != "" {
-			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, "")
 		}
 		return nil, withCleanupError(identityErr, cleanupErr)
 	}
@@ -295,7 +295,7 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 		c.inspectMu.RLock()
 		uid := c.uid
 		c.inspectMu.RUnlock()
-		if err := cancelReuseReaperHandoff(c.runner, c.eng, c.id, uid, c.id); err != nil {
+		if err := cancelReuseReaperHandoffWithGeneration(c.runner, c.eng, c.id, c.creation, uid, c.id); err != nil {
 			return withCleanupError(cause, err)
 		}
 		return cause
@@ -655,7 +655,7 @@ func retireContainerReaper(c *Container) error {
 	c.inspectMu.RLock()
 	uid := c.uid
 	c.inspectMu.RUnlock()
-	return unregisterHandoffWithGlobalReaper(binary, c.eng.reaperSubcommand(), c.id, uid)
+	return unregisterHandoffWithGlobalReaper(binary, c.eng.reaperSubcommand(), c.id, c.creation, uid)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {

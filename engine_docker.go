@@ -247,12 +247,8 @@ func dockerState(s string) State {
 	}
 }
 
-func (dockerEngine) stopArgs(id string, timeout *time.Duration) []string {
-	args := []string{"stop"}
-	if timeout != nil {
-		args = append(args, "--time", strconv.Itoa(int(timeout.Seconds())))
-	}
-	return append(args, id)
+func (dockerEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
+	return stopArgsFor(id, timeout)
 }
 
 func (dockerEngine) deleteArgs(id string) []string {

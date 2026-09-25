@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 	"strings"
 	"time"
 
@@ -83,12 +82,8 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	return nil, fmt.Errorf("container %s not in inspect output", id)
 }
 
-func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
-	args := []string{"stop"}
-	if timeout != nil {
-		args = append(args, "--time", strconv.Itoa(int(timeout.Seconds())))
-	}
-	return append(args, id)
+func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
+	return stopArgsFor(id, timeout)
 }
 
 func (appleEngine) deleteArgs(id string) []string {

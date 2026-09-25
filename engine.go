@@ -1,6 +1,8 @@
 package container
 
 import (
+	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -47,7 +49,7 @@ type engine interface {
 	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
-	stopArgs(id string, timeout *time.Duration) []string
+	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
@@ -91,4 +93,33 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+}
+
+func stopArgsFor(id string, timeout *time.Duration) ([]string, error) {
+	args := []string{"stop"}
+	if timeout != nil {
+		seconds, err := stopTimeoutSeconds(*timeout, int(^uint(0)>>1))
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--time", strconv.Itoa(seconds))
+	}
+	return append(args, id), nil
+}
+
+// stopTimeoutSeconds rounds up so the backend never grants less grace than
+// the caller requested, and checks the CLI's native integer limit before
+// conversion.
+func stopTimeoutSeconds(timeout time.Duration, maxSeconds int) (int, error) {
+	if timeout < 0 {
+		return 0, fmt.Errorf("stop timeout must be non-negative: %s", timeout)
+	}
+	seconds := timeout / time.Second
+	if timeout%time.Second != 0 {
+		seconds++
+	}
+	if uint64(seconds) > uint64(maxSeconds) {
+		return 0, fmt.Errorf("stop timeout %s exceeds backend limit of %d seconds", timeout, maxSeconds)
+	}
+	return int(seconds), nil
 }

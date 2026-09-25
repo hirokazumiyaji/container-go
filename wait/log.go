@@ -237,6 +237,20 @@ type logSettleRead struct {
 	err error
 }
 
+func nextReadyLogSettle(readResults <-chan logSettleRead, done <-chan struct{}) (logSettleRead, bool, bool) {
+	select {
+	case read := <-readResults:
+		return read, true, false
+	default:
+	}
+	select {
+	case <-done:
+		return logSettleRead{}, false, true
+	default:
+	}
+	return logSettleRead{}, false, false
+}
+
 // settleLogMatch actively consumes merged output after a readiness match.
 // A single delayed read leaves a public io.Pipe blocked, which can prevent
 // the follow process from exiting and hide its terminal diagnostic. The
@@ -306,54 +320,66 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 		return status.TerminalError()
 	}
 
+	handleRead := func(read logSettleRead) (bool, error) {
+		if read.err != nil {
+			if isTerminalStreamError(read.err) && hasStatus {
+				return true, settleTerminal()
+			}
+			if isPermanentCheckError(read.err) || isTerminalStreamError(read.err) {
+				return true, read.err
+			}
+			if errors.Is(read.err, io.EOF) {
+				if hasStatus {
+					select {
+					case <-done:
+						return true, settleTerminal()
+					default:
+					}
+				}
+				return true, nil
+			}
+			return true, read.err
+		}
+		if read.n == 0 {
+			startRead()
+			return false, nil
+		}
+		resetIdle()
+		startRead()
+		return false, nil
+	}
+
+	idleExpired := false
+	maxExpired := false
 	for {
+		// Before accepting either timer, consume evidence that is already
+		// queued. This closes the select race where a ready terminal read
+		// could lose to an idle/max timer and incorrectly report success.
+		if read, hasRead, doneReady := nextReadyLogSettle(readResults, done); hasRead {
+			terminal, err := handleRead(read)
+			if terminal {
+				return err
+			}
+			continue
+		} else if doneReady {
+			return settleTerminal()
+		}
+		if idleExpired || maxExpired {
+			return nil
+		}
+
 		select {
 		case read := <-readResults:
-			if read.err != nil {
-				if isTerminalStreamError(read.err) && hasStatus {
-					return settleTerminal()
-				}
-				if isPermanentCheckError(read.err) || isTerminalStreamError(read.err) {
-					return read.err
-				}
-				if errors.Is(read.err, io.EOF) {
-					if hasStatus {
-						select {
-						case <-done:
-							return settleTerminal()
-						default:
-						}
-					}
-					return nil
-				}
-				return read.err
+			terminal, err := handleRead(read)
+			if terminal {
+				return err
 			}
-			if read.n == 0 {
-				startRead()
-				continue
-			}
-			resetIdle()
-			startRead()
 		case <-done:
 			return settleTerminal()
 		case <-idleTimer.C:
-			// No output arrived during the idle grace period. Recheck Done
-			// once before accepting a live follow stream as ready.
-			select {
-			case <-done:
-				return settleTerminal()
-			default:
-			}
-			return nil
+			idleExpired = true
 		case <-maxTimer.C:
-			// A continuously active live stream must not postpone readiness
-			// forever. Recheck Done before accepting the bounded result.
-			select {
-			case <-done:
-				return settleTerminal()
-			default:
-			}
-			return nil
+			maxExpired = true
 		case <-ctx.Done():
 			return ctx.Err()
 		}

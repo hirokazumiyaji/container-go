@@ -270,6 +270,44 @@ func TestContainerNotFoundFailsFastDuringWait(t *testing.T) {
 	}
 }
 
+// nextReadyLogSettle is the priority pass used before idle/max timers.
+func TestLogSettlePrefersReadyEvidenceBeforeTerminal(t *testing.T) {
+	reads := make(chan logSettleRead, 1)
+	done := make(chan struct{})
+	want := logSettleRead{err: errLogLineTooLong}
+	reads <- want
+
+	got, hasRead, doneReady := nextReadyLogSettle(reads, done)
+	if !hasRead || doneReady || !errors.Is(got.err, errLogLineTooLong) {
+		t.Fatalf("ready evidence = (%+v, read=%v, done=%v), want queued read", got, hasRead, doneReady)
+	}
+
+	close(done)
+	_, hasRead, doneReady = nextReadyLogSettle(make(chan logSettleRead), done)
+	if hasRead || !doneReady {
+		t.Fatalf("done evidence = (read=%v, done=%v), want done", hasRead, doneReady)
+	}
+}
+
+func TestForLogTreatsOversizedLineAsPermanent(t *testing.T) {
+	target := &issue90Target{logs: []io.ReadCloser{
+		io.NopCloser(strings.NewReader(strings.Repeat("x", maxLogLineSize+1))),
+	}}
+	err := ForLog("never").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, errLogLineTooLong) {
+		t.Fatalf("error = %v, want errLogLineTooLong", err)
+	}
+	if got := target.followCalls.Load(); got != 1 {
+		t.Fatalf("FollowLogs calls = %d, want 1", got)
+	}
+	if got := target.runningCalls.Load(); got != 0 {
+		t.Fatalf("Running calls = %d, want 0", got)
+	}
+}
+
 func TestForLogPollIntervalReconnects(t *testing.T) {
 	target := &issue90Target{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader("starting\n")),

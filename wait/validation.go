@@ -71,7 +71,8 @@ func isPermanentCheckError(err error) bool {
 	}
 	return errors.Is(err, ErrPortNotExposed) ||
 		errors.Is(err, ErrContainerNotFound) ||
-		errors.Is(err, ErrInvalidConfiguration)
+		errors.Is(err, ErrInvalidConfiguration) ||
+		errors.Is(err, errLogLineTooLong)
 }
 
 // isTerminalStreamError identifies a backend process that has already

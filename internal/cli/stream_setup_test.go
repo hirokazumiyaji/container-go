@@ -11,11 +11,12 @@ import (
 )
 
 func TestStreamClassifiesExecutableFormatStartErrorAsSetup(t *testing.T) {
+	name, mode := "backend", os.FileMode(0o700)
 	if runtime.GOOS == "windows" {
-		t.Skip("Windows does not report Unix ENOEXEC for an invalid executable")
+		name, mode = "backend.exe", 0o600
 	}
-	backend := filepath.Join(t.TempDir(), "backend")
-	if err := os.WriteFile(backend, []byte("not an executable format"), 0o700); err != nil {
+	backend := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(backend, []byte("not an executable format"), mode); err != nil {
 		t.Fatal(err)
 	}
 
@@ -27,7 +28,7 @@ func TestStreamClassifiesExecutableFormatStartErrorAsSetup(t *testing.T) {
 	if !errors.Is(err, ErrStreamSetup) {
 		t.Fatalf("error = %v, want ErrStreamSetup", err)
 	}
-	if !errors.Is(err, syscall.ENOEXEC) {
+	if runtime.GOOS != "windows" && !errors.Is(err, syscall.ENOEXEC) {
 		t.Fatalf("error = %v, want ENOEXEC cause", err)
 	}
 }

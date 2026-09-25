@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -39,6 +40,8 @@ var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
 )
+
+var errUnverifiedContainer = errors.New("container inspect failed ownership validation")
 
 // sessionID identifies all containers created by this process.
 var sessionID = sync.OnceValue(func() string {
@@ -98,9 +101,12 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// unverifiedLookup marks helper handles used only to discover a named
+	// container. Their inspect results must never be cached or published.
+	unverifiedLookup bool
 
 	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	info *engineInfo // cached inspect verified against this handle
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -237,7 +243,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return
 	}
 	defer unlock()
-	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	info, err := namedContainer(cfg, cfg.name).inspectUnverified(cleanupCtx)
 	if err != nil {
 		return
 	}
@@ -469,22 +475,62 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.cacheInfo(info)
+	if err := c.cacheInfo(info); err != nil {
+		return nil, err
+	}
 	return info, nil
 }
 
-// cacheInfo records immutable identity and complete connection data. The
-// UID is write-once so a lazy inspect and a concurrent Terminate cannot
-// disagree about which backend object the handle owns.
-func (c *Container) cacheInfo(info *engineInfo) {
+// cacheInfo records immutable identity and complete connection data only
+// after the inspected object's generation, UID, and ownership labels match
+// this handle.
+func (c *Container) cacheInfo(info *engineInfo) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if err := c.validateInfoLocked(info); err != nil {
+		return err
+	}
 	if c.uid == "" {
 		c.uid = info.uid
 	}
 	if c.infoComplete(info) {
 		c.info = info
 	}
+	return nil
+}
+
+func (c *Container) validateInfoLocked(info *engineInfo) error {
+	if info == nil {
+		return fmt.Errorf("%w: container %s inspect returned no identity", errUnverifiedContainer, c.id)
+	}
+	if c.unverifiedLookup {
+		return fmt.Errorf("%w: container %s cannot publish an unverified name lookup", errUnverifiedContainer, c.id)
+	}
+	if c.uid != "" && info.uid != c.uid {
+		return fmt.Errorf("%w: %s immutable ID changed", ErrGenerationReplaced, c.id)
+	}
+	if c.creation != "" && info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("%w: %s expected generation %q, got %q", ErrGenerationReplaced, c.id, c.creation, info.labels[creationLabel])
+	}
+	if c.reused {
+		if info.labels[reuseLabel] != "true" {
+			return fmt.Errorf("%w: container %s was not created with WithReuse", errUnverifiedContainer, c.id)
+		}
+		return nil
+	}
+	// A matching backend-assigned UID is sufficient immutable ownership;
+	// name-based backends additionally require this handle's generation and
+	// managed/session labels.
+	if c.uid != "" {
+		return nil
+	}
+	if c.creation == "" {
+		return fmt.Errorf("%w: container %s inspect has no generation for this handle", errUnverifiedContainer, c.id)
+	}
+	if info.labels[managedLabel] != "true" || info.labels[sessionLabel] != sessionID() {
+		return fmt.Errorf("%w: container %s ownership does not match this handle", errUnverifiedContainer, c.id)
+	}
+	return nil
 }
 
 func (c *Container) immutableID() string {
@@ -516,6 +562,23 @@ func (c *Container) infoComplete(info *engineInfo) bool {
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	info, err := c.inspectUnverified(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	err = c.validateInfoLocked(info)
+	c.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	return info, nil
+}
+
+// inspectUnverified performs only the name lookup used by get-or-create
+// discovery. Callers must validate ownership and identity before exposing
+// the result through a Container handle or cache.
+func (c *Container) inspectUnverified(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)

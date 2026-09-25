@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +101,9 @@ func TestStreamCloseIsIdempotent(t *testing.T) {
 }
 
 func TestStreamClassifiesNonExecutableAbsolutePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce Unix executable permission bits")
+	}
 	backend := filepath.Join(t.TempDir(), "backend")
 	if err := os.WriteFile(backend, []byte("not executable"), 0o600); err != nil {
 		t.Fatal(err)

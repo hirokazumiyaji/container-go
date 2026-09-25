@@ -492,11 +492,11 @@ func TestForExecFinalStateProbeRespectsCallerCancel(t *testing.T) {
 	}
 }
 
-func TestForExecFinalStateProbeIsBounded(t *testing.T) {
+func TestForExecStateProbeHonorsDeadline(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
-	// State ignores progress until its context ends; without a bound
-	// on the diagnostic probe this would hang for queryTimeout.
+	// State ignores progress until its context ends; a probe must not
+	// outlive the strategy deadline or create a fresh timeout budget.
 	slow := &slowStateTarget{fakeTarget: target, block: 30 * time.Second}
 
 	s := ForExec([]string{"pg_isready"}).
@@ -508,7 +508,7 @@ func TestForExecFinalStateProbeIsBounded(t *testing.T) {
 		t.Fatal("want error")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("took %v; want bounded final State probe", elapsed)
+		t.Errorf("took %v; want State probe bounded by strategy deadline", elapsed)
 	}
 }
 

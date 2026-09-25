@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"strings"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 const (
@@ -252,36 +253,8 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				default:
 				}
 			}
-			// A final classification is useful only when this strategy's
-			// own startup deadline won. Never detach from or probe after a
-			// caller cancellation/deadline.
-			if errors.Is(waitCtx.Err(), context.DeadlineExceeded) && !callerDeadlineWins(callerCtx, startupDeadline) {
-				probeCtx, probeCancel := context.WithTimeout(callerCtx, stateCheckInterval)
-				if probeCtx.Err() == nil {
-					state, stateErr := targetState(probeCtx, target)
-					probeErr := probeCtx.Err()
-					probeCancel()
-					if callerErr := callerCtx.Err(); callerErr != nil {
-						return newWaitError(fmt.Sprintf("%s: %s", what, callerErr)+diagnosticSuffix(lastCheckErr, stateErr), callerErr, lastCheckErr, stateErr)
-					}
-					if probeErr != nil {
-						// The bounded diagnostic probe ended while the
-						// lifecycle CLI was returning. Its state error is
-						// incomplete, so retain the strategy timeout.
-						return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, stateErr)
-					}
-					if stateErr != nil {
-						if permanentProbeError(stateErr) {
-							return fmt.Errorf("%s: %w", what, stateErr)
-						}
-						lastStateErr = stateErr
-					} else if terminalWaitState(state) {
-						return stateFailure(what, state, lastCheckErr, lastStateErr)
-					}
-				} else {
-					probeCancel()
-				}
-			}
+			// The strategy deadline is authoritative. Do not detach from
+			// it or start a fresh timeout budget for post-deadline state.
 			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
 		case <-timer.C:
 		}
@@ -385,9 +358,9 @@ func diagnosticSuffix(checkErr, stateErr error) string {
 
 // permanentProbeError identifies failures that cannot recover by retrying the
 // same target operation. Backend adapters should wrap disappearance in
-// ErrTargetNotFound. Launch failures are permanent; ordinary CLI/inspect
-// failures remain retryable unless the operation-specific strategy says
-// otherwise.
+// ErrTargetNotFound. Deterministic executable-start failures are permanent;
+// ordinary CLI/inspect failures remain retryable unless the operation-specific
+// strategy says otherwise.
 func permanentProbeError(err error) bool {
 	if err == nil {
 		return false
@@ -395,6 +368,5 @@ func permanentProbeError(err error) bool {
 	if errors.Is(err, ErrTargetNotFound) {
 		return true
 	}
-	var launchErr *exec.Error
-	return errors.As(err, &launchErr)
+	return cli.PermanentStartError(err)
 }

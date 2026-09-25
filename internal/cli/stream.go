@@ -9,7 +9,6 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -48,7 +47,7 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		if permanentStreamStartError(bin, err) {
+		if PermanentStartError(err) {
 			return nil, fmt.Errorf("%s %s: %w: %w", bin, strings.Join(args, " "), ErrStreamSetup, err)
 		}
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
@@ -59,18 +58,6 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	// cannot reap the child more than once.
 	go stream.wait()
 	return stream, nil
-}
-
-// permanentStreamStartError reports setup failures that cannot change when
-// the same runner opens the same backend again. Explicit relative paths
-// bypass exec.LookPath just like absolute paths, so their permission,
-// existence, and executable-format failures need explicit classification.
-func permanentStreamStartError(_ string, err error) bool {
-	var execErr *exec.Error
-	if errors.As(err, &execErr) {
-		return true
-	}
-	return os.IsPermission(err) || os.IsNotExist(err) || errors.Is(err, syscall.ENOEXEC)
 }
 
 type processStream struct {

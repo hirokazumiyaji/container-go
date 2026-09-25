@@ -16,10 +16,11 @@ import (
 )
 
 type inspectSequenceRunner struct {
-	mu       sync.Mutex
-	steps    []inspectStep
-	inspects int
-	image    bool
+	mu         sync.Mutex
+	steps      []inspectStep
+	inspects   int
+	image      bool
+	generation string
 }
 
 type inspectStep struct {
@@ -41,22 +42,39 @@ func (r *inspectSequenceRunner) Run(_ context.Context, args ...string) ([]byte, 
 		}
 		return nil, nil, nil
 	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if generation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.generation = generation
+				}
+			}
+		}
 		return []byte("myctr\n"), nil, nil
 	case "inspect":
 		i := r.inspects
 		r.inspects++
 		if i < len(r.steps) {
 			step := r.steps[i]
-			return []byte(step.data), nil, step.err
+			return []byte(r.withAppleOwnership(step.data)), nil, step.err
 		}
 		if len(r.steps) == 0 {
 			return nil, nil, errors.New("unexpected inspect")
 		}
 		step := r.steps[len(r.steps)-1]
-		return []byte(step.data), nil, step.err
+		return []byte(r.withAppleOwnership(step.data)), nil, step.err
 	default:
 		return nil, nil, nil
 	}
+}
+
+func (r *inspectSequenceRunner) withAppleOwnership(data string) string {
+	generation := r.generation
+	if generation == "" {
+		generation = "generation-a"
+	}
+	oldLabel := `"` + managedLabel + `": "true"`
+	newLabels := fmt.Sprintf(`%q: "true", %q: %q, %q: %q`, managedLabel, sessionLabel, sessionID(), creationLabel, generation)
+	return strings.Replace(data, oldLabel, newLabels, 1)
 }
 
 func appleInspectWithNetwork(id, state, address string) string {
@@ -79,7 +97,7 @@ func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
 	created := appleInspectWithNetwork("myctr", "created", "")
 	running := appleInspectWithNetwork("myctr", "running", "192.168.64.3/24")
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "generation-a", exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no IP yet")
@@ -119,7 +137,7 @@ func TestEndpointRefreshesIncompleteDockerBinding(t *testing.T) {
 	created := dockerInspectWithBinding("myctr", "created", "", 0)
 	running := dockerInspectWithBinding("myctr", "running", "172.17.0.2", 49153)
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", uid: "myctr", runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no host binding yet")
@@ -178,7 +196,7 @@ func TestContainerStateCanonicalizesUnknownAppleState(t *testing.T) {
 	runner := newInspectSequenceRunner([]inspectStep{{
 		data: appleInspectWithNetwork("myctr", "future-state", "192.168.64.3/24"),
 	}})
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "generation-a"}
 
 	state, err := ctr.State(context.Background())
 	if err != nil {

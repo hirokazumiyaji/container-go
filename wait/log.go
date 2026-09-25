@@ -2,6 +2,7 @@ package wait
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
@@ -142,7 +143,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			}
 			if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
 				_ = stream.Close()
-				return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
+				return logContextScanError(callerCtx, waitCtx, what, timeout, lastCheckErr, scanResult.err)
 			}
 			replay = scanResult.replay
 			matches := replay.matches
@@ -156,7 +157,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				terminalErr := terminalLogStreamError(waitCtx, stream)
 				_ = stream.Close()
 				if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
-					return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
+					return logContextScanError(callerCtx, waitCtx, what, timeout, lastCheckErr, terminalErr)
 				}
 				if terminalErr != nil {
 					return fmt.Errorf("%s: %w", what, terminalErr)
@@ -228,6 +229,7 @@ func (s *LogStrategy) scanStream(
 	go func() {
 		scanner := bufio.NewScanner(stream)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+		scanner.Split(scanCompleteLogLine)
 		digest := sha256.New()
 		var digestSum [sha256.Size]byte
 		var lineLength [8]byte
@@ -305,9 +307,30 @@ func (s *LogStrategy) scanStream(
 				return logScanResult{}, stateFailure(what, state, nil, *lastStateErr)
 			}
 		case <-ctx.Done():
+			if result, ok := scanResultOnContextDone(results); ok {
+				return result, nil
+			}
 			return logScanResult{err: ctx.Err()}, nil
 		}
 	}
+}
+
+// scanCompleteLogLine emits only newline-terminated log records. At EOF an
+// unterminated suffix may be a truncated write; consume it without adding it
+// to replay state so a later full-history connection can observe its
+// completed form and any following ready line.
+func scanCompleteLogLine(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		line := data[:i]
+		if len(line) > 0 && line[len(line)-1] == '\r' {
+			line = line[:len(line)-1]
+		}
+		return i + 1, line, nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), nil, nil
+	}
+	return 0, nil, nil
 }
 
 func permanentLogStreamError(err error) bool {
@@ -333,6 +356,9 @@ func settleScanner(ctx context.Context, scanner *bufio.Scanner) error {
 	case err := <-result:
 		return err
 	case <-ctx.Done():
+		if err, ok := scannerErrorOnContextDone(result); ok {
+			return err
+		}
 		return ctx.Err()
 	case <-timer.C:
 		return nil
@@ -366,9 +392,48 @@ func terminalLogStreamError(ctx context.Context, stream io.ReadCloser) error {
 	select {
 	case <-done:
 		return status.TerminalError()
+	case <-ctx.Done():
+		select {
+		case <-done:
+			return status.TerminalError()
+		default:
+			return ctx.Err()
+		}
 	case <-timer.C:
 		return nil
 	}
+}
+
+func scannerErrorOnContextDone(results <-chan error) (error, bool) {
+	select {
+	case err := <-results:
+		return err, true
+	default:
+		return nil, false
+	}
+}
+
+func scanResultOnContextDone(results <-chan logScanResult) (logScanResult, bool) {
+	select {
+	case result := <-results:
+		return result, true
+	default:
+		return logScanResult{}, false
+	}
+}
+
+func logContextScanError(callerCtx, waitCtx context.Context, what string, timeout time.Duration, checkErr, scanErr error) error {
+	contextErr := logContextTermination(callerCtx, waitCtx)
+	if contextErr == nil {
+		return nil
+	}
+	if scanErr != nil && permanentLogStreamError(scanErr) {
+		return fmt.Errorf("%s: %w", what, errors.Join(scanErr, contextErr))
+	}
+	if scanErr != nil {
+		checkErr = joinNonNil(checkErr, fmt.Errorf("read log stream: %w", scanErr))
+	}
+	return logWaitEnded(callerCtx, waitCtx, what, timeout, checkErr, nil)
 }
 
 func logContextTermination(callerCtx, waitCtx context.Context) error {

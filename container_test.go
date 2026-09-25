@@ -120,7 +120,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "id": %q,
       "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
     },
     "status": {
       "state": "running",

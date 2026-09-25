@@ -34,11 +34,18 @@ func TestWaitTargetBackendStatePolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			runner := waitRunnerFunc(func(_ context.Context, _ ...string) ([]byte, []byte, error) {
 				if tc.engine.name() == "apple" {
-					return []byte(fmt.Sprintf(`[{"id":"myctr","status":{"state":%q}}]`, tc.status)), nil, nil
+					return []byte(fmt.Sprintf(`[{"id":"myctr","configuration":{"labels":{%q:"true",%q:%q,%q:"generation-a"}},"status":{"state":%q}}]`,
+						managedLabel, sessionLabel, sessionID(), creationLabel, tc.status)), nil, nil
 				}
 				return []byte(fmt.Sprintf(`[{"Id":"myctr","State":{"Status":%q}}]`, tc.status)), nil, nil
 			})
-			target := waitTarget{c: &Container{id: "myctr", runner: runner, eng: tc.engine}}
+			ctr := &Container{id: "myctr", runner: runner, eng: tc.engine}
+			if tc.engine.name() == "apple" {
+				ctr.creation = "generation-a"
+			} else {
+				ctr.uid = "myctr"
+			}
+			target := waitTarget{c: ctr}
 
 			got, err := target.State(context.Background())
 			if err != nil {

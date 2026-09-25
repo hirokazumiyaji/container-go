@@ -104,8 +104,8 @@ func TestReview91ReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 	}
 	close(runner.releaseBase)
 
-	if err := <-leaderResult; err != nil {
-		t.Fatalf("leader Run: %v", err)
+	if err := <-leaderResult; !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("leader error = %v, want ErrGenerationReplaced", err)
 	}
 	if err := <-waiterResult; !errors.Is(err, ErrGenerationReplaced) {
 		t.Fatalf("waiting caller error = %v, want ErrGenerationReplaced", err)
@@ -271,8 +271,8 @@ func TestReview91ReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T
 	}
 	close(runner.releaseBase)
 
-	if err := <-leaderResult; err != nil {
-		t.Fatalf("leader Run: %v", err)
+	if err := <-leaderResult; !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("leader error = %v, want context.DeadlineExceeded", err)
 	}
 	if err := <-waiterResult; !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("waiting caller error = %v, want context.DeadlineExceeded", err)
@@ -291,7 +291,7 @@ func (r *review91LazyUIDRunner) Run(_ context.Context, args ...string) ([]byte, 
 		// Keep inspect in flight while concurrent Terminate calls read the
 		// lazy immutable-ID field.
 		time.Sleep(r.inspectDelay)
-		return []byte(review91ReuseInspectJSON("immutable-uid", "generation-a", false)), nil, nil
+		return []byte(review91OwnedDockerInspect("immutable-uid", "generation-a", false, false)), nil, nil
 	case "rm":
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])

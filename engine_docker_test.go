@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
@@ -169,6 +171,7 @@ type dockerRunner struct {
 	*fakeRunner
 	inspectJSON []byte
 	failInspect bool
+	generation  string
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -177,12 +180,27 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if generation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					d.generation = generation
+				}
+			}
+		}
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
-		return d.inspectJSON, nil, nil
+		var docs []map[string]any
+		if err := json.Unmarshal(d.inspectJSON, &docs); err != nil || len(docs) == 0 {
+			return nil, nil, errors.New("invalid docker inspect fixture")
+		}
+		config, _ := docs[0]["Config"].(map[string]any)
+		labels, _ := config["Labels"].(map[string]any)
+		labels[creationLabel] = d.generation
+		data, err := json.Marshal(docs)
+		return data, nil, err
 	default:
 		return nil, nil, nil
 	}

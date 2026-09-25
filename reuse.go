@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -62,8 +61,13 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
 	}
-	ctr.cacheInfo(info)
+	if err := ctr.cacheInfo(info); err != nil {
+		return nil, err
+	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		return nil, err
+	}
+	if err := revalidateReuse(ctx, image, cfg, ctr); err != nil {
 		return nil, err
 	}
 	if err := ctx.Err(); err != nil {
@@ -161,7 +165,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				reused:    true,
 				creation:  info.labels[creationLabel],
 			}
-			ctr.cacheInfo(info)
+			if err := ctr.cacheInfo(info); err != nil {
+				return nil, err
+			}
 			return ctr, nil
 		default:
 			if !waitReusePoll(ctx) {
@@ -222,7 +228,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	ctr.cacheInfo(info)
+	if err := ctr.cacheInfo(info); err != nil {
+		_ = ctr.Terminate(context.WithoutCancel(ctx))
+		return nil, err
+	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -239,6 +248,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	ctr := namedContainer(cfg, cfg.name)
+	ctr.unverifiedLookup = false
+	ctr.reused = true
 	ctr.creation = info.labels[creationLabel]
 	err := ctr.Terminate(ctx)
 	if errors.Is(err, ErrGenerationReplaced) {
@@ -267,8 +278,56 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 	return ctx.Err()
 }
 
+// revalidateReuse closes the replacement race between the initial attach and
+// readiness completion. The final inspect is name-based on backends without
+// an immutable ID, so inspectFresh verifies generation and ownership before
+// compatibility data can be cached or returned.
+func revalidateReuse(ctx context.Context, image string, cfg *config, ctr *Container) error {
+	inspectCtx, cancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer cancel()
+	var info *engineInfo
+	for {
+		var err error
+		info, err = ctr.inspectFresh(inspectCtx)
+		if err == nil {
+			break
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			return fmt.Errorf("reuse %s: timed out revalidating after readiness: %w", cfg.name, context.DeadlineExceeded)
+		}
+		if isNotFound(err) || errors.Is(err, ErrGenerationReplaced) || errors.Is(err, errUnverifiedContainer) || !retryReuseInspect(err) {
+			return err
+		}
+		if !waitReusePoll(inspectCtx) {
+			if errors.Is(inspectCtx.Err(), context.DeadlineExceeded) && ctx.Err() == nil {
+				return fmt.Errorf("reuse %s: timed out revalidating after readiness: %w", cfg.name, context.DeadlineExceeded)
+			}
+			return ctx.Err()
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if info.state != StateRunning {
+		return fmt.Errorf("reuse %s: container %s after readiness", cfg.name, info.state)
+	}
+	if err := checkReuseCompat(info, image, cfg); err != nil {
+		return err
+	}
+	if !reuseInfoComplete(cfg, info) {
+		return fmt.Errorf("reuse %s: connection information incomplete after readiness", cfg.name)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return ctr.cacheInfo(info)
+}
+
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
-	return namedContainer(cfg, id).inspectFresh(ctx)
+	return namedContainer(cfg, id).inspectUnverified(ctx)
 }
 
 // reuseInfoComplete reports whether inspect contains all connection data
@@ -310,8 +369,7 @@ func retryReuseInspect(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var launchErr *exec.Error
-	return !errors.As(err, &launchErr)
+	return !cli.PermanentStartError(err)
 }
 
 // reuseInfoForCaller fills a missing/incomplete inspect without turning a
@@ -402,11 +460,12 @@ func reuseContextError(ctx context.Context, name string) error {
 
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:        id,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
+		id:               id,
+		runner:           cfg.runner,
+		eng:              cfg.eng,
+		exposed:          cfg.exposed,
+		published:        cfg.published,
+		unverifiedLookup: true,
 	}
 }
 

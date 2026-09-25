@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -23,6 +24,24 @@ func TestReview91FollowLogsClassifiesUnsupportedStreamSetup(t *testing.T) {
 	}
 }
 
+type review91StreamSetupTarget struct {
+	ctr *Container
+}
+
+func (*review91StreamSetupTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*review91StreamSetupTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *review91StreamSetupTarget) State(context.Context) (wait.State, error) {
+	return wait.StateRunning, nil
+}
+func (t *review91StreamSetupTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	return t.ctr.FollowLogs(ctx)
+}
+func (*review91StreamSetupTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
 func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	backend := filepath.Join(t.TempDir(), "docker")
 	if err := os.WriteFile(backend, []byte("not executable"), 0o600); err != nil {
@@ -38,7 +57,7 @@ func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	err := wait.ForLog("ready").
 		WithStartupTimeout(2*time.Second).
 		WithPollInterval(time.Millisecond).
-		WaitUntilReady(context.Background(), waitTarget{c: ctr})
+		WaitUntilReady(context.Background(), &review91StreamSetupTarget{ctr: ctr})
 	if !errors.Is(err, wait.ErrLogStreamSetup) {
 		t.Fatalf("error = %v, want ErrLogStreamSetup", err)
 	}

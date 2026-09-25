@@ -38,8 +38,11 @@ const (
 	// 1.3.0 (Parser.resources, PublishPort, Utility, and
 	// ContainersService). Keeping them here makes a bad request fail before
 	// any image fetch or container create is attempted.
-	appleMinMemoryBytes     uint64 = 200 * 1024 * 1024
-	appleMaxMemoryBytes     uint64 = 1<<64 - 1
+	appleMinMemoryBytes uint64 = 200 * 1024 * 1024
+	// Apple parses the input as a Double, converts to MiB, narrows to Int64,
+	// then multiplies by 1 MiB into UInt64. MaxInt64 bytes is a conservative
+	// bound that leaves room for floating-point rounding in that path.
+	appleMaxMemoryBytes     uint64 = 1<<63 - 1
 	applePublishedPortLimit        = 64
 )
 
@@ -224,11 +227,12 @@ func (appleEngine) checkConfig(cfg *config) error {
 }
 
 // appleMemoryBytes parses the integer/unit form accepted by WithMemory and
-// applies the limits used by Apple Container's run/create path. Apple converts
-// the value to MiB before storing it, and the API server requires at least
-// 200 MiB. The upstream memory field is UInt64, so reject values whose unit
-// multiplication would overflow that representation before handing them to the
-// CLI.
+// applies the limits used by Apple Container's run/create path. Apple parses
+// the numeric value as a Swift Double, converts it to MiB, narrows it to
+// Int64, and multiplies by 1 MiB into UInt64. The API server requires at least
+// 200 MiB. Use MaxInt64 bytes as a conservative upper bound so values that
+// could round across the final UInt64 conversion are rejected before reaching
+// the CLI.
 func appleMemoryBytes(size string) (uint64, error) {
 	if !memoryRE.MatchString(size) {
 		return 0, fmt.Errorf("invalid Apple memory size %q: use an integer with an optional K, M, G, T, or P suffix", size)

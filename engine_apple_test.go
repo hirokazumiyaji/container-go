@@ -259,6 +259,14 @@ func TestAppleCheckConfigMemory(t *testing.T) {
 			t.Errorf("memory %q: want Apple memory validation error", size)
 		}
 	}
+	for _, size := range []string{
+		"18446744073709551615",
+		"18014398509481983K",
+	} {
+		if _, err := appleMemoryBytes(size); err == nil || !strings.Contains(err.Error(), "overflow") {
+			t.Errorf("memory %q: got %v, want overflow error", size, err)
+		}
+	}
 	if _, err := appleMemoryBytes("18446744073709551616"); err == nil || !strings.Contains(err.Error(), "overflow") {
 		t.Fatalf("byte overflow = %v, want overflow error", err)
 	}

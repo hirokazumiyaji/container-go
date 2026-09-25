@@ -1,10 +1,13 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
+
+var errReaperHelperUnavailable = errors.New("reaper helper unavailable")
 
 type reaperHelperPaths struct {
 	awk   string
@@ -16,6 +19,30 @@ type reaperHelperPaths struct {
 
 func (p reaperHelperPaths) complete() bool {
 	return p.awk != "" && p.ps != "" && p.rm != "" && p.sleep != ""
+}
+
+func (p reaperHelperPaths) validate() error {
+	for name, path := range map[string]string{
+		"awk": p.awk, "ps": p.ps, "rm": p.rm, "sleep": p.sleep,
+	} {
+		if path == "" || !filepath.IsAbs(path) {
+			return fmt.Errorf("%w: %s", errReaperHelperUnavailable, name)
+		}
+		info, err := os.Stat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("%w: %s (%q)", errReaperHelperUnavailable, name, path)
+		}
+	}
+	if p.pgrep != "" {
+		if !filepath.IsAbs(p.pgrep) {
+			return fmt.Errorf("%w: pgrep (%q)", errReaperHelperUnavailable, p.pgrep)
+		}
+		info, err := os.Stat(p.pgrep)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			return fmt.Errorf("%w: pgrep (%q)", errReaperHelperUnavailable, p.pgrep)
+		}
+	}
+	return nil
 }
 
 func trustedReaperHelperPath(name string) (string, error) {
@@ -34,7 +61,7 @@ func trustedReaperHelperPath(name string) (string, error) {
 			return path, nil
 		}
 	}
-	return "", fmt.Errorf("reaper: trusted helper %q is unavailable", name)
+	return "", fmt.Errorf("%w: trusted helper %q", errReaperHelperUnavailable, name)
 }
 
 func trustedReaperHelpers() (reaperHelperPaths, error) {

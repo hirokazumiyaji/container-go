@@ -53,19 +53,21 @@ max_registered_entries=1024
 registered_entries=0
 ids=""
 while IFS= read -r line; do
-  [ "$registered_entries" -lt "$max_registered_entries" ] || break
-  registered_entries=$((registered_entries + 1))
-  [ "${#line}" -le 256 ] 2>/dev/null || continue
-  ids="$ids
+  if [ "$registered_entries" -lt "$max_registered_entries" ]; then
+    registered_entries=$((registered_entries + 1))
+    [ "${#line}" -le 256 ] 2>/dev/null || continue
+    ids="$ids
 $line"
+  fi
 done
-descendant_timeout=1
-helper_timeout=2
+# Each helper has a one-second execution budget. The global cleanup budget
+# bounds a timed entry even when every helper is hostile or wedged.
+helper_timeout=1
 max_descendant_pids=256
 max_descendant_depth=32
 max_descendant_lookups=64
 helper_output_blocks=512
-cleanup_helper_budget=0
+cleanup_helper_budget=6
 cleanup_active=0
 work_dir="$5"
 awk_bin="$6"
@@ -75,7 +77,7 @@ rm_bin="$9"
 sleep_bin="${10:-}"
 ps_start_field="${11:-lstart}"
 case "$ps_start_field" in
-  lstart|stime) ;;
+  lstart) ;;
   *) exit 0 ;;
 esac
 case "$timeout" in
@@ -356,6 +358,13 @@ is_stopped() {
 mark_stopped() {
   is_stopped "$1" || stopped_pids="$stopped_pids $1"
 }
+kill_stopped_processes() {
+  for stopped_pid in $stopped_pids; do
+    # A successful SIGSTOP reserves this PID until it is resumed or exits;
+    # do this even when identity/traversal state was lost after the stop.
+    kill -KILL "$stopped_pid" 2>/dev/null || true
+  done
+}
 list_children() {
   parent="$1"
   descendant_lookups=$((descendant_lookups + 1))
@@ -580,6 +589,7 @@ direct_snapshot_fallback() {
       mark_tombstoned "$snapshot_pid"
     fi
   done
+  kill_stopped_processes
   kill -9 "$kill_root_pid" 2>/dev/null || true
 }
 same_pid_list() {
@@ -639,19 +649,21 @@ capture_quiesced_process_table() {
 kill_pipeline() {
   kill_root_pid="$1"
   cleanup_active=1
-  cleanup_helper_budget=32
+  cleanup_helper_budget=6
   tombstoned_pids=
   stopped_pids=
   capture_identity "$kill_root_pid" "$work_dir/identity.$kill_root_pid"
   snapshot_status="$?"
   if [ "$snapshot_status" -ne 0 ]; then
     reaper_warn "root process identity lookup failed for pid $kill_root_pid"
+    kill_stopped_processes
     kill -9 "$kill_root_pid" 2>/dev/null || true
     return 1
   fi
   revalidate_identity "$kill_root_pid"
   snapshot_status="$?"
   if [ "$snapshot_status" -ne 0 ]; then
+    kill_stopped_processes
     kill -9 "$kill_root_pid" 2>/dev/null || true
     return 1
   fi
@@ -822,10 +834,13 @@ set -f
 `
 
 const (
+	maxReaperRegisteredEntries  = 1024
 	maxReaperSpawnFailures      = 3
 	defaultReaperTimeoutSeconds = 30
 	reaperCleanupTimeout        = 2 * time.Second
 )
+
+var errReaperRegistrationOverflow = errors.New("reaper registration capacity exceeded")
 
 // breQuote escapes a literal for the reaper's field matcher, so the label
 // key's dots remain literal characters rather than matcher syntax.
@@ -913,6 +928,12 @@ func (r *reaper) register(id, creation string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if len(r.entries) >= maxReaperRegisteredEntries {
+		// The shell deliberately keeps draining its input after its bounded
+		// prefix. Give the caller an explicit ownership error rather than
+		// silently abandoning the newly-created container.
+		return errReaperRegistrationOverflow
+	}
 	entry := reaperEntry{id: id, creation: creation}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
@@ -938,6 +959,12 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 func (r *reaper) respawnAndReplayLocked() error {
 	for r.spawnFailures < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
+			// A missing dependency is an explicit, recoverable registration
+			// failure. Do not spend the consecutive-spawn budget or mark the
+			// reaper permanently unusable; a later deployment may provide it.
+			if errors.Is(err, errReaperHelperUnavailable) {
+				return fmt.Errorf("reaper: required helper unavailable: %w", err)
+			}
 			r.spawnFailures++
 			continue
 		}
@@ -966,6 +993,9 @@ func (r *reaper) spawnLocked() error {
 	if timeout <= 0 {
 		timeout = defaultReaperTimeoutSeconds
 	}
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		return fmt.Errorf("%w: /bin/sh: %v", errReaperHelperUnavailable, err)
+	}
 	helpers := r.helperPaths
 	if !helpers.complete() {
 		var err error
@@ -974,14 +1004,17 @@ func (r *reaper) spawnLocked() error {
 			return err
 		}
 	}
+	if err := helpers.validate(); err != nil {
+		return err
+	}
 	workDir, err := os.MkdirTemp("", "containergo-reaper-")
 	if err != nil {
 		return err
 	}
+	// The shell's portable fallback uses the stable process-start field.
+	// Darwin's Go-side identity path uses the kernel's microsecond start
+	// timestamp; CPU-time fields are never process identities.
 	psStartField := "lstart"
-	if runtime.GOOS == "darwin" {
-		psStartField = "stime"
-	}
 	cmd := exec.Command(
 		"/bin/sh", "-c", reaperScript, "containergo-reaper",
 		r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout),
@@ -1051,10 +1084,10 @@ var (
 	globalReapers   = map[string]*reaper{}
 )
 
-// registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble is logged
-// but never fails container startup. The reaper needs /bin/sh, so on
-// Windows this is a no-op and cleanup relies on the normal paths.
+// registerWithGlobalReaper registers a container with the process-wide
+// reaper for its backend binary and logs registration failures. The reaper
+// needs /bin/sh, so on Windows this is a no-op and cleanup relies on the
+// normal paths.
 func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil

@@ -4,75 +4,63 @@ package container
 
 import (
 	"context"
-	"errors"
+	"encoding/binary"
 	"fmt"
-	"io"
-	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
-	"time"
+	"unsafe"
 )
 
-// Darwin's lstart field is only second-resolution. stime includes
-// hundredths of a second, giving process identity enough resolution to
-// distinguish rapid PID reuse during descendant cleanup.
+// Darwin exposes the process start timestamp in proc_bsdinfo. Unlike ps's
+// stime (elapsed CPU time), this value is immutable for the life of a
+// process. The offsets below match the 64-bit Darwin proc_bsdinfo layout;
+// the kernel rejects a buffer with an incompatible size.
+const (
+	darwinProcInfoCallPIDInfo = 2
+	darwinProcPIDTBSDInfo     = 3
+	darwinProcBSDInfoSize     = 136
+	darwinBSDInfoPIDOffset    = 12
+	darwinBSDInfoStartOffset  = 120
+)
+
 func reaperProcessStartTime(ctx context.Context, pid int) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	psPath, err := trustedReaperHelperPath("ps")
-	if err != nil {
+	if pid <= 0 {
+		return "", fmt.Errorf("reaper: invalid process pid %d", pid)
+	}
+
+	// Keep the buffer local and parse it by offset so this remains a pure Go
+	// build (no cgo/libproc headers are needed for cross-compilation).
+	info := make([]byte, darwinProcBSDInfoSize)
+	result, _, errno := syscall.Syscall6(
+		syscall.SYS_PROC_INFO,
+		uintptr(darwinProcInfoCallPIDInfo),
+		uintptr(pid),
+		uintptr(darwinProcPIDTBSDInfo),
+		0,
+		uintptr(unsafe.Pointer(&info[0])),
+		uintptr(len(info)),
+	)
+	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	lookupTimeout := 200 * time.Millisecond
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return "", ctx.Err()
+	if result == 0 {
+		if errno != 0 {
+			return "", errno
 		}
-		if remaining < lookupTimeout {
-			lookupTimeout = remaining
-		}
+		return "", syscall.ESRCH
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
-	defer cancel()
-	cmd := exec.CommandContext(lookupCtx, psPath, "-o", "pid=", "-o", "stime=", "-p", strconv.Itoa(pid))
-	prepareReaperCommand(cmd)
-	cmd.Cancel = func() error { return reaperCommandCancel(cmd) }
-	cmd.WaitDelay = 50 * time.Millisecond
-	stdout, err := cmd.StdoutPipe()
-	if err != nil {
-		return "", err
+	if result < darwinProcBSDInfoSize {
+		return "", fmt.Errorf("reaper: Darwin process identity response was %d bytes", result)
 	}
-	cmd.Stderr = io.Discard
-	if err := cmd.Start(); err != nil {
-		return "", err
+	if got := binary.LittleEndian.Uint32(info[darwinBSDInfoPIDOffset:]); got != uint32(pid) {
+		return "", fmt.Errorf("reaper: Darwin process identity PID = %d, want %d", got, pid)
 	}
-	data, readErr := io.ReadAll(io.LimitReader(stdout, 256))
-	if len(data) == 256 && cmd.Process != nil {
-		_ = reaperCommandCancel(cmd)
+	seconds := binary.LittleEndian.Uint64(info[darwinBSDInfoStartOffset:])
+	microseconds := binary.LittleEndian.Uint64(info[darwinBSDInfoStartOffset+8:])
+	if seconds == 0 && microseconds == 0 {
+		return "", fmt.Errorf("reaper: Darwin returned no process start time for pid %d", pid)
 	}
-	waitErr := cmd.Wait()
-	if ctxErr := lookupCtx.Err(); ctxErr != nil {
-		return "", ctxErr
-	}
-	if readErr != nil {
-		return "", readErr
-	}
-	if waitErr != nil {
-		var exitErr *exec.ExitError
-		if errors.As(waitErr, &exitErr) && exitErr.ExitCode() == 1 {
-			return "", syscall.ESRCH
-		}
-		return "", waitErr
-	}
-	if len(data) == 256 {
-		return "", fmt.Errorf("reaper: ps start time output exceeded limit")
-	}
-	value := strings.TrimSpace(string(data))
-	if value == "" {
-		return "", fmt.Errorf("reaper: ps returned no start time for pid %d", pid)
-	}
-	return value, nil
+	return fmt.Sprintf("%d.%09d", seconds, microseconds), nil
 }

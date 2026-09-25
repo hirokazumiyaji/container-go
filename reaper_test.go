@@ -5,6 +5,7 @@ package container
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
@@ -95,20 +96,27 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
-func TestReaperProcessesBoundedRegistrationPrefix(t *testing.T) {
+func TestReaperRejectsRegistrationOverflow(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
-	const entries = 1025
-	for i := 0; i < entries; i++ {
+	for i := 0; i < maxReaperRegisteredEntries; i++ {
 		if err := r.register(fmt.Sprintf("bounded-%04d", i), ""); err != nil {
 			t.Fatalf("register %d: %v", i, err)
 		}
 	}
+	if err := r.register("bounded-overflow", ""); !errors.Is(err, errReaperRegistrationOverflow) {
+		t.Fatalf("overflow registration error = %v, want capacity error", err)
+	}
+	if err := r.register("bounded-after-overflow", ""); !errors.Is(err, errReaperRegistrationOverflow) {
+		t.Fatalf("post-overflow registration error = %v, want capacity error", err)
+	}
 	closeReaperForTestWithin(t, r, 60*time.Second)
 	waitForReaperLogLinesWithin(t, logPath, 60*time.Second,
 		"delete --force bounded-0000", "delete --force bounded-1023")
-	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force bounded-1024") {
-		t.Fatalf("registration cap processed an entry beyond the bounded prefix: %q", data)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force bounded-overflow") ||
+		strings.Contains(string(data), "delete --force bounded-after-overflow") {
+		t.Fatalf("registration cap processed a rejected entry: %q", data)
 	}
 }
 
@@ -204,6 +212,44 @@ func TestRunRegistersFullDockerIDThroughExternalPath(t *testing.T) {
 	r.mu.Unlock()
 	if len(entries) != 1 || entries[0].id != runner.id || entries[0].creation != "" {
 		t.Fatalf("registered entries = %+v, want full Docker ID without generation", entries)
+	}
+}
+
+func TestRunRollsBackOnReaperRegistrationOverflow(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	inner := newTestRunner()
+	inner.imagePresent = true
+	id := strings.Repeat("ef", 32)
+	runner := &reaperExternalRunner{inner: inner, binary: bin, id: id}
+
+	globalReapersMu.Lock()
+	delete(globalReapers, bin)
+	globalReapers[bin] = &reaper{
+		binary:     bin,
+		subcommand: "rm",
+		entries:    make([]reaperEntry, maxReaperRegisteredEntries),
+	}
+	globalReapersMu.Unlock()
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, bin)
+		globalReapersMu.Unlock()
+	})
+
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("overflow-ctr"),
+		WithPullPolicy(PullNever),
+		withRunner(runner),
+		withEngine(dockerEngine{}),
+	)
+	if ctr != nil {
+		t.Fatalf("Run returned container %q after reaper overflow", ctr.ID())
+	}
+	if !errors.Is(err, errReaperRegistrationOverflow) {
+		t.Fatalf("Run error = %v, want reaper capacity error", err)
+	}
+	if got := inner.callWith("rm"); fmt.Sprint(got) != fmt.Sprint([]string{"rm", "--force", id}) {
+		t.Fatalf("rollback call = %v, want immutable-ID removal", got)
 	}
 }
 
@@ -598,6 +644,29 @@ func TestReaperShellUsesPsWhenPgrepIsUnavailable(t *testing.T) {
 	waitForPath(t, childPIDPath)
 	waitForReaperProcessGone(t, readReaperPID(t, childPIDPath))
 	waitForLogLines(t, logPath, "rm --force "+first)
+}
+
+func TestReaperHelperUnavailableDoesNotConsumeSpawnBudget(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	helpers := testReaperHelpers(t, reaperHelperPaths{})
+	helpers.awk = filepath.Join(t.TempDir(), "missing-awk")
+	r := newReaper(bin, "delete")
+	r.helperPaths = helpers
+	r.spawnFailures = 2
+
+	if err := r.register("deferred", ""); !errors.Is(err, errReaperHelperUnavailable) {
+		t.Fatalf("registration error = %v, want unavailable helper", err)
+	}
+	if r.spawnFailures != 2 {
+		t.Fatalf("spawn failures = %d, want unavailable helper not to consume retry budget", r.spawnFailures)
+	}
+
+	r.helperPaths = testReaperHelpers(t, reaperHelperPaths{})
+	if err := r.register("later", ""); err != nil {
+		t.Fatalf("registration after helper recovery: %v", err)
+	}
+	closeReaperForTest(t, r)
+	waitForLogLines(t, logPath, "delete --force deferred", "delete --force later")
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {

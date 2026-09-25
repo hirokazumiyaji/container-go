@@ -25,6 +25,29 @@ func TestSameReaperProcessTableRequiresFixedEdges(t *testing.T) {
 	}
 }
 
+func TestReaperProcessSubtreeIgnoresUnrelatedEdges(t *testing.T) {
+	table := map[int][]int{
+		100: {101},
+		101: {102},
+		200: {103},
+	}
+	got := reaperProcessSubtree(table, 100)
+	want := map[int][]int{100: {101}, 101: {102}}
+	if !sameReaperProcessTable(got, want) {
+		t.Fatalf("subtree = %v, want %v", got, want)
+	}
+}
+
+func TestReaperProcessStartTimeIdentifiesCurrentProcess(t *testing.T) {
+	start, err := reaperProcessStartTime(context.Background(), os.Getpid())
+	if err != nil {
+		t.Fatalf("current process start time: %v", err)
+	}
+	if start == "" {
+		t.Fatal("current process start time is empty")
+	}
+}
+
 func TestReaperDescendantsSignalsBranchesAndRepeats(t *testing.T) {
 	const root = 100
 	rootCalls := 0

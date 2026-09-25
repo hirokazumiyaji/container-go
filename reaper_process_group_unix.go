@@ -21,6 +21,7 @@ const (
 	maxReaperDescendantDepth          = 64
 	maxReaperDescendantLookups        = 4096
 	reaperPgrepWaitDelay              = 100 * time.Millisecond
+	reaperSignalTimeout               = time.Second
 )
 
 var errReaperDescendantLimit = errors.New("reaper descendant traversal limit exceeded")
@@ -51,38 +52,47 @@ func killReaperCommand(ctx context.Context, cmd *exec.Cmd) error {
 	// A timed entry can have its own process group. Capture the root identity
 	// before quiescing and retain its pidfd/process handle through signaling.
 	rootRef, rootIdentityErr := captureReaperProcessIdentityContext(cleanupCtx, cmd.Process.Pid)
-	// Quiesce the complete process table before any KILL so a shell cannot
-	// fork a nested child between one lookup row and the next. Every lookup
-	// and identity check uses the same aggregate cleanup context.
-	table, quiesceErr := quiesceReaperTree(cleanupCtx, cmd.Process.Pid)
+	quiesced, quiesceErr := quiesceReaperTreeWithRefs(cleanupCtx, cmd.Process.Pid)
 	if rootIdentityErr != nil && !reaperProcessRefGone(rootIdentityErr) {
 		quiesceErr = errors.Join(quiesceErr, rootIdentityErr)
 	}
+
+	// Traversal and identity checks get a fresh budget. A timeout while
+	// quiescing must not consume the only budget needed to kill processes
+	// that were already stopped successfully.
+	signalCtx, signalCancel := context.WithTimeout(context.Background(), reaperSignalTimeout)
+	defer signalCancel()
 	var traversalErr error
-	if table != nil {
-		traversalErr = reaperDescendantsWithTable(cleanupCtx, cmd.Process.Pid, table, killReaperProcessRefContext)
+	if quiesced.table != nil {
+		traversalErr = reaperDescendantsWithTable(signalCtx, cmd.Process.Pid, quiesced.table, killReaperProcessRefContext)
 	} else {
 		lookup := reaperValidatedPgrepLookup
 		if _, err := trustedReaperPgrepPath(); err != nil {
 			lookup = reaperValidatedPsLookup
 		}
-		traversalErr = reaperDescendantsWithRefs(cleanupCtx, cmd.Process.Pid, lookup, captureReaperProcessIdentityContext, killReaperProcessRefContext)
+		traversalErr = reaperDescendantsWithRefs(signalCtx, cmd.Process.Pid, lookup, captureReaperProcessIdentityContext, killReaperProcessRefContext)
 	}
 
-	// Always try the root group even when pgrep is unavailable or the
-	// bounded traversal was interrupted. The root child is still owned by
-	// this process while cleanup runs, so its group ID cannot be recycled.
-	rootErr := killReaperRoot(cleanupCtx, cmd, rootRef)
+	// A stopped process cannot execute or create descendants, but it can
+	// still be left stopped forever if the identity context expires before
+	// the normal traversal reaches it. Kill every retained stopped reference
+	// directly as a final, bounded safety net.
+	stoppedErr := killReaperStoppedRefs(quiesced.stopped)
+	// Always try the root group even when lookup/traversal was interrupted.
+	rootErr := killReaperRoot(signalCtx, cmd, rootRef)
 	if quiesceErr != nil {
 		quiesceErr = fmt.Errorf("quiesce snapshot: %w", quiesceErr)
 	}
 	if traversalErr != nil {
 		traversalErr = fmt.Errorf("descendant snapshot: %w", traversalErr)
 	}
+	if stoppedErr != nil {
+		stoppedErr = fmt.Errorf("stopped process cleanup: %w", stoppedErr)
+	}
 	if rootErr != nil {
 		rootErr = fmt.Errorf("root cleanup: %w", rootErr)
 	}
-	return errors.Join(quiesceErr, traversalErr, rootErr)
+	return errors.Join(quiesceErr, traversalErr, stoppedErr, rootErr)
 }
 
 func killReaperRoot(ctx context.Context, cmd *exec.Cmd, ref reaperProcessRef) error {
@@ -182,6 +192,9 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 	if table == nil {
 		return fmt.Errorf("reaper: missing quiesced process table")
 	}
+	signalCtx, cancel := context.WithTimeout(ctx, reaperSignalTimeout)
+	defer cancel()
+	ctx = signalCtx
 	type tableState struct {
 		ref        reaperProcessRef
 		tombstoned bool
@@ -410,6 +423,36 @@ func killReaperProcessRefContext(ctx context.Context, ref reaperProcessRef) erro
 		return err
 	}
 	return nil
+}
+
+// killReaperStoppedRefs is intentionally independent of the traversal
+// context. A successful SIGSTOP reserves the PID until the process is
+// resumed or exits, so a retained process handle (or, on platforms without
+// pidfd, the still-reserved numeric PID) can be safely killed even when the
+// identity lookup budget has already expired.
+func killReaperStoppedRefs(refs []reaperProcessRef) error {
+	var errs []error
+	seen := make(map[int]struct{}, len(refs))
+	for _, ref := range refs {
+		if ref.pid <= 0 {
+			errs = append(errs, fmt.Errorf("invalid stopped process pid %d", ref.pid))
+			continue
+		}
+		if _, ok := seen[ref.pid]; ok {
+			continue
+		}
+		seen[ref.pid] = struct{}{}
+		var err error
+		if ref.process != nil {
+			err = ref.process.Signal(syscall.SIGKILL)
+		} else {
+			err = syscall.Kill(ref.pid, syscall.SIGKILL)
+		}
+		if err != nil && !reaperProcessRefGone(err) {
+			errs = append(errs, fmt.Errorf("kill stopped process %d: %w", ref.pid, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func reaperDescendantsWithLookupAndIdentity(ctx context.Context, root int, visit func(int) error, lookup reaperDescendantLookup, identify reaperDescendantIdentity) error {
@@ -763,34 +806,70 @@ func sameReaperPIDSet(first, second []int) bool {
 	return true
 }
 
-func quiesceReaperTree(ctx context.Context, root int) (map[int][]int, error) {
+type reaperQuiescedSnapshot struct {
+	table   map[int][]int
+	stopped []reaperProcessRef
+}
+
+// reaperProcessSubtree removes unrelated host edges before snapshots are
+// compared. The process-table helper necessarily reports the whole host,
+// but unrelated process churn must not prevent the target tree reaching a
+// fixed point.
+func reaperProcessSubtree(table map[int][]int, root int) map[int][]int {
+	pids := reaperTableDescendants(table, root)
+	inTree := make(map[int]struct{}, len(pids))
+	for _, pid := range pids {
+		inTree[pid] = struct{}{}
+	}
+	subtree := make(map[int][]int)
+	for _, parent := range pids {
+		for _, child := range table[parent] {
+			if _, ok := inTree[child]; !ok || child <= 0 {
+				continue
+			}
+			subtree[parent] = append(subtree[parent], child)
+		}
+	}
+	return subtree
+}
+
+func quiesceReaperTreeWithRefs(ctx context.Context, root int) (reaperQuiescedSnapshot, error) {
+	var result reaperQuiescedSnapshot
 	var lastErr error
-	var table map[int][]int
 	var previous map[int][]int
 	stablePasses := 0
+	stoppedSeen := make(map[int]struct{})
 	for pass := 0; pass < maxReaperDescendantSnapshotPasses; pass++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			result.table = previous
+			return result, errors.Join(lastErr, err)
 		}
-		var err error
-		table, err = reaperProcessTableSnapshot(ctx)
+		table, err := reaperProcessTableSnapshot(ctx)
 		if err != nil {
-			return nil, err
+			result.table = previous
+			return result, errors.Join(lastErr, err)
 		}
-		pids := reaperTableDescendants(table, root)
+		subtree := reaperProcessSubtree(table, root)
+		pids := reaperTableDescendants(subtree, root)
 		if len(pids) > maxReaperDescendantPIDs {
-			return nil, fmt.Errorf("%w: quiesce snapshot exceeded %d processes", errReaperDescendantLimit, maxReaperDescendantPIDs)
+			result.table = subtree
+			return result, fmt.Errorf("%w: quiesce snapshot exceeded %d processes", errReaperDescendantLimit, maxReaperDescendantPIDs)
 		}
-		if sameReaperProcessTable(previous, table) {
+		if sameReaperProcessTable(previous, subtree) {
 			stablePasses++
 			if stablePasses >= 1 {
-				return table, lastErr
+				result.table = subtree
+				return result, lastErr
 			}
 		} else {
 			stablePasses = 0
 		}
-		previous = table
+		previous = subtree
+		result.table = subtree
 		for _, pid := range pids {
+			if err := ctx.Err(); err != nil {
+				return result, errors.Join(lastErr, err)
+			}
 			ref, err := captureReaperProcessIdentityContext(ctx, pid)
 			if err != nil {
 				if !reaperProcessRefGone(err) {
@@ -805,12 +884,20 @@ func quiesceReaperTree(ctx context.Context, root int) (map[int][]int, error) {
 				}
 				continue
 			}
-			if err := ref.process.Signal(syscall.SIGSTOP); err != nil && !reaperProcessRefGone(err) {
-				lastErr = err
+			if err := ref.process.Signal(syscall.SIGSTOP); err != nil {
+				if !reaperProcessRefGone(err) {
+					lastErr = err
+				}
+				continue
+			}
+			if _, seen := stoppedSeen[pid]; !seen {
+				result.stopped = append(result.stopped, ref)
+				stoppedSeen[pid] = struct{}{}
 			}
 		}
 	}
-	return table, errors.Join(lastErr, errReaperDescendantLimit)
+	result.table = previous
+	return result, errors.Join(lastErr, errReaperDescendantLimit)
 }
 
 func trustedReaperPgrepPath() (string, error) {

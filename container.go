@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -182,10 +183,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
+		var reaperErr error
 		if c.uid != "" {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+			reaperErr = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
 		} else {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+			reaperErr = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		}
+		// An overflowing reaper cannot retain ownership of a newly-created
+		// container. Roll it back rather than returning a live container
+		// that would be silently lost if this process exits. Other reaper
+		// failures remain best-effort and are logged by the registration
+		// helper, preserving the documented normal cleanup fallback.
+		if errors.Is(reaperErr, errReaperRegistrationOverflow) {
+			return nil, c.rollback(ctx, fmt.Errorf("register watchdog reaper: %w", reaperErr))
 		}
 	}
 

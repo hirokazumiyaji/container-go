@@ -78,6 +78,7 @@ type activeEnvFile struct {
 	mu       sync.Mutex
 	lock     *os.File
 	dirInfo  os.FileInfo
+	rootInfo os.FileInfo
 	root     string
 	path     string
 	original string
@@ -234,6 +235,10 @@ func writeEnvFileAtWithRootContext(ctx context.Context, base string, env map[str
 }
 
 func createEnvFile(root string, env map[string]string) (path, dir string, err error) {
+	rootInfo, err := os.Lstat(root)
+	if err != nil {
+		return "", "", err
+	}
 	staging, err := os.MkdirTemp(root, envFileStagingPrefix)
 	if err != nil {
 		return "", "", err
@@ -338,6 +343,7 @@ func createEnvFile(root string, env map[string]string) (path, dir string, err er
 	activeEnvFiles.Store(dir, &activeEnvFile{
 		lock:     lock,
 		dirInfo:  dirInfo,
+		rootInfo: rootInfo,
 		root:     root,
 		path:     dir,
 		original: dir,
@@ -489,11 +495,32 @@ func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, rem
 		if err := validateEnvCleanupPath(root, dir); err != nil {
 			return err
 		}
+		ownedState := state.lock != nil || state.pending || state.dirInfo != nil || state.root != ""
+		currentRootInfo, err := os.Lstat(root)
+		if err != nil {
+			if ownedState {
+				return fmt.Errorf("%w: environment root %q is unavailable: %v", errUnsafeEnvFile, root, err)
+			}
+			return err
+		}
+		if ownedState {
+			if state.rootInfo == nil {
+				return fmt.Errorf("%w: environment root %q has no recorded identity", errUnsafeEnvFile, root)
+			}
+			if !os.SameFile(state.rootInfo, currentRootInfo) {
+				return fmt.Errorf("%w: environment root %q was replaced", errUnsafeEnvFile, root)
+			}
+		}
+		state.rootInfo = currentRootInfo
 		info, err := os.Lstat(dir)
 		if errors.Is(err, os.ErrNotExist) {
-			// A previous attempt may have removed the directory before a
-			// deferred close/release reported an error. The state remains
-			// owned until this idempotent retry observes the absence.
+			// A pending state whose lock was already released may have
+			// completed removal before a late error was reported. An active
+			// owned directory, however, cannot disappear and be treated as a
+			// successful cleanup: the root or directory was replaced.
+			if state.lock != nil || (ownedState && !state.pending) {
+				return fmt.Errorf("%w: environment directory %q disappeared while cleanup ownership was active", errUnsafeEnvFile, dir)
+			}
 			pathMissing = true
 			return nil
 		}
@@ -1152,9 +1179,6 @@ func withEnvFileRootContextWithClose(ctx context.Context, base string, fn func(s
 }
 
 func boundedEnvContext(ctx context.Context) (context.Context, context.CancelFunc) {
-	if _, ok := ctx.Deadline(); ok {
-		return ctx, func() {}
-	}
 	return context.WithTimeout(ctx, envFileSecurityTimeout)
 }
 

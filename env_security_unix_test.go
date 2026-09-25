@@ -272,6 +272,143 @@ func TestIssue97LateWriteErrorRetainsPublishedEnvOwnership(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
+type issue97RootReplacementRunner struct {
+	*fakeRunner
+	envPath string
+	root    string
+	oldRoot string
+}
+
+func (r *issue97RootReplacementRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	stdout, stderr, err := r.fakeRunner.Run(ctx, args...)
+	if err != nil || len(args) == 0 || args[0] != "run" {
+		return stdout, stderr, err
+	}
+	for i, arg := range args {
+		if arg == "--env-file" && i+1 < len(args) {
+			r.envPath = args[i+1]
+			break
+		}
+	}
+	if r.envPath == "" {
+		return stdout, stderr, errors.New("root replacement runner did not receive an env file")
+	}
+	dir := filepath.Dir(r.envPath)
+	r.root = filepath.Dir(dir)
+	r.oldRoot = r.root + "-old"
+	if renameErr := os.Rename(r.root, r.oldRoot); renameErr != nil {
+		return nil, nil, renameErr
+	}
+	return stdout, stderr, nil
+}
+
+func TestIssue97RunRetainsEnvOwnershipWhenCacheRootReplaced(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	isolateEnvFileRoot(t)
+	runner := &issue97RootReplacementRunner{fakeRunner: newTestRunner()}
+	defer func() {
+		if runner.envPath != "" {
+			dir := filepath.Dir(runner.envPath)
+			if state := loadEnvCleanupState(dir); state != nil {
+				state.mu.Lock()
+				lock := state.lock
+				state.lock = nil
+				state.mu.Unlock()
+				if lock != nil {
+					_ = closeEnvFileLock(lock)
+				}
+				clearEnvCleanupState(state)
+			}
+			_ = os.RemoveAll(dir)
+		}
+		if runner.oldRoot != "" {
+			_ = os.RemoveAll(runner.oldRoot)
+		}
+		if runner.root != "" {
+			_ = os.RemoveAll(runner.root)
+		}
+	}()
+
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("root-replaced"), WithEnv(map[string]string{"TOKEN": "secret"}),
+		withRunner(runner), withEngine(appleEngine{}))
+	if ctr == nil || ctr.ID() != "root-replaced" {
+		t.Fatalf("Run handle = %v, error = %v; want usable handle", ctr, err)
+	}
+	if err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("Run error = %v, want root replacement safety error", err)
+	}
+	if runner.oldRoot == "" {
+		t.Fatal("runner did not rename the cache root")
+	}
+
+	dir := filepath.Dir(runner.envPath)
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("root replacement dropped env cleanup ownership")
+	}
+	state.mu.Lock()
+	lock, recordedRoot := state.lock, state.rootInfo
+	state.mu.Unlock()
+	if lock == nil {
+		t.Fatal("root replacement released the owned env lock")
+	}
+	if recordedRoot == nil {
+		t.Fatal("env ownership did not persist the cache-root identity")
+	}
+	currentRoot, statErr := os.Lstat(runner.root)
+	if statErr != nil {
+		t.Fatal(statErr)
+	}
+	if os.SameFile(recordedRoot, currentRoot) {
+		t.Fatal("replacement root unexpectedly retained the old inode")
+	}
+	oldEnvDir := filepath.Join(runner.oldRoot, filepath.Base(dir))
+	if _, statErr := os.Stat(oldEnvDir); statErr != nil {
+		t.Fatalf("renamed env directory was lost: %v", statErr)
+	}
+}
+
+func TestIssue97CleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	root := isolateEnvFileRoot(t)
+	_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("write did not publish env ownership")
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupEnvFile(dir); err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("cleanup error = %v, want unsafe missing-path error", err)
+	}
+	state = loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("missing owned path cleared cleanup ownership")
+	}
+	state.mu.Lock()
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if lock == nil {
+		t.Fatal("missing owned path released the lock")
+	}
+	if err := closeEnvFileLock(lock); err != nil {
+		t.Logf("closing retained lock: %v", err)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(dir)
+	_ = os.RemoveAll(root)
+}
+
 func TestIssue97PendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")

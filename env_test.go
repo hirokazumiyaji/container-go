@@ -8,9 +8,62 @@ import (
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/wait"
 )
+
+func TestBoundedEnvContextCapsLongerCallerDeadline(t *testing.T) {
+	oldTimeout := envFileSecurityTimeout
+	envFileSecurityTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { envFileSecurityTimeout = oldTimeout })
+
+	parent, cancelParent := context.WithTimeout(context.Background(), time.Second)
+	defer cancelParent()
+	ctx, cancel := boundedEnvContext(parent)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("boundedEnvContext returned a context without a deadline")
+	}
+	if remaining := time.Until(deadline); remaining > 100*time.Millisecond {
+		t.Fatalf("bounded deadline = %v, want the shorter security timeout", remaining)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("bounded context error = %v, want deadline exceeded", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded context did not honor the security timeout")
+	}
+}
+
+func TestBoundedEnvContextPreservesEarlierCallerDeadline(t *testing.T) {
+	oldTimeout := envFileSecurityTimeout
+	envFileSecurityTimeout = time.Second
+	t.Cleanup(func() { envFileSecurityTimeout = oldTimeout })
+
+	parent, cancelParent := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancelParent()
+	ctx, cancel := boundedEnvContext(parent)
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("boundedEnvContext returned a context without a deadline")
+	}
+	if remaining := time.Until(deadline); remaining > 100*time.Millisecond {
+		t.Fatalf("bounded deadline = %v, want the earlier caller deadline", remaining)
+	}
+	select {
+	case <-ctx.Done():
+		if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			t.Fatalf("bounded context error = %v, want caller deadline exceeded", ctx.Err())
+		}
+	case <-time.After(time.Second):
+		t.Fatal("bounded context did not honor the earlier caller deadline")
+	}
+}
 
 func TestEnvValidationRejectsInvalidEntriesBeforeBackendCall(t *testing.T) {
 	cases := []struct {

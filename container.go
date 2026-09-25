@@ -330,8 +330,12 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inside that window is not detectable by name (see lockName). An
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
-func (c *Container) Terminate(ctx context.Context) error {
-	defer c.clearDiagnosticSecrets()
+func (c *Container) Terminate(ctx context.Context) (err error) {
+	defer func() {
+		if err == nil {
+			c.clearDiagnosticSecrets()
+		}
+	}()
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
 	}

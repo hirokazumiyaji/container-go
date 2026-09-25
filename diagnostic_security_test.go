@@ -217,6 +217,24 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 	}
 }
 
+func TestFailedTerminateRetainsDiagnosticSecrets(t *testing.T) {
+	const secret = "terminate-retained-secret-117"
+	f := newTestRunner()
+	ctr := runTestContainer(t, f, WithEnv(map[string]string{"TOKEN": secret}))
+	ctr.diagnosticSecrets = append(ctr.diagnosticSecrets, secret, "terminate-fallback-secret")
+	f.failPrefix = "delete"
+
+	if err := ctr.Terminate(context.Background()); err == nil {
+		t.Fatal("want terminate failure")
+	}
+	if ctr.diagnosticRedactorValue == nil || len(ctr.diagnosticSecrets) != 2 {
+		t.Fatalf("failed Terminate cleared diagnostics: matcher=%v secrets=%v", ctr.diagnosticRedactorValue != nil, ctr.diagnosticSecrets)
+	}
+	if strings.Contains(ctr.diagnosticRedactor().Text(secret), secret) || strings.Contains(ctr.diagnosticRedactor().Text("terminate-fallback-secret"), "terminate-fallback-secret") {
+		t.Fatal("retained diagnostic matcher cannot redact retained values")
+	}
+}
+
 func TestContainerUsesBoundedHashedDiagnosticMatcher(t *testing.T) {
 	const secret = "handle-lifetime-secret-117"
 	ctr := runTestContainer(t, newTestRunner(), WithEnv(map[string]string{"TOKEN": secret}))

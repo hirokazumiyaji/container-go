@@ -4,6 +4,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRedactorHandlesCommonSecretForms(t *testing.T) {
@@ -228,6 +229,98 @@ func TestStreamRedactorDropsOversizedStructuralLine(t *testing.T) {
 	}
 }
 
+func TestRedactTailDoesNotReconstructSecretAcrossEmissionCuts(t *testing.T) {
+	secret := "!" + strings.Repeat("s", 2*streamChunkSize+17)
+	firstCut := MaxStreamOverlap + streamChunkSize
+	secretStart := firstCut - streamChunkSize/2
+	input := strings.Repeat("x", secretStart) + secret + strings.Repeat("z", 15*MaxStreamOverlap/16) + "visible"
+	for _, tc := range []struct {
+		name string
+		new  func(string) *Redactor
+	}{
+		{name: "plaintext", new: func(value string) *Redactor { return NewContextRedactor(value) }},
+		{name: "hashed", new: func(value string) *Redactor { return NewHashedContextRedactor(value) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := tc.new(secret).RedactTail(strings.NewReader(input), 2*MaxStreamOverlap)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Contains(got, secret) || strings.Contains(got, secret[:streamChunkSize]) || strings.Contains(got, secret[streamChunkSize:]) {
+				t.Fatal("tail reconstructed a configured value across emission cuts")
+			}
+			if !strings.Contains(got, "visible") {
+				t.Fatalf("tail = %q, want later diagnostic", got)
+			}
+		})
+	}
+}
+
+func TestStreamRedactorDelaysCutsForConfiguredValues(t *testing.T) {
+	secret := "!" + strings.Repeat("s", 2*streamChunkSize+17)
+	input := strings.Repeat("x", 4*streamChunkSize+streamChunkSize/2) + secret + strings.Repeat("z", 4*streamChunkSize)
+	for _, tc := range []struct {
+		name string
+		new  func(string) *Redactor
+	}{
+		{name: "plaintext", new: func(value string) *Redactor { return NewContextRedactor(value) }},
+		{name: "hashed", new: func(value string) *Redactor { return NewHashedContextRedactor(value) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := tc.new(secret).NewStream(0)
+			stream.processor.overlap = 4 * streamChunkSize
+			if _, err := stream.Write([]byte(input)); err != nil {
+				t.Fatal(err)
+			}
+			if err := stream.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if got := stream.String(); strings.Contains(got, secret) {
+				t.Fatal("stream reconstructed a configured value across delayed cuts")
+			}
+		})
+	}
+}
+
+func TestStreamRedactorDiscardsMultilineSecretUntilTerminator(t *testing.T) {
+	stream := NewRedactor().NewStream(8 * MaxStreamOverlap)
+	continuation := "continued-secret\n"
+	input := "password=" + strings.Repeat("s", MaxStreamOverlap+streamChunkSize) + "\n" +
+		strings.Repeat(continuation, 80) + "\nvisible\n"
+	if _, err := stream.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := stream.String()
+	if strings.Contains(got, "continued-secret") || strings.Contains(got, strings.Repeat("s", 1024)) {
+		t.Fatalf("stream leaked an unbounded multiline secret: len=%d", len(got))
+	}
+	if !strings.Contains(got, "visible") {
+		t.Fatalf("stream = %q, want output after blank-line terminator", got)
+	}
+}
+
+func TestStreamRedactorDiscardsOversizedPEMUntilEndMarker(t *testing.T) {
+	stream := NewRedactor().NewStream(8 * MaxStreamOverlap)
+	input := "-----BEGIN PRIVATE KEY-----\n" + strings.Repeat("p", MaxStreamOverlap+streamChunkSize) +
+		"\n-----END PRIVATE KEY-----\nvisible\n"
+	if _, err := stream.Write([]byte(input)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := stream.String()
+	if strings.Contains(got, strings.Repeat("p", 1024)) {
+		t.Fatalf("stream leaked an oversized PEM value: len=%d", len(got))
+	}
+	if !strings.Contains(got, "visible") {
+		t.Fatalf("stream = %q, want output after PEM terminator", got)
+	}
+}
+
 func TestRedactTailIsBoundedAndPreservesReadError(t *testing.T) {
 	wantErr := errors.New("terminal read error")
 	input := &errorAfterReader{data: []byte(strings.Repeat("a", 4096)), err: wantErr}
@@ -295,6 +388,20 @@ func TestStructuralRedactionDoesNotTrustPublicRedactionMarker(t *testing.T) {
 	}
 	if !strings.Contains(got, Redacted) {
 		t.Fatalf("Text() = %q, want a redaction", got)
+	}
+}
+
+func TestRedactorHandlesManyUnterminatedCookieObjectsLinearly(t *testing.T) {
+	input := strings.Repeat(`"cookie":{"session":"value",`, 10000)
+	done := make(chan string, 1)
+	go func() { done <- NewRedactor().Text(input) }()
+	select {
+	case got := <-done:
+		if len(got) == 0 {
+			t.Fatal("unterminated cookie input produced no diagnostic")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("unterminated cookie input took too long")
 	}
 }
 

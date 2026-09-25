@@ -46,6 +46,12 @@ func privateRedactionSentinel(s string) string {
 	return strings.Repeat("\x00", longestRun+1)
 }
 
+var secretMarkerWords = []string{
+	"password", "passwd", "secret", "token", "api-key", "api_key", "apikey", "access-key", "access_key", "accesskey",
+	"private-key", "private_key", "privatekey", "client-secret", "client_secret", "clientsecret", "credential", "credentials",
+	"authorization", "signature", "jwt",
+}
+
 var (
 	// These expressions deliberately use ASCII name characters rather
 	// than \b: underscore is a word character in the secret names this
@@ -448,8 +454,10 @@ func redactCookieObjects(s, replacement string) string {
 		}
 		end := matchingBrace(s, j)
 		if end < 0 {
-			i = keyEnd
-			continue
+			// An unterminated object consumes the rest of this pass. Stop
+			// instead of retrying the suffix from every cookie-looking key,
+			// which would make malformed input quadratic.
+			return s
 		}
 		b.WriteString(s[last : j+1])
 		b.WriteString(replacement)
@@ -862,7 +870,29 @@ func redactURLCredentials(s, replacement string) string {
 	})
 }
 
+func hasSecretMarker(s string) bool {
+	lower := strings.ToLower(s)
+	for _, marker := range secretMarkerWords {
+		if strings.Contains(lower, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasSecretMarkerBytes(s []byte) bool {
+	for _, marker := range secretMarkerWords {
+		if containsFoldASCII(s, []byte(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
 func redactSecretShaped(s, replacement string) string {
+	if !hasSecretMarker(s) {
+		return s
+	}
 	return secretShapedRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := secretShapedRE.FindStringSubmatch(match)
 		if len(parts) != 3 {

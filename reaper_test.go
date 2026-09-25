@@ -1,3 +1,5 @@
+//go:build !windows
+
 package container
 
 import (
@@ -44,7 +46,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
-	r := newReaper(bin, "delete")
+	r := newReaper(bin, "rm")
 
 	first := strings.Repeat("a", 64)
 	second := strings.Repeat("b", 64)
@@ -59,7 +61,75 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	// dies, however it dies.
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force "+first, "delete --force "+second)
+	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
+}
+
+func TestReaperPendingEntryRechecksLateCreate(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	counterPath := filepath.Join(dir, "counter")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  n=$(cat " + counterPath + " 2>/dev/null || echo 0)\n" +
+		"  n=$((n + 1)); echo \"$n\" > " + counterPath + "\n" +
+		"  if [ \"$n\" -lt 2 ]; then exit 1; fi\n" +
+		"  echo '    \"" + creationLabel + "\": \"0123456789abcdef\",'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	r.pendingAttempts = 4
+	if err := r.registerPending("late", "0123456789abcdef"); err != nil {
+		t.Fatalf("registerPending: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect late", "delete --force late")
+}
+
+func TestReaperCompletionStopsPendingRecheck(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	// The completion marker changes the record to active; the inspect
+	// response still proves the generation before deletion.
+	raw, err := os.ReadFile(bin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = append(raw, []byte("if [ \"$1\" = inspect ]; then echo '    \""+creationLabel+"\": \"0123456789abcdef\",'; exit 0; fi\n")...)
+	if err := os.WriteFile(bin, raw, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "delete")
+	if err := r.registerPending("complete", "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.completePending("complete", "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force complete")
+}
+
+func TestReaperPromotesPendingDockerEntryToImmutableID(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	if err := r.registerPending("pending-docker", "0123456789abcdef"); err != nil {
+		t.Fatal(err)
+	}
+	uid := strings.Repeat("ab", 32)
+	if err := r.promotePendingToDockerID("pending-docker", "0123456789abcdef", uid); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].id != uid {
+		t.Fatalf("entries = %+v, want immutable ID %q", entries, uid)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
 }
 
 func TestReaperRejectsInvalidID(t *testing.T) {
@@ -79,7 +149,7 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
-	r := newReaper(bin, "delete")
+	r := newReaper(bin, "rm")
 
 	before := strings.Repeat("c", 64)
 	after := strings.Repeat("d", 64)
@@ -96,11 +166,11 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	}
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force "+before, "delete --force "+after)
+	waitForLogLines(t, logPath, "rm --force "+before, "rm --force "+after)
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
+	if !strings.Contains(reaperScript, `sleep "$timeout"`) || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
 	// The creation label must be read as a structural JSON field, anchored
@@ -108,7 +178,7 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
 		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ]`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
 }
@@ -121,7 +191,7 @@ func TestBreQuoteEscapesLabelKey(t *testing.T) {
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
-	r := newReaper(bin, "delete")
+	r := newReaper(bin, "rm")
 	r.spawnFailures = 2
 	if err := r.register(strings.Repeat("e", 64), ""); err != nil {
 		t.Fatalf("register: %v", err)

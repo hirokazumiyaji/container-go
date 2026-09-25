@@ -61,6 +61,7 @@ func ownedInspectJSON(name string) string {
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
         "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
         "com.github.hirokazumiyaji.container-go.creation": "__CREATION__"
       }
     },
@@ -162,7 +163,7 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	}
 }
 
-func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
+func TestReuseCreateFailureRetainsAmbiguousGeneration(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
 	// reuseCreate inspects first: report not-found once, then owned after failed run.
@@ -181,8 +182,8 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	if !strings.Contains(err.Error(), "entrypoint") {
 		t.Fatalf("error = %v, want run failure", err)
 	}
-	if len(inner.deleted) != 1 {
-		t.Fatalf("deleted = %v, want cleanup", inner.deleted)
+	if len(inner.deleted) != 0 {
+		t.Fatalf("deleted = %v, reused ambiguous generation must be retained", inner.deleted)
 	}
 }
 

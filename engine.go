@@ -20,6 +20,14 @@ type engineInfo struct {
 	// reports it. It is used to resolve a complete OCI platform without
 	// confusing a mutable image tag with the image the container uses.
 	imageID string
+	// imageDigest is the OCI descriptor digest reported for the image.
+	imageDigest string
+	// created is Docker's creation timestamp. It is an additional
+	// identity witness when a backend reuses a name during inspection.
+	created string
+	// createdAt is a compatibility alias for adapters that expose the
+	// same Docker field under a descriptive Go name.
+	createdAt string
 	// platform is the complete OCI platform reported by inspect when
 	// available. Docker's top-level Platform field may contain only the
 	// OS; the Docker adapter enriches it from image inspect when needed.
@@ -30,6 +38,17 @@ type engineInfo struct {
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort
+}
+
+// pruneCandidate carries the identity observed during a list operation.
+// Apple addresses containers by name, so the later delete must revalidate
+// this snapshot under the stable name lock.
+type pruneCandidate struct {
+	id         string
+	creation   string
+	state      State
+	managed    bool
+	reuseGroup string
 }
 
 type boundPort struct {
@@ -65,15 +84,17 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the IDs of
-	// stopped containers this library created.
-	parseStoppedManaged(data []byte) ([]string, error)
+	// parseStoppedManaged extracts stopped managed candidates and the
+	// identity metadata needed to revalidate a name-addressed delete.
+	parseStoppedManaged(data []byte) ([]pruneCandidate, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
-	// output that carry the given reuse group.
-	parseReuseGroupIDs(data []byte, group string) ([]string, error)
+	// parseReuseGroupIDs extracts candidates carrying the given group.
+	parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error)
+	// nameAddressedDeletes reports whether deletes target a name rather
+	// than an immutable backend ID.
+	nameAddressedDeletes() bool
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool

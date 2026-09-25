@@ -66,7 +66,7 @@ type lsRunner struct {
 }
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "ls" {
+	if args[0] == "ls" || args[0] == "inspect" {
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
@@ -74,7 +74,7 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}},
   {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
@@ -102,6 +102,34 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	}
 	if !slices.Equal(deleted, []string{"managed-stopped"}) {
 		t.Errorf("deleted = %v", deleted)
+	}
+}
+
+func TestDockerPruneIDListRevalidatesOwnershipAndGroup(t *testing.T) {
+	uid := strings.Repeat("a", 64)
+	candidates, err := (dockerEngine{}).parseReuseGroupIDs([]byte(uid+"\n"), "group-a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 || candidates[0].reuseGroup != "group-a" {
+		t.Fatalf("candidates = %+v", candidates)
+	}
+	fresh := &engineInfo{
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:    "true",
+			reuseLabel:      "true",
+			reuseGroupLabel: "group-a",
+			creationLabel:   "0123456789abcdef",
+		},
+		uid: uid,
+	}
+	if !pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
+		t.Fatal("matching Docker ID candidate was rejected")
+	}
+	fresh.state = StateRunning
+	if pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
+		t.Fatal("running Docker candidate was accepted")
 	}
 }
 

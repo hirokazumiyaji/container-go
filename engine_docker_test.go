@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
@@ -95,8 +96,11 @@ func TestDockerParseInspect(t *testing.T) {
 	if info.ip != "172.17.0.2" {
 		t.Errorf("ip = %q", info.ip)
 	}
-	if info.image != "redis:7-alpine" {
+	if !strings.HasPrefix(info.image, "redis:7-alpine@sha256:") {
 		t.Errorf("image = %q", info.image)
+	}
+	if info.created == "" || !validDockerImageID(info.imageID) {
+		t.Errorf("creation/image identity = %q/%q", info.created, info.imageID)
 	}
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
@@ -151,11 +155,19 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 		t.Errorf("listArgs = %v, want daemon-side filters", got)
 	}
 	ids, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	if err == nil {
+		t.Fatal("parseStoppedManaged accepted malformed IDs")
+	}
+	if ids != nil {
+		t.Errorf("ids = %v", ids)
+	}
+	valid := strings.Repeat("a", 64) + "\n" + strings.Repeat("b", 64)
+	candidates, err := e.parseStoppedManaged([]byte(valid))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []string{"one", "two"}) {
-		t.Errorf("ids = %v", ids)
+	if len(candidates) != 2 || candidates[0].id != strings.Repeat("a", 64) || candidates[1].id != strings.Repeat("b", 64) {
+		t.Errorf("candidates = %v", candidates)
 	}
 }
 
@@ -168,23 +180,36 @@ type dockerRunner struct {
 	*fakeRunner
 	inspectJSON []byte
 	failInspect bool
+	creation    string
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	d.calls = append(d.calls, args)
 	switch args[0] {
+	case "image":
+		if len(args) > 1 && args[1] == "inspect" {
+			return []byte(`[{"Id":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","RepoDigests":["docker.io/library/redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}]`), nil, nil
+		}
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					d.creation = value
+				}
+			}
+		}
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
-		return d.inspectJSON, nil, nil
+		return bytes.ReplaceAll(d.inspectJSON, []byte("__CONTAINER_CREATION__"), []byte(d.creation)), nil, nil
 	default:
 		return nil, nil, nil
 	}
+	return nil, nil, nil
 }
 
 func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {

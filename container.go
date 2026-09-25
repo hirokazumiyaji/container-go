@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -38,6 +39,9 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock.
+	terminateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -107,6 +111,11 @@ type Container struct {
 	// identityOptional is used only for short-lived name lookups before a
 	// reuse/cleanup caller has established which generation it owns.
 	identityOptional bool
+	// imageIdentity/image are the immutable image target pinned before
+	// create. image is retained as the concise handle field used by the
+	// image-identity contract; both are kept in sync for compatibility.
+	imageIdentity imageIdentity
+	image         imageIdentity
 
 	// inspectMu protects uid and serializes target-bound inspects. The
 	// identity cache is protected separately by mu.
@@ -166,24 +175,60 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
-	// The pull policy brings the image into the local store before the
-	// run command; both share the aggregated flight so concurrent Runs
-	// of the same image pull once.
-	if err := cfg.ensureImage(runCtx, image); err != nil {
+	// Resolve the image once, before create, and pass the immutable
+	// reference to the backend. A mutable tag may be used only when the
+	// caller explicitly opted into that compatibility escape hatch.
+	imageIdentity, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	// Register before the create command. If the process dies between the
+	// backend acknowledging the run and Run receiving stdout, the pending
+	// reaper entry rechecks the name for a bounded settling window.
+	reaperBin := ""
+	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
+		reaperBin = er.ExternalBinary()
+		if reaperBin == "" {
+			reaperBin = cfg.eng.binary()
+		}
+		if validCreationGeneration(cfg.creation) {
+			if err := preRegisterWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation); err != nil {
+				log.Printf("container-go: reaper pre-registration failed: %v", err)
+			}
+		}
+	}
+	runImage := image
+	if imageIdentity.reference != "" {
+		runImage = imageIdentity.reference
+	}
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, runImage, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		if keepContainers() {
+			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
+			return retained, withCleanupError(classified, retainedErr)
+		}
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
+	if reaperBin != "" && validCreationGeneration(cfg.creation) {
+		if cfg.eng.name() == "docker" && validDockerUID(uid) {
+			if err := promotePendingDockerIDWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, uid); err != nil {
+				log.Printf("container-go: reaper immutable-ID promotion failed: %v", err)
+			}
+		} else if err := completePendingWithGlobalReaper(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation); err != nil {
+			log.Printf("container-go: reaper completion failed: %v", err)
+		}
+	}
 	if cfg.eng.name() == "docker" && !validDockerUID(uid) {
 		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
-		cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
-		return nil, identityErr
+		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
+		return nil, withCleanupError(identityErr, cleanupErr)
 	}
 	c := &Container{
 		id:                cfg.name,
@@ -194,26 +239,24 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		creation:          cfg.creation,
 		uid:               uid,
 		requestedPlatform: cfg.platform,
+		imageIdentity:     imageIdentity,
+		image:             imageIdentity,
 	}
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. Docker must be
-	// registered by its immutable UID; Apple is registered by a valid
-	// generation because it has no immutable target.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
+	// A successful create is not enough: the backend may have resolved a
+	// tag to a different local image. Bind the handle only after checking
+	// the container's immutable image identity against the pre-create pin.
+	if imageIdentity.pinned {
+		info, inspectErr := c.inspectFresh(ctx)
+		if inspectErr != nil {
+			return nil, c.rollback(ctx, inspectErr)
 		}
-		if cfg.eng.name() == "docker" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
-		} else if validCreationGeneration(cfg.creation) {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		if err := verifyContainerImageIdentity(c, info); err != nil {
+			return rollbackResult(ctx, c, err)
 		}
 	}
-
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, c.rollback(ctx, err)
+			return rollbackResult(ctx, c, err)
 		}
 	}
 	if cfg.waitStrategy != nil {
@@ -224,7 +267,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			if tail != "" {
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, c.rollback(ctx, err)
+			return rollbackResult(ctx, c, err)
 		}
 	}
 	return c, nil
@@ -235,63 +278,76 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	if c == nil || c.reused {
+		return cause
+	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		return withCleanupError(cause, fmt.Errorf("container %s left behind: %w", c.id, err))
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes only a container that can be tied to this
+// exact create. It never treats an ambiguous running generation as an
+// owned failure: a peer may have adopted it while the create command was
+// still reporting an error.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
 	}
 	defer unlock()
-	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+
+	ctr := namedContainer(cfg, cfg.name)
+	info, err := ctr.inspectFreshLocked(cleanupCtx)
 	if err != nil {
-		return
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
 	}
-	if info.labels[managedLabel] != "true" {
-		return
+	if !failedCreateOwned(cfg, info) {
+		return nil
 	}
-	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+	if info.state != StateStopped && info.state != StateCreated {
+		return fmt.Errorf("cleanup container %s: %s generation may already be adopted; refusing automatic deletion", cfg.name, info.state)
 	}
-	if !validCreationGeneration(cfg.creation) {
-		return
-	}
-	actual, ok := info.labels[creationLabel]
-	if !ok || !validCreationGeneration(actual) || actual != cfg.creation {
-		return
-	}
-	var target string
-	switch cfg.eng.name() {
-	case "docker":
+	if cfg.eng.name() == "docker" {
 		if !validDockerUID(info.uid) {
-			return
+			return fmt.Errorf("cleanup container %s: inspect returned no valid Docker ID", cfg.name)
 		}
-		target = info.uid
-	case "apple":
-		if info.uid != "" {
-			return
-		}
-		target = cfg.name
-	default:
-		return
+		return ctr.delete(cleanupCtx, info.uid)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
-	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if cfg.eng.name() == "apple" {
+		if info.uid != "" {
+			return fmt.Errorf("cleanup container %s: Apple inspect returned an unexpected ID", cfg.name)
+		}
+		return ctr.delete(cleanupCtx, cfg.name)
+	}
+	return fmt.Errorf("cleanup container %s: unknown backend", cfg.name)
+}
+
+func failedCreateOwned(cfg *config, info *engineInfo) bool {
+	if info == nil || info.labels[managedLabel] != "true" ||
+		info.labels[sessionLabel] != sessionID() {
+		return false
+	}
+	if !validCreationGeneration(cfg.creation) ||
+		info.labels[creationLabel] != cfg.creation {
+		return false
+	}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return false
+	}
+	return validateReuseIdentity(cfg.eng, info) == nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -394,6 +450,15 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, func()
 		if !validDockerUID(uid) {
 			return "", noop, generationReplaced(c.id)
 		}
+		if c.reused {
+			info, err := c.inspectFresh(ctx)
+			if err != nil {
+				return "", noop, err
+			}
+			if err := c.validateHandleInfo(info); err != nil {
+				return "", noop, err
+			}
+		}
 		return uid, noop, nil
 	}
 	if c.eng.name() != "apple" {
@@ -406,11 +471,15 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, func()
 	if err != nil {
 		return "", noop, fmt.Errorf("lock name: %w", err)
 	}
-	_, err = c.inspectFreshLocked(ctx)
+	info, err := c.inspectFreshLocked(ctx)
 	if err != nil {
 		unlock()
 		// inspectFreshLocked already joins the replacement sentinel
 		// with a missing reused target; do not duplicate its text.
+		return "", noop, err
+	}
+	if err := c.validateHandleInfo(info); err != nil {
+		unlock()
 		return "", noop, err
 	}
 	return c.id, unlock, nil
@@ -461,6 +530,21 @@ func (c *Container) Terminate(ctx context.Context) error {
 	c.inspectMu.RUnlock()
 	if c.eng.name() == "docker" {
 		if validDockerUID(uid) {
+			if c.reused {
+				info, err := c.inspectFresh(ctx)
+				if err != nil {
+					if isNotFound(err) {
+						return nil
+					}
+					return fmt.Errorf("terminate %s: verify reused Docker identity: %w", c.id, err)
+				}
+				if err := validateReuseIdentity(c.eng, info); err != nil ||
+					info.uid != uid || info.labels[managedLabel] != "true" ||
+					info.labels[reuseLabel] != "true" || !validCreationGeneration(info.labels[creationLabel]) ||
+					info.labels[creationLabel] != creation {
+					return generationReplaced(c.id)
+				}
+			}
 			return c.delete(ctx, uid)
 		}
 		// A just-created handle may resolve a missing run ID once, but
@@ -502,12 +586,21 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
-	_, err = c.inspectFreshLocked(ctx)
+	info, err := c.inspectFreshLocked(ctx)
 	if isNotFound(err) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+	}
+	if err := validateReuseIdentity(c.eng, info); err != nil ||
+		info.labels[managedLabel] != "true" ||
+		!validCreationGeneration(info.labels[creationLabel]) ||
+		info.labels[creationLabel] != creation {
+		return generationReplaced(c.id)
+	}
+	if c.reused && info.labels[reuseLabel] != "true" {
+		return generationReplaced(c.id)
 	}
 	// The locked, identity-bound inspect has already rejected a missing,
 	// malformed, or different Apple generation. The only safe target is
@@ -610,6 +703,9 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 		return "", 0, err
 	}
 	if published != nil {
+		if c.reused && !hasPublishedBinding(info.bound, *published) {
+			return "", 0, fmt.Errorf("published port %s is no longer bound as requested", published.raw)
+		}
 		addr := published.connectAddr()
 		if !c.eng.directIP() {
 			addr = dockerConnectHost(addr, c.eng)
@@ -656,6 +752,36 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 // bindInspectInfo validates the identity represented by info and records
 // an immutable snapshot. It is deliberately strict for reused handles:
 // missing or malformed generation/UID values are replacement errors.
+func (c *Container) validateHandleInfo(info *engineInfo) error {
+	if err := validateReuseIdentity(c.eng, info); err != nil {
+		return generationReplaced(c.id)
+	}
+	if info.labels[managedLabel] != "true" ||
+		!validCreationGeneration(info.labels[creationLabel]) {
+		return generationReplaced(c.id)
+	}
+	c.inspectMu.RLock()
+	creation := c.creation
+	c.inspectMu.RUnlock()
+	if !validCreationGeneration(creation) || info.labels[creationLabel] != creation {
+		return generationReplaced(c.id)
+	}
+	if c.reused && info.labels[reuseLabel] != "true" {
+		return generationReplaced(c.id)
+	}
+	expected := c.imageIdentity
+	if !expected.pinned {
+		expected = c.image
+	}
+	if expected.pinned {
+		observed := containerImageIdentity(c.eng, info)
+		if !observed.pinned || !imageIdentitiesCompatible(expected, observed) {
+			return generationReplaced(c.id)
+		}
+	}
+	return nil
+}
+
 func (c *Container) bindInspectInfo(info *engineInfo) error {
 	if info == nil {
 		return withGenerationReplaced(c.id, errIdentity("empty inspect result"))
@@ -671,14 +797,15 @@ func (c *Container) bindInspectInfo(info *engineInfo) error {
 		if !validDockerUID(info.uid) {
 			return withGenerationReplaced(c.id, errIdentity("Docker inspect returned no valid immutable container ID"))
 		}
+		if !validCreationGeneration(creation) || !validCreationGeneration(info.labels[creationLabel]) ||
+			info.labels[creationLabel] != creation {
+			return withGenerationReplaced(c.id, errIdentity("Docker inspect returned no matching creation generation"))
+		}
 		if uid != "" {
 			if !validDockerUID(uid) || info.uid != uid {
 				return generationReplaced(c.id)
 			}
-		} else if !bootstrap || !validCreationGeneration(creation) ||
-			info.labels[creationLabel] != creation {
-			// A name lookup can bind a just-created handle only when
-			// its own generation label proves ownership.
+		} else if !bootstrap {
 			return generationReplaced(c.id)
 		}
 		if uid == "" {
@@ -699,7 +826,12 @@ func (c *Container) bindInspectInfo(info *engineInfo) error {
 	default:
 		return errIdentity("unknown backend cannot bind a container identity")
 	}
-
+	if info.labels[managedLabel] != "true" || (c.reused && info.labels[reuseLabel] != "true") {
+		return generationReplaced(c.id)
+	}
+	if c.eng.name() == "docker" && strings.TrimSpace(dockerCreation(info)) == "" {
+		return generationReplaced(c.id)
+	}
 	c.mu.Lock()
 	if c.info != nil && !sameEngineIdentity(c.eng, c.info, info) {
 		c.mu.Unlock()
@@ -750,6 +882,9 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		info.platform, err = resolveContainerPlatform(qCtx, c.eng, c.runner, info, c.requestedPlatform)
 		if err != nil {
 			return nil, fmt.Errorf("resolve container platform: %w", err)
+		}
+		if err := checkPlatformCompatibility(c.requestedPlatform, info.platform); err != nil {
+			return nil, fmt.Errorf("container platform: %w", err)
 		}
 	}
 	if !c.identityOptional {

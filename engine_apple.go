@@ -36,8 +36,6 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-func (appleEngine) checkConfig(*config) error { return nil }
-
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {
@@ -63,11 +61,17 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			continue
 		}
 		platform := c.Configuration.Platform
+		image := c.Configuration.Image.Reference
+		imageDigest := c.Configuration.Image.Descriptor.Digest
+		if image != "" && validImageDigest(imageDigest) {
+			image = stripImageDigest(image) + "@" + imageDigest
+		}
 		info := &engineInfo{
-			state:    State(c.Status.State),
-			labels:   c.Configuration.Labels,
-			image:    c.Configuration.Image.Reference,
-			platform: formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
+			state:       State(c.Status.State),
+			labels:      c.Configuration.Labels,
+			image:       image,
+			imageDigest: imageDigest,
+			platform:    formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -147,20 +151,28 @@ func (appleEngine) listArgs() []string {
 	return []string{"ls", "--all", "--format", "json"}
 }
 
-// parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter.
-func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
+// parseStoppedManaged filters client-side and retains the list-time
+// identity needed to close the Apple name-addressed delete race.
+func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[managedLabel] == "true" && c.Status.State == string(StateStopped) {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[managedLabel] != "true" || c.Status.State != string(StateStopped) {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    true,
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
 
 func (appleEngine) imageInspectArgs(image, _ string) []string {
@@ -179,45 +191,237 @@ func (appleEngine) imageMissing(err error) bool {
 	return appleStderrContains(err, appleStderrNotFound)
 }
 
+type appleImageDescriptor struct {
+	Digest string `json:"digest"`
+}
+
+type appleImageVariant struct {
+	Digest   string `json:"digest"`
+	Platform struct {
+		OS           string `json:"os"`
+		Architecture string `json:"architecture"`
+		Variant      string `json:"variant"`
+	} `json:"platform"`
+}
+
+type appleImageInspectRecord struct {
+	ID            string               `json:"id"`
+	Reference     string               `json:"reference"`
+	Name          string               `json:"name"`
+	Descriptor    appleImageDescriptor `json:"descriptor"`
+	Configuration struct {
+		Name       string               `json:"name"`
+		Reference  string               `json:"reference"`
+		Descriptor appleImageDescriptor `json:"descriptor"`
+		Image      struct {
+			Reference  string               `json:"reference"`
+			Descriptor appleImageDescriptor `json:"descriptor"`
+		} `json:"image"`
+	} `json:"configuration"`
+	Variants []appleImageVariant `json:"variants"`
+}
+
+func (appleEngine) imageIdentityNeedsLocalCheck() bool { return true }
+
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
+	identity, exists := (appleEngine{}).parseImageIdentity(data, "", platform)
+	return exists && !identity.notLocal
+}
+
+// parseImageIdentity reads the root index descriptor exposed by current
+// Apple Container releases and also accepts the older flat image shape.
+// When a platform is selected, the root remains the run identity while
+// the selected variant is retained as validation metadata.
+func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool) {
+	var records []appleImageInspectRecord
+	if err := json.Unmarshal(data, &records); err != nil {
+		return imageIdentity{}, true
+	}
+	if len(records) == 0 {
+		return imageIdentity{}, false
+	}
+	record := records[0]
+	rootDigest, rootOK := appleRootDescriptorDigest(record)
+	if platform != "" {
+		variantDigest, variantOK := applePlatformVariantDigest(record, platform)
+		if !variantOK {
+			return imageIdentity{
+				notLocal:       true,
+				notLocalReason: "Apple image inspect has no complete matching platform variant",
+				platform:       platform,
+			}, true
+		}
+		if !rootOK {
+			return imageIdentity{}, true
+		}
+		return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest), true
+	}
+	if !rootOK && appleDescriptorPresent(record) {
+		return imageIdentity{}, true
+	}
+	return finishAppleImageIdentity(image, record, rootDigest, "", ""), true
+}
+
+func appleRootDescriptorDigest(record appleImageInspectRecord) (string, bool) {
+	var digest string
+	for _, candidate := range []string{
+		record.Configuration.Descriptor.Digest,
+		record.Configuration.Image.Descriptor.Digest,
+		record.Descriptor.Digest,
+	} {
+		if candidate == "" {
+			continue
+		}
+		if !validImageDigest(candidate) {
+			return "", false
+		}
+		if digest != "" && !strings.EqualFold(digest, candidate) {
+			return "", false
+		}
+		digest = candidate
+	}
+	return digest, digest != ""
+}
+
+func appleDescriptorPresent(record appleImageInspectRecord) bool {
+	return record.Configuration.Descriptor.Digest != "" ||
+		record.Configuration.Image.Descriptor.Digest != "" ||
+		record.Descriptor.Digest != ""
+}
+
+type applePlatform struct {
+	os           string
+	architecture string
+	variant      string
+}
+
+func parseApplePlatformSelector(platform string) (applePlatform, bool) {
+	parts := strings.Split(strings.ToLower(strings.TrimSpace(platform)), "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" ||
+		(len(parts) == 3 && parts[2] == "") {
+		return applePlatform{}, false
+	}
+	variant := ""
+	if len(parts) == 3 {
+		variant = parts[2]
+	} else {
+		switch parts[1] {
+		case "arm", "armhf", "armel":
+			variant = "v7"
+		case "aarch64", "arm64":
+			variant = "v8"
+		}
+	}
+	return canonicalApplePlatform(parts[0], parts[1], variant), true
+}
+
+func canonicalApplePlatform(osName, architecture, variant string) applePlatform {
+	p := applePlatform{os: osName, architecture: architecture, variant: variant}
+	switch architecture {
+	case "aarch64", "arm64":
+		p.architecture = "arm64"
+		if variant == "" || variant == "v8" || variant == "8" {
+			p.variant = "v8"
+		}
+	case "x86_64", "x86-64", "amd64":
+		p.architecture = "amd64"
+		if variant == "v1" {
+			p.variant = ""
+		}
+	case "armhf", "armel":
+		p.architecture = "arm"
+	}
+	return p
+}
+
+func applePlatformsEqual(want, have applePlatform) bool {
+	return want.os == have.os && want.architecture == have.architecture && want.variant == have.variant
+}
+
+func applePlatformVariantDigest(record appleImageInspectRecord, platform string) (string, bool) {
+	if len(record.Variants) == 0 {
+		return "", false
+	}
+	want, ok := parseApplePlatformSelector(platform)
+	if !ok {
+		return "", false
+	}
+	selected := ""
+	for _, variant := range record.Variants {
+		if variant.Platform.OS == "" || variant.Platform.Architecture == "" || !validImageDigest(variant.Digest) {
+			return "", false
+		}
+		have := canonicalApplePlatform(variant.Platform.OS, variant.Platform.Architecture, variant.Platform.Variant)
+		if applePlatformsEqual(want, have) {
+			selected = variant.Digest
+			break
+		}
+	}
+	return selected, selected != ""
+}
+
+func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest, platform, variantDigest string) imageIdentity {
+	reference := record.Configuration.Name
+	if reference == "" {
+		reference = record.Configuration.Reference
+	}
+	if reference == "" {
+		reference = record.Configuration.Image.Reference
+	}
+	if reference == "" {
+		reference = record.Reference
+	}
+	if reference == "" {
+		reference = record.Name
+	}
+	if isImageID(requested) || isBareImageID(requested) {
+		if imageReferenceBase(reference) == "" || !validImageDigest(digest) {
+			return imageIdentity{}
+		}
+		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
+			return imageIdentity{mismatch: true}
+		}
+	} else if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
+		requestedDigest := imageDigest(requested)
+		if requestedDigest == "" || imageDigest(reference) != "" || imageRepository(requested) != imageRepository(reference) {
+			return imageIdentity{mismatch: true}
+		}
+	}
+	if validImageDigest(digest) {
+		identity := imageReferenceWithDigest(requested, reference, digest, "")
+		identity.platform = platform
+		identity.variantDigest = variantDigest
+		identity.mutableAlias = isRepositoryDigestReference(requested)
+		return identity
+	}
+	if isImageID(record.ID) {
+		return imageIdentity{}
+	}
+	if len(record.ID) == 64 && isHex(record.ID) {
+		identity := imageReferenceWithDigest(requested, reference, "sha256:"+record.ID, "")
+		identity.platform = platform
+		identity.variantDigest = variantDigest
+		identity.mutableAlias = isRepositoryDigestReference(requested)
+		return identity
+	}
+	return imageIdentity{}
+}
+
+func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
+	requestedDigest := requested
+	if isBareImageID(requested) {
+		requestedDigest = "sha256:" + requested
+	}
+	if (!isImageID(requested) && !isBareImageID(requested)) || !validImageDigest(digest) || !strings.EqualFold(digest, requestedDigest) {
 		return false
 	}
-	if platform == "" {
+	if recordID == "" {
 		return true
 	}
-	var images []struct {
-		Variants []struct {
-			Platform struct {
-				Os           string `json:"os"`
-				Architecture string `json:"architecture"`
-				Variant      string `json:"variant"`
-			} `json:"platform"`
-		} `json:"variants"`
+	if strings.HasPrefix(recordID, "sha256:") {
+		return isImageID(recordID) && strings.EqualFold(recordID, digest)
 	}
-	if err := json.Unmarshal(data, &images); err != nil {
-		return true
-	}
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
-	for _, img := range images {
-		if len(img.Variants) == 0 {
-			return true
-		}
-		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != wantOS {
-				continue
-			}
-			if wantArch != "" && v.Platform.Architecture != wantArch {
-				continue
-			}
-			if wantVariant != "" && v.Platform.Variant != wantVariant {
-				continue
-			}
-			return true
-		}
-	}
-	return false
+	return len(recordID) == 64 && isHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
 }
 
 func splitPlatform(p string) (os, arch, variant string) {
@@ -238,19 +442,29 @@ func (appleEngine) listReuseGroupArgs(string) []string {
 	return []string{"ls", "--all", "--format", "json"}
 }
 
-func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
+func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[reuseGroupLabel] == group {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[reuseGroupLabel] != group {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    labels[managedLabel] == "true",
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
+
+func (appleEngine) nameAddressedDeletes() bool { return true }
 
 // nameConflict matches Apple Container's duplicate-name wording.
 func (appleEngine) nameConflict(err error) bool {

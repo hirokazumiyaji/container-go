@@ -469,7 +469,7 @@ func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
 	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	r := &reuseGroupRunner{ids: []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
@@ -494,7 +494,10 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	case "ps":
 		r.listCalls++
 		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte("a\nb\n"), nil, nil
+		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Created":"2026-08-19T01:23:45Z","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"%s":"true","%s":"true","%s":"integration","%s":"aaaaaaaaaaaaaaaa"}}}]`, id, managedLabel, reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

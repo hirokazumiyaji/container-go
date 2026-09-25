@@ -1,0 +1,22 @@
+//go:build aix
+
+package container
+
+import (
+	"errors"
+	"syscall"
+)
+
+// AIX exposes Setpgid and supports negative-PID kill, but the Go syscall
+// package does not expose Getpgid. Probe the group before signaling it;
+// a missing group is handled as a direct-process kill by the caller.
+func reaperProcessGroupID(pid int) (int, error) {
+	err := syscall.Kill(-pid, syscall.Signal(0))
+	if err == nil {
+		return pid, nil
+	}
+	if errors.Is(err, syscall.ESRCH) {
+		return 0, nil
+	}
+	return 0, err
+}

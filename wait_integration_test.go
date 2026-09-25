@@ -67,6 +67,22 @@ func TestRunWaitFailureRollsBackAndAttachesLogs(t *testing.T) {
 
 // endpointInspectStrategy forces the wait path through Endpoint so a
 // deferred first inspect failure still rolls the container back.
+type inspectFailAfterRunner struct {
+	*fakeRunner
+	inspectCount int
+	failAfter    int
+}
+
+func (r *inspectFailAfterRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "inspect" {
+		r.inspectCount++
+		if r.inspectCount > r.failAfter {
+			return nil, nil, errors.New("injected inspect failure")
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
 type endpointInspectStrategy struct{}
 
 func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.Target) error {
@@ -75,8 +91,7 @@ func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.T
 }
 
 func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
-	f := newTestRunner()
-	f.failPrefix = "inspect"
+	f := &inspectFailAfterRunner{fakeRunner: newTestRunner(), failAfter: 1}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
 		WithExposedPorts("6379/tcp"),

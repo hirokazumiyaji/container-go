@@ -15,28 +15,34 @@ import (
 type Option func(*config) error
 
 type config struct {
-	runner       cli.Runner
-	eng          engine
-	name         string
-	env          map[string]string
-	cmd          []string
-	entrypoint   string
-	exposed      []portSpec
-	published    []publishSpec
-	labels       map[string]string
-	mounts       []Mount
-	files        []File
-	waitStrategy wait.Strategy
-	cpus         int
-	memory       string
-	user         string
-	workdir      string
-	network      string
-	platform     string
-	pullPolicy   PullPolicy
-	reuse        bool
-	reuseGroup   string
-	creation     string
+	runner               cli.Runner
+	eng                  engine
+	name                 string
+	env                  map[string]string
+	cmd                  []string
+	entrypoint           string
+	exposed              []portSpec
+	published            []publishSpec
+	labels               map[string]string
+	mounts               []Mount
+	files                []File
+	waitStrategy         wait.Strategy
+	cpus                 int
+	memory               string
+	user                 string
+	workdir              string
+	network              string
+	platform             string
+	pullPolicy           PullPolicy
+	allowMutableImageTag bool
+	imagePrepared        bool
+	preparedImage        imageIdentity
+	reuse                bool
+	reuseGroup           string
+	creation             string
+	reusedCreated        bool
+	reusedCreatedUID     string
+	reusedCreatedGen     string
 }
 
 func newConfig() *config {
@@ -57,9 +63,6 @@ func (c *config) allLabels() map[string]string {
 	}
 	labels[managedLabel] = "true"
 	labels[sessionLabel] = sessionID()
-	if c.creation != "" {
-		labels[creationLabel] = c.creation
-	}
 	if c.creation != "" {
 		labels[creationLabel] = c.creation
 	}
@@ -151,6 +154,10 @@ func WithReuseGroup(group string) Option {
 // nameRE is Apple Container's container name rule; the name doubles as
 // the container ID.
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
+// networkNameRE is the shared syntactic guard for network names. Apple
+// applies its stricter lowercase/no-separator rule in checkConfig.
+var networkNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 // labelKeyRE is the Docker-style label key rule the CLI enforces,
 // extended with slash-separated OCI segments.
@@ -345,7 +352,7 @@ func WithWorkingDir(dir string) Option {
 // "default".
 func WithNetwork(name string) Option {
 	return func(c *config) error {
-		if !nameRE.MatchString(name) {
+		if !networkNameRE.MatchString(name) {
 			return fmt.Errorf("invalid network name %q", name)
 		}
 		c.network = name

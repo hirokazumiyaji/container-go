@@ -72,11 +72,13 @@ func dockerReuseInspectJSON(spec reuseInspectSpec) []byte {
 		}}
 	}
 	return marshalReuseInspectJSON([]map[string]any{{
-		"Id":    spec.uid,
-		"Name":  "/shared",
-		"State": map[string]string{"Status": spec.state},
+		"Id":      spec.uid,
+		"Created": "2026-08-19T01:23:45.678901234Z",
+		"Image":   "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"Name":    "/shared",
+		"State":   map[string]string{"Status": spec.state},
 		"Config": map[string]any{
-			"Image":  spec.image,
+			"Image":  spec.image + "@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
 			"Labels": reuseInspectLabels(spec.creation),
 		},
 		"Platform": spec.platform,
@@ -100,8 +102,11 @@ func appleReuseInspectJSON(spec reuseInspectSpec) []byte {
 	return marshalReuseInspectJSON([]map[string]any{{
 		"id": "shared",
 		"configuration": map[string]any{
-			"id":             "shared",
-			"image":          map[string]string{"reference": spec.image},
+			"id": "shared",
+			"image": map[string]any{
+				"reference":  spec.image,
+				"descriptor": map[string]string{"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+			},
 			"labels":         reuseInspectLabels(spec.creation),
 			"platform":       platformInspectJSON(spec.platform),
 			"publishedPorts": ports,

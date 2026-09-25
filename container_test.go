@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
@@ -33,6 +34,8 @@ type fakeRunner struct {
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
 	creations    map[string]string // container name -> creation generation from run args
+	uidCreations map[string]string // Docker UID -> creation generation
+	lastCreation string
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -68,7 +71,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
-			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+			return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reference":"redis:7-alpine","RepoDigests":["docker.io/library/redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","platform":{"os":"linux","architecture":"amd64","variant":""}}]}]`), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
@@ -87,10 +90,12 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	switch args[0] {
 	case "run":
+		name, creation := "", ""
 		for i, a := range args {
 			if a == "--label" && i+1 < len(args) {
 				if v, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
-					name := ""
+					creation = v
+					name = ""
 					for j, b := range args {
 						if b == "--name" && j+1 < len(args) {
 							name = args[j+1]
@@ -101,14 +106,20 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 							f.creations = map[string]string{}
 						}
 						f.creations[name] = v
+						f.lastCreation = v
 					}
 				}
 			}
 		}
-		// Docker's detached run output is a full immutable ID. Apple
-		// ignores this value and continues to address the container by
-		// its generated name.
-		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
+		// Docker's detached run output is a full immutable ID. Derive a
+		// stable per-generation value in this fake so concurrent tests do
+		// not share one name-addressed inspect snapshot.
+		uid := fmt.Sprintf("%x", sha256.Sum256([]byte(name+":"+creation)))
+		if f.uidCreations == nil {
+			f.uidCreations = map[string]string{}
+		}
+		f.uidCreations[uid] = creation
+		return []byte(uid + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
@@ -116,14 +127,37 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			// creation generation captured at run time so
 			// generation-verified deletes succeed.
 			name := args[len(args)-1]
-			json = fmt.Sprintf(`[
+			if validDockerUID(name) {
+				creation := f.uidCreations[name]
+				if creation == "" {
+					creation = f.creations[name]
+				}
+				if creation == "" {
+					creation = f.lastCreation
+				}
+				json = fmt.Sprintf(`[
+  {
+    "Id": %q,
+    "Created": "2026-08-19T01:23:45.678901234Z",
+    "Image": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "State": {"Status": "running"},
+    "Config": {
+      "Image": "docker.io/library/redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "Labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.creation": %q}
+    },
+    "NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
+  }
+]`, name, sessionID(), creation)
+			} else {
+				json = fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "docker.io/library/redis:7-alpine"},
+      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+      "platform": {"os": "linux", "architecture": "amd64"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.creation": %q}
     },
     "status": {
       "state": "running",
@@ -131,6 +165,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
     }
   }
 ]`, name, name, sessionID(), f.creations[name])
+			}
 		}
 		return []byte(json), nil, nil
 	default:
@@ -174,7 +209,7 @@ func TestRunInvokesRunDetachedWithImage(t *testing.T) {
 	if !slices.Contains(runCall, "--detach") {
 		t.Errorf("run call missing --detach: %v", runCall)
 	}
-	if runCall[len(runCall)-1] != "redis:7-alpine" {
+	if !strings.HasPrefix(runCall[len(runCall)-1], "redis:7-alpine") {
 		t.Errorf("image not last arg: %v", runCall)
 	}
 	if ctr.ID() != "myctr" {
@@ -187,7 +222,13 @@ func TestRunAppendsCmdAfterImage(t *testing.T) {
 	runTestContainer(t, f, WithCmd("redis-server", "--appendonly", "yes"))
 
 	runCall := f.callWith("run")
-	i := slices.Index(runCall, "redis:7-alpine")
+	i := -1
+	for index, value := range runCall {
+		if strings.HasPrefix(value, "redis:7-alpine") {
+			i = index
+			break
+		}
+	}
 	if i < 0 || !slices.Equal(runCall[i+1:], []string{"redis-server", "--appendonly", "yes"}) {
 		t.Errorf("cmd not after image: %v", runCall)
 	}
@@ -338,22 +379,16 @@ func TestRunRejectsMountWithComma(t *testing.T) {
 	}
 }
 
-func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
+func TestRunVerifiesPostCreateIdentity(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if ctr != nil || err == nil {
+		t.Fatalf("Run = (%v, %v), want post-create identity failure", ctr, err)
 	}
-	if f.callWith("inspect") != nil {
-		t.Errorf("inspect issued during Run: %v", f.calls)
-	}
-	if f.callWith("delete") != nil {
-		t.Errorf("unexpected delete during Run: %v", f.calls)
-	}
-	if _, err := ctr.State(context.Background()); err == nil {
-		t.Fatal("want error when first inspect fails after Run")
+	if f.callWith("run") == nil {
+		t.Fatal("run was not attempted")
 	}
 }
 

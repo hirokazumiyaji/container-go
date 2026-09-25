@@ -22,7 +22,7 @@ func (r *imageIdentityRunner) Run(_ context.Context, args ...string) ([]byte, []
 	r.mu.Lock()
 	r.calls = append(r.calls, append([]string(nil), args...))
 	r.mu.Unlock()
-	if len(args) == 3 && args[0] == "image" && args[1] == "inspect" {
+	if len(args) >= 3 && args[0] == "image" && args[1] == "inspect" {
 		return []byte(fmt.Sprintf(`[{"Id":%q,"Os":"linux","Architecture":%q,"Variant":""}]`, r.imageID, r.platform)), nil, nil
 	}
 	return nil, nil, nil
@@ -52,19 +52,20 @@ func (r *ociPlatformReuseRunner) Run(ctx context.Context, args ...string) ([]byt
 		r.mu.Unlock()
 		data := marshalReuseInspectJSON([]map[string]any{{
 			"Id":       r.uid,
+			"Created":  "2026-08-19T01:23:45.678901234Z",
 			"Name":     "/shared",
 			"Platform": "linux",
 			"Image":    r.imageID,
 			"State":    map[string]string{"Status": "running"},
 			"Config": map[string]any{
-				"Image":  "redis:7-alpine",
+				"Image":  "redis:7-alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 				"Labels": reuseInspectLabels("aaaaaaaaaaaaaaaa"),
 			},
 			"NetworkSettings": map[string]any{},
 		}})
 		return data, nil, nil
 	}
-	if len(args) == 3 && args[0] == "image" && args[1] == "inspect" {
+	if len(args) >= 3 && args[0] == "image" && args[1] == "inspect" {
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		platform := "amd64"
@@ -87,9 +88,9 @@ func TestWithReuseValidatesExistingAndFreshOCIPlatform(t *testing.T) {
 		platforms []string
 		wantErr   string
 	}{
-		{name: "existing mismatch", platforms: []string{"arm64"}, wantErr: "does not match existing"},
-		{name: "fresh mismatch", platforms: []string{"amd64", "arm64"}, wantErr: "platform"},
-		{name: "match", platforms: []string{"amd64", "amd64"}},
+		{name: "existing mismatch", platforms: []string{"arm64", "arm64", "arm64", "arm64"}, wantErr: "does not match"},
+		{name: "fresh mismatch", platforms: []string{"amd64", "amd64", "amd64", "arm64"}, wantErr: "platform"},
+		{name: "match", platforms: []string{"amd64", "amd64", "amd64", "amd64"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

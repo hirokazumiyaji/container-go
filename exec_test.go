@@ -97,11 +97,15 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 
 type execMissingRunner struct {
 	*execRunner
+	inspectCount int
 }
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+		m.inspectCount++
+		if m.inspectCount > 1 {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+		}
 	}
 	return m.execRunner.Run(ctx, args...)
 }

@@ -166,6 +166,7 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
 	ID       string `json:"Id"`
+	Created  string `json:"Created"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
 	// Image is Docker's top-level immutable image ID. Config.Image is
@@ -224,13 +225,16 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[match]
 
 	info := &engineInfo{
-		state:    dockerState(c.State.Status),
-		labels:   c.Config.Labels,
-		uid:      c.ID,
-		image:    c.Config.Image,
-		imageID:  c.ImageID,
-		platform: c.Platform,
-		ip:       c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		image:       c.Config.Image,
+		imageID:     c.ImageID,
+		imageDigest: imageDigest(c.Config.Image),
+		created:     c.Created,
+		createdAt:   c.Created,
+		platform:    c.Platform,
+		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {
@@ -265,10 +269,11 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 // recover the complete OCI platform. Docker container inspect's
 // top-level Platform is only an OS on current Engine releases.
 type dockerImageInspect struct {
-	ID           string `json:"Id"`
-	OS           string `json:"Os"`
-	Architecture string `json:"Architecture"`
-	Variant      string `json:"Variant"`
+	ID           string   `json:"Id"`
+	RepoDigests  []string `json:"RepoDigests"`
+	OS           string   `json:"Os"`
+	Architecture string   `json:"Architecture"`
+	Variant      string   `json:"Variant"`
 }
 
 // resolvePlatform fills an OS-only container platform from the image
@@ -377,19 +382,29 @@ func (dockerEngine) logsTailArgs(id string) []string {
 	return []string{"logs", "--tail", "1000", id}
 }
 
-// listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// listArgs emits full immutable IDs so prune never falls back to a name.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
+		"--filter", "status=dead",
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func parseDockerPruneIDs(data []byte) ([]pruneCandidate, error) {
+	var candidates []pruneCandidate
+	for _, id := range splitNonEmptyLines(data) {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker ps returned invalid container ID %q", id)
+		}
+		candidates = append(candidates, pruneCandidate{id: id, managed: true})
+	}
+	return candidates, nil
+}
+
+func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+	return parseDockerPruneIDs(data)
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -411,25 +426,100 @@ func (dockerEngine) imageMissing(err error) bool {
 	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
-func (dockerEngine) parseImageExists(data []byte, _ string) bool {
-	var images []json.RawMessage
+func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
+
+func (dockerEngine) parseImageExists(data []byte, platform string) bool {
+	_, exists := (dockerEngine{}).parseImageIdentity(data, "", platform)
+	return exists
+}
+
+func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
+	var images []dockerImageInspect
 	if err := json.Unmarshal(data, &images); err != nil {
-		return false
+		return imageIdentity{}, true
 	}
-	return len(images) > 0
+	if len(images) == 0 {
+		return imageIdentity{}, false
+	}
+	requestedID := isImageID(image)
+	requestedIDRef := image
+	if !requestedID {
+		if canonical, ok := canonicalDockerImageID(image); ok {
+			requestedID = true
+			requestedIDRef = canonical
+		}
+	}
+	if image != "" && isBareImageReference(image) && !requestedID {
+		return imageIdentity{}, true
+	}
+	explicitPinned := requestedID || (image != "" && validImageDigest(imageDigest(image)))
+	sawExplicitConflict := false
+	fallbackID := ""
+	for _, img := range images {
+		if requestedID {
+			if (isImageID(img.ID) && strings.EqualFold(img.ID, requestedIDRef)) ||
+				(isBareImageID(img.ID) && "sha256:"+img.ID == requestedIDRef) {
+				return imageIdentity{reference: requestedIDRef, id: requestedIDRef, pinned: true}, true
+			}
+			continue
+		}
+		for _, repoDigest := range img.RepoDigests {
+			digest := imageDigest(repoDigest)
+			if !validImageDigest(digest) || imageReferenceBase(repoDigest) == "" {
+				continue
+			}
+			if image != "" {
+				requestedDigest := imageDigest(image)
+				if requestedDigest != "" {
+					if requestedDigest != digest || imageRepository(image) != imageRepository(repoDigest) {
+						sawExplicitConflict = true
+						continue
+					}
+				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
+					continue
+				}
+			}
+			return imageReferenceWithDigest(image, repoDigest, digest, img.ID), true
+		}
+		if img.ID != "" {
+			if !explicitPinned {
+				return imageReferenceWithDigest(image, "", "", img.ID), true
+			}
+			if fallbackID == "" {
+				fallbackID = img.ID
+			}
+		}
+	}
+	if explicitPinned {
+		if sawExplicitConflict {
+			return imageIdentity{mismatch: true}, true
+		}
+		if fallbackID != "" {
+			return imageReferenceWithDigest(image, "", "", fallbackID), true
+		}
+	}
+	return imageIdentity{}, true
 }
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
 	}
 }
 
-func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error) {
+	candidates, err := parseDockerPruneIDs(data)
+	if err != nil {
+		return nil, err
+	}
+	for i := range candidates {
+		candidates[i].reuseGroup = group
+	}
+	return candidates, nil
 }
+
+func (dockerEngine) nameAddressedDeletes() bool { return false }
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {

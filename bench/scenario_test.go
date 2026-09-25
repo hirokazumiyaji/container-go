@@ -4,6 +4,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -272,6 +273,61 @@ func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
 	}
 }
 
+// runTestcontainersMulti keeps cleanup outside the measured region while
+// retaining a partial container returned alongside a failed create/start.
+func runTestcontainersMulti(t *testing.T, create func() (tc.Container, error)) (func(), error) {
+	var containers []tc.Container
+	for range 5 {
+		ctr, err := create()
+		if ctr != nil {
+			containers = append(containers, ctr)
+		}
+		if err != nil {
+			return tcTerminateCleanup(t, containers...), err
+		}
+	}
+	return tcTerminateCleanup(t, containers...), nil
+}
+
+type partialTestcontainersContainer struct {
+	tc.Container
+	terminateCalls int
+}
+
+func (c *partialTestcontainersContainer) Terminate(context.Context, ...tc.TerminateOption) error {
+	c.terminateCalls++
+	return nil
+}
+
+func TestRunTestcontainersMultiCleansPartialHandleOnError(t *testing.T) {
+	previous := &partialTestcontainersContainer{}
+	partial := &partialTestcontainersContainer{}
+	createErr := errors.New("create failed")
+	calls := 0
+
+	cleanup, err := runTestcontainersMulti(t, func() (tc.Container, error) {
+		calls++
+		if calls == 1 {
+			return previous, nil
+		}
+		return partial, createErr
+	})
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want %v", err, createErr)
+	}
+	if cleanup == nil {
+		t.Fatal("multi scenario returned nil cleanup")
+	}
+	cleanup()
+
+	if previous.terminateCalls != 1 {
+		t.Fatalf("previous terminate calls = %d, want 1", previous.terminateCalls)
+	}
+	if partial.terminateCalls != 1 {
+		t.Fatalf("partial terminate calls = %d, want 1", partial.terminateCalls)
+	}
+}
+
 // TestIntegrationBenchTestcontainers measures testcontainers-go under
 // the same conditions. The first iteration includes the session
 // initialization (starting and connecting the Ryuk sidecar container),
@@ -308,15 +364,9 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	// initialization was already paid above.
 	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil,
 		func(t *testing.T) (func(), error) {
-			var containers []tc.Container
-			for range 5 {
-				ctr, err := tc.GenericContainer(context.Background(), tcRequest())
-				if err != nil {
-					return tcTerminateCleanup(t, containers...), err
-				}
-				containers = append(containers, ctr)
-			}
-			return tcTerminateCleanup(t, containers...), nil
+			return runTestcontainersMulti(t, func() (tc.Container, error) {
+				return tc.GenericContainer(context.Background(), tcRequest())
+			})
 		})
 
 	path := writeDoc(t, "docker-tc", doc)

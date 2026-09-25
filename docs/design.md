@@ -367,32 +367,39 @@ redact configured and secret-shaped values and escape terminal control
 characters (including U+2028/U+2029) before they reach CI output; callers
 that need the original CLI diagnostic must explicitly use `RawError()`.
 The wait package exposes an optional diagnostic-value provider. HTTP
-headers and Basic-auth material, log patterns, exec commands, and requested
-ports are collected recursively (including `ForAll`/`ForAny`) and supplied
-to both normal and reuse log-tail diagnostics. A tail is redacted and
+headers and Basic-auth material, individual cookie names/values (including
+URL/base64 forms), log patterns, exec commands, and requested ports are
+collected recursively (including `ForAll`/`ForAny`) and supplied to both
+normal and reuse log-tail diagnostics. Stderr and log tails use bounded
+streaming redaction with cross-chunk overlap; the safe ring is redacted and
 sanitized before its final 1MiB truncation, so a secret split by an earlier
-boundary cannot survive as a suffix.
+boundary cannot survive as a suffix. A finite log stream is also processed
+without a `Scanner` line buffer, and terminal read errors are retained.
 
 Rejected options are rendered through value-free `ValidationError` or
 `OptionError` values at the public boundary; their original causes remain
-available through the unwrap chain.
+available through the explicit `UnwrapRaw` escape hatch.
 
 Structural detection covers underscore/dotted secret names, empty-user
-credential URLs, Basic base64, quoted and PEM multiline values, JWTs,
-cookies/signatures, and attached or aliased `-e`, volume, mount, publish,
-and filter arguments. Known values use boundary-aware replacement, while
-operation-context values are replaced even when adjacent to log text. Redactors are
-composable so a public-boundary context is never discarded by a later
-container or wait wrapper.
+credential URLs, Basic base64, quoted and PEM multiline values, complete
+compact 3-segment JWS and 5-segment JWE values (including an empty JWE
+encrypted-key segment), cookies/signatures, and attached or aliased `-e`,
+volume, mount, publish, and filter arguments. Known values use boundary-aware
+replacement, while operation-context values are replaced even when adjacent
+to log text. Redactors are composable so a public-boundary context is never
+discarded by a later container or wait wrapper. Long-lived handles retain a
+hashed, closeable matcher rather than plaintext; `Terminate` drops that
+matcher reference and clears the internal compatibility fallback.
 
 `CLIError` remains an alias of the internal CLI type, preserving its
 keyed exported fields and `errors.As` identity. Safe wrappers carry
 unexported redactor/original state; this deliberately means external
 packages must use keyed `CLIError` literals rather than unkeyed literals.
-`errors.As` on a safe wrapper returns a redacted `*CLIError`, while
-`RawError()` is the explicit unredacted escape hatch. `ErrSystemNotRunning`
-retains the original operation and failed liveness-probe errors in its
-multi-error chain.
+Safe wrappers have no ordinary `Unwrap` that could expose raw diagnostics:
+`errors.As` returns a redacted `*CLIError` or redacted
+`*SystemNotRunningError`, while `RawError()`/`UnwrapRaw()` are explicit
+unredacted escape hatches. `ErrSystemNotRunning` retains the original
+operation and failed liveness-probe errors in its safe multi-error chain.
 
 ## Performance design
 
@@ -413,7 +420,9 @@ bounded only by host resources.
 
 **Keep streams finite**. `Logs` returns the `container logs --follow`
 child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+reliably kills the process. Diagnostic snapshots and ForLog matching use
+fixed-size streaming buffers/rings; a huge line cannot grow memory without
+bound.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On

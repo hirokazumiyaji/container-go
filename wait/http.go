@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -110,6 +111,9 @@ func (s *HTTPStrategy) DiagnosticValues() []string {
 	values := []string{s.path, s.port, s.method, s.username, s.password}
 	for key, value := range s.headers {
 		values = append(values, key, value, key+": "+value, key+"="+value)
+		if strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2") {
+			values = append(values, cookieDiagnosticValues(value)...)
+		}
 	}
 	if s.basicAuth {
 		values = append(values, basicAuthValues(s.username, s.password)...)

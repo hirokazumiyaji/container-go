@@ -232,11 +232,12 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 デバッグログ(`WithLogger` で注入)に CLI の argv を出す場合、env-file の中身は出力しない。
 `CLIError.Error()` と readiness log tail は設定値と secret らしい値をマスクし、制御文字(U+2028/U+2029 を含む)をエスケープする。元の CLI 診断が必要なら `RawError()` を明示的に呼び出す。
 
-`wait` パッケージは任意の diagnostic-value provider を提供する。HTTP ヘッダーと Basic 認証、ログパターン、exec コマンド、要求ポートを `ForAll`/`ForAny` も含めて再帰的に収集し、通常のログ末尾と reuse の診断へ渡す。ログ末尾は最後に 1MiB で切り詰める前に redact/sanitize するため、境界で分断された secret の尾部も残らない。
+`wait` パッケージは任意の diagnostic-value provider を提供する。HTTP ヘッダーと Basic 認証、個々の cookie 名/値(URL/base64 の encoded form を含む)、ログパターン、exec コマンド、要求ポートを `ForAll`/`ForAny` も含めて再帰的に収集し、通常のログ末尾と reuse の診断へ渡す。stderr とログ末尾はチャンクをまたぐ overlap を持つ bounded streaming redaction を使い、最後に 1MiB のリングへ入れるため、巨大な行や出力でもメモリが無限に増えない。終端の read error も保持する。
 
-構造的な検出対象には underscore/dotted な secret 名、空ユーザー URL、Basic base64、引用付き/PEM の複数行、JWT、cookie/signature、添付・別名付きの `-e`/volume/mount/publish/filter 引数を含む。既知値は境界を考慮して置換し、操作コンテキストの値はログ本文に隣接していても置換する。redactor は合成 가능で、後段の container/wrap 処理でも最初の公開境界文脈を捨てない。
 
-`CLIError` は内部 CLI 型の alias のままなので、exported field の keyed literal と `errors.As` の同一性を保つ。safe wrapper には非公開の redactor/original state を持たせるため、外部 package では unkeyed literal ではなく keyed literal を使うという互換性上の取舍を明示する。safe wrapper の `errors.As` は redact 済み `*CLIError` を返し、元の値が必要な場合は明示的に `RawError()` を使う。`ErrSystemNotRunning` は元の操作と liveness probe の両方を multi-error chain に保持する。
+構造的な検出対象には underscore/dotted な secret 名、空ユーザー URL、Basic base64、引用付き/PEM の複数行、3 セグメント JWS と 5 セグメント JWE(JWE の空 encrypted-key segment を含む)、cookie/signature、添付・別名付きの `-e`/volume/mount/publish/filter 引数を含む。token は全体の compact form だけを検出し、prefix の部分一致で誤検出しない。redactor は合成可能で、後段の container/wrap 処理でも最初の公開境界文脈を捨てない。handle は平文ではなく hash 化した closeable matcher を保持し、`Terminate` でその参照と内部の互換 fallback をクリアする。
+
+`CLIError` は内部 CLI 型の alias のままなので、exported field の keyed literal と `errors.As` の同一性を保つ。safe wrapper には非公開の redactor/original state を持たせるため、外部 package では unkeyed literal ではなく keyed literal を使うという互換性上の取舍を明示する。safe wrapper は raw diagnostic へ戻る通常の `Unwrap` を持たず、`errors.As` は redact 済み `*CLIError`/`*SystemNotRunningError` を返す。元の値が必要な場合は `RawError()`/`UnwrapRaw()` を明示的に使う。`ErrSystemNotRunning` は元の操作と liveness probe の両方を redact 済み multi-error chain に保持する。
 
 ## パフォーマンス設計
 
@@ -254,7 +255,7 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
-ForLog が診断用に保持するログは 1MiB を上限とする。
+ForLog の matcher と log-tail 診断は固定サイズの streaming buffer/ring を使い、巨大な行でもメモリが無限に増えない。終端の read error は保持する。
 
 **すべての CLI 呼び出しに期限を付ける**。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。

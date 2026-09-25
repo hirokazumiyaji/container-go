@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -70,8 +71,9 @@ type CLIError struct {
 	ExitCode int
 	Stderr   string
 
-	redactor *Redactor
-	raw      *CLIError
+	redactor  *Redactor
+	raw       *CLIError
+	rawStderr string
 }
 
 // Error renders a safe diagnostic. Secret-shaped arguments and stderr
@@ -101,8 +103,12 @@ func (e *CLIError) RawError() string {
 		bin = "container"
 	}
 	msg := fmt.Sprintf("%s %s: exit code %d", bin, strings.Join(raw.Args, " "), raw.ExitCode)
-	if raw.Stderr != "" {
-		msg += ": " + raw.Stderr
+	rawStderr := raw.Stderr
+	if raw.rawStderr != "" {
+		rawStderr = raw.rawStderr
+	}
+	if rawStderr != "" {
+		msg += ": " + rawStderr
 	}
 	return msg
 }
@@ -112,7 +118,12 @@ func (e *CLIError) Is(target error) bool {
 	return ok && e != nil && other != nil && e.original() == other.original()
 }
 
-func (e *CLIError) Unwrap() error {
+// UnwrapRaw is the explicit escape hatch for callers that need the original
+// error object behind a safe clone. It is intentionally not named Unwrap:
+// errors.Is/errors.As and errors.Unwrap must not cross back into raw
+// diagnostics accidentally. A directly-created CLIError has no separate raw
+// source and returns nil.
+func (e *CLIError) UnwrapRaw() error {
 	if e == nil || e.raw == nil {
 		return nil
 	}
@@ -141,7 +152,7 @@ func (e *CLIError) format(r *Redactor) string {
 	}
 	args := r.Args(raw.Args)
 	msg := fmt.Sprintf("%s %s: exit code %d", r.Text(bin), strings.Join(args, " "), raw.ExitCode)
-	stderr := truncateStderr(r.Text(raw.Stderr))
+	stderr := r.RedactBounded(raw.Stderr, maxStderr)
 	if stderr != "" {
 		msg += ": " + strings.TrimSpace(stderr)
 	}
@@ -161,7 +172,7 @@ func (e *CLIError) withRedactor(r *Redactor) *CLIError {
 		Binary:   combined.Text(raw.Binary),
 		Args:     combined.Args(raw.Args),
 		ExitCode: raw.ExitCode,
-		Stderr:   truncateStderr(combined.Text(raw.Stderr)),
+		Stderr:   combined.RedactBounded(raw.Stderr, maxStderr),
 		redactor: combined,
 		raw:      raw,
 	}
@@ -186,16 +197,18 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	var stdout, stderr bytes.Buffer
+	safeStderr := NewRedactor().NewStream(maxStderr)
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, safeStderr)
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
 	err := cmd.Run()
+	_ = safeStderr.Close()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
-	// diagnostic copy inside CLIError is bounded.
+	// diagnostic copy inside CLIError is bounded and streamed.
 	if err != nil {
 		if ctx.Err() != nil {
 			safeArgs := NewRedactor().Args(args)
@@ -204,23 +217,16 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			return stdout.Bytes(), stderr.Bytes(), &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
+				Binary:    bin,
+				Args:      args,
+				ExitCode:  exitErr.ExitCode(),
+				Stderr:    safeStderr.String(),
+				rawStderr: stderr.String(),
 			}
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
-}
-
-// truncateStderr bounds the diagnostic copy kept in CLIError.
-func truncateStderr(s string) string {
-	if len(s) > maxStderr {
-		return s[:maxStderr]
-	}
-	return s
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process
@@ -237,14 +243,20 @@ func IsCommandExit(err error) bool {
 const probeTimeout = 5 * time.Second
 
 // SystemNotRunningError reports a failed backend operation whose liveness
-// probe also failed. It retains all three relevant errors in its unwrap
-// chain: ErrSystemNotRunning, the original operation error, and the probe
-// error. The latter two are available explicitly as well, which is useful
-// when both are *CLIError values.
+// probe also failed. It retains all three relevant errors in its safe
+// unwrap chain: ErrSystemNotRunning, the original operation error, and the
+// probe error. The latter two are available explicitly as well, which is
+// useful when both are *CLIError values.
+//
+// A value obtained through WithRedactor is a redacted clone: its children
+// and accessors contain safe values, not the raw diagnostics held by the
+// source error. UnwrapRaw is available only as an explicit opt-in.
 type SystemNotRunningError struct {
-	hint     string
-	original error
-	probe    error
+	hint      string
+	original  error
+	probe     error
+	redactor  *Redactor
+	rawSystem *SystemNotRunningError
 }
 
 // Error renders the classification and both underlying diagnostics. Public
@@ -264,8 +276,9 @@ func (e *SystemNotRunningError) Error() string {
 	return msg
 }
 
-// Unwrap exposes the sentinel, original error, and probe error to errors.Is
-// and errors.As.
+// Unwrap exposes only the safe children of a redacted clone. A raw
+// classification returned directly by Classify retains its historical chain;
+// callers must explicitly use UnwrapRaw when they need that raw object.
 func (e *SystemNotRunningError) Unwrap() []error {
 	if e == nil {
 		return nil
@@ -280,7 +293,20 @@ func (e *SystemNotRunningError) Unwrap() []error {
 	return errs
 }
 
-// OriginalError returns the failed operation that triggered the probe.
+// UnwrapRaw is the explicit escape hatch for the original classification.
+// It is deliberately not part of the errors.Unwrap traversal on safe clones.
+// A directly-created classification has no separate raw source and returns
+// nil.
+func (e *SystemNotRunningError) UnwrapRaw() error {
+	if e == nil || e.rawSystem == nil {
+		return nil
+	}
+	return e.rawSystem
+}
+
+// OriginalError returns the failed operation that triggered the probe. On a
+// safe clone the returned error is itself safe and exposes no raw child via
+// errors.Unwrap.
 func (e *SystemNotRunningError) OriginalError() error {
 	if e == nil {
 		return nil
@@ -288,7 +314,8 @@ func (e *SystemNotRunningError) OriginalError() error {
 	return e.original
 }
 
-// ProbeError returns the failed liveness probe.
+// ProbeError returns the failed liveness probe. On a safe clone the returned
+// error is itself safe.
 func (e *SystemNotRunningError) ProbeError() error {
 	if e == nil {
 		return nil

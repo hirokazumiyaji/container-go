@@ -98,9 +98,12 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
-	// diagnosticSecrets are caller-supplied values that must be removed
-	// from backend and readiness diagnostics.
-	diagnosticSecrets []string
+	// diagnosticSecrets is retained only as a compatibility fallback for
+	// package-internal test doubles. Normal handles use the hashed matcher
+	// below, so plaintext is not held for the handle lifetime.
+	diagnosticSecrets       []string
+	diagnosticRedactorValue *cli.Redactor
+	secretsMu               sync.RWMutex
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -176,14 +179,14 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 
 	c := &Container{
-		id:                cfg.name,
-		runner:            cfg.runner,
-		eng:               cfg.eng,
-		exposed:           cfg.exposed,
-		published:         cfg.published,
-		creation:          cfg.creation,
-		uid:               cfg.eng.parseRunID(stdout),
-		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
+		id:                      cfg.name,
+		runner:                  cfg.runner,
+		eng:                     cfg.eng,
+		exposed:                 cfg.exposed,
+		published:               cfg.published,
+		creation:                cfg.creation,
+		uid:                     cfg.eng.parseRunID(stdout),
+		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -209,9 +212,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
 			waitValues := wait.DiagnosticValues(cfg.waitStrategy)
-			tail := c.logTail(cleanupCtx, waitValues...)
+			tail, tailErr := c.logTailWithError(cleanupCtx, waitValues...)
 			err = c.publicError(fmt.Errorf("container %s failed to become ready: %w", c.id, err), waitValues...)
-			if tail != "" {
+			if tailErr != nil {
+				err = c.publicError(fmt.Errorf("%w; container log tail unavailable: %w", err, tailErr), waitValues...)
+			} else if tail != "" {
 				err = c.publicError(fmt.Errorf("%w; container logs: %s", err, tail), waitValues...)
 			}
 			return nil, c.rollback(ctx, err)
@@ -326,6 +331,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
+	defer c.clearDiagnosticSecrets()
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
 	}

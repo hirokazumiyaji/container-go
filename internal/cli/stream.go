@@ -18,7 +18,24 @@ type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
 
+// SnapshotStreamer is the bounded-output counterpart used for diagnostics.
+// It exposes both backend output streams without first materializing them in
+// a []byte returned by Runner.Run.
+type SnapshotStreamer interface {
+	StreamSnapshot(ctx context.Context, args ...string) (io.ReadCloser, error)
+}
+
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
+	return r.stream(ctx, args...)
+}
+
+// StreamSnapshot starts a finite CLI invocation and exposes its merged output
+// as a stream. The caller must close the returned stream to reap the child.
+func (r *ExecRunner) StreamSnapshot(ctx context.Context, args ...string) (io.ReadCloser, error) {
+	return r.stream(ctx, args...)
+}
+
+func (r *ExecRunner) stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
 	cmd := exec.CommandContext(ctx, r.binary(), args...)
 	cmd.WaitDelay = 3 * time.Second
 	// One pipe carries both output streams: `docker logs` splits the

@@ -116,6 +116,26 @@ func TestHTTPWaitErrorRedactsCLIErrorFromErrorsAs(t *testing.T) {
 	}
 }
 
+func TestDiagnosticValuesRegisterCookieComponentsAndEncodings(t *testing.T) {
+	const (
+		name  = "session"
+		value = "cookie-value-117"
+	)
+	strategy := ForHTTP("/").WithHeader("Cookie", name+"="+value+"; theme=dark")
+	values := strings.Join(DiagnosticValues(strategy), "\x00")
+	for _, want := range []string{
+		name,
+		value,
+		name + "=" + value,
+		"cookie-value-117",
+		"Y29va2llLXZhbHVlLTExNw==",
+	} {
+		if !strings.Contains(values, want) {
+			t.Errorf("DiagnosticValues() = %v, missing %q", values, want)
+		}
+	}
+}
+
 func TestHTTPWaitErrorUsesHeaderAndBasicAuthContext(t *testing.T) {
 	const (
 		path     = "/private-health"

@@ -117,6 +117,22 @@ func TestWithRedactorComposesAcrossWrappedErrors(t *testing.T) {
 	}
 }
 
+func TestDiagnosticWrapperDoesNotExposeRawCLIError(t *testing.T) {
+	const secret = "diagnostic-wrapper-raw-117"
+	raw := &CLIError{Args: []string{"run", secret}, Stderr: secret, ExitCode: 1}
+	safe := diagnostic.WithRedactor(fmt.Errorf("context: %w", raw), diagnostic.NewRedactor(secret))
+	if got := errors.Unwrap(safe); got != nil {
+		t.Fatalf("errors.Unwrap(diagnostic safe error) = %v, want nil", got)
+	}
+	var got *CLIError
+	if !errors.As(safe, &got) {
+		t.Fatal("errors.As did not find safe CLIError")
+	}
+	if strings.Contains(got.Error(), secret) || strings.Contains(got.Stderr, secret) {
+		t.Fatalf("diagnostic errors.As exposed raw CLIError: %q", got.Error())
+	}
+}
+
 func TestDiagnosticAndCLIWrappersComposeRedactors(t *testing.T) {
 	const (
 		first  = "cross-wrapper-first-secret"
@@ -134,6 +150,65 @@ func TestDiagnosticAndCLIWrappersComposeRedactors(t *testing.T) {
 	}
 	if !strings.Contains(got.RawError(), first) || !strings.Contains(got.RawError(), second) {
 		t.Fatalf("RawError() = %q, want both original values", got.RawError())
+	}
+}
+
+func TestSafeWrappersDoNotExposeRawThroughUnwrapOrAs(t *testing.T) {
+	const secret = "safe-wrapper-secret-117"
+	raw := &CLIError{Args: []string{"run", "image", secret}, Stderr: secret, ExitCode: 1}
+	safe := WithRedactor(fmt.Errorf("outer: %w", raw), NewRedactor(secret))
+
+	if got := errors.Unwrap(safe); got != nil {
+		t.Fatalf("errors.Unwrap(safe) = %v, want nil", got)
+	}
+	var cliErr *CLIError
+	if !errors.As(safe, &cliErr) {
+		t.Fatal("errors.As did not find safe CLIError")
+	}
+	if cliErr == raw || strings.Contains(cliErr.Error(), secret) || strings.Contains(strings.Join(cliErr.Args, " "), secret) || strings.Contains(cliErr.Stderr, secret) {
+		t.Fatalf("errors.As exposed raw CLIError: %#v", cliErr)
+	}
+	if got := errors.Unwrap(cliErr); got != nil {
+		t.Fatalf("errors.Unwrap(CLIError clone) = %v, want nil", got)
+	}
+	if !errors.Is(safe, raw) {
+		t.Fatal("safe wrapper lost errors.Is identity")
+	}
+	rawProvider, ok := safe.(interface{ UnwrapRaw() error })
+	if !ok || rawProvider.UnwrapRaw() == nil {
+		t.Fatal("safe wrapper is missing explicit UnwrapRaw")
+	}
+}
+
+func TestSafeSystemNotRunningCloneRedactsBothChildren(t *testing.T) {
+	const originalSecret = "original-system-secret-117"
+	const probeSecret = "probe-system-secret-117"
+	original := &CLIError{Args: []string{"run", "image", originalSecret}, Stderr: originalSecret, ExitCode: 1}
+	probe := &CLIError{Args: []string{"system", "status"}, Stderr: probeSecret, ExitCode: 1}
+	classified := &SystemNotRunningError{hint: "start the service", original: original, probe: probe}
+	safe := WithRedactor(classified, NewRedactor(originalSecret, probeSecret))
+
+	var system *SystemNotRunningError
+	if !errors.As(safe, &system) {
+		t.Fatal("errors.As did not find safe SystemNotRunningError")
+	}
+	if system == classified || strings.Contains(system.Error(), originalSecret) || strings.Contains(system.Error(), probeSecret) {
+		t.Fatalf("system clone is unsafe: %q", system.Error())
+	}
+	for _, child := range []error{system.OriginalError(), system.ProbeError()} {
+		if child == original || child == probe {
+			t.Fatalf("accessor returned raw child: %T", child)
+		}
+		if got := errors.Unwrap(child); got != nil {
+			t.Fatalf("errors.Unwrap(safe child) = %v, want nil", got)
+		}
+	}
+	if !errors.Is(safe, original) || !errors.Is(safe, probe) || !errors.Is(safe, ErrSystemNotRunning) {
+		t.Fatal("safe system clone lost intended errors.Is links")
+	}
+	var childCLI *CLIError
+	if !errors.As(safe, &childCLI) || strings.Contains(childCLI.Error(), originalSecret) || strings.Contains(childCLI.Stderr, originalSecret) {
+		t.Fatalf("errors.As through safe system exposed unsafe CLIError: %v", childCLI)
 	}
 }
 

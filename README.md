@@ -228,12 +228,21 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
 - `CLIError.Error()` and readiness log tails redact configured and
-  secret-shaped values, including wait HTTP headers/Basic auth, log
-  patterns, exec commands, and ports. `RawError()` is the explicit
-  unredacted escape hatch; `errors.As` on a safe error returns a
-  redacted `*CLIError`. `CLIError` remains a keyed-literal-compatible
-  alias, but its safe-wrapper state makes external unkeyed literals
-  unsupported.
+  secret-shaped values, including wait HTTP headers/Basic auth, individual
+  cookie names/values (and encoded forms), log patterns, exec commands, and
+  ports. Stderr and log tails use bounded streaming redaction with overlap;
+  raw output is never materialized as a second full-size safe copy.
+- `RawError()` is the explicit unredacted escape hatch. Safe wrappers do not
+  implement ordinary `Unwrap`; use the explicit `UnwrapRaw()` method when raw
+  diagnostics are intentional. `errors.As` returns redacted `*CLIError` and
+  redacted `*SystemNotRunningError` children, while `errors.Is` retains the
+  intended sentinel and source identity.
+- Complete compact 3-segment JWS and 5-segment JWE values (including an empty
+  JWE encrypted-key segment) are redacted as whole tokens. Normal handles keep
+  only a hashed, closeable diagnostic matcher; `Terminate` drops its reference
+  and clears the internal compatibility fallback.
+- `CLIError` remains a keyed-literal-compatible alias, but its safe-wrapper
+  state makes external unkeyed literals unsupported.
 
 ## Differences from testcontainers-go
 

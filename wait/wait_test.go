@@ -160,6 +160,43 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	}
 }
 
+func TestForLogStreamsHugeLinesWithoutScannerBufferLimit(t *testing.T) {
+	target := newFakeTarget()
+	target.logs = io.NopCloser(strings.NewReader(strings.Repeat("x", 8*1024*1024)))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want stream-ended error")
+	}
+	if strings.Contains(err.Error(), "token too long") {
+		t.Fatalf("error = %v, want bounded streaming behavior", err)
+	}
+}
+
+func TestForLogPreservesTerminalReadError(t *testing.T) {
+	readErr := errors.New("log transport failed")
+	target := newFakeTarget()
+	target.logs = io.NopCloser(&terminalLogReader{err: readErr})
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("error = %v, want terminal read error", err)
+	}
+}
+
+type terminalLogReader struct {
+	err  error
+	sent bool
+}
+
+func (r *terminalLogReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, []byte("not-ready")), nil
+	}
+	return 0, r.err
+}
+
 func TestForHTTPMatchesStatusCode(t *testing.T) {
 	var hits atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

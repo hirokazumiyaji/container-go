@@ -54,7 +54,7 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 // pruneListed lists containers with listArgs, parses IDs, and force-deletes
 // each one. errKind prefixes per-ID delete failures ("prune", …).
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, values ...string) ([]string, error) {
-	redactor := cli.NewContextRedactor(values...)
+	redactor := cli.NewHashedContextRedactor(values...)
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)

@@ -5,8 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -58,21 +58,36 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 // failures.
 const logTailLimit = 1024 * 1024
 
-// logTail fetches the backend's bounded log snapshot, redacts and sanitizes
-// the complete snapshot, and only then applies the final byte cap. Taking the
-// tail before redaction can split a secret at the boundary and leave its
-// suffix in the diagnostic.
+// logTail fetches the backend's bounded log snapshot through a streaming
+// interface when available, redacts and sanitizes chunks with cross-chunk
+// overlap, and only then applies the final byte cap. Taking the tail before
+// redaction can split a secret at the boundary and leave its suffix in the
+// diagnostic.
 func (c *Container) logTail(ctx context.Context, extra ...string) string {
+	tail, _ := c.logTailWithError(ctx, extra...)
+	return tail
+}
+
+func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
+	redactor := c.diagnosticRedactor(extra...)
+	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {
+		stream, err := streamer.StreamSnapshot(qCtx, c.eng.logsTailArgs(c.id)...)
+		if err != nil {
+			return "", err
+		}
+		defer stream.Close()
+		return redactor.RedactTail(stream, logTailLimit)
+	}
 	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
 	if err != nil {
-		return ""
+		return "", err
 	}
-	var raw bytes.Buffer
-	_, _ = raw.ReadFrom(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)))
-	safe := c.diagnosticRedactor(extra...).Text(raw.String())
-	return lastNBytes(strings.NewReader(safe), logTailLimit)
+	return redactor.RedactTail(
+		io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)),
+		logTailLimit,
+	)
 }
 
 // lastNBytes keeps only the trailing n bytes of r using a fixed-size

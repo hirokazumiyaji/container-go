@@ -42,16 +42,16 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 
 	ctr := &Container{
-		id:                base.id,
-		runner:            base.runner,
-		eng:               base.eng,
-		exposed:           cfg.exposed,
-		published:         cfg.published,
-		reused:            true,
-		info:              info,
-		creation:          info.labels[creationLabel],
-		uid:               info.uid,
-		diagnosticSecrets: uniqueStrings(append(append([]string(nil), base.diagnosticSecrets...), cfg.diagnosticSecrets...)),
+		id:                      base.id,
+		runner:                  base.runner,
+		eng:                     base.eng,
+		exposed:                 cfg.exposed,
+		published:               cfg.published,
+		reused:                  true,
+		info:                    info,
+		creation:                info.labels[creationLabel],
+		uid:                     info.uid,
+		diagnosticRedactorValue: composeDiagnosticMatchers(base.diagnosticRedactorValue, newDiagnosticMatcher(cfg.diagnosticValues())),
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -116,16 +116,16 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			continue
 		case StateRunning:
 			return &Container{
-				id:                cfg.name,
-				runner:            cfg.runner,
-				eng:               cfg.eng,
-				exposed:           cfg.exposed,
-				published:         cfg.published,
-				reused:            true,
-				info:              info,
-				creation:          info.labels[creationLabel],
-				uid:               info.uid,
-				diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
+				id:                      cfg.name,
+				runner:                  cfg.runner,
+				eng:                     cfg.eng,
+				exposed:                 cfg.exposed,
+				published:               cfg.published,
+				reused:                  true,
+				info:                    info,
+				creation:                info.labels[creationLabel],
+				uid:                     info.uid,
+				diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -168,15 +168,15 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 
 	ctr := &Container{
-		id:                cfg.name,
-		runner:            cfg.runner,
-		eng:               cfg.eng,
-		exposed:           cfg.exposed,
-		published:         cfg.published,
-		reused:            true,
-		creation:          cfg.creation,
-		uid:               cfg.eng.parseRunID(stdout),
-		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
+		id:                      cfg.name,
+		runner:                  cfg.runner,
+		eng:                     cfg.eng,
+		exposed:                 cfg.exposed,
+		published:               cfg.published,
+		reused:                  true,
+		creation:                cfg.creation,
+		uid:                     cfg.eng.parseRunID(stdout),
+		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -212,8 +212,11 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
 		values := wait.DiagnosticValues(cfg.waitStrategy)
-		tail := ctr.logTail(context.WithoutCancel(ctx), values...)
+		tail, tailErr := ctr.logTailWithError(context.WithoutCancel(ctx), values...)
 		safeErr := ctr.publicError(fmt.Errorf("reuse failed to become ready: %w", err), values...)
+		if tailErr != nil {
+			return ctr.publicError(fmt.Errorf("%w; container log tail unavailable: %w", safeErr, tailErr), values...)
+		}
 		if tail != "" {
 			return ctr.publicError(fmt.Errorf("%w; container logs: %s", safeErr, tail), values...)
 		}
@@ -228,12 +231,12 @@ func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, err
 
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:                id,
-		runner:            cfg.runner,
-		eng:               cfg.eng,
-		exposed:           cfg.exposed,
-		published:         cfg.published,
-		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
+		id:                      id,
+		runner:                  cfg.runner,
+		eng:                     cfg.eng,
+		exposed:                 cfg.exposed,
+		published:               cfg.published,
+		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
 	}
 }
 

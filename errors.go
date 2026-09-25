@@ -15,9 +15,10 @@ import (
 //
 // The alias keeps the exported Binary/Args/ExitCode/Stderr fields and keyed
 // composite literals source-compatible. The safe wrapper adds unexported
-// state to retain the original value for RawError; consequently external
-// packages must use keyed CLIError literals rather than unkeyed literals.
-// This is the deliberate compatibility tradeoff for safe errors.As results.
+// state to retain the original value for RawError and the explicit
+// UnwrapRaw escape hatch; consequently external packages must use keyed
+// CLIError literals rather than unkeyed literals. This is the deliberate
+// compatibility tradeoff for safe errors.As results.
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that the Apple Container system service is
@@ -25,9 +26,10 @@ type CLIError = cli.CLIError
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // SystemNotRunningError is the typed classification returned when both the
-// original CLI operation and its liveness probe fail. Its unwrap chain keeps
-// ErrSystemNotRunning, the original error, and the probe error; use
+// original CLI operation and its liveness probe fail. Its safe unwrap chain
+// keeps ErrSystemNotRunning, redacted child errors, and the probe error; use
 // OriginalError or ProbeError when both errors have the same concrete type.
+// UnwrapRaw is the explicit opt-in path to a raw classification.
 type SystemNotRunningError = cli.SystemNotRunningError
 
 // ErrInvalidOption identifies a rejected functional option. Option values
@@ -36,17 +38,31 @@ type SystemNotRunningError = cli.SystemNotRunningError
 var ErrInvalidOption = errors.New("invalid option")
 
 // OptionError is the public-boundary fallback for a functional option that
-// returns an untyped error. Its original cause remains in the unwrap chain,
-// but its rendering is intentionally value-free.
+// returns an untyped error. Its original cause remains available through
+// errors.Is and the explicit UnwrapRaw escape hatch, but its ordinary
+// rendering and errors.Unwrap traversal are intentionally value-free.
 type OptionError struct {
 	cause error
 }
 
 func (e *OptionError) Error() string { return "invalid option" }
-func (e *OptionError) Unwrap() error { return e.cause }
-func (e *OptionError) Is(target error) bool {
-	return target == ErrInvalidOption || errors.Is(e.cause, target)
+
+// UnwrapRaw is an explicit escape hatch for the original option failure. The
+// ordinary errors.Unwrap traversal is intentionally value-free.
+func (e *OptionError) UnwrapRaw() error {
+	if e == nil {
+		return nil
+	}
+	return e.cause
 }
+
+func (e *OptionError) Is(target error) bool {
+	return target == ErrInvalidOption || (e != nil && errors.Is(e.cause, target))
+}
+
+// DiagnosticSafe marks this value-free error as safe to expose through a
+// safe wrapper's errors.As implementation.
+func (*OptionError) DiagnosticSafe() {}
 
 // ValidationError describes a rejected option without echoing its value.
 // Callers can use errors.Is(err, ErrInvalidOption) or errors.As for this
@@ -67,6 +83,10 @@ func (e *ValidationError) Error() string {
 }
 
 func (e *ValidationError) Unwrap() error { return ErrInvalidOption }
+
+// DiagnosticSafe marks this value-free error as safe to expose through a
+// safe wrapper's errors.As implementation.
+func (*ValidationError) DiagnosticSafe() {}
 
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts.

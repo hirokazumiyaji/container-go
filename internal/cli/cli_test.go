@@ -57,6 +57,26 @@ func TestExecRunnerNonZeroExitReturnsCLIError(t *testing.T) {
 	}
 }
 
+func TestExecRunnerRedactsSplitStderrBeforeCap(t *testing.T) {
+	const secret = "split-stderr-secret-117"
+	r := &ExecRunner{Binary: writeStub(t, `printf 'password=' >&2; printf '%s\\n' '`+secret+`' >&2; exit 1`)}
+
+	_, stderr, err := r.Run(context.Background(), "run")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if strings.Contains(cliErr.Stderr, secret) || !strings.Contains(cliErr.Stderr, "[REDACTED]") {
+		t.Fatalf("CLIError.Stderr = %q, want streamed redaction", cliErr.Stderr)
+	}
+	if !strings.Contains(cliErr.RawError(), secret) {
+		t.Fatalf("RawError() = %q, want explicit raw stderr", cliErr.RawError())
+	}
+	if len(stderr) <= len(secret) {
+		t.Fatalf("raw returned stderr = %q, want complete output", stderr)
+	}
+}
+
 func TestExecRunnerCapsStderr(t *testing.T) {
 	// Emit ~1MiB of stderr, far beyond the 64KiB cap.
 	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; exit 1`)}

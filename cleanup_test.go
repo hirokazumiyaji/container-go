@@ -2,9 +2,12 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func TestTerminateContainerIsNilSafe(t *testing.T) {
@@ -36,6 +39,50 @@ func TestTerminateContainerHonorsKeepEnv(t *testing.T) {
 	}
 	if f.callWith("delete") != nil {
 		t.Error("delete issued despite CONTAINERGO_KEEP=1")
+	}
+}
+
+type cleanupRecorder struct {
+	cleanups []func()
+	errors   []string
+	logs     []string
+}
+
+func (r *cleanupRecorder) Helper() {}
+
+func (r *cleanupRecorder) Cleanup(fn func()) {
+	r.cleanups = append(r.cleanups, fn)
+}
+
+func (r *cleanupRecorder) Errorf(format string, args ...any) {
+	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
+func (r *cleanupRecorder) Logf(format string, args ...any) {
+	r.logs = append(r.logs, fmt.Sprintf(format, args...))
+}
+
+func (r *cleanupRecorder) run() {
+	for _, fn := range r.cleanups {
+		fn()
+	}
+}
+
+func TestCleanupStrictReportsFailure(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	cleanupErr := &cli.CLIError{Args: []string{"delete", "myctr"}, ExitCode: 1, Stderr: "strict cleanup failed"}
+	ctr.runner = &notFoundRunner{inner: f, err: cleanupErr}
+	recorder := &cleanupRecorder{}
+
+	registerCleanup(recorder, ctr, true)
+	recorder.run()
+
+	if len(recorder.errors) != 1 || !strings.Contains(recorder.errors[0], cleanupErr.Stderr) {
+		t.Fatalf("errors = %v, want strict cleanup failure", recorder.errors)
+	}
+	if len(recorder.logs) != 0 {
+		t.Fatalf("logs = %v, want strict cleanup reported as failure", recorder.logs)
 	}
 }
 

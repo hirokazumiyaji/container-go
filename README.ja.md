@@ -131,11 +131,14 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。
 
-1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で削除を登録します。
-   defer 派には `container.TerminateContainer(ctr)` があります。どちらも
-   nil 安全なので、`Run` のエラーチェックより前に呼べます。
+1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で best-effort の削除を
+   登録します。`container.CleanupStrict(t, ctr)` を使うと、削除失敗を
+   テスト失敗として報告します。defer 派には
+   `container.TerminateContainer(ctr)` があります。いずれも nil 安全なので、
+   `Run` のエラーチェックより前に呼べます。
 2. `Run` が途中で失敗した場合は、`Run` 自身が作成済みリソースを削除して
-   から返ります。
+   から返ります。削除にも失敗した場合は、返された `*CleanupError` から
+   元の error とクリーンアップ error の両方を取得できます。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、

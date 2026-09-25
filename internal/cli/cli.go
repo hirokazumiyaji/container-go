@@ -145,8 +145,8 @@ func IsCommandExit(err error) bool {
 const probeTimeout = 5 * time.Second
 
 // Classify augments a failed CLI call: if the backend does not answer
-// the probe, the failure is reported as ErrSystemNotRunning instead of
-// the original error.
+// the probe, the failure is reported as ErrSystemNotRunning while the
+// original error remains in the chain.
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
@@ -166,7 +166,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		if ctx.Err() != nil {
 			return err
 		}
-		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
+		return fmt.Errorf("%w: %s (underlying error: %w)", ErrSystemNotRunning, probe.Hint, err)
 	}
 	return err
 }

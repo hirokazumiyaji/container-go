@@ -26,15 +26,37 @@ func TerminateContainer(ctr *Container) error {
 	return ctr.Terminate(context.Background())
 }
 
-// Cleanup registers container removal via tb.Cleanup. It is nil-safe,
-// so call it right after Run, before checking Run's error.
-func Cleanup(tb testing.TB, ctr *Container) {
+type cleanupTB interface {
+	Helper()
+	Cleanup(func())
+	Logf(string, ...any)
+	Errorf(string, ...any)
+}
+
+func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 	tb.Helper()
 	tb.Cleanup(func() {
 		if err := TerminateContainer(ctr); err != nil {
+			if strict {
+				tb.Errorf("container-go: cleanup %s: %v", ctr.ID(), err)
+				return
+			}
 			tb.Logf("container-go: cleanup %s: %v", ctr.ID(), err)
 		}
 	})
+}
+
+// Cleanup registers best-effort container removal via tb.Cleanup. It is
+// nil-safe, so call it right after Run, before checking Run's error.
+func Cleanup(tb testing.TB, ctr *Container) {
+	registerCleanup(tb, ctr, false)
+}
+
+// CleanupStrict is Cleanup with cleanup failures reported as test
+// failures. It is nil-safe and otherwise has the same reuse and
+// CONTAINERGO_KEEP behavior as Cleanup.
+func CleanupStrict(tb testing.TB, ctr *Container) {
+	registerCleanup(tb, ctr, true)
 }
 
 // Prune removes stopped containers created by this library, from any

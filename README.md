@@ -160,11 +160,14 @@ container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 
 Three layers make sure containers do not outlive your tests:
 
-1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
-   `container.TerminateContainer(ctr)` is the deferred-style variant.
-   Both are nil-safe, so call them before checking `Run`'s error.
+1. `container.Cleanup(t, ctr)` registers best-effort removal via
+   `t.Cleanup`; `container.CleanupStrict(t, ctr)` reports a removal
+   failure as a test failure. `container.TerminateContainer(ctr)` is the
+   deferred-style variant. All are nil-safe, so call them before checking
+   `Run`'s error.
 2. If `Run` fails partway, it removes whatever it created before
-   returning.
+   returning. If that removal also fails, the returned `*CleanupError`
+   exposes both the original and cleanup errors.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is

@@ -42,10 +42,18 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
-// checkConfig rejects explicit loopback publish binds on a remote
-// daemon: Docker would listen on the remote machine's loopback, which
-// no rewrite of the client-facing address can make reachable.
+// checkConfig rejects options Docker cannot honor before any image or
+// container command is issued, including one-character volume names
+// and explicit loopback publish binds on a remote daemon.
 func (dockerEngine) checkConfig(cfg *config) error {
+	// Docker's local volume driver rejects one-character names because
+	// they can be interpreted as host paths. Keep the shared grammar
+	// permissive for Apple Container, which accepts them.
+	for _, m := range cfg.mounts {
+		if m.Type == MountVolume && len(m.Source) == 1 {
+			return validationErrorf("mount", m, "volume name %q is too short, names should be at least two alphanumeric characters", m.Source)
+		}
+	}
 	if !isRemoteDockerHost() {
 		return nil
 	}

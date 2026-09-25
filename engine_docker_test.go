@@ -93,6 +93,44 @@ func TestDockerRemoteLoopbackPublishReturnsValidationError(t *testing.T) {
 	}
 }
 
+func TestDockerRejectsOneCharacterVolumeNameBeforeBackend(t *testing.T) {
+	mount := Mount{Type: MountVolume, Source: "x", Target: "/data"}
+	cfg := dockerTestConfig(t, WithMounts(mount))
+
+	check := func(err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("one-character Docker volume name was accepted")
+		}
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("error = %T %v, want *ValidationError", err, err)
+		}
+		if !errors.Is(err, ErrInvalidOption) {
+			t.Fatalf("error = %v, want ErrInvalidOption", err)
+		}
+		if validationErr.Option != "mount" {
+			t.Errorf("validation option = %q, want mount", validationErr.Option)
+		}
+	}
+
+	check((dockerEngine{}).checkConfig(cfg))
+
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithMounts(mount), withRunner(f), withEngine(dockerEngine{}))
+	check(err)
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called before Docker volume validation: %v", f.calls)
+	}
+
+	// The common grammar remains permissive enough for Apple Container,
+	// which accepts one-character volume names.
+	if err := (appleEngine{}).checkConfig(cfg); err != nil {
+		t.Fatalf("Apple backend rejected one-character volume name: %v", err)
+	}
+}
+
 func TestDockerRunArgsCarryCommonFlags(t *testing.T) {
 	cfg := dockerTestConfig(t,
 		WithCPUs(2), WithMemory("512M"), WithUser("nobody"),

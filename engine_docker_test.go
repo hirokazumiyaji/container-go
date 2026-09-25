@@ -159,6 +159,82 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 	}
 }
 
+func TestDockerListArgsIncludeStoppedStatuses(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	for _, want := range []string{"status=exited", "status=dead"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
+	for _, unwanted := range []string{"status=created", "status=running"} {
+		if slices.Contains(args, unwanted) {
+			t.Errorf("listArgs = %v, unexpectedly includes %q", args, unwanted)
+		}
+	}
+}
+
+type dockerPruneCandidate struct {
+	id      string
+	status  string
+	managed bool
+}
+
+// dockerPruneRunner models Docker's repeated status filters: containers
+// matching any requested status are returned, while other states are not.
+type dockerPruneRunner struct {
+	calls      [][]string
+	candidates []dockerPruneCandidate
+}
+
+func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	d.calls = append(d.calls, args)
+	if args[0] != "ps" {
+		return nil, nil, nil
+	}
+
+	var ids []string
+	for _, candidate := range d.candidates {
+		if !candidate.managed || !slices.Contains(args, "label="+managedLabel+"=true") {
+			continue
+		}
+		if slices.Contains(args, "status="+candidate.status) {
+			ids = append(ids, candidate.id)
+		}
+	}
+	if len(ids) == 0 {
+		return nil, nil, nil
+	}
+	return []byte(strings.Join(ids, "\n") + "\n"), nil, nil
+}
+
+func TestDockerPruneRemovesExitedAndDeadOnly(t *testing.T) {
+	f := &dockerPruneRunner{candidates: []dockerPruneCandidate{
+		{id: "exited", status: "exited", managed: true},
+		{id: "dead", status: "dead", managed: true},
+		{id: "created", status: "created", managed: true},
+		{id: "running", status: "running", managed: true},
+		{id: "unmanaged", status: "exited"},
+	}}
+
+	removed, err := pruneWith(context.Background(), f, dockerEngine{})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if want := []string{"exited", "dead"}; !slices.Equal(removed, want) {
+		t.Fatalf("removed = %v, want %v", removed, want)
+	}
+
+	var deleted []string
+	for _, call := range f.calls {
+		if call[0] == "rm" {
+			deleted = append(deleted, call[len(call)-1])
+		}
+	}
+	if want := []string{"exited", "dead"}; !slices.Equal(deleted, want) {
+		t.Errorf("deleted = %v, want %v", deleted, want)
+	}
+}
+
 // dockerRunner serves docker-shaped responses.
 // dockerFixtureID is the Id in testdata/docker_inspect_v29.json, which
 // `docker run --detach` also prints on stdout.

@@ -298,12 +298,15 @@ func (dockerEngine) logsTailArgs(id string) []string {
 }
 
 // listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// status filters directly. Docker treats repeated status filters as
+// alternatives, so both exited and dead are selected without admitting
+// created or running containers.
 func (dockerEngine) listArgs() []string {
 	return []string{
 		"ps", "--all", "--quiet",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
+		"--filter", "status=dead",
 		"--format", "{{.Names}}",
 	}
 }

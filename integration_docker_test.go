@@ -553,3 +553,82 @@ func TestIntegrationDockerExecMissingContainerIsError(t *testing.T) {
 		t.Fatal("want error for exec on missing container")
 	}
 }
+
+// TestIntegrationDockerPruneKeepsCreatedAndRunning covers the state
+// boundary of Prune: exited containers are removed, while containers that
+// have never started or are still running survive.
+func TestIntegrationDockerPruneKeepsCreatedAndRunning(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+
+	// Pulling through the public helper keeps this test independent of
+	// whether the image was already present in the local store.
+	if err := container.Pull(ctx, integrationAlpine); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+
+	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	createdName := "containergo-prune-created-" + suffix
+	exitedName := "containergo-prune-exited-" + suffix
+	runningName := "containergo-prune-running-" + suffix
+	names := []string{createdName, exitedName, runningName}
+	t.Cleanup(func() {
+		for _, name := range names {
+			_ = exec.Command("docker", "rm", "--force", name).Run()
+		}
+	})
+
+	const managedLabel = "com.github.hirokazumiyaji.container-go=true"
+	runDocker := func(args ...string) {
+		t.Helper()
+		out, err := exec.Command("docker", args...).CombinedOutput()
+		if err != nil {
+			t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, out)
+		}
+	}
+	inspectState := func(name string) (string, error) {
+		out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", name).Output()
+		return strings.TrimSpace(string(out)), err
+	}
+	waitState := func(name, want string) {
+		t.Helper()
+		deadline := time.Now().Add(30 * time.Second)
+		for time.Now().Before(deadline) {
+			state, err := inspectState(name)
+			if err == nil && state == want {
+				return
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+		state, err := inspectState(name)
+		t.Fatalf("state of %s = %q (err=%v), want %q", name, state, err, want)
+	}
+
+	runDocker("create", "--label", managedLabel, "--name", createdName, integrationAlpine)
+	runDocker("create", "--label", managedLabel, "--name", exitedName, integrationAlpine, "true")
+	runDocker("start", exitedName)
+	runDocker("run", "--detach", "--label", managedLabel, "--name", runningName, integrationAlpine, "sleep", "60")
+	waitState(createdName, "created")
+	waitState(exitedName, "exited")
+	waitState(runningName, "running")
+
+	if _, err := container.Prune(ctx); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if _, err := inspectState(exitedName); err == nil {
+		t.Fatalf("exited container %s survived Prune", exitedName)
+	}
+	for name, want := range map[string]string{
+		createdName: "created",
+		runningName: "running",
+	} {
+		state, err := inspectState(name)
+		if err != nil {
+			t.Errorf("container %s was removed by Prune: %v", name, err)
+			continue
+		}
+		if state != want {
+			t.Errorf("state of %s = %q, want %q", name, state, want)
+		}
+	}
+}

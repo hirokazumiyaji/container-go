@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 // dockerEngine drives the `docker` CLI. Unlike Apple Container, the
@@ -192,13 +193,26 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
+// dockerInspectFields are the entry fields the matcher below depends on to
+// recognize the requested container and its state. Nullable collections
+// the CLI uses for empty values (Config.Labels, NetworkSettings.Ports,
+// which real output emits as null) are deliberately absent: a null there
+// is an empty value, not unreadable output.
+var dockerInspectFields = []string{"Id", "Name", "State", "State.Status"}
+
+// parseInspect returns the one entry that matches target exactly: the full
+// container ID for an ID target, or the slash-prefixed name for a logical
+// name. Other entries are ignored, and output the parser cannot read is an
+// error rather than a missing container.
 func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
-	var containers []dockerInspect
-	if err := json.Unmarshal(data, &containers); err != nil {
+	// Decode entry by entry so an entry this parser cannot interpret is
+	// reported as a schema failure instead of a zero value. A target-naming
+	// entry that decoded to nothing would be classified ErrContainerNotFound
+	// even though the container exists, which lets a delete that verified
+	// nothing pass as a removal that happened.
+	containers, err := strictjson.Array[dockerInspect](data, dockerInspectFields)
+	if err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
-	}
-	if containers == nil {
-		return nil, fmt.Errorf("decode docker inspect output: expected a JSON array, got null")
 	}
 	match := -1
 	if dockerIDRE.MatchString(target) {

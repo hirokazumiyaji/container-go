@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -175,13 +176,17 @@ func TestParseInspectTargetErrors(t *testing.T) {
 		backendData     bool
 		wantNotFound    bool
 		wantSyntaxError bool
-		wantSchemaError bool
+		wantSchema      string
 	}{
 		{name: "empty", data: `[]`, wantNotFound: true},
 		{name: "target absent", backendData: true, wantNotFound: true},
 		{name: "ID missing", data: `[{}]`, wantNotFound: true},
 		{name: "malformed JSON", data: `{not json`, wantSyntaxError: true},
-		{name: "top-level null", data: `null`, wantSchemaError: true},
+		{name: "top-level null", data: `null`, wantSchema: "expected a JSON array"},
+		// A null entry decodes to a zero value, so a skipped non-match
+		// would report a missing container for output that never said so.
+		{name: "null entry", data: `[null]`, wantSchema: "got null"},
+		{name: "null entry after another", data: `[{"id":"other"},null]`, wantSchema: "got null"},
 	}
 	for _, backend := range engines {
 		for _, tc := range cases {
@@ -201,9 +206,9 @@ func TestParseInspectTargetErrors(t *testing.T) {
 				if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
 					t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
 				}
-				if tc.wantSchemaError {
-					if errors.Is(err, ErrContainerNotFound) || !strings.Contains(err.Error(), "expected a JSON array") {
-						t.Errorf("error = %v, want a schema error distinct from ErrContainerNotFound", err)
+				if tc.wantSchema != "" {
+					if errors.Is(err, ErrContainerNotFound) || !strings.Contains(err.Error(), tc.wantSchema) {
+						t.Errorf("error = %v, want a schema error containing %q and distinct from ErrContainerNotFound", err, tc.wantSchema)
 					}
 				}
 			})
@@ -295,6 +300,93 @@ func TestDockerParseInspectNameSkipsMalformedIDAndNonmatchingName(t *testing.T) 
 	}
 	if info.state != StateRunning {
 		t.Errorf("state = %q, want %q", info.state, StateRunning)
+	}
+}
+
+// An explicit null in a field the matcher reads is unreadable output, not
+// a missing container. Reporting ErrContainerNotFound would let a delete
+// that verified nothing pass as a removal that happened.
+func TestDockerParseInspectRejectsNullIdentityFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		entry  string
+		target string
+		field  string
+	}{
+		{
+			name:   "Id null on an ID target",
+			entry:  `{"Id":null,"Name":"/myctr","State":{"Status":"running"}}`,
+			target: dockerFixtureID,
+			field:  "Id",
+		},
+		{
+			name:   "Id null on a name target",
+			entry:  `{"Id":null,"Name":"/myctr","State":{"Status":"running"}}`,
+			target: "myctr",
+			field:  "Id",
+		},
+		{
+			name:   "Name null on a name target",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":null,"State":{"Status":"running"}}`,
+			target: "myctr",
+			field:  "Name",
+		},
+		{
+			name:   "State null",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":null}`,
+			target: "myctr",
+			field:  "State",
+		},
+		{
+			name:   "State.Status null",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":null}}`,
+			target: "myctr",
+			field:  "State.Status",
+		},
+		{
+			// A malformed entry is unusable output whatever the target is.
+			name:   "State null for an unrelated target",
+			entry:  `{"Id":"` + strings.Repeat("a", 64) + `","Name":"/other","State":null}`,
+			target: "myctr",
+			field:  "State",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := (dockerEngine{}).parseInspect([]byte("["+tc.entry+"]"), tc.target)
+			if err == nil {
+				t.Fatalf("parseInspect = %+v, want a schema error", info)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Errorf("error = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if want := fmt.Sprintf("field %q", tc.field); !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %v, want it to report %s", err, want)
+			}
+		})
+	}
+}
+
+// A field that is absent is not a schema violation: a network or volume
+// inspect entry carries no container State, and the matcher must keep
+// skipping it in favor of the exact container entry that follows.
+func TestDockerParseInspectSkipsNonContainerObjectsWithoutState(t *testing.T) {
+	networkID := strings.Repeat("b", 64)
+	// The name and ID would match, so only the absent State keeps this
+	// entry from being taken for the requested container.
+	data := []byte(`[{"Id":"` + networkID + `","Name":"/myctr","Driver":"bridge"}]`)
+	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want ErrContainerNotFound for a non-container entry", err)
+	}
+	// A volume-shaped entry alongside the real one still resolves exactly.
+	data = []byte(`[{"Id":"` + networkID + `","Name":"vol","Mountpoint":"/var/lib/volumes/vol"},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"exited"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID || info.state != StateStopped {
+		t.Errorf("info = %+v, want the exact container entry", info)
 	}
 }
 
@@ -586,6 +678,37 @@ func TestDockerOperationFailsClosedWithoutUID(t *testing.T) {
 	}
 	if len(runner.calls) != 0 {
 		t.Fatalf("unverified Docker handle issued calls: %v", runner.calls)
+	}
+}
+
+// Unreadable inspect output says nothing about whether the container
+// exists. Reporting ErrContainerNotFound would let callers that read a
+// missing container as a removed one act on a container that is still up.
+func TestDockerInspectSchemaErrorIsNotNotFound(t *testing.T) {
+	for _, data := range []string{`[null]`, `[{"Id":"` + dockerFixtureID + `","State":null}]`} {
+		t.Run(data, func(t *testing.T) {
+			d := &dockerRunner{fakeRunner: newTestRunner()}
+			ctr := runDockerTestContainer(t, d)
+			// runDockerTestContainer installs a well-formed fixture; replace
+			// it with the unreadable output under test.
+			d.inspectJSON = []byte(data)
+
+			state, err := ctr.State(context.Background())
+			if err == nil {
+				t.Fatalf("State = %q, want an error for unreadable output", state)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Errorf("State error = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if !strings.Contains(err.Error(), "decode docker inspect output") {
+				t.Errorf("State error = %v, want a decode error", err)
+			}
+			// A rejected entry must not publish a UID to the handle; the
+			// handle keeps only the ID docker run itself printed.
+			if ctr.uid != dockerFixtureID {
+				t.Errorf("uid = %q, want the run ID %q", ctr.uid, dockerFixtureID)
+			}
+		})
 	}
 }
 

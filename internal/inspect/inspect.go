@@ -4,9 +4,10 @@
 package inspect
 
 import (
-	"encoding/json"
 	"fmt"
 	"net/netip"
+
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 // Container is one element of the array both commands emit.
@@ -44,14 +45,21 @@ type Network struct {
 	Network     string `json:"network"`
 }
 
-// Decode parses the JSON array output.
+// containerFields are the entry fields Decode callers depend on to
+// recognize a container and read its state. Nullable collections the CLI
+// uses for empty maps and arrays (labels, publishedPorts, networks,
+// maskedPaths) are deliberately absent: a null there is an empty value,
+// not unreadable output.
+var containerFields = []string{"id", "configuration", "status", "status.state"}
+
+// Decode parses the JSON array output. Output that cannot be read is an
+// error rather than a zero Container: an entry that decoded to nothing
+// would be skipped as a non-match, reporting a missing container for
+// output that never said whether the target exists.
 func Decode(data []byte) ([]Container, error) {
-	var containers []Container
-	if err := json.Unmarshal(data, &containers); err != nil {
+	containers, err := strictjson.Array[Container](data, containerFields)
+	if err != nil {
 		return nil, fmt.Errorf("decode container inspect output: %w", err)
-	}
-	if containers == nil {
-		return nil, fmt.Errorf("decode container inspect output: expected a JSON array, got null")
 	}
 	return containers, nil
 }

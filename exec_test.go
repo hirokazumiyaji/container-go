@@ -127,7 +127,7 @@ func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
 		inspectErr      error
 		wantNotFound    bool
 		wantSyntaxError bool
-		wantSchemaError bool
+		wantSchema      string
 	}{
 		{
 			name: "target missing",
@@ -143,9 +143,17 @@ func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
 			wantSyntaxError: true,
 		},
 		{
-			name:            "null inspect",
-			inspectStdout:   []byte(`null`),
-			wantSchemaError: true,
+			name:          "null inspect",
+			inspectStdout: []byte(`null`),
+			wantSchema:    "expected a JSON array",
+		},
+		{
+			// A null entry is unreadable output, not a missing
+			// container: reporting it as not found would send a running
+			// container's exec failure down the wrong path.
+			name:          "null inspect entry",
+			inspectStdout: []byte(`[null]`),
+			wantSchema:    "got null",
 		},
 	}
 	for _, tc := range cases {
@@ -174,8 +182,8 @@ func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
 			if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
 				t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
 			}
-			if tc.wantSchemaError && (!strings.Contains(err.Error(), "expected a JSON array") || errors.Is(err, ErrContainerNotFound)) {
-				t.Errorf("error = %v, want a schema error distinct from ErrContainerNotFound", err)
+			if tc.wantSchema != "" && (!strings.Contains(err.Error(), tc.wantSchema) || errors.Is(err, ErrContainerNotFound)) {
+				t.Errorf("error = %v, want a schema error containing %q and distinct from ErrContainerNotFound", err, tc.wantSchema)
 			}
 		})
 	}

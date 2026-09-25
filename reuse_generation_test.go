@@ -153,6 +153,52 @@ func TestTerminateFailsClosedWhenInspectFails(t *testing.T) {
 	}
 }
 
+// Unreadable inspect output cannot prove the container is gone, so the
+// name-addressed delete must fail closed instead of reporting a removal
+// that never happened.
+func TestTerminateFailsClosedOnSchemaInvalidInspect(t *testing.T) {
+	for _, data := range []string{`[null]`, `[{"id":"myctr","configuration":null}]`} {
+		t.Run(data, func(t *testing.T) {
+			r := &inspectOutputRunner{stdout: data}
+			ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+			err := ctr.Terminate(context.Background())
+			if err == nil {
+				t.Fatal("Terminate = nil, want failure on unreadable inspect output")
+			}
+			if !errors.Is(err, ErrGenerationReplaced) {
+				t.Errorf("Terminate = %v, want ErrGenerationReplaced", err)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Errorf("Terminate = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if r.deleteCalls != 0 {
+				t.Errorf("deleteCalls = %d, want 0 when the generation cannot be read", r.deleteCalls)
+			}
+		})
+	}
+}
+
+type inspectOutputRunner struct {
+	stdout      string
+	deleteCalls int
+}
+
+func (g *inspectOutputRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		return []byte(g.stdout), nil, nil
+	case "system":
+		return []byte("running"), nil, nil
+	case "version":
+		return []byte("ok"), nil, nil
+	case "delete", "rm":
+		g.deleteCalls++
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
 type inspectErrorRunner struct {
 	stderr      string
 	deleteCalls int

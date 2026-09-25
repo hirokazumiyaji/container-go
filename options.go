@@ -3,6 +3,7 @@ package container
 import (
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -383,8 +384,8 @@ const (
 // Mount describes one filesystem mount.
 type Mount struct {
 	Type     MountType
-	Source   string // host path (bind) or volume name (volume); empty for tmpfs
-	Target   string // absolute path inside the container
+	Source   string // host path in host OS syntax (bind) or volume name (volume); empty for tmpfs
+	Target   string // absolute POSIX path inside the container
 	ReadOnly bool
 }
 
@@ -397,7 +398,7 @@ func (m Mount) validate() error {
 	}
 	switch m.Type {
 	case MountBind:
-		if !strings.HasPrefix(m.Source, "/") {
+		if !filepath.IsAbs(m.Source) {
 			return fmt.Errorf("bind mount source %q must be an absolute host path", m.Source)
 		}
 	case MountVolume:

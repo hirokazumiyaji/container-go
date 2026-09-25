@@ -8,8 +8,9 @@ on:
 
 jobs:
   # Unit tests run against a fake CLI runner, so the cheaper Linux
-  # runner is enough; integration tests need real Apple Container and
-  # run locally via `make integration`.
+  # runner is enough; the Windows-specific mount regression runs below.
+  # Integration tests need real Apple Container and run locally via
+  # `make integration`.
   test:
     runs-on: ubuntu-latest
     strategy:
@@ -22,6 +23,15 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test ./...
+
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: stable
+      - run: go test . -run TestWindowsBindMountUsesHostPathAndPOSIXTarget -count=1
 
   race:
     runs-on: ubuntu-latest

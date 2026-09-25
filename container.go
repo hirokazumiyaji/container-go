@@ -106,6 +106,12 @@ type Container struct {
 // removed before returning. WithReuse switches to get-or-create; see
 // WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
+	// Validate the public image before applying options. Option functions
+	// are user-provided code and may have side effects or return errors;
+	// an invalid image must have a deterministic, side-effect-free result.
+	if err := validateImageReference(image); err != nil {
+		return nil, err
+	}
 	cfg := newConfig()
 	for i, opt := range opts {
 		if opt == nil {
@@ -117,15 +123,6 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
-	}
-	if err := validateImageReference(image); err != nil {
-		return nil, err
-	}
-	if cfg.reuse && cfg.name == "" {
-		return nil, validationErrorf("WithReuse", nil, "WithReuse requires WithName")
-	}
-	if cfg.reuseGroup != "" && !cfg.reuse {
-		return nil, validationErrorf("WithReuseGroup", cfg.reuseGroup, "WithReuseGroup requires WithReuse")
 	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()
@@ -301,8 +298,13 @@ func (c *Container) State(ctx context.Context) (State, error) {
 }
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
-// period before the process is killed.
+// period before the process is killed. A non-nil timeout must not be
+// negative.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Stop", "timeout", *timeout,
+			fmt.Errorf("stop timeout must be >= 0, got %s", *timeout))
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)

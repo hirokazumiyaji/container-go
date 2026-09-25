@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -20,14 +21,38 @@ type File struct {
 // failures fail Run and roll the container back.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
-		for _, f := range files {
+		validated := make([]File, len(files))
+		for i, f := range files {
 			if err := validateContainerPath(f.ContainerPath); err != nil {
-				return newValidationError("WithFiles", f, err)
+				return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, err)
 			}
+			abs, err := validateHostPath(f.HostPath)
+			if err != nil {
+				return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
+			}
+			f.HostPath = abs
+			validated[i] = f
 		}
-		c.files = append(c.files, files...)
+		c.files = append(c.files, validated...)
 		return nil
 	}
+}
+
+// validateHostPath resolves a host path before any backend work and checks
+// that the resulting absolute path can be statted. Resolving here also
+// prevents a later working-directory change from changing the source.
+func validateHostPath(hostPath string) (string, error) {
+	if hostPath == "" {
+		return "", fmt.Errorf("host path must not be empty")
+	}
+	abs, err := filepath.Abs(hostPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve host path %q: %w", hostPath, err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("host path %q: %w", hostPath, err)
+	}
+	return abs, nil
 }
 
 // CopyToContainer copies a host file or directory into the running
@@ -55,7 +80,12 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, newValidationErrorWithField("CopyFileFromContainer", "containerPath", containerPath, err)
 	}
-	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
+	// Container paths are POSIX paths even when the client runs on Windows.
+	// Normalize with path (not filepath) so equivalent root spellings such as
+	// // and /tmp/.. are classified consistently. Keep the raw trailing slash
+	// check because path.Clean intentionally removes it.
+	cleaned := path.Clean(containerPath)
+	if cleaned == "/" || strings.HasSuffix(containerPath, "/") {
 		return nil, newValidationErrorWithField(
 			"CopyFileFromContainer",
 			"containerPath",
@@ -67,7 +97,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err != nil {
 		return nil, err
 	}
-	dst := filepath.Join(dir, filepath.Base(containerPath))
+	dst := filepath.Join(dir, path.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {

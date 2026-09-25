@@ -57,29 +57,17 @@ func newConfig() *config {
 	}
 }
 
-// validate checks invariants that may be assembled by multiple options.
-// Collection cardinality is intentionally left to the backend and caller;
-// there is no universal item-count policy for public options.
+// validate checks invariants that depend on more than one option. Scalar
+// option values are validated when their option is applied; keeping those
+// checks there gives callers an error from the option itself. This second
+// pass is intentionally limited to cross-option relationships and is called
+// by Run after every option has been applied.
 func (c *config) validate() error {
-	if c.memory != "" {
-		if err := validateMemorySize(c.memory); err != nil {
-			return err
-		}
+	if c.reuse && c.name == "" {
+		return validationErrorf("WithReuse", nil, "WithReuse requires WithName")
 	}
-	if c.reuseGroup != "" {
-		if err := validateReuseGroup(c.reuseGroup); err != nil {
-			return err
-		}
-	}
-	for _, m := range c.mounts {
-		if err := m.validate(); err != nil {
-			return err
-		}
-	}
-	for _, f := range c.files {
-		if err := validateContainerPath(f.ContainerPath); err != nil {
-			return newValidationError("WithFiles", f, err)
-		}
+	if c.reuseGroup != "" && !c.reuse {
+		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
 	}
 	return nil
 }
@@ -249,16 +237,27 @@ func WithName(name string) Option {
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") {
-				return validationErrorf("WithEnv", k, "invalid environment variable name %q", k)
-			}
-			if strings.ContainsAny(v, "\n\x00") {
-				return validationErrorf("WithEnv", k, "environment variable %s: value must not contain newlines", k)
+			if err := validateEnvironmentEntry("WithEnv", "environment variable", k, v); err != nil {
+				return err
 			}
 			c.env[k] = v
 		}
 		return nil
 	}
+}
+
+func validateEnvironmentEntry(option, description, key, value string) error {
+	if key == "" || strings.ContainsAny(key, "=\n\x00") {
+		return newValidationErrorWithField(option, "key", key,
+			fmt.Errorf("invalid %s name %q", description, key))
+	}
+	if strings.ContainsAny(value, "\n\x00") {
+		// Environment and exec values can contain credentials. Keep both
+		// the value and its error text free of the rejected value.
+		return newValidationErrorWithField(option, "value", nil,
+			fmt.Errorf("%s %q has an invalid value: values must not contain newlines or NUL bytes", description, key))
+	}
+	return nil
 }
 
 // WithCmd overrides the arguments passed to the image's entrypoint.
@@ -319,17 +318,21 @@ func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
-				return validationErrorf("WithLabels", k, "invalid label key %q", k)
+				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("invalid label key %q", k))
 			}
 			switch k {
 			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
-				return validationErrorf("WithLabels", k, "label key %q is reserved", k)
+				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("label key %q is reserved", k))
 			}
+			// Label values may carry secrets. Do not put them in Value or
+			// the rendered diagnostic when the entry is rejected.
 			if len(k)+len(v)+1 > 4096 {
-				return validationErrorf("WithLabels", k, "label %s: key=value exceeds 4096 bytes", k)
+				return newValidationErrorWithField("WithLabels", "value", nil,
+					fmt.Errorf("label %q: key=value exceeds 4096 bytes", k))
 			}
 			if strings.ContainsAny(v, "\x00") {
-				return validationErrorf("WithLabels", k, "label %s: value must not contain NUL", k)
+				return newValidationErrorWithField("WithLabels", "value", nil,
+					fmt.Errorf("label %q: value must not contain NUL", k))
 			}
 			c.labels[k] = v
 		}
@@ -466,9 +469,9 @@ func WithPlatform(p string) Option {
 // MountType selects how a Mount is backed.
 type MountType int
 
-// volumeNameRE matches the portable Docker/OCI volume-name grammar:
-// one leading alphanumeric followed by name characters. Backend-specific
-// volume capability checks remain in each engine.
+// volumeNameRE is the name grammar shared by both backends. Docker adds a
+// minimum length requirement in dockerEngine.checkConfig; Apple accepts a
+// single-character name.
 var volumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 const (
@@ -526,6 +529,8 @@ func (m Mount) validate() error {
 		if !volumeNameRE.MatchString(m.Source) {
 			return mountValidationErrorf(m, "invalid volume name %q", m.Source)
 		}
+		// Docker's minimum length is checked in checkConfig because Apple
+		// accepts one-character names.
 	case MountTmpfs:
 		if m.Source != "" {
 			return mountValidationErrorf(m, "tmpfs mount for %q must not have a source", m.Target)

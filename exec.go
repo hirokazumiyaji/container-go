@@ -25,8 +25,8 @@ type execConfig struct {
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
 		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
-				return validationErrorf("WithExecEnv", k, "invalid exec environment variable %q", k)
+			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
+				return err
 			}
 			c.env[k] = v
 		}

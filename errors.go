@@ -20,15 +20,21 @@ var ErrSystemNotRunning = cli.ErrSystemNotRunning
 // WithExposedPorts.
 var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 
-// ErrInvalidOption identifies an invalid public option or option value.
-// Callers can use errors.Is without matching the human-readable message.
+// ErrInvalidOption identifies an invalid public option, operation argument,
+// or option value. Callers can use errors.Is without matching the
+// human-readable message, or use errors.As with *ValidationError for field
+// metadata.
 var ErrInvalidOption = errors.New("invalid option")
 
 // ValidationError describes a public input rejected before a backend
-// operation starts. Option names the public option, operation, or input,
-// Field identifies the rejected field when it differs, Value contains the
-// rejected value, and Message preserves the detailed explanation returned
-// to the caller.
+// operation starts.
+//
+// Option names the public option or operation. Field names the exact input
+// field, such as "key", "value", "hostPath", or "containerPath". Value is
+// the rejected value when it is safe to expose; values that may contain
+// credentials or other sensitive material are represented by nil. Message is
+// retained for source compatibility, but Err is the source of truth for the
+// rendered message and the error chain.
 type ValidationError struct {
 	Option  string
 	Field   string
@@ -41,11 +47,13 @@ func (e *ValidationError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	if e.Message != "" {
-		return e.Message
-	}
+	// Derive the message from Err so callers cannot make Message and Err
+	// disagree by mutating the exported compatibility field.
 	if e.Err != nil {
 		return e.Err.Error()
+	}
+	if e.Message != "" {
+		return e.Message
 	}
 	return ErrInvalidOption.Error()
 }
@@ -68,12 +76,6 @@ func (e *ValidationError) Is(target error) bool {
 	}
 	return e.Err != nil && errors.Is(e.Err, target)
 }
-
-// OptionError is an option-specific name for ValidationError.
-type OptionError = ValidationError
-
-// InvalidOptionError is an alias for ValidationError.
-type InvalidOptionError = ValidationError
 
 func newValidationError(option string, value any, err error) error {
 	return newValidationErrorWithField(option, option, value, err)

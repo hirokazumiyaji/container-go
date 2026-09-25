@@ -107,6 +107,51 @@ func TestClassifyDaemonDownWithTermsInEndpointPaths(t *testing.T) {
 	}
 }
 
+func TestClassifyDockerDesktopUnableToStart(t *testing.T) {
+	original := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"run"},
+		ExitCode: 1,
+		Stderr:   "command failed",
+	}
+	probeErr := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"version", "--format", "{{.Server.Version}}"},
+		ExitCode: 1,
+		Stderr:   "Error response from daemon: Docker Desktop is unable to start",
+	}
+	runner := &classifyProbeRunner{probeErr: probeErr}
+
+	got := cli.Classify(context.Background(), runner, original, dockerEngine{}.probe())
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning for Docker Desktop startup failure", got)
+	}
+	if !errors.Is(got, original) || !errors.Is(got, probeErr) {
+		t.Fatalf("error = %v, want original and probe error chains", got)
+	}
+}
+
+func TestDockerProbeUnavailableRequiresStructuredDesktopPhrase(t *testing.T) {
+	for _, stderr := range []string{
+		"Error response from daemon: unable to start",
+		"Error response from daemon: Docker Desktop is unable to startup",
+		"daemon: Docker Desktop is unable to start",
+		"application says Docker Desktop is unable to start",
+	} {
+		t.Run(stderr, func(t *testing.T) {
+			err := &cli.CLIError{
+				Binary:   "docker",
+				Args:     []string{"version"},
+				ExitCode: 1,
+				Stderr:   stderr,
+			}
+			if dockerProbeUnavailable(err) {
+				t.Fatalf("dockerProbeUnavailable(%q) = true, want false", stderr)
+			}
+		})
+	}
+}
+
 func TestClassifyProbeFailureMatrix(t *testing.T) {
 	backends := []struct {
 		name       string

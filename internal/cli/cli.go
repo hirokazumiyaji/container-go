@@ -256,7 +256,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	// A timeout or signal reported by the operation itself is already a
 	// known termination result. Probing the backend after it would turn a
 	// useful operation error into a second, misleading operation.
-	if isOperationTimeoutError(err) {
+	if IsOperationTimeoutError(err) {
 		return err
 	}
 
@@ -355,7 +355,9 @@ func classifySystemNotRunning(ctx, probeCtx context.Context, original, probeErr 
 	return classified
 }
 
-func isOperationTimeoutError(err error) bool {
+// IsOperationTimeoutError reports whether err is a timeout, cancellation,
+// or signal-shaped operation failure rather than an application result.
+func IsOperationTimeoutError(err error) bool {
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
 		errors.Is(err, os.ErrDeadlineExceeded) {
 		return true
@@ -385,6 +387,7 @@ func isOperationTimeoutError(err error) bool {
 			"context cancelled",
 			"operation timed out",
 			"operation timeout",
+			"command timed out",
 			"i/o timeout",
 		} {
 			if strings.Contains(text, fragment) {

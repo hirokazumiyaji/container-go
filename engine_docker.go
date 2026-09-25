@@ -39,6 +39,8 @@ const (
 	dockerStderrNoSuchCtr    = "no such container"
 )
 
+var dockerDesktopUnableToStartRE = regexp.MustCompile(`(?i)^error response from daemon: docker desktop is unable to start\b`)
+
 func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
@@ -77,6 +79,9 @@ func dockerProbeUnavailable(err error) bool {
 	if !ok {
 		return false
 	}
+	if dockerDesktopStartupFailure(s) {
+		return true
+	}
 	for _, fragment := range []string{
 		"cannot connect to the docker daemon",
 		"is the docker daemon running",
@@ -85,6 +90,15 @@ func dockerProbeUnavailable(err error) bool {
 		"dial unix",
 	} {
 		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerDesktopStartupFailure(s string) bool {
+	for _, line := range strings.Split(s, "\n") {
+		if dockerDesktopUnableToStartRE.MatchString(strings.TrimSpace(line)) {
 			return true
 		}
 	}

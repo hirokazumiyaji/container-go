@@ -159,6 +159,49 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 }
 
+func TestExecReturnsOperationTimeoutAsInfrastructureError(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+	}{
+		{name: "i/o timeout", stderr: "client: i/o timeout"},
+		{name: "command timed out", stderr: "command timed out"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "partial stdout",
+				execErr: &cli.CLIError{
+					Args:     []string{"exec"},
+					ExitCode: 7,
+					Stderr:   tc.stderr,
+				},
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"query"})
+			if err == nil {
+				t.Fatal("Exec returned nil error for an operation timeout")
+			}
+			if code != 7 {
+				t.Errorf("exit code = %d, want 7", code)
+			}
+			if out == nil {
+				t.Fatal("Exec returned nil output for an operation timeout")
+			}
+			var cliErr *cli.CLIError
+			if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+				t.Fatalf("error = %v, want the original timeout CLIError", err)
+			}
+			if f.callWith("version") != nil || f.callWith("system") != nil {
+				t.Errorf("timeout triggered an infrastructure probe: %v", f.calls)
+			}
+		})
+	}
+}
+
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)

@@ -105,6 +105,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if !cli.IsCommandExit(err) {
 		return 0, output, wrapNotFound(c.classify(ctx, err))
 	}
+	// A timeout-shaped command exit is an operation failure, not an
+	// application result. Classify returns it without probing the backend.
+	if cli.IsOperationTimeoutError(err) {
+		return cliErr.ExitCode, output, c.classify(ctx, err)
+	}
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.

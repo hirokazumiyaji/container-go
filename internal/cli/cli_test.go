@@ -379,6 +379,20 @@ func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
 	}
 }
 
+func TestIsOperationTimeoutErrorRecognizesCLITimeoutText(t *testing.T) {
+	for _, stderr := range []string{
+		"i/o timeout",
+		"command timed out",
+	} {
+		t.Run(stderr, func(t *testing.T) {
+			err := &CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: stderr}
+			if !IsOperationTimeoutError(err) {
+				t.Fatalf("IsOperationTimeoutError(%q) = false, want true", stderr)
+			}
+		})
+	}
+}
+
 func TestClassifyProbeTimeoutPreservesExplicitDeadline(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
 	r := &hangingProbeRunner{

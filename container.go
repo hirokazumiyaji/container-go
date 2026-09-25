@@ -161,8 +161,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	c := &Container{
@@ -214,40 +214,45 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
+		return withCleanupError(cause, cleanupErr)
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create. It never deletes a pre-existing same-name container:
+// name conflicts are skipped, and only a container carrying this process's
+// managed+session labels is removed. A cleanup failure is returned so Run
+// can preserve it alongside the original operation error.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
 	}
 	defer unlock()
-	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	ctr := namedContainer(cfg, cfg.name)
+	info, err := ctr.inspectFresh(cleanupCtx)
 	if err != nil {
-		return
+		if isNotFoundFor(cfg.eng, err) {
+			return nil
+		}
+		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.creation != "" {
 		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
+			return nil
 		}
 	}
 	target := cfg.name
@@ -256,7 +261,10 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if err := ctr.delete(delCtx, target); err != nil {
+		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -326,7 +334,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
+	if isNotFoundFor(c.eng, err) {
 		return nil
 	}
 	if err != nil {
@@ -347,7 +355,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isNotFoundFor(c.eng, err) {
 		return nil
 	}
 	return c.classify(ctx, err)
@@ -464,7 +472,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

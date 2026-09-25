@@ -230,7 +230,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
   script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  only as validated stdin data. When it needs inspect output, it streams
+  the JSON through a filter that retains only the generation, ID, and
+  status; raw inspect data is never staged in a host file.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use
@@ -261,7 +263,9 @@ make bench-integration   # pull-heavy bench and singleflight scenarios
 
 Integration tests pull library images via `public.ecr.aws/docker/library/...`
 to avoid anonymous Docker Hub rate limits. Set `CONTAINERGO_BACKEND=apple` or
-`docker` to skip the other backend.
+`docker` to skip the other backend. Docker custom-volume-driver preservation
+coverage is opt-in; set `CONTAINERGO_DOCKER_VOLUME_DRIVER` to an installed
+plugin alias, and the test skips when the plugin is unavailable.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md))

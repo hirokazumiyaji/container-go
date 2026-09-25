@@ -109,6 +109,24 @@ func waitForDockerVolume(t *testing.T, name string, wantExists bool) {
 	}
 }
 
+type captureVolumeThenFail struct {
+	t      *testing.T
+	name   string
+	volume string
+}
+
+func (s *captureVolumeThenFail) WaitUntilReady(ctx context.Context, target wait.Target) error {
+	// Force the same lazy inspect path as the HTTP strategy, then record the
+	// image-defined volume while the container still exists.
+	_, _ = target.Endpoint(ctx, "80/tcp")
+	s.volume = dockerMountVolumeName(s.t, s.name, "/data")
+	if s.volume == "" {
+		return errors.New("image-defined /data volume not found")
+	}
+	waitForDockerVolume(s.t, s.volume, true)
+	return errors.New("forced readiness failure")
+}
+
 func TestDockerVolumeInspectClassifiesOnlyNoSuchVolumeAsAbsent(t *testing.T) {
 	exitErr := errors.New("exit status 1")
 	for _, tc := range []struct {
@@ -300,6 +318,164 @@ func TestIntegrationDockerCleanupVolumePolicy(t *testing.T) {
 		t.Fatalf("Terminate with named volume: %v", err)
 	}
 	waitForDockerVolume(t, named, true)
+}
+
+// TestIntegrationDockerNamedCustomDriverVolumePolicy is opt-in because
+// Docker does not ship a third-party volume plugin. Set
+// CONTAINERGO_DOCKER_VOLUME_DRIVER to an installed plugin alias to run it.
+func TestIntegrationDockerNamedCustomDriverVolumePolicy(t *testing.T) {
+	requireDocker(t)
+	driver := os.Getenv("CONTAINERGO_DOCKER_VOLUME_DRIVER")
+	if driver == "" {
+		t.Skip("set CONTAINERGO_DOCKER_VOLUME_DRIVER to an installed Docker volume plugin")
+	}
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-custom-volume-%d-%d", os.Getpid(), time.Now().UnixNano())
+	named := name + "-named"
+	if out, err := exec.Command("docker", "volume", "create", "--driver", driver, named).CombinedOutput(); err != nil {
+		t.Skipf("custom volume driver %q is unavailable: %v: %s", driver, err, out)
+	}
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+		_ = exec.Command("docker", "volume", "rm", "--force", named).Run()
+	}()
+
+	ctr, err := container.Run(ctx, integrationRedis,
+		container.WithName(name),
+		container.WithEntrypoint("sleep"),
+		container.WithCmd("60"),
+		container.WithMounts(container.Mount{
+			Type:   container.MountVolume,
+			Source: named,
+			Target: "/custom",
+		}),
+	)
+	if err != nil {
+		t.Fatalf("Run with custom-driver volume: %v", err)
+	}
+	if mounted := dockerMountVolumeName(t, name, "/custom"); mounted != named {
+		t.Fatalf("custom volume mount = %q, want %q", mounted, named)
+	}
+	anonymous := dockerMountVolumeName(t, name, "/data")
+	if anonymous == "" {
+		t.Fatal("image-defined /data volume not found")
+	}
+	waitForDockerVolume(t, anonymous, true)
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate custom-driver volume: %v", err)
+	}
+	waitForDockerVolume(t, anonymous, false)
+	waitForDockerVolume(t, named, true)
+}
+
+func runDockerCommand(t *testing.T, args ...string) string {
+	t.Helper()
+	out, err := exec.Command("docker", args...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("docker %s: %v: %s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func dockerContainerState(t *testing.T, name string) (string, bool) {
+	t.Helper()
+	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
+	if err == nil {
+		state := strings.TrimSpace(string(out))
+		if state == "" {
+			t.Fatalf("docker inspect %s returned an empty state", name)
+		}
+		return state, true
+	}
+	message := strings.ToLower(string(out))
+	if strings.Contains(message, "no such object") || strings.Contains(message, "no such container") {
+		return "", false
+	}
+	t.Fatalf("docker inspect %s: %v: %s", name, err, out)
+	return "", false
+}
+
+func waitDockerContainerState(t *testing.T, name, want string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		state, found := dockerContainerState(t, name)
+		if found && state == want {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	state, found := dockerContainerState(t, name)
+	t.Fatalf("state of %s = %q (found=%t), want %q", name, state, found, want)
+}
+
+func TestIntegrationDockerPruneKeepsCreatedAndRunning(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	if err := container.Pull(ctx, integrationAlpine); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
+	createdName := "containergo-prune-created-" + suffix
+	exitedName := "containergo-prune-exited-" + suffix
+	runningName := "containergo-prune-running-" + suffix
+	names := []string{createdName, exitedName, runningName}
+	t.Cleanup(func() {
+		for _, name := range names {
+			_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+		}
+	})
+	const managedLabel = "com.github.hirokazumiyaji.container-go=true"
+
+	runDockerCommand(t, "create", "--label", managedLabel, "--name", createdName, integrationAlpine)
+	runDockerCommand(t, "create", "--label", managedLabel, "--name", exitedName, integrationAlpine, "true")
+	runDockerCommand(t, "start", exitedName)
+	runDockerCommand(t, "run", "--detach", "--label", managedLabel, "--name", runningName,
+		integrationAlpine, "sh", "-c", "while :; do sleep 3600; done")
+	waitDockerContainerState(t, createdName, "created")
+	waitDockerContainerState(t, exitedName, "exited")
+	waitDockerContainerState(t, runningName, "running")
+
+	if _, err := container.Prune(ctx); err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if state, found := dockerContainerState(t, exitedName); found {
+		t.Fatalf("exited container %s survived Prune (state=%q)", exitedName, state)
+	}
+	for name, want := range map[string]string{createdName: "created", runningName: "running"} {
+		state, found := dockerContainerState(t, name)
+		if !found {
+			t.Errorf("Prune removed preserved container %s", name)
+			continue
+		}
+		if state != want {
+			t.Errorf("state of %s = %q, want %q", name, state, want)
+		}
+	}
+}
+
+func TestIntegrationDockerPruneAcceptsDeadStatus(t *testing.T) {
+	requireDocker(t)
+	out, err := exec.Command("docker", "ps", "--all", "--quiet", "--filter", "status=dead").CombinedOutput()
+	if err != nil {
+		t.Fatalf("Docker rejected status=dead: %v: %s", err, out)
+	}
+	ids := strings.Fields(string(out))
+	if len(ids) == 0 {
+		t.Skip("Docker accepts status=dead, but no dead container is available to inspect")
+	}
+	for _, id := range ids {
+		out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", id).CombinedOutput()
+		if err != nil {
+			if strings.Contains(strings.ToLower(string(out)), "no such") {
+				continue
+			}
+			t.Fatalf("inspect %s: %v: %s", id, err, out)
+		}
+		if got := strings.TrimSpace(string(out)); got != "dead" {
+			t.Errorf("status=dead returned %s with state %q", id, got)
+		}
+	}
 }
 
 func TestIntegrationDockerPruneVolumePolicies(t *testing.T) {
@@ -556,6 +732,7 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 		_ = exec.Command("docker", "volume", "rm", named).Run()
 	}()
+	strategy := &captureVolumeThenFail{t: t, name: name}
 	_, err = container.Run(ctx, integrationRedis,
 		container.WithName(name),
 		container.WithEntrypoint("sleep"),
@@ -566,18 +743,18 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 			Source: named,
 			Target: "/named",
 		}),
-		container.WithWaitStrategy(
-			wait.ForHTTP("/").
-				WithStartupTimeout(3*time.Second).
-				WithPollInterval(200*time.Millisecond),
-		),
+		container.WithWaitStrategy(strategy),
 	)
 	if err == nil {
-		t.Fatal("want error when HTTP wait cannot succeed")
+		t.Fatal("want error when readiness wait fails")
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr == nil {
 		t.Fatalf("container still present after wait rollback: %s", out)
 	}
+	if strategy.volume == "" {
+		t.Fatal("readiness strategy did not capture the anonymous volume")
+	}
+	waitForDockerVolume(t, strategy.volume, false)
 	waitForDockerVolume(t, named, true)
 }
 
@@ -612,7 +789,7 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	name := fmt.Sprintf("containergo-reuse-%d", os.Getpid())
 	defer func() {
 		_, _ = container.PruneReuseGroup(context.Background(), "integration-reuse")
-		_ = exec.Command("docker", "rm", "--force", name).Run()
+		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 	}()
 
 	startChild := func() *exec.Cmd {
@@ -692,7 +869,7 @@ func TestIntegrationDockerRunFailureCleansUp(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-failclean-%d", os.Getpid())
-	_ = exec.Command("docker", "rm", "--force", name).Run()
+	_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 	named := name + "-named"
 	if out, err := exec.Command("docker", "volume", "create", named).CombinedOutput(); err != nil {
 		t.Fatalf("create named volume: %v: %s", err, out)
@@ -727,7 +904,7 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-failkeep-%d", os.Getpid())
-	_ = exec.Command("docker", "rm", "--force", name).Run()
+	_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 
 	ctr, err := container.Run(ctx, integrationAlpine,
 		container.WithName(name),
@@ -758,9 +935,9 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-stale-%d", os.Getpid())
-	_ = exec.Command("docker", "rm", "--force", name).Run()
+	_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 	defer func() {
-		_ = exec.Command("docker", "rm", "--force", name).Run()
+		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
 	}()
 
 	oldCtr, err := container.Run(ctx, integrationAlpine,

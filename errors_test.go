@@ -12,7 +12,7 @@ func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &inspectNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `No such object: myctr`},
+		err: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`},
 	}
 	// Clear cached info so inspectFresh runs.
 	ctr.info = nil
@@ -25,7 +25,7 @@ func TestExecWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 	}
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Exec error = %v, want ErrContainerNotFound", err)
@@ -60,11 +60,24 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 	return nil, nil, n.err
 }
 
+func TestCleanupErrorUnwrapsOperationAndCleanup(t *testing.T) {
+	operationErr := errors.New("operation failed")
+	cleanupErr := errors.New("cleanup failed")
+	err := withCleanupError(operationErr, cleanupErr)
+	if !errors.Is(err, operationErr) || !errors.Is(err, cleanupErr) {
+		t.Fatalf("joined error = %v, want both causes", err)
+	}
+	var wrapped *CleanupError
+	if !errors.As(err, &wrapped) || wrapped.Err != operationErr || wrapped.CleanupErr != cleanupErr {
+		t.Fatalf("wrapped = %#v, want both fields", wrapped)
+	}
+}
+
 func TestCLIErrorAliasUsableWithErrorsAs(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 	}
 	_, _, err := ctr.Exec(context.Background(), []string{"true"})
 	var cliErr *CLIError
@@ -76,11 +89,161 @@ func TestCLIErrorAliasUsableWithErrorsAs(t *testing.T) {
 	}
 }
 
+func TestAppleInspectTargetedNotFound(t *testing.T) {
+	err := &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+	if !isNotFoundFor(appleEngine{}, err) {
+		t.Fatal("targeted Apple inspect not-found was not recognized")
+	}
+}
+
+func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
+	cases := []struct {
+		name string
+		err  *cli.CLIError
+		want bool
+	}{
+		{
+			name: "direct Apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+			want: true,
+		},
+		{
+			name: "wrapped Apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: failed to bootstrap container: container with ID myctr not found",
+			},
+			want: true,
+		},
+		{
+			name: "generic application message",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: application: container not found: myctr",
+			},
+		},
+		{
+			name: "wrong command",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"exec", "myctr", "true"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+		},
+		{
+			name: "wrong target",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID other not found",
+			},
+		},
+		{
+			name: "wrong binary",
+			err: &cli.CLIError{
+				Binary: "docker", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := createRaceMissing(tc.err); got != tc.want {
+				t.Fatalf("createRaceMissing() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestApplicationNotFoundOutputIsNotContainerMissing(t *testing.T) {
+	appleErr := &cli.CLIError{
+		Args:   []string{"exec", "myctr", "true"},
+		Stderr: "Error: application: container not found: myctr",
+	}
+	if isNotFoundFor(appleEngine{}, appleErr) {
+		t.Fatal("Apple application output was treated as a missing container")
+	}
+	dockerErr := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"rm", "--force", "myctr"},
+		Stderr: "Error: application: no such container: myctr",
+	}
+	if isNotFoundFor(dockerEngine{}, dockerErr) {
+		t.Fatal("Docker application output was treated as a missing container")
+	}
+}
+
+func TestDockerVolumeNotFoundIsNotContainerMissing(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"rm", "--force", "--volumes", "container-id"},
+		Stderr: "error removing volume: volume driver plugin not found",
+	}
+	if (dockerEngine{}).containerMissing(err) {
+		t.Fatal("volume/plugin not-found error was classified as a missing container")
+	}
+	if isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("volume/plugin not-found error was treated as idempotent")
+	}
+}
+
+func TestDockerVolumeErrorMentioningContainerIsNotContainerMissing(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"rm", "--force", "--volumes", "container-id"},
+		Stderr: "error removing volume data for container container-id: volume driver not found",
+	}
+	if isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("volume error mentioning the container was treated as a missing container")
+	}
+}
+
+func TestDockerVolumeInspectNotFoundIsNotContainerMissing(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"volume", "inspect", "named-volume"},
+		Stderr: "no such volume: named-volume",
+	}
+	if isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("volume inspect not-found was treated as a missing container")
+	}
+}
+
+func TestDockerMatcherRequiresDockerBinary(t *testing.T) {
+	err := &cli.CLIError{Args: []string{"inspect", "myctr"}, Stderr: "Error: No such object: myctr"}
+	if (dockerEngine{}).containerMissing(err) {
+		t.Fatal("empty binary was accepted as a Docker error")
+	}
+}
+
+func TestDockerMissingContainerTargetIsExact(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"rm", "--force", "abc"},
+		Stderr: "Error response from daemon: No such container: abcd",
+	}
+	if isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("a different container ID prefix was treated as the requested target")
+	}
+}
+
+func TestDockerPreciseDeleteNotFoundIsContainerMissing(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"rm", "--force", "--volumes", "container-id"},
+		Stderr: "Error response from daemon: No such container: container-id",
+	}
+	if !isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("precise Docker rm not-found was not recognized")
+	}
+}
+
 func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &execNotFoundRunner{
-		err: &cli.CLIError{Args: []string{"logs", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+		err: &cli.CLIError{Args: []string{"logs", "myctr"}, ExitCode: 1, Stderr: `Error: failed to get logs for container myctr: failed to open container logs: container with ID myctr not found`},
 	}
 	if _, err := ctr.Logs(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Logs error = %v, want ErrContainerNotFound", err)

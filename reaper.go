@@ -23,7 +23,9 @@ import (
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule or Docker's 64-hex
 // ID format, and the script itself disables globbing and quotes every
-// expansion the IDs reach.
+// expansion the IDs reach. Inspect output is filtered while it is
+// streamed, so raw inspect JSON (which may contain environment secrets)
+// is never staged in a host file.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -62,11 +64,29 @@ echo "$ids" | while IFS= read -r line; do
   [ "$id" = "$line" ] && creation=""
   target="$id"
   if [ -n "$creation" ]; then
-    tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
-    rm -f "$tmp"
+    # Filter the inspect stream before command substitution. Only the
+    # generation, immutable ID, and inspect status are retained in memory;
+    # raw JSON (including environment values) never reaches a host file.
+    inspect_fields=$(
+      {
+        "$bin" inspect "$id" 2>/dev/null &
+        pid=$!
+        (sleep 10; kill -9 "$pid" 2>/dev/null) >/dev/null 2>&1 & killer=$!
+        wait "$pid" 2>/dev/null
+        rc=$?
+        kill "$killer" 2>/dev/null
+        wait "$killer" 2>/dev/null
+        printf '\n__containergo_inspect_rc__%s\n' "$rc"
+      } | sed -n \
+        -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
+        -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
+        -e 's/^__containergo_inspect_rc__\([0-9][0-9]*\)$/inspect_rc=\1/p'
+    ) || continue
+    got=$(printf '%s\n' "$inspect_fields" | sed -n 's/^creation=//p' | head -n 1)
+    uid=$(printf '%s\n' "$inspect_fields" | sed -n 's/^id=//p' | head -n 1)
+    inspect_rc=$(printf '%s\n' "$inspect_fields" | sed -n 's/^inspect_rc=//p' | tail -n 1)
+    unset inspect_fields
+    [ "$inspect_rc" = 0 ] || continue
     [ "$got" = "$creation" ] || continue
     [ -n "$uid" ] && target="$uid"
   fi

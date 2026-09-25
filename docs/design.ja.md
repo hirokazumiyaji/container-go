@@ -193,6 +193,7 @@ type Strategy interface {
 親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へバックエンドの強制削除コマンドを実行して自身も終了する。
 Apple Container では `container delete --force`、Docker では `docker rm --force --volumes` を使う。
 テストプロセス生存中はリーパーは何もしない(削除は通常経路が担い、リーパーは保険である)。
+世代を確認する必要がある inspect 出力は、生成元・不変 ID・状態だけを残すフィルタにストリームし、元の JSON をホストファイルに一時保存しない。
 この方式は container-rs の watchdog と同じで、シグナルハンドラでは捕捉できない SIGKILL にも対応できる。
 
 **セッションラベル**：作成する全コンテナに次のラベルを付与する。
@@ -336,7 +337,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 **クリーンアップの違い**:watchdog リーパーは削除コマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force --volumes`)。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
-`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+`Prune` は Docker ではデーモンのフィルタ（`--filter label=... --filter status=exited --filter status=dead`）を使う。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
 

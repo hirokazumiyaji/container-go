@@ -26,8 +26,8 @@ type dockerEngine struct{}
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
 //   - image missing: "Error response from daemon: No such image: …"
-//   - container missing: "error: no such object: …" (also historically
-//     "No such container" / "not found")
+//   - container missing: "error: no such object: …" for inspect and
+//     "No such container" (or a targeted "not found") for lifecycle calls
 const (
 	dockerDeleteVolumesFlag  = "--volumes"
 	dockerStderrConflict     = "conflict"
@@ -300,13 +300,15 @@ func (dockerEngine) logsTailArgs(id string) []string {
 	return []string{"logs", "--tail", "1000", id}
 }
 
-// listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// listArgs filters daemon-side; Docker treats repeated status filters as
+// alternatives, so both exited and dead stopped states are selected while
+// created and running containers remain out of scope.
 func (dockerEngine) listArgs() []string {
 	return []string{
 		"ps", "--all", "--quiet",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
+		"--filter", "status=dead",
 		"--format", "{{.Names}}",
 	}
 }
@@ -364,15 +366,49 @@ func (dockerEngine) nameConflict(err error) bool {
 		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
 }
 
-// containerMissing matches a CLI failure for an absent container.
+// containerMissing matches Docker's command-specific absent-container
+// response. Docker uses "no such object" for inspect and "no such
+// container" for lifecycle/stream commands. The command, binary, and
+// exact target are all required so a volume or application error cannot
+// make deletion look idempotent.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
+	if !cliErrorBelongsTo(err, "docker") {
+		return false
+	}
+	command, args, ok := cliCommandParts(err)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
+	target := cliCommandTarget(command, args)
+	if target == "" {
+		return false
+	}
+	switch command {
+	case "inspect":
+		return hasCLIErrorLine(err, func(line string) bool {
+			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchObj+":")
+			return ok && cliTargetListMatches(rest, target)
+		})
+	case "rm", "delete", "stop", "exec", "logs":
+		if hasCLIErrorLine(err, func(line string) bool {
+			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
+			return ok && cliTargetListMatches(rest, target)
+		}) {
+			return true
+		}
+		// Older Docker clients used a target-qualified generic phrase for
+		// rm. Keep that narrow fallback; it is not used for exec/logs,
+		// whose stderr may be application output.
+		if command == "rm" || command == "delete" {
+			return hasCLIErrorLine(err, func(line string) bool {
+				rest, ok := strings.CutPrefix(line, dockerStderrNotFound+":")
+				return ok && cliTargetListMatches(strings.TrimSpace(rest), target)
+			})
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 func dockerCLIStderr(err error) (string, bool) {

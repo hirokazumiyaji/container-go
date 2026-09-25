@@ -2,9 +2,12 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func TestTerminateContainerIsNilSafe(t *testing.T) {
@@ -107,13 +110,18 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 
 type dockerListRunner struct {
 	*fakeRunner
-	output string
+	output    string
+	deleteErr error
 }
 
 func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "ps" {
 		d.calls = append(d.calls, args)
 		return []byte(d.output), nil, nil
+	}
+	if args[0] == "rm" && d.deleteErr != nil {
+		d.calls = append(d.calls, args)
+		return nil, nil, d.deleteErr
 	}
 	return d.fakeRunner.Run(ctx, args...)
 }
@@ -162,6 +170,100 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestDockerPruneReportsVolumeDeleteFailure(t *testing.T) {
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     "managed-one\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", "managed-one"},
+			Stderr: "error removing volume: volume driver plugin not found",
+		},
+	}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err == nil {
+		t.Fatal("prune succeeded, want volume deletion failure")
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want no falsely successful deletions", removed)
+	}
+	if !strings.Contains(err.Error(), "prune managed-one") {
+		t.Fatalf("error = %v, want prune target context", err)
+	}
+}
+
+func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
+	id := "managed-one"
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     id + "\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", id},
+			Stderr: "Error response from daemon: No such container: " + id,
+		},
+	}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if !slices.Equal(removed, []string{id}) {
+		t.Fatalf("removed = %v, want [%s]", removed, id)
+	}
+}
+
+func TestDockerPruneSelectsExitedAndDeadOnly(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	for _, want := range []string{"status=exited", "status=dead"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
+	for _, unwanted := range []string{"status=created", "status=running"} {
+		if slices.Contains(args, unwanted) {
+			t.Errorf("listArgs = %v, unexpectedly includes %q", args, unwanted)
+		}
+	}
+}
+
+type cleanupTBRecorder struct {
+	callbacks []func()
+	logs      []string
+	errors    []string
+}
+
+func (r *cleanupTBRecorder) Helper() {}
+
+func (r *cleanupTBRecorder) Cleanup(fn func()) {
+	r.callbacks = append(r.callbacks, fn)
+}
+
+func (r *cleanupTBRecorder) Logf(format string, args ...any) {
+	r.logs = append(r.logs, fmt.Sprintf(format, args...))
+}
+
+func (r *cleanupTBRecorder) Errorf(format string, args ...any) {
+	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
+func TestCleanupStrictReportsCleanupFailure(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.failPrefix = "delete"
+	tb := &cleanupTBRecorder{}
+	registerCleanup(tb, ctr, true)
+	if len(tb.callbacks) != 1 {
+		t.Fatalf("callbacks = %d, want 1", len(tb.callbacks))
+	}
+	tb.callbacks[0]()
+	if len(tb.errors) != 1 {
+		t.Fatalf("errors = %v, want cleanup failure", tb.errors)
+	}
+	if len(tb.logs) != 0 {
+		t.Fatalf("logs = %v, strict cleanup should report through Errorf", tb.logs)
 	}
 }
 

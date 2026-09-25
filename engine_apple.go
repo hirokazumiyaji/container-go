@@ -23,13 +23,11 @@ type appleEngine struct{}
 //   - image missing / container missing: ContainerizationError(.notFound)
 //     surfaces as "image not found: …" / "container not found: …"
 const (
-	appleStderrAlready   = "already"
-	appleStderrExist     = "exist"
-	appleStderrInUse     = "in use"
-	appleStderrTaken     = "taken"
-	appleStderrNotFound  = "not found"
-	appleStderrNoSuchObj = "no such object"    // defensive; not observed on 1.3.0
-	appleStderrNoSuchCtr = "no such container" // defensive; not observed on 1.3.0
+	appleStderrAlready  = "already"
+	appleStderrExist    = "exist"
+	appleStderrInUse    = "in use"
+	appleStderrTaken    = "taken"
+	appleStderrNotFound = "not found"
 )
 
 func (appleEngine) name() string   { return "apple" }
@@ -254,15 +252,117 @@ func (appleEngine) nameConflict(err error) bool {
 			strings.Contains(s, appleStderrTaken))
 }
 
-// containerMissing matches a CLI failure for an absent container.
+// containerMissing matches the command-specific Apple Container forms
+// for an absent container. The command, binary, and exact target are
+// required so application output containing "not found" is not treated
+// as a backend result.
 func (appleEngine) containerMissing(err error) bool {
-	s, ok := appleCLIStderr(err)
+	if !cliErrorBelongsTo(err, "container") {
+		return false
+	}
+	command, args, ok := cliCommandParts(err)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, appleStderrNotFound) ||
-		strings.Contains(s, appleStderrNoSuchObj) ||
-		strings.Contains(s, appleStderrNoSuchCtr)
+	target := cliCommandTarget(command, args)
+	if target == "" {
+		return false
+	}
+	switch command {
+	case "inspect":
+		return hasCLIErrorLine(err, func(line string) bool {
+			rest, ok := strings.CutPrefix(line, "container not found:")
+			return ok && cliTargetListMatches(rest, target)
+		})
+	case "exec":
+		return hasCLIErrorLine(err, func(line string) bool {
+			return appleExecMissingLine(line, target)
+		})
+	case "stop":
+		return hasCLIErrorLine(err, func(line string) bool {
+			return appleStateMissingLine(line, target, "failed to stop container:")
+		})
+	case "delete", "rm":
+		return hasCLIErrorLine(err, func(line string) bool {
+			return appleStateMissingLine(line, target, "failed to delete container:")
+		})
+	case "logs":
+		return hasCLIErrorLine(err, func(line string) bool {
+			return appleLogsMissingLine(line, target)
+		})
+	default:
+		return false
+	}
+}
+
+func appleExecMissingLine(line, target string) bool {
+	rest, ok := strings.CutPrefix(line, "get failed:")
+	if !ok {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	rest, ok = strings.CutPrefix(rest, "container ")
+	if !ok || !strings.HasSuffix(rest, " not found") {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, " not found")), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+		(target == "" || strings.EqualFold(id, target))
+}
+
+func appleIDMissingLine(line, target string) bool {
+	rest, ok := strings.CutPrefix(line, "container with id ")
+	if !ok || !strings.HasSuffix(rest, " not found") {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, " not found")), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+		(target == "" || strings.EqualFold(id, target))
+}
+
+func appleStateMissingLine(line, target, wrapper string) bool {
+	current := line
+	for range 3 {
+		if appleIDMissingLine(current, target) {
+			return true
+		}
+		rest, ok := strings.CutPrefix(current, wrapper)
+		if !ok {
+			return false
+		}
+		current = strings.TrimSpace(rest)
+	}
+	return false
+}
+
+func appleLogsMissingLine(line, target string) bool {
+	const prefix = "failed to get logs for container "
+	rest, ok := strings.CutPrefix(line, prefix)
+	if !ok {
+		return appleIDMissingLine(line, target)
+	}
+	rest = strings.TrimSpace(rest)
+	separator := strings.Index(rest, ":")
+	if separator < 0 {
+		return false
+	}
+	logID := strings.TrimSpace(rest[:separator])
+	if logID == "" || (target != "" && !strings.EqualFold(logID, target)) {
+		return false
+	}
+	nested := strings.TrimSpace(rest[separator+1:])
+	const openPrefix = "failed to open container logs: "
+	for range 3 {
+		if appleIDMissingLine(nested, target) || appleExecMissingLine(nested, target) {
+			return true
+		}
+		openRest, ok := strings.CutPrefix(nested, openPrefix)
+		if !ok {
+			return false
+		}
+		nested = strings.TrimSpace(openRest)
+	}
+	return false
 }
 
 func appleCLIStderr(err error) (string, bool) {

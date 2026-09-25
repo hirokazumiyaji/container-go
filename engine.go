@@ -69,6 +69,10 @@ type engine interface {
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
+	// containerMissing reports whether a backend error specifically means
+	// that the requested container is absent. It must use the CLI operation
+	// and target rather than matching arbitrary "not found" text.
+	containerMissing(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
 	// runs as `<binary> <subcommand> --force [backend flags] <id>`.
 	reaperSubcommand() string

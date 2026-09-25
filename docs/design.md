@@ -276,10 +276,12 @@ are registered by writing them down a pipe. However the parent dies,
 the pipe reaches EOF, and the reaper runs the backend's force-delete
 command (`container delete --force` on Apple Container or
 `docker rm --force --volumes` on Docker) for every registered ID and
-exits. While the parent lives the reaper does nothing (deletion belongs
-to the normal path; the reaper is insurance). This mirrors
-container-rs's watchdog and covers SIGKILL, which no signal handler
-can.
+exits. When a generation check needs inspect output, the reaper streams
+it through a filter that retains only the generation, immutable ID, and
+inspect status; raw inspect JSON is never staged in a host file. While
+the parent lives the reaper does nothing (deletion belongs to the normal
+path; the reaper is insurance). This mirrors container-rs's watchdog and
+covers SIGKILL, which no signal handler can.
 
 **Session labels**: every created container carries
 
@@ -290,7 +292,8 @@ can.
 The CLI has no label filter, so orphan sweeps filter
 `container ls -a --format json` client-side. A helper `Prune(ctx)`
 removes stopped containers carrying the managed label from any
-session.
+session; on Docker its daemon-side filter includes both `exited` and
+`dead` states, while leaving `created` and `running` containers alone.
 
 Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
 reaper (for debugging).

@@ -73,7 +73,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if !isNotFoundFor(cfg.eng, err) {
 				return nil, err
 			}
 			// Creation carries its own runTimeout budget detached from
@@ -160,8 +160,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	ctr := &Container{
@@ -175,13 +175,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, ctr.rollback(ctx, err)
 		}
 	}
 	return ctr, nil
@@ -230,19 +228,35 @@ func namedContainer(cfg *config, id string) *Container {
 	}
 }
 
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
+// createRaceMissing reports only Apple's anchored concurrent-create form:
+// a run command that reaches bootstrap and then loses the named object.
+// Generic "container not found" output is deliberately excluded because
+// it is commonly emitted by the application process and must remain an
+// ordinary original error.
 func createRaceMissing(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	command, args, ok := cliCommandParts(err)
+	if !ok || command != "run" || !cliErrorBelongsTo(err, "container") {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
-		return true
+	target := cliCommandTarget(command, args)
+	if target == "" {
+		return false
 	}
-	return strings.Contains(s, "container not found")
+	return hasCLIErrorLine(err, func(line string) bool {
+		if appleIDMissingLine(line, target) {
+			return true
+		}
+		for _, wrapper := range []string{
+			"failed to bootstrap container:",
+			"failed to run container:",
+		} {
+			rest, found := strings.CutPrefix(line, wrapper)
+			if found && appleIDMissingLine(strings.TrimSpace(rest), target) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted

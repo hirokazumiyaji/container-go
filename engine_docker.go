@@ -1,10 +1,10 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
 	"net/url"
 	"os"
 	"regexp"
@@ -46,10 +46,11 @@ func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
 // checkConfig rejects publish options that Docker cannot honor before
-// any image or container command is issued. In particular, Docker
-// silently discards -p in host mode, and a none network has no host
-// port namespace at all.
-func (dockerEngine) checkConfig(cfg *config) error {
+// any image or container command is issued. Named networks are
+// inspected because Docker's externally isolated networks cannot provide
+// the host endpoints promised by WithExposedPorts or
+// WithPublishedPort.
+func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	if !dockerNetworkAllowsPublish(cfg.network) {
 		if len(cfg.published) > 0 {
 			return dockerPublishOptionError(cfg.network, "WithPublishedPort")
@@ -58,23 +59,96 @@ func (dockerEngine) checkConfig(cfg *config) error {
 			return dockerPublishOptionError(cfg.network, "WithExposedPorts")
 		}
 	}
-	if !isRemoteDockerHost() {
-		return nil
+	if isRemoteDockerHost() {
+		// hostAddr is validated and canonicalized by parsePublishSpec.
+		for _, p := range cfg.published {
+			if ipIsLoopback(p.hostAddr) {
+				err := &ConfigError{
+					Backend: "docker",
+					Network: cfg.network,
+					Option:  "WithPublishedPort",
+					Detail:  fmt.Sprintf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw),
+				}
+				return errors.Join(err, ErrEndpointUnreachable)
+			}
+		}
 	}
-	// hostAddr is validated as an IP literal by parsePublishSpec.
-	for _, p := range cfg.published {
-		if p.hostAddr != "" && net.ParseIP(p.hostAddr).IsLoopback() {
-			return fmt.Errorf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw)
+	option := ""
+	if len(cfg.published) > 0 {
+		option = "WithPublishedPort"
+	} else if len(cfg.exposed) > 0 {
+		option = "WithExposedPorts"
+	}
+	if option != "" {
+		network, err := inspectDockerNetwork(ctx, cfg)
+		if err != nil {
+			return err
+		}
+		if reason := dockerNetworkIsolationReason(network); reason != "" {
+			return &ConfigError{
+				Backend: "docker",
+				Network: cfg.network,
+				Option:  option,
+				Detail:  reason + " networks are externally isolated; this library cannot create a reachable published endpoint on them",
+			}
 		}
 	}
 	return nil
 }
 
-func dockerPublishOptionError(mode, option string) error {
-	if mode == dockerNetworkHost {
-		return fmt.Errorf("docker host network does not support %s; Docker discards published ports", option)
+func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, error) {
+	queryCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
+	if err != nil {
+		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, classified)
 	}
-	return fmt.Errorf("docker network mode %q does not support %s", mode, option)
+	return parseDockerNetworkInspect(stdout, cfg.network)
+}
+
+type dockerNetworkInfo struct {
+	Name     string
+	Internal bool
+	Options  map[string]string
+}
+
+func parseDockerNetworkInspect(data []byte, requested string) (dockerNetworkInfo, error) {
+	var networks []dockerNetworkInfo
+	if err := json.Unmarshal(data, &networks); err != nil {
+		return dockerNetworkInfo{}, fmt.Errorf("decode Docker network inspect output: %w", err)
+	}
+	if len(networks) == 0 {
+		return dockerNetworkInfo{}, fmt.Errorf("docker network %q missing from inspect output", requested)
+	}
+	return networks[0], nil
+}
+
+func dockerNetworkIsolationReason(network dockerNetworkInfo) string {
+	if network.Internal {
+		return "internal"
+	}
+	for key, value := range network.Options {
+		key = strings.ToLower(key)
+		if (strings.HasSuffix(key, "gateway_mode_ipv4") || strings.HasSuffix(key, "gateway_mode_ipv6")) &&
+			strings.EqualFold(strings.TrimSpace(value), "isolated") {
+			return "isolated"
+		}
+	}
+	return ""
+}
+
+func dockerPublishOptionError(mode, option string) error {
+	detail := fmt.Sprintf("Docker network mode %q cannot create a host port binding", mode)
+	if mode == dockerNetworkHost {
+		detail = "Docker host networking does not create host port bindings"
+	}
+	return &ConfigError{
+		Backend: "docker",
+		Network: mode,
+		Option:  option,
+		Detail:  detail,
+	}
 }
 
 // dockerNetworkAllowsPublish reports whether Docker can create a
@@ -85,22 +159,17 @@ func dockerNetworkAllowsPublish(mode string) bool {
 }
 
 // dockerNetworkModesMatch compares the requested mode with the mode
-// reported by inspect. Docker may call the implicit default network
-// "default" or "bridge" depending on how it was selected.
+// reported by inspect. The identity is exact so a user-defined network
+// named "default" cannot impersonate Docker's built-in bridge. Empty
+// values are intentionally incompatible: reuse and endpoint resolution
+// fail closed rather than treating missing inspect data as a wildcard.
 func dockerNetworkModesMatch(requested, actual string) bool {
 	requested = strings.TrimSpace(requested)
 	actual = strings.TrimSpace(actual)
-	if actual == "" {
-		// Older inspect output may omit NetworkMode. Keep bridge
-		// compatibility, but never treat a requested special mode as
-		// verified when the backend did not report it.
-		return requested != dockerNetworkHost && requested != dockerNetworkNone
+	if requested == "" || actual == "" {
+		return false
 	}
-	if requested == "" || requested == actual {
-		return true
-	}
-	return (requested == "default" || requested == "bridge") &&
-		(actual == "default" || actual == "bridge")
+	return requested == actual
 }
 
 func dockerNetworkModeError(requested, actual string) error {
@@ -111,9 +180,9 @@ func dockerNetworkModeError(requested, actual string) error {
 }
 
 func dockerNetworkEndpointError(mode string) error {
-	switch mode {
+	switch strings.TrimSpace(mode) {
 	case dockerNetworkHost:
-		return fmt.Errorf("%w: Docker network mode %q has no host port binding; use a bridge network or omit WithExposedPorts and WithPublishedPort", ErrPortNotExposed, mode)
+		return fmt.Errorf("%w: Docker host networking has no library-managed host port binding; Host returns the daemon host, but Endpoint does not infer a port", ErrPortNotExposed)
 	case dockerNetworkNone:
 		return fmt.Errorf("%w: Docker network mode %q has no network interface for a host port binding", ErrPortNotExposed, mode)
 	default:
@@ -136,51 +205,61 @@ func (dockerEngine) probe() cli.Probe {
 func (dockerEngine) defaultHost() string {
 	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
 		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-			return u.Hostname()
+			host := canonicalIP(u.Hostname())
+			if ipIsUnspecified(host) {
+				if ipIs4(host) {
+					return "127.0.0.1"
+				}
+				return "::1"
+			}
+			return host
 		}
 	}
 	return "127.0.0.1"
 }
 
 // isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
-// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
+// tcp daemon. Auto-publish must bind 0.0.0.0 there; a loopback bind on
 // the remote host is unreachable from the client.
 func isRemoteDockerHost() bool {
 	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
-// must be rewritten to defaultHost() on a remote daemon. IP literals
-// use net.IP.IsLoopback / IsUnspecified so the full 127.0.0.0/8 and
-// ::1 ranges are covered, not only a few spellings.
+// must be rewritten to defaultHost() on a remote daemon.
 func isLoopbackOrUnspecified(addr string) bool {
 	if addr == "" || strings.EqualFold(addr, "localhost") {
 		return true
 	}
-	ip := net.ParseIP(addr)
-	if ip == nil {
-		return false
-	}
-	return ip.IsLoopback() || ip.IsUnspecified()
+	return ipIsLoopback(addr) || ipIsUnspecified(addr)
 }
 
-// dockerConnectHost rewrites binds to the client-facing host. On a
-// remote daemon, loopback and unspecified addresses become
-// defaultHost(). Locally, unspecified binds still map to defaultHost(),
-// but an explicit loopback (127.0.0.1, ::1, …) is preserved so an
-// IPv6-only published port stays reachable.
+// dockerConnectHost rewrites unspecified binds to the client-facing
+// host. On a remote daemon, loopback and unspecified addresses become
+// defaultHost(). Locally, an unspecified IPv6 bind becomes ::1 rather
+// than losing its address family; an explicit loopback is preserved.
 func dockerConnectHost(addr string, eng engine) string {
-	if isRemoteDockerHost() {
-		if isLoopbackOrUnspecified(addr) {
-			return eng.defaultHost()
-		}
-		return addr
-	}
-	switch addr {
-	case "", "0.0.0.0", "::":
+	canonical := canonicalIP(addr)
+	if canonical == "" {
 		return eng.defaultHost()
 	}
-	return addr
+	if isRemoteDockerHost() && isLoopbackOrUnspecified(canonical) {
+		return eng.defaultHost()
+	}
+	if ipIsUnspecified(canonical) {
+		if ipIs4(canonical) {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return canonical
+}
+
+func dockerBindingConnectHost(b boundPort, eng engine) (string, error) {
+	if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+		return "", fmt.Errorf("%w: Docker port %d is bound to remote-daemon loopback %q", ErrEndpointUnreachable, b.hostPort, canonicalIP(b.hostAddr))
+	}
+	return dockerConnectHost(b.hostAddr, eng), nil
 }
 
 func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
@@ -317,7 +396,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			info.bound = append(info.bound, boundPort{
 				containerPort: spec.port,
 				proto:         spec.proto,
-				hostAddr:      b.HostIP,
+				hostAddr:      canonicalIP(b.HostIP),
 				hostPort:      hostPort,
 			})
 		}

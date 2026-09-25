@@ -97,21 +97,34 @@ testcontainers model. Locally this binds loopback
 e.g. `tcp://docker:2375` in CI) it binds all interfaces
 (`-p 0.0.0.0::<port>`) so the client can reach it. `Host` returns
 `127.0.0.1` (or the host from a `tcp://` `DOCKER_HOST`) and
-`MappedPort` returns the assigned port. Assignment happens atomically
-in the daemon, so parallel tests do not race over ports here either.
-With a remote daemon, an explicit `WithPublishedPort` bound to loopback
-(`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
-on the remote machine.
+`MappedPort` returns the assigned port. IPv6 bindings are canonicalized
+without changing address family: an unspecified `::` endpoint resolves
+to `[::1]`, for example. Assignment happens atomically in the daemon, so
+parallel tests do not race over ports here either. With a remote daemon,
+an explicit `WithPublishedPort` bound to loopback is rejected, since it
+would only listen on the remote machine. Reuse also rejects an existing
+remote-daemon loopback binding instead of rewriting it to an unreachable
+host address.
 
-Docker's `host` and `none` network modes cannot create host-side port
-bindings. Consequently, `WithExposedPorts` (which auto-publishes on
-Docker) and `WithPublishedPort` are rejected before the container is
-created when combined with `WithNetwork("host")` or
-`WithNetwork("none")`. Host mode remains available without port options,
-but this library does not invent a host-mode `Endpoint`; an application
-using it is responsible for its host-network reachability. If a Docker
-installation disables host networking, the backend CLI error is
-returned rather than a fabricated endpoint.
+Docker's `host` and `none` modes cannot create library-managed port
+bindings. Externally isolated networks (`Internal: true` or an isolated
+bridge gateway mode) are rejected as well. `Run` inspects the requested
+Docker network before pulling or creating anything and returns a
+`*ConfigError` (matching `ErrInvalidConfig`) when either
+`WithExposedPorts` or `WithPublishedPort` is combined with one of these
+networks.
+
+Host mode remains available without port options. `Host` returns the
+client-facing daemon host, but `MappedPort` and `Endpoint` do not invent
+a host-namespace service port: they require a port declared and bound by
+this library. `none` mode has no reachable host, so `Host` returns an
+error. If a Docker installation disables host networking, the backend
+CLI start error is returned rather than a fabricated endpoint.
+
+For Docker, omitting `WithNetwork` means the default `bridge` network.
+`WithReuse` requires that network identity to match the existing
+container; an omitted option is not a wildcard for `host`, `none`, or a
+named network.
 
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
 daemon is not detected.
@@ -213,9 +226,10 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Only image and ports are compared; `env` / `cmd` / `mounts`
-  differences attach silently by design (use distinct names when they
-  matter).
+  Docker also requires the requested network identity to match. Omitted
+  `WithNetwork` means `bridge`; `host`, `none`, and named networks are
+  not wildcards. `env` / `cmd` / `mounts` differences still attach
+  silently by design (use distinct names when they matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

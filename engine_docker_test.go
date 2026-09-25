@@ -2,12 +2,14 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"errors"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -20,6 +22,10 @@ func dockerTestConfig(t *testing.T, opts ...Option) *config {
 			t.Fatal(err)
 		}
 	}
+	if cfg.network == "" {
+		cfg.network = "bridge"
+	}
+	cfg.runner = &dockerRunner{fakeRunner: newTestRunner()}
 	return cfg
 }
 
@@ -181,8 +187,9 @@ const dockerFixtureID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b
 
 type dockerRunner struct {
 	*fakeRunner
-	inspectJSON []byte
-	failInspect bool
+	inspectJSON        []byte
+	networkInspectJSON []byte
+	failInspect        bool
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -190,6 +197,11 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	switch args[0] {
 	case "info":
 		return []byte("ok"), nil, nil
+	case "network":
+		if d.networkInspectJSON != nil {
+			return d.networkInspectJSON, nil, nil
+		}
+		return []byte(`[{"Name":"bridge","Internal":false,"Options":{}}]`), nil, nil
 	case "run":
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
@@ -235,11 +247,13 @@ func TestDockerParseRunID(t *testing.T) {
 
 func runDockerTestContainer(t *testing.T, d *dockerRunner, opts ...Option) *Container {
 	t.Helper()
-	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
-	if err != nil {
-		t.Fatal(err)
+	if d.inspectJSON == nil {
+		data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.inspectJSON = data
 	}
-	d.inspectJSON = data
 	opts = append([]Option{WithName("myctr"), withRunner(d), withEngine(dockerEngine{})}, opts...)
 	ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err != nil {
@@ -289,6 +303,14 @@ func TestDockerHostHonorsDockerHostEnv(t *testing.T) {
 	if got := (dockerEngine{}).defaultHost(); got != "10.0.0.5" {
 		t.Errorf("defaultHost = %q, want 10.0.0.5", got)
 	}
+	t.Setenv("DOCKER_HOST", "tcp://[2001:0db8:0000:0000:0000:0000:0000:0005]:2375")
+	if got := (dockerEngine{}).defaultHost(); got != "2001:db8::5" {
+		t.Errorf("expanded IPv6 defaultHost = %q, want 2001:db8::5", got)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://[::]:2375")
+	if got := (dockerEngine{}).defaultHost(); got != "::1" {
+		t.Errorf("IPv6 unspecified defaultHost = %q, want ::1", got)
+	}
 
 	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
 	if got := (dockerEngine{}).defaultHost(); got != "127.0.0.1" {
@@ -315,18 +337,15 @@ func TestDockerRunArgsBindAllInterfacesOnRemoteDaemon(t *testing.T) {
 	}
 }
 
-func TestDockerEndpointsRewriteLoopbackOnRemoteDaemon(t *testing.T) {
+func TestDockerEndpointsRejectLoopbackOnRemoteDaemon(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d, WithExposedPorts("6379/tcp"))
-	// testdata binds 127.0.0.1:49153 on the daemon; the client must dial
-	// the remote host instead.
+	// testdata binds 127.0.0.1:49153 on the daemon. Rewriting that to
+	// the remote host would not reach the actual listener.
 	ep, err := ctr.Endpoint(context.Background(), "6379/tcp")
-	if err != nil {
-		t.Fatalf("Endpoint: %v", err)
-	}
-	if ep != "10.0.0.5:49153" {
-		t.Errorf("Endpoint = %q, want 10.0.0.5:49153", ep)
+	if !errors.Is(err, ErrEndpointUnreachable) {
+		t.Fatalf("Endpoint = %q, err = %v; want ErrEndpointUnreachable", ep, err)
 	}
 }
 
@@ -343,14 +362,25 @@ func TestDockerConnectHostMapping(t *testing.T) {
 	}
 
 	t.Setenv("DOCKER_HOST", "")
-	for _, addr := range []string{"", "0.0.0.0", "::"} {
+	for _, addr := range []string{"", "0.0.0.0"} {
 		if got := dockerConnectHost(addr, eng); got != "127.0.0.1" {
-			t.Errorf("local unspecified dockerConnectHost(%q) = %q, want 127.0.0.1", addr, got)
+			t.Errorf("local IPv4 unspecified dockerConnectHost(%q) = %q, want 127.0.0.1", addr, got)
 		}
 	}
-	for _, addr := range []string{"127.0.0.1", "::1", "localhost"} {
-		if got := dockerConnectHost(addr, eng); got != addr {
-			t.Errorf("local explicit dockerConnectHost(%q) = %q, want preserved", addr, got)
+	for _, addr := range []string{"::", "0:0:0:0:0:0:0:0"} {
+		if got := dockerConnectHost(addr, eng); got != "::1" {
+			t.Errorf("local IPv6 unspecified dockerConnectHost(%q) = %q, want ::1", addr, got)
+		}
+	}
+	for _, tc := range [][2]string{
+		{"127.0.0.1", "127.0.0.1"},
+		{"127.0.0.2", "127.0.0.2"},
+		{"::1", "::1"},
+		{"0:0:0:0:0:0:0:1", "::1"},
+		{"localhost", "localhost"},
+	} {
+		if got := dockerConnectHost(tc[0], eng); got != tc[1] {
+			t.Errorf("local explicit dockerConnectHost(%q) = %q, want %q", tc[0], got, tc[1])
 		}
 	}
 }
@@ -377,6 +407,13 @@ func TestDockerRejectsLoopbackPublishOnRemoteDaemon(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "unreachable") {
 			t.Errorf("WithPublishedPort(%q) on remote daemon: err = %v, want unreachable rejection", spec, err)
 		}
+		if !errors.Is(err, ErrInvalidConfig) || !errors.Is(err, ErrEndpointUnreachable) {
+			t.Errorf("WithPublishedPort(%q) error = %v, want config and unreachable sentinels", spec, err)
+		}
+		var configErr *ConfigError
+		if !errors.As(err, &configErr) {
+			t.Errorf("WithPublishedPort(%q) error = %v, want *ConfigError", spec, err)
+		}
 	}
 	if len(d.callWith("run")) != 0 {
 		t.Errorf("run must not be issued: %v", d.callWith("run"))
@@ -384,14 +421,14 @@ func TestDockerRejectsLoopbackPublishOnRemoteDaemon(t *testing.T) {
 	// Unspecified and non-loopback binds stay allowed.
 	for _, spec := range []string{"0.0.0.0:18080:80", "10.0.0.5:18080:80", "18080:80"} {
 		cfg := dockerTestConfig(t, WithPublishedPort(spec))
-		if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+		if err := (dockerEngine{}).checkConfig(context.Background(), cfg); err != nil {
 			t.Errorf("checkConfig(%q) = %v, want nil", spec, err)
 		}
 	}
 
 	t.Setenv("DOCKER_HOST", "")
 	cfg := dockerTestConfig(t, WithPublishedPort("127.0.0.1:18080:80"))
-	if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+	if err := (dockerEngine{}).checkConfig(context.Background(), cfg); err != nil {
 		t.Errorf("local loopback publish must be allowed: %v", err)
 	}
 }
@@ -462,6 +499,13 @@ func TestDockerRejectsHostNetworkPublishingBeforeRun(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("Run error = %v, want %q", err, tc.wantErr)
 			}
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Errorf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Errorf("Run error = %v, want *ConfigError", err)
+			}
 			if len(d.calls) != 0 {
 				t.Errorf("CLI called before configuration rejection: %v", d.calls)
 			}
@@ -479,8 +523,9 @@ func TestDockerRunArgsNetworkModeMatrix(t *testing.T) {
 		wantPublish []string
 	}{
 		{
-			name:        "default auto-publish",
+			name:        "default bridge auto-publish",
 			opts:        []Option{WithExposedPorts("80/tcp")},
+			wantNetwork: "bridge",
 			wantPublish: []string{"127.0.0.1::80/tcp"},
 		},
 		{
@@ -523,7 +568,7 @@ func TestDockerRunArgsNetworkModeMatrix(t *testing.T) {
 			}
 			cfg := dockerTestConfig(t, opts...)
 			eng := dockerEngine{}
-			if err := eng.checkConfig(cfg); err != nil {
+			if err := eng.checkConfig(context.Background(), cfg); err != nil {
 				t.Fatalf("checkConfig: %v", err)
 			}
 			args := eng.runArgs(cfg, "redis:7-alpine", "")
@@ -655,6 +700,175 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 				t.Errorf("Endpoint = %q, err = %v; want %q", endpoint, err, tc.wantEndpoint)
 			}
 		})
+	}
+}
+
+func TestDockerRejectsIsolatedNetworkPublishingBeforeRun(t *testing.T) {
+	cases := []struct {
+		name         string
+		networkJSON  string
+		wantContains string
+	}{
+		{
+			name:         "internal",
+			networkJSON:  `[{"Name":"private","Internal":true,"Options":{}}]`,
+			wantContains: "internal",
+		},
+		{
+			name:         "isolated gateway",
+			networkJSON:  `[{"Name":"private","Internal":false,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}]`,
+			wantContains: "isolated",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, option := range []Option{WithExposedPorts("80/tcp"), WithPublishedPort("127.0.0.1:18080:80")} {
+				d := &dockerRunner{
+					fakeRunner:         newTestRunner(),
+					networkInspectJSON: []byte(tc.networkJSON),
+				}
+				_, err := Run(context.Background(), "redis:7-alpine",
+					WithName("myctr"), WithNetwork("private"), option,
+					withRunner(d), withEngine(dockerEngine{}))
+				if err == nil || !strings.Contains(strings.ToLower(err.Error()), tc.wantContains) {
+					t.Fatalf("Run error = %v, want %s rejection", err, tc.wantContains)
+				}
+				if !errors.Is(err, ErrInvalidConfig) {
+					t.Errorf("Run error = %v, want ErrInvalidConfig", err)
+				}
+				var configErr *ConfigError
+				if !errors.As(err, &configErr) {
+					t.Errorf("Run error = %v, want *ConfigError", err)
+				} else if configErr.Backend != "docker" || configErr.Network != "private" || configErr.Option == "" {
+					t.Errorf("ConfigError = %+v, want docker/private/option fields", configErr)
+				}
+				if len(d.callWith("run")) != 0 || len(d.callWith("image")) != 0 {
+					t.Fatalf("CLI started image/container before config rejection: %v", d.calls)
+				}
+				if networkCall := d.callWith("network"); len(networkCall) < 3 || networkCall[1] != "inspect" || networkCall[2] != "private" {
+					t.Fatalf("network inspect calls = %v, want inspect private", d.calls)
+				}
+			}
+		})
+	}
+}
+
+func TestDockerIPv6BindingsAreCanonicalAndPreserveFamily(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name         string
+		publishSpec  string
+		hostIP       string
+		wantHost     string
+		wantEndpoint string
+	}{
+		{
+			name:         "expanded loopback",
+			publishSpec:  "[0:0:0:0:0:0:0:1]:49153:6379/tcp",
+			hostIP:       "::1",
+			wantHost:     "::1",
+			wantEndpoint: "[::1]:49153",
+		},
+		{
+			name:         "IPv6 unspecified",
+			publishSpec:  "[::]:49153:6379/tcp",
+			hostIP:       "::",
+			wantHost:     "::1",
+			wantEndpoint: "[::1]:49153",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			inspectJSON := strings.Replace(string(data), `"HostIp": "127.0.0.1"`, `"HostIp": "`+tc.hostIP+`"`, 1)
+			d := &dockerRunner{fakeRunner: newTestRunner()}
+			ctr := runDockerTestContainer(t, d,
+				WithNetwork("bridge"), WithPublishedPort(tc.publishSpec))
+			d.inspectJSON = []byte(inspectJSON)
+			ctr.info = nil
+			host, err := ctr.Host(context.Background())
+			if err != nil || host != tc.wantHost {
+				t.Fatalf("Host = %q, err = %v; want %q", host, err, tc.wantHost)
+			}
+			endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+			if err != nil || endpoint != tc.wantEndpoint {
+				t.Fatalf("Endpoint = %q, err = %v; want %q", endpoint, err, tc.wantEndpoint)
+			}
+		})
+	}
+}
+
+func TestDockerOmittedNetworkUsesDefaultBridgeIdentity(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d, WithExposedPorts("6379/tcp"))
+	if ctr.network != "bridge" {
+		t.Errorf("Container.network = %q, want bridge", ctr.network)
+	}
+	if got := argvValue(d.callWith("run"), "--network"); got != "bridge" {
+		t.Errorf("--network = %q, want bridge", got)
+	}
+}
+
+func TestDockerReuseRejectsOmittedNetworkWildcard(t *testing.T) {
+	for _, actual := range []string{"host", "none", "test-net", "default", ""} {
+		t.Run("actual="+actual, func(t *testing.T) {
+			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
+			info := &engineInfo{
+				labels:      map[string]string{reuseLabel: "true"},
+				image:       "redis:7-alpine",
+				networkMode: actual,
+			}
+			if err := checkReuseCompat(info, "redis:7-alpine", cfg); err == nil || !strings.Contains(err.Error(), "network mode") {
+				t.Fatalf("checkReuseCompat error = %v, want network mismatch", err)
+			}
+		})
+	}
+}
+
+func TestDockerReuseRejectsRemoteLoopbackBinding(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	cfg := dockerTestConfig(t,
+		WithName("myctr"), WithReuse(), WithNetwork("bridge"),
+		WithExposedPorts("6379/tcp"),
+	)
+	info := &engineInfo{
+		labels:      map[string]string{reuseLabel: "true"},
+		image:       "redis:7-alpine",
+		networkMode: "bridge",
+		bound: []boundPort{{
+			containerPort: 6379,
+			proto:         "tcp",
+			hostAddr:      "0:0:0:0:0:0:0:1",
+			hostPort:      49153,
+		}},
+	}
+	err := checkReuseCompat(info, "redis:7-alpine", cfg)
+	if err == nil || !strings.Contains(err.Error(), "unreachable") {
+		t.Fatalf("checkReuseCompat error = %v, want unreachable loopback rejection", err)
+	}
+	if !errors.Is(err, ErrEndpointUnreachable) {
+		t.Errorf("checkReuseCompat error = %v, want ErrEndpointUnreachable", err)
+	}
+}
+
+func TestDockerHostModeHostReturnsDaemonHostWithoutInventingPort(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspectJSON := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "host"`, 1)
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d, WithNetwork("host"))
+	d.inspectJSON = []byte(inspectJSON)
+	ctr.info = nil
+	host, err := ctr.Host(context.Background())
+	if err != nil || host != "127.0.0.1" {
+		t.Fatalf("Host = %q, err = %v; want daemon host", host, err)
+	}
+	if endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
+		t.Fatalf("Endpoint = %q, want host-network port inference to fail", endpoint)
 	}
 }
 

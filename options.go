@@ -227,7 +227,8 @@ func WithEntrypoint(entrypoint string) Option {
 
 // WithExposedPorts declares the container ports ("6379/tcp" or "6379")
 // that MappedPort and Endpoint may resolve. Docker auto-publishes these
-// ports; host and none network modes reject that combination.
+// ports; host, none, internal, and isolated networks reject that
+// combination before container creation.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
 		for _, p := range ports {
@@ -244,8 +245,8 @@ func WithExposedPorts(ports ...string) Option {
 // WithPublishedPort publishes a container port on the host
 // ("[host-ip:]host-port:container-port[/proto]"). On Apple Container,
 // endpoints resolve to the container's own IP when this is omitted; on
-// Docker, WithExposedPorts auto-publishes instead. Docker host and none
-// network modes reject both publish forms.
+// Docker, WithExposedPorts auto-publishes instead. Docker rejects both
+// publish forms on host, none, internal, and isolated networks.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)
@@ -344,10 +345,11 @@ func WithWorkingDir(dir string) Option {
 	}
 }
 
-// WithNetwork attaches the container to a named network instead of
-// "default". Docker's "host" and "none" modes cannot be combined with
-// WithExposedPorts or WithPublishedPort; the Docker backend rejects
-// those combinations before creating the container.
+// WithNetwork selects a network. Omitting it uses Docker's default
+// bridge network (and Apple Container's default network). Docker's
+// "host" and "none" modes and externally isolated networks cannot be
+// combined with WithExposedPorts or WithPublishedPort; the Docker
+// backend rejects those combinations before creating the container.
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
@@ -488,9 +490,11 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		rest = parts[1] + ":" + parts[2]
 	}
 	if spec.hostAddr != "" {
-		if _, err := netip.ParseAddr(spec.hostAddr); err != nil {
+		addr, err := netip.ParseAddr(spec.hostAddr)
+		if err != nil {
 			return publishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
 		}
+		spec.hostAddr = addr.Unmap().String()
 	}
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")
@@ -516,10 +520,40 @@ func parsePortNumber(s string) (int, error) {
 }
 
 // connectAddr is the address clients should dial for a published port.
-// An unspecified bind address is reachable via loopback.
+// Preserve the address family when turning an unspecified bind into a
+// loopback destination.
 func (p publishSpec) connectAddr() string {
-	if p.hostAddr == "" || p.hostAddr == "0.0.0.0" || p.hostAddr == "::" {
+	if p.hostAddr == "" {
 		return "127.0.0.1"
 	}
-	return p.hostAddr
+	if ipIsUnspecified(p.hostAddr) {
+		if ipIs4(p.hostAddr) {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return canonicalIP(p.hostAddr)
+}
+
+func canonicalIP(addr string) string {
+	ip, err := netip.ParseAddr(addr)
+	if err != nil {
+		return addr
+	}
+	return ip.Unmap().String()
+}
+
+func ipIs4(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().Is4()
+}
+
+func ipIsLoopback(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().IsLoopback()
+}
+
+func ipIsUnspecified(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().IsUnspecified()
 }

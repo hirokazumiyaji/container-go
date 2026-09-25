@@ -90,19 +90,44 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。
+ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン
+(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。
+`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、
+`MappedPort` は割り当てられたポートを返します。
+IPv6 の束縛先は正規化してもアドレスファミリーを維持するため、`::` は
+`[::1]` として解決します。
+リモートデーモンでは、明示的な loopback 束縛も再利用時の既存 loopback
+束縛も拒否します。
+これらをリモートの host へ書き換えても実際の待ち受け先には到達できない
+ためです。
 
-Docker の `host` / `none` ネットワークモードでは host 側のポート
-バインディングを作成できません。そのため `WithNetwork("host")` または
-`WithNetwork("none")` と `WithExposedPorts`(Docker では自動公開) /
-`WithPublishedPort` を組み合わせた場合は、コンテナ作成前に拒否します。
-ポート指定なしの host モードは利用可能ですが、このライブラリは host
-モード用の `Endpoint` を推測して返しません。host ネットワークの到達性は
-アプリケーション側の責務です。Docker 側で host ネットワークが無効な
-場合は、推測した endpoint ではなくバックエンド CLI のエラーを返します。
-`docker context` 経由のリモート指定は検知しません。割り当てはデーモンが
-起動時に原子的に行うため、こちらでも並列テストがポートを奪い合うことは
-ありません。
+Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
+作成できません。
+`Internal: true` または isolated bridge gateway mode の外部遮断
+ネットワークも同じです。
+`Run` は image の pull やコンテナ作成より先に Docker network を inspect
+し、これらのネットワークと `WithExposedPorts` または
+`WithPublishedPort` を組み合わせた場合は `*ConfigError` を返します。
+このエラーは `ErrInvalidConfig` と一致します。
+
+ポート指定なしの host モードは利用できます。
+`Host` はクライアントから見たデーモンの host を返しますが、
+`MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
+ライブラリが宣言して束縛したポートが必要です。
+`none` モードには到達可能な host がないため、`Host` はエラーを返します。
+Docker 側で host networking が無効な場合は、推測した endpoint ではなく
+バックエンド CLI の開始エラーを返します。
+
+Docker で `WithNetwork` を省略した場合は、既定の `bridge` network として
+扱います。
+`WithReuse` では、この network が既存コンテナと一致する必要があり、
+省略指定は `host`、`none`、任意の名前付き network の wildcard には
+なりません。
+
+`docker context` 経由のリモート指定は検知しません。
+割り当てはデーモンが起動時に原子的に行うため、並列テストがポートを奪い合う
+こともありません。
 
 クライアントが `localhost` を要求する場合(または構成上コンテナ IP に
 届かない場合)は、明示的に公開します。
@@ -181,7 +206,11 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
-- image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
+- image / port が既存と不一致なら分かりやすいエラーを返す。
+  Docker では network も一致する必要があります。
+  `WithNetwork` 省略時は `bridge` として扱い、`host`、`none`、名前付き
+  network は wildcard にしません。
+  `env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様です。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。

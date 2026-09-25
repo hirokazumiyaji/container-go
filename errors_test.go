@@ -8,6 +8,13 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+func TestErrPortNotExposedDescribesAllFailureCases(t *testing.T) {
+	const want = "port is not declared or has no usable host binding"
+	if got := ErrPortNotExposed.Error(); got != want {
+		t.Fatalf("ErrPortNotExposed = %q, want %q", got, want)
+	}
+}
+
 func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

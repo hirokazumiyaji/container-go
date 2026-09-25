@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -113,6 +114,95 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
 	}
+}
+
+func TestIntegrationDockerRejectsInternalNetworkEndpoints(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	network := fmt.Sprintf("containergo-internal-%d", os.Getpid())
+	if out, err := exec.Command("docker", "network", "create", "--internal", network).CombinedOutput(); err != nil {
+		t.Fatalf("docker network create --internal: %v: %s", err, out)
+	}
+	defer func() {
+		if out, err := exec.Command("docker", "network", "rm", network).CombinedOutput(); err != nil {
+			t.Errorf("docker network rm %s: %v: %s", network, err, out)
+		}
+	}()
+
+	for i, option := range []struct {
+		name string
+		opt  container.Option
+	}{
+		{name: "exposed", opt: container.WithExposedPorts("6379/tcp")},
+		{name: "published", opt: container.WithPublishedPort("127.0.0.1:18080:6379/tcp")},
+	} {
+		t.Run(option.name, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-internal-ctr-%d-%d", os.Getpid(), i)
+			ctr, err := container.Run(ctx, integrationRedis,
+				container.WithName(name),
+				container.WithNetwork(network),
+				option.opt,
+			)
+			container.Cleanup(t, ctr)
+			if err == nil {
+				t.Fatal("Run succeeded; want typed isolated-network configuration error")
+			}
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("Run error = %v, want *ConfigError", err)
+			}
+			if configErr.Backend != "docker" || configErr.Network != network {
+				t.Errorf("ConfigError = %+v, want Docker network %q", configErr, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Errorf("container was created despite configuration rejection: %s", out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerIPv6PublishedEndpoint(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expanded loopback input must canonicalize without changing family.
+	spec := fmt.Sprintf("[0:0:0:0:0:0:0:1]:%d:6379/tcp", port)
+	ctr, err := container.Run(ctx, integrationRedis,
+		container.WithExposedPorts("6379/tcp"),
+		container.WithPublishedPort(spec),
+		container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil || host != "::1" {
+		t.Fatalf("Host = %q, err = %v; want ::1", host, err)
+	}
+	endpoint, err := ctr.Endpoint(ctx, "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if endpoint != fmt.Sprintf("[::1]:%d", port) {
+		t.Fatalf("Endpoint = %q, want [::1]:%d", endpoint, port)
+	}
+	conn, err := net.DialTimeout("tcp6", endpoint, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", endpoint, err)
+	}
+	_ = conn.Close()
 }
 
 func TestIntegrationDockerParallelStarts(t *testing.T) {
@@ -451,9 +541,11 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+	// Docker's stale handle retains the old immutable ID. A second
+	// termination is therefore an idempotent no-op, while the
+	// same-name replacement must survive.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("stale Docker Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)

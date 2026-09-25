@@ -150,7 +150,8 @@ provides:
 - `WithCPUs(n int)` / `WithMemory(size string)`: resource limits
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory
-- `WithNetwork(name string)`: target network
+- `WithNetwork(name string)`: target network; Docker's omitted default is
+  the `bridge` network
 - `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
 Options like `WithHostname` or `WithPrivileged` are intentionally omitted
@@ -214,18 +215,34 @@ unreachable in a given setup), publish explicitly with
 `WithPublishedPort("127.0.0.1:15432:5432")`. Then `Host` returns the
 given host address and `MappedPort` the host port.
 
-Docker's `host` and `none` network modes are different: Docker
-discards published ports in host mode and has no host namespace in
-none mode. The backend therefore rejects `WithExposedPorts` (which is
-Docker auto-publish) and `WithPublishedPort` with those modes before
-container creation. Host mode without port declarations is left to the
-application, and the library does not synthesize an endpoint for it.
-Endpoint resolution also checks the network mode and the actual inspect
-binding instead of trusting the requested publish string.
+Docker's `host` and `none` network modes cannot create
+library-managed port bindings.
+Externally isolated networks (`Internal: true` or an isolated bridge
+gateway mode) are rejected for the same endpoint contract.
+`Run` inspects the requested network before any image or container
+command and returns `*ConfigError` when either `WithExposedPorts` or
+`WithPublishedPort` is combined with an incompatible network.
 
-`MappedPort` errors with `ErrPortNotExposed` for ports not declared
-via `WithExposedPorts`. The declarations also feed wait strategies
-(the default port of ForListeningPort, for example).
+Host mode without port declarations remains available.
+`Host` returns the client-facing daemon host, while `MappedPort` and
+`Endpoint` refuse to infer a service port from the host namespace.
+None mode has no reachable host, so `Host` returns an error.
+Endpoint resolution verifies both the requested/actual network mode and
+the inspected binding instead of trusting the publish string.
+
+IP addresses are canonicalized with `netip`, so expanded IPv6 loopback
+and `::` compare correctly with Docker inspect output.
+An unspecified IPv6 bind resolves to `::1`, preserving its address
+family.
+On a remote daemon, an inspected loopback binding returns
+`ErrEndpointUnreachable`; rewriting it to the remote host would not
+reach the daemon's loopback listener.
+
+`MappedPort` and `Endpoint` error with `ErrPortNotExposed` for ports
+not declared via `WithExposedPorts` or `WithPublishedPort`, and for
+declared ports without a usable host binding.
+The declarations also feed wait strategies (the default port of
+ForListeningPort, for example).
 
 ## Wait strategies
 
@@ -307,9 +324,15 @@ volumes must be named, and their lifecycle belongs to the caller.
 ## Reuse
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
-(shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. `env`,
-`cmd`, and `mounts` differences attach silently to the existing
+(shared across processes).
+The compatibility check compares the image reference, declared and
+published ports, and the Docker network identity.
+An omitted Docker `WithNetwork` means `bridge`; it is not a wildcard
+for `host`, `none`, or a named network.
+Missing network-mode inspect data also fails closed.
+A loopback binding inspected on a remote daemon fails with
+`ErrEndpointUnreachable`.
+`env`, `cmd`, and `mounts` differences attach silently to the existing
 container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
@@ -405,8 +428,12 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
-- `ErrPortNotExposed`: querying a port not declared via
-  `WithExposedPorts`
+- `ErrInvalidConfig` / `*ConfigError`: a backend-incompatible option
+  combination rejected before creation
+- `ErrPortNotExposed`: a port was not declared or has no usable host
+  binding
+- `ErrEndpointUnreachable`: an inspected binding, notably remote-daemon
+  loopback, cannot be reached by the client
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
 
@@ -481,26 +508,28 @@ resolution stay the docker CLI's job.
 **Internal structure**: a backend is an internal interface owning only
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
-normalized record holds four things: state (mapped onto running /
-stopped / stopping / unknown), labels, the container IP, and host-side
-port bindings (container port → host address and port).
+normalized record holds state (mapped onto running / stopped /
+stopping / unknown), labels, immutable identity, image, container IP,
+Docker network mode, and host-side port bindings (container port →
+host address and port).
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults
-to the published-port model testcontainers uses. Ports declared via
-`WithExposedPorts` are automatically published to random ports:
-locally `-p 127.0.0.1::<port>`, on a remote daemon
-(`DOCKER_HOST=tcp://host`) `-p 0.0.0.0::<port>` so the client can reach
-it; `Host` returns `127.0.0.1` (or the host from a `tcp://`
-`DOCKER_HOST`) and `MappedPort` the assigned host port. Loopback and
-unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
-binding observed on a remote daemon still resolves to the remote host.
-An explicit `WithPublishedPort` loopback bind on a remote daemon is
-rejected by `Run`: Docker would listen on the remote machine's loopback,
-which no client-side rewrite can reach.
+to the published-port model testcontainers uses.
+Ports declared via `WithExposedPorts` are automatically published to
+random ports: locally `-p 127.0.0.1::<port>`, on a remote daemon
+(`DOCKER_HOST=tcp://host`) `-p 0.0.0.0::<port>`.
+`Host` returns `127.0.0.1` (or the host from a `tcp://`
+`DOCKER_HOST`) and `MappedPort` the assigned host port.
+Unspecified binds resolve through loopback while preserving IPv4/IPv6
+family; explicit IPv6 addresses are canonicalized through `netip`.
+An explicit or reused loopback binding on a remote daemon is rejected:
+it listens on the remote machine's loopback, which no client-side
+rewrite can reach.
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected. The daemon assigns ports atomically at start,
-so the free-port race avoided on Apple Container does not reappear.
+daemon is not detected.
+The daemon assigns ports atomically at start, so the free-port race
+avoided on Apple Container does not reappear.
 The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
@@ -516,7 +545,8 @@ on Docker (`--filter label=... --filter status=exited`).
 ## Out of scope
 
 - Dockerfile builds via `container build` / `docker build`
-- Network creation and management (only the default network is used)
+- Network creation and management (`WithNetwork` can attach an existing
+  Docker network)
 - Volume creation and management
 - High-level packages equivalent to testcontainers modules (postgres
   and the like; revisit once the core is stable)

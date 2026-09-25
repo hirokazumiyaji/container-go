@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -44,7 +45,7 @@ type engine interface {
 	probe() cli.Probe
 	// checkConfig rejects option combinations this backend cannot
 	// honor before anything is created.
-	checkConfig(cfg *config) error
+	checkConfig(ctx context.Context, cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).

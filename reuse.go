@@ -280,29 +280,54 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	// validation, including on direct-IP engines.
 	if !cfg.eng.directIP() {
 		for _, spec := range cfg.exposed {
-			if !hasBoundPort(info.bound, spec.port, spec.proto) {
+			b, ok := matchingExposedBinding(info.bound, spec)
+			if !ok {
 				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+			}
+			if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+				return fmt.Errorf("reuse %s: exposed port %s: %w", cfg.name, spec, err)
 			}
 		}
 	}
 	for _, p := range cfg.published {
-		if !hasPublishedBinding(info.bound, p) {
+		b, ok := matchingPublishedBinding(info.bound, p)
+		if !ok {
 			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
+		}
+		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+			return fmt.Errorf("reuse %s: published port %s: %w", cfg.name, p.raw, err)
 		}
 	}
 	return nil
 }
 
-func hasBoundPort(bound []boundPort, port int, proto string) bool {
-	for _, b := range bound {
-		if b.containerPort == port && b.proto == proto && b.hostPort > 0 {
-			return true
-		}
+func checkReuseBindingReachable(eng engine, b boundPort) error {
+	if eng.name() != "docker" {
+		return nil
 	}
-	return false
+	_, err := dockerBindingConnectHost(b, eng)
+	return err
+}
+
+func matchingExposedBinding(bound []boundPort, spec portSpec) (boundPort, bool) {
+	var loopback boundPort
+	foundLoopback := false
+	for _, b := range bound {
+		if b.containerPort != spec.port || b.proto != spec.proto || b.hostPort <= 0 {
+			continue
+		}
+		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+			loopback, foundLoopback = b, true
+			continue
+		}
+		return b, true
+	}
+	return loopback, foundLoopback
 }
 
 func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool) {
+	var loopback boundPort
+	foundLoopback := false
 	for _, b := range bound {
 		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
 			continue
@@ -310,17 +335,16 @@ func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool
 		if p.hostPort != 0 && b.hostPort != p.hostPort {
 			continue
 		}
-		if p.hostAddr != "" && b.hostAddr != p.hostAddr {
+		if p.hostAddr != "" && canonicalIP(b.hostAddr) != p.hostAddr {
+			continue
+		}
+		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+			loopback, foundLoopback = b, true
 			continue
 		}
 		return b, true
 	}
-	return boundPort{}, false
-}
-
-func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
-	_, ok := matchingPublishedBinding(bound, p)
-	return ok
+	return loopback, foundLoopback
 }
 
 // imagesCompatible reports whether a requested image reference matches

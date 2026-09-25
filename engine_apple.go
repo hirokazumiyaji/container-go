@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,7 +37,7 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-func (appleEngine) checkConfig(*config) error { return nil }
+func (appleEngine) checkConfig(context.Context, *config) error { return nil }
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
@@ -74,7 +75,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
 				proto:         p.Proto,
-				hostAddr:      p.HostAddress,
+				hostAddr:      canonicalIP(p.HostAddress),
 				hostPort:      p.HostPort,
 			})
 		}

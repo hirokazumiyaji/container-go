@@ -1,6 +1,7 @@
 package container
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -190,68 +191,165 @@ func (appleEngine) platformCompatible(selector, actual string) bool {
 }
 
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
-	osOnly := wantOS != "" && wantArch == "" && wantVariant == ""
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil {
-		return osOnly
+	var rawImages []json.RawMessage
+	// Decode the complete shape before applying the legacy fallback.
+	// Invalid JSON or a platform field of the wrong type is not equivalent
+	// to an older backend that simply omitted metadata.
+	if err := json.Unmarshal(data, &rawImages); err != nil || len(rawImages) == 0 {
+		return false
 	}
-	if len(raw) == 0 {
+
+	// Validate all platform-shaped fields even when no selector was
+	// requested. A malformed record must not make an otherwise present
+	// image look healthy.
+	metadataValid := true
+	records := make([]appleImageMetadata, 0, len(rawImages))
+	for _, rawImage := range rawImages {
+		if appleJSONNull(rawImage) {
+			return false
+		}
+		var image struct {
+			Platform json.RawMessage `json:"platform"`
+			Variants json.RawMessage `json:"variants"`
+		}
+		if err := json.Unmarshal(rawImage, &image); err != nil {
+			return false
+		}
+		var rawVariants []json.RawMessage
+		if len(image.Variants) != 0 {
+			if appleJSONNull(image.Variants) {
+				return false
+			}
+			if err := json.Unmarshal(image.Variants, &rawVariants); err != nil {
+				return false
+			}
+		}
+		var platformData appleImagePlatform
+		hasPlatform := false
+		if len(image.Platform) != 0 {
+			if appleJSONNull(image.Platform) {
+				return false
+			}
+			if err := json.Unmarshal(image.Platform, &platformData); err != nil {
+				return false
+			}
+			hasPlatform = true
+			if formatInspectPlatform(platformData.OS, platformData.Architecture, platformData.Variant) == "" {
+				metadataValid = false
+			}
+		}
+		variants := make([]appleImageVariant, 0, len(rawVariants))
+		for _, rawVariant := range rawVariants {
+			if appleJSONNull(rawVariant) {
+				return false
+			}
+			var variant struct {
+				Platform json.RawMessage `json:"platform"`
+			}
+			if err := json.Unmarshal(rawVariant, &variant); err != nil {
+				return false
+			}
+			var variantPlatform appleImagePlatform
+			hasVariantPlatform := false
+			if len(variant.Platform) != 0 {
+				if appleJSONNull(variant.Platform) {
+					return false
+				}
+				if err := json.Unmarshal(variant.Platform, &variantPlatform); err != nil {
+					return false
+				}
+				hasVariantPlatform = true
+				if formatInspectPlatform(variantPlatform.OS, variantPlatform.Architecture, variantPlatform.Variant) == "" {
+					metadataValid = false
+				}
+			} else {
+				metadataValid = false
+			}
+			variants = append(variants, appleImageVariant{
+				platform:  variantPlatform,
+				hasFields: hasVariantPlatform,
+			})
+		}
+		records = append(records, appleImageMetadata{
+			platform:  platformData,
+			hasFields: hasPlatform,
+			variants:  variants,
+		})
+	}
+
+	if !metadataValid {
 		return false
 	}
 	if platform == "" {
 		return true
 	}
-	var images []struct {
-		Platform *struct {
-			OS           string `json:"os"`
-			Architecture string `json:"architecture"`
-			Variant      string `json:"variant"`
-		} `json:"platform"`
-		Variants []struct {
-			Platform struct {
-				OS           string `json:"os"`
-				Architecture string `json:"architecture"`
-				Variant      string `json:"variant"`
-			} `json:"platform"`
-		} `json:"variants"`
+	wantOS, wantArch, wantVariant, selectorOK := parsePlatformParts(platform)
+	if !selectorOK {
+		return false
 	}
-	if err := json.Unmarshal(data, &images); err != nil {
-		// A bare OS selector retains the image-presence guarantee even
-		// when an older backend cannot provide variant metadata. An
-		// explicit architecture or variant remains fail-closed.
-		return osOnly
-	}
-	for _, img := range images {
-		if img.Platform != nil {
-			actual := formatInspectPlatform(img.Platform.OS, img.Platform.Architecture, img.Platform.Variant)
-			if actual != "" && platformSelectorMatches(platform, actual) {
-				return true
-			}
-		}
-		if len(img.Variants) == 0 {
-			if osOnly {
-				return true
-			}
-			continue
-		}
-		for _, v := range img.Variants {
+	osOnly := wantOS != "" && wantArch == "" && wantVariant == ""
+	for _, image := range records {
+		hasMetadata := false
+		if image.hasFields {
+			// A present but empty platform object is not the same as an
+			// omitted field: it is malformed metadata and must not enable
+			// the legacy fallback below.
+			hasMetadata = true
 			actual := formatInspectPlatform(
-				v.Platform.OS,
-				v.Platform.Architecture,
-				v.Platform.Variant,
+				image.platform.OS,
+				image.platform.Architecture,
+				image.platform.Variant,
 			)
-			if actual == "" && osOnly {
-				return true
-			}
 			if actual != "" && platformSelectorMatches(platform, actual) {
 				return true
 			}
+		}
+		for _, variant := range image.variants {
+			hasMetadata = true
+			if !variant.hasFields {
+				continue
+			}
+			actual := formatInspectPlatform(
+				variant.platform.OS,
+				variant.platform.Architecture,
+				variant.platform.Variant,
+			)
+			if actual != "" && platformSelectorMatches(platform, actual) {
+				return true
+			}
+		}
+		if !hasMetadata && osOnly {
+			// Only an actually absent platform field gets the legacy
+			// OS-only presence fallback. Known mismatching metadata is
+			// deliberately not treated as an unconstrained image.
+			return true
 		}
 	}
 	return false
 }
 
+type appleImagePlatform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
+}
+
+type appleImageVariant struct {
+	platform  appleImagePlatform
+	hasFields bool
+}
+
+type appleImageMetadata struct {
+	platform  appleImagePlatform
+	hasFields bool
+	variants  []appleImageVariant
+}
+
+func appleJSONNull(raw []byte) bool {
+	return bytes.Equal(bytes.TrimSpace(raw), []byte("null"))
+}
+
+//nolint:unused // retained for package-local platform parsing compatibility.
 func splitPlatform(p string) (os, arch, variant string) {
 	parts := strings.Split(p, "/")
 	if len(parts) > 0 {

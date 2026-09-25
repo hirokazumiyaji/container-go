@@ -78,6 +78,81 @@ func (r *generationRetryRunner) Run(_ context.Context, args ...string) ([]byte, 
 	}
 }
 
+func TestIssue94ReuseCreatorRejectsReplacementBeforeBindingOrDelete(t *testing.T) {
+	for _, state := range []string{"running", "stopped"} {
+		t.Run(state, func(t *testing.T) {
+			uidA := strings.Repeat("a", 64)
+			uidB := strings.Repeat("b", 64)
+			r := &issue94CreatorReplacementRunner{
+				fakeRunner: newTestRunner(),
+				uidA:       uidA,
+				uidB:       uidB,
+				state:      state,
+			}
+			r.imagePresent = true
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("creator-replacement"), WithReuse(),
+				withRunner(r), withEngine(dockerEngine{}))
+			if ctr != nil || err == nil || !errors.Is(err, ErrGenerationReplaced) {
+				t.Fatalf("Run = (%v, %v), want immediate ErrGenerationReplaced", ctr, err)
+			}
+			r.mu.Lock()
+			deletes := append([]string(nil), r.deleted...)
+			r.mu.Unlock()
+			if len(deletes) != 0 {
+				t.Fatalf("replacement was deleted: %v", deletes)
+			}
+		})
+	}
+}
+
+type issue94CreatorReplacementRunner struct {
+	*fakeRunner
+	mu      sync.Mutex
+	uidA    string
+	uidB    string
+	created string
+	state   string
+	deleted []string
+}
+
+func (r *issue94CreatorReplacementRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "run":
+		r.mu.Lock()
+		for i := range args {
+			if i+1 < len(args) && strings.HasPrefix(args[i+1], creationLabel+"=") {
+				r.created = strings.TrimPrefix(args[i+1], creationLabel+"=")
+			}
+		}
+		r.mu.Unlock()
+		return []byte(r.uidA + "\n"), nil, nil
+	case "inspect":
+		target := args[len(args)-1]
+		r.mu.Lock()
+		created := r.created
+		state := r.state
+		r.mu.Unlock()
+		if target == "creator-replacement" {
+			if created == "" {
+				return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "not found"}
+			}
+			return reviewDockerInspect(r.uidB, state, "redis:7-alpine", "bbbbbbbbbbbbbbbb", "linux/amd64"), nil, nil
+		}
+		if target == r.uidA {
+			return reviewDockerInspect(r.uidA, "running", "redis:7-alpine", r.created, "linux/amd64"), nil, nil
+		}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "not found"}
+	case "rm", "delete":
+		r.mu.Lock()
+		r.deleted = append(r.deleted, args[len(args)-1])
+		r.mu.Unlock()
+		return nil, nil, nil
+	default:
+		return r.fakeRunner.Run(ctx, args...)
+	}
+}
+
 func TestKeepNeverReturnsStaleReuseHandle(t *testing.T) {
 	t.Setenv("CONTAINERGO_KEEP", "1")
 	newRunner := func() *reviewDockerRunner {

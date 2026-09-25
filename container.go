@@ -177,6 +177,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(cfg.eng.parseRunID(stdout)) {
+			return recoverDockerRunOutput(ctx, cfg, classified)
+		}
 		if keepContainers() {
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
 			return retained, withCleanupError(classified, retainedErr)
@@ -195,27 +198,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		creation:  cfg.creation,
 	}
 	c.rememberImmutableID(runID)
-	if usesImmutableIDs(cfg.eng) {
-		if uid := c.immutableID(); !dockerIDRE.MatchString(uid) {
-			// Without the daemon-assigned ID there is no safe Docker
-			// delete target. Do not fall back to the user-visible name.
-			return nil, fmt.Errorf("run %s: backend did not return a full 64-hex container ID", cfg.name)
-		}
+	if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(runID) {
+		return recoverDockerRunOutput(ctx, cfg, fmt.Errorf("run %s: backend did not return a full 64-hex container ID", cfg.name))
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
 	// immutable ID the reaper deletes by it and needs no generation.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
-		}
-		if usesImmutableIDs(cfg.eng) {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.immutableID(), "")
-		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
-		}
-	}
+	registerContainerReaper(cfg, c)
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {

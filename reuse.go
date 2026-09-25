@@ -84,6 +84,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			}
 			return nil, err
 		}
+		if cfg.reusedCreated && !cfg.reuseCreatedMatches(info) {
+			return nil, fmt.Errorf("reuse %s: %w: creator generation changed", cfg.name, ErrGenerationReplaced)
+		}
 		if !cfg.reuseCreatedMatches(info) {
 			cfg.clearReuseCreated()
 		}
@@ -197,7 +200,7 @@ func reuseEnsureFlight(ctx context.Context, image string, cfg *config) (*Contain
 }
 
 func (c *config) reuseCreatedMatches(info *engineInfo) bool {
-	if !c.reusedCreated {
+	if !c.reusedCreated || info == nil {
 		return false
 	}
 	if c.reusedCreatedUID != "" || info.uid != "" {
@@ -403,6 +406,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// the classified chain so callers do not lose daemon errors.
 			return nil, classified
 		}
+		if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(cfg.eng.parseRunID(stdout)) {
+			return recoverDockerRunOutput(ctx, cfg, classified)
+		}
 		if keepContainers() {
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
 			return retained, withCleanupError(classified, retainedErr)
@@ -423,7 +429,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 	ctr.rememberImmutableID(runID)
 	if usesImmutableIDs(cfg.eng) && !dockerIDRE.MatchString(ctr.immutableID()) {
-		return nil, fmt.Errorf("reuse %s: backend did not return a full immutable Docker ID", cfg.name)
+		return recoverDockerRunOutput(ctx, cfg, fmt.Errorf("reuse %s: backend did not return a full immutable Docker ID", cfg.name))
 	}
 	if err := initializeReuseHandle(runCtx, cfg, ctr); err != nil {
 		// A reuse container is shared as soon as its name is published;

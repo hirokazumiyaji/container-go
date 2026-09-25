@@ -15,7 +15,7 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	logPath = filepath.Join(dir, "calls.log")
 	binPath = filepath.Join(dir, "container")
 	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + managedLabel + "\": \"true\"'; fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + managedLabel + "\": \"true\"'; echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -43,7 +43,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 	t.Fatalf("log %s = %q, want all of %q", path, data, wants)
 }
 
-func TestReaperDoesNotDeleteUngeneratedReuseContainer(t *testing.T) {
+func TestReaperRejectsGenerationlessAppleDelete(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	binPath := filepath.Join(dir, "container")
@@ -57,25 +57,55 @@ func TestReaperDoesNotDeleteUngeneratedReuseContainer(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "delete")
-	if err := r.register("ungenerated-reuse", ""); err != nil {
+	if err := r.register("ungenerated-reuse", ""); err == nil {
+		t.Fatal("generationless Apple reaper entry should be rejected")
+	}
+	if len(r.entries) != 0 || r.cmd != nil {
+		t.Fatal("generationless Apple entry reached reaper process state")
+	}
+	if data, err := os.ReadFile(logPath); err == nil && len(data) != 0 {
+		t.Fatalf("reaper executed a generationless entry: %q", data)
+	}
+	r.closeStdin()
+}
+
+func TestIssue94ReaperRetriesTransientInspectMissUnderLock(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	countPath := filepath.Join(dir, "inspect-count")
+	binPath := filepath.Join(dir, "container")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  count=0\n" +
+		"  [ -f " + countPath + " ] && count=$(cat " + countPath + ")\n" +
+		"  count=$((count + 1))\n" +
+		"  echo \"$count\" > " + countPath + "\n" +
+		"  [ \"$count\" -gt 1 ] || exit 1\n" +
+		"  echo '  \"" + managedLabel + "\": \"true\"'\n" +
+		"  echo '  \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("transient", creation); err != nil {
 		t.Fatal(err)
 	}
 	r.closeStdin()
-	time.Sleep(300 * time.Millisecond)
-	data, _ := os.ReadFile(logPath)
-	if strings.Contains(string(data), "delete --force ungenerated-reuse") {
-		t.Fatalf("reaper deleted an ungenerated reuse generation: %q", data)
-	}
+	waitForLogLines(t, logPath, "delete --force transient")
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
+	creation := "0123456789abcdef"
 
-	if err := r.register("ctr-one", ""); err != nil {
+	if err := r.register("ctr-one", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two", ""); err != nil {
+	if err := r.register("ctr-two", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -109,8 +139,9 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
+	creation := "0123456789abcdef"
 
-	if err := r.register("before-crash", ""); err != nil {
+	if err := r.register("before-crash", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -118,7 +149,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash", ""); err != nil {
+	if err := r.register("after-crash", creation); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()
@@ -151,7 +182,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
-	if err := r.register("ok", ""); err != nil {
+	if err := r.register("ok", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
@@ -163,7 +194,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 func TestReaperNameEntriesCarryStableLockPath(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
-	if err := r.register("guarded-name", ""); err != nil {
+	if err := r.register("guarded-name", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	defer r.closeStdin()

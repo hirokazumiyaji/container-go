@@ -129,8 +129,16 @@ run_guarded() {
           wait "$pid" 2>/dev/null
           return $?
         }
+        [ "$sub" = "delete" ] && [ -z "$creation" ] && exit 0
         target="$id"
-        metadata=$(run_capture_timeout "$bin" inspect "$id" 2>/dev/null) || exit 0
+        inspect_attempts=0
+        while :; do
+          inspect_attempts=$((inspect_attempts + 1))
+          metadata=$(run_capture_timeout "$bin" inspect "$id" 2>/dev/null) || metadata=
+          [ -n "$metadata" ] && break
+          [ "$inspect_attempts" -lt 5 ] || exit 0
+          sleep 0.1
+        done
         got_managed=$(printf "%s\n" "$metadata" | sed -n "s/^[[:space:]]*\"$managed_key\"[[:space:]]*:[[:space:]]*\"true\".*/true/p" | head -n 1)
         [ "$got_managed" = "true" ] || exit 0
         if [ -z "$creation" ]; then
@@ -260,14 +268,18 @@ func newReaper(binary, subcommand string) *reaper {
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. Apple targets are names;
 // Docker targets may be the full 64-hex ID printed by docker run. creation
-// is the generation ID from creationLabel; empty skips the generation
-// check for backward compatibility.
+// is the generation ID from creationLabel. Apple delete entries require
+// one: without a generation there is no safe ownership token for a
+// name-addressed automatic delete.
 func (r *reaper) register(id, creation string) error {
 	if !validReaperID(r.subcommand, id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
+	if r.subcommand == "delete" && creation == "" {
+		return fmt.Errorf("reaper: Apple delete entry %q has no ownership generation", id)
 	}
 
 	lockPath := ""
@@ -299,6 +311,9 @@ func (r *reaper) register(id, creation string) error {
 }
 
 func (r *reaper) writeLocked(e reaperEntry) error {
+	if r.subcommand == "delete" && e.creation == "" {
+		return fmt.Errorf("reaper: Apple delete entry %q has no ownership generation", e.id)
+	}
 	if r.stdin == nil {
 		return io.ErrClosedPipe
 	}

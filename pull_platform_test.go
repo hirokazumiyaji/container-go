@@ -110,3 +110,33 @@ func TestAppleParseImageExistsVariantMismatch(t *testing.T) {
 		t.Error("v7 must match linux/arm/v7")
 	}
 }
+
+func TestIssue94AppleParseImageExistsFailsClosedOnMalformedMetadata(t *testing.T) {
+	eng := appleEngine{}
+	cases := []struct {
+		name string
+		data string
+		want bool
+	}{
+		{name: "invalid JSON", data: `[{"platform":`, want: false},
+		{name: "wrong platform type", data: `[{"platform":"linux/amd64"}]`, want: false},
+		{name: "null image", data: `[null]`, want: false},
+		{name: "null variant", data: `[{"variants":[null]}]`, want: false},
+		{name: "known mismatch", data: `[{"platform":{"os":"darwin","architecture":"arm64"}}]`, want: false},
+		{name: "empty platform object", data: `[{"platform":{}}]`, want: false},
+		{name: "empty variant platform", data: `[{"variants":[{"platform":{}}]}]`, want: false},
+		{name: "absent metadata OS only", data: `[{"reference":"redis"}]`, want: true},
+		{name: "absent metadata explicit arch", data: `[{"reference":"redis"}]`, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			platform := "linux"
+			if tc.name == "absent metadata explicit arch" {
+				platform = "linux/amd64"
+			}
+			if got := eng.parseImageExists([]byte(tc.data), platform); got != tc.want {
+				t.Fatalf("parseImageExists(%q, %q) = %v, want %v", tc.data, platform, got, tc.want)
+			}
+		})
+	}
+}

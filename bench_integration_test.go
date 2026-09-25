@@ -60,6 +60,9 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 	if !ok {
 		t.Fatalf("no benchmark policy for scenario %q", scenario)
 	}
+	if len(policy.WorkloadCacheStates) == 0 {
+		t.Fatalf("benchmark policy %q has no workload cache state", scenario)
+	}
 	for i := 1; i <= policy.Iterations; i++ {
 		if prep != nil {
 			prep(t)
@@ -78,16 +81,17 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 			t.Logf("%s iteration %d: terminate: %v", scenario, i, err)
 		}
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:      b.Name,
-			Library:      bench.LibraryContainerGo,
-			Image:        image,
-			ImageDigest:  policy.ImageDigest,
-			Scenario:     scenario,
-			Iteration:    i,
-			Iterations:   policy.Iterations,
-			Commit:       doc.Env.Commit,
-			DurationNS:   int64(elapsed),
-			Subprocesses: spawns,
+			Backend:            b.Name,
+			Library:            bench.LibraryContainerGo,
+			Image:              image,
+			ImageDigest:        policy.ImageDigest,
+			WorkloadCacheState: policy.WorkloadCacheStates[0],
+			Scenario:           scenario,
+			Iteration:          i,
+			Iterations:         policy.Iterations,
+			Commit:             doc.Env.Commit,
+			DurationNS:         int64(elapsed),
+			Subprocesses:       spawns,
 		})
 	}
 }
@@ -99,6 +103,9 @@ func TestIntegrationBenchCounting(t *testing.T) {
 	for _, b := range []bench.Backend{bench.DockerBackend(), bench.AppleBackend()} {
 		t.Run(b.Name, func(t *testing.T) {
 			b.Available(t)
+			// Pin the backend for the public Run path as well as the
+			// explicitly injected counting runner.
+			t.Setenv("CONTAINERGO_BACKEND", b.Name)
 			eng, ok := benchEngines(b)
 			if !ok {
 				t.Fatalf("no engine for backend %s", b.Name)
@@ -159,6 +166,7 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 		t.Fatal("no benchmark policy for run/multi-5")
 	}
 	for i := 1; i <= policy.Iterations; i++ {
+		b.EnsureImage(t, image)
 		r := newCountingRunner(&cli.ExecRunner{Binary: b.Bin})
 		var containers []*Container
 		start := time.Now()
@@ -179,16 +187,17 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 			}
 		}
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:      b.Name,
-			Library:      bench.LibraryContainerGo,
-			Image:        image,
-			ImageDigest:  policy.ImageDigest,
-			Scenario:     "run/multi-5",
-			Iteration:    i,
-			Iterations:   policy.Iterations,
-			Commit:       doc.Env.Commit,
-			DurationNS:   int64(elapsed),
-			Subprocesses: r.count(),
+			Backend:            b.Name,
+			Library:            bench.LibraryContainerGo,
+			Image:              image,
+			ImageDigest:        policy.ImageDigest,
+			WorkloadCacheState: policy.WorkloadCacheStates[0],
+			Scenario:           "run/multi-5",
+			Iteration:          i,
+			Iterations:         policy.Iterations,
+			Commit:             doc.Env.Commit,
+			DurationNS:         int64(elapsed),
+			Subprocesses:       r.count(),
 		})
 	}
 }
@@ -242,16 +251,17 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 			}
 		}
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:      b.Name,
-			Library:      bench.LibraryContainerGo,
-			Image:        image,
-			ImageDigest:  policy.ImageDigest,
-			Scenario:     "run/parallel-8",
-			Iteration:    i,
-			Iterations:   policy.Iterations,
-			Commit:       doc.Env.Commit,
-			DurationNS:   int64(elapsed),
-			Subprocesses: spawns,
+			Backend:            b.Name,
+			Library:            bench.LibraryContainerGo,
+			Image:              image,
+			ImageDigest:        policy.ImageDigest,
+			WorkloadCacheState: policy.WorkloadCacheStates[0],
+			Scenario:           "run/parallel-8",
+			Iteration:          i,
+			Iterations:         policy.Iterations,
+			Commit:             doc.Env.Commit,
+			DurationNS:         int64(elapsed),
+			Subprocesses:       spawns,
 		})
 	}
 }

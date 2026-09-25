@@ -19,7 +19,9 @@ anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
 and singleflight cases (`make bench-integration` covers those). Set
 `CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
 Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
-pull other Hub images locally.
+pull other Hub images locally. The root module supports Go 1.23+; the nested
+`bench/` benchmark module requires Go 1.25+ and is documented in
+`bench/README.md`.
 
 ## Pull requests
 

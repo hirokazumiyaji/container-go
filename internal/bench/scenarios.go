@@ -35,8 +35,8 @@ const (
 	// initialization separately from steady-state iterations.
 	SessionInitIterations = 1
 
-	// CacheStateCold and CacheStateWarm identify whether the pinned Ryuk
-	// image was absent or present when tc/session-init measurement began.
+	// CacheStateCold and CacheStateWarm identify whether the relevant image
+	// was absent or present when a measurement began.
 	CacheStateCold = "cold"
 	CacheStateWarm = "warm"
 )
@@ -45,17 +45,18 @@ const (
 // scenario. The policy is shared by the root counting harness, the
 // comparison harness, and the documentation schema test.
 //
-// RyukImage and RyukImageDigest are set for every testcontainers-go
-// scenario. CacheStates is non-empty only for tc/session-init, whose result
-// must select exactly one state.
+// WorkloadCacheStates describes the workload image state at timer start.
+// CacheStates is the independent testcontainers Ryuk state and is non-empty
+// only for tc/session-init, whose result must select exactly one state.
 type ScenarioPolicy struct {
-	Name            string
-	Image           string
-	ImageDigest     string
-	RyukImage       string
-	RyukImageDigest string
-	CacheStates     []string
-	Iterations      int
+	Name                string
+	Image               string
+	ImageDigest         string
+	RyukImage           string
+	RyukImageDigest     string
+	WorkloadCacheStates []string
+	CacheStates         []string
+	Iterations          int
 }
 
 // ScenarioKey identifies the backend/library combination to which a
@@ -73,56 +74,56 @@ type scenarioPolicyRow struct {
 
 var scenarioPolicyRows = []scenarioPolicyRow{
 	{
-		Policy: ScenarioPolicy{Name: "run/cold", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/cold", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateCold}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/cold"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/cold"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/warm", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/warm", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/warm"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/warm"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/warm-nginx", Image: NginxImage, ImageDigest: NginxImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/warm-nginx", Image: NginxImage, ImageDigest: NginxImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/warm-nginx"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/warm-nginx"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/no-wait", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/no-wait", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/no-wait"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/no-wait"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/forlog", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/forlog", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/forlog"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/forlog"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/forexec", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/forexec", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/forexec"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/forexec"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/parallel-8", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/parallel-8", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/parallel-8"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/parallel-8"},
 		},
 	},
 	{
-		Policy: ScenarioPolicy{Name: "run/multi-5", Image: RedisImage, ImageDigest: RedisImageDigest, Iterations: DefaultIterations},
+		Policy: ScenarioPolicy{Name: "run/multi-5", Image: RedisImage, ImageDigest: RedisImageDigest, WorkloadCacheStates: []string{CacheStateWarm}, Iterations: DefaultIterations},
 		Identities: []ScenarioKey{
 			{Backend: "docker", Library: LibraryContainerGo, Scenario: "run/multi-5"},
 			{Backend: "apple", Library: LibraryContainerGo, Scenario: "run/multi-5"},
@@ -130,35 +131,38 @@ var scenarioPolicyRows = []scenarioPolicyRow{
 	},
 	{
 		Policy: ScenarioPolicy{
-			Name:            "tc/session-init",
-			Image:           RedisImage,
-			ImageDigest:     RedisImageDigest,
-			RyukImage:       TestcontainersRyukImage,
-			RyukImageDigest: TestcontainersRyukImageDigest,
-			CacheStates:     []string{CacheStateCold, CacheStateWarm},
-			Iterations:      SessionInitIterations,
+			Name:                "tc/session-init",
+			Image:               RedisImage,
+			ImageDigest:         RedisImageDigest,
+			RyukImage:           TestcontainersRyukImage,
+			RyukImageDigest:     TestcontainersRyukImageDigest,
+			WorkloadCacheStates: []string{CacheStateWarm},
+			CacheStates:         []string{CacheStateCold, CacheStateWarm},
+			Iterations:          SessionInitIterations,
 		},
 		Identities: []ScenarioKey{{Backend: "docker", Library: LibraryTestcontainersGo, Scenario: "tc/session-init"}},
 	},
 	{
 		Policy: ScenarioPolicy{
-			Name:            "tc/single",
-			Image:           RedisImage,
-			ImageDigest:     RedisImageDigest,
-			RyukImage:       TestcontainersRyukImage,
-			RyukImageDigest: TestcontainersRyukImageDigest,
-			Iterations:      DefaultIterations,
+			Name:                "tc/single",
+			Image:               RedisImage,
+			ImageDigest:         RedisImageDigest,
+			RyukImage:           TestcontainersRyukImage,
+			RyukImageDigest:     TestcontainersRyukImageDigest,
+			WorkloadCacheStates: []string{CacheStateWarm},
+			Iterations:          DefaultIterations,
 		},
 		Identities: []ScenarioKey{{Backend: "docker", Library: LibraryTestcontainersGo, Scenario: "tc/single"}},
 	},
 	{
 		Policy: ScenarioPolicy{
-			Name:            "tc/multi-5",
-			Image:           RedisImage,
-			ImageDigest:     RedisImageDigest,
-			RyukImage:       TestcontainersRyukImage,
-			RyukImageDigest: TestcontainersRyukImageDigest,
-			Iterations:      DefaultIterations,
+			Name:                "tc/multi-5",
+			Image:               RedisImage,
+			ImageDigest:         RedisImageDigest,
+			RyukImage:           TestcontainersRyukImage,
+			RyukImageDigest:     TestcontainersRyukImageDigest,
+			WorkloadCacheStates: []string{CacheStateWarm},
+			Iterations:          DefaultIterations,
 		},
 		Identities: []ScenarioKey{{Backend: "docker", Library: LibraryTestcontainersGo, Scenario: "tc/multi-5"}},
 	},
@@ -219,6 +223,17 @@ func ScenarioPolicyForKey(backend, library, name string) (ScenarioPolicy, bool) 
 	return ScenarioPolicy{}, false
 }
 
+// ScenarioPolicyKeys returns every backend/library/scenario identity in
+// documentation order. It is the complete key set that strict docs and
+// scenario-set validation must cover.
+func ScenarioPolicyKeys() []ScenarioKey {
+	var keys []ScenarioKey
+	for _, row := range scenarioPolicyRows {
+		keys = append(keys, row.Identities...)
+	}
+	return keys
+}
+
 // ScenarioNames returns the documented scenario names in policy order.
 func ScenarioNames() []string {
 	policies := ScenarioPolicies()
@@ -230,6 +245,7 @@ func ScenarioNames() []string {
 }
 
 func cloneScenarioPolicy(policy ScenarioPolicy) ScenarioPolicy {
+	policy.WorkloadCacheStates = append([]string(nil), policy.WorkloadCacheStates...)
 	policy.CacheStates = append([]string(nil), policy.CacheStates...)
 	return policy
 }

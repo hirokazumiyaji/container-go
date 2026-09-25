@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "env": {
     "os": "darwin",
     "arch": "arm64",
@@ -8,6 +8,7 @@
     "host": "bench-host",
     "commit": "0123456789abcdef0123456789abcdef01234567",
     "tree": "89abcdef0123456789abcdef0123456789abcdef",
+    "reaper_session_id": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
     "dirty": false,
     "clis": {
       "docker.client": "29.8.0",
@@ -26,7 +27,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "cold"
     },
     {
       "backend": "docker",
@@ -38,7 +40,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "cold"
     },
     {
       "backend": "docker",
@@ -50,7 +53,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "cold"
     },
     {
       "backend": "docker",
@@ -62,7 +66,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "cold"
     },
     {
       "backend": "docker",
@@ -74,7 +79,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "cold"
     },
     {
       "backend": "docker",
@@ -86,7 +92,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -98,7 +105,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -110,7 +118,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -122,7 +131,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -134,7 +144,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -146,7 +157,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -158,7 +170,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -170,7 +183,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -182,7 +196,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -194,7 +209,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -206,7 +222,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -218,7 +235,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -230,7 +248,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -242,7 +261,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -254,7 +274,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -266,7 +287,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -278,7 +300,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -290,7 +313,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -302,7 +326,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -314,7 +339,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -326,7 +352,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -338,7 +365,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -350,7 +378,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -362,7 +391,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -374,7 +404,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -386,7 +417,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -398,7 +430,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -410,7 +443,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -422,7 +456,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -434,7 +469,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -446,7 +482,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -458,7 +495,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -470,7 +508,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -482,7 +521,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -494,7 +534,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -509,7 +550,8 @@
       "iterations": 1,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -523,7 +565,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -537,7 +580,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -551,7 +595,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -565,7 +610,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -579,7 +625,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -593,7 +640,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -607,7 +655,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -621,7 +670,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -635,7 +685,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     },
     {
       "backend": "docker",
@@ -649,7 +700,8 @@
       "iterations": 5,
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
-      "subprocesses": 0
+      "subprocesses": 0,
+      "workload_cache_state": "warm"
     }
   ]
 }

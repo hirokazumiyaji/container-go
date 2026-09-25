@@ -141,6 +141,23 @@ func validGitObjectID(value string) bool {
 	if len(value) != 40 && len(value) != 64 {
 		return false
 	}
+	return validLowerHex(value)
+}
+
+func validSessionID(value string) bool {
+	if value == "" || len(value) > 128 {
+		return false
+	}
+	for _, c := range value {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == ':' {
+			continue
+		}
+		return false
+	}
+	return true
+}
+
+func validLowerHex(value string) bool {
 	for _, c := range value {
 		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
 			return false

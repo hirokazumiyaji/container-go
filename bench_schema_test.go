@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,35 +12,44 @@ import (
 )
 
 func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(source), "docs", "benchmarks.md"))
-	if err != nil {
-		t.Fatalf("read benchmark documentation: %v", err)
-	}
-
+	data := readRepositoryFile(t, filepath.Join("docs", "benchmarks.md"))
 	rows := parseBenchmarkRows(t, data)
-	if len(rows) != len(bench.ScenarioNames()) {
-		t.Fatalf("baseline has %d scenario rows, want %d", len(rows), len(bench.ScenarioNames()))
+	keys := bench.ScenarioPolicyKeys()
+	if len(rows) != len(keys) {
+		t.Fatalf("baseline has %d scenario keys, want %d", len(rows), len(keys))
 	}
-	for scenario, row := range rows {
-		if _, ok := bench.ScenarioPolicyForKey(row.backend, row.library, scenario); !ok {
-			t.Errorf("baseline has unknown scenario key %s/%s/%s", row.backend, row.library, scenario)
+	for key := range rows {
+		if _, ok := bench.ScenarioPolicyForKey(key.Backend, key.Library, key.Scenario); !ok {
+			t.Errorf("baseline has unknown scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 		}
 	}
-	for _, policy := range bench.ScenarioPolicies() {
-		row, ok := rows[policy.Name]
+	for _, key := range keys {
+		row, ok := rows[key]
 		if !ok {
-			t.Errorf("baseline is missing scenario %q", policy.Name)
+			t.Errorf("baseline is missing scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 			continue
 		}
+		policy, _ := bench.ScenarioPolicyForKey(key.Backend, key.Library, key.Scenario)
 		if row.iterations != policy.Iterations {
-			t.Errorf("baseline %q iterations = %d, want %d", policy.Name, row.iterations, policy.Iterations)
+			t.Errorf("baseline %s/%s/%s iterations = %d, want %d", key.Backend, key.Library, key.Scenario, row.iterations, policy.Iterations)
 		}
 	}
-	for _, required := range []string{bench.RedisImage, bench.NginxImage, bench.TestcontainersRyukImage, "schema_version", "env.tree", "docker.client", "docker.server", "apple.service", "ryuk_image", "cache_state"} {
+	for _, required := range []string{
+		bench.RedisImage,
+		bench.NginxImage,
+		bench.TestcontainersRyukImage,
+		"schema_version",
+		"workload_cache_state",
+		"env.tree",
+		"env.dirty",
+		"docker.client",
+		"docker.server",
+		"apple.client",
+		"apple.service",
+		"ryuk_image",
+		"cache_state",
+		"reaper_session_id",
+	} {
 		if !bytes.Contains(data, []byte(required)) {
 			t.Errorf("benchmark documentation does not describe %q", required)
 		}
@@ -57,12 +65,10 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 }
 
 type benchmarkRow struct {
-	backend    string
-	library    string
 	iterations int
 }
 
-func parseBenchmarkRows(t *testing.T, data []byte) map[string]benchmarkRow {
+func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchmarkRow {
 	t.Helper()
 	lines := strings.Split(string(data), "\n")
 	start := -1
@@ -75,7 +81,7 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[string]benchmarkRow {
 	if start < 0 {
 		t.Fatal("baseline table header not found")
 	}
-	rows := make(map[string]benchmarkRow)
+	rows := make(map[bench.ScenarioKey]benchmarkRow)
 	for _, line := range lines[start+2:] {
 		line = strings.TrimSpace(line)
 		if line == "" || !strings.HasPrefix(line, "|") {
@@ -85,19 +91,40 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[string]benchmarkRow {
 		if len(cells) < 4 {
 			t.Fatalf("malformed baseline row: %q", line)
 		}
-		scenario := strings.TrimSpace(cells[2])
+		key := bench.ScenarioKey{
+			Backend:  strings.TrimSpace(cells[0]),
+			Library:  strings.TrimSpace(cells[1]),
+			Scenario: strings.TrimSpace(cells[2]),
+		}
 		iterations, err := strconv.Atoi(strings.TrimSpace(cells[3]))
 		if err != nil {
-			t.Fatalf("baseline %q iterations: %v", scenario, err)
+			t.Fatalf("baseline %s/%s/%s iterations: %v", key.Backend, key.Library, key.Scenario, err)
 		}
-		if _, exists := rows[scenario]; exists {
-			t.Errorf("baseline has duplicate scenario %q", scenario)
+		if _, exists := rows[key]; exists {
+			t.Errorf("baseline has duplicate scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 		}
-		rows[scenario] = benchmarkRow{
-			backend:    strings.TrimSpace(cells[0]),
-			library:    strings.TrimSpace(cells[1]),
-			iterations: iterations,
-		}
+		rows[key] = benchmarkRow{iterations: iterations}
 	}
 	return rows
+}
+
+func readRepositoryFile(t *testing.T, relative string) []byte {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	for {
+		candidate := filepath.Join(dir, relative)
+		if data, err := os.ReadFile(candidate); err == nil {
+			return data
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("repository file %q not found from working directory", relative)
+	return nil
 }

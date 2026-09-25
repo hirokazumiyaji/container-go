@@ -37,17 +37,24 @@ func ValidateDoc(d Doc) error {
 }
 
 func validateEnvironment(env Env) error {
-	if strings.TrimSpace(env.OS) == "" {
-		return fmt.Errorf("env.os is required")
+	if env.metadataPresent && !env.dirtyPresent {
+		return fmt.Errorf("env.dirty is required")
 	}
-	if strings.TrimSpace(env.Arch) == "" {
-		return fmt.Errorf("env.arch is required")
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "os", value: env.OS},
+		{name: "arch", value: env.Arch},
+		{name: "go", value: env.Go},
+		{name: "host", value: env.Host},
+	} {
+		if err := validateMetadataValue("env."+field.name, field.value); err != nil {
+			return err
+		}
 	}
-	if strings.TrimSpace(env.Host) == "" || strings.EqualFold(env.Host, "unknown") {
-		return fmt.Errorf("env.host is required and must not be unknown")
-	}
-	if strings.TrimSpace(env.Go) == "" {
-		return fmt.Errorf("env.go is required")
+	if strings.EqualFold(env.Host, "unknown") {
+		return fmt.Errorf("env.host must not be unknown")
 	}
 	if env.CPUs < 1 {
 		return fmt.Errorf("env.cpus = %d, want >= 1", env.CPUs)
@@ -64,15 +71,29 @@ func validateEnvironment(env Env) error {
 	if len(env.CLIs) == 0 {
 		return fmt.Errorf("env.clis is required")
 	}
+	allowedCLIs := map[string]bool{
+		DockerClientVersionKey: true,
+		DockerServerVersionKey: true,
+		AppleClientVersionKey:  true,
+		AppleServiceVersionKey: true,
+	}
 	for name, version := range env.CLIs {
-		if strings.TrimSpace(version) == "" {
-			return fmt.Errorf("env.clis[%q] is required", name)
+		if !allowedCLIs[name] {
+			return fmt.Errorf("env.clis[%q] is not a recognized backend version key", name)
 		}
-		if strings.TrimSpace(version) != version || strings.ContainsAny(version, "\r\n") {
-			return fmt.Errorf("env.clis[%q] must be one normalized value", name)
+		if err := validateMetadataValue("env.clis["+name+"]", version); err != nil {
+			return err
 		}
 		if strings.EqualFold(version, "unknown") {
 			return fmt.Errorf("env.clis[%q] must not be unknown", name)
+		}
+	}
+	if env.ReaperSessionID != "" {
+		if err := validateMetadataValue("env.reaper_session_id", env.ReaperSessionID); err != nil {
+			return err
+		}
+		if !validSessionID(env.ReaperSessionID) {
+			return fmt.Errorf("env.reaper_session_id = %q, want a normalized session ID", env.ReaperSessionID)
 		}
 	}
 	if env.RecordedAt.IsZero() {
@@ -81,15 +102,41 @@ func validateEnvironment(env Env) error {
 	return nil
 }
 
+func validateMetadataValue(name, value string) error {
+	if value == "" {
+		return fmt.Errorf("%s is required", name)
+	}
+	if strings.TrimSpace(value) != value || strings.ContainsAny(value, "\r\n") {
+		return fmt.Errorf("%s must be normalized", name)
+	}
+	return nil
+}
+
 func validateVersionMetadata(env Env, results []Result) error {
 	required := make(map[string]bool)
+	usesTestcontainers := false
+	usesDocker := false
+	usesApple := false
 	for _, result := range results {
 		switch result.Backend {
 		case "docker":
+			usesDocker = true
 			required[DockerClientVersionKey] = true
 			required[DockerServerVersionKey] = true
 		case "apple":
+			usesApple = true
 			required[AppleClientVersionKey] = true
+		}
+		if result.Library == LibraryTestcontainersGo {
+			usesTestcontainers = true
+		}
+	}
+	for name := range env.CLIs {
+		if usesDocker && strings.HasPrefix(name, "apple.") {
+			return fmt.Errorf("env.clis[%q] is not valid for a Docker-only result set", name)
+		}
+		if usesApple && strings.HasPrefix(name, "docker.") {
+			return fmt.Errorf("env.clis[%q] is not valid for an Apple-only result set", name)
 		}
 	}
 	keys := make([]string, 0, len(required))
@@ -102,23 +149,38 @@ func validateVersionMetadata(env Env, results []Result) error {
 			return fmt.Errorf("env.clis[%q] is required for the recorded backends", key)
 		}
 	}
+	if usesTestcontainers {
+		if env.ReaperSessionID == "" {
+			return fmt.Errorf("env.reaper_session_id is required for testcontainers results")
+		}
+	} else if env.ReaperSessionID != "" {
+		return fmt.Errorf("env.reaper_session_id is only valid for testcontainers results")
+	}
 	return nil
 }
 
 // ValidateResult checks one result's backend/library identity, immutable
 // images, optional Ryuk provenance, and iteration metadata against policy.
 func ValidateResult(result Result) error {
-	if result.Backend == "" {
-		return fmt.Errorf("backend is required")
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "backend", value: result.Backend},
+		{name: "library", value: result.Library},
+		{name: "image", value: result.Image},
+		{name: "scenario", value: result.Scenario},
+		{name: "commit", value: result.Commit},
+	} {
+		if err := validateMetadataValue(field.name, field.value); err != nil {
+			return err
+		}
 	}
-	if result.Library == "" {
-		return fmt.Errorf("library is required")
+	if result.WorkloadCacheState == "" {
+		return fmt.Errorf("workload_cache_state is required")
 	}
-	if result.Image == "" {
-		return fmt.Errorf("image is required")
-	}
-	if result.Scenario == "" {
-		return fmt.Errorf("scenario is required")
+	if strings.TrimSpace(result.WorkloadCacheState) != result.WorkloadCacheState {
+		return fmt.Errorf("workload_cache_state must be normalized")
 	}
 	if !validGitObjectID(result.Commit) {
 		return fmt.Errorf("commit = %q, want a full Git object ID", result.Commit)
@@ -138,6 +200,9 @@ func ValidateResult(result Result) error {
 	}
 	if result.Iteration > result.Iterations {
 		return fmt.Errorf("%s iteration = %d, want <= %d", result.Scenario, result.Iteration, result.Iterations)
+	}
+	if len(policy.WorkloadCacheStates) == 0 || !containsString(policy.WorkloadCacheStates, result.WorkloadCacheState) {
+		return fmt.Errorf("%s workload_cache_state = %q, want one of %v", result.Scenario, result.WorkloadCacheState, policy.WorkloadCacheStates)
 	}
 	if result.Image != policy.Image {
 		return fmt.Errorf("%s image = %q, want pinned image %q", result.Scenario, result.Image, policy.Image)
@@ -265,7 +330,15 @@ func validateResultGroups(groups map[string][]Result) error {
 			return fmt.Errorf("%s has %d results, want %d", group[0].Scenario, len(group), policy.Iterations)
 		}
 		iterations := make(map[int]bool, len(group))
+		workloadState := group[0].WorkloadCacheState
+		ryukState := group[0].CacheState
 		for _, result := range group {
+			if result.WorkloadCacheState != workloadState {
+				return fmt.Errorf("%s mixes workload cache states %q and %q", group[0].Scenario, workloadState, result.WorkloadCacheState)
+			}
+			if result.CacheState != ryukState {
+				return fmt.Errorf("%s mixes Ryuk cache states %q and %q", group[0].Scenario, ryukState, result.CacheState)
+			}
 			if iterations[result.Iteration] {
 				return fmt.Errorf("%s has duplicate iteration %d", group[0].Scenario, result.Iteration)
 			}
@@ -400,6 +473,9 @@ func compareGroups(baseline, candidate resultGroup) error {
 		}
 		if first.ImageDigest != other.ImageDigest {
 			return fmt.Errorf("image digest mismatch for %q: baseline %q, candidate %q", first.Scenario, first.ImageDigest, other.ImageDigest)
+		}
+		if first.WorkloadCacheState != other.WorkloadCacheState {
+			return fmt.Errorf("workload cache state mismatch for %q: baseline %q, candidate %q", first.Scenario, first.WorkloadCacheState, other.WorkloadCacheState)
 		}
 		if first.RyukImage != other.RyukImage {
 			return fmt.Errorf("ryuk image mismatch for %q: baseline %q, candidate %q", first.Scenario, first.RyukImage, other.RyukImage)

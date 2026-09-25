@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -34,7 +33,7 @@ func TestFixtureMatchesSchema(t *testing.T) {
 		if result.Backend == "" || result.Library == "" || result.Image == "" || result.Scenario == "" {
 			t.Errorf("result[%d] missing identity fields: %+v", i, result)
 		}
-		if result.ImageDigest == "" || result.Commit == "" || result.Iterations < 1 {
+		if result.ImageDigest == "" || result.WorkloadCacheState == "" || result.Commit == "" || result.Iterations < 1 {
 			t.Errorf("result[%d] missing reproducibility fields: %+v", i, result)
 		}
 	}
@@ -55,7 +54,7 @@ func TestParseDocKeepsLegacyDocumentsParseable(t *testing.T) {
 	if len(doc.Results) != 1 || doc.Results[0].Iteration != 1 {
 		t.Fatalf("legacy results = %+v", doc.Results)
 	}
-	if doc.Results[0].ImageDigest != "" || doc.Results[0].Iterations != 0 || doc.Env.Commit != "" || doc.SchemaVersion != 0 {
+	if doc.Results[0].ImageDigest != "" || doc.Results[0].WorkloadCacheState != "" || doc.Results[0].Iterations != 0 || doc.Env.Commit != "" || doc.SchemaVersion != 0 {
 		t.Fatalf("legacy metadata unexpectedly synthesized: %+v", doc)
 	}
 }
@@ -72,34 +71,44 @@ func TestPinnedBenchmarkImages(t *testing.T) {
 }
 
 func TestBenchmarkDocsMatchScenarioPolicy(t *testing.T) {
-	_, source, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller failed")
-	}
-	data, err := os.ReadFile(filepath.Join(filepath.Dir(source), "..", "docs", "benchmarks.md"))
-	if err != nil {
-		t.Fatalf("read benchmark documentation: %v", err)
-	}
+	data := readRepositoryFile(t, filepath.Join("..", "docs", "benchmarks.md"))
 	rows := parseBaselineRows(t, data)
-	if len(rows) != len(ScenarioNames()) {
-		t.Fatalf("baseline has %d scenario rows, want %d", len(rows), len(ScenarioNames()))
+	keys := ScenarioPolicyKeys()
+	if len(rows) != len(keys) {
+		t.Fatalf("baseline has %d scenario keys, want %d", len(rows), len(keys))
 	}
-	for scenario, row := range rows {
-		if _, ok := ScenarioPolicyForKey(row.Backend, row.Library, scenario); !ok {
-			t.Errorf("baseline has unknown scenario key %s/%s/%s", row.Backend, row.Library, scenario)
+	for key := range rows {
+		if _, ok := ScenarioPolicyForKey(key.Backend, key.Library, key.Scenario); !ok {
+			t.Errorf("baseline has unknown scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 		}
 	}
-	for _, policy := range ScenarioPolicies() {
-		row, ok := rows[policy.Name]
+	for _, key := range keys {
+		row, ok := rows[key]
 		if !ok {
-			t.Errorf("baseline is missing scenario %q", policy.Name)
+			t.Errorf("baseline is missing scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 			continue
 		}
+		policy, _ := ScenarioPolicyForKey(key.Backend, key.Library, key.Scenario)
 		if row.Iterations != policy.Iterations {
-			t.Errorf("baseline %q iterations = %d, want %d", policy.Name, row.Iterations, policy.Iterations)
+			t.Errorf("baseline %s/%s/%s iterations = %d, want %d", key.Backend, key.Library, key.Scenario, row.Iterations, policy.Iterations)
 		}
 	}
-	for _, required := range []string{RedisImage, NginxImage, TestcontainersRyukImage, "schema_version", "env.tree", "docker.client", "docker.server", "apple.service", "ryuk_image", "cache_state"} {
+	for _, required := range []string{
+		RedisImage,
+		NginxImage,
+		TestcontainersRyukImage,
+		"schema_version",
+		"workload_cache_state",
+		"env.tree",
+		"env.dirty",
+		"docker.client",
+		"docker.server",
+		"apple.client",
+		"apple.service",
+		"ryuk_image",
+		"cache_state",
+		"reaper_session_id",
+	} {
 		if !bytes.Contains(data, []byte(required)) {
 			t.Errorf("benchmark documentation does not describe %q", required)
 		}
@@ -115,12 +124,10 @@ func TestBenchmarkDocsMatchScenarioPolicy(t *testing.T) {
 }
 
 type baselineRow struct {
-	Backend    string
-	Library    string
 	Iterations int
 }
 
-func parseBaselineRows(t *testing.T, data []byte) map[string]baselineRow {
+func parseBaselineRows(t *testing.T, data []byte) map[ScenarioKey]baselineRow {
 	t.Helper()
 	lines := strings.Split(string(data), "\n")
 	start := -1
@@ -133,30 +140,50 @@ func parseBaselineRows(t *testing.T, data []byte) map[string]baselineRow {
 	if start < 0 {
 		t.Fatal("baseline table header not found")
 	}
-	rows := make(map[string]baselineRow)
+	rows := make(map[ScenarioKey]baselineRow)
 	for _, line := range lines[start+2:] {
 		line = strings.TrimSpace(line)
-		if line == "" {
-			break
-		}
-		if !strings.HasPrefix(line, "|") {
+		if line == "" || !strings.HasPrefix(line, "|") {
 			break
 		}
 		cells := strings.Split(strings.Trim(line, "|"), "|")
 		if len(cells) < 4 {
 			t.Fatalf("malformed baseline row: %q", line)
 		}
-		backend := strings.TrimSpace(cells[0])
-		library := strings.TrimSpace(cells[1])
-		scenario := strings.TrimSpace(cells[2])
+		key := ScenarioKey{
+			Backend:  strings.TrimSpace(cells[0]),
+			Library:  strings.TrimSpace(cells[1]),
+			Scenario: strings.TrimSpace(cells[2]),
+		}
 		iterations, err := strconv.Atoi(strings.TrimSpace(cells[3]))
 		if err != nil {
-			t.Fatalf("baseline %q iterations: %v", scenario, err)
+			t.Fatalf("baseline %s/%s/%s iterations: %v", key.Backend, key.Library, key.Scenario, err)
 		}
-		if _, exists := rows[scenario]; exists {
-			t.Errorf("baseline has duplicate scenario %q", scenario)
+		if _, exists := rows[key]; exists {
+			t.Errorf("baseline has duplicate scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 		}
-		rows[scenario] = baselineRow{Backend: backend, Library: library, Iterations: iterations}
+		rows[key] = baselineRow{Iterations: iterations}
 	}
 	return rows
+}
+
+func readRepositoryFile(t *testing.T, relative string) []byte {
+	t.Helper()
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("get working directory: %v", err)
+	}
+	for {
+		candidate := filepath.Join(dir, relative)
+		if data, err := os.ReadFile(candidate); err == nil {
+			return data
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			break
+		}
+		dir = parent
+	}
+	t.Fatalf("repository file %q not found from working directory", relative)
+	return nil
 }

@@ -33,6 +33,14 @@ const (
 
 func requireDocker(t *testing.T) {
 	t.Helper()
+	if selected := os.Getenv("CONTAINERGO_BACKEND"); selected != "" {
+		if selected != "docker" && selected != "apple" {
+			t.Fatalf("invalid CONTAINERGO_BACKEND=%q: valid values are \"apple\" and \"docker\"", selected)
+		}
+		if selected != "docker" {
+			t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker benchmark", selected)
+		}
+	}
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -49,27 +57,31 @@ func record(doc *Doc, backend, library, image, name string, iteration int, elaps
 	if !ok {
 		panic("unknown benchmark scenario key: " + backend + "/" + library + "/" + name)
 	}
+	if len(policy.WorkloadCacheStates) == 0 {
+		panic("benchmark policy has no workload cache state: " + name)
+	}
 	doc.Results = append(doc.Results, Result{
-		Backend:         backend,
-		Library:         library,
-		Image:           image,
-		ImageDigest:     policy.ImageDigest,
-		RyukImage:       policy.RyukImage,
-		RyukImageDigest: policy.RyukImageDigest,
-		CacheState:      cacheState,
-		Scenario:        name,
-		Iteration:       iteration,
-		Iterations:      policy.Iterations,
-		Commit:          doc.Env.Commit,
-		DurationNS:      int64(elapsed),
+		Backend:            backend,
+		Library:            library,
+		Image:              image,
+		ImageDigest:        policy.ImageDigest,
+		WorkloadCacheState: policy.WorkloadCacheStates[0],
+		RyukImage:          policy.RyukImage,
+		RyukImageDigest:    policy.RyukImageDigest,
+		CacheState:         cacheState,
+		Scenario:           name,
+		Iteration:          iteration,
+		Iterations:         policy.Iterations,
+		Commit:             doc.Env.Commit,
+		DurationNS:         int64(elapsed),
 	})
 }
 
 // runScenario runs fn iterations times and records each Run→ready
-// duration. prep runs before the timer; cleanup runs after it, so
-// image setup/teardown and container termination stay out of the
+// duration. prep and ensureImage run before the timer; cleanup runs after
+// it, so image setup/teardown and container termination stay out of the
 // measurement.
-func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, prep func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
+func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, prep, ensureImage func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
 	t.Helper()
 	policy, ok := ibench.ScenarioPolicyForKey(backend, library, name)
 	if !ok {
@@ -78,6 +90,9 @@ func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, p
 	for i := 1; i <= policy.Iterations; i++ {
 		if prep != nil {
 			prep(t)
+		}
+		if ensureImage != nil {
+			ensureImage(t)
 		}
 		start := time.Now()
 		cleanup, err := fn(t)
@@ -176,37 +191,40 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 			// CONTAINERGO_BACKEND (or the OS default).
 			t.Setenv("CONTAINERGO_BACKEND", b.Name)
 			doc := Doc{SchemaVersion: ibench.CurrentSchemaVersion, Env: benchEnv(t, b)}
+			ensureRedis := func(t *testing.T) { b.EnsureImage(t, redisImage) }
+			ensureNginx := func(t *testing.T) { b.EnsureImage(t, nginxImage) }
 
 			// Cold: remove the image so the run includes the pull.
 			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/cold",
 				func(t *testing.T) { b.EnsureImageAbsent(t, redisImage) },
+				nil,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/warm", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/warm", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
 					return terminateCleanup(t, ctr), err
 				})
 			b.EnsureImage(t, nginxImage)
-			runScenario(t, &doc, b.Name, LibraryContainerGo, nginxImage, "run/warm-nginx", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, nginxImage, "run/warm-nginx", nil, ensureNginx,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, nginxImage, "80/tcp")
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/no-wait", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/no-wait", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage)
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forlog", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forlog", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage,
 						container.WithWaitStrategy(wait.ForLog("Ready to accept connections")))
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forexec", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forexec", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage,
 						container.WithWaitStrategy(wait.ForExec([]string{"redis-cli", "ping"})))
@@ -214,7 +232,7 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 				})
 
 			// Multi: five sequential containers in one process.
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/multi-5", nil,
+			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/multi-5", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					var containers []*container.Container
 					for range 5 {
@@ -236,6 +254,7 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 				t.Fatal("no benchmark policy for run/parallel-8")
 			}
 			for i := 1; i <= parallelPolicy.Iterations; i++ {
+				ensureRedis(t)
 				errs := make([]error, n)
 				var (
 					mu         sync.Mutex
@@ -317,11 +336,8 @@ func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
 // resolved repository digest is verified against the policy pin.
 func prepareTestcontainersRyuk(t *testing.T, b ibench.Backend) string {
 	t.Helper()
-	if tc.ReaperDefaultImage != ibench.TestcontainersRyukTag {
-		t.Fatalf("testcontainers Ryuk default = %q, want %q", tc.ReaperDefaultImage, ibench.TestcontainersRyukTag)
-	}
-	if b.ImageDigest == nil || b.TagImage == nil {
-		t.Fatal("Docker image digest/tag operations are required for the Ryuk benchmark")
+	if b.ImageExists == nil || b.ImageDigest == nil || b.TagImage == nil {
+		t.Fatal("Docker image inspect/digest/tag operations are required for the Ryuk benchmark")
 	}
 
 	mode := os.Getenv("CONTAINERGO_BENCH_RYUK_CACHE")
@@ -341,7 +357,7 @@ func prepareTestcontainersRyuk(t *testing.T, b ibench.Backend) string {
 			if err := b.TagImage(ibench.TestcontainersRyukImage, ibench.TestcontainersRyukTag); err != nil {
 				t.Fatalf("tag cached pinned Ryuk image: %v", err)
 			}
-			if err := verifyTestcontainersRyuk(b); err != nil {
+			if err := verifyTestcontainersRyukDigest(b, ibench.TestcontainersRyukTag); err != nil {
 				t.Fatal(err)
 			}
 			return ibench.CacheStateWarm
@@ -353,7 +369,7 @@ func prepareTestcontainersRyuk(t *testing.T, b ibench.Backend) string {
 		if err := b.TagImage(ibench.TestcontainersRyukImage, ibench.TestcontainersRyukTag); err != nil {
 			t.Fatalf("tag pinned Ryuk image: %v", err)
 		}
-		if err := verifyTestcontainersRyuk(b); err != nil {
+		if err := verifyTestcontainersRyukDigest(b, ibench.TestcontainersRyukTag); err != nil {
 			t.Fatal(err)
 		}
 		return ibench.CacheStateWarm
@@ -367,11 +383,43 @@ func prepareTestcontainersRyuk(t *testing.T, b ibench.Backend) string {
 	}
 }
 
-func verifyTestcontainersRyuk(b ibench.Backend) error {
+func verifyTestcontainersRyuk(b ibench.Backend, sessionID string) error {
+	if b.ContainerInspect == nil || b.ImageID == nil || b.ImageDigest == nil {
+		return fmt.Errorf("Docker reaper identity operations are required for the benchmark")
+	}
+	name := "reaper_" + sessionID
+	identity, err := b.ContainerInspect(name)
+	if err != nil {
+		return fmt.Errorf("inspect testcontainers reaper %q: %w", name, err)
+	}
+	if identity.ID == "" || identity.ImageID == "" {
+		return fmt.Errorf("testcontainers reaper %q has no container or image identity", name)
+	}
+	if identity.Name != name {
+		return fmt.Errorf("testcontainers reaper name = %q, want %q", identity.Name, name)
+	}
+	if identity.ImageReference != ibench.TestcontainersRyukTag {
+		return fmt.Errorf("testcontainers reaper image = %q, want %q", identity.ImageReference, ibench.TestcontainersRyukTag)
+	}
+	if identity.Labels["org.testcontainers.sessionId"] != sessionID ||
+		identity.Labels["org.testcontainers.reaper"] != "true" ||
+		identity.Labels["org.testcontainers.ryuk"] != "true" {
+		return fmt.Errorf("testcontainers reaper labels do not match the generated session")
+	}
+	currentImageID, err := b.ImageID(identity.ImageReference)
+	if err != nil {
+		return fmt.Errorf("inspect current Ryuk image identity: %w", err)
+	}
+	if currentImageID != identity.ImageID {
+		return fmt.Errorf("reaper image ID = %q, current tag image ID = %q", identity.ImageID, currentImageID)
+	}
 	return verifyTestcontainersRyukDigest(b, ibench.TestcontainersRyukTag)
 }
 
 func verifyTestcontainersRyukDigest(b ibench.Backend, image string) error {
+	if b.ImageDigest == nil {
+		return fmt.Errorf("Ryuk image digest operation is required")
+	}
 	digest, err := b.ImageDigest(image)
 	if err != nil {
 		return fmt.Errorf("verify Ryuk image: %w", err)
@@ -388,8 +436,15 @@ func verifyTestcontainersRyukDigest(b ibench.Backend, image string) error {
 // recorded separately as tc/session-init; steady-state values follow.
 func TestIntegrationBenchTestcontainers(t *testing.T) {
 	requireDocker(t)
-	doc := Doc{SchemaVersion: ibench.CurrentSchemaVersion, Env: benchEnv(t, ibench.DockerBackend())}
-	cacheState := prepareTestcontainersRyuk(t, ibench.DockerBackend())
+	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	dockerBackend := ibench.DockerBackend()
+	sessionID := requireCanonicalTestcontainersConfig(t)
+	env := benchEnv(t, dockerBackend)
+	env.ReaperSessionID = sessionID
+	doc := Doc{SchemaVersion: ibench.CurrentSchemaVersion, Env: env}
+	cacheState := prepareTestcontainersRyuk(t, dockerBackend)
+	// The workload pull is preparation, not part of session-init timing.
+	dockerBackend.EnsureImage(t, redisImage)
 
 	// Session init plus the first container: recorded as its own
 	// scenario so steady-state numbers stay comparable.
@@ -399,7 +454,7 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("session-init container: %v", err)
 	}
-	if err := verifyTestcontainersRyuk(ibench.DockerBackend()); err != nil {
+	if err := verifyTestcontainersRyuk(dockerBackend, sessionID); err != nil {
 		_ = ctr.Terminate(context.Background())
 		t.Fatalf("session-init Ryuk provenance: %v", err)
 	}
@@ -408,7 +463,7 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 		t.Fatalf("terminate: %v", err)
 	}
 
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/single", nil,
+	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/single", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
 		func(t *testing.T) (func(), error) {
 			ctr, err := tc.GenericContainer(context.Background(), tcRequest())
 			return tcTerminateCleanup(t, ctr), err
@@ -416,7 +471,7 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 
 	// Multi: five sequential containers in one process; the session
 	// initialization was already paid above.
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil,
+	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
 		func(t *testing.T) (func(), error) {
 			var containers []tc.Container
 			for range 5 {

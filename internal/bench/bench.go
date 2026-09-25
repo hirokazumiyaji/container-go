@@ -17,7 +17,7 @@ import (
 // CurrentSchemaVersion is the strict, reproducible result schema. ParseDoc
 // remains permissive for older documents, but ValidateDoc and CompareDocs
 // accept only this version.
-const CurrentSchemaVersion = 2
+const CurrentSchemaVersion = 3
 
 // Library names a code path under measurement.
 const (
@@ -35,13 +35,17 @@ type Result struct {
 	Image string `json:"image"`
 	// ImageDigest is the content digest resolved for Image.
 	ImageDigest string `json:"image_digest,omitempty"`
+	// WorkloadCacheState records whether the workload image was absent or
+	// present at the instant the timed region started. It is required for
+	// every result and is independent of the testcontainers Ryuk state.
+	WorkloadCacheState string `json:"workload_cache_state"`
 	// RyukImage is the immutable reaper image used by a
 	// testcontainers-go scenario. It is empty for container-go scenarios.
 	RyukImage string `json:"ryuk_image,omitempty"`
 	// RyukImageDigest is the content digest of RyukImage.
 	RyukImageDigest string `json:"ryuk_image_digest,omitempty"`
-	// CacheState is "cold" or "warm" for tc/session-init and empty for
-	// every other scenario.
+	// CacheState is the testcontainers Ryuk cache state. It is "cold" or
+	// "warm" for tc/session-init and empty for every other scenario.
 	CacheState string `json:"cache_state,omitempty"`
 	// Scenario identifies the measurement, e.g. "run/warm".
 	Scenario string `json:"scenario"`
@@ -75,9 +79,68 @@ type Env struct {
 	Tree string `json:"tree,omitempty"`
 	// Dirty records whether tracked or untracked source files differed
 	// from Commit when the run started. Strict validation rejects true.
-	Dirty      bool              `json:"dirty"`
-	CLIs       map[string]string `json:"clis"`
-	RecordedAt time.Time         `json:"recorded_at"`
+	Dirty bool              `json:"dirty"`
+	CLIs  map[string]string `json:"clis"`
+	// ReaperSessionID is the actual generated testcontainers session used
+	// by a testcontainers result. It is empty for container-go-only docs.
+	ReaperSessionID string    `json:"reaper_session_id,omitempty"`
+	RecordedAt      time.Time `json:"recorded_at"`
+
+	// metadataPresent and dirtyPresent preserve JSON field presence while
+	// keeping Dirty source-compatible as a bool. They are intentionally
+	// not serialized.
+	metadataPresent bool
+	dirtyPresent    bool
+}
+
+// UnmarshalJSON records whether env.dirty was present. A plain bool cannot
+// distinguish an omitted field from an explicit false, which matters for the
+// strict schema contract.
+func (e *Env) UnmarshalJSON(data []byte) error {
+	type plainEnv Env
+	var decoded plainEnv
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	*e = Env(decoded)
+	e.metadataPresent = true
+	_, e.dirtyPresent = fields["dirty"]
+	return nil
+}
+
+// NormalizeEnv trims command/version metadata and canonicalizes its CLI map
+// without changing identity fields that validation must reject when they are
+// malformed.
+func NormalizeEnv(env Env) Env {
+	env.OS = strings.TrimSpace(env.OS)
+	env.Arch = strings.TrimSpace(env.Arch)
+	env.Go = strings.TrimSpace(env.Go)
+	env.Host = strings.TrimSpace(env.Host)
+	env.Commit = strings.TrimSpace(env.Commit)
+	env.Tree = strings.TrimSpace(env.Tree)
+	env.ReaperSessionID = strings.TrimSpace(env.ReaperSessionID)
+	if !env.RecordedAt.IsZero() {
+		env.RecordedAt = env.RecordedAt.UTC()
+	}
+	if env.CLIs != nil {
+		clis := make(map[string]string, len(env.CLIs))
+		for key, value := range env.CLIs {
+			clis[strings.TrimSpace(key)] = strings.TrimSpace(value)
+		}
+		env.CLIs = clis
+	}
+	return env
+}
+
+// NormalizeDoc returns a metadata-normalized copy suitable for writing or
+// comparison. It does not make an invalid identity valid.
+func NormalizeDoc(doc Doc) Doc {
+	doc.Env = NormalizeEnv(doc.Env)
+	return doc
 }
 
 // Doc is a complete recorded run: schema version, environment, and results.
@@ -91,7 +154,7 @@ type Doc struct {
 func (d Doc) WriteJSON(w io.Writer) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
-	return enc.Encode(d)
+	return enc.Encode(NormalizeDoc(d))
 }
 
 // ParseDoc reads a doc written by WriteJSON.
@@ -105,10 +168,12 @@ func ParseDoc(data []byte) (Doc, error) {
 
 // Summary aggregates the iterations of one scenario.
 type Summary struct {
-	Backend  string
-	Library  string
-	Image    string
-	Scenario string
+	Backend            string
+	Library            string
+	Image              string
+	Scenario           string
+	WorkloadCacheState string
+	RyukCacheState     string
 
 	Iterations int
 	Median     time.Duration
@@ -126,7 +191,7 @@ func Summarize(results []Result) []Summary {
 	groups := map[string][]Result{}
 	var keys []string
 	for _, r := range results {
-		k := r.Backend + "\x00" + r.Library + "\x00" + r.Image + "\x00" + r.Scenario
+		k := r.Backend + "\x00" + r.Library + "\x00" + r.Image + "\x00" + r.Scenario + "\x00" + r.WorkloadCacheState + "\x00" + r.CacheState
 		if _, ok := groups[k]; !ok {
 			keys = append(keys, k)
 		}
@@ -138,11 +203,13 @@ func Summarize(results []Result) []Summary {
 	for _, k := range keys {
 		rs := groups[k]
 		s := Summary{
-			Backend:    rs[0].Backend,
-			Library:    rs[0].Library,
-			Image:      rs[0].Image,
-			Scenario:   rs[0].Scenario,
-			Iterations: len(rs),
+			Backend:            rs[0].Backend,
+			Library:            rs[0].Library,
+			Image:              rs[0].Image,
+			Scenario:           rs[0].Scenario,
+			WorkloadCacheState: rs[0].WorkloadCacheState,
+			RyukCacheState:     rs[0].CacheState,
+			Iterations:         len(rs),
 		}
 		durations := make([]int64, 0, len(rs))
 		subprocesses := make([]int64, 0, len(rs))
@@ -176,12 +243,13 @@ func median(values []int64) int64 {
 
 // Table renders summaries as a fixed-width human-readable table.
 func Table(summaries []Summary) string {
-	const pattern = "%-8s %-18s %-18s %-16s %4s %10s %10s %10s %8s\n"
+	const pattern = "%-8s %-18s %-18s %-16s %-8s %-8s %4s %10s %10s %10s %8s\n"
 	var b strings.Builder
-	fmt.Fprintf(&b, pattern, "BACKEND", "LIBRARY", "IMAGE", "SCENARIO", "N", "MEDIAN", "MIN", "MAX", "SPAWN")
+	fmt.Fprintf(&b, pattern, "BACKEND", "LIBRARY", "IMAGE", "SCENARIO", "WORKLOAD", "RYUK", "N", "MEDIAN", "MIN", "MAX", "SPAWN")
 	for _, s := range summaries {
 		fmt.Fprintf(&b, pattern,
 			s.Backend, s.Library, s.Image, s.Scenario,
+			s.WorkloadCacheState, s.RyukCacheState,
 			fmt.Sprint(s.Iterations),
 			s.Median.Round(time.Millisecond),
 			s.Min.Round(time.Millisecond),

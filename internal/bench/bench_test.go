@@ -2,15 +2,18 @@ package bench
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 const (
-	testCommit = "0123456789abcdef0123456789abcdef01234567"
-	testTree   = "89abcdef0123456789abcdef0123456789abcdef"
+	testCommit        = "0123456789abcdef0123456789abcdef01234567"
+	testTree          = "89abcdef0123456789abcdef0123456789abcdef"
+	testReaperSession = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
 )
 
 func sampleResults() []Result {
@@ -20,16 +23,17 @@ func sampleResults() []Result {
 			panic("unknown test scenario: " + scenario)
 		}
 		return Result{
-			Backend:      "docker",
-			Library:      LibraryContainerGo,
-			Image:        policy.Image,
-			ImageDigest:  policy.ImageDigest,
-			Scenario:     scenario,
-			Iteration:    it,
-			Iterations:   policy.Iterations,
-			Commit:       testCommit,
-			DurationNS:   int64(d),
-			Subprocesses: spawns,
+			Backend:            "docker",
+			Library:            LibraryContainerGo,
+			Image:              policy.Image,
+			ImageDigest:        policy.ImageDigest,
+			WorkloadCacheState: policy.WorkloadCacheStates[0],
+			Scenario:           scenario,
+			Iteration:          it,
+			Iterations:         policy.Iterations,
+			Commit:             testCommit,
+			DurationNS:         int64(d),
+			Subprocesses:       spawns,
 		}
 	}
 	return []Result{
@@ -61,15 +65,16 @@ func completeResults(commit string) []Result {
 	for _, policy := range ScenarioPoliciesFor("docker", LibraryContainerGo) {
 		for iteration := 1; iteration <= policy.Iterations; iteration++ {
 			results = append(results, Result{
-				Backend:     "docker",
-				Library:     LibraryContainerGo,
-				Image:       policy.Image,
-				ImageDigest: policy.ImageDigest,
-				Scenario:    policy.Name,
-				Iteration:   iteration,
-				Iterations:  policy.Iterations,
-				Commit:      commit,
-				DurationNS:  1,
+				Backend:            "docker",
+				Library:            LibraryContainerGo,
+				Image:              policy.Image,
+				ImageDigest:        policy.ImageDigest,
+				WorkloadCacheState: policy.WorkloadCacheStates[0],
+				Scenario:           policy.Name,
+				Iteration:          iteration,
+				Iterations:         policy.Iterations,
+				Commit:             commit,
+				DurationNS:         1,
 			})
 		}
 	}
@@ -80,18 +85,19 @@ func completeResults(commit string) []Result {
 				cacheState = CacheStateWarm
 			}
 			results = append(results, Result{
-				Backend:         "docker",
-				Library:         LibraryTestcontainersGo,
-				Image:           policy.Image,
-				ImageDigest:     policy.ImageDigest,
-				RyukImage:       policy.RyukImage,
-				RyukImageDigest: policy.RyukImageDigest,
-				CacheState:      cacheState,
-				Scenario:        policy.Name,
-				Iteration:       iteration,
-				Iterations:      policy.Iterations,
-				Commit:          commit,
-				DurationNS:      1,
+				Backend:            "docker",
+				Library:            LibraryTestcontainersGo,
+				Image:              policy.Image,
+				ImageDigest:        policy.ImageDigest,
+				WorkloadCacheState: policy.WorkloadCacheStates[0],
+				RyukImage:          policy.RyukImage,
+				RyukImageDigest:    policy.RyukImageDigest,
+				CacheState:         cacheState,
+				Scenario:           policy.Name,
+				Iteration:          iteration,
+				Iterations:         policy.Iterations,
+				Commit:             commit,
+				DurationNS:         1,
 			})
 		}
 	}
@@ -100,13 +106,14 @@ func completeResults(commit string) []Result {
 
 func testEnv(commit string) Env {
 	return Env{
-		OS:     "darwin",
-		Arch:   "arm64",
-		CPUs:   10,
-		Go:     "go1.27.0",
-		Host:   "bench-host",
-		Commit: commit,
-		Tree:   testTree,
+		OS:              "darwin",
+		Arch:            "arm64",
+		CPUs:            10,
+		Go:              "go1.27.0",
+		Host:            "bench-host",
+		Commit:          commit,
+		Tree:            testTree,
+		ReaperSessionID: testReaperSession,
 		CLIs: map[string]string{
 			DockerClientVersionKey: "29.8.0",
 			DockerServerVersionKey: "29.8.0",
@@ -188,6 +195,50 @@ func TestParseDocRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func TestValidateDocRequiresExplicitDirtyField(t *testing.T) {
+	doc := completeDoc(testCommit)
+	var buf bytes.Buffer
+	if err := doc.WriteJSON(&buf); err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &raw); err != nil {
+		t.Fatal(err)
+	}
+	env := raw["env"].(map[string]any)
+	delete(env, "dirty")
+	withoutDirty, err := json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := ParseDoc(withoutDirty)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidateDoc(parsed); err == nil || !strings.Contains(err.Error(), "env.dirty") {
+		t.Fatalf("ValidateDoc error = %v, want missing env.dirty", err)
+	}
+}
+
+func TestNormalizeEnvCanonicalizesMetadata(t *testing.T) {
+	env := testEnv(testCommit)
+	env.OS = " darwin "
+	env.CLIs[DockerClientVersionKey] = " 29.8.0\n"
+	env.RecordedAt = time.Unix(1, 0).In(time.FixedZone("offset", 3600))
+	normalized := NormalizeEnv(env)
+	if normalized.OS != "darwin" || normalized.CLIs[DockerClientVersionKey] != "29.8.0" || normalized.RecordedAt.Location() != time.UTC {
+		t.Fatalf("normalized env = %+v", normalized)
+	}
+}
+
+func TestValidateDocRejectsUnknownCLIMetadata(t *testing.T) {
+	doc := completeDoc(testCommit)
+	doc.Env.CLIs["docker.other"] = "1"
+	if err := ValidateDoc(doc); err == nil || !strings.Contains(err.Error(), "not a recognized") {
+		t.Fatalf("ValidateDoc error = %v, want unknown CLI key", err)
+	}
+}
+
 func TestValidateDocChecksReproducibilityMetadata(t *testing.T) {
 	doc := completeDoc(testCommit)
 	if err := ValidateDoc(doc); err != nil {
@@ -219,7 +270,13 @@ func TestValidateDocChecksReproducibilityMetadata(t *testing.T) {
 		}
 	}
 	if err := ValidateDoc(doc); err == nil {
-		t.Fatal("ValidateDoc accepted an invalid cache state")
+		t.Fatal("ValidateDoc accepted an invalid Ryuk cache state")
+	}
+
+	doc = completeDoc(testCommit)
+	doc.Results[0].WorkloadCacheState = CacheStateWarm
+	if err := ValidateDoc(doc); err == nil {
+		t.Fatal("ValidateDoc accepted the wrong workload cache state")
 	}
 }
 
@@ -243,7 +300,7 @@ func TestScenarioPolicyIncludesIdentityAndSessionInitSpecialCase(t *testing.T) {
 	if !ok {
 		t.Fatal("tc/session-init policy is missing")
 	}
-	if policy.Iterations != SessionInitIterations || len(policy.CacheStates) != 2 {
+	if policy.Iterations != SessionInitIterations || len(policy.CacheStates) != 2 || len(policy.WorkloadCacheStates) != 1 || policy.WorkloadCacheStates[0] != CacheStateWarm {
 		t.Fatalf("tc/session-init policy = %+v", policy)
 	}
 	if _, ok := ScenarioPolicyForKey("apple", LibraryTestcontainersGo, "tc/single"); ok {
@@ -258,8 +315,14 @@ func TestScenarioPolicyIncludesIdentityAndSessionInitSpecialCase(t *testing.T) {
 	if len(ScenarioPoliciesFor("docker", LibraryContainerGo)) != 8 {
 		t.Fatal("Docker container-go policy set is incomplete")
 	}
+	if len(ScenarioPoliciesFor("apple", LibraryContainerGo)) != 8 {
+		t.Fatal("Apple container-go policy set is incomplete")
+	}
 	if len(ScenarioPoliciesFor("docker", LibraryTestcontainersGo)) != 3 {
 		t.Fatal("Docker testcontainers policy set is incomplete")
+	}
+	if len(ScenarioPolicyKeys()) != 19 {
+		t.Fatalf("complete scenario key set = %d, want 19", len(ScenarioPolicyKeys()))
 	}
 }
 
@@ -383,7 +446,13 @@ func TestCompareDocsValidatesAndAllowsSourceRevisionChanges(t *testing.T) {
 		}
 	}
 	if err := CompareDocs(baseline, candidate); err == nil {
-		t.Fatal("CompareDocs accepted a changed cache state")
+		t.Fatal("CompareDocs accepted a changed Ryuk cache state")
+	}
+
+	candidate = completeDoc(candidateCommit)
+	candidate.Results[0].WorkloadCacheState = CacheStateWarm
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted a changed workload cache state")
 	}
 
 	candidate = completeDoc(candidateCommit)
@@ -401,7 +470,7 @@ func TestCompareDocsValidatesAndAllowsSourceRevisionChanges(t *testing.T) {
 
 func TestTableRendersAllColumns(t *testing.T) {
 	table := Table(Summarize(sampleResults()))
-	for _, want := range []string{"BACKEND", "docker", LibraryContainerGo, RedisImage, "run/warm", "300ms", "3"} {
+	for _, want := range []string{"BACKEND", "WORKLOAD", "RYUK", "docker", LibraryContainerGo, RedisImage, "run/warm", "300ms", "3"} {
 		if !bytes.Contains([]byte(table), []byte(want)) {
 			t.Errorf("table missing %q:\n%s", want, table)
 		}

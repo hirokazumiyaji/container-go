@@ -40,7 +40,10 @@ macOS で Docker(Docker Desktop など)を使う場合は
 呼び出します。cgo 不要、デーモン API クライアント不要です。`DOCKER_HOST`、
 コンテキスト、レジストリ認証は docker CLI 自身が解決します。
 
-Go 1.23 以上が必要です。
+ルートモジュールには Go 1.23 以上が必要です。オプションの
+ネストした `bench/` ベンチマークモジュールは Go 1.25 以上が必要です
+(testcontainers-go の依存関係の要件)。詳細は
+[bench/README.md](bench/README.md) を参照してください。
 
 動作確認済みバックエンド(本ライブラリがマッチする CLI stderr 文言と
 inspect JSON 形状):

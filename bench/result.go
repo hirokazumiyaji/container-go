@@ -74,6 +74,10 @@ func ScenarioPolicies() []ScenarioPolicy { return ibench.ScenarioPolicies() }
 // ScenarioNames returns the documented benchmark scenario names.
 func ScenarioNames() []string { return ibench.ScenarioNames() }
 
+// ScenarioPolicyKeys returns every backend/library/scenario identity in
+// the complete benchmark policy.
+func ScenarioPolicyKeys() []ScenarioKey { return ibench.ScenarioPolicyKeys() }
+
 // ScenarioPolicyFor returns the compatibility name-only policy.
 func ScenarioPolicyFor(name string) (ScenarioPolicy, bool) { return ibench.ScenarioPolicyFor(name) }
 
@@ -120,3 +124,9 @@ func WriteJSON(w io.Writer, d Doc) error { return d.WriteJSON(w) }
 
 // ParseDoc reads a doc written by WriteJSON.
 func ParseDoc(data []byte) (Doc, error) { return ibench.ParseDoc(data) }
+
+// NormalizeEnv trims and canonicalizes environment metadata.
+func NormalizeEnv(env Env) Env { return ibench.NormalizeEnv(env) }
+
+// NormalizeDoc returns a metadata-normalized copy of a result document.
+func NormalizeDoc(doc Doc) Doc { return ibench.NormalizeDoc(doc) }

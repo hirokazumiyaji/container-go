@@ -40,7 +40,9 @@ The library shells out to the backend CLI (`container` or `docker`) —
 no cgo, no daemon API client. `DOCKER_HOST`, contexts, and registry
 auth are handled by the docker CLI itself.
 
-Go 1.23+ is required.
+Go 1.23+ is required for the root module. The optional nested
+`bench/` benchmark module requires Go 1.25+ because it pins a newer
+testcontainers-go toolchain; see [bench/README.md](bench/README.md).
 
 Verified backends (CLI stderr wording and inspect JSON shapes this library
 matches against):

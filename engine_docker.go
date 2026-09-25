@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"net/url"
 	"os"
@@ -21,10 +22,10 @@ import (
 // ports and endpoints resolve to those.
 type dockerEngine struct{}
 
-// Docker multiplies the requested seconds by time.Duration inside the
-// daemon. Keep the rounded value within the largest whole-second duration
-// that can be represented without overflowing that conversion.
-const maxDockerStopSeconds int64 = int64(maxDuration / time.Second)
+// Docker parses stop --time through a signed integer. Cap the value at
+// MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
+// ones; the daemon's duration conversion is also safe at this limit.
+const maxDockerStopSeconds int64 = math.MaxInt32
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.

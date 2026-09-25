@@ -12,13 +12,35 @@ import (
 const (
 	maxStopTestDuration      time.Duration = math.MaxInt64
 	maxAppleStopTestSeconds  int64         = math.MaxInt32
-	maxDockerStopTestSeconds int64         = int64(maxStopTestDuration / time.Second)
+	maxDockerStopTestSeconds int64         = math.MaxInt32
 )
 
 type stopArgsBuilder func(string, *time.Duration) ([]string, error)
 
 func TestDockerStopArgs(t *testing.T) {
 	testStopArgs(t, dockerEngine{}.stopArgs, maxDockerStopTestSeconds)
+}
+
+func TestDockerStopArgs32BitBoundary(t *testing.T) {
+	const wantMax int64 = math.MaxInt32
+	if maxDockerStopSeconds != wantMax {
+		t.Fatalf("maxDockerStopSeconds = %d, want %d", maxDockerStopSeconds, wantMax)
+	}
+
+	maxTimeout := time.Duration(wantMax) * time.Second
+	got, err := (dockerEngine{}).stopArgs("myctr", &maxTimeout)
+	if err != nil {
+		t.Fatalf("maximum 32-bit timeout: %v", err)
+	}
+	want := []string{"stop", "--time", strconv.FormatInt(wantMax, 10), "myctr"}
+	if !slices.Equal(got, want) {
+		t.Errorf("stopArgs = %v, want %v", got, want)
+	}
+
+	firstInvalid := maxTimeout + time.Nanosecond
+	if got, err := (dockerEngine{}).stopArgs("myctr", &firstInvalid); err == nil {
+		t.Fatalf("accepted first timeout above the 32-bit limit: %v", got)
+	}
 }
 
 func TestAppleStopArgs(t *testing.T) {

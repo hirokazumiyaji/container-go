@@ -14,9 +14,12 @@ import (
 )
 
 // A zero timeout should complete well before the 1.5-second round-up case's
-// two-second grace period. The one-second ceiling leaves room for normal CLI
-// and scheduler overhead without turning this into a hardware benchmark.
-const stopImmediateMaxElapsed = time.Second
+// two-second grace period. Keep the bounds backend-specific: CLI startup and
+// scheduler overhead can vary independently on Apple Container and Docker.
+const (
+	appleStopImmediateMaxElapsed  = 2 * time.Second
+	dockerStopImmediateMaxElapsed = 2 * time.Second
+)
 
 // runStopTimingIntegration checks the externally visible stop grace period.
 // The process ignores SIGTERM, so a 1.5-second request must not complete at

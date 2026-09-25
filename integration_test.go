@@ -119,7 +119,7 @@ func TestIntegrationStopTimeoutRoundsUp(t *testing.T) {
 
 func TestIntegrationStopTimeoutZeroIsImmediate(t *testing.T) {
 	requireSystem(t)
-	runStopTimingIntegration(t, "apple-zero", 0, 0, stopImmediateMaxElapsed)
+	runStopTimingIntegration(t, "apple-zero", 0, 0, appleStopImmediateMaxElapsed)
 }
 
 func TestIntegrationPublishedPort(t *testing.T) {

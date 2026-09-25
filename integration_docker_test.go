@@ -122,7 +122,7 @@ func TestIntegrationDockerStopTimeoutRoundsUp(t *testing.T) {
 
 func TestIntegrationDockerStopTimeoutZeroIsImmediate(t *testing.T) {
 	requireDocker(t)
-	runStopTimingIntegration(t, "docker-zero", 0, 0, stopImmediateMaxElapsed)
+	runStopTimingIntegration(t, "docker-zero", 0, 0, dockerStopImmediateMaxElapsed)
 }
 
 func TestIntegrationDockerParallelStarts(t *testing.T) {

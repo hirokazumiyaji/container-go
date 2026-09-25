@@ -29,7 +29,7 @@ func TestRedis(t *testing.T) {
 
 | OS | Default backend | Requirement |
 |---|---|---|
-| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) 1.2.x with `container system start` done |
+| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) CLI 1.2.2 or 1.3.0 with `container system start` done |
 | Linux | Docker | docker CLI + running daemon |
 | Windows | Docker | docker CLI + running daemon (no watchdog reaper; see below) |
 
@@ -189,8 +189,9 @@ CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
   go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
 ```
 
-Apple container names must be 2–63 characters and match its name rule. Network
-names are lowercase 1–63-character names (the public `WithNetwork` option
+Apple container names must be 2–63 characters and match
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`. Network names are lowercase
+1–63-character names (the public `WithNetwork` option
 intentionally does not accept comma-separated MAC/MTU properties). Memory is at
 least 200 MiB and uses the same integer with an optional `K`/`M`/`G`/`T`/`P`
 suffix as `WithMemory`; invalid units and overflow are rejected. Published
@@ -264,7 +265,10 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
   script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  only as validated stdin data. Name-addressed entries use the shared
+  `nameRE` token rule, while Docker's full 64-hex immutable IDs are accepted
+  separately; Apple's stricter 2–63-character name check runs before
+  container creation.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use

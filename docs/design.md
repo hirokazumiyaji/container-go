@@ -3,7 +3,7 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
+Targets: Apple Container CLI 1.2.2 or 1.3.0 (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
 
 ## Purpose
 
@@ -359,10 +359,13 @@ As a library that spawns subprocesses, these rules hold.
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` before
-writing it to the pipe. The two layers together leave no command
-injection through IDs.
+expansions). The reaper validates name-addressed entries against the
+shared generic `nameRE` form
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` and accepts Docker's full 64-hex
+immutable IDs. This shared guard is intentionally not the complete Apple
+contract: `appleEngine.checkConfig` applies Apple's stricter 2–63-character
+`appleContainerNameRE` before a container is created. The two layers together
+leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main

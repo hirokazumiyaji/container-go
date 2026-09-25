@@ -264,21 +264,27 @@ func cleanupAppleCapabilityContainer(t *testing.T, r *cli.ExecRunner, name, toke
 	}
 }
 
-func dockerLiveOwned(r *cli.ExecRunner, name, token string) (bool, error) {
+func dockerLiveOwned(r *cli.ExecRunner, name, token string) (string, bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	stdout, _, err := r.Run(ctx, "inspect", name)
 	if err != nil {
 		if isNotFound(err) {
-			return false, nil
+			return "", false, nil
 		}
-		return false, err
+		return "", false, err
 	}
 	info, err := (dockerEngine{}).parseInspect(stdout, name)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return info.labels[appleCapabilityLabel] == token, nil
+	if info.labels[appleCapabilityLabel] != token {
+		return "", false, nil
+	}
+	if !dockerIDRE.MatchString(info.uid) {
+		return "", false, fmt.Errorf("Docker inspect returned invalid immutable container ID %q", info.uid)
+	}
+	return info.uid, true, nil
 }
 
 func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token string) {
@@ -292,7 +298,7 @@ func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token str
 	}
 	defer unlock()
 
-	owned, err := dockerLiveOwned(r, name, token)
+	uid, owned, err := dockerLiveOwned(r, name, token)
 	if err != nil {
 		t.Logf("Docker live-test cleanup %s: inspect ownership: %v", name, err)
 		return
@@ -300,9 +306,39 @@ func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token str
 	if !owned {
 		return
 	}
-	_, stderr, err := r.Run(ctx, "rm", "--force", name)
+	_, stderr, err := r.Run(ctx, "rm", "--force", uid)
 	if err != nil && !isNotFound(err) {
 		t.Logf("Docker live-test cleanup %s: delete: %v (%s)", name, err, stderr)
+	}
+}
+
+func TestDockerLiveCleanupUsesImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/calls.log"
+	uid := strings.Repeat("ab", 32)
+	token := "cleanup-token"
+	data := fmt.Sprintf(`[{"Id":%q,"Name":"/race-name","Config":{"Labels":{%q:%q}}}]`, uid, appleCapabilityLabel, token)
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  cat <<'JSON'\n" + data + "\nJSON\n" +
+		"fi\n"
+	binPath := dir + "/docker"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cleanupDockerLiveContainer(t, &cli.ExecRunner{Binary: binPath}, "race-name", token)
+	got, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	calls := string(got)
+	if !strings.Contains(calls, "rm --force "+uid) {
+		t.Fatalf("cleanup calls = %q, want rm by immutable ID %s", calls, uid)
+	}
+	if strings.Contains(calls, "rm --force race-name") {
+		t.Fatalf("cleanup deleted mutable name after inspecting: %q", calls)
 	}
 }
 
@@ -366,7 +402,9 @@ func TestIntegrationAppleCapabilityMatrix(t *testing.T) {
 			name:   "non-Linux platform",
 			suffix: "platform",
 			extra:  []string{"--platform", "windows/amd64"},
-			want:   "unsupported platform",
+			// Apple renders the error code and message separately, for
+			// example: unsupported: "platform windows/amd64".
+			want: "unsupported",
 		},
 		{
 			name:   "invalid platform variant",

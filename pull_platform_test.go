@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -124,6 +125,30 @@ func TestRunResolvesDefaultPlatformForInspectPullAndRun(t *testing.T) {
 	}
 	if !hasPlatformArg(pull, "linux/arm64") || !hasPlatformArg(run, "linux/arm64") {
 		t.Fatalf("effective platform missing from pull/run: %v", f.calls)
+	}
+}
+
+func TestApplePlatformNormalizationPreservesPullSelector(t *testing.T) {
+	f := newTestRunner()
+	f.imagePresent = false
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPlatform("linux/aarch64"), withRunner(f), withEngine(appleEngine{})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if f.pullCalls != 1 {
+		t.Fatalf("pulls = %d, want 1", f.pullCalls)
+	}
+	var pull []string
+	for _, call := range f.calls {
+		if len(call) >= 2 && call[0] == "image" && call[1] == "pull" {
+			pull = call
+		}
+	}
+	if !hasPlatformArg(pull, "linux/aarch64") {
+		t.Errorf("pull did not retain caller platform: %v", f.calls)
+	}
+	if !hasPlatformArg(f.callWith("run"), "linux/aarch64") {
+		t.Errorf("run did not retain caller platform: %v", f.calls)
 	}
 }
 
@@ -253,5 +278,37 @@ func TestAppleParseImageExistsVariantMismatch(t *testing.T) {
 	dataV7 := []byte(`[{"variants":[{"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`)
 	if !(appleEngine{}).parseImageExists(dataV7, "linux/arm/v7") {
 		t.Error("v7 must match linux/arm/v7")
+	}
+}
+
+func TestAppleParseImageExistsCanonicalizesPlatformAliasesAndDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		inspected string
+		requested string
+		want      bool
+	}{
+		{name: "aarch64 matches arm64", inspected: "linux/aarch64", requested: "linux/arm64", want: true},
+		{name: "arm64 matches aarch64", inspected: "linux/arm64", requested: "linux/aarch64", want: true},
+		{name: "armhf matches arm v7", inspected: "linux/arm/v7", requested: "linux/armhf", want: true},
+		{name: "armel v6 matches arm v6", inspected: "linux/arm/v6", requested: "linux/armel/v6", want: true},
+		{name: "amd64 matches x86_64", inspected: "linux/amd64", requested: "linux/x86_64", want: true},
+		{name: "x86_64 v1 is the amd64 default", inspected: "linux/x86_64/v1", requested: "linux/amd64", want: true},
+		{name: "arm64 nil matches v8", inspected: "linux/arm64", requested: "linux/arm64/v8", want: true},
+		{name: "aarch64 8 matches arm64", inspected: "linux/aarch64/8", requested: "linux/arm64", want: true},
+		{name: "different architecture", inspected: "linux/amd64", requested: "linux/arm64", want: false},
+		{name: "different operating system", inspected: "windows/arm64", requested: "linux/arm64", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			parts := strings.Split(tc.inspected, "/")
+			variant := ""
+			if len(parts) == 3 {
+				variant = fmt.Sprintf(`,"variant":%q`, parts[2])
+			}
+			data := []byte(fmt.Sprintf(`[{"variants":[{"platform":{"os":%q,"architecture":%q%s}}]}]`, parts[0], parts[1], variant))
+			if got := (appleEngine{}).parseImageExists(data, tc.requested); got != tc.want {
+				t.Errorf("parseImageExists(%q, %q) = %v, want %v", tc.requested, tc.inspected, got, tc.want)
+			}
+		})
 	}
 }

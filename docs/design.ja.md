@@ -3,7 +3,7 @@
 English (primary): [design.md](design.md)
 
 作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
-対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.23 以降
+対象: Apple Container CLI 1.2.2 または 1.3.0(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS)、Go 1.23 以降
 
 ## 目的
 
@@ -219,7 +219,10 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
 ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` で検証してからパイプへ書く。
+スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+リーパーは name-addressed entry を共有の generic `nameRE`
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証し、Docker の 64 桁 16 進数 ID も受け付ける。
+この shared guard は Apple の契約全体ではない。`appleEngine.checkConfig` がコンテナ作成前に Apple 固有の 2〜63 文字の `appleContainerNameRE` を適用する。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。

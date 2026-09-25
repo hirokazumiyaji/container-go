@@ -19,8 +19,12 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated against the shared generic nameRE token rule
+// `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (or Docker's full 64-hex immutable
+// ID). The Apple-specific minimum-length rule is enforced earlier by
+// checkConfig; the reaper's shared guard intentionally
+// permits the common one-character form. The script itself disables globbing
+// and quotes every expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -88,6 +92,16 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+// validReaperID keeps the backend address spaces explicit. nameRE is the
+// shared safe token form for names; Docker also prints immutable IDs that are
+// longer than that form.
+func validReaperID(subcommand, id string) bool {
+	if nameRE.MatchString(id) {
+		return true
+	}
+	return subcommand == "rm" && dockerIDRE.MatchString(id)
+}
+
 type reaperEntry struct {
 	id       string
 	creation string
@@ -113,11 +127,12 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
+// respawning the reaper process as needed. Apple targets are names; Docker
+// targets may be the full 64-hex ID printed by docker run. creation is the
+// generation ID from creationLabel; empty skips the generation check for
 // backward compatibility.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !validReaperID(r.subcommand, id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {

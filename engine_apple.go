@@ -96,6 +96,75 @@ func validateApplePlatform(platform string) error {
 	return nil
 }
 
+// applePlatform is the normalized form used when matching an image
+// descriptor to a requested platform. It follows the normalization in
+// ContainerizationOCI.Platform: architecture aliases are folded to their OCI
+// names and the default arm64 variant (nil) is equivalent to v8.
+type applePlatform struct {
+	os           string
+	architecture string
+	variant      string
+}
+
+// parseApplePlatformSelector parses a platform selector using the same
+// defaults as ContainerizationOCI.Platform(from:). In particular, a bare
+// arm/armhf/armel selector means v7, a bare aarch64/arm64 selector means v8,
+// and x86 aliases default to no variant.
+func parseApplePlatformSelector(platform string) (applePlatform, bool) {
+	parts := strings.Split(platform, "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+		return applePlatform{}, false
+	}
+	if len(parts) == 3 && parts[2] == "" {
+		return applePlatform{}, false
+	}
+
+	variant := ""
+	if len(parts) == 3 {
+		variant = parts[2]
+	} else {
+		switch parts[1] {
+		case "arm", "armhf", "armel":
+			variant = "v7"
+		case "aarch64", "arm64":
+			variant = "v8"
+		}
+	}
+	return canonicalApplePlatform(parts[0], parts[1], variant), true
+}
+
+// canonicalApplePlatform normalizes a selector or an inspect descriptor.
+// Apple treats the architecture aliases as equivalent and treats a nil arm64
+// variant as v8. The explicit v1 x86 spelling is equivalent to the canonical
+// no-variant amd64 form; v8/8 is likewise normalized for arm64.
+func canonicalApplePlatform(osName, architecture, variant string) applePlatform {
+	p := applePlatform{os: osName, architecture: architecture, variant: variant}
+	switch architecture {
+	case "aarch64", "arm64":
+		p.architecture = "arm64"
+		if variant == "" || variant == "v8" || variant == "8" {
+			p.variant = "v8"
+		}
+	case "x86_64", "x86-64", "amd64":
+		p.architecture = "amd64"
+		if variant == "v1" {
+			p.variant = ""
+		}
+	case "armhf", "armel":
+		// The aliases normalize to arm, but a descriptor's nil arm
+		// variant remains unknown; Apple only defaults nil to v8 for
+		// arm64.
+		p.architecture = "arm"
+	}
+	return p
+}
+
+func applePlatformsEqual(want, have applePlatform) bool {
+	return want.os == have.os &&
+		want.architecture == have.architecture &&
+		want.variant == have.variant
+}
+
 // checkConfig applies the parts of Apple Container's CLI contract that are
 // independent of the current service state. The Apple CLI performs these
 // checks only after it has already resolved the image, so doing them here
@@ -332,12 +401,19 @@ func (appleEngine) imageMissing(err error) bool {
 }
 
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
+	// Keep the caller's selector unchanged. It is also the value used for
+	// pull/run argv and the pull-flight key; normalization here must only
+	// affect comparison with inspect output.
 	var raw []json.RawMessage
 	if err := json.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
 		return false
 	}
 	if platform == "" {
 		return true
+	}
+	want, ok := parseApplePlatformSelector(platform)
+	if !ok {
+		return false
 	}
 	var images []struct {
 		Variants []struct {
@@ -351,39 +427,18 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 	if err := json.Unmarshal(data, &images); err != nil {
 		return true
 	}
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
 	for _, img := range images {
 		if len(img.Variants) == 0 {
 			return true
 		}
 		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != wantOS {
-				continue
+			have := canonicalApplePlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant)
+			if applePlatformsEqual(want, have) {
+				return true
 			}
-			if wantArch != "" && v.Platform.Architecture != wantArch {
-				continue
-			}
-			if wantVariant != "" && v.Platform.Variant != wantVariant {
-				continue
-			}
-			return true
 		}
 	}
 	return false
-}
-
-func splitPlatform(p string) (os, arch, variant string) {
-	parts := strings.Split(p, "/")
-	if len(parts) > 0 {
-		os = parts[0]
-	}
-	if len(parts) > 1 {
-		arch = parts[1]
-	}
-	if len(parts) > 2 {
-		variant = parts[2]
-	}
-	return os, arch, variant
 }
 
 func (appleEngine) listReuseGroupArgs(string) []string {

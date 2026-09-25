@@ -28,7 +28,7 @@ func TestRedis(t *testing.T) {
 
 | OS | 既定バックエンド | 要件 |
 |---|---|---|
-| macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) 1.2.x(`container system start` 実行済み) |
+| macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) CLI 1.2.2 または 1.3.0(`container system start` 実行済み) |
 | Linux | Docker | docker CLI + 稼働中のデーモン |
 | Windows | Docker | docker CLI + 稼働中のデーモン(watchdog リーパーなし。後述) |
 
@@ -168,7 +168,8 @@ CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
   go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
 ```
 
-`container name` は 2〜63 文字の Apple 規則、network name は小文字の 1〜63 文字です。
+`container name` は 2〜63 文字で
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` に一致する必要があります。network name は小文字の 1〜63 文字です。
 公開 API の `WithNetwork` は MAC/MTU の comma 付き property を意図的に受け付けません。
 memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G`/`T`/`P` suffix)表記を使い、unit 誤りや overflow を拒否します。
 publish port は 2〜65535、publish descriptor は最大 64 個です。
@@ -233,7 +234,9 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
   シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
-  stdin データとしてのみ渡ります。
+  stdin データとしてのみ渡します。name-addressed entry には共有の `nameRE`
+  トークン規則を、Docker の full 64-hex immutable ID は別に受け付ける。
+  Apple のより厳密な 2〜63 文字の名前チェックはコンテナ作成前に適用します。
 - 環境変数はパーミッション 0600 の一時 env ファイル経由で渡すため、秘密が
   プロセス一覧(`ps`)に現れません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry

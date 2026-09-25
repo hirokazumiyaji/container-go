@@ -21,6 +21,11 @@ import (
 // ports and endpoints resolve to those.
 type dockerEngine struct{}
 
+// Docker multiplies the requested seconds by time.Duration inside the
+// daemon. Keep the rounded value within the largest whole-second duration
+// that can be represented without overflowing that conversion.
+const maxDockerStopSeconds int64 = int64(maxDuration / time.Second)
+
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Observed wording:
@@ -248,7 +253,7 @@ func dockerState(s string) State {
 }
 
 func (dockerEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
-	return stopArgsFor(id, timeout)
+	return stopArgsFor(id, timeout, maxDockerStopSeconds)
 }
 
 func (dockerEngine) deleteArgs(id string) []string {

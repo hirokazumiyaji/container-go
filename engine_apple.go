@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -13,6 +14,10 @@ import (
 
 // appleEngine drives Apple Container's `container` CLI.
 type appleEngine struct{}
+
+// Apple Container parses stop --time as a signed 32-bit integer, even when
+// the library itself runs on a 64-bit host.
+const maxAppleStopSeconds int64 = math.MaxInt32
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
@@ -83,7 +88,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
-	return stopArgsFor(id, timeout)
+	return stopArgsFor(id, timeout, maxAppleStopSeconds)
 }
 
 func (appleEngine) deleteArgs(id string) []string {

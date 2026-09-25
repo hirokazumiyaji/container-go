@@ -95,31 +95,32 @@ type engine interface {
 	parseImageExists(data []byte, platform string) bool
 }
 
-func stopArgsFor(id string, timeout *time.Duration) ([]string, error) {
+func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {
 	args := []string{"stop"}
 	if timeout != nil {
-		seconds, err := stopTimeoutSeconds(*timeout, int(^uint(0)>>1))
+		seconds, err := stopTimeoutSeconds(*timeout, maxSeconds)
 		if err != nil {
 			return nil, err
 		}
-		args = append(args, "--time", strconv.Itoa(seconds))
+		args = append(args, "--time", strconv.FormatInt(seconds, 10))
 	}
 	return append(args, id), nil
 }
 
 // stopTimeoutSeconds rounds up so the backend never grants less grace than
-// the caller requested, and checks the CLI's native integer limit before
-// conversion.
-func stopTimeoutSeconds(timeout time.Duration, maxSeconds int) (int, error) {
+// the caller requested, then checks the rounded value against the backend's
+// seconds limit. The result is int64 so the validation does not depend on the
+// host architecture's native int width.
+func stopTimeoutSeconds(timeout time.Duration, maxSeconds int64) (int64, error) {
 	if timeout < 0 {
 		return 0, fmt.Errorf("stop timeout must be non-negative: %s", timeout)
 	}
-	seconds := timeout / time.Second
+	seconds := int64(timeout / time.Second)
 	if timeout%time.Second != 0 {
 		seconds++
 	}
-	if uint64(seconds) > uint64(maxSeconds) {
+	if seconds > maxSeconds {
 		return 0, fmt.Errorf("stop timeout %s exceeds backend limit of %d seconds", timeout, maxSeconds)
 	}
-	return int(seconds), nil
+	return seconds, nil
 }

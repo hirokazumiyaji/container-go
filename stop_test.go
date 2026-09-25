@@ -2,33 +2,34 @@ package container
 
 import (
 	"context"
+	"math"
 	"slices"
 	"strconv"
 	"testing"
 	"time"
 )
 
-const maxStopTestDuration = time.Duration(1<<63 - 1)
+const (
+	maxStopTestDuration      time.Duration = math.MaxInt64
+	maxAppleStopTestSeconds  int64         = math.MaxInt32
+	maxDockerStopTestSeconds int64         = int64(maxStopTestDuration / time.Second)
+)
 
 type stopArgsBuilder func(string, *time.Duration) ([]string, error)
 
 func TestDockerStopArgs(t *testing.T) {
-	testStopArgs(t, dockerEngine{}.stopArgs)
+	testStopArgs(t, dockerEngine{}.stopArgs, maxDockerStopTestSeconds)
 }
 
 func TestAppleStopArgs(t *testing.T) {
-	testStopArgs(t, appleEngine{}.stopArgs)
+	testStopArgs(t, appleEngine{}.stopArgs, maxAppleStopTestSeconds)
 }
 
-func testStopArgs(t *testing.T, build stopArgsBuilder) {
+func testStopArgs(t *testing.T, build stopArgsBuilder, maxSeconds int64) {
 	t.Helper()
 
-	maxSeconds := int64(maxStopTestDuration / time.Second)
-	if maxStopTestDuration%time.Second != 0 {
-		maxSeconds++
-	}
+	maxTimeout := time.Duration(maxSeconds) * time.Second
 	maxArg := strconv.FormatInt(maxSeconds, 10)
-	maxOverflows := strconv.IntSize == 32
 	cases := []struct {
 		name        string
 		nilTimeout  bool
@@ -43,7 +44,8 @@ func testStopArgs(t *testing.T, build stopArgsBuilder) {
 		{name: "whole second", timeout: time.Second, wantSeconds: "1"},
 		{name: "fractional second", timeout: 1500 * time.Millisecond, wantSeconds: "2"},
 		{name: "negative", timeout: -time.Second, wantErr: true},
-		{name: "maximum", timeout: maxStopTestDuration, wantSeconds: maxArg, wantErr: maxOverflows},
+		{name: "backend maximum", timeout: maxTimeout, wantSeconds: maxArg},
+		{name: "first value rounding above maximum", timeout: maxTimeout + time.Nanosecond, wantErr: true},
 	}
 
 	for _, tc := range cases {
@@ -77,106 +79,120 @@ func testStopArgs(t *testing.T, build stopArgsBuilder) {
 	}
 }
 
-func TestStopTimeoutConversionRejectsOverflow(t *testing.T) {
-	if _, err := stopTimeoutSeconds(2*time.Second, 1); err == nil {
-		t.Fatal("stopTimeoutSeconds accepted seconds above the backend limit")
-	}
-}
-
-func TestStopTimeout(t *testing.T) {
-	maxSeconds := int64(maxStopTestDuration / time.Second)
-	if maxStopTestDuration%time.Second != 0 {
-		maxSeconds++
-	}
-	maxArg := strconv.FormatInt(maxSeconds, 10)
-	maxOverflows := strconv.IntSize == 32
-
+func TestStopTimeoutBackendBoundaries(t *testing.T) {
 	cases := []struct {
-		name        string
-		nilTimeout  bool
-		timeout     time.Duration
-		wantFlag    bool
-		wantSeconds string
-		wantErr     bool
+		name       string
+		maxSeconds int64
 	}{
-		{name: "nil uses backend default", nilTimeout: true},
-		{name: "zero requests immediate stop", wantFlag: true, wantSeconds: "0"},
-		{name: "one nanosecond rounds up", timeout: time.Nanosecond, wantFlag: true, wantSeconds: "1"},
-		{name: "sub-second rounds up", timeout: 999 * time.Millisecond, wantFlag: true, wantSeconds: "1"},
-		{name: "one second is unchanged", timeout: time.Second, wantFlag: true, wantSeconds: "1"},
-		{name: "fractional second rounds up", timeout: 1500 * time.Millisecond, wantFlag: true, wantSeconds: "2"},
-		{name: "negative is rejected", timeout: -time.Second, wantErr: true},
-		{name: "maximum duration", timeout: maxStopTestDuration, wantFlag: !maxOverflows, wantSeconds: maxArg, wantErr: maxOverflows},
+		{name: "Apple", maxSeconds: maxAppleStopTestSeconds},
+		{name: "Docker", maxSeconds: maxDockerStopTestSeconds},
 	}
-
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newTestRunner()
-			ctr := runTestContainer(t, f)
-			f.calls = nil
+			maxTimeout := time.Duration(tc.maxSeconds) * time.Second
+			firstInvalid := maxTimeout + time.Nanosecond
 
-			var timeout *time.Duration
-			if !tc.nilTimeout {
-				timeout = &tc.timeout
-			}
-			err := ctr.Stop(context.Background(), timeout)
-			if tc.wantErr {
-				if err == nil {
-					t.Fatal("Stop returned nil error")
-				}
-				if stop := f.callWith("stop"); stop != nil {
-					t.Fatalf("invalid timeout reached backend: %v", stop)
-				}
-				return
-			}
+			got, err := stopTimeoutSeconds(maxTimeout, tc.maxSeconds)
 			if err != nil {
-				t.Fatalf("Stop: %v", err)
+				t.Fatalf("maximum safe timeout: %v", err)
 			}
-
-			want := []string{"stop"}
-			if tc.wantFlag {
-				want = append(want, "--time", tc.wantSeconds)
+			if got != tc.maxSeconds {
+				t.Errorf("maximum safe seconds = %d, want %d", got, tc.maxSeconds)
 			}
-			want = append(want, "myctr")
-			if got := f.callWith("stop"); !slices.Equal(got, want) {
-				t.Errorf("stop args = %v, want %v", got, want)
+			if _, err := stopTimeoutSeconds(firstInvalid, tc.maxSeconds); err == nil {
+				t.Fatalf("accepted first timeout that rounds above maximum: %s", firstInvalid)
+			}
+			if _, err := stopTimeoutSeconds(maxStopTestDuration, tc.maxSeconds); err == nil {
+				t.Fatal("accepted maximum time.Duration")
 			}
 		})
 	}
 }
 
-type stopContextRunner struct {
-	deadline    time.Time
-	hasDeadline bool
-	contextErr  error
+func TestStopTimeout(t *testing.T) {
+	backends := []struct {
+		name       string
+		engine     engine
+		maxSeconds int64
+	}{
+		{name: "Apple", engine: appleEngine{}, maxSeconds: maxAppleStopTestSeconds},
+		{name: "Docker", engine: dockerEngine{}, maxSeconds: maxDockerStopTestSeconds},
+	}
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			maxTimeout := time.Duration(backend.maxSeconds) * time.Second
+			cases := []struct {
+				name        string
+				nilTimeout  bool
+				timeout     time.Duration
+				wantFlag    bool
+				wantSeconds string
+				wantErr     bool
+			}{
+				{name: "nil uses backend default", nilTimeout: true},
+				{name: "zero requests immediate stop", wantFlag: true, wantSeconds: "0"},
+				{name: "one nanosecond rounds up", timeout: time.Nanosecond, wantFlag: true, wantSeconds: "1"},
+				{name: "sub-second rounds up", timeout: 999 * time.Millisecond, wantFlag: true, wantSeconds: "1"},
+				{name: "one second is unchanged", timeout: time.Second, wantFlag: true, wantSeconds: "1"},
+				{name: "fractional second rounds up", timeout: 1500 * time.Millisecond, wantFlag: true, wantSeconds: "2"},
+				{name: "negative is rejected", timeout: -time.Second, wantErr: true},
+				{name: "backend maximum", timeout: maxTimeout, wantFlag: true, wantSeconds: strconv.FormatInt(backend.maxSeconds, 10)},
+				{name: "first value rounding above maximum", timeout: maxTimeout + time.Nanosecond, wantErr: true},
+				{name: "maximum duration", timeout: maxStopTestDuration, wantErr: true},
+			}
+
+			for _, tc := range cases {
+				t.Run(tc.name, func(t *testing.T) {
+					ctr, runner := newStopTestContainer(t, backend.engine)
+					runner.calls = nil
+
+					var timeout *time.Duration
+					if !tc.nilTimeout {
+						timeout = &tc.timeout
+					}
+					err := ctr.Stop(context.Background(), timeout)
+					if tc.wantErr {
+						if err == nil {
+							t.Fatal("Stop returned nil error")
+						}
+						if stop := runner.callWith("stop"); stop != nil {
+							t.Fatalf("invalid timeout reached backend: %v", stop)
+						}
+						return
+					}
+					if err != nil {
+						t.Fatalf("Stop: %v", err)
+					}
+
+					want := []string{"stop"}
+					if tc.wantFlag {
+						want = append(want, "--time", tc.wantSeconds)
+					}
+					want = append(want, "myctr")
+					if got := runner.callWith("stop"); !slices.Equal(got, want) {
+						t.Errorf("stop args = %v, want %v", got, want)
+					}
+				})
+			}
+		})
+	}
 }
 
-func (r *stopContextRunner) Run(ctx context.Context, _ ...string) ([]byte, []byte, error) {
-	r.deadline, r.hasDeadline = ctx.Deadline()
-	r.contextErr = ctx.Err()
-	return nil, nil, nil
+func newStopTestContainer(t *testing.T, eng engine) (*Container, *fakeRunner) {
+	t.Helper()
+	if _, ok := eng.(dockerEngine); ok {
+		runner := &dockerRunner{fakeRunner: newTestRunner()}
+		return runDockerTestContainer(t, runner), runner.fakeRunner
+	}
+	runner := newTestRunner()
+	return runTestContainer(t, runner), runner
 }
 
-func TestStopMaximumTimeoutSaturatesContextBudget(t *testing.T) {
-	if strconv.IntSize == 32 {
-		t.Skip("maximum duration overflows the backend integer")
+func TestSaturatingAddDuration(t *testing.T) {
+	if got := saturatingAddDuration(queryTimeout, maxStopTestDuration); got != maxStopTestDuration {
+		t.Errorf("saturatingAddDuration(max) = %v, want %v", got, maxStopTestDuration)
 	}
-	runner := new(stopContextRunner)
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}}
-	timeout := maxStopTestDuration
-	start := time.Now()
-
-	if err := ctr.Stop(context.Background(), &timeout); err != nil {
-		t.Fatalf("Stop: %v", err)
-	}
-	if !runner.hasDeadline {
-		t.Fatal("stop context has no deadline")
-	}
-	if runner.contextErr != nil {
-		t.Fatalf("stop context already ended: %v", runner.contextErr)
-	}
-	budget := runner.deadline.Sub(start)
-	if budget > maxStopTestDuration || budget < maxStopTestDuration-time.Second {
-		t.Errorf("stop context budget = %v, want approximately %v", budget, maxStopTestDuration)
+	if got, want := saturatingAddDuration(queryTimeout, -time.Second), queryTimeout-time.Second; got != want {
+		t.Errorf("saturatingAddDuration(negative) = %v, want %v", got, want)
 	}
 }

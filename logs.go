@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -59,7 +60,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // or the context is cancelled. Close terminates the underlying CLI
 // process. A startup failure is returned by FollowLogs; after the stream
 // is returned, a terminal CLI failure is delivered by Read. The direct
-// CLI child is reaped; Unix process groups and Windows taskkill provide
+// CLI child is reaped; Unix process groups and Windows Job Objects provide
 // only best-effort descendant termination while that child is owned, and
 // descendants are not reaped by this package. Once the child is reaped,
 // Close does not signal its former process group.
@@ -83,6 +84,14 @@ type classifyingStream struct {
 	io.ReadCloser
 	ctx       context.Context
 	container *Container
+
+	terminalOnce sync.Once
+	terminalErr  error
+}
+
+type terminalStreamStatus interface {
+	Done() <-chan struct{}
+	TerminalError() error
 }
 
 func (s *classifyingStream) Read(p []byte) (int, error) {
@@ -90,5 +99,48 @@ func (s *classifyingStream) Read(p []byte) (int, error) {
 	if err == nil || errors.Is(err, io.EOF) {
 		return n, err
 	}
-	return n, wrapNotFound(s.container.classify(s.ctx, err))
+	if _, ok := s.ReadCloser.(terminalStreamStatus); ok {
+		if terminalErr := s.TerminalError(); terminalErr != nil {
+			return n, terminalErr
+		}
+	}
+	return n, s.wrap(err)
+}
+
+// Done forwards the optional process status exposed by the underlying stream.
+// A nil channel means that the reader has no status capability; wait.ForLog
+// then falls back to its ordinary io.Reader contract.
+func (s *classifyingStream) Done() <-chan struct{} {
+	if status, ok := s.ReadCloser.(interface{ Done() <-chan struct{} }); ok {
+		return status.Done()
+	}
+	return nil
+}
+
+// TerminalError returns the classified terminal CLI error, if the stream
+// implementation exposes one. It is cached so Read and readiness handling
+// observe the same cause and classification probe result.
+func (s *classifyingStream) TerminalError() error {
+	s.terminalOnce.Do(func() {
+		status, ok := s.ReadCloser.(terminalStreamStatus)
+		if !ok {
+			return
+		}
+		s.terminalErr = s.wrap(status.TerminalError())
+	})
+	return s.terminalErr
+}
+
+func (s *classifyingStream) wrap(err error) error {
+	if err == nil || errors.Is(err, io.EOF) {
+		return err
+	}
+	classified := s.container.classify(s.ctx, err)
+	if classified == nil || errors.Is(classified, err) || errors.Is(err, classified) {
+		return wrapNotFound(classified)
+	}
+	// A backend probe can classify a terminal CLI failure as an
+	// infrastructure problem. Keep both causes so Read/ForLog callers can
+	// still recover CLIError and ErrContainerNotFound with errors.Is/As.
+	return wrapNotFound(errors.Join(classified, err))
 }

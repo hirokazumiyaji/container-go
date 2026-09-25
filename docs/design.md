@@ -383,15 +383,17 @@ bounded only by host resources.
 
 **Keep streams finite**. `FollowLogs` returns the `container logs --follow`
 child as an `io.ReadCloser`. `Close` or context cancellation terminates
-and reaps the direct CLI child. On Unix-like systems the runner also
-sends a best-effort signal to the child's process group, but it does not
-reap descendants. A descendant that becomes a zombie is the platform
-init/subreaper's responsibility. If the direct child has already been
-reaped, Close does not signal its former process group, so descendants
-may outlive it. Detached or reparented descendants are outside the group
-boundary. On Windows, `taskkill /T` is a best-effort descendant boundary
-rather than a Job Object guarantee. Other supported platforms cover only
-the direct child. ForLog's diagnostic buffer caps at 1MiB.
+and reaps the direct CLI child. On Unix-like systems the runner makes a
+best-effort process-group termination attempt, but only after the direct
+process handle accepts the stop signal; it does not reap descendants. A
+descendant that becomes a zombie is the platform init/subreaper's
+responsibility. Once the direct child is reaped, Close does not use its
+former process-group ID, so descendants may outlive it. Detached or
+reparented descendants are outside the group boundary. On Windows, a
+Job Object handle is used for the descendant boundary; if job assignment
+is unavailable, the direct process handle is the fallback. Other
+supported platforms cover only the direct child. ForLog's diagnostic
+buffer caps at 1MiB.
 
 A stream has two error phases. `Stream` (and the public `FollowLogs`
 wrapper) returns startup errors. Once a stream has been returned, a
@@ -401,9 +403,11 @@ intentional terminal paths and may instead produce EOF or a context error.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the direct CLI child is killed and reaped. Process-group or
-`taskkill` termination of descendants is best effort; this package does
-not claim descendant reaping.
+cancellation the direct CLI child is killed and reaped. Unix process-group
+termination is gated by the direct process handle; Windows Job Object
+termination is handle-based, with direct-child fallback when assignment
+fails. Descendant cleanup is best effort and this package does not claim
+descendant reaping.
 
 ## Error handling
 

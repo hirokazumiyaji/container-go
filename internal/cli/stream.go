@@ -32,8 +32,13 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 }
 
 type streamHooks struct {
-	afterStart func(*processStream)
-	terminate  func(*exec.Cmd) error
+	// start is a test seam around exec.Cmd.Start. Production leaves it nil.
+	start func(*exec.Cmd) error
+	// beforePublish runs after the process exists but before the lifecycle
+	// barrier is opened. It lets tests cancel during that publication gap.
+	beforePublish  func(*processStream)
+	cancelObserved func()
+	terminate      func(*exec.Cmd) error
 }
 
 func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...string) (io.ReadCloser, error) {
@@ -57,34 +62,38 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 	pr, pw := io.Pipe()
-	terminateTree := hooks.terminate
-	if terminateTree == nil {
-		terminateTree = terminateProcessTree
-	}
+	lifecycle := newCommandLifecycle(ctx, cmd)
 	stream := &processStream{
-		ReadCloser:    pr,
-		cmd:           cmd,
-		ctx:           ctx,
-		binary:        bin,
-		args:          append([]string(nil), args...),
-		output:        pw,
-		stderr:        &tailBuffer{},
-		stdoutRead:    stdoutRead,
-		stderrRead:    stderrRead,
-		startDone:     make(chan struct{}),
-		waitDone:      make(chan struct{}),
-		pumpsDone:     make(chan struct{}),
-		terminateTree: terminateTree,
+		ReadCloser:     pr,
+		cmd:            cmd,
+		lifecycle:      lifecycle,
+		ctx:            ctx,
+		binary:         bin,
+		args:           append([]string(nil), args...),
+		output:         pw,
+		stderr:         &tailBuffer{},
+		stdoutRead:     stdoutRead,
+		stderrRead:     stderrRead,
+		stderrDone:     make(chan struct{}),
+		startDone:      lifecycle.startDone,
+		waitDone:       lifecycle.waitDone,
+		pumpsDone:      make(chan struct{}),
+		cancelObserved: hooks.cancelObserved,
 	}
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderrWrite
-	// Cancel closes the reader as well as killing the process tree. This
-	// is the callback used by exec.CommandContext's context watcher.
+	// Cancel closes the reader as well as terminating the owned process
+	// tree. The lifecycle, rather than this callback, owns Wait.
 	cmd.Cancel = stream.cancel
-	if err := cmd.Start(); err != nil {
+
+	start := hooks.start
+	if start == nil {
+		start = func(command *exec.Cmd) error { return command.Start() }
+	}
+	if err := start(cmd); err != nil {
 		// Start does not return a usable process on failure. Close the
 		// ownership barrier anyway so no lifecycle caller can wait forever.
-		close(stream.startDone)
+		lifecycle.failStart()
 		_ = stdoutWrite.Close()
 		_ = stderrWrite.Close()
 		_ = pr.Close()
@@ -100,20 +109,26 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
 
-	// Publish ownership only after Start has returned successfully. A
-	// context cancellation delivered by os/exec waits on startDone before
-	// it is allowed to signal the process tree.
-	stream.stateMu.Lock()
-	stream.started = true
-	stream.stateMu.Unlock()
-	close(stream.startDone)
-
-	// The hook is nil in production. It gives package tests a precise
-	// cancellation-during-start interleaving without changing the public
-	// API or relying on scheduler timing.
-	if hooks.afterStart != nil {
-		hooks.afterStart(stream)
+	var tree processTree
+	if hooks.terminate != nil {
+		tree = processTreeFunc(hooks.terminate)
+	} else {
+		tree, err = newProcessTree(cmd)
+		if err != nil {
+			// A platform tree is an enhancement. The direct process handle
+			// remains a safe cancellation path if attachment is unavailable.
+			tree = directProcessTree{}
+		} else {
+			stream.treeAttached = true
+		}
 	}
+
+	// The context watcher can run as soon as Start returns. Keep the
+	// ownership barrier closed until all process handles are published.
+	if hooks.beforePublish != nil {
+		hooks.beforePublish(stream)
+	}
+	lifecycle.publishStart(tree)
 
 	stream.pumpWG.Add(2)
 	go stream.pump(stdoutRead, false)
@@ -124,38 +139,41 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		close(stream.pumpsDone)
 	}()
 
-	// Wait is deliberately owned by one caller. Every lifecycle path
-	// coordinates through waitOnce, so EOF, cancellation, and Close cannot
-	// reap the child more than once.
+	// Wait is deliberately owned by one lifecycle caller. Every lifecycle
+	// path coordinates through that owner, so EOF, cancellation, and Close
+	// cannot reap the child more than once.
 	go stream.wait()
 	return stream, nil
 }
 
 type processStream struct {
 	io.ReadCloser
-	cmd    *exec.Cmd
-	ctx    context.Context
-	binary string
-	args   []string
-	output *io.PipeWriter
-	stderr *tailBuffer
+	cmd       *exec.Cmd
+	lifecycle *commandLifecycle
+	ctx       context.Context
+	binary    string
+	args      []string
+	output    *io.PipeWriter
+	stderr    *tailBuffer
 
 	// stdoutRead and stderrRead belong to the stream after construction.
 	// The matching write ends are local to Stream and are never stored
 	// here; this keeps endpoint ownership immutable across cancellation.
 	stdoutRead *os.File
 	stderrRead *os.File
+	stderrDone chan struct{}
 
-	// startDone is closed after a successful Start and state publication.
-	// It prevents a context callback from inspecting a half-started Cmd.
+	// startDone is closed after a successful Start and all process handles
+	// are published. It prevents a context callback from inspecting a
+	// half-started Cmd.
 	startDone chan struct{}
 
-	waitOnce sync.Once
-	waitDone chan struct{}
-	waitErr  error
-	// waitCalls is an internal invariant probe: the sole cmd.Wait call
-	// must remain exactly-once even when lifecycle paths race.
-	waitCalls atomic.Int32
+	waitOnce           sync.Once
+	waitDone           chan struct{}
+	waitCalls          atomic.Int32
+	treeAttached       bool
+	cancelObserved     func()
+	cancelObservedOnce sync.Once
 
 	pumpWG          sync.WaitGroup
 	pumpsDone       chan struct{}
@@ -163,17 +181,12 @@ type processStream struct {
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
 
-	terminateOnce sync.Once
-	terminateErr  error
-	terminateTree func(*exec.Cmd) error
-
-	closeOnce sync.Once
-	stateMu   sync.Mutex
-	started   bool
-	reaped    bool
-	closed    bool
-	cancelled bool
-	ctxErr    error
+	closeOnce           sync.Once
+	stateMu             sync.Mutex
+	closed              bool
+	cancelled           bool
+	terminalSnapshot    error
+	terminalSnapshotSet bool
 }
 
 // streamOutput retains a rolling stderr diagnostic while forwarding the
@@ -193,6 +206,9 @@ func (w *streamOutput) Write(p []byte) (int, error) {
 func (s *processStream) pump(r *os.File, stderr bool) {
 	defer s.pumpWG.Done()
 	defer func() { _ = r.Close() }()
+	if stderr {
+		defer close(s.stderrDone)
+	}
 	var output io.Writer = s.output
 	if stderr {
 		output = &streamOutput{output: s.output, stderr: s.stderr}
@@ -203,18 +219,9 @@ func (s *processStream) pump(r *os.File, stderr bool) {
 func (s *processStream) wait() {
 	s.waitOnce.Do(func() {
 		s.waitCalls.Add(1)
-		err := s.cmd.Wait()
-		ctxErr := s.ctx.Err()
-		s.stateMu.Lock()
-		s.waitErr = err
-		s.ctxErr = ctxErr
-		// Cmd.Wait has returned, so this process is no longer ours to
-		// signal. In particular, never use its PID/PGID after this point:
-		// the kernel may immediately reuse either identifier.
-		s.reaped = true
-		s.stateMu.Unlock()
-		close(s.waitDone)
+		s.lifecycle.wait()
 	})
+	<-s.waitDone
 }
 
 func (s *processStream) cancel() error {
@@ -222,6 +229,10 @@ func (s *processStream) cancel() error {
 }
 
 func (s *processStream) requestTermination(cancelled bool) error {
+	// Preserve a terminal CLI failure that completed just before Close or
+	// cancellation marks the stream as intentionally closed.
+	s.captureTerminalError()
+
 	s.stateMu.Lock()
 	if cancelled {
 		s.cancelled = true
@@ -230,33 +241,16 @@ func (s *processStream) requestTermination(cancelled bool) error {
 	}
 	s.stateMu.Unlock()
 
-	// Start owns cmd.Process until it has published a successful start.
-	// Waiting on the barrier also makes cancellation before Start returns
-	// safe without reading a concurrently initialized exec.Cmd.
-	<-s.startDone
-	s.stateMu.Lock()
-	if !s.started || s.reaped {
-		s.stateMu.Unlock()
-		s.closeReader()
-		s.closeSourceFiles()
-		return os.ErrProcessDone
+	if s.cancelObserved != nil {
+		s.cancelObservedOnce.Do(s.cancelObserved)
 	}
-
-	// Serialize the ownership check with the tree signal. Once Wait marks
-	// the child reaped, a delayed Close or context callback observes the
-	// reaped flag and cannot signal a stale PID/PGID.
-	s.terminateOnce.Do(func() {
-		s.terminateErr = s.terminateTree(s.cmd)
-	})
-	terminateErr := s.terminateErr
-	s.stateMu.Unlock()
-
-	// Kill the whole process group first so an output-heavy descendant
+	err := s.lifecycle.terminate()
+	// Kill the owned process tree first so an output-heavy descendant
 	// cannot keep the CLI alive. closeSourceFiles then releases pumps that
 	// may be blocked writing to the public reader.
 	s.closeReader()
 	s.closeSourceFiles()
-	return terminateErr
+	return err
 }
 
 func (s *processStream) closeSourceFiles() {
@@ -275,10 +269,13 @@ func (s *processStream) closeReader() {
 
 func (s *processStream) waitResult() error {
 	s.wait()
-	<-s.waitDone
-	s.stateMu.Lock()
-	defer s.stateMu.Unlock()
-	return s.waitErr
+	return s.lifecycle.error()
+}
+
+// Done reports completion of the direct child. It is an optional status
+// capability used by readiness strategies; it does not wait for descendants.
+func (s *processStream) Done() <-chan struct{} {
+	return s.waitDone
 }
 
 func (s *processStream) Read(p []byte) (int, error) {
@@ -299,11 +296,60 @@ func (s *processStream) Read(p []byte) (int, error) {
 }
 
 func (s *processStream) readError(readErr error) error {
+	return s.processError(s.waitResult(), readErr, false)
+}
+
+// TerminalError returns the process-level terminal error, if any. It is
+// deliberately separate from Read so a consumer that matched a log line can
+// check whether the CLI had already failed before declaring readiness.
+func (s *processStream) TerminalError() error {
+	s.stateMu.Lock()
+	if s.terminalSnapshotSet {
+		err := s.terminalSnapshot
+		s.stateMu.Unlock()
+		return err
+	}
+	s.stateMu.Unlock()
+
 	waitErr := s.waitResult()
+	// The stderr pump normally drains while a log scanner is active. Give
+	// it a short bounded chance to record the terminal diagnostic before
+	// constructing CLIError, without making a caller that is not reading
+	// the stream wait forever on public-pipe backpressure.
+	timer := time.NewTimer(10 * time.Millisecond)
+	select {
+	case <-s.stderrDone:
+	case <-timer.C:
+	}
+	timer.Stop()
+	err := s.processError(waitErr, io.EOF, true)
+	s.stateMu.Lock()
+	if !s.terminalSnapshotSet {
+		s.terminalSnapshot = err
+		s.terminalSnapshotSet = true
+	}
+	s.stateMu.Unlock()
+	return err
+}
+
+func (s *processStream) captureTerminalError() {
+	if !s.lifecycle.isReaped() {
+		return
+	}
+	s.stateMu.Lock()
+	if s.terminalSnapshotSet {
+		s.stateMu.Unlock()
+		return
+	}
+	s.stateMu.Unlock()
+	_ = s.TerminalError()
+}
+
+func (s *processStream) processError(waitErr, readErr error, terminalOnly bool) error {
 	s.stateMu.Lock()
 	closed := s.closed
 	cancelled := s.cancelled
-	ctxErr := s.ctxErr
+	ctxErr := s.lifecycle.contextError()
 	s.stateMu.Unlock()
 
 	if waitErr != nil {
@@ -314,13 +360,23 @@ func (s *processStream) readError(readErr error) error {
 			// races with the reader shutdown, so those paths take
 			// precedence over the exit status.
 			if cancelled {
+				if exitErr.ExitCode() >= 0 {
+					return errors.Join(s.cliError(exitErr), s.contextError())
+				}
 				return s.contextError()
 			}
 			if closed {
+				if terminalOnly {
+					return nil
+				}
 				return io.EOF
 			}
 			if exitErr.ExitCode() >= 0 {
-				return s.cliError(exitErr)
+				cliErr := s.cliError(exitErr)
+				if ctxErr != nil {
+					return errors.Join(cliErr, s.contextError())
+				}
+				return cliErr
 			}
 			// A signal not caused by this stream is still a terminal CLI
 			// failure. If the context was done while Wait returned, the
@@ -334,6 +390,9 @@ func (s *processStream) readError(readErr error) error {
 			return s.contextError()
 		}
 		if closed {
+			if terminalOnly {
+				return nil
+			}
 			return io.EOF
 		}
 		return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), waitErr)
@@ -343,7 +402,13 @@ func (s *processStream) readError(readErr error) error {
 		return s.contextError()
 	}
 	if closed {
+		if terminalOnly {
+			return nil
+		}
 		return io.EOF
+	}
+	if terminalOnly {
+		return nil
 	}
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
 		return readErr

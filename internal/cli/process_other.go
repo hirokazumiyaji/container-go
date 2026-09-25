@@ -2,20 +2,25 @@
 
 package cli
 
-import (
-	"os"
-	"os/exec"
-)
+import "os/exec"
 
-// These platforms have no portable process-group implementation in the
-// standard library. Cancellation still terminates and reaps the direct CLI
-// child, but detached descendants cannot be guaranteed and are not reaped
-// by this package.
+// These platforms have no portable process-group or job-object API in this
+// package. Cancellation still terminates and reaps the direct CLI child;
+// detached descendants cannot be guaranteed and are not reaped here.
 func configureProcessTree(*exec.Cmd) {}
 
+type otherProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) {
+	return otherProcessTree{}, nil
+}
+
+func (otherProcessTree) terminate(cmd *exec.Cmd) error {
+	return terminateProcessTree(cmd)
+}
+
+func (otherProcessTree) close() {}
+
 func terminateProcessTree(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
-	}
-	return cmd.Process.Kill()
+	return directProcessTree{}.terminate(cmd)
 }

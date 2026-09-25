@@ -96,7 +96,8 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
-	cmd.Cancel = func() error { return terminateProcessTree(cmd) }
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	cmd.Cancel = lifecycle.terminate
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -104,7 +105,22 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		lifecycle.failStart()
+		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	tree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		// The direct os.Process handle is still a safe cancellation path
+		// when a platform tree cannot be attached.
+		tree = directProcessTree{}
+	}
+	lifecycle.publishStart(tree)
+
+	// Run owns the sole Wait call through the same lifecycle used by Stream.
+	// This keeps context cancellation and the eventual reap from racing a
+	// stale numeric process-group signal.
+	err := lifecycle.result()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.

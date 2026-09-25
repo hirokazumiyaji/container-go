@@ -20,9 +20,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FollowLogs`, terminal CLI failures are delivered by `Read`, and
   process-group descendants are only best-effort terminated (the direct
   CLI child is the process this package reaps).
-- Serialize stream endpoint ownership and stop process-tree signaling
-  after the direct child is reaped, so delayed cancellation cannot target a
-  reused PID or process-group ID.
+- Give each CLI invocation one lifecycle owner for Start/Wait/termination;
+  Unix group signals are gated by the direct process handle, and Windows
+  uses a Job Object handle with a direct-child fallback.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

@@ -6,33 +6,96 @@ import (
 	"errors"
 	"os"
 	"os/exec"
-	"strconv"
+	"sync"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
 )
 
-// configureProcessTree is intentionally a no-op on Windows. The standard
-// library does not expose a Job Object handle, so termination uses the
-// platform's taskkill tree operation below instead. The PID is numeric and
-// passed as a fixed argv, never through a shell. Detached/reparented
-// descendants are outside taskkill's best-effort guarantee, and this
-// package does not reap descendants.
+// Windows process-tree termination uses a Job Object handle rather than a
+// numeric PID. The handle remains valid across child exit and cannot be
+// redirected to a reused PID. If the process cannot be assigned to a job
+// (for example, because the caller is already inside a restrictive job), the
+// caller falls back to the direct os.Process handle.
 func configureProcessTree(*exec.Cmd) {}
 
-// terminateProcessTree is called only while the stream owns the direct
-// child. The caller must not invoke it after cmd.Wait has returned: the
-// numeric PID can then be reused by an unrelated process.
-func terminateProcessTree(cmd *exec.Cmd) error {
+type windowsProcessTree struct {
+	mu     sync.Mutex
+	job    windows.Handle
+	closed bool
+}
+
+func newProcessTree(cmd *exec.Cmd) (processTree, error) {
+	job, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
+	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		job,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&limits)),
+		uint32(unsafe.Sizeof(limits)),
+	); err != nil {
+		_ = windows.CloseHandle(job)
+		return nil, err
+	}
+
+	// The lifecycle has not called Wait yet, so this numeric PID still
+	// identifies the child and cannot have been recycled. The resulting
+	// job handle, unlike the PID, remains valid for later termination.
+	process, err := windows.OpenProcess(
+		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		false,
+		uint32(cmd.Process.Pid),
+	)
+	if err != nil {
+		_ = windows.CloseHandle(job)
+		return nil, err
+	}
+	err = windows.AssignProcessToJobObject(job, process)
+	_ = windows.CloseHandle(process)
+	if err != nil {
+		_ = windows.CloseHandle(job)
+		return nil, err
+	}
+	return &windowsProcessTree{job: job}, nil
+}
+
+func (t *windowsProcessTree) terminate(cmd *exec.Cmd) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.job != 0 && !t.closed {
+		if err := windows.TerminateJobObject(t.job, 1); err == nil {
+			return nil
+		}
+	}
+	// Job assignment can fail, and a job can be closed concurrently with a
+	// normal child exit. The direct handle remains a safe fallback.
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone
 	}
-	pid := strconv.Itoa(cmd.Process.Pid)
-	taskErr := exec.Command("taskkill", "/T", "/F", "/PID", pid).Run()
-	killErr := cmd.Process.Kill()
-	if taskErr == nil {
+	if err := cmd.Process.Kill(); err == nil || errors.Is(err, os.ErrProcessDone) {
 		return nil
+	} else {
+		return err
 	}
-	if killErr == nil || errors.Is(killErr, os.ErrProcessDone) {
-		// The direct process is gone; taskkill can race with normal exit.
-		return nil
+}
+
+func (t *windowsProcessTree) close() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.job != 0 && !t.closed {
+		_ = windows.CloseHandle(t.job)
+		t.job = 0
+		t.closed = true
 	}
-	return taskErr
+}
+
+// terminateProcessTree is kept as the direct-child fallback used by package
+// tests and by callers that have not attached a job handle.
+func terminateProcessTree(cmd *exec.Cmd) error {
+	return directProcessTree{}.terminate(cmd)
 }

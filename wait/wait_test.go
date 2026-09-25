@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -155,10 +156,101 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target.logs = pr
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
-	if err := s.WaitUntilReady(context.Background(), target); err == nil {
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
 		t.Fatal("want timeout error")
 	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Fatalf("error = %v, want timeout diagnostic", err)
+	}
 }
+
+type delayedTerminalLogReader struct {
+	reader    io.Reader
+	done      chan struct{}
+	closeOnce sync.Once
+	terminal  error
+}
+
+func (r *delayedTerminalLogReader) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+
+func (r *delayedTerminalLogReader) Close() error { return nil }
+
+func (r *delayedTerminalLogReader) Done() <-chan struct{} { return r.done }
+
+func (r *delayedTerminalLogReader) TerminalError() error { return r.terminal }
+
+func (r *delayedTerminalLogReader) finish() {
+	r.closeOnce.Do(func() { close(r.done) })
+}
+
+func TestForLogRejectsMatchingLineWhenTerminalErrorAlreadySettled(t *testing.T) {
+	terminalErr := errors.New("terminal CLI failure")
+	reader := &delayedTerminalLogReader{
+		reader:   strings.NewReader("diagnostic matching line\n"),
+		done:     make(chan struct{}),
+		terminal: terminalErr,
+	}
+	reader.finish()
+	target := newFakeTarget()
+	target.logs = reader
+
+	err := ForLog("diagnostic matching line").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("error = %v, want terminal error", err)
+	}
+	if target.runningCalls.Load() != 0 {
+		t.Fatalf("Running calls = %d, want no state probe after terminal error", target.runningCalls.Load())
+	}
+}
+
+func TestForLogSettlesTerminalErrorAfterMatchingLine(t *testing.T) {
+	terminalErr := errors.New("terminal CLI failure after match")
+	reader := &delayedTerminalLogReader{
+		reader:   strings.NewReader("diagnostic matching line\n"),
+		done:     make(chan struct{}),
+		terminal: terminalErr,
+	}
+	time.AfterFunc(time.Millisecond, reader.finish)
+	target := newFakeTarget()
+	target.logs = reader
+
+	err := ForLog("diagnostic matching line").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("error = %v, want terminal error", err)
+	}
+}
+
+func TestForLogPreservesTerminalReaderError(t *testing.T) {
+	terminalErr := errors.New("reader terminal failure")
+	target := newFakeTarget()
+	target.logs = &errorAfterReader{Reader: strings.NewReader("no match\n"), err: terminalErr}
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminalErr) {
+		t.Fatalf("error = %v, want terminal reader error", err)
+	}
+}
+
+type errorAfterReader struct {
+	io.Reader
+	err error
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if err == io.EOF {
+		return n, r.err
+	}
+	return n, err
+}
+
+func (r *errorAfterReader) Close() error { return nil }
 
 func TestForHTTPMatchesStatusCode(t *testing.T) {
 	var hits atomic.Int32

@@ -9,39 +9,55 @@ import (
 	"syscall"
 )
 
-// configureProcessTree gives each CLI invocation its own process group.
-// The group is a termination boundary only: signaling it can terminate
-// descendants that remain in the group, but it does not reap them. Once
-// the direct child is gone, the platform init/subreaper owns descendant
-// zombies; descendants that deliberately detach are outside the boundary.
+// configureProcessTree gives each CLI invocation its own process group. The
+// group is a termination boundary only: signaling it can terminate descendants
+// that remain in the group, but it does not reap them. Descendants that detach
+// are outside the boundary.
 func configureProcessTree(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// terminateProcessTree is called while the stream still owns the direct
-// child. It never uses the process-group ID after the direct child has been
-// waited, because that ID can be reused by an unrelated process.
+type unixProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) {
+	return unixProcessTree{}, nil
+}
+
+func (unixProcessTree) terminate(cmd *exec.Cmd) error {
+	return terminateProcessTree(cmd)
+}
+
+func (unixProcessTree) close() {}
+
+// terminateProcessTree uses the direct process handle before addressing the
+// process group. The lifecycle has exactly one Wait caller, and os.Process
+// serializes Signal with that Wait: once Wait has marked the process done,
+// Signal returns os.ErrProcessDone instead of sending a signal through a
+// potentially reused numeric PID. If Signal succeeds, the child is still an
+// unreaped process (or a stopped child), so its process-group ID cannot have
+// been recycled before the group signal.
 func terminateProcessTree(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone
 	}
-	// os.Process retains its own done state. In particular, signal 0
-	// returns os.ErrProcessDone after the direct child has been waited even
-	// if the numeric PID has already been reused.
-	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
 		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 			return os.ErrProcessDone
 		}
-		// EPERM (and unusual platform-specific errors) still mean that a
-		// process handle exists; retain the best-effort group signal.
+		// EPERM and unusual platform errors do not make a numeric group
+		// signal safe. Fall back to the direct process handle.
+		if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return err
+		}
+		return nil
 	}
 	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err == nil {
 		return nil
-	} else if !errors.Is(err, syscall.ESRCH) {
+	} else if killErr := cmd.Process.Kill(); killErr == nil || errors.Is(killErr, os.ErrProcessDone) {
+		// The group may have disappeared or rejected the signal after the
+		// direct handle was stopped. The direct handle is still safe.
+		return nil
+	} else {
 		return err
 	}
-	// A process group can disappear between the liveness check and the
-	// signal. The direct child is still owned here, so this fallback does
-	// not target a reused PID.
-	return cmd.Process.Kill()
 }

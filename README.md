@@ -145,18 +145,21 @@ logs attached to the error.
 until EOF; if the CLI later exits unsuccessfully, the terminal error (and
 its `CLIError` details) is returned by `Read`, not by `FollowLogs`. Calling
 `Close` or cancelling the context is an intentional termination; a
-subsequent `Read` may return EOF or the context error instead.
+subsequent `Read` may return EOF or the context error instead. `wait.ForLog`
+checks the optional terminal status before treating a matching line as
+readiness, so a merged CLI diagnostic cannot mask a terminal failure.
 
 The library always waits for and reaps the direct CLI child. On Unix-like
-systems it also makes a best-effort attempt to terminate descendants in
-that child's process group, but it does not reap descendants: a descendant
-that becomes a zombie is the platform init/subreaper's responsibility.
-If the direct child has already exited and been reaped, Close does not
-signal its former process group, so descendants may outlive it. Detached
-or reparented descendants are outside the group guarantee. On Windows,
-`taskkill /T` is the best-effort descendant boundary; on other platforms
-only the direct child is covered. Do not rely on descendant cleanup when
-a CLI deliberately detaches helpers.
+systems it makes a best-effort attempt to terminate descendants in the
+child's process group, gated by the direct process handle; it does not
+reap descendants, so a descendant that becomes a zombie is the platform
+init/subreaper's responsibility. Once the direct child is reaped, Close
+does not use its former process-group ID, so descendants may outlive it.
+Detached or reparented descendants are outside the group guarantee. On
+Windows, an attached Job Object provides the descendant boundary; if the
+host prevents job assignment, only the direct process handle is covered.
+Other supported platforms cover only the direct child. Do not rely on
+descendant cleanup when a CLI deliberately detaches helpers.
 
 ## Image pulls
 

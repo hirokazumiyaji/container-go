@@ -9,7 +9,8 @@ import (
 
 // These platforms have no portable process-group implementation in the
 // standard library. Cancellation still terminates and reaps the direct CLI
-// child, but detached descendants cannot be guaranteed.
+// child, but detached descendants cannot be guaranteed and are not reaped
+// by this package.
 func configureProcessTree(*exec.Cmd) {}
 
 func terminateProcessTree(cmd *exec.Cmd) error {

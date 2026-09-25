@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Validate wait strategies and declared ports before image pulls, classify
   terminal log-stream errors, and de-duplicate replayed log occurrences.
+- Clarify streaming log behavior: startup failures are returned by
+  `FollowLogs`, terminal CLI failures are delivered by `Read`, and
+  process-group descendants are only best-effort terminated (the direct
+  CLI child is the process this package reaps).
+- Serialize stream endpoint ownership and stop process-tree signaling
+  after the direct child is reaped, so delayed cancellation cannot target a
+  reused PID or process-group ID.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

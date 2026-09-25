@@ -173,6 +173,7 @@ func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
@@ -399,13 +400,29 @@ lock (reaper ID registration takes a mutex for a one-line write).
 Because the default design consumes no host ports, parallelism is
 bounded only by host resources.
 
-**Keep streams finite**. `Logs` returns the `container logs --follow`
-child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+**Keep streams finite**. `FollowLogs` returns the `container logs --follow`
+child as an `io.ReadCloser`. `Close` or context cancellation terminates
+and reaps the direct CLI child. On Unix-like systems the runner also
+sends a best-effort signal to the child's process group, but it does not
+reap descendants. A descendant that becomes a zombie is the platform
+init/subreaper's responsibility. If the direct child has already been
+reaped, Close does not signal its former process group, so descendants
+may outlive it. Detached or reparented descendants are outside the group
+boundary. On Windows, `taskkill /T` is a best-effort descendant boundary
+rather than a Job Object guarantee. Other supported platforms cover only
+the direct child. ForLog's diagnostic buffer caps at 1MiB.
+
+A stream has two error phases. `Stream` (and the public `FollowLogs`
+wrapper) returns startup errors. Once a stream has been returned, a
+terminal CLI failure is delivered by `Read`; callers must read the stream
+to observe `CLIError` details. `Close` and context cancellation are
+intentional terminal paths and may instead produce EOF or a context error.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
+cancellation the direct CLI child is killed and reaped. Process-group or
+`taskkill` termination of descendants is best effort; this package does
+not claim descendant reaping.
 
 ## Error handling
 
@@ -470,7 +487,8 @@ code assumes non-nil get real fakes in tests, never nil.
 **Integration tests**: split off behind the `integration` build tag
 and run only on real hardware (macOS 26 with Apple Container up). They
 cover startup, connection, exec, copy, cleanup, and the watchdog
-(SIGKILL a child process, watch the reaper act). They check
+(SIGKILL the test process, then watch the reaper remove registered
+containers). They check
 `container system status` first and skip when the service is down.
 
 **CI**: unit tests and `go vet` run in GitHub Actions per push (no

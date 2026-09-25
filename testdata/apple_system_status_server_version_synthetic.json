@@ -1,0 +1,9 @@
+{
+  "status": "running",
+  "server": {
+    "version": "1.3.0",
+    "build": "release",
+    "commit": "d6de569",
+    "appName": "container-apiserver"
+  }
+}

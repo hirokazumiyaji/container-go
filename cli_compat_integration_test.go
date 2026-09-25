@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -310,6 +311,12 @@ func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token str
 }
 
 func TestIntegrationDockerLiveCleanupUsesImmutableID(t *testing.T) {
+	// Keep the other integration tests available on Windows; only this fake
+	// executable depends on a POSIX shell.
+	if runtime.GOOS == "windows" {
+		t.Skip("the fake Docker CLI requires a POSIX shell")
+	}
+
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	uid := strings.Repeat("ab", 32)

@@ -7,8 +7,8 @@ import (
 )
 
 // decodeAppleStatusVersion extracts the API-server version from the status
-// JSON returned by Apple Container. Apple Container 1.2.2 exposes it at the
-// top level, while newer layouts place it under server.version.
+// JSON returned by Apple Container. Apple Container 1.3.0 exposes it at the
+// top level; a future layout may place it under server.version.
 func decodeAppleStatusVersion(data []byte) (string, error) {
 	var status struct {
 		APIServerVersion string `json:"apiServerVersion"`
@@ -28,7 +28,11 @@ func decodeAppleStatusVersion(data []byte) (string, error) {
 }
 
 func TestAppleStatusVersionShapes(t *testing.T) {
-	nested, err := os.ReadFile("testdata/apple_system_status_1.3.0.json")
+	apple130, err := os.ReadFile("testdata/apple_system_status_1.3.0.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	synthetic, err := os.ReadFile("testdata/apple_system_status_server_version_synthetic.json")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -39,8 +43,13 @@ func TestAppleStatusVersionShapes(t *testing.T) {
 		want string
 	}{
 		{
-			name: "1.3.0 nested server version",
-			data: nested,
+			name: "1.3.0 top-level status",
+			data: apple130,
+			want: "1.3.0",
+		},
+		{
+			name: "synthetic nested server version",
+			data: synthetic,
 			want: "1.3.0",
 		},
 		{

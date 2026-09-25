@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -164,5 +165,244 @@ func TestExecRejectsEmptyCommand(t *testing.T) {
 
 	if _, _, err := ctr.Exec(context.Background(), nil); err == nil {
 		t.Fatal("want error for empty command")
+	}
+}
+
+type issue116BlockingExecRunner struct {
+	*fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (r *issue116BlockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 || args[0] != "exec" {
+		return r.fakeRunner.Run(ctx, args...)
+	}
+	close(r.started)
+	select {
+	case <-ctx.Done():
+		return []byte("partial stdout"), []byte("partial stderr"), ctx.Err()
+	case <-r.release:
+		return []byte("partial stdout"), []byte("partial stderr"), errors.New("backend released")
+	}
+}
+
+type issue116DeadlineExecRunner struct {
+	*fakeRunner
+	deadline time.Time
+	has      bool
+}
+
+func (r *issue116DeadlineExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		r.deadline, r.has = ctx.Deadline()
+		return []byte("ok"), nil, nil
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+type issue116ExecResult struct {
+	code int
+	out  io.Reader
+	err  error
+}
+
+func waitForIssue116ExecStart(t *testing.T, started <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("exec stub was not started")
+	}
+}
+
+func waitForIssue116ExecResult(t *testing.T, result <-chan issue116ExecResult) issue116ExecResult {
+	t.Helper()
+	select {
+	case got := <-result:
+		return got
+	case <-time.After(time.Second):
+		t.Fatal("Exec did not return")
+		return issue116ExecResult{}
+	}
+}
+
+func TestExecAddsDefaultDeadline(t *testing.T) {
+	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !f.has {
+		t.Fatal("Exec passed a context without a default deadline")
+	}
+	remaining := time.Until(f.deadline)
+	if remaining <= 0 || remaining > defaultExecTimeout+time.Second {
+		t.Fatalf("default deadline = %v away, want within %v", remaining, defaultExecTimeout)
+	}
+}
+
+func TestExecDefaultTimeoutStopsBlockingBackend(t *testing.T) {
+	original := defaultExecTimeout
+	defaultExecTimeout = 20 * time.Millisecond
+	defer func() { defaultExecTimeout = original }()
+
+	f := &issue116BlockingExecRunner{
+		fakeRunner: newTestRunner(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	ctr := runTestContainer(t, f)
+	result := make(chan issue116ExecResult, 1)
+	go func() {
+		code, out, err := ctr.Exec(context.Background(), []string{"true"})
+		result <- issue116ExecResult{code: code, out: out, err: err}
+	}()
+	waitForIssue116ExecStart(t, f.started)
+	got := waitForIssue116ExecResult(t, result)
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
+	}
+	if got.out == nil {
+		t.Fatal("Exec returned nil output on default timeout")
+	}
+	data, _ := io.ReadAll(got.out)
+	if !strings.Contains(string(data), "partial stdout") || !strings.Contains(string(data), "partial stderr") {
+		t.Fatalf("output = %q, want partial output", data)
+	}
+}
+
+func TestExecCancellationPreservesPartialOutput(t *testing.T) {
+	f := &issue116BlockingExecRunner{
+		fakeRunner: newTestRunner(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	ctr := runTestContainer(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer close(f.release)
+
+	result := make(chan issue116ExecResult, 1)
+	go func() {
+		code, out, err := ctr.Exec(ctx, []string{"true"})
+		result <- issue116ExecResult{code: code, out: out, err: err}
+	}()
+	waitForIssue116ExecStart(t, f.started)
+	cancel()
+
+	got := waitForIssue116ExecResult(t, result)
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", got.err)
+	}
+	if got.out == nil {
+		t.Fatal("Exec returned nil output on cancellation")
+	}
+	data, err := io.ReadAll(got.out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if got.code != 0 || !strings.Contains(string(data), "partial stdout") || !strings.Contains(string(data), "partial stderr") {
+		t.Fatalf("code/output = %d/%q, want partial output", got.code, data)
+	}
+}
+
+func TestExecTimeoutPreservesPartialOutput(t *testing.T) {
+	f := &issue116BlockingExecRunner{
+		fakeRunner: newTestRunner(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	ctr := runTestContainer(t, f)
+
+	result := make(chan issue116ExecResult, 1)
+	go func() {
+		code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
+		result <- issue116ExecResult{code: code, out: out, err: err}
+	}()
+	waitForIssue116ExecStart(t, f.started)
+	got := waitForIssue116ExecResult(t, result)
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
+	}
+	if got.out == nil {
+		t.Fatal("Exec returned nil output on timeout")
+	}
+	data, _ := io.ReadAll(got.out)
+	if !strings.Contains(string(data), "partial stdout") || !strings.Contains(string(data), "partial stderr") {
+		t.Fatalf("output = %q, want partial output", data)
+	}
+}
+
+func TestExecInfrastructureErrorPreservesOutput(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "diagnostic stdout",
+		execErr:    errors.New("backend unavailable"),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"true"})
+	if err == nil {
+		t.Fatal("want infrastructure error")
+	}
+	if code != 0 || out == nil {
+		t.Fatalf("code/output = %d/%v, want code 0 and output", code, out)
+	}
+	data, _ := io.ReadAll(out)
+	if !strings.Contains(string(data), "diagnostic stdout") || !strings.Contains(string(data), "stderr-part") {
+		t.Fatalf("output = %q, want diagnostic output", data)
+	}
+}
+
+type issue116InfraRunner struct {
+	*fakeRunner
+}
+
+func (r *issue116InfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		return []byte("partial stdout"), []byte("partial stderr"), &cli.CLIError{
+			Args:     args,
+			ExitCode: 125,
+			Stderr:   "daemon unavailable",
+		}
+	}
+	if len(args) > 0 && args[0] == "inspect" {
+		return nil, nil, errors.New("inspect failed")
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
+	f := &issue116InfraRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"true"})
+	if err == nil {
+		t.Fatal("want classified infrastructure error")
+	}
+	if code != 125 || out == nil {
+		t.Fatalf("code/output = %d/%v, want code 125 and output", code, out)
+	}
+	data, _ := io.ReadAll(out)
+	if !strings.Contains(string(data), "partial stdout") || !strings.Contains(string(data), "partial stderr") {
+		t.Fatalf("output = %q, want partial output", data)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 125 {
+		t.Fatalf("error = %v, want classified CLI error with exit code 125", err)
+	}
+}
+
+func TestExecZeroTimeoutDisablesDefaultDeadline(t *testing.T) {
+	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	if _, _, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(0)); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if f.has {
+		t.Fatal("WithExecTimeout(0) unexpectedly added a deadline")
 	}
 }

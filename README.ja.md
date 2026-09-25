@@ -127,6 +127,26 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
+## Exec のタイムアウトと長時間実行
+
+`Container.Exec` は有限時間・バッファリングされる操作です。caller の
+context に deadline がない場合、Exec は 30 秒の既定 deadline を適用し、
+ハングした backend が test を無期限にブロックしないようにします。
+`WithExecTimeout(d)` でこの bound を変更でき、caller の deadline は
+常に優先されます。`WithExecTimeout(0)` を明示すると library の既定
+deadline を無効にできます。これは意図的な長時間実行コマンドの場合だけ
+使用し、cancellable な context(可能なら deadline 付き)を併用して
+ください。長寿命のプロセスは通常、コンテナの本体的コマンド
+(`WithCmd`)として起動し、出力には `FollowLogs` を使ってください。
+長-open な `Exec` 呼び出しは避けてください。
+
+Exec は既存の `(exitCode, output, error)` 契約を維持します。command
+の非ゼロ終了は結果であり、backend・timeout・cancellation のエラーは
+分類済み error として返されます。backend が終了コードを返している
+場合は、その error と併せて `exitCode` にも保持されます。いずれのエラー
+でも、失敗前に生成された partial stdout/stderr を保持しているため
+`output` を読んでください。
+
 ## クリーンアップの契約
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。

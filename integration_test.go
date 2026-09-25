@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -109,6 +110,36 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	}
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
+	}
+}
+
+func TestIntegrationExecPreservesPartialOutputOnTimeout(t *testing.T) {
+	requireSystem(t)
+
+	ctr, err := container.Run(context.Background(), integrationAlpine,
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	code, out, err := ctr.Exec(context.Background(), []string{"sh", "-c", "printf partial-output; sleep 30"}, container.WithExecTimeout(time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Exec error = %v, want context.DeadlineExceeded", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 on infrastructure timeout", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output on timeout")
+	}
+	data, readErr := io.ReadAll(out)
+	if readErr != nil {
+		t.Fatalf("read output: %v", readErr)
+	}
+	if !strings.Contains(string(data), "partial-output") {
+		t.Fatalf("output = %q, want partial command output", data)
 	}
 }
 

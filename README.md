@@ -139,6 +139,25 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 
+## Exec timeout and long-running commands
+
+`Container.Exec` is a finite, buffered operation. When the caller's
+context has no deadline, Exec applies a 30-second default so a hung
+backend cannot block a test indefinitely. `WithExecTimeout(d)` changes
+that bound; a caller deadline always remains authoritative. Passing
+`WithExecTimeout(0)` explicitly opts out of the library deadline. Use
+that only for a deliberately long-running command and pair it with a
+cancellable context (prefer a deadline). Long-lived processes should
+normally be the container's main command (`WithCmd`) with `FollowLogs`
+for output rather than a long-lived `Exec` call.
+
+Exec keeps the existing `(exitCode, output, error)` contract: a
+command's non-zero exit is a result, while a backend, timeout, or
+cancellation error is returned with the classified error. A backend
+exit status, when available, is retained in `exitCode` even alongside
+that error. In either error case, read `output` to retain partial stdout
+and stderr produced before the failure.
+
 ## Image pulls
 
 `Run` checks the image before starting and fetches it when missing

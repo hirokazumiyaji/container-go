@@ -134,6 +134,18 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
+`Exec` は有限時間・バッファリングされる操作で、終了コードと stdout+stderr
+を返す(非ゼロ終了は結果であり error ではない)。caller の context に
+deadline がない場合は 30 秒の既定 deadline を適用する。
+`WithExecTimeout(d)` で既定値を上書きでき、`WithExecTimeout(0)` を
+明示すると library の deadline を無効化できる。caller の deadline は
+常に優先されるため、長時間実行する command には cancellable な context
+も渡す。長寿命のプロセスは通常 `WithCmd` で本体的コマンドとして起動し、
+出力は `FollowLogs` で取得する(Long-open な Exec は避ける)。
+backend・timeout・cancellation error の場合も、failure 前に生成された
+partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
+backend の終了コードが利用できる場合は、最初の戻り値にも保持する。
+したがって error が non-nil でも reader を読む。
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
@@ -249,8 +261,12 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
 ForLog が診断用に保持するログは 1MiB を上限とする。
 
-**すべての CLI 呼び出しに期限を付ける**。
-各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
+**有限の CLI 呼び出しに期限を付ける**。
+各呼び出しは `context` を尊重し、既定タイムアウト(照会系と public Exec は 30 秒、pull を伴う run は 10 分)を持つ。
+`Exec` は有限・バッファリング操作であり、`WithExecTimeout(0)` は意図的な
+長時間実行 command のための明示的な escape hatch とする(その場合でも
+cancellable な context を併用する)。長寿命の出力には別の streaming API
+`FollowLogs` を使う。
 コンテキスト取消時は子プロセスへ SIGKILL を送って回収し、ゾンビとハングを残さない。
 
 ## エラー処理

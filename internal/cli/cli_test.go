@@ -129,6 +129,21 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestExecRunnerPreservesOutputOnContextCancellation(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'partial stdout'; printf 'partial stderr' >&2; sleep 30`)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	stdout, stderr, err := r.Run(ctx, "exec", "ctr", "true")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if string(stdout) != "partial stdout" || string(stderr) != "partial stderr" {
+		t.Fatalf("output = %q/%q, want partial output", stdout, stderr)
+	}
+}
+
 func TestCLIErrorIncludesBinaryName(t *testing.T) {
 	err := &CLIError{Binary: "docker", Args: []string{"run", "--detach"}, ExitCode: 125, Stderr: "conflict"}
 	got := err.Error()

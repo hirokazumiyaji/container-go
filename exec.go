@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -15,10 +16,31 @@ import (
 // ExecOption configures Exec.
 type ExecOption func(*execConfig) error
 
+// defaultExecTimeout is a var so tests can shorten the public Exec
+// deadline without waiting for the production default.
+var defaultExecTimeout = 30 * time.Second
+
 type execConfig struct {
-	env     map[string]string
-	user    string
-	workdir string
+	env        map[string]string
+	user       string
+	workdir    string
+	timeout    time.Duration
+	timeoutSet bool
+}
+
+// WithExecTimeout sets the deadline for one Exec invocation when ctx has
+// no earlier deadline. The default is 30 seconds. A zero value disables
+// the library default for deliberately long-running commands; callers
+// should then pass a cancellable context.
+func WithExecTimeout(d time.Duration) ExecOption {
+	return func(c *execConfig) error {
+		if d < 0 {
+			return fmt.Errorf("exec timeout must not be negative, got %v", d)
+		}
+		c.timeout = d
+		c.timeoutSet = true
+		return nil
+	}
 }
 
 // WithExecEnv sets environment variables for the exec'd process,
@@ -58,12 +80,16 @@ func WithExecWorkDir(dir string) ExecOption {
 }
 
 // Exec runs a command in the container and returns its exit code and
-// combined output. A non-zero exit code is a result, not an error.
+// combined output. A non-zero exit code is a result, not an error. When
+// the backend or the context fails, the reader still contains whatever
+// stdout and stderr the command produced before the failure; callers
+// should read it even when err is non-nil. If the backend reports an
+// exit status, that status is returned alongside the classified error.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	if len(cmd) == 0 {
 		return 0, nil, errors.New("exec: command must not be empty")
 	}
-	cfg := &execConfig{env: map[string]string{}}
+	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
 			return 0, nil, err
@@ -80,13 +106,24 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	// Exec is a buffered, bounded operation by default. An explicit zero
+	// timeout opts out of the library deadline; a caller deadline always
+	// remains authoritative.
+	execCtx, cancel := ctx, context.CancelFunc(func() {})
+	if !cfg.timeoutSet || cfg.timeout > 0 {
+		execCtx, cancel = withDefaultTimeout(ctx, cfg.timeout)
+	}
+	defer cancel()
+
+	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		// A launch, context, or transport failure has no command exit
+		// code, but the CLI may still have emitted useful diagnostics.
+		return 0, output, wrapNotFound(c.classify(execCtx, err))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -96,10 +133,12 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
 		return cliErr.ExitCode, output, nil
 	}
-	if c.execContainerRunning(ctx) {
+	if c.execContainerRunning(execCtx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	// Preserve both the CLI exit code and the classified infrastructure
+	// error. The output reader is intentionally non-nil on this path.
+	return cliErr.ExitCode, output, wrapNotFound(c.classify(execCtx, err))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

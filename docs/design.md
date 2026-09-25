@@ -179,8 +179,20 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Exec` returns the exit code with combined stdout+stderr (a non-zero
-exit is a result, not an error); this is kept for v1 compatibility.
+`Exec` is a finite, buffered operation. It returns the exit code with
+combined stdout+stderr (a non-zero exit is a result, not an error);
+this is kept for v1 compatibility. When the caller's context has no
+deadline, Exec applies a 30-second default. `WithExecTimeout(d)`
+overrides that default, while `WithExecTimeout(0)` explicitly disables
+the library deadline for a deliberately long-running command. A
+caller deadline remains authoritative in either case, so a long-running
+command should also receive a cancellable context. Start persistent
+processes as the container's main command (`WithCmd`) and use
+`FollowLogs` for their output rather than holding an Exec call open.
+On backend, timeout, or cancellation errors, Exec retains partial
+stdout+stderr in its reader and returns the classified error; a backend
+exit status, when available, remains in the first return value. Callers
+must read the reader even when the error is non-nil.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -384,8 +396,12 @@ bounded only by host resources.
 child as an `io.ReadCloser` whose `Close` (or context cancellation)
 reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
 
-**Deadline every CLI call**. Every call honors `context` and carries a
-default timeout (30s for queries, 10min for pull-bearing runs). On
+**Deadline every finite CLI call**. Every call honors `context` and
+carries a default timeout (30s for queries and public Exec, 10min for
+pull-bearing runs). `Exec` is finite and buffered by design;
+`WithExecTimeout(0)` is the explicit escape hatch for an intentional
+long-running command, which should still use a cancellable context.
+`FollowLogs` is the separate streaming API for long-lived output. On
 cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 
 ## Error handling

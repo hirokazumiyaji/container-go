@@ -10,8 +10,9 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// keepContainers reports whether CONTAINERGO_KEEP=1 disables all
-// automatic cleanup (for debugging).
+// keepContainers reports whether CONTAINERGO_KEEP=1 skips the
+// automatic cleanup helpers and watchdog registration. Explicit
+// Container.Terminate and Run rollback are not changed.
 func keepContainers() bool {
 	return os.Getenv("CONTAINERGO_KEEP") == "1"
 }

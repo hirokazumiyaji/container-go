@@ -20,8 +20,11 @@ func TestRedis(t *testing.T) {
         t.Fatal(err)
     }
 
-    endpoint, _ := ctr.Endpoint(ctx, "6379/tcp") // e.g. "192.168.64.3:6379"
-    // ... connect your client to endpoint
+    endpoint, err := ctr.Endpoint(ctx, "6379/tcp") // e.g. "192.168.64.3:6379"
+    if err != nil {
+        t.Fatal(err)
+    }
+    _ = endpoint // connect your client to endpoint
 }
 ```
 
@@ -129,27 +132,51 @@ probed client-side by the `wait` package:
 wait.ForLog("Ready to accept connections")   // substring; .AsRegexp(), .WithOccurrence(n)
 wait.ForListeningPort("6379/tcp")            // TCP dial succeeds
 wait.ForExposedPort()                        // first declared port
-wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
+wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders/.WithHeader, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
-wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
+wait.ForAll(wait.ForExposedPort()), wait.ForAny(wait.ForExposedPort()) // composition; .WithStartupTimeout
 ```
 
-Every strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back with a tail of its
-logs attached to the error.
+The primitive strategies have a 60-second default startup timeout.
+`ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms by
+default; `ForExec` polls every 250ms by default. `ForLog` reads a
+continuous `FollowLogs` stream rather than polling, so its
+`WithPollInterval` setter has no effect. `ForAll` and `ForAny` do not
+expose `WithPollInterval`; their `WithStartupTimeout` setter bounds the
+whole composition, while child strategies keep their own settings.
+Waiting fails fast if the container stops. A failed wait on a newly
+created, non-reused container rolls it back with a tail of its logs
+attached to the error; a reused container is left for the shared
+lifetime described below.
+
+## Logs
+
+`Logs` and `LogsWithOptions` return a finite snapshot. `LogsWithOptions`
+can limit the snapshot with `LogsOptions{Tail, Since}`. `FollowLogs`
+returns a streaming `io.ReadCloser`; close it or cancel its context to
+stop the backend CLI. `ForLog` uses `FollowLogs`, while `Logs` does not
+follow new output.
 
 ## Image pulls
 
-`Run` checks the image before starting and fetches it when missing
-(`PullMissing`, the previous implicit behavior). Concurrent `Run` calls
-in one process share the pull: the first caller fetches, the rest wait
-for it. The Docker backend passes `--pull=never` so pulling happens
-only through this aggregated path.
+When `Run` needs to create a container, it applies an explicit pull
+policy before starting it:
+
+- `PullMissing` (the default) inspects the local image store and runs
+  an explicit pull only when the image is absent.
+- `PullAlways` requests an explicit pull for every `Run` invocation.
+- `PullNever` only inspects; it returns `ErrImageNotFound` before
+  starting when the image is absent.
+
+Concurrent operations in one process share a pull for the same backend,
+image, platform, and operation. A cancelled waiter stops waiting, but
+the shared pull continues for the remaining callers. The Docker backend
+passes `--pull=never` to `docker run`, so the CLI does not pull a second
+time. Apple Container uses the same explicit policy path.
 
 ```go
 container.Run(ctx, "redis:7-alpine",
-    container.WithPullPolicy(container.PullAlways)) // pull on every Run
+    container.WithPullPolicy(container.PullAlways))
 // container.PullNever: fail before starting when the image is absent
 // (errors.Is(err, container.ErrImageNotFound))
 
@@ -163,26 +190,31 @@ Three layers make sure containers do not outlive your tests:
 1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
-2. If `Run` fails partway, it removes whatever it created before
-   returning.
-3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
-   registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+2. On the non-reuse path, if `Run` fails partway, it attempts to remove
+   whatever it created before returning and reports a deletion failure
+   if one occurs.
+3. When a real CLI container is registered, a best-effort watchdog
+   reaper is started lazily as an external `/bin/sh` child. When the
+   parent process closes its pipe (including after a panic or SIGKILL),
+   the reaper attempts to force-delete every registered container. It
+   is not available on Windows, and a failure to start or complete a
+   delete is not hidden as a successful cleanup.
 
-Extras:
+`CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`, and reaper
+registration so containers can be inspected during debugging. An
+explicit `ctr.Terminate`, and rollback after a failed `Run`, can still
+remove a container.
 
-- `CONTAINERGO_KEEP=1` keeps containers around for debugging.
-- `container.Prune(ctx)` removes stopped containers this library
-  created in any previous session (they carry the
-  `com.github.hirokazumiyaji.container-go` label).
+`container.Prune(ctx)` removes stopped containers this library created
+in any previous session (they carry the
+`com.github.hirokazumiyaji.container-go` label). It does not remove
+running containers.
 
 ## Reuse (shared containers across tests/processes)
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`.
 Concurrent callers in the same process, and parallel `go test` packages
-in other processes, share one container:
+in other processes on the same host, share one container:
 
 ```go
 ctr, err := container.Run(ctx, "redis:7-alpine",
@@ -198,7 +230,9 @@ container.Cleanup(t, ctr) // no-op for reused handles
 Contract:
 
 - `WithName` is required; readiness strategies always re-run.
-- Name conflicts from a racing create are treated as success and attach.
+- An existing container must have been created with `WithReuse` and have
+  a compatible image. Name conflicts from a racing create are treated as
+  success and attach.
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
@@ -207,17 +241,21 @@ Contract:
   matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
-  watchdog reaper guards deletion the same way.
+  watchdog reaper guards deletion the same way. The name-based guard is
+  limited to processes using this library on the same host; an external
+  CLI delete/recreate is outside that guarantee.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
-  container tagged with that group (CI teardown). Ordinary `Prune` still
-  only deletes stopped managed containers.
+  container tagged with that group (CI teardown). The group is a label,
+  not part of the reuse key. Ordinary `Prune` still only deletes
+  stopped managed containers.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup
 step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
+
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
@@ -226,7 +264,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use
-  `container registry login`, which stores them in the macOS Keychain.
+  `container registry login` for Apple Container or `docker login` for
+  Docker. The backend CLI owns the resulting credentials and registry
+  context.
 
 ## Differences from testcontainers-go
 
@@ -238,7 +278,7 @@ Not supported (Apple Container has no equivalent, or out of scope):
 | Building from a Dockerfile | Out of scope (use `container build` / `docker build` yourself) |
 | Ryuk reaper container | Replaced by the local watchdog reaper process |
 | Random host port mapping | Apple backend connects to the container IP directly; Docker backend auto-publishes to random loopback ports |
-| Network/volume management APIs | Out of scope for now |
+| Network/volume creation and lifecycle management | Out of scope for now; `WithNetwork` attaches an existing network and `WithMounts` accepts mounts |
 | `GenericContainerRequest.Reuse` | `WithReuse` + `WithName`: cross-process get-or-create with mandatory re-wait and no Cleanup/reaper ownership |
 
 ## Development
@@ -255,8 +295,18 @@ Integration tests pull library images via `public.ecr.aws/docker/library/...`
 to avoid anonymous Docker Hub rate limits. Set `CONTAINERGO_BACKEND=apple` or
 `docker` to skip the other backend.
 
+GitHub Actions runs unit tests and race tests on `ubuntu-latest` with Go
+1.23.0 and the stable Go release, then runs lint and `govulncheck`. It
+also runs the Docker integration matrix on `ubuntu-latest`; Apple
+Container integration remains a local test because the hosted runners do
+not provide that service. The non-integration
+`examples/compile_test.go` keeps the documented API calls type-checked;
+the tagged examples under `examples/` exercise a real backend.
+
 Design document: [docs/design.md](docs/design.md) (日本語版:
-[docs/design.ja.md](docs/design.ja.md))
+[docs/design.ja.md](docs/design.ja.md)). The implementation phases in
+that document are historical; the current API and behavior are
+maintained in the source and tests.
 
 Contributing: [CONTRIBUTING.md](CONTRIBUTING.md). Security reports:
 [SECURITY.md](SECURITY.md).

@@ -12,8 +12,9 @@ import (
 // an internal package.
 type CLIError = cli.CLIError
 
-// ErrSystemNotRunning reports that the Apple Container system service is
-// not running. Start it with `container system start`.
+// ErrSystemNotRunning reports that the selected backend is not
+// reachable. For Apple Container, start the system service with
+// `container system start`; for Docker, start the Docker daemon.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was not declared via

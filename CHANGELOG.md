@@ -16,12 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Synchronize the English and Japanese README/design documents with the
+  current pull policies, `Logs`/`FollowLogs` split, operation-specific
+  timeouts, reaper limits, backend selection, and CI matrix. Remove
+  nonexistent logger API references and mark the implementation phases
+  as historical.
+- Add a non-backend compile check for the documented API examples.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
-- Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`
-  in `flight.go`.
-- Deduplicate reuse/cleanup helpers (`inspectNamed`/`deleteNamed`, prune
-  loops, Docker line splitting), hoist `memoryRE`, and document `Host` vs
+- Consolidate image and reuse single-flight state in the generic
+  `flightGroup[T]` helper in `flight.go`.
+- Deduplicate reuse/cleanup helpers (including `inspectNamed`, prune loops,
+  and Docker line splitting), hoist `memoryRE`, and document `Host` vs
   `Endpoint` when publish host-IPs differ.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.

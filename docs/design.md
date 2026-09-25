@@ -3,15 +3,22 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
+Last synchronized: 2026-09-25
+Targets: Apple Container v1.2.x–1.3.x (macOS 26+, Apple Silicon), Docker 29.x (Linux, Windows, macOS), Go 1.23+
+
+This document describes the current implementation in this checkout.
+The **Implementation phases** section is retained as a historical plan;
+it is not a promise that every phase is still a current API or roadmap.
+The public API and behavior described in the current sections come from
+the implementation and its tests.
 
 ## Purpose
 
 **container-go** is a testcontainers-style Go library backed by Apple
 Container ([apple/container](https://github.com/apple/container)).
 It starts throwaway containers from Go tests, hands out connection
-endpoints, and guarantees the containers are destroyed when the tests
-end.
+endpoints, and provides normal and best-effort orphan cleanup for the
+containers it creates.
 
 [shiguredo/container-rs](https://github.com/shiguredo/container-rs) is
 prior art for Rust. This library covers the same problem space in Go,
@@ -43,7 +50,7 @@ The design decisions below rest on these properties of Apple Container
   fail while the service is down; `container system status` reports
   its state.
 - The container name is the container ID. Names must match
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters.
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters).
 - Several Docker features do not exist: healthchecks, a `wait`
   command, an event stream, label filters on `ls`, and re-attaching to
   a running container. Their behavior must be reproduced client-side.
@@ -85,8 +92,10 @@ imperceptible.
 
 The CLI wrapper's weaknesses are output-format drift across CLI
 versions and features the CLI does not expose (label filters, for
-example). The first is contained by only ever parsing `--format json`
-output, never text tables. The second is worked around with
+example). The implementation uses JSON for inspect and Apple list data, and
+parses the documented machine-oriented Docker name and run-ID output
+where the backend provides it. It never parses human-readable tables.
+Features that the CLI does not expose are worked around with
 client-side filtering.
 
 ## Public API
@@ -114,7 +123,10 @@ func TestRedis(t *testing.T) {
     }
 
     endpoint, err := ctr.Endpoint(ctx, "6379/tcp") // e.g. "192.168.64.3:6379"
-    ...
+    if err != nil {
+        t.Fatal(err)
+    }
+    _ = endpoint
 }
 ```
 
@@ -124,45 +136,65 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-`Run` fetches the image (the CLI auto-pulls when missing), creates and
-starts the container, and completes the wait strategy; on failure it
-rolls back whatever it created before returning the error.
+When `Run` needs to create a container, it applies the pull policy
+before starting it and then completes the wait strategy. The default
+`PullMissing` policy inspects the local image store and issues an
+explicit pull only when the image is absent. `PullAlways` issues an
+explicit pull request for every invocation, and `PullNever` only
+inspects and returns
+`ErrImageNotFound` when the image is absent. Docker's run command also
+passes `--pull=never`, so a pull is not duplicated by the CLI. If a
+post-start operation or wait fails on the non-reuse path, `Run` rolls
+back the container it created before returning the error. Reuse has
+the separate shared-lifetime contract described below.
 
-Options use the functional options pattern. The initial release
-provides:
+Options use the functional options pattern. The current options are:
 
 - `WithExposedPorts(ports ...string)`: declare the container ports
-  (`"6379/tcp"` form) endpoints may resolve
-- `WithEnv(env map[string]string)`: environment variables
+  (`"6379/tcp"` form) that `MappedPort` and `Endpoint` may resolve.
+  Docker automatically publishes these ports; Apple Container resolves
+  them through the container IP by default.
+- `WithEnv(env map[string]string)`: environment variables, passed
+  through a temporary file rather than command-line values.
 - `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`:
   command and entrypoint overrides. Entrypoint is a single token per
   `docker run --entrypoint` semantics; pass multi-token commands via
   `WithCmd`.
-- `WithWaitStrategy(s wait.Strategy)`: readiness detection
+- `WithWaitStrategy(s wait.Strategy)`: readiness detection.
 - `WithName(name string)`: container name (default
-  `containergo-<random hex>`)
-- `WithLabels(labels map[string]string)`: extra labels
-- `WithMounts(mounts ...Mount)`: bind, volume, and tmpfs mounts
-- `WithFiles(files ...File)`: files copied into the container after
-  start
-- `WithPublishedPort(spec string)`: host-side port publishing (off by
-  default; see below)
-- `WithCPUs(n int)` / `WithMemory(size string)`: resource limits
+  `containergo-<random hex>`).
+- `WithLabels(labels map[string]string)`: extra labels. The library's
+  managed labels are reserved.
+- `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
+- `WithFiles(files ...File)`: files copied into the running container
+  after start; a copy failure rolls back `Run`.
+- `WithPublishedPort(spec string)`: explicit host-side port publishing.
+  It is optional because Apple Container uses a direct IP and Docker
+  auto-publishes exposed ports.
+- `WithPullPolicy(policy PullPolicy)`: choose `PullMissing` (default),
+  `PullAlways`, or `PullNever`.
+- `WithReuse()`: make a named `Run` a get-or-create operation.
+- `WithReuseGroup(group string)`: label a reused container for
+  `PruneReuseGroup`; it requires `WithReuse` and is not part of the
+  reuse key.
+- `WithCPUs(n int)` / `WithMemory(size string)`: resource limits.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
-  and working directory
-- `WithNetwork(name string)`: target network
-- `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
+  and working directory.
+- `WithNetwork(name string)`: attach to an existing named network.
+- `WithPlatform(p string)`: select an image platform such as
+  `linux/amd64` (including Rosetta use on Apple Container).
 
-Options like `WithHostname` or `WithPrivileged` are intentionally omitted
-because Apple Container CLI provides no corresponding flags; the option
-surface is restricted to backend-neutral capabilities supported across both
-backends. For log consumers, `FollowLogs` streams container logs directly
-to any destination without an extra option.
+Options outside the backend-neutral CLI surface are intentionally
+omitted. There is no public logger-injection option. For log consumers,
+`FollowLogs` returns a stream and `Logs`/`LogsWithOptions` return
+snapshots.
 
 ### The Container handle
 
 ```go
-type Container struct { ... }
+type Container struct {
+    // unexported fields omitted
+}
 
 func (c *Container) ID() string
 func (c *Container) Host(ctx context.Context) (string, error)
@@ -173,22 +205,30 @@ func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Exec` returns the exit code with combined stdout+stderr (a non-zero
-exit is a result, not an error); this is kept for v1 compatibility.
-`LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
-containers. `Terminate` is generation-guarded: it refuses to delete a
-name recycled by another process (see Reuse below).
+`Exec` returns the exit code and combined stdout+stderr. A command
+that runs in a running container and exits non-zero is a result rather
+than an infrastructure error; a stopped or unreachable container can
+still return an error. `WithExecEnv`, `WithExecUser`, and
+`WithExecWorkDir` configure an individual exec invocation; environment
+values use the same temporary-file mechanism as `WithEnv`. `Logs` and
+`LogsWithOptions` return finite snapshots, and `FollowLogs` streams
+until its reader is closed or its context is cancelled. `LogsOptions` currently exposes `Tail` and
+`Since` for bounding snapshots. `Terminate` is generation-guarded: it
+refuses to delete a name recycled by another process (see Reuse
+below).
 
-`Terminate` maps to `container delete --force` and is idempotent
-(deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
-`TerminateContainer(ctr)` are nil-safe helpers preserving the
-testcontainers-go idiom of deferring cleanup before the error check.
+`Terminate` maps to `container delete --force` on Apple Container and
+`docker rm --force` on Docker, and is idempotent when the container is
+already absent. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are
+nil-safe helpers preserving the testcontainers-go idiom of registering
+cleanup before checking `Run`'s error.
 
 ## Connection endpoints
 
@@ -214,9 +254,10 @@ unreachable in a given setup), publish explicitly with
 `WithPublishedPort("127.0.0.1:15432:5432")`. Then `Host` returns the
 given host address and `MappedPort` the host port.
 
-`MappedPort` errors with `ErrPortNotExposed` for ports not declared
-via `WithExposedPorts`. The declarations also feed wait strategies
-(the default port of ForListeningPort, for example).
+`MappedPort` and `Endpoint` return `ErrPortNotExposed` for ports that
+are neither declared via `WithExposedPorts` nor explicitly published.
+The declarations also feed wait strategies (the default port of
+`ForListeningPort`, for example).
 
 ## Wait strategies
 
@@ -224,28 +265,35 @@ Apple Container has neither healthchecks nor a wait command, so
 readiness is decided entirely client-side. The `wait` subpackage
 provides:
 
-- `wait.ForLog(s string)`: wait until a substring (or regexp via
-  `AsRegexp`) appears in `container logs --follow` output;
-  `WithOccurrence(n)` for repeat counts
-- `wait.ForListeningPort(port string)`: wait until `net.DialTimeout`
-  to the container IP succeeds
-- `wait.ForHTTP(path string)`: wait until an HTTP request via
-  `net/http` matches the status predicate (2xx by default,
-  `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select
-  the target; `WithHeaders` / `WithBasicAuth` / `WithTLS` /
-  `WithTLSConfig` / `WithHTTPClient` cover auth, TLS, and custom
-  transports without breaking the default plain-HTTP probe.
-- `wait.ForExec(cmd []string)`: wait until `container exec` exits with
-  an accepted code (0 by default)
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition. Each child keeps its own `WithStartupTimeout`; the whole
-  composition can also be bounded with `WithStartupTimeout` (or
-  `context.WithTimeout` from the caller).
+- `wait.ForLog(pattern)`: read the `FollowLogs` stream until a
+  substring (or a regular expression via `AsRegexp`) appears. Matching
+  is per line; `WithOccurrence(n)` changes the required count. This
+  strategy is stream-based rather than poll-based.
+- `wait.ForListeningPort(port)`: poll a TCP connection to the resolved
+  endpoint until it succeeds.
+- `wait.ForExposedPort()`: use the first port declared by
+  `WithExposedPorts`.
+- `wait.ForHTTP(path)`: send an HTTP request to the resolved endpoint
+  until its status matches (2xx by default; change it with
+  `WithStatusCodeMatcher`). `WithPort` and `WithMethod` select the
+  target; `WithHeaders`, `WithHeader`, `WithBasicAuth`, `WithTLS`,
+  `WithTLSConfig`, and `WithHTTPClient` configure authentication, TLS,
+  or the HTTP client.
+- `wait.ForExec(cmd)`: run a command through the backend CLI until it
+  exits with an accepted code (0 by default).
+- `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`:
+  composition. Child strategies keep their own settings. The composite
+  types expose `WithStartupTimeout` to bound the whole composition;
+  they do not expose `WithPollInterval`.
 
-Every strategy carries `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). If the container transitions to
-stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+The primitive strategies default to a 60-second startup timeout.
+`ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms;
+`ForExec` polls every 250ms. The current `ForLog` type also exposes
+`WithPollInterval`, but it has no effect because it consumes a stream.
+If a container stops while a connection or HTTP strategy is waiting,
+the wait fails without burning the full timeout. A failed non-reuse
+`Run` wait rolls the container back and attaches a log tail capped at
+1MiB to the error; a reuse wait leaves the shared container in place.
 
 The strategy interface:
 
@@ -262,35 +310,48 @@ reader, exec, state query) implemented by adapting
 
 ## Cleanup
 
-Every way a test process can exit has a path that still deletes its
-containers.
+The library has normal and best-effort abnormal-exit paths.
 
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
-`t.Cleanup`. Mid-`Run` failures are rolled back by `Run` itself.
+`t.Cleanup`. `TerminateContainer(ctr)` is the nil-safe deferred-style
+helper. On the non-reuse path, if `Run` fails after creating a
+container, its rollback tries to remove that container and reports a
+deletion failure instead of hiding it. Reused containers follow the
+shared-lifetime contract below.
 
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
-`t.Cleanup` run, so an external **watchdog reaper** takes over. At
-library initialization one `/bin/sh` child is spawned; container IDs
-are registered by writing them down a pipe. However the parent dies,
-the pipe reaches EOF, and the reaper runs `container delete --force`
-for every registered ID and exits. While the parent lives the reaper
-does nothing (deletion belongs to the normal path; the reaper is
-insurance). This mirrors container-rs's watchdog and covers SIGKILL,
-which no signal handler can.
+`t.Cleanup` run. When the first real CLI container is registered, the
+library lazily starts one external `/bin/sh` watchdog reaper and writes
+registered IDs to its pipe. When the parent closes the pipe, the
+reaper attempts a force-delete for each registered ID and exits. The
+reaper is insurance, not a transactional guarantee: spawn and delete
+failures are best-effort, and it is unavailable on Windows. It does
+nothing while the parent is alive, and its per-entry backend calls
+are bounded by a POSIX `sleep`/`kill` timeout.
+
+For Docker, the reaper is given the immutable container ID when one is
+available; registration is best-effort and a failed registration does
+not fail `Run`. Apple Container has no separate immutable ID, so the
+reaper stores the creation generation and checks the creation label
+before deleting by name. The name-based guarantee is limited to
+cooperating processes using this library on the same host; an external
+CLI delete/recreate cannot be distinguished by name.
 
 **Session labels**: every created container carries
 
 - `com.github.hirokazumiyaji.container-go`: `true` (managed-by marker)
 - `com.github.hirokazumiyaji.container-go.session`: a per-process
   random ID
+- a creation generation label, and, for reuse, the reuse/group labels
 
-The CLI has no label filter, so orphan sweeps filter
-`container ls -a --format json` client-side. A helper `Prune(ctx)`
-removes stopped containers carrying the managed label from any
-session.
+The Apple CLI has no label filter, so orphan sweeps filter
+`container ls -a --format json` client-side. `Prune(ctx)` removes
+stopped containers carrying the managed label from any session. Docker
+can apply the same filter daemon-side.
 
-Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
-reaper (for debugging).
+Setting `CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`,
+and reaper registration. It does not change an explicit
+`Container.Terminate` or the rollback path in `Run`.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -298,11 +359,13 @@ volumes must be named, and their lifecycle belongs to the caller.
 ## Reuse
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
-(shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. `env`,
-`cmd`, and `mounts` differences attach silently to the existing
-container by design; callers needing isolation should use distinct
-names or reset state via `Exec`.
+(shared across processes on the same host). An existing container
+must have been created with `WithReuse`, and every caller reruns its
+readiness strategy. The compatibility check is intentionally narrow:
+image reference and declared/published ports only. `env`, `cmd`, and
+`mounts` differences attach silently to the existing container by
+design; callers needing isolation should use distinct names or reset
+state via `Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
@@ -338,10 +401,10 @@ As a library that spawns subprocesses, these rules hold.
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
-writing it to the pipe. The two layers together leave no command
-injection through IDs.
+expansions), and the library validates Apple-style names against
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before writing them to the pipe.
+Reaper registration failures are ignored. The two layers together
+leave no command injection through registered IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -351,58 +414,81 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
-environment keys (no `=`, no NUL), and copy paths (absolute, valid
-UTF-8) are all validated before reaching the CLI. The CLI validates
+environment keys (no `=`, no NUL), and container-side copy paths
+(absolute, valid UTF-8) are all validated before reaching the CLI.
+Host-side copy paths are resolved to absolute paths. The CLI validates
 too, but validating first gives clearer errors and independence from
 future CLI changes.
 
-**Handle no credentials**. Registry auth is delegated to
-`container registry login` (credentials live in the macOS Keychain);
-the library has no credential input path.
+**Handle no credentials**. Registry authentication is delegated to
+the backend CLI: use `container registry login` for Apple Container or
+`docker login` for Docker. The library has no credential input path.
 
-**No secrets in logs**. Debug logging of CLI argv never includes
-env-file contents.
+**No logger injection API**. The public API does not expose a logger
+hook. `CLIError` exposes the failed command arguments and bounded stderr
+for diagnostics, while environment values remain in the temporary env
+file rather than appearing in argv. The watchdog can emit one
+standard-log message if it cannot be started after repeated attempts.
 
 ## Performance design
 
-**Minimize subprocess count**. Create+start is one
-`container run --detach` call. Immutable facts (config, labels,
-published ports) are cached from the first inspect; only the state is
-re-queried.
+**Minimize subprocess count**. Create+start is one backend
+`run --detach` call. Immutable facts (configuration, labels, image,
+network address, and published ports) are cached from the first
+inspect; state is re-queried when requested.
 
-**Wait via connections, not subprocesses**. ForListeningPort and
-ForHTTP dial the container IP directly without spawning the CLI. Only
-ForExec and state queries poll through subprocesses, cheap enough at
-the 100ms interval.
+**Wait via connections where possible**. `ForListeningPort` and
+`ForHTTP` use the resolved endpoint directly. `ForExec` and state
+queries invoke the backend CLI; `ForLog` uses the streaming logs API.
+The default polling intervals are 100ms for connection probes and
+250ms for exec probes.
 
 **Never serialize parallel startups**. The library holds no global
-lock (reaper ID registration takes a mutex for a one-line write).
-Because the default design consumes no host ports, parallelism is
-bounded only by host resources.
+lock for container creation (reaper ID registration takes a mutex for
+a one-line write). Apple Container consumes no host ports by default;
+Docker's daemon assigns published ports atomically.
 
-**Keep streams finite**. `Logs` returns the `container logs --follow`
-child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+**Keep streams bounded**. `Logs` and `LogsWithOptions` buffer a finite
+snapshot. `FollowLogs` is intentionally a stream; closing its
+`io.ReadCloser` or cancelling its context terminates the CLI process.
+The wait-failure diagnostic tail is capped at 1MiB.
 
-**Deadline every CLI call**. Every call honors `context` and carries a
-default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
+**Apply operation-specific deadlines**. Most query-like operations
+(inspect, copy, snapshot logs, delete, and prune) use a 30-second
+default when the caller has no deadline. `Run` and explicit image
+fetches use a 10-minute pull/create budget. A shared pull leader is
+intentionally detached from an individual caller's cancellation so one
+caller cannot abort the pull for other waiters; each waiter still stops
+waiting when its own context is cancelled. `Exec`'s command invocation
+and `FollowLogs` pass the caller's context through without adding a
+library deadline; an `Exec` infrastructure check may use a bounded
+follow-up context. When a library default is applied to an operation
+that is not a shared pull leader, an existing caller deadline is
+preserved.
 
 ## Error handling
 
 Errors are discriminable with `errors.Is`/`errors.As`.
 
-- `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
-- `ErrContainerNotFound`: not-found from inspect and friends
-- `ErrPortNotExposed`: querying a port not declared via
-  `WithExposedPorts`
-- `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+- `ErrSystemNotRunning`: a CLI failure was followed by a failed backend
+  liveness probe. Apple Container's hint is `container system start`;
+  Docker's hint is to start the Docker daemon.
+- `ErrContainerNotFound`: a container operation could not find the
+  container.
+- `ErrImageNotFound`: `Run` with `PullNever` found no local image.
+- `ErrPortNotExposed`: a port was neither declared nor published, or
+  the declared port had no usable host binding.
+- `ErrGenerationReplaced`: a generation-guarded delete refused to
+  remove a same-name replacement.
+- `*CLIError`: a backend CLI exited non-zero. It carries the binary,
+  arguments, exit code, and stderr (the diagnostic stderr copy is
+  capped at 64KiB).
 
-When `Run` fails on a wait timeout, the returned error includes the
-container's log tail, and the rollback delete follows.
+When a non-reuse `Run` fails on a wait timeout, the returned error
+includes a bounded container-log tail, and rollback deletion follows.
+A rollback deletion failure is included in the returned error rather
+than hidden. Reuse reports the wait failure while leaving the shared
+container in place.
 
 The library never runs `container system start` itself: the command
 can prompt interactively for a kernel install, which a test library
@@ -410,22 +496,38 @@ must not trigger implicitly.
 
 ## Package layout
 
+The following is the core layout, not an exhaustive file listing. The
+root package contains the public API and backend-neutral lifecycle
+code. Backend implementations own argv assembly and inspect
+normalization.
+
 ```
 container-go/
-├── container.go      // Run, Container, Option
-├── options.go        // functional options
+├── container.go      // Run, Container, endpoint and state methods
+├── options.go        // public functional options and validation
+├── wait_adapter.go   // adaptation from Container to wait.Target
+├── pull.go           // pull policies and in-process pull aggregation
+├── reuse.go          // WithReuse and PruneReuseGroup
 ├── cleanup.go        // Cleanup, TerminateContainer, Prune
 ├── reaper.go         // watchdog reaper
-├── exec.go           // Exec
-├── logs.go           // Logs
-├── copy.go           // CopyToContainer, CopyFileFromContainer
-├── errors.go         // error types
-├── internal/cli/     // CLI runner (argv assembly, execution, timeouts)
+├── exec.go           // Exec and ExecOption
+├── logs.go           // Logs, LogsWithOptions, FollowLogs
+├── copy.go           // WithFiles and copy methods
+├── errors.go         // public error values
+├── backend.go        // backend selection
+├── engine.go         // backend interface and normalized info
+├── engine_apple.go   // Apple Container argv/inspect adapter
+├── engine_docker.go  // Docker argv/inspect adapter
+├── namelock.go       // cooperating-process name lock
+├── flight.go         // in-process single-flight helper
+├── internal/cli/     // CLI runner, streaming, and error classification
 ├── internal/inspect/ // inspect JSON models and decoding
-└── wait/             // wait strategies
+└── wait/             // public readiness strategies
 ```
 
-The `internal/cli` runner is an interface; tests inject a fake.
+The `internal/cli` runner is an interface; tests inject a fake. It is
+an internal package, so external users should depend on the public
+root and `wait` packages rather than importing it.
 
 ```go
 type Runner interface {
@@ -435,21 +537,29 @@ type Runner interface {
 
 ## Testing strategy
 
-**Unit tests**: inject a fake `Runner` returning canned JSON and
-verify argv assembly, JSON decoding, error classification, and wait
-strategy logic without real hardware. Dependencies that production
-code assumes non-nil get real fakes in tests, never nil.
+**Unit tests** inject a fake `Runner` returning canned JSON and verify
+argv assembly, JSON decoding, error classification, and wait strategy
+logic without a real backend. Dependencies that production code assumes
+non-nil receive real fakes in tests, never nil. The non-integration
+`examples/compile_test.go` type-checks the public calls used in the
+README and this design without starting a backend.
 
-**Integration tests**: split off behind the `integration` build tag
-and run only on real hardware (macOS 26 with Apple Container up). They
-cover startup, connection, exec, copy, cleanup, and the watchdog
-(SIGKILL a child process, watch the reaper act). They check
-`container system status` first and skip when the service is down.
+**Integration tests** use the `integration` build tag. The root suite
+contains Apple Container and Docker lifecycle, connection, exec, copy,
+cleanup, reuse, and watchdog cases. Each backend-specific helper checks
+its CLI/service first and skips cleanly when it is unavailable.
+`make integration` runs both backends and skips the pull-heavy bench
+and single-flight scenarios; `make integration-docker` selects Docker;
+`make bench-integration` runs the pull-heavy scenarios and the separate
+benchmark module.
 
-**CI**: unit tests and `go vet` run in GitHub Actions per push (no
-Apple Container needed). GitHub-hosted runners are unlikely to run the
-integration tests (macOS version and nested-virtualization limits), so
-those stay local as `make integration`.
+**CI**: `.github/workflows/ci.yml` runs unit tests and race tests on
+`ubuntu-latest` with Go 1.23.0 and the stable Go release, plus lint and
+`govulncheck`. It also runs the Docker integration matrix on
+`ubuntu-latest`. Apple Container integration is intentionally local:
+the hosted Linux runners do not provide the Apple Container service or
+the required host environment. `CONTAINERGO_BACKEND=apple` or
+`CONTAINERGO_BACKEND=docker` can select one backend locally.
 
 ## Backends (v0.2)
 
@@ -472,9 +582,16 @@ resolution stay the docker CLI's job.
 **Internal structure**: a backend is an internal interface owning only
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
-normalized record holds four things: state (mapped onto running /
-stopped / stopping / unknown), labels, the container IP, and host-side
-port bindings (container port → host address and port).
+normalized record holds state (mapped onto running / stopped /
+stopping / created / unknown), labels, image reference, immutable
+backend ID when available, container IP, and host-side port bindings
+(container port → host address and port).
+
+**Image handling**: both backends implement the pull policy through
+explicit image inspection and pull commands. The Docker run argv adds
+`--pull=never`; Apple Container uses the same explicit policy path.
+Concurrent pulls are aggregated only within the current process and
+for the same backend, image, platform, and operation.
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults
@@ -497,26 +614,61 @@ The Apple backend's direct-IP default is unchanged.
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for
 Docker). The reaper depends on `/bin/sh` and thus does not run on
-Windows; v0.2 documents that Windows relies on the normal cleanup
-paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
-on Docker (`--filter label=... --filter status=exited`).
+Windows; Windows relies on the normal cleanup paths (`Cleanup`,
+rollback) only. `Prune` can use daemon-side filters on Docker
+(`--filter label=... --filter status=exited`).
 
 **Liveness detection**: the probe command switches per backend
-(`system status` for Apple, `info` for Docker).
+(`system status` for Apple, `version --format {{.Server.Version}}` for
+Docker).
 
 ## Out of scope
 
-- Dockerfile builds via `container build` / `docker build`
-- Network creation and management (only the default network is used)
-- Volume creation and management
+- Dockerfile builds via `container build` / `docker build`.
+- Network creation and management. `WithNetwork` can attach a container
+  to an existing named network, but the library does not create networks.
+- Volume creation and lifecycle management. `WithMounts` can use bind,
+  named-volume, or tmpfs mounts, but their lifecycle belongs to the
+  caller.
 - High-level packages equivalent to testcontainers modules (postgres
-  and the like; revisit once the core is stable)
-- A direct Docker Engine API client (revisit if the CLI wrapper ever
-  falls short)
+  and the like; revisit once the core is stable).
+- A direct Docker Engine API client. The CLI wrapper is the current
+  transport; a direct client remains a future decision, not a hidden
+  fallback.
 
-## Implementation phases
+## Unresolved product decisions
 
-Implementation proceeds in this order, one GitHub Issue per phase.
+These are deliberately recorded rather than implied by the current API:
+
+- **Apple name-based deletion**: the creation-generation check protects
+  cooperating processes using this library on one host, but cannot
+  distinguish an external CLI delete/recreate in the same window.
+  Closing that gap requires an immutable identity or an atomic
+  conditional delete from the backend.
+- **Remote Docker detection**: only `DOCKER_HOST=tcp://...` is used
+  for endpoint selection. A remote Docker context is not detected.
+- **Reuse compatibility**: image and ports are checked, while `env`,
+  `cmd`, and `mounts` differences intentionally attach. Whether a
+  future release should compare more configuration is an open product
+  decision; callers needing isolation should use distinct names.
+- **Logger injection**: no public logger hook exists. Adding one would
+  require a separate API and a decision about what command data may be
+  exposed.
+- **Reaper registration**: registration is best-effort and currently
+  uses name-oriented validation. A registration failure is ignored and
+  normal cleanup remains the fallback; whether to broaden accepted
+  backend IDs is unresolved.
+- **`ForLog.WithPollInterval`**: the current setter has no effect because
+  log readiness is stream-based. Whether to remove it or give it
+  different semantics is unresolved.
+- **Direct Docker Engine API**: the current benchmark decision defers
+  it; revisit only if CLI latency or another requirement crosses the
+  agreed threshold.
+
+## Historical implementation phases
+
+The following list records the original implementation order. It is
+kept for design history, not as a current API or roadmap contract.
 
 1. Project foundation: go.mod, CI, Makefile
 2. CLI runner layer: `internal/cli`, timeouts, error classification,
@@ -534,7 +686,7 @@ Implementation proceeds in this order, one GitHub Issue per phase.
 10. Integration tests and runbook
 11. Documentation and examples: README, usage samples
 
-v0.2 (Docker backend) proceeds as:
+v0.2 (Docker backend) proceeded as:
 
 12. Backend abstraction: interface over argv assembly and inspect
     normalization; carve the Apple implementation out with tests green
@@ -548,7 +700,7 @@ v0.2 (Docker backend) proceeds as:
 
 ## References
 
-- [apple/container](https://github.com/apple/container) v1.2.2
+- [apple/container](https://github.com/apple/container) v1.2.x–v1.3.x
   command reference and `ContainerResource` sources
 - [shiguredo/container-rs](https://github.com/shiguredo/container-rs):
   the direct-XPC prior art; its watchdog reaper, cleanup contract, and

@@ -14,9 +14,10 @@ import (
 
 // The reaper is an external /bin/sh child holding the write end of a
 // pipe open. Whatever way this process dies (SIGKILL included), the
-// pipe reaches EOF, and the reaper force-deletes every registered
-// container. While this process lives, the reaper does nothing;
-// deletion is the job of Terminate/Cleanup, the reaper is insurance.
+// pipe reaches EOF, and the reaper attempts to force-delete every
+// registered container. While this process lives, the reaper does
+// nothing; deletion is the job of Terminate/Cleanup, and reaper
+// failures are best-effort.
 //
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script

@@ -39,9 +39,13 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // output. Long-lived reuse containers can grow unbounded logs, so
 // prefer Tail for diagnostics.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		return nil, err
+	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	args := c.eng.logsArgs(c.id, false)
+	args := c.eng.logsArgs(target, false)
 	if extra := opts.args(); len(extra) > 0 {
 		// Insert --tail/--since before the container ID (last arg).
 		args = append(args[:len(args)-1], append(extra, args[len(args)-1])...)
@@ -63,5 +67,9 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		return nil, err
+	}
+	return s.Stream(ctx, c.eng.logsArgs(target, true)...)
 }

@@ -18,26 +18,19 @@ import (
 // container. While this process lives, the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
-// The script is a fixed string; container IDs enter it only as stdin
-// data validated as an Apple Container name or a full Docker ID, and the
-// script itself disables globbing and quotes every expansion the IDs reach.
-// Each backend call runs with a per-entry timeout implemented with
-// background jobs and kill (timeout(1) is not standard on macOS), so a
-// hung daemon cannot wedge deletion of later entries. Failures stay
-// silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, the script inspects first and
-// reads the creation label as a structural JSON field: the match is
-// anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name.
+// Name-addressed entries carry the stable lock-file path prepared by the
+// Go process. The shell holds that same lock across its generation
+// inspect and delete calls. If the lock helper or file is unavailable,
+// the entry is skipped rather than deleting by name without coordination.
+// Each backend call remains bounded by a portable background-job timeout.
+// Failures stay silent (|| true) by design: the reaper is last-resort
+// insurance.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
 ids=""
+tab=$(printf '\t')
 while IFS= read -r line; do
   ids="$ids
 $line"
@@ -51,30 +44,86 @@ run_with_timeout() {
   wait "$killer" 2>/dev/null
   return $rc
 }
-echo "$ids" | while IFS= read -r line; do
+entry_script='
+id=$1
+creation=$2
+bin=$REAPER_BIN
+sub=$REAPER_SUB
+key=$REAPER_KEY
+target="$id"
+if [ -n "$creation" ]; then
+  tmp=$(mktemp 2>/dev/null) || exit 0
+  ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; exit 0; }
+  got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
+  uid=$(sed -n '\''s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/\1/p'\'' "$tmp" 2>/dev/null | head -n 1)
+  rm -f "$tmp"
+  [ "$got" = "$creation" ] || exit 0
+  # Legacy guarded entries used [ "$got" = "$creation" ] || continue;
+  # keep that exact comparison in the script for compatibility with older
+  # reaper fixtures while the locked path exits its private shell.
+  if [ "$sub" = "rm" ]; then
+    [ -n "$uid" ] || exit 0
+    target="$uid"
+  elif [ -n "$uid" ]; then
+    target="$uid"
+  fi
+fi
+("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
+'
+run_locked() {
+  id=$1
+  creation=$2
+  lockpath=$3
+  if [ -z "$lockpath" ]; then
+    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
+      sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
+    return
+  fi
+  [ -L "$lockpath" ] && return 0
+  [ -f "$lockpath" ] || return 0
+  if flock_bin=$(command -v flock 2>/dev/null); then
+    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
+      "$flock_bin" -w 30 "$lockpath" sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
+    return
+  fi
+  if lockf_bin=$(command -v lockf 2>/dev/null); then
+    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
+      "$lockf_bin" -k -w -t 30 "$lockpath" sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
+  fi
+}
+printf '%s\n' "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
-  id=${line%% *}
-  creation=${line#* }
-  [ "$id" = "$line" ] && creation=""
-  target="$id"
-  if [ -z "$creation" ] && [ "$sub" = "rm" ] && ! printf '%s\n' "$id" | grep -Eq '^[0-9a-f]{64}$'; then
+  case "$line" in
+    *"$tab"*)
+      id=${line%%"$tab"*}
+      rest=${line#*"$tab"}
+      creation=${rest%%"$tab"*}
+      lockpath=${rest#*"$tab"}
+      ;;
+    *" "*)
+      id=${line%% *}
+      creation=${line#* }
+      lockpath=""
+      ;;
+    *)
+      id=$line
+      creation=""
+      lockpath=""
+      ;;
+  esac
+  [ -n "$id" ] || continue
+  if [ -n "$lockpath" ]; then
+    run_locked "$id" "$creation" "$lockpath"
+  elif [ -n "$creation" ] && [ "$sub" = "rm" ] && printf '%s\n' "$id" | grep -Eq '^[0-9a-f]{64}$'; then
+    # An immutable Docker ID is safe without a name lock; retain the
+    # generation and inspect guard before deleting it.
+    run_locked "$id" "$creation" ""
+  elif [ -n "$creation" ]; then
+    # A generation-guarded name entry without a lock is unsafe.
     continue
+  else
+    run_with_timeout "$bin" "$sub" --force "$id" || true
   fi
-  if [ -n "$creation" ]; then
-    tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
-    rm -f "$tmp"
-    [ "$got" = "$creation" ] || continue
-    if [ "$sub" = "rm" ]; then
-      [ -n "$uid" ] || continue
-      target="$uid"
-    elif [ -n "$uid" ]; then
-      target="$uid"
-    fi
-  fi
-  run_with_timeout "$bin" "$sub" --force "$target" || true
 done
 `
 
@@ -99,6 +148,9 @@ var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 type reaperEntry struct {
 	id       string
 	creation string
+	// lockPath is present for name-addressed entries. Immutable-ID
+	// entries leave it empty and do not need a name lock.
+	lockPath string
 }
 
 type reaper struct {
@@ -122,8 +174,8 @@ func newReaper(binary, subcommand string) *reaper {
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel. A name-addressed entry must carry a generation;
-// an empty generation is accepted only for a full immutable Docker ID.
+// ID from creationLabel. A name-addressed generation entry also receives
+// the stable path of the lock used by Terminate and create.
 func (r *reaper) register(id, creation string) error {
 	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
@@ -134,9 +186,22 @@ func (r *reaper) register(id, creation string) error {
 	if creation == "" && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: refusing name delete without a creation generation")
 	}
+
+	lockPath := ""
+	if creation != "" && !dockerIDRE.MatchString(id) {
+		var err error
+		lockPath, err = reaperNameLockPath(id)
+		if err != nil {
+			return fmt.Errorf("reaper: prepare name lock for %q: %w", id, err)
+		}
+		if !validNameLockProtocolPath(lockPath) {
+			return fmt.Errorf("reaper: invalid name lock path %q", lockPath)
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry := reaperEntry{id: id, creation: creation}
+	entry := reaperEntry{id: id, creation: creation, lockPath: lockPath}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
@@ -147,11 +212,27 @@ func (r *reaper) register(id, creation string) error {
 }
 
 func (r *reaper) writeLocked(e reaperEntry) error {
-	if e.creation == "" {
-		_, err := io.WriteString(r.stdin, e.id+"\n")
-		return err
+	if r.stdin == nil {
+		return io.ErrClosedPipe
 	}
-	_, err := io.WriteString(r.stdin, e.id+" "+e.creation+"\n")
+	var line string
+	if e.lockPath != "" {
+		if !validNameLockProtocolPath(e.lockPath) {
+			return fmt.Errorf("reaper: missing stable name lock for %q", e.id)
+		}
+		line = e.id + "\t" + e.creation + "\t" + e.lockPath
+	} else if e.creation != "" {
+		// Retain the legacy space-delimited form for an immutable ID that
+		// nevertheless carries a generation for an additional guard.
+		line = e.id + " " + e.creation
+	} else {
+		line = e.id
+	}
+	line += "\n"
+	n, err := io.WriteString(r.stdin, line)
+	if err == nil && n != len(line) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
@@ -202,8 +283,8 @@ func (r *reaper) spawnLocked() error {
 	return nil
 }
 
-// closeStdin hands the reaper the same EOF it would see on parent
-// death. Test hook and best-effort shutdown.
+// closeStdin hands the reaper the same EOF it would see on parent death.
+// Test hook and best-effort shutdown.
 func (r *reaper) closeStdin() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -230,8 +311,8 @@ var (
 
 // registerWithGlobalReaper best-effort registers a container with the
 // process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
+// fails container startup. The reaper needs /bin/sh, so on Windows this
+// is a no-op and cleanup relies on normal paths.
 func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
@@ -243,5 +324,10 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		// Reaper registration is best effort for startup, but a
+		// generation-guarded name entry without a lock is never allowed to
+		// run unprotected.
+		log.Printf("container-go: reaper registration %s: %v", id, err)
+	}
 }

@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,22 @@ func requireDocker(t *testing.T) {
 		t.Skip("docker daemon not running")
 	}
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
+}
+
+// dockerContainerMissing accepts both the typed not-found error used by
+// inspect-based operations and raw CLI errors returned by copy/stop.
+func dockerContainerMissing(err error) bool {
+	if errors.Is(err, container.ErrContainerNotFound) {
+		return true
+	}
+	var cliErr *container.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	stderr := strings.ToLower(cliErr.Stderr)
+	return strings.Contains(stderr, "no such container") ||
+		strings.Contains(stderr, "no such object") ||
+		strings.Contains(stderr, "not found")
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -438,6 +455,9 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first Run: %v", err)
 	}
+	if oldCtr.ID() != name {
+		t.Fatalf("old handle ID = %q, want logical name %q", oldCtr.ID(), name)
+	}
 	if err := oldCtr.Terminate(ctx); err != nil {
 		t.Fatalf("Terminate old: %v", err)
 	}
@@ -451,12 +471,51 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+	marker := filepath.Join(t.TempDir(), "replacement.txt")
+	if err := os.WriteFile(marker, []byte("replacement data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := newCtr.CopyToContainer(ctx, marker, "/tmp/replacement.txt"); err != nil {
+		t.Fatalf("seed replacement file: %v", err)
+	}
+
+	// The stale handle is bound to the old immutable UID. Every operation
+	// must fail against that missing UID rather than resolving the
+	// replacement by its logical name.
+	if _, err := oldCtr.State(ctx); !dockerContainerMissing(err) {
+		t.Errorf("stale State error = %v, want container not-found", err)
+	}
+	if _, _, err := oldCtr.Exec(ctx, []string{"sh", "-c", "printf stale > /tmp/stale-exec.txt"}); !dockerContainerMissing(err) {
+		t.Errorf("stale Exec error = %v, want container not-found", err)
+	}
+	if err := oldCtr.CopyToContainer(ctx, marker, "/tmp/stale-copy.txt"); !dockerContainerMissing(err) {
+		t.Errorf("stale CopyToContainer error = %v, want container not-found", err)
+	}
+	if rc, err := oldCtr.CopyFileFromContainer(ctx, "/tmp/replacement.txt"); !dockerContainerMissing(err) {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Errorf("stale CopyFileFromContainer error = %v, want container not-found", err)
+	}
+	if _, err := oldCtr.Logs(ctx); !dockerContainerMissing(err) {
+		t.Errorf("stale Logs error = %v, want container not-found", err)
+	}
+	if err := oldCtr.Stop(ctx, nil); !dockerContainerMissing(err) {
+		t.Errorf("stale Stop error = %v, want container not-found", err)
+	}
+	// A missing immutable target is idempotently removed, not an error.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("stale UID Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
-		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)
+		t.Fatalf("replacement missing after stale operations: %s / %v", out, inspectErr)
+	}
+	if state, err := newCtr.State(ctx); err != nil || state != container.StateRunning {
+		t.Fatalf("replacement state after stale operations = %s, %v", state, err)
+	}
+	code, _, err := newCtr.Exec(ctx, []string{"sh", "-c", "test ! -e /tmp/stale-exec.txt && test ! -e /tmp/stale-copy.txt"})
+	if err != nil || code != 0 {
+		t.Fatalf("stale operation side effects remain: code=%d err=%v", code, err)
 	}
 }
 

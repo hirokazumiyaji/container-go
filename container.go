@@ -93,13 +93,17 @@ type Container struct {
 	// library; see Terminate for the limits of the name-based path.
 	creation string
 	// uid is the backend's immutable container ID when it has one
-	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it.
+	// (Docker). Backend operations target it directly, so a stale handle
+	// cannot affect a same-name replacement.
 	uid string
 
 	mu        sync.Mutex
 	info      *engineInfo // cached first inspect; immutable fields only
 	inspectMu sync.Mutex  // serializes inspect and protects uid after publication
+	// nameInspect is limited to short-lived lookups used by reuse and
+	// failed-create cleanup. A Docker handle returned to callers must not
+	// fall back to its logical name for State or any other operation.
+	nameInspect bool
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -159,11 +163,20 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
+	}
+	uid := cfg.eng.parseRunID(stdout)
+	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
+		err := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
+		cleanupFailedCreate(ctx, cfg, err, err)
+		return nil, err
 	}
 
 	c := &Container{
@@ -173,7 +186,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -207,6 +220,24 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 	}
 	return c, nil
+}
+
+// runCreateLocked serializes Apple Container's name-addressed create with
+// generation-checked deletes and the watchdog reaper. The attempted result
+// is separate from the error so a lock failure does not trigger cleanup for
+// a create command that was never issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
+	if cfg.eng.name() != "apple" {
+		stdout, _, err = cfg.runner.Run(ctx, args...)
+		return stdout, true, err
+	}
+	unlock, err := lockName(ctx, cfg.name)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlock()
+	stdout, _, err = cfg.runner.Run(ctx, args...)
+	return stdout, true, err
 }
 
 // rollback removes a container Run created but cannot return. A failed
@@ -287,8 +318,41 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 	return path, dir, nil
 }
 
-// ID returns the container ID (identical to its name).
+// ID returns the logical container name. Docker also has an immutable
+// backend ID, but changing the public result would break callers that use
+// the name for display and diagnostics.
 func (c *Container) ID() string { return c.id }
+
+// operationTarget returns the strongest backend identity currently bound
+// to this handle. It is intentionally a small compatibility helper: Apple
+// Container has no immutable ID and therefore returns its logical name.
+// Callers that issue a backend operation use verifiedOperationTarget below
+// so a Docker handle never falls back to that name.
+func (c *Container) operationTarget() string {
+	c.inspectMu.Lock()
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if requiresImmutableID(c.eng) && validImmutableID(c.eng, uid) {
+		return uid
+	}
+	return c.id
+}
+
+func (c *Container) verifiedOperationTarget() (string, error) {
+	c.inspectMu.Lock()
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if requiresImmutableID(c.eng) {
+		if !validImmutableID(c.eng, uid) {
+			return "", fmt.Errorf("container %s: invalid immutable container ID %q", c.id, uid)
+		}
+		return uid, nil
+	}
+	if c.id == "" {
+		return "", fmt.Errorf("container has no logical name")
+	}
+	return c.id, nil
+}
 
 func (c *Container) classify(ctx context.Context, err error) error {
 	return cli.Classify(ctx, c.runner, err, c.eng.probe())
@@ -306,9 +370,13 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		return err
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
 	return c.classify(ctx, err)
 }
 
@@ -508,6 +576,9 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	uid := c.uid
 	if uid != "" && !validImmutableID(c.eng, uid) {
 		return nil, fmt.Errorf("container %s has invalid immutable ID %q", c.id, uid)
+	}
+	if requiresImmutableID(c.eng) && uid == "" && !c.nameInspect {
+		return nil, fmt.Errorf("container %s: refusing Docker name inspect without an immutable ID", c.id)
 	}
 	target := c.inspectTargetLocked()
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)

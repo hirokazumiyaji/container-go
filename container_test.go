@@ -105,7 +105,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		// Docker run --detach prints a full immutable ID. Keeping the
+		// shared fake Docker-shaped avoids accidentally exercising a
+		// name fallback in tests that use dockerEngine.
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {

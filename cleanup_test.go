@@ -81,6 +81,7 @@ const pruneLsJSON = `[
 
 func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
+	f.inspectJSON = reuseInspectJSONWithCreation("managed-stopped", "stopped", "redis:7-alpine", "0123456789abcdef")
 
 	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {

@@ -169,7 +169,17 @@ type dockerInspect struct {
 	ID       string `json:"Id"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
-	State    struct {
+	// ImageManifestDescriptor is the complete OCI platform metadata on
+	// Docker versions that expose it. The top-level Platform field is
+	// frequently only the OS (for example, "linux").
+	ImageManifestDescriptor struct {
+		Platform struct {
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
+			Variant      string `json:"variant"`
+		} `json:"platform"`
+	} `json:"ImageManifestDescriptor"`
+	State struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -215,12 +225,36 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		return nil, fmt.Errorf("docker inspect for %s returned invalid container ID %q", target, c.ID)
 	}
 
+	platform := c.Platform
+	descriptor := c.ImageManifestDescriptor.Platform
+	if descriptor.OS != "" || descriptor.Architecture != "" || descriptor.Variant != "" {
+		// A descriptor may omit OS on some API responses; the top-level
+		// value remains the authoritative OS in that case. Missing
+		// architecture/variant are intentionally not invented: explicit
+		// selectors must fail closed when Docker cannot verify them.
+		if descriptor.Architecture == "" {
+			// A variant without an architecture is not a complete OCI
+			// platform. Keep the verified OS-only value rather than
+			// accidentally interpreting the variant as an architecture.
+			platform = c.Platform
+		} else {
+			if descriptor.OS == "" {
+				if osParts, ok := parsePlatform(c.Platform); ok {
+					descriptor.OS = osParts.os
+				} else {
+					descriptor.OS = c.Platform
+				}
+			}
+			platform = formatInspectPlatform(descriptor.OS, descriptor.Architecture, descriptor.Variant)
+		}
+	}
+
 	info := &engineInfo{
 		state:    dockerState(c.State.Status),
 		labels:   c.Config.Labels,
 		uid:      c.ID,
 		image:    c.Config.Image,
-		platform: c.Platform,
+		platform: platform,
 		ip:       c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {

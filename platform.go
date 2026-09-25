@@ -53,23 +53,26 @@ func platformPartMatches(selector, actual string) bool {
 	return selector == "" || strings.EqualFold(selector, actual)
 }
 
-// dockerPlatformMatches accounts for `docker inspect` reporting Platform
-// as the OS only. OS must still match; architecture and variant are compared
-// when inspect reports them but otherwise remain unverified by this backend.
-func dockerPlatformMatches(selector, actual string) bool {
+func platformSelectorUnverifiable(selector, actual string) bool {
 	want, ok := parsePlatform(selector)
 	if !ok {
-		return false
+		return true
 	}
 	have, ok := parsePlatform(actual)
-	if !ok || !platformPartMatches(want.os, have.os) {
+	if !ok {
+		return true
+	}
+	if want.os != "" && have.os != "" && !strings.EqualFold(want.os, have.os) {
 		return false
 	}
-	if have.architecture != "" && !platformPartMatches(want.architecture, have.architecture) {
-		return false
-	}
-	if have.variant != "" && !platformPartMatches(want.variant, have.variant) {
-		return false
-	}
-	return true
+	return (want.architecture != "" && have.architecture == "") ||
+		(want.variant != "" && have.variant == "")
+}
+
+// dockerPlatformMatches treats omitted selector components as
+// unconstrained, but requires Docker to report every explicitly selected
+// component. In particular, an OS-only legacy inspect result cannot
+// satisfy an architecture- or variant-specific request.
+func dockerPlatformMatches(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
 }

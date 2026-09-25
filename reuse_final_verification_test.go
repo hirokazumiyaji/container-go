@@ -85,9 +85,12 @@ func issue83FinalDockerInspect(spec issue83FinalVerifySpec) []byte {
 		}}
 	}
 	data, _ := json.Marshal([]map[string]any{{
-		"Id":       spec.uid,
-		"Name":     "/" + spec.name,
-		"State":    map[string]string{"Status": spec.state},
+		"Id":    spec.uid,
+		"Name":  "/" + spec.name,
+		"State": map[string]string{"Status": spec.state},
+		"ImageManifestDescriptor": map[string]any{
+			"platform": map[string]string{"os": "linux", "architecture": "arm64"},
+		},
 		"Config":   map[string]any{"Image": spec.image, "Labels": issue83FinalLabels(spec.creation)},
 		"Platform": spec.platform,
 		"NetworkSettings": map[string]any{

@@ -80,7 +80,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		return 0, nil, err
+	}
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil

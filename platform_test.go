@@ -10,7 +10,7 @@ func TestDockerPlatformCompatible(t *testing.T) {
 		want     bool
 	}{
 		{name: "OS-only actual", selector: "linux", actual: "linux", want: true},
-		{name: "architecture selector", selector: "linux/arm64", actual: "linux", want: true},
+		{name: "architecture selector unverifiable", selector: "linux/arm64", actual: "linux"},
 		{name: "OS selector", selector: "linux", actual: "linux/amd64", want: true},
 		{name: "reported architecture matches", selector: "linux/arm64", actual: "linux/arm64", want: true},
 		{name: "reported architecture differs", selector: "linux/arm64", actual: "linux/amd64"},

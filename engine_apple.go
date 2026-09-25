@@ -187,6 +187,16 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 	if platform == "" {
 		return true
 	}
+	selector, ok := parsePlatform(platform)
+	if !ok {
+		return false
+	}
+	// A bare OS selector intentionally means "any architecture on this
+	// OS". It therefore retains the image-presence behavior even when an
+	// older Apple response does not include a decodable variants array.
+	// Architecture/variant selectors are different: an absent or malformed
+	// variants list cannot prove that the requested image is present.
+	osOnly := selector.architecture == "" && selector.variant == ""
 	var images []struct {
 		Variants []struct {
 			Platform struct {
@@ -197,14 +207,20 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 		} `json:"variants"`
 	}
 	if err := json.Unmarshal(data, &images); err != nil {
-		return true
+		return osOnly
 	}
 	for _, img := range images {
 		if len(img.Variants) == 0 {
-			return true
+			if osOnly {
+				return true
+			}
+			continue
 		}
 		for _, v := range img.Variants {
 			actual := formatInspectPlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant)
+			if actual == "" && osOnly {
+				return true
+			}
 			if (appleEngine{}).platformCompatible(platform, actual) {
 				return true
 			}

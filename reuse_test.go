@@ -352,9 +352,10 @@ func TestReuseRecreatesStoppedContainer(t *testing.T) {
 
 type stoppedThenCreateRunner struct {
 	*fakeRunner
-	deleted bool
-	created bool
-	phase   int
+	deleted  bool
+	created  bool
+	phase    int
+	creation string
 }
 
 func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -373,13 +374,24 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 		if !s.created {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		creation := s.creation
+		if creation == "" {
+			creation = "0123456789abcdef"
+		}
+		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
 		s.created = true
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					s.creation = value
+				}
+			}
+		}
 		return []byte("myctr\n"), nil, nil
 	default:
 		return nil, nil, nil
@@ -505,6 +517,8 @@ func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}
+	f.inspectJSON = strings.Replace(reuseInspectJSONWithCreation("g1", "running", "redis:7-alpine", "0123456789abcdef"),
+		`"`+reuseLabel+`": "true",`, `"`+reuseLabel+`": "true", "`+reuseGroupLabel+`": "integration",`, 1)
 	removed, err := pruneReuseGroupWith(context.Background(), f, appleEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("PruneReuseGroup: %v", err)

@@ -31,6 +31,8 @@ func TestLockNameSerializesHolders(t *testing.T) {
 	defer cancel()
 	if _, err := lockName(ctx, name); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("second lock while held: err = %v, want deadline exceeded", err)
+	} else if errors.Is(err, ErrNameLockCompatibility) {
+		t.Fatalf("second lock while held: err = %v, context timeout mislabeled as compatibility failure", err)
 	}
 
 	unlock()
@@ -50,6 +52,9 @@ func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
 
 	t.Setenv("TMPDIR", t.TempDir())
 	t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("LocalAppData", t.TempDir())
 	second, err := nameLockPath(name)
 	if err != nil {
 		t.Fatalf("nameLockPath after TMPDIR change: %v", err)
@@ -65,7 +70,10 @@ func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
 func TestNameLockPathUsesDurableStateNamespace(t *testing.T) {
 	stateHome := t.TempDir()
 	cacheHome := t.TempDir()
-	t.Setenv("XDG_STATE_HOME", stateHome)
+	oldOverride := nameLockStateRootOverride
+	nameLockStateRootOverride = stateHome
+	t.Cleanup(func() { nameLockStateRootOverride = oldOverride })
+	t.Setenv("XDG_STATE_HOME", filepath.Join(t.TempDir(), "ignored"))
 	t.Setenv("XDG_CACHE_HOME", cacheHome)
 
 	name := "lock-" + newContainerName()
@@ -90,7 +98,7 @@ func TestNameLockPathUsesDurableStateNamespace(t *testing.T) {
 	}
 }
 
-func TestDefaultStateDirRejectsRelativeNamespaceByFallback(t *testing.T) {
+func TestDefaultStateDirUsesAccountHome(t *testing.T) {
 	home := t.TempDir()
 	got := defaultStateDir(home, "relative/state")
 	var want string
@@ -101,6 +109,39 @@ func TestDefaultStateDirRejectsRelativeNamespaceByFallback(t *testing.T) {
 	}
 	if got != want {
 		t.Fatalf("defaultStateDir = %q, want %q", got, want)
+	}
+}
+
+func TestUserStateDirIgnoresEnvironment(t *testing.T) {
+	home := t.TempDir()
+	first, err := userStateDirFromHome(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	t.Setenv("HOME", t.TempDir())
+	second, err := userStateDirFromHome(home)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("user state directory changed with environment: %q != %q", first, second)
+	}
+}
+
+func TestCurrentUserHomeDoesNotFollowEnvironment(t *testing.T) {
+	first, err := currentUserHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	second, err := currentUserHome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first != second {
+		t.Fatalf("currentUserHome changed with environment: %q != %q", first, second)
 	}
 }
 
@@ -497,7 +538,7 @@ func TestNameLockHelperProcess(t *testing.T) {
 	fmt.Println("locked")
 }
 
-func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
+func TestNameLockSerializesAcrossProcessesWithDifferentLockEnvironmentDirs(t *testing.T) {
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
 	if err != nil {
@@ -506,6 +547,8 @@ func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
 
 	runHelper := func(tempDir, timeout string) string {
 		t.Helper()
+		cacheDir := t.TempDir()
+		homeDir := t.TempDir()
 		cmd := exec.Command(os.Args[0], "-test.run=^TestNameLockHelperProcess$")
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_LOCK_INHERIT=1",
@@ -513,6 +556,8 @@ func TestNameLockSerializesAcrossProcessesWithDifferentTempDirs(t *testing.T) {
 			"CONTAINERGO_LOCK_NAME="+name,
 			"CONTAINERGO_LOCK_TIMEOUT="+timeout,
 			"TMPDIR="+tempDir,
+			"XDG_CACHE_HOME="+cacheDir,
+			"HOME="+homeDir,
 		)
 		output, err := cmd.CombinedOutput()
 		if err != nil {
@@ -662,6 +707,96 @@ func TestNameLockAcquiresHistoricalBarriersBeforeState(t *testing.T) {
 		resultValue.unlock()
 	case <-ctx.Done():
 		t.Fatal("new lock did not finish after state release")
+	}
+}
+
+func TestRunCreateWaitsForNameLock(t *testing.T) {
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	runner := newTestRunner()
+	cfg := &config{name: name, runner: runner, eng: appleEngine{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	stdout, attempted, err := runCreateLocked(ctx, cfg, "run")
+	if attempted || stdout != nil {
+		t.Fatalf("runCreateLocked attempted=%v stdout=%q, want no create attempt", attempted, stdout)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runCreateLocked error = %v, want deadline exceeded", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("runner calls = %v, want none while name lock is held", runner.calls)
+	}
+}
+
+func TestNameLockKeepsMaintenanceThroughCleanup(t *testing.T) {
+	name := "lock-" + newContainerName()
+	statePath, err := nameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	maintenancePath := filepath.Join(filepath.Dir(statePath), nameLockMaintenanceFile)
+	cleanupReached := make(chan struct{})
+	releaseCleanup := make(chan struct{})
+	hooks := &nameLockHooks{beforeCleanup: func() {
+		close(cleanupReached)
+		<-releaseCleanup
+	}}
+	type result struct {
+		unlock func()
+		err    error
+	}
+	firstResult := make(chan result, 1)
+	go func() {
+		unlock, err := lockNameWithHooks(context.Background(), name, hooks)
+		firstResult <- result{unlock: unlock, err: err}
+	}()
+	select {
+	case <-cleanupReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first lock did not reach held-lock cleanup")
+	}
+
+	peerCtx, peerCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer peerCancel()
+	peerMaintenance := make(chan struct{})
+	peerResult := make(chan error, 1)
+	go func() {
+		maintenanceUnlock, err := acquireLockFile(peerCtx, maintenanceNameLockStage, maintenancePath, false, nil)
+		if err != nil {
+			peerResult <- err
+			return
+		}
+		close(peerMaintenance)
+		stateUnlock, err := acquireLockFile(peerCtx, stateNameLockStage, statePath, true, nil)
+		if stateUnlock != nil {
+			stateUnlock()
+		}
+		maintenanceUnlock()
+		peerResult <- err
+	}()
+
+	select {
+	case <-peerMaintenance:
+		t.Fatal("peer acquired maintenance while the state lock was held for cleanup")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(releaseCleanup)
+
+	first := <-firstResult
+	if first.err != nil {
+		t.Fatalf("first lock: %v", first.err)
+	}
+	if first.unlock != nil {
+		first.unlock()
+	}
+	if err := <-peerResult; err != nil {
+		t.Fatalf("peer lock: %v", err)
 	}
 }
 

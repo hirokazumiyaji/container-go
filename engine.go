@@ -24,6 +24,22 @@ type engineInfo struct {
 	bound []boundPort
 }
 
+// pruneCandidate is the identity-bearing subset of a list result. Apple
+// Container addresses containers by name, so a later inspect must prove
+// that the same generation and lifecycle state is still present before a
+// name-based delete is attempted.
+type pruneCandidate struct {
+	id         string
+	creation   string
+	state      State
+	managed    bool
+	reuseGroup string
+}
+
+func verifiedImmutableID(eng engine, id string) bool {
+	return eng.immutableID() && dockerIDRE.MatchString(id)
+}
+
 type boundPort struct {
 	containerPort int
 	proto         string
@@ -48,6 +64,10 @@ type engine interface {
 	// immutableID reports whether backend inspection/deletes can address a
 	// specific generation without a name lock.
 	immutableID() bool
+	// nameAddressedDeletes reports whether deletes target a name rather
+	// than an immutable backend ID. Name-addressed paths must use the
+	// guarded create/inspect/delete protocol.
+	nameAddressedDeletes() bool
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	stopArgs(id string, timeout *time.Duration) []string
@@ -60,15 +80,17 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the IDs of
-	// stopped containers this library created.
-	parseStoppedManaged(data []byte) ([]string, error)
+	// parseStoppedManaged extracts, from listArgs output, the stopped
+	// managed containers this library created, including the metadata
+	// needed to revalidate a name-addressed delete.
+	parseStoppedManaged(data []byte) ([]pruneCandidate, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
-	// output that carry the given reuse group.
-	parseReuseGroupIDs(data []byte, group string) ([]string, error)
+	// parseReuseGroupIDs extracts containers from listReuseGroupArgs
+	// output that carry the given reuse group, with their list-time
+	// identity metadata.
+	parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error)
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool

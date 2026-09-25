@@ -19,6 +19,7 @@ type failRunRunner struct {
 	*fakeRunner
 	runErr      error
 	inspectJSON string
+	creation    string
 	deleted     []string
 }
 
@@ -27,13 +28,24 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if creation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = creation
+				}
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		data := r.inspectJSON
+		if r.creation != "" {
+			data = strings.ReplaceAll(data, "__CONTAINERGO_CREATION__", r.creation)
+		}
 		r.mu.Unlock()
-		return []byte(r.inspectJSON), nil, nil
+		return []byte(data), nil, nil
 	case "delete", "rm":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
@@ -46,6 +58,25 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 }
 
 func ownedInspectJSON(name string) string {
+	return fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINERGO_CREATION__"
+      }
+    },
+    "status": {"state": "created", "networks": []}
+  }
+]`, name, name, sessionID())
+}
+
+func ownedWithoutGenerationJSON(name string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -140,6 +171,7 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 		fakeRunner:  base,
 		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
 		inspectJSON: ownedInspectJSON("myctr"),
+		creation:    "aaaaaaaaaaaaaaaa",
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -147,6 +179,7 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.runner = r
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
+	cfg.creation = "aaaaaaaaaaaaaaaa"
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
 		t.Fatalf("cleanupFailedCreate: %v", err)
@@ -156,7 +189,43 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	}
 }
 
-func TestRunFailureSurfacesCleanupLockFailure(t *testing.T) {
+func TestRollbackPreservesCleanupError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Apple name locks are unavailable on Windows")
+	}
+	t.Setenv("XDG_CACHE_HOME", "")
+	t.Setenv("HOME", "")
+	cause := errors.New("copy failed")
+	ctr := &Container{
+		id: "myctr", runner: &generationRunner{}, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa",
+	}
+	err := ctr.rollback(context.Background(), cause)
+	if !errors.Is(err, cause) || !errors.Is(err, ErrNameLockCompatibility) {
+		t.Fatalf("rollback error = %v, want primary and cleanup errors", err)
+	}
+}
+
+func TestCleanupFailedCreateSkipsMissingGeneration(t *testing.T) {
+	r := &failRunRunner{
+		fakeRunner:  newTestRunner(),
+		inspectJSON: ownedWithoutGenerationJSON("myctr"),
+	}
+	cfg := &config{
+		name:     "myctr",
+		creation: "aaaaaaaaaaaaaaaa",
+		runner:   r,
+		eng:      appleEngine{},
+	}
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
+	if err := cleanupFailedCreate(context.Background(), cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete without a generation", r.deleted)
+	}
+}
+
+func TestRunSurfacesCreateLockFailure(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Apple name locks are unavailable on Windows")
 	}
@@ -172,13 +241,10 @@ func TestRunFailureSurfacesCleanupLockFailure(t *testing.T) {
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
-	if err == nil || !strings.Contains(err.Error(), "entrypoint not found") {
-		t.Fatalf("Run error = %v, want original run failure", err)
-	}
-	if !errors.Is(err, ErrNameLockCompatibility) ||
-		!strings.Contains(err.Error(), "cleanup myctr: lock name") ||
+	if err == nil || !errors.Is(err, ErrNameLockCompatibility) ||
+		!strings.Contains(err.Error(), "create myctr: lock name") ||
 		!strings.Contains(err.Error(), "transitional user cache directory") {
-		t.Fatalf("Run error = %v, want surfaced cleanup lock failure", err)
+		t.Fatalf("Run error = %v, want surfaced create lock failure", err)
 	}
 	if len(r.deleted) != 0 {
 		t.Fatalf("deleted = %v, want no delete without compatibility lock", r.deleted)
@@ -197,11 +263,12 @@ func TestCleanupFailedCreateDockerSkipsNameLock(t *testing.T) {
 		"Name": "/myctr",
 		"Config": {"Labels": {
 			%q: "true",
-			%q: %q
+			%q: %q,
+			%q: "aaaaaaaaaaaaaaaa"
 		}},
 		"State": {"Status": "exited"},
 		"NetworkSettings": {}
-	}]`, id, managedLabel, sessionLabel, sessionID())
+	}]`, id, managedLabel, sessionLabel, sessionID(), creationLabel)
 	r := &failRunRunner{
 		fakeRunner:  newTestRunner(),
 		inspectJSON: inspectJSON,

@@ -159,7 +159,8 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
-func (dockerEngine) immutableID() bool { return true }
+func (dockerEngine) immutableID() bool          { return true }
+func (dockerEngine) nameAddressedDeletes() bool { return false }
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
@@ -310,8 +311,15 @@ func (dockerEngine) listArgs() []string {
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+// parseStoppedManaged extracts stopped managed container IDs. Docker
+// deletes by immutable ID, so list-time identity metadata is unnecessary.
+func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+	ids := splitNonEmptyLines(data)
+	candidates := make([]pruneCandidate, 0, len(ids))
+	for _, id := range ids {
+		candidates = append(candidates, pruneCandidate{id: id})
+	}
+	return candidates, nil
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -349,8 +357,13 @@ func (dockerEngine) listReuseGroupArgs(group string) []string {
 	}
 }
 
-func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
+	ids := splitNonEmptyLines(data)
+	candidates := make([]pruneCandidate, 0, len(ids))
+	for _, id := range ids {
+		candidates = append(candidates, pruneCandidate{id: id})
+	}
+	return candidates, nil
 }
 
 // nameConflict matches Docker's duplicate container name error.

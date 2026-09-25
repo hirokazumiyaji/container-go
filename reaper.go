@@ -6,6 +6,7 @@ import (
 	"io"
 	"log"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -15,33 +16,44 @@ import (
 // The reaper is an external /bin/sh child holding the write end of a
 // pipe open. Whatever way this process dies (SIGKILL included), the
 // pipe reaches EOF, and the reaper force-deletes every registered
-// container. While this process lives, the reaper does nothing;
+// container. While the process lives the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
-// The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
-// Each backend call runs with a per-entry timeout implemented with
-// background jobs and kill (timeout(1) is not standard on macOS), so a
-// hung daemon cannot wedge deletion of later entries. Failures stay
-// silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, the script inspects first and
-// reads the creation label as a structural JSON field: the match is
-// anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name.
+// Name-addressed entries carry library-prepared durable state and
+// maintenance lock paths. The shell holds maintenance first and state
+// second, matching lockName, across generation inspection and deletion.
+// If lockf is unavailable, the entry is skipped rather than deleted
+// without coordination. Docker's immutable-ID entries remain lock-free.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
 ids=""
+tab=$(printf '\t')
 while IFS= read -r line; do
   ids="$ids
 $line"
 done
+helper=$(mktemp 2>/dev/null) || exit 0
+trap 'rm -f "$helper"' EXIT
+cat >"$helper" <<'REAPER_LOCKED_HELPER'
+#!/bin/sh
+if [ "${REAPER_STATE_HELD:-}" != "1" ]; then
+  REAPER_STATE_HELD=1 exec "$REAPER_LOCKF" -k -n -w -t 30 "$1" "$0" "$@"
+fi
+id=$2
+creation=$3
+bin=$REAPER_BIN
+sub=$REAPER_SUB
+key=$REAPER_KEY
+tmp=$(mktemp 2>/dev/null) || exit 0
+("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; exit 0; }
+got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
+rm -f "$tmp"
+[ "$got" = "$creation" ] || exit 0
+("$bin" "$sub" --force "$id" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
+REAPER_LOCKED_HELPER
+chmod 700 "$helper" 2>/dev/null || exit 0
 run_with_timeout() {
   "$@" >/dev/null 2>&1 & pid=$!
   (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
@@ -51,22 +63,49 @@ run_with_timeout() {
   wait "$killer" 2>/dev/null
   return $rc
 }
-echo "$ids" | while IFS= read -r line; do
+run_locked() {
+  id="$1"
+  creation="$2"
+  statepath="$3"
+  maintenancepath="$4"
+  [ -n "$statepath" ] && [ -n "$maintenancepath" ] || return 0
+  [ -L "$statepath" ] && return 0
+  [ -L "$maintenancepath" ] && return 0
+  [ -f "$statepath" ] && [ -f "$maintenancepath" ] || return 0
+  lockf_bin=$(command -v lockf 2>/dev/null) || return 0
+  [ -n "$lockf_bin" ] || return 0
+  REAPER_STATE_HELD=0 REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_LOCKF="$lockf_bin" REAPER_HELPER="$helper" \
+    "$lockf_bin" -k -n -w -t 30 "$maintenancepath" "$helper" "$statepath" "$id" "$creation" >/dev/null 2>&1 || true
+}
+printf '%s\n' "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
-  id=${line%% *}
-  creation=${line#* }
-  [ "$id" = "$line" ] && creation=""
-  target="$id"
-  if [ -n "$creation" ]; then
-    tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
-    rm -f "$tmp"
-    [ "$got" = "$creation" ] || continue
-    [ -n "$uid" ] && target="$uid"
+  case "$line" in
+    *"$tab"*)
+      id=${line%%"$tab"*}
+      rest=${line#*"$tab"}
+      creation=${rest%%"$tab"*}
+      rest=${rest#*"$tab"}
+      statepath=${rest%%"$tab"*}
+      maintenancepath=${rest#*"$tab"}
+      ;;
+    *)
+      id=$line
+      creation=""
+      statepath=""
+      maintenancepath=""
+      ;;
+  esac
+  [ -n "$id" ] || continue
+  if [ "$sub" = delete ]; then
+    [ -n "$creation" ] || continue
+    [ -n "$statepath" ] && [ -n "$maintenancepath" ] || continue
+    run_locked "$id" "$creation" "$statepath" "$maintenancepath"
+  elif [ -n "$statepath" ]; then
+    [ -n "$maintenancepath" ] || continue
+    run_locked "$id" "$creation" "$statepath" "$maintenancepath"
+  else
+    run_with_timeout "$bin" "$sub" --force "$id" || true
   fi
-  run_with_timeout "$bin" "$sub" --force "$target" || true
 done
 `
 
@@ -88,9 +127,15 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+func validNameLockProtocolPath(path string) bool {
+	return filepath.IsAbs(path) && !strings.ContainsAny(path, "\x00\n\r\t")
+}
+
 type reaperEntry struct {
-	id       string
-	creation string
+	id              string
+	creation        string
+	stateLockPath   string
+	maintenancePath string
 }
 
 type reaper struct {
@@ -113,19 +158,41 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// respawning the reaper process as needed. Name-addressed entries must
+// carry a valid generation and prepared stable lock paths.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
-		return fmt.Errorf("reaper: invalid container id %q", id)
+	if r.subcommand == "delete" {
+		if !nameRE.MatchString(id) {
+			return fmt.Errorf("reaper: invalid container id %q", id)
+		}
+	} else if !dockerIDRE.MatchString(id) {
+		return fmt.Errorf("reaper: invalid immutable container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+
+	statePath, maintenancePath := "", ""
+	if r.subcommand == "delete" {
+		if creation == "" {
+			return fmt.Errorf("reaper: missing creation generation for name-addressed entry %q", id)
+		}
+		var err error
+		statePath, maintenancePath, err = reaperNameLockPaths(id)
+		if err != nil {
+			return fmt.Errorf("reaper: prepare name locks for %q: %w", id, err)
+		}
+		if !validNameLockProtocolPath(statePath) || !validNameLockProtocolPath(maintenancePath) {
+			return fmt.Errorf("reaper: invalid name lock path for %q", id)
+		}
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry := reaperEntry{id: id, creation: creation}
+	entry := reaperEntry{id: id, creation: creation, stateLockPath: statePath, maintenancePath: maintenancePath}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
@@ -136,15 +203,21 @@ func (r *reaper) register(id, creation string) error {
 }
 
 func (r *reaper) writeLocked(e reaperEntry) error {
-	if e.creation == "" {
-		_, err := io.WriteString(r.stdin, e.id+"\n")
-		return err
+	if r.stdin == nil {
+		return io.ErrClosedPipe
 	}
-	_, err := io.WriteString(r.stdin, e.id+" "+e.creation+"\n")
+	if e.stateLockPath != "" && (!validNameLockProtocolPath(e.stateLockPath) || !validNameLockProtocolPath(e.maintenancePath)) {
+		return fmt.Errorf("reaper: invalid stable name locks for %q", e.id)
+	}
+	line := e.id + "\t" + e.creation + "\t" + e.stateLockPath + "\t" + e.maintenancePath + "\n"
+	n, err := io.WriteString(r.stdin, line)
+	if err == nil && n != len(line) {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
-// respawnAndReplayLocked starts a fresh reaper process and re-registers
+// respawnAndReplayLocked starts a fresh reaper child and re-registers
 // every known ID with it. Success resets the consecutive-failure count;
 // giving up logs once so a permanently broken reaper is visible.
 func (r *reaper) respawnAndReplayLocked() error {
@@ -218,9 +291,9 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
+// process-wide reaper for its backend binary. Reaper trouble never fails
+// container startup, but an Apple entry without valid stable locks is not
+// registered and therefore cannot be deleted without coordination.
 func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
@@ -232,5 +305,7 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration %s: %v", id, err)
+	}
 }

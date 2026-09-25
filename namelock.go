@@ -43,9 +43,16 @@ const (
 // nameLockHooks exists so tests can place a substitution at each side of
 // the final-component open without mutating process-global test state.
 type nameLockHooks struct {
-	beforeOpen func(nameLockStage, string)
-	afterOpen  func(nameLockStage, string)
+	beforeOpen    func(nameLockStage, string)
+	afterOpen     func(nameLockStage, string)
+	beforeCleanup func()
 }
+
+// nameLockStateRootOverride is used only by the package test harness to
+// keep lock files out of the developer's real account state directory.
+// Production callers leave it empty and always derive the state root from
+// the account database.
+var nameLockStateRootOverride string
 
 // nameLockPath returns the durable, per-user state path for name. The
 // digest keeps arbitrary container names out of the filesystem path and
@@ -58,16 +65,37 @@ func nameLockPath(name string) (string, error) {
 	return filepath.Join(dir, nameLockFileName(name)), nil
 }
 
+// reaperNameLockPaths prepares the durable state and maintenance inodes
+// before a shell reaper receives their paths. The shell must never be
+// allowed to create or follow a different inode for a name-addressed
+// delete or cleanup race.
+func reaperNameLockPaths(name string) (statePath, maintenancePath string, err error) {
+	statePath, err = nameLockPath(name)
+	if err != nil {
+		return "", "", err
+	}
+	maintenancePath = filepath.Join(filepath.Dir(statePath), nameLockMaintenanceFile)
+	for _, path := range []string{statePath, maintenancePath} {
+		f, openErr := openLockFile(path, true, stateNameLockStage, nil)
+		if openErr != nil {
+			return "", "", openErr
+		}
+		if closeErr := f.Close(); closeErr != nil {
+			return "", "", fmt.Errorf("close prepared reaper lock file %s: %w", path, closeErr)
+		}
+	}
+	return statePath, maintenancePath, nil
+}
+
 func nameLockFileName(name string) string {
 	digest := sha256.Sum256([]byte(name))
 	return hex.EncodeToString(digest[:]) + ".lock"
 }
 
-// nameLockDir returns a private directory below the durable per-user
-// state root. XDG_STATE_HOME is honored when absolute; otherwise the
-// platform's user state directory is used. There is deliberately no
-// temporary-directory fallback because lock-file retention is part of the
-// coordination protocol.
+// nameLockDir returns a private directory below a fixed per-user state
+// root. Process environment variables such as XDG_STATE_HOME and HOME are
+// deliberately not consulted: they can differ between otherwise identical
+// cooperating processes and must not split the coordination namespace.
 func nameLockDir() (string, error) {
 	stateDir, err := userStateDir()
 	if err != nil {
@@ -85,48 +113,41 @@ func nameLockDir() (string, error) {
 }
 
 func userStateDir() (string, error) {
-	stateHome := os.Getenv("XDG_STATE_HOME")
-	if filepath.IsAbs(stateHome) {
-		return prepareUserBase(stateHome, "user state directory")
+	if nameLockStateRootOverride != "" {
+		return prepareUserBase(nameLockStateRootOverride, "user state directory")
 	}
 	home, err := currentUserHome()
 	if err != nil {
 		return "", fmt.Errorf("find durable user state directory: %w", err)
 	}
-	return prepareUserBase(defaultStateDir(home, stateHome), "user state directory")
+	return userStateDirFromHome(home)
 }
 
-func defaultStateDir(home, stateHome string) string {
-	if filepath.IsAbs(stateHome) {
-		return filepath.Clean(stateHome)
-	}
+func userStateDirFromHome(home string) (string, error) {
+	return prepareUserBase(defaultStateDir(home, ""), "user state directory")
+}
+
+func defaultStateDir(home, _ string) string {
 	if runtime.GOOS == "darwin" {
 		return filepath.Join(home, "Library", "Application Support")
 	}
 	return filepath.Join(home, ".local", "state")
 }
 
-// currentUserHome prefers the account database over HOME so unrelated
-// process environments cannot silently select different lock namespaces.
-// The HOME-derived value is only a fallback and is accepted only after
-// the same ownership and directory-safety checks.
+// currentUserHome uses the account database exclusively. Falling back to
+// HOME would allow two processes with the same account but different
+// environments to select different lock namespaces, so failure to obtain
+// the account home is fail-closed.
 func currentUserHome() (string, error) {
-	var errs []error
-	if current, err := user.Current(); err != nil {
-		errs = append(errs, fmt.Errorf("look up current user: %w", err))
-	} else if home, err := existingUserDir(current.HomeDir); err != nil {
-		errs = append(errs, fmt.Errorf("use account home %q: %w", current.HomeDir, err))
-	} else {
-		return home, nil
+	current, err := user.Current()
+	if err != nil {
+		return "", fmt.Errorf("look up current user: %w", err)
 	}
-	if home, err := os.UserHomeDir(); err != nil {
-		errs = append(errs, fmt.Errorf("use HOME fallback: %w", err))
-	} else if resolved, err := existingUserDir(home); err != nil {
-		errs = append(errs, fmt.Errorf("use HOME fallback %q: %w", home, err))
-	} else {
-		return resolved, nil
+	home, err := existingUserDir(current.HomeDir)
+	if err != nil {
+		return "", fmt.Errorf("use account home %q: %w", current.HomeDir, err)
 	}
-	return "", errors.Join(errs...)
+	return home, nil
 }
 
 func existingUserDir(path string) (string, error) {
@@ -338,14 +359,14 @@ func checkLockFile(info os.FileInfo, path string) error {
 	return checkLockOwner(info, "lock file")
 }
 
-// lockName serializes generation-checked, name-addressed deletes across
-// cooperating processes and library revisions on this host. Every new
-// caller takes three barriers in a fixed order: the parent revision's
-// TMPDIR flock, the UserCacheDir flock introduced by the first hardened
-// revision, and the durable state flock. An old caller takes its one
-// historical barrier, so no old/new pair can enter the critical section
-// together. Failure to establish any historical barrier is a fail-closed
-// compatibility error.
+// lockName serializes name-addressed creates and generation-checked
+// deletes across cooperating processes on this host. Every new caller
+// takes three barriers in a fixed order: the parent revision's TMPDIR
+// flock, the UserCacheDir flock introduced by the first hardened revision,
+// and the durable state flock. An old caller takes only its historical
+// barrier, so coordination with an old binary is guaranteed only when its
+// historical path is the same. Failure to establish a historical namespace
+// is a fail-closed compatibility error.
 func lockName(ctx context.Context, name string) (func(), error) {
 	return lockNameWithHooks(ctx, name, nil)
 }
@@ -383,7 +404,7 @@ func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (
 	acquire := func(stage nameLockStage, path string, touch bool) error {
 		unlock, err := acquireLockFile(ctx, stage, path, touch, hooks)
 		if err != nil {
-			return fmt.Errorf("%w: acquire %s lock: %w", ErrNameLockCompatibility, stage, err)
+			return wrapNameLockAcquireError(stage, err)
 		}
 		acquired = append(acquired, unlock)
 		return nil
@@ -404,20 +425,41 @@ func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (
 	maintenanceUnlock, err := acquireLockFile(ctx, maintenanceNameLockStage, maintenancePath, false, nil)
 	if err != nil {
 		release()
-		return nil, fmt.Errorf("%w: acquire lock maintenance: %w", ErrNameLockCompatibility, err)
+		return nil, wrapNameLockAcquireError("lock maintenance", err)
 	}
 	if err := acquire(stateNameLockStage, statePath, true); err != nil {
 		maintenanceUnlock()
 		release()
 		return nil, err
 	}
-	maintenanceUnlock()
 
-	if err := cleanupNameLockFiles(ctx, stateDir, statePath, time.Now()); err != nil {
-		release()
-		return nil, fmt.Errorf("%w: lock maintenance: %w", ErrNameLockCompatibility, err)
+	// Keep maintenance held while the stale-file sweep runs. Releasing it
+	// before the sweep would allow another caller to hold maintenance while
+	// waiting for this state lock, producing a lock-order inversion.
+	if hooks != nil && hooks.beforeCleanup != nil {
+		hooks.beforeCleanup()
 	}
+	if err := cleanupNameLockFilesLocked(ctx, stateDir, statePath, time.Now(), nameLockCleanupScan, nameLockCleanupDelete); err != nil {
+		maintenanceUnlock()
+		release()
+		return nil, wrapNameLockMaintenanceError(err)
+	}
+	maintenanceUnlock()
 	return release, nil
+}
+
+func wrapNameLockAcquireError(stage nameLockStage, err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("acquire %s lock: %w", stage, err)
+	}
+	return fmt.Errorf("%w: acquire %s lock: %w", ErrNameLockCompatibility, stage, err)
+}
+
+func wrapNameLockMaintenanceError(err error) error {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("lock maintenance: %w", err)
+	}
+	return fmt.Errorf("%w: lock maintenance: %w", ErrNameLockCompatibility, err)
 }
 
 func acquireLockFile(ctx context.Context, stage nameLockStage, path string, touch bool, hooks *nameLockHooks) (func(), error) {
@@ -565,7 +607,13 @@ func cleanupNameLockFilesAt(ctx context.Context, dir, keep string, now time.Time
 		return err
 	}
 	defer maintenanceUnlock()
+	return cleanupNameLockFilesLocked(ctx, dir, keep, now, scanLimit, deleteLimit)
+}
 
+// cleanupNameLockFilesLocked performs the sweep while the caller holds the
+// namespace maintenance lock. Keeping that lock held is what prevents a
+// second caller from opening a candidate between the probe and unlink.
+func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.Time, scanLimit, deleteLimit int) error {
 	df, err := os.OpenFile(dir, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return fmt.Errorf("open lock directory %s: %w", dir, err)

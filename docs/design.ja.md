@@ -210,25 +210,31 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 
 Apple Container ではコンテナ ID が名前であるため、`inspect` と `delete` の間で同じ名前が再生成される可能性がある。
 生成ラベルの検証と削除は、名前ごとの `flock` の下で実行する。
-新しい実装は、親リビジョンの `TMPDIR` ロック、UserCacheDir を使う初版ハードニングのロック、永続するユーザー state ディレクトリのロックを、この順で取得する。
+名前が同じで、世代がないハンドルや `inspect` 結果の世代欠落は name ベース削除をしない。
+create、inspect、prune、delete は、検証済みの固定ユーザー state 名前ロックを使う。
+Docker は検証済み immutable ID でのみ削除し、名前ロックを取得しない。
+新しい実装は、親リビジョンの `TMPDIR` ロック、UserCacheDir を使う初版ハードニングのロック、アカウント情報から導いた固定 state ディレクトリのロックを、この順で取得する。
+`XDG_STATE_HOME` や `HOME` で同じアカウントの lock namespace を分けたりはしない。
 移行用ロックの解決または取得に失敗した場合は、臨界領域へ入らず互換性エラーを返す。
+古い実装が異なる `TMPDIR` を使う場合、旧実装と新しい実装の historical path は一致しないため、mixed-revision の保証はその組み合わせには適用されない。rollout は段階的に行う。
 state のファイル名は名前の SHA-256 ダイジェストであり、`TMPDIR` や cache が異なっても新しい実装彼此は同じ state inode を使う。
 すべてのロックファイルは `O_NOFOLLOW` で開き、ファイル種別、所有者、`0600`、path と open fd の inode 一致を `flock` の前後で確認する。
 state ディレクトリは所有者と置換可能性を検索し、sticky bit を持つ標準の temporary root は sticky 規則で保護されるため受け入れる。
-Docker は immutable ID で削除するため、名前ロックを取得しない。
 
 最近使用した state ロックファイルは保持し、他の協力プロセスが保持する inode は unlink しない。
-namespace の maintenance `flock` は、新しい呼び出しの open から `flock` までの窓と cleanup を分離する。
+namespace の maintenance `flock` は cleanup の sweep が終わるまで保持し、maintenance を保持しながら state lock を待つ順位逆転を防ぐ。
 cleanup は 1 回の取得ごとに最大 258 件（name-lock 256 件と maintenance 1 件）を調べ、最大 32 件だけを削除する。
 7 日より古いファイルは削除対象であり、256 件の上限を超えた場合は他のプロセスが使用していないファイルなら早く削除できる。
 非 blocking exclusive `flock` を取得できない候補は skip するため、保持中の inode は cleanup 対象にならない。
 旧実装と併存できるあいだは、移行用ロックファイルを cleanup しない。
 
 外部の `container delete` と再作成は、この lock を使わず、名前だけでは検出できない。
+`Prune` と `PruneReuseGroup` は list 時の generation、managed label、group、state を保存し、name lock 内で fresh inspect して再検証する。
+watchdog reaper は Apple の inspect/delete 間 동안同じ stable lock を `lockf` で保持し、helper や lock file がない場合は fail closed して削除しない。Docker の ID 経路は lock-free。
 `Terminate` と `TerminateContainer` は、各段階へ 30 秒ずつ割り当てるのではなく、lock 取得、inspect、delete を一つの既定 30 秒の aggregate budget で実行する。
 `cleanupFailedCreate` も lock 取得と backend 処理に一つの 30 秒 budget を使う。
 呼び出し元が指定した短い deadline は、この aggregate budget を上書きしない。
-lock や directory の失敗は `Run` のエラーへ join し、cleanup がコンテナを残した事实を隠さない。
+lock や directory の失敗は `Run` のエラーへ join し、rollback の cleanup error も `%w` で保持する。
 
 ## セキュリティ設計
 
@@ -237,7 +243,7 @@ lock や directory の失敗は `Run` のエラーへ join し、cleanup がコ�
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
+ここはスクリプト本文を固定文字列とし、コンテナ ID とライブラリ生成の lock path は検証済みの標準入力データとして渡す。
 スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証してからパイプへ書く。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 

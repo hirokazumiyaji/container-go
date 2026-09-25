@@ -62,7 +62,8 @@ func TestCleanupIsNilSafe(t *testing.T) {
 // lsRunner serves a canned `ls` listing and records deletes.
 type lsRunner struct {
 	*fakeRunner
-	lsJSON string
+	lsJSON          string
+	inspectJSONByID map[string]string
 }
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -70,17 +71,31 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
+	if args[0] == "inspect" {
+		if data, ok := l.inspectJSONByID[args[len(args)-1]]; ok {
+			l.calls = append(l.calls, args)
+			return []byte(data), nil, nil
+		}
+	}
 	return l.fakeRunner.Run(ctx, args...)
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"bbbbbbbbbbbbbbbb"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
 func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
-	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
+	base := newTestRunner()
+	base.creations = map[string]string{"managed-stopped": "aaaaaaaaaaaaaaaa"}
+	f := &lsRunner{
+		fakeRunner: base,
+		lsJSON:     pruneLsJSON,
+		inspectJSONByID: map[string]string{
+			"managed-stopped": strings.ReplaceAll(reuseInspectJSON("managed-stopped", "stopped", "redis:7-alpine"), "cccccccccccccccc", "aaaaaaaaaaaaaaaa"),
+		},
+	}
 
 	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {

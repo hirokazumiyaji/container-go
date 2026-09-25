@@ -42,7 +42,9 @@ func Cleanup(tb testing.TB, ctr *Container) {
 }
 
 // Prune removes stopped containers created by this library, from any
-// session. It returns the IDs it removed.
+// session. On Apple Container, each list candidate is re-inspected and its
+// generation, managed label, and state must still match before its name is
+// deleted under the per-name lock. It returns the IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
@@ -52,34 +54,92 @@ func Prune(ctx context.Context) ([]string, error) {
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
+	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", "")
 }
 
-// pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. errKind prefixes per-ID delete failures ("prune", …).
-func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+// pruneListed lists candidates and removes them. Backends with immutable
+// delete IDs use the list target directly. Name-addressed backends retain
+// list-time identity and revalidate it under the same per-name lock.
+func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]pruneCandidate, error), errKind, reuseGroup string) ([]string, error) {
+	opCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := r.Run(qCtx, listArgs...)
+	stdout, _, err := r.Run(opCtx, listArgs...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
+		return nil, cli.Classify(opCtx, r, err, eng.probe())
 	}
-	ids, err := parse(stdout)
+	candidates, err := parse(stdout)
 	if err != nil {
 		return nil, err
 	}
 
 	var removed []string
 	var errs []error
-	for _, id := range ids {
-		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
-		dCancel()
-		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
+	for _, candidate := range candidates {
+		if err := opCtx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", errKind, err))
+			break
+		}
+		var didRemove bool
+		if eng.nameAddressedDeletes() {
+			didRemove, err = pruneNamedCandidate(opCtx, r, eng, candidate, errKind, reuseGroup)
+		} else {
+			didRemove, err = deletePruneCandidate(opCtx, r, eng, candidate.id, errKind)
+		}
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
-		removed = append(removed, id)
+		if didRemove {
+			removed = append(removed, candidate.id)
+		}
 	}
 	return removed, errors.Join(errs...)
+}
+
+func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
+	_, _, err := r.Run(ctx, eng.deleteArgs(id)...)
+	if err != nil && !isNotFound(err) {
+		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
+	}
+	return true, nil
+}
+
+// pruneNamedCandidate closes the list/inspect/delete race for Apple
+// Container. The fresh inspect and delete remain in one locked section.
+func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+	if candidate.id == "" || !nameRE.MatchString(candidate.id) {
+		return false, nil
+	}
+	unlock, err := lockName(ctx, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: lock name: %w", errKind, candidate.id, err)
+	}
+	defer unlock()
+
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(ctx)
+	if isNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
+		return false, nil
+	}
+	return deletePruneCandidate(ctx, r, eng, candidate.id, errKind)
+}
+
+func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
+	if fresh == nil || !candidate.managed || !creationRE.MatchString(candidate.creation) ||
+		candidate.state == "" || candidate.state == StateUnknown {
+		return false
+	}
+	if fresh.labels[managedLabel] != "true" || fresh.labels[creationLabel] != candidate.creation ||
+		fresh.state != candidate.state || fresh.labels[reuseGroupLabel] != candidate.reuseGroup {
+		return false
+	}
+	if reuseGroup != "" {
+		return candidate.reuseGroup == reuseGroup && fresh.labels[reuseGroupLabel] == reuseGroup
+	}
+	return true
 }

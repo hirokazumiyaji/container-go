@@ -154,7 +154,7 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []string{"one", "two"}) {
+	if !slices.Equal(ids, []pruneCandidate{{id: "one"}, {id: "two"}}) {
 		t.Errorf("ids = %v", ids)
 	}
 }

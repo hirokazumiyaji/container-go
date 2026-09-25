@@ -163,8 +163,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		if cleanupErr != nil {
@@ -216,13 +219,30 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
+// runCreateLocked serializes name-addressed creates with the guarded
+// delete paths. attempted is separate from err so a lock setup failure does
+// not trigger failed-create cleanup for a command that was never issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
+	if cfg.eng.nameAddressedDeletes() {
+		lockCtx, lockCancel := withDefaultTimeout(ctx, queryTimeout)
+		defer lockCancel()
+		unlock, lockErr := lockName(lockCtx, cfg.name)
+		if lockErr != nil {
+			return nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, lockErr)
+		}
+		defer unlock()
+	}
+	stdout, _, err = cfg.runner.Run(ctx, args...)
+	return stdout, true, err
+}
+
 // rollback removes a container Run created but cannot return. A failed
 // removal is not hidden: without an immutable ID, Terminate refuses to
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		return errors.Join(cause, fmt.Errorf("container %s left behind: %w", c.id, err))
 	}
 	return cause
 }
@@ -239,6 +259,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
+	if !cfg.eng.immutableID() && !creationRE.MatchString(cfg.creation) {
+		return fmt.Errorf("cleanup %s: missing or invalid creation generation; refusing name-addressed delete", cfg.name)
+	}
 	if !cfg.eng.immutableID() {
 		unlock, err := lockName(cleanupCtx, cfg.name)
 		if err != nil {
@@ -260,12 +283,20 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return nil
 	}
 	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
+		actual, ok := info.labels[creationLabel]
+		if !ok || actual != cfg.creation {
 			return nil
 		}
 	}
+	if cfg.eng.immutableID() {
+		if !verifiedImmutableID(cfg.eng, info.uid) {
+			return fmt.Errorf("cleanup %s: backend did not return a verified immutable ID", cfg.name)
+		}
+	} else if cfg.creation == "" {
+		return fmt.Errorf("cleanup %s: missing creation generation; refusing name-addressed delete", cfg.name)
+	}
 	target := cfg.name
-	if info.uid != "" {
+	if cfg.eng.immutableID() {
 		target = info.uid
 	}
 	_, _, err = cfg.runner.Run(cleanupCtx, cfg.eng.deleteArgs(target)...)
@@ -333,11 +364,14 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
-	if c.uid != "" {
+	if c.eng.immutableID() {
+		if !verifiedImmutableID(c.eng, c.uid) {
+			return fmt.Errorf("terminate %s: backend did not return a verified immutable ID", c.id)
+		}
 		return c.delete(ctx, c.uid)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if !creationRE.MatchString(c.creation) {
+		return fmt.Errorf("terminate %s: missing or invalid creation generation; refusing name-addressed delete", c.id)
 	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
@@ -356,9 +390,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 	if info.labels[creationLabel] != c.creation {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
-	}
+	// Name-addressed engines must not switch to an ID merely because an
+	// inspect response happens to contain one. Only the engine's verified
+	// immutable-ID path may do that.
 	return c.delete(ctx, c.id)
 }
 

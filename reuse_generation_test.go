@@ -49,11 +49,23 @@ func TestTerminateAllowsMatchingGeneration(t *testing.T) {
 	}
 }
 
+func TestReuseRejectsMissingGeneration(t *testing.T) {
+	info := &engineInfo{labels: map[string]string{
+		managedLabel: "true", reuseLabel: "true",
+	}}
+	cfg := &config{eng: appleEngine{}, name: "shared"}
+	if err := checkReuseOwned(info, "redis", cfg); err == nil || !strings.Contains(err.Error(), "valid creation generation") {
+		t.Fatalf("checkReuseOwned = %v, want missing-generation refusal", err)
+	}
+}
+
 func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	cfg := &config{runner: &generationRunner{creation: "bbbbbbbbbbbbbbbb"}, eng: appleEngine{}, name: "shared"}
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
 	}
 	// Fresh inspect reports a different generation in running state, so
 	// there is nothing stopped to delete.
@@ -69,8 +81,10 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 
 func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
 	}
 	r := &generationStateRunner{creation: "", state: "stopped"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
@@ -84,8 +98,10 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}

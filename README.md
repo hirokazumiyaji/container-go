@@ -167,16 +167,22 @@ Three layers make sure containers do not outlive your tests:
    returning.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+   SIGKILL and panics included. On Apple it holds the same durable
+   per-name lock across generation inspection and deletion, and skips
+   an entry if that lock or `lockf` is unavailable. The reaper needs
+   `/bin/sh`, so it is unavailable on Windows — there, cleanup relies
+   on the first two layers only.
 
 Extras:
 
 - `CONTAINERGO_KEEP=1` keeps containers around for debugging.
 - `container.Prune(ctx)` removes stopped containers this library
   created in any previous session (they carry the
-  `com.github.hirokazumiyaji.container-go` label).
+  `com.github.hirokazumiyaji.container-go` label). On Apple,
+  candidates are freshly re-inspected under the name lock before
+  deletion. During a rolling upgrade, an old binary using a different
+  historical `TMPDIR` cannot participate in the new state-only barrier;
+  stage the upgrade rather than assuming mixed-`TMPDIR` coordination.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -207,13 +213,16 @@ Contract:
   matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
-  watchdog reaper guards deletion the same way.
+  watchdog reaper guards deletion the same way. A name-addressed
+  handle without a valid generation is never deleted.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
-  container tagged with that group (CI teardown). Ordinary `Prune` still
-  only deletes stopped managed containers.
+  container tagged with that group (CI teardown). On Apple, list-time
+  generation, group, managed label, and state are rechecked under the
+  name lock. Ordinary `Prune` still only deletes stopped managed
+  containers.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup
@@ -221,8 +230,8 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
-  script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  script (the reaper) is a fixed string that receives container IDs and
+  generated lock paths only as validated stdin data.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use

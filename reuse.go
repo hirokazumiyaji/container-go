@@ -151,8 +151,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
@@ -178,13 +181,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, ctr.rollback(context.WithoutCancel(ctx), err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, ctr.rollback(context.WithoutCancel(ctx), err)
 		}
 	}
 	return ctr, nil
@@ -196,13 +197,76 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
-	err := ctr.Terminate(ctx)
-	if errors.Is(err, ErrGenerationReplaced) {
+	ctr.uid = info.uid
+
+	if cfg.eng.nameAddressedDeletes() {
+		guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
+		defer guardCancel()
+		unlock, err := lockName(guardCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("reuse %s: lock stopped generation: %w", cfg.name, err)
+		}
+		defer unlock()
+
+		fresh, err := ctr.inspectFresh(guardCtx)
+		if isNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+		}
+		if !sameStoppedReuseGeneration(info, fresh) || fresh.state != StateStopped {
+			return nil
+		}
+		return ctr.delete(guardCtx, freshTarget(fresh, ctr))
+	}
+
+	fresh, err := ctr.inspectFresh(ctx)
+	if isNotFound(err) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+	}
+	if !verifiedImmutableID(cfg.eng, fresh.uid) {
+		return fmt.Errorf("reuse %s: backend did not return a verified immutable ID", cfg.name)
+	}
+	return ctr.delete(ctx, fresh.uid)
+}
+
+func checkReuseIdentity(info *engineInfo, cfg *config) error {
+	if info == nil {
+		return fmt.Errorf("reuse %s: existing container was not found", cfg.name)
+	}
+	if info.labels[managedLabel] != "true" || info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: existing container has no valid creation generation; refusing reuse", cfg.name)
+	}
+	return nil
+}
+
+func sameStoppedReuseGeneration(before, fresh *engineInfo) bool {
+	if before == nil || fresh == nil || !creationRE.MatchString(before.labels[creationLabel]) {
+		return false
+	}
+	return before.labels[creationLabel] == fresh.labels[creationLabel] &&
+		before.labels[reuseGroupLabel] == fresh.labels[reuseGroupLabel] &&
+		(before.uid == "" || before.uid == fresh.uid) &&
+		fresh.labels[managedLabel] == "true" && fresh.labels[reuseLabel] == "true"
+}
+
+func freshTarget(fresh *engineInfo, ctr *Container) string {
+	if fresh != nil && verifiedImmutableID(ctr.eng, fresh.uid) {
+		return fresh.uid
+	}
+	return ctr.id
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -251,8 +315,8 @@ func createRaceMissing(err error) bool {
 // checkReuseOwned reports whether a stopped container may be deleted
 // and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
@@ -405,7 +469,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]pruneCandidate, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group)
+	}, "prune reuse group "+group, group)
 }

@@ -72,6 +72,21 @@ func TestTerminateRefusesReplacedContainer(t *testing.T) {
 	}
 }
 
+func TestTerminateRejectsMissingOrInvalidGeneration(t *testing.T) {
+	for _, generation := range []string{"", "not-a-generation"} {
+		t.Run(generation, func(t *testing.T) {
+			r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
+			ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: generation}
+			if err := ctr.Terminate(context.Background()); err == nil || !strings.Contains(err.Error(), "missing or invalid creation generation") {
+				t.Fatalf("Terminate = %v, want missing-generation refusal", err)
+			}
+			if r.deleteCalls != 0 {
+				t.Fatalf("deleteCalls = %d, want 0", r.deleteCalls)
+			}
+		})
+	}
+}
+
 func TestTerminateDeletesSameGeneration(t *testing.T) {
 	base := newTestRunner()
 	creation := "cccccccccccccccc"
@@ -105,6 +120,7 @@ func TestRunAddsCreationLabel(t *testing.T) {
 }
 
 func TestReaperSkipsReplacedGeneration(t *testing.T) {
+	requireReaperLockf(t)
 	// Stub binary: inspect prints the *current* creation, delete logs.
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -133,6 +149,7 @@ func TestReaperSkipsReplacedGeneration(t *testing.T) {
 }
 
 func TestReaperDeletesMatchingGeneration(t *testing.T) {
+	requireReaperLockf(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/ctr"

@@ -138,15 +138,19 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    から返ります。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
-   削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
-   Windows では前 2 層のみでクリーンアップします。
+   削除します。Apple では世代 inspect と delete の間にも同じ stable
+   name lock を保持し、lock や `lockf` がなければ fail closed して
+   スキップします。リーパーは `/bin/sh` を必要とするため Windows では
+   動かず、Windows では前 2 層のみでクリーンアップします。
 
 補足:
 
 - `CONTAINERGO_KEEP=1` でコンテナを残せます(デバッグ用)。
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
-  を削除します。
+  を削除します。Apple では name lock 内で fresh inspect してから削除します。
+  rolling upgrade 中は、異なる historical `TMPDIR` を使う旧 binary を
+  新しい state-only barrier で協調できないため、段階的に更新します。
 
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 
@@ -172,11 +176,13 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
 - image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
-- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
+- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。名前ベースのハンドルに有効な世代がない場合は削除しない。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
-  コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
+  コンテナを強制削除する(CI 終了時)。Apple では list 時の generation、
+  group、managed label、state を name lock 内で再検証する。通常の
+  `Prune` は stopped のみ。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って

@@ -13,6 +13,18 @@ import (
 	"time"
 )
 
+func TestSameReaperProcessTableRequiresFixedEdges(t *testing.T) {
+	first := map[int][]int{100: {101, 102}, 101: {103}}
+	second := map[int][]int{100: {102, 101}, 101: {103}}
+	if !sameReaperProcessTable(first, second) {
+		t.Fatal("process tables with the same parent-child edges should compare equal")
+	}
+	third := map[int][]int{100: {101, 102}, 102: {103}}
+	if sameReaperProcessTable(first, third) {
+		t.Fatal("process tables with a reparented child must not compare equal")
+	}
+}
+
 func TestReaperDescendantsSignalsBranchesAndRepeats(t *testing.T) {
 	const root = 100
 	rootCalls := 0
@@ -73,6 +85,31 @@ func TestReaperDescendantsHonorsContext(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("bounded traversal took %s", elapsed)
+	}
+}
+
+func TestReaperIdentityLookupHonorsAggregateContext(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := reaperDescendantsWithRefs(
+		ctx,
+		100,
+		func(context.Context, int) ([]int, error) { return nil, nil },
+		func(ctx context.Context, _ int) (reaperProcessRef, error) {
+			<-ctx.Done()
+			return reaperProcessRef{}, ctx.Err()
+		},
+		func(context.Context, reaperProcessRef) error { return nil },
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("identity lookup error = %v, want aggregate context deadline", err)
+	}
+}
+
+func TestKillReaperProcessRefNeverFallsBackToNumber(t *testing.T) {
+	err := killReaperProcessRefContext(context.Background(), reaperProcessRef{pid: 1 << 30})
+	if !errors.Is(err, errReaperProcessIdentityUnavailable) {
+		t.Fatalf("unidentified process ref error = %v, want identity-unavailable", err)
 	}
 }
 

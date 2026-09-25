@@ -1,4 +1,4 @@
-//go:build aix || dragonfly || freebsd || netbsd || openbsd || solaris
+//go:build darwin
 
 package container
 
@@ -14,6 +14,9 @@ import (
 	"time"
 )
 
+// Darwin's lstart field is only second-resolution. stime includes
+// hundredths of a second, giving process identity enough resolution to
+// distinguish rapid PID reuse during descendant cleanup.
 func reaperProcessStartTime(ctx context.Context, pid int) (string, error) {
 	if err := ctx.Err(); err != nil {
 		return "", err
@@ -34,7 +37,7 @@ func reaperProcessStartTime(ctx context.Context, pid int) (string, error) {
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, lookupTimeout)
 	defer cancel()
-	cmd := exec.CommandContext(lookupCtx, psPath, "-o", "lstart=", "-p", strconv.Itoa(pid))
+	cmd := exec.CommandContext(lookupCtx, psPath, "-o", "pid=", "-o", "stime=", "-p", strconv.Itoa(pid))
 	prepareReaperCommand(cmd)
 	cmd.Cancel = func() error { return reaperCommandCancel(cmd) }
 	cmd.WaitDelay = 50 * time.Millisecond

@@ -3,12 +3,16 @@
 package container
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"strings"
 )
 
-func reaperProcessStartTime(pid int) (string, error) {
+func reaperProcessStartTime(ctx context.Context, pid int) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	data, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
 	if err != nil {
 		return "", err
@@ -24,6 +28,9 @@ func reaperProcessStartTime(pid int) (string, error) {
 	const startTimeIndex = 19 // field 22 overall, after field 3 starts at index 0
 	if len(fields) <= startTimeIndex {
 		return "", os.ErrInvalid
+	}
+	if err := ctx.Err(); err != nil {
+		return "", err
 	}
 	return fields[startTimeIndex], nil
 }

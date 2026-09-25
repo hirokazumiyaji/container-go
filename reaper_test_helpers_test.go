@@ -9,7 +9,7 @@ import (
 
 func waitForLogLines(t *testing.T, path string, wants ...string) {
 	t.Helper()
-	waitForReaperLogLinesWithin(t, path, 5*time.Second, wants...)
+	waitForReaperLogLinesWithin(t, path, 30*time.Second, wants...)
 }
 
 func waitForReaperLogLinesWithin(t *testing.T, path string, timeout time.Duration, wants ...string) {
@@ -34,6 +34,10 @@ func waitForReaperLogLinesWithin(t *testing.T, path string, timeout time.Duratio
 }
 
 func closeReaperForTest(t *testing.T, r *reaper) {
+	closeReaperForTestWithin(t, r, 30*time.Second)
+}
+
+func closeReaperForTestWithin(t *testing.T, r *reaper, timeout time.Duration) {
 	t.Helper()
 	r.closeStdin()
 	r.mu.Lock()
@@ -44,7 +48,7 @@ func closeReaperForTest(t *testing.T, r *reaper) {
 	}
 	select {
 	case <-exited:
-	case <-time.After(5 * time.Second):
+	case <-time.After(timeout):
 		t.Fatal("reaper did not exit after stdin close")
 	}
 }

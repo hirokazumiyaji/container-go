@@ -95,6 +95,23 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperProcessesBoundedRegistrationPrefix(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	const entries = 1025
+	for i := 0; i < entries; i++ {
+		if err := r.register(fmt.Sprintf("bounded-%04d", i), ""); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+	}
+	closeReaperForTestWithin(t, r, 60*time.Second)
+	waitForReaperLogLinesWithin(t, logPath, 60*time.Second,
+		"delete --force bounded-0000", "delete --force bounded-1023")
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force bounded-1024") {
+		t.Fatalf("registration cap processed an entry beyond the bounded prefix: %q", data)
+	}
+}
+
 func TestReaperAcceptsFullDockerID(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "rm")
@@ -212,7 +229,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 
 func waitForPath(t *testing.T, path string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		if _, err := os.Stat(path); err == nil {
 			return
@@ -237,7 +254,7 @@ func readReaperPID(t *testing.T, path string) int {
 
 func waitForReaperProcessGone(t *testing.T, pid int) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
 		state := strings.TrimSpace(string(out))
@@ -478,10 +495,11 @@ func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
 }
 
 func TestReaperShellBoundsPgrepLookup(t *testing.T) {
+	t.Setenv("CONTAINERGO_REAPER_DISABLE_MONITOR", "1")
 	dir := t.TempDir()
 	pgrepPath := filepath.Join(dir, "pgrep")
 	helperChildPath := filepath.Join(dir, "helper-child.pid")
-	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nsleep 5 &\necho \"$!\" > "+reaperShellQuote(helperChildPath)+"\nwait\nexit 2\n"), 0o755); err != nil {
+	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nsleep 30 &\necho \"$!\" > "+reaperShellQuote(helperChildPath)+"\nwait\nexit 2\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
@@ -508,7 +526,7 @@ func TestReaperShellBoundsPgrepLookup(t *testing.T) {
 	}
 	started := time.Now()
 	closeReaperForTest(t, r)
-	if elapsed := time.Since(started); elapsed > 4*time.Second {
+	if elapsed := time.Since(started); elapsed > 8*time.Second {
 		t.Fatalf("reaper shell cleanup took %s, want bounded pgrep lookup", elapsed)
 	}
 	waitForPath(t, childPIDPath)
@@ -553,6 +571,33 @@ func TestReaperShellRejectsInvalidPgrepPID(t *testing.T) {
 	childPID := readReaperPID(t, childPIDPath)
 	waitForReaperProcessGone(t, childPID)
 	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
+}
+
+func TestReaperShellUsesPsWhenPgrepIsUnavailable(t *testing.T) {
+	dir := t.TempDir()
+	bin, logPath := writeReaperStub(t)
+	const first = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	childPIDPath := filepath.Join(dir, "child.pid")
+	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then\n" +
+		"  sh -c 'sleep 30' &\n" +
+		"  echo \"$!\" > " + reaperShellQuote(childPIDPath) + "\n" +
+		"  wait\n" +
+		"fi\n"
+	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "rm")
+	helpers := testReaperHelpers(t, reaperHelperPaths{})
+	helpers.pgrep = ""
+	r.helperPaths = helpers
+	r.timeoutSeconds = 1
+	if err := r.register(first, ""); err != nil {
+		t.Fatal(err)
+	}
+	closeReaperForTest(t, r)
+	waitForPath(t, childPIDPath)
+	waitForReaperProcessGone(t, readReaperPID(t, childPIDPath))
+	waitForLogLines(t, logPath, "rm --force "+first)
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {

@@ -53,9 +53,9 @@ max_registered_entries=1024
 registered_entries=0
 ids=""
 while IFS= read -r line; do
-  [ "${#line}" -le 256 ] 2>/dev/null || exit 0
+  [ "$registered_entries" -lt "$max_registered_entries" ] || break
   registered_entries=$((registered_entries + 1))
-  [ "$registered_entries" -le "$max_registered_entries" ] || exit 0
+  [ "${#line}" -le 256 ] 2>/dev/null || continue
   ids="$ids
 $line"
 done
@@ -65,12 +65,19 @@ max_descendant_pids=256
 max_descendant_depth=32
 max_descendant_lookups=64
 helper_output_blocks=512
+cleanup_helper_budget=0
+cleanup_active=0
 work_dir="$5"
 awk_bin="$6"
 pgrep_bin="$7"
 ps_bin="$8"
 rm_bin="$9"
 sleep_bin="${10:-}"
+ps_start_field="${11:-lstart}"
+case "$ps_start_field" in
+  lstart|stime) ;;
+  *) exit 0 ;;
+esac
 case "$timeout" in
   ''|*[!0-9]*) timeout=30 ;;
 esac
@@ -79,27 +86,104 @@ case "$work_dir" in
   /*) [ -d "$work_dir" ] || exit 0 ;;
   *) exit 0 ;;
 esac
-for helper_path in "$awk_bin" "$pgrep_bin" "$ps_bin" "$rm_bin" "$sleep_bin"; do
+for helper_path in "$awk_bin" "$ps_bin" "$rm_bin" "$sleep_bin"; do
   case "$helper_path" in
     /*) [ -x "$helper_path" ] || exit 0 ;;
     *) exit 0 ;;
   esac
 done
+case "$pgrep_bin" in
+  "") pgrep_disabled=1 ;;
+  /*) [ -x "$pgrep_bin" ] || exit 0 ;;
+  *) exit 0 ;;
+esac
 ulimit -f "$helper_output_blocks" 2>/dev/null || exit 0
 reaper_warn() {
   printf 'containergo: %s\n' "$*" >&2
 }
 monitor_enabled() {
+  if [ "${CONTAINERGO_REAPER_DISABLE_MONITOR:-}" = 1 ]; then
+    return 1
+  fi
   monitor_state=$(set -o 2>/dev/null) || monitor_state=
   case "$monitor_state" in
     *"monitor on"*) return 0 ;;
   esac
   return 1
 }
+helper_tree_pids=
+helper_tree_count=0
+helper_tree_known=
+helper_tree_table_result=0
+build_helper_tree() {
+  helper_tree_root="$1"
+  helper_tree_file="$2"
+  helper_tree_known=" $helper_tree_root"
+  helper_tree_pids=
+  helper_tree_edges=
+  helper_tree_count=1
+  helper_tree_added=1
+  while [ "$helper_tree_added" -eq 1 ]; do
+    helper_tree_added=0
+    while IFS=' ' read -r tree_pid tree_ppid tree_rest; do
+      [ -n "$tree_pid" ] && [ -n "$tree_ppid" ] && [ -n "$tree_rest" ] || { helper_tree_table_result=1; break; }
+      case "$tree_pid" in *[!0-9]*) helper_tree_table_result=1; break ;; esac
+      case "$tree_ppid" in *[!0-9]*) helper_tree_table_result=1; break ;; esac
+      case " $helper_tree_known " in
+        *" $tree_pid "*) continue ;;
+      esac
+      case " $helper_tree_known " in
+        *" $tree_ppid "*)
+          printf '%s\n' "$tree_rest" >"$work_dir/identity.$tree_pid" 2>/dev/null || { helper_tree_table_result=1; break; }
+          helper_tree_known="$helper_tree_known $tree_pid"
+          helper_tree_pids="$helper_tree_pids $tree_pid"
+          helper_tree_edges="$helper_tree_edges $tree_ppid:$tree_pid"
+          helper_tree_count=$((helper_tree_count + 1))
+          if [ "$helper_tree_count" -gt "$max_descendant_pids" ]; then
+            helper_tree_table_result=1
+            break
+          fi
+          helper_tree_added=1
+          ;;
+      esac
+    done <"$helper_tree_file"
+    [ "$helper_tree_table_result" -eq 0 ] || break
+  done
+  helper_tree_pids="${helper_tree_pids# }"
+  return "$helper_tree_table_result"
+}
+kill_helper_descendants() {
+  helper_tree_root="$1"
+  helper_tree_table="$work_dir/helper.table"
+  helper_tree_error="$work_dir/helper.err"
+  saved_helper_pid="$helper_pid"
+  saved_helper_timer="$helper_timer"
+  saved_helper_groups="$helper_process_groups"
+  saved_helper_enumeration="$helper_enumeration"
+  helper_enumeration=1
+  run_helper "$helper_tree_table" "$helper_tree_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
+  helper_table_status="$?"
+  helper_pid="$saved_helper_pid"
+  helper_timer="$saved_helper_timer"
+  helper_process_groups="$saved_helper_groups"
+  helper_enumeration="$saved_helper_enumeration"
+  helper_tree_table_result=0
+  if [ "$helper_table_status" -eq 0 ]; then
+    build_helper_tree "$helper_tree_root" "$helper_tree_table" || true
+    for tree_pid in $helper_tree_pids; do
+      kill -0 "$tree_pid" 2>/dev/null || continue
+      kill -KILL "$tree_pid" 2>/dev/null || true
+    done
+  fi
+}
 run_helper() {
   helper_out="$1"
   helper_err="$2"
   shift 2
+  if [ "$cleanup_active" = 1 ]; then
+    [ "$cleanup_helper_budget" -gt 0 ] || return 125
+    cleanup_helper_budget=$((cleanup_helper_budget - 1))
+  fi
   : >"$helper_out" 2>/dev/null || return 125
   : >"$helper_err" 2>/dev/null || return 125
   set -m 2>/dev/null
@@ -124,6 +208,8 @@ run_helper() {
     helper_sleeper=
     if [ "$helper_process_groups" = 1 ]; then
       kill -KILL -"$helper_pid" 2>/dev/null || true
+    elif [ "$helper_enumeration" != 1 ]; then
+      kill_helper_descendants "$helper_pid"
     fi
     kill -KILL "$helper_pid" 2>/dev/null || true
     wait "$helper_pid" 2>/dev/null || true
@@ -144,8 +230,11 @@ remove_files() {
 capture_process_table() {
   process_table="$work_dir/process.table"
   process_table_error="$work_dir/process-table.err"
-  run_helper "$process_table" "$process_table_error" "$ps_bin" -e -o pid= -o ppid= -o lstart=
+  saved_process_helper_enumeration="$helper_enumeration"
+  helper_enumeration=1
+  run_helper "$process_table" "$process_table_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
   process_table_status="$?"
+  helper_enumeration="$saved_process_helper_enumeration"
   if [ "$process_table_status" -ne 0 ]; then
     reaper_warn "process table lookup failed (status $process_table_status)"
     return 1
@@ -185,8 +274,11 @@ capture_identity() {
   identity_file="$2"
   identity_raw="$identity_file.raw"
   identity_error="$identity_file.err"
-  run_helper "$identity_raw" "$identity_error" "$ps_bin" -o pid= -o lstart= -p "$identity_pid"
+  saved_identity_helper_enumeration="$helper_enumeration"
+  helper_enumeration=1
+  run_helper "$identity_raw" "$identity_error" "$ps_bin" -o pid= -o "$ps_start_field=" -p "$identity_pid"
   identity_status="$?"
+  helper_enumeration="$saved_identity_helper_enumeration"
   if [ "$identity_status" -eq 1 ] && [ ! -s "$identity_error" ]; then
     remove_files "$identity_raw" "$identity_error" || true
     return 1
@@ -490,8 +582,64 @@ direct_snapshot_fallback() {
   done
   kill -9 "$kill_root_pid" 2>/dev/null || true
 }
+same_pid_list() {
+  same_left_count=0
+  for same_pid in $1; do
+    same_left_count=$((same_left_count + 1))
+  done
+  same_right_count=0
+  for same_pid in $2; do
+    same_right_count=$((same_right_count + 1))
+  done
+  [ "$same_left_count" -eq "$same_right_count" ] || return 1
+  for same_pid in $1; do
+    case " $2 " in
+      *" $same_pid "*) ;;
+      *) return 1 ;;
+    esac
+  done
+  return 0
+}
+capture_quiesced_process_table() {
+  quiesce_root="$1"
+  quiesce_previous=
+  quiesce_previous_edges=
+  quiesce_stable=0
+  quiesce_pass=0
+  process_table_ready=0
+  while [ "$quiesce_pass" -lt 8 ]; do
+    capture_process_table || return 1
+    helper_tree_table_result=0
+    if ! build_helper_tree "$quiesce_root" "$process_table"; then
+      process_table_ready=0
+      return 1
+    fi
+    quiesce_current="$helper_tree_pids"
+    quiesce_current_edges="$helper_tree_edges"
+    if same_pid_list "$quiesce_previous" "$quiesce_current" && same_pid_list "$quiesce_previous_edges" "$quiesce_current_edges"; then
+      quiesce_stable=$((quiesce_stable + 1))
+      if [ "$quiesce_stable" -ge 1 ]; then
+        return 0
+      fi
+    else
+      quiesce_stable=0
+    fi
+    quiesce_previous="$quiesce_current"
+    quiesce_previous_edges="$quiesce_current_edges"
+    for quiesce_pid in $quiesce_current; do
+      if kill -STOP "$quiesce_pid" 2>/dev/null; then
+        mark_stopped "$quiesce_pid"
+      fi
+    done
+    quiesce_pass=$((quiesce_pass + 1))
+  done
+  reaper_warn "quiesced descendant snapshot did not reach a fixed point"
+  return 1
+}
 kill_pipeline() {
   kill_root_pid="$1"
+  cleanup_active=1
+  cleanup_helper_budget=32
   tombstoned_pids=
   stopped_pids=
   capture_identity "$kill_root_pid" "$work_dir/identity.$kill_root_pid"
@@ -508,14 +656,16 @@ kill_pipeline() {
     return 1
   fi
   process_table_ready=0
-  pgrep_disabled=0
+  if [ -n "$pgrep_bin" ]; then
+    pgrep_disabled=0
+  fi
   # Stop only the validated root process. The timer and helper groups are
   # siblings; a negative group stop could freeze the timer before it reaps
   # its own sleep child.
   if kill -STOP "$kill_root_pid" 2>/dev/null; then
     mark_stopped "$kill_root_pid"
   fi
-  capture_process_table || true
+  capture_quiesced_process_table "$kill_root_pid" || true
   known_parents=" $kill_root_pid"
   known_count=1
   snapshot=
@@ -666,6 +816,7 @@ echo "$ids" | while IFS= read -r line; do
   run_with_timeout "$timeout" process_entry "$bin" "$sub" "$id" "$creation" "$key" || true
 done
 set +f
+helper_enumeration=1
 run_helper "$work_dir/remove.out" "$work_dir/remove.err" "$rm_bin" -f "$work_dir/pgrep.out" "$work_dir/pgrep.err" "$work_dir/process.table" "$work_dir/process-table.err" "$work_dir"/identity.* || true
 set -f
 `
@@ -827,10 +978,14 @@ func (r *reaper) spawnLocked() error {
 	if err != nil {
 		return err
 	}
+	psStartField := "lstart"
+	if runtime.GOOS == "darwin" {
+		psStartField = "stime"
+	}
 	cmd := exec.Command(
 		"/bin/sh", "-c", reaperScript, "containergo-reaper",
 		r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout),
-		workDir, helpers.awk, helpers.pgrep, helpers.ps, helpers.rm, helpers.sleep,
+		workDir, helpers.awk, helpers.pgrep, helpers.ps, helpers.rm, helpers.sleep, psStartField,
 	)
 	prepareReaperCommand(cmd)
 	stdin, err := cmd.StdinPipe()

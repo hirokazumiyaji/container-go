@@ -15,7 +15,7 @@ type reaperHelperPaths struct {
 }
 
 func (p reaperHelperPaths) complete() bool {
-	return p.awk != "" && p.pgrep != "" && p.ps != "" && p.rm != "" && p.sleep != ""
+	return p.awk != "" && p.ps != "" && p.rm != "" && p.sleep != ""
 }
 
 func trustedReaperHelperPath(name string) (string, error) {
@@ -43,8 +43,8 @@ func trustedReaperHelpers() (reaperHelperPaths, error) {
 	if paths.awk, err = trustedReaperHelperPath("awk"); err != nil {
 		return reaperHelperPaths{}, err
 	}
-	if paths.pgrep, err = trustedReaperHelperPath("pgrep"); err != nil {
-		return reaperHelperPaths{}, err
+	if path, pathErr := trustedReaperHelperPath("pgrep"); pathErr == nil {
+		paths.pgrep = path
 	}
 	if paths.ps, err = trustedReaperHelperPath("ps"); err != nil {
 		return reaperHelperPaths{}, err

@@ -48,22 +48,31 @@ func killReaperCommand(ctx context.Context, cmd *exec.Cmd) error {
 	cleanupCtx, cancel := context.WithTimeout(ctx, reaperCleanupTimeout)
 	defer cancel()
 
-	// A timed entry can have its own process group. Quiesce the complete
-	// process table before any KILL so a shell cannot fork a nested child
-	// between one pgrep row and the next. The snapshot and every later
-	// signal retain process identity (pidfd on Linux where available).
+	// A timed entry can have its own process group. Capture the root identity
+	// before quiescing and retain its pidfd/process handle through signaling.
+	rootRef, rootIdentityErr := captureReaperProcessIdentityContext(cleanupCtx, cmd.Process.Pid)
+	// Quiesce the complete process table before any KILL so a shell cannot
+	// fork a nested child between one lookup row and the next. Every lookup
+	// and identity check uses the same aggregate cleanup context.
 	table, quiesceErr := quiesceReaperTree(cleanupCtx, cmd.Process.Pid)
+	if rootIdentityErr != nil && !reaperProcessRefGone(rootIdentityErr) {
+		quiesceErr = errors.Join(quiesceErr, rootIdentityErr)
+	}
 	var traversalErr error
 	if table != nil {
-		traversalErr = reaperDescendantsWithTable(cleanupCtx, cmd.Process.Pid, table, killReaperProcessRef)
+		traversalErr = reaperDescendantsWithTable(cleanupCtx, cmd.Process.Pid, table, killReaperProcessRefContext)
 	} else {
-		traversalErr = reaperDescendantsWithRefs(cleanupCtx, cmd.Process.Pid, reaperValidatedPgrepLookup, captureReaperProcessIdentity, killReaperProcessRef)
+		lookup := reaperValidatedPgrepLookup
+		if _, err := trustedReaperPgrepPath(); err != nil {
+			lookup = reaperValidatedPsLookup
+		}
+		traversalErr = reaperDescendantsWithRefs(cleanupCtx, cmd.Process.Pid, lookup, captureReaperProcessIdentityContext, killReaperProcessRefContext)
 	}
 
 	// Always try the root group even when pgrep is unavailable or the
 	// bounded traversal was interrupted. The root child is still owned by
 	// this process while cleanup runs, so its group ID cannot be recycled.
-	rootErr := killReaperRoot(cmd)
+	rootErr := killReaperRoot(cleanupCtx, cmd, rootRef)
 	if quiesceErr != nil {
 		quiesceErr = fmt.Errorf("quiesce snapshot: %w", quiesceErr)
 	}
@@ -76,20 +85,31 @@ func killReaperCommand(ctx context.Context, cmd *exec.Cmd) error {
 	return errors.Join(quiesceErr, traversalErr, rootErr)
 }
 
-func killReaperRoot(cmd *exec.Cmd) error {
+func killReaperRoot(ctx context.Context, cmd *exec.Cmd, ref reaperProcessRef) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
 	pid := cmd.Process.Pid
-	pgid, groupErr := reaperProcessGroupID(pid)
-	if groupErr == nil && pgid == pid {
-		// The root is a direct child and has not been reaped while this
-		// cleanup is running. Check its handle immediately before using
-		// the group ID, then fall back to the pidfd/handle signal below.
-		if err := cmd.Process.Signal(syscall.Signal(0)); err == nil {
-			if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil {
+	identityOK := false
+	var identityErr error
+	if ref.identified {
+		matches, err := reaperProcessRefMatchesContext(ctx, ref)
+		if err != nil {
+			if reaperProcessRefGone(err) {
 				return nil
-			} else if !errors.Is(err, syscall.ESRCH) {
-				return err
 			}
-		} else if !reaperProcessRefGone(err) {
+			identityErr = err
+		} else {
+			identityOK = matches
+		}
+	}
+	// A negative group signal is numeric, so only use it while the retained
+	// root identity still matches. If identity was lost, use the direct
+	// process handle (pidfd where available) and never fall back to a number.
+	if identityOK && ref.pgid == pid {
+		if err := syscall.Kill(-pid, syscall.SIGKILL); err == nil {
+			return nil
+		} else if !errors.Is(err, syscall.ESRCH) {
 			return err
 		}
 	}
@@ -97,7 +117,7 @@ func killReaperRoot(cmd *exec.Cmd) error {
 	if err != nil && !reaperProcessRefGone(err) {
 		return err
 	}
-	return nil
+	return identityErr
 }
 
 func killReaperProcess(pid int) error {
@@ -126,6 +146,28 @@ func reaperValidatedPgrepLookup(ctx context.Context, parent int) ([]int, error) 
 	}
 	children := make([]int, 0, len(first))
 	for _, pid := range first {
+		if _, ok := allowed[pid]; ok {
+			children = append(children, pid)
+		}
+	}
+	return children, nil
+}
+
+func reaperValidatedPsLookup(ctx context.Context, parent int) ([]int, error) {
+	first, err := reaperProcessTableSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	second, err := reaperProcessTableSnapshot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	allowed := make(map[int]struct{}, len(second[parent]))
+	for _, pid := range second[parent] {
+		allowed[pid] = struct{}{}
+	}
+	children := make([]int, 0, len(first[parent]))
+	for _, pid := range first[parent] {
 		if _, ok := allowed[pid]; ok {
 			children = append(children, pid)
 		}
@@ -167,7 +209,7 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 		parent := item.pid
 		state, ok := states[parent]
 		if !ok {
-			ref, err := captureReaperProcessIdentity(parent)
+			ref, err := captureReaperProcessIdentityContext(ctx, parent)
 			if err != nil {
 				if !reaperProcessRefGone(err) && !errors.Is(err, errReaperProcessIdentityUnavailable) {
 					errs = append(errs, fmt.Errorf("reaper: identify snapshot pid %d: %w", parent, err))
@@ -181,7 +223,7 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 		if state.tombstoned {
 			continue
 		}
-		matches, err := reaperProcessRefMatches(state.ref)
+		matches, err := reaperProcessRefMatchesContext(ctx, state.ref)
 		if err != nil || !matches {
 			if reaperProcessRefGone(err) || errors.Is(err, errReaperProcessIdentityChanged) || errors.Is(err, errReaperProcessIdentityUnavailable) {
 				state.tombstoned = true
@@ -220,7 +262,7 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 			if state == nil || state.tombstoned {
 				continue
 			}
-			matches, err := reaperProcessRefMatches(state.ref)
+			matches, err := reaperProcessRefMatchesContext(ctx, state.ref)
 			if err != nil || !matches {
 				if reaperProcessRefGone(err) || errors.Is(err, errReaperProcessIdentityChanged) || errors.Is(err, errReaperProcessIdentityUnavailable) {
 					state.tombstoned = true
@@ -229,7 +271,7 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 				}
 				continue
 			}
-			if err := visit(state.ref); err != nil {
+			if err := visit(ctx, state.ref); err != nil {
 				failedSignals[pid] = err
 				if attempt == 0 {
 					errs = append(errs, fmt.Errorf("reaper: signal snapshot pid %d: %w", pid, err))
@@ -243,9 +285,9 @@ func reaperDescendantsWithTable(ctx context.Context, root int, table map[int][]i
 }
 
 func reaperDescendantsWithLookup(ctx context.Context, root int, visit func(int) error, lookup reaperDescendantLookup) error {
-	return reaperDescendantsWithRefs(ctx, root, lookup, func(pid int) (reaperProcessRef, error) {
+	return reaperDescendantsWithRefs(ctx, root, lookup, func(_ context.Context, pid int) (reaperProcessRef, error) {
 		return reaperProcessRef{pid: pid}, nil
-	}, func(ref reaperProcessRef) error { return visit(ref.pid) })
+	}, func(_ context.Context, ref reaperProcessRef) error { return visit(ref.pid) })
 }
 
 var (
@@ -262,10 +304,17 @@ type reaperProcessRef struct {
 	check      func() (bool, error)
 }
 
-type reaperProcessRefLookup func(int) (reaperProcessRef, error)
-type reaperProcessRefVisit func(reaperProcessRef) error
+type reaperProcessRefLookup func(context.Context, int) (reaperProcessRef, error)
+type reaperProcessRefVisit func(context.Context, reaperProcessRef) error
 
 func captureReaperProcessIdentity(pid int) (reaperProcessRef, error) {
+	return captureReaperProcessIdentityContext(context.Background(), pid)
+}
+
+func captureReaperProcessIdentityContext(ctx context.Context, pid int) (reaperProcessRef, error) {
+	if err := ctx.Err(); err != nil {
+		return reaperProcessRef{}, err
+	}
 	if pid <= 0 {
 		return reaperProcessRef{}, fmt.Errorf("reaper: invalid process pid %d", pid)
 	}
@@ -283,7 +332,7 @@ func captureReaperProcessIdentity(pid int) (reaperProcessRef, error) {
 	if err := process.Signal(syscall.Signal(0)); err != nil {
 		return reaperProcessRef{}, err
 	}
-	startTime, startErr := reaperProcessStartTime(pid)
+	startTime, startErr := reaperProcessStartTime(ctx, pid)
 	if startErr != nil {
 		if reaperProcessRefGone(startErr) {
 			return reaperProcessRef{}, startErr
@@ -293,7 +342,10 @@ func captureReaperProcessIdentity(pid int) (reaperProcessRef, error) {
 	return reaperProcessRef{pid: pid, pgid: pgid, startTime: startTime, process: process, identified: true}, nil
 }
 
-func reaperProcessRefMatches(ref reaperProcessRef) (bool, error) {
+func reaperProcessRefMatchesContext(ctx context.Context, ref reaperProcessRef) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if ref.check != nil {
 		return ref.check()
 	}
@@ -316,7 +368,7 @@ func reaperProcessRefMatches(ref reaperProcessRef) (bool, error) {
 		return false, errReaperProcessIdentityChanged
 	}
 	if ref.startTime != "" {
-		startTime, err := reaperProcessStartTime(ref.pid)
+		startTime, err := reaperProcessStartTime(ctx, ref.pid)
 		if err != nil {
 			return false, err
 		}
@@ -332,13 +384,14 @@ func reaperProcessRefGone(err error) bool {
 }
 
 func killReaperProcessRef(ref reaperProcessRef) error {
+	return killReaperProcessRefContext(context.Background(), ref)
+}
+
+func killReaperProcessRefContext(ctx context.Context, ref reaperProcessRef) error {
 	if !ref.identified {
-		if ref.check != nil {
-			return errReaperProcessIdentityUnavailable
-		}
-		return killReaperProcess(ref.pid)
+		return errReaperProcessIdentityUnavailable
 	}
-	ok, err := reaperProcessRefMatches(ref)
+	ok, err := reaperProcessRefMatchesContext(ctx, ref)
 	if err != nil {
 		if reaperProcessRefGone(err) {
 			return nil
@@ -360,7 +413,7 @@ func killReaperProcessRef(ref reaperProcessRef) error {
 }
 
 func reaperDescendantsWithLookupAndIdentity(ctx context.Context, root int, visit func(int) error, lookup reaperDescendantLookup, identify reaperDescendantIdentity) error {
-	return reaperDescendantsWithRefs(ctx, root, lookup, func(pid int) (reaperProcessRef, error) {
+	return reaperDescendantsWithRefs(ctx, root, lookup, func(_ context.Context, pid int) (reaperProcessRef, error) {
 		pgid, identified := identify(pid)
 		if !identified && pid == root {
 			return reaperProcessRef{pid: pid}, nil
@@ -380,7 +433,7 @@ func reaperDescendantsWithLookupAndIdentity(ctx context.Context, root int, visit
 				return true, nil
 			},
 		}, nil
-	}, func(ref reaperProcessRef) error { return visit(ref.pid) })
+	}, func(_ context.Context, ref reaperProcessRef) error { return visit(ref.pid) })
 }
 
 func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDescendantLookup, lookupRef reaperProcessRefLookup, visitRef reaperProcessRefVisit) error {
@@ -395,7 +448,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 		ref        reaperProcessRef
 		tombstoned bool
 	}
-	rootRef, rootErr := lookupRef(root)
+	rootRef, rootErr := lookupRef(ctx, root)
 	if rootErr != nil {
 		if reaperProcessRefGone(rootErr) {
 			return nil
@@ -482,7 +535,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 				continue
 			}
 			if state.ref.identified || state.ref.check != nil {
-				matches, err := reaperProcessRefMatches(state.ref)
+				matches, err := reaperProcessRefMatchesContext(ctx, state.ref)
 				if err != nil || !matches {
 					if reaperProcessRefGone(err) || errors.Is(err, errReaperProcessIdentityChanged) || errors.Is(err, errReaperProcessIdentityUnavailable) {
 						state.tombstoned = true
@@ -501,7 +554,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 				continue
 			}
 			if state.ref.identified || state.ref.check != nil {
-				matches, identityErr := reaperProcessRefMatches(state.ref)
+				matches, identityErr := reaperProcessRefMatchesContext(ctx, state.ref)
 				if identityErr != nil || !matches {
 					if reaperProcessRefGone(identityErr) || errors.Is(identityErr, errReaperProcessIdentityChanged) || errors.Is(identityErr, errReaperProcessIdentityUnavailable) {
 						state.tombstoned = true
@@ -531,7 +584,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 					rememberError("lookup", parentPID, fmt.Errorf("%w: more than %d descendants", errReaperDescendantLimit, maxReaperDescendantPIDs))
 					break
 				}
-				ref, refErr := lookupRef(child)
+				ref, refErr := lookupRef(ctx, child)
 				if refErr != nil {
 					if reaperProcessRefGone(refErr) || errors.Is(refErr, errReaperProcessIdentityUnavailable) {
 						states[child] = &descendantState{ref: reaperProcessRef{pid: child}, tombstoned: true}
@@ -571,7 +624,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 			if state == nil || state.tombstoned {
 				continue
 			}
-			matches, err := reaperProcessRefMatches(state.ref)
+			matches, err := reaperProcessRefMatchesContext(ctx, state.ref)
 			if err != nil || !matches {
 				if reaperProcessRefGone(err) || errors.Is(err, errReaperProcessIdentityChanged) {
 					state.tombstoned = true
@@ -580,7 +633,7 @@ func reaperDescendantsWithRefs(ctx context.Context, root int, lookup reaperDesce
 				}
 				continue
 			}
-			if err := visitRef(state.ref); err != nil {
+			if err := visitRef(ctx, state.ref); err != nil {
 				rememberError("signal", pid, err)
 			} else {
 				clearError("signal", pid)
@@ -678,6 +731,22 @@ func reaperTableDescendants(table map[int][]int, root int) []int {
 	return ordered
 }
 
+func sameReaperProcessTable(first, second map[int][]int) bool {
+	parents := make(map[int]struct{}, len(first)+len(second))
+	for parent := range first {
+		parents[parent] = struct{}{}
+	}
+	for parent := range second {
+		parents[parent] = struct{}{}
+	}
+	for parent := range parents {
+		if !sameReaperPIDSet(first[parent], second[parent]) {
+			return false
+		}
+	}
+	return true
+}
+
 func sameReaperPIDSet(first, second []int) bool {
 	if len(first) != len(second) {
 		return false
@@ -697,7 +766,8 @@ func sameReaperPIDSet(first, second []int) bool {
 func quiesceReaperTree(ctx context.Context, root int) (map[int][]int, error) {
 	var lastErr error
 	var table map[int][]int
-	previous := []int(nil)
+	var previous map[int][]int
+	stablePasses := 0
 	for pass := 0; pass < maxReaperDescendantSnapshotPasses; pass++ {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -711,19 +781,24 @@ func quiesceReaperTree(ctx context.Context, root int) (map[int][]int, error) {
 		if len(pids) > maxReaperDescendantPIDs {
 			return nil, fmt.Errorf("%w: quiesce snapshot exceeded %d processes", errReaperDescendantLimit, maxReaperDescendantPIDs)
 		}
-		if sameReaperPIDSet(previous, pids) {
-			return table, lastErr
+		if sameReaperProcessTable(previous, table) {
+			stablePasses++
+			if stablePasses >= 1 {
+				return table, lastErr
+			}
+		} else {
+			stablePasses = 0
 		}
-		previous = append(previous[:0], pids...)
+		previous = table
 		for _, pid := range pids {
-			ref, err := captureReaperProcessIdentity(pid)
+			ref, err := captureReaperProcessIdentityContext(ctx, pid)
 			if err != nil {
 				if !reaperProcessRefGone(err) {
 					lastErr = err
 				}
 				continue
 			}
-			matches, matchErr := reaperProcessRefMatches(ref)
+			matches, matchErr := reaperProcessRefMatchesContext(ctx, ref)
 			if matchErr != nil || !matches {
 				if !reaperProcessRefGone(matchErr) && !errors.Is(matchErr, errReaperProcessIdentityChanged) && !errors.Is(matchErr, errReaperProcessIdentityUnavailable) {
 					lastErr = matchErr

@@ -46,8 +46,13 @@ func TestReaperScriptValidationIsPortable(t *testing.T) {
 	for _, required := range []string{
 		"valid_docker_id \"$uid\"",
 		"\"$pgrep_bin\" -P \"$parent\"",
+		"pgrep_disabled=1",
 		"\"$awk_bin\" -v key=",
-		"\"$ps_bin\" -o pid= -o lstart=",
+		"\"$ps_bin\" -o pid= -o \"$ps_start_field=\"",
+		"ps_start_field=\"${11:-lstart}\"",
+		"CONTAINERGO_REAPER_DISABLE_MONITOR",
+		"kill_helper_descendants",
+		"capture_quiesced_process_table",
 		"\"$rm_bin\" -f",
 		"work_dir=\"$5\"",
 		"ulimit -f",
@@ -56,6 +61,7 @@ func TestReaperScriptValidationIsPortable(t *testing.T) {
 		"tombstoned_pids",
 		"kill -9 \"$snapshot_pid\"",
 		"max_descendant_lookups",
+		"cleanup_helper_budget",
 	} {
 		if !strings.Contains(reaperScript, required) {
 			t.Errorf("reaper script missing bounded cleanup fragment %q", required)

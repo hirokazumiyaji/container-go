@@ -328,10 +328,16 @@ entries are rejected and logged. For Apple, the reaper stores the generation,
 reads the label as a line-anchored JSON field (`"key": "value"`, never a
 substring), and skips deletion on mismatch. Each reaper entry's complete
 inspect/status-marker/filter/delete pipeline carries a bounded 30s timeout via
-pinned POSIX helpers, and the timeout snapshots and validates descendants
-before signaling their process groups. On Unix, descendant cleanup retains
-pidfd or process-start-time identity and tombstones exited PIDs before every
-retry. Helper output is capped, and helper process groups are killed and reaped.
+pinned POSIX helpers. The timeout takes a fixed-point, quiesced descendant
+snapshot before signaling, including nested `setsid` children. On Unix,
+cleanup retains pidfd or high-resolution process-start-time identity
+(including Darwin `stime`), tombstones exited PIDs, and never falls back to a
+numeric kill after identity loss. One aggregate cleanup context and helper
+budget cover every lookup and retry. `pgrep` is optional; a pinned `ps`
+process-table fallback supplies descendants when it is unavailable. Helper
+output is capped, and helper descendants are enumerated, killed, and reaped
+when monitor mode is unavailable. Registration input is bounded to its
+prefix, so the cap does not disable cleanup.
 The leader's own pull/create uses an independent `runTimeout` budget;
 `reuseAttachTimeout` bounds only attach polling
 for another process's container.

@@ -7,9 +7,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -62,15 +62,15 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 }
 
 // permanentStreamStartError reports setup failures that cannot change when
-// the same runner opens the same backend again. Absolute paths bypass
-// exec.LookPath, so permission and existence failures arrive as PathError
-// rather than exec.Error and need explicit classification.
-func permanentStreamStartError(bin string, err error) bool {
+// the same runner opens the same backend again. Explicit relative paths
+// bypass exec.LookPath just like absolute paths, so their permission,
+// existence, and executable-format failures need explicit classification.
+func permanentStreamStartError(_ string, err error) bool {
 	var execErr *exec.Error
 	if errors.As(err, &execErr) {
 		return true
 	}
-	return filepath.IsAbs(bin) && (os.IsPermission(err) || os.IsNotExist(err))
+	return os.IsPermission(err) || os.IsNotExist(err) || errors.Is(err, syscall.ENOEXEC)
 }
 
 type processStream struct {

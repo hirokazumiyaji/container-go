@@ -35,10 +35,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 
 	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
 	defer infoCancel()
-	info, err := reuseInfoForCaller(infoCtx, cfg, base.info)
+	info, err := reuseInfoForCaller(infoCtx, cfg, base)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
-			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect", cfg.name)
+			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect: %w", cfg.name, context.DeadlineExceeded)
 		}
 		return nil, err
 	}
@@ -60,7 +60,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published: cfg.published,
 		reused:    true,
 		creation:  info.labels[creationLabel],
-		uid:       base.uid,
+		uid:       info.uid,
 	}
 	ctr.cacheInfo(info)
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
@@ -81,7 +81,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 	for {
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
+				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", cfg.name, context.DeadlineExceeded)
 			}
 			return nil, err
 		}
@@ -216,7 +216,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
-	info, err := reuseInfoForCaller(infoCtx, cfg, ctr.info)
+	info, err := reuseInfoForCaller(infoCtx, cfg, ctr)
 	infoCancel()
 	if err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -315,15 +315,21 @@ func retryReuseInspect(err error) bool {
 }
 
 // reuseInfoForCaller fills a missing/incomplete inspect without turning a
-// backend's brief inspect failure into a failed WithReuse call. The initial
-// value is usually the shared ensure's cached complete inspect; the loop is
-// primarily for callers that received a Running result before its endpoint
-// data became visible.
-func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (*engineInfo, error) {
+// backend's brief inspect failure into a failed WithReuse call. Every
+// refreshed result must still name the same generation and immutable
+// container ID as base; otherwise publishing it would combine one
+// generation's identity with another generation's endpoint data.
+func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*engineInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if reuseInfoReady(cfg, initial) {
+	base.mu.Lock()
+	initial := base.info
+	creation := base.creation
+	uid := base.uid
+	base.mu.Unlock()
+
+	if reuseInfoReady(cfg, initial) && reuseInfoIdentityMatches(initial, creation, uid) {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
@@ -338,6 +344,9 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (
 			return nil, ctxErr
 		}
 		if err == nil {
+			if !reuseInfoIdentityMatches(info, creation, uid) {
+				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+			}
 			if reuseInfoReady(cfg, info) {
 				if err := ctx.Err(); err != nil {
 					return nil, err
@@ -365,6 +374,14 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (
 	}
 }
 
+func reuseInfoIdentityMatches(info *engineInfo, creation, uid string) bool {
+	if info == nil {
+		return false
+	}
+	return (creation == "" || info.labels[creationLabel] == creation) &&
+		(uid == "" || info.uid == uid)
+}
+
 func waitReusePoll(ctx context.Context) bool {
 	timer := time.NewTimer(reusePollInterval)
 	defer timer.Stop()
@@ -378,7 +395,7 @@ func waitReusePoll(ctx context.Context) bool {
 
 func reuseContextError(ctx context.Context, name string) error {
 	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return fmt.Errorf("reuse %s: timed out waiting for a usable container", name)
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, context.DeadlineExceeded)
 	}
 	return ctx.Err()
 }

@@ -53,7 +53,7 @@ func TestReview91ReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
 	cfg := &config{}
 	ready := &engineInfo{state: StateRunning}
 
-	info, err := reuseInfoForCaller(ctx, cfg, ready)
+	info, err := reuseInfoForCaller(ctx, cfg, &Container{info: ready})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}

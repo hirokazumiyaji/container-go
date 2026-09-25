@@ -102,13 +102,14 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
 	}
 	state, err := targetState(waitCtx, target)
+	if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
+		return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
+	}
 	if err != nil {
 		if permanentProbeError(err) {
 			return fmt.Errorf("%s: %w", what, err)
 		}
-		if waitCtx.Err() == nil {
-			lastStateErr = err
-		}
+		lastStateErr = err
 	} else if terminalWaitState(state) {
 		return stateFailure(what, state, lastCheckErr, lastStateErr)
 	}
@@ -154,8 +155,18 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			if matches >= s.occurrences {
 				terminalErr := terminalLogStreamError(waitCtx, stream)
 				_ = stream.Close()
+				if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
+					return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
+				}
 				if terminalErr != nil {
 					return fmt.Errorf("%s: %w", what, terminalErr)
+				}
+				finalErr := finalLifecycleCheck(waitCtx, target, what)
+				if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
+					return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, finalErr)
+				}
+				if finalErr != nil {
+					return finalErr
 				}
 				return nil
 			}
@@ -176,6 +187,9 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		// retry transient open errors and EOF until the startup deadline.
 		if waitCtx.Err() == nil {
 			state, stateErr := targetState(waitCtx, target)
+			if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
+				return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
+			}
 			if stateErr != nil {
 				if permanentProbeError(stateErr) {
 					return fmt.Errorf("%s: %w", what, stateErr)
@@ -242,14 +256,22 @@ func (s *LogStrategy) scanStream(
 			if next.matches >= s.occurrences {
 				ended = false
 				if settleErr := settleScanner(ctx, scanner); settleErr != nil && !errors.Is(settleErr, io.EOF) {
-					results <- logScanResult{matches: next.matches, err: settleErr, replay: next}
+					results <- logScanResult{err: settleErr, replay: replay}
 					return
 				}
 				break
 			}
 		}
 		scanErr := scanner.Err()
-		replaceHistory := ended && scanErr == nil && replay.complete && !reachedBaseline && lineCount > 0 && lineCount == replay.lines
+		if scanErr != nil {
+			// A failed transport may have delivered only a suffix of the
+			// retained history. Commit neither its occurrence count nor
+			// its replay baseline; the next complete connection is the
+			// first trustworthy observation.
+			results <- logScanResult{err: scanErr, replay: replay}
+			return
+		}
+		replaceHistory := ended && replay.complete && !reachedBaseline && lineCount > 0 && lineCount == replay.lines
 		if replaceHistory {
 			next.matches += divergentMatches
 		}
@@ -269,6 +291,9 @@ func (s *LogStrategy) scanStream(
 			return result, nil
 		case <-ticker.C:
 			state, err := targetState(ctx, target)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return logScanResult{err: ctxErr}, nil
+			}
 			if err != nil {
 				if permanentProbeError(err) {
 					return logScanResult{}, fmt.Errorf("%s: %w", what, err)

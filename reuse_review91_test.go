@@ -50,16 +50,24 @@ func (r *review91ReuseRunner) inspectCount() int {
 }
 
 func review91DockerInspect(bound bool) string {
+	return review91DockerInspectIdentity(bound, "myctr", "")
+}
+
+func review91DockerInspectIdentity(bound bool, uid, creation string) string {
 	ports := `{}`
 	if bound {
 		ports = `{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}`
 	}
+	creationLabel := ""
+	if creation != "" {
+		creationLabel = fmt.Sprintf(`,"com.github.hirokazumiyaji.container-go.creation":%q`, creation)
+	}
 	return fmt.Sprintf(`[{
-		"Id":"myctr",
-		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go.reuse":"true"}},
+		"Id":%q,
+		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go.reuse":"true"%s}},
 		"State":{"Status":"running"},
 		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s}
-	}]`, ports)
+	}]`, uid, creationLabel, ports)
 }
 
 func TestReview91WithReuseRetriesTransientInspect(t *testing.T) {
@@ -130,6 +138,7 @@ type review91CreateInspectRunner struct {
 	*fakeRunner
 	created  bool
 	inspects int
+	creation string
 }
 
 func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -144,9 +153,16 @@ func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) (
 		if r.inspects == 1 {
 			return nil, nil, errors.New("temporary post-create inspect failure")
 		}
-		return []byte(review91DockerInspect(true)), nil, nil
+		return []byte(review91DockerInspectIdentity(true, "myctr", r.creation)), nil, nil
 	case "run":
 		r.created = true
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if creation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = creation
+				}
+			}
+		}
 		return []byte("myctr\n"), nil, nil
 	default:
 		return r.fakeRunner.Run(ctx, args...)

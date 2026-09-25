@@ -316,8 +316,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	if uid := c.immutableID(); uid != "" {
+		return c.delete(ctx, uid)
 	}
 	if c.creation == "" {
 		return c.delete(ctx, c.id)
@@ -460,9 +460,10 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 // deliberately not cached for later polls.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	cached := c.info
+	c.mu.Unlock()
+	if cached != nil {
+		return cached, nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
@@ -473,14 +474,23 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 }
 
 // cacheInfo records immutable identity and complete connection data. The
-// caller must hold c.mu when the Container is already shared.
+// UID is write-once so a lazy inspect and a concurrent Terminate cannot
+// disagree about which backend object the handle owns.
 func (c *Container) cacheInfo(info *engineInfo) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	if c.uid == "" {
 		c.uid = info.uid
 	}
 	if c.infoComplete(info) {
 		c.info = info
 	}
+}
+
+func (c *Container) immutableID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.uid
 }
 
 func (c *Container) infoComplete(info *engineInfo) bool {

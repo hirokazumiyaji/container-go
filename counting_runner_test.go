@@ -126,9 +126,9 @@ func TestRunForLogChecksInitialState(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + initial state inspect + logs stream.
-	if got := r.count(); got != 4 {
-		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
+	// image inspect + run + initial/final state inspects + logs stream.
+	if got := r.count(); got != 5 {
+		t.Fatalf("after ForLog Run: calls = %d, want 5", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -138,8 +138,8 @@ func TestRunForLogChecksInitialState(t *testing.T) {
 			inspects++
 		}
 	}
-	if inspects != 1 {
-		t.Fatalf("container inspect calls = %d, want one initial lifecycle check", inspects)
+	if inspects != 2 {
+		t.Fatalf("container inspect calls = %d, want initial and final lifecycle checks", inspects)
 	}
 }
 

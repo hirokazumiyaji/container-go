@@ -207,9 +207,9 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	return errors.Join(errs...)
 }
 
-// finalLifecycleCheck closes the ticker race at a successful strategy
-// boundary. A composite never accepts success without one bounded state
-// observation made after the child returns; probe failure is fail-closed.
+// finalLifecycleCheck closes the ticker race at a successful leaf or
+// composite strategy boundary. Readiness never succeeds without one bounded
+// state observation made afterward; probe failure is fail-closed.
 func finalLifecycleCheck(ctx context.Context, target Target, what string) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -220,8 +220,12 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 		return err
 	}
 	state, err := targetState(probeCtx, target)
+	probeErr := probeCtx.Err()
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return ctxErr
+	}
+	if probeErr != nil {
+		return probeErr
 	}
 	if err != nil {
 		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
@@ -243,6 +247,9 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 	}
 	var lastStateErr error
 	state, err := targetState(ctx, target)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, fmt.Errorf("%s: %w", what, ctxErr)
+	}
 	if err != nil {
 		if permanentProbeError(err) {
 			return nil, fmt.Errorf("%s: %w", what, err)
@@ -262,6 +269,9 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 				return
 			case <-ticker.C:
 				state, err := targetState(ctx, target)
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return
+				}
 				if err != nil {
 					if permanentProbeError(err) {
 						lifecycleErr <- fmt.Errorf("%s: %w", what, err)

@@ -178,13 +178,14 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
 	}
 	state, err := targetState(waitCtx, target)
+	if waitErr := waitCtx.Err(); waitErr != nil {
+		return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
+	}
 	if err != nil {
 		if permanentProbeError(err) {
 			return fmt.Errorf("%s: %w", what, err)
 		}
-		if waitCtx.Err() == nil {
-			lastStateErr = err
-		}
+		lastStateErr = err
 	} else if terminalWaitState(state) {
 		if callerErr := callerCtx.Err(); callerErr != nil {
 			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
@@ -203,6 +204,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			if waitErr := waitCtx.Err(); waitErr != nil {
 				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
 			}
+			finalErr := finalLifecycleCheck(waitCtx, target, what)
+			if waitErr := waitCtx.Err(); waitErr != nil {
+				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, finalErr)
+			}
+			if finalErr != nil {
+				return finalErr
+			}
 			return nil
 		}
 		// Keep the check cause even when the context ends while the check
@@ -219,13 +227,14 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if waitCtx.Err() == nil && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
 			state, stateErr := targetState(waitCtx, target)
+			if waitErr := waitCtx.Err(); waitErr != nil {
+				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
+			}
 			if stateErr != nil {
 				if permanentProbeError(stateErr) {
 					return fmt.Errorf("%s: %w", what, stateErr)
 				}
 				lastStateErr = stateErr
-			} else if waitCtx.Err() != nil {
-				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
 			} else if terminalWaitState(state) {
 				if callerErr := callerCtx.Err(); callerErr != nil {
 					return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
@@ -250,9 +259,16 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				probeCtx, probeCancel := context.WithTimeout(callerCtx, stateCheckInterval)
 				if probeCtx.Err() == nil {
 					state, stateErr := targetState(probeCtx, target)
+					probeErr := probeCtx.Err()
 					probeCancel()
 					if callerErr := callerCtx.Err(); callerErr != nil {
 						return newWaitError(fmt.Sprintf("%s: %s", what, callerErr)+diagnosticSuffix(lastCheckErr, stateErr), callerErr, lastCheckErr, stateErr)
+					}
+					if probeErr != nil {
+						// The bounded diagnostic probe ended while the
+						// lifecycle CLI was returning. Its state error is
+						// incomplete, so retain the strategy timeout.
+						return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, stateErr)
 					}
 					if stateErr != nil {
 						if permanentProbeError(stateErr) {
@@ -310,12 +326,18 @@ func callerDeadlineWins(callerCtx context.Context, startupDeadline time.Time) bo
 func targetState(ctx context.Context, target Target) (State, error) {
 	if stateTarget, ok := target.(StateTarget); ok {
 		state, err := stateTarget.State(ctx)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return StateUnknown, ctxErr
+		}
 		if err != nil {
 			return StateUnknown, err
 		}
 		return canonicalState(state), nil
 	}
 	running, err := target.Running(ctx)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return StateUnknown, ctxErr
+	}
 	if err != nil {
 		return StateUnknown, err
 	}

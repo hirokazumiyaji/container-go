@@ -19,8 +19,8 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated as an Apple Container name or full Docker ID, and the
+// script itself disables globbing and quotes every expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -113,11 +113,12 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// respawning the reaper process as needed. Apple targets are names;
+// Docker targets may be the full 64-hex ID returned by docker run.
+// creation is the generation ID from creationLabel; empty skips the
+// generation check for backward compatibility.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {

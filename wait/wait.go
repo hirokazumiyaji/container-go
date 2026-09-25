@@ -19,6 +19,19 @@ const (
 	stateCheckInterval = time.Second
 )
 
+// State is a container lifecycle state reported by Target.
+type State string
+
+const (
+	StateUnknown    State = "unknown"
+	StateCreated    State = "created"
+	StateRunning    State = "running"
+	StateStopping   State = "stopping"
+	StateStopped    State = "stopped"
+	StateRestarting State = "restarting"
+	StatePaused     State = "paused"
+)
+
 // Target is the container surface strategies probe. *container.Container
 // is adapted to it by container.Run.
 type Target interface {
@@ -26,8 +39,10 @@ type Target interface {
 	// dialable "host:port". An empty port means the first declared
 	// port.
 	Endpoint(ctx context.Context, port string) (string, error)
-	// Running reports whether the container is still running.
-	Running(ctx context.Context) (bool, error)
+	// State reports the current lifecycle state. Probe failures should
+	// be returned with StateUnknown; readiness polling retries them
+	// until its deadline.
+	State(ctx context.Context) (State, error)
 	// FollowLogs streams log output; Close releases the stream.
 	FollowLogs(ctx context.Context) (io.ReadCloser, error)
 	// ExecCommand runs a command in the container and returns its
@@ -57,12 +72,11 @@ func (o options) effective() (timeout, interval time.Duration) {
 }
 
 // poll runs check every interval until it succeeds, the container
-// stops, or the timeout elapses. When checkRunning is true the poll
-// also probes target.Running between checks and fails fast once the
-// container stopped; strategies whose check itself talks to the
-// container (ForExec) pass false and rely on the final classification
-// below.
-func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
+// reaches a terminal wait state, or the timeout elapses. When
+// checkState is true the poll also probes target.State between checks;
+// strategies whose check itself talks to the container (ForExec) pass
+// false and rely on the final classification below.
+func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkState bool) error {
 	timeout, interval := o.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -84,10 +98,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			return nil
 		}
 
-		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
+		if checkState && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
-			if running, err := target.Running(ctx); err == nil && !running {
-				return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+			if state, err := target.State(ctx); err == nil && terminalWaitState(state) {
+				return stateFailure(what, state, lastErr)
 			}
 		}
 
@@ -99,12 +113,12 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			// Probe only after our wait deadline; never override
 			// caller cancellation, and bound the probe so a hung
 			// backend cannot outlive the wait by queryTimeout.
-			if !checkRunning && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			if !checkState && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
-				running, err := target.Running(probeCtx)
+				state, err := target.State(probeCtx)
 				probeCancel()
-				if err == nil && !running {
-					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+				if err == nil && terminalWaitState(state) {
+					return stateFailure(what, state, lastErr)
 				}
 			}
 			if errors.Is(ctx.Err(), context.Canceled) {
@@ -114,6 +128,21 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		case <-time.After(interval):
 		}
 	}
+}
+
+// terminalWaitState reports states that cannot become ready during a
+// startup wait without external intervention. Created, stopping,
+// restarting, unknown, and probe errors are transitional and remain
+// bounded by the startup timeout.
+func terminalWaitState(state State) bool {
+	return state == StateStopped || state == StatePaused
+}
+
+func stateFailure(what string, state State, lastErr error) error {
+	if lastErr == nil {
+		return fmt.Errorf("%s: container %s while waiting", what, state)
+	}
+	return fmt.Errorf("%s: container %s while waiting (last error: %v)", what, state, lastErr)
 }
 
 // fatalCheckError wraps a check error that must end the poll

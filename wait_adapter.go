@@ -34,12 +34,27 @@ func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	return t.c.Endpoint(ctx, port)
 }
 
-func (t waitTarget) Running(ctx context.Context) (bool, error) {
+func (t waitTarget) State(ctx context.Context) (wait.State, error) {
 	state, err := t.c.State(ctx)
 	if err != nil {
-		return false, err
+		return wait.StateUnknown, err
 	}
-	return state == StateRunning, nil
+	switch state {
+	case StateRunning:
+		return wait.StateRunning, nil
+	case StateStopped:
+		return wait.StateStopped, nil
+	case StateStopping:
+		return wait.StateStopping, nil
+	case StateCreated:
+		return wait.StateCreated, nil
+	case StateRestarting:
+		return wait.StateRestarting, nil
+	case StatePaused:
+		return wait.StatePaused, nil
+	default:
+		return wait.StateUnknown, nil
+	}
 }
 
 func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {

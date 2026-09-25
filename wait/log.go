@@ -93,10 +93,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		// cannot stall diagnostics. WithoutCancel detaches from the
 		// expired wait deadline, WithTimeout re-bounds the probe.
 		probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		running, rErr := target.Running(probeCtx)
+		state, stateErr := target.State(probeCtx)
 		probeCancel()
-		if rErr == nil && !running {
-			return fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern)
+		if stateErr == nil && terminalWaitState(state) {
+			return stateFailure(fmt.Sprintf("wait for log %q", s.pattern), state, nil)
 		}
 		return fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %v)", s.pattern, err)
 	case <-ctx.Done():

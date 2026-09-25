@@ -240,8 +240,19 @@ func dockerState(s string) State {
 		return StateCreated
 	case "exited", "dead":
 		return StateStopped
-	case "restarting", "removing":
+	case "restarting":
+		// Docker can move a restarting container back to running; keep
+		// it distinct so startup readiness retries instead of failing
+		// fast as stopped.
+		return StateRestarting
+	case "removing":
+		// Removal is still a backend transition; let the bounded wait
+		// observe the following stopped/missing state.
 		return StateStopping
+	case "paused":
+		// A paused container is stable but not executing; wait treats
+		// it as terminal rather than misreporting it as stopped.
+		return StatePaused
 	default:
 		return StateUnknown
 	}

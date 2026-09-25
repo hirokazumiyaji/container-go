@@ -52,9 +52,9 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	if matcher == nil {
 		matcher = func(code int) bool { return code == 0 }
 	}
-	// checkRunning is false: each check already talks to the container
-	// via exec, so a concurrent Running probe would only add spawns.
-	// A stopped container is still reported once at timeout.
+	// checkState is false: each check already talks to the container
+	// via exec, so a concurrent state probe would only add spawns.
+	// A terminal container state is still reported once at timeout.
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		code, err := target.ExecCommand(ctx, s.cmd)
 		if err != nil {

@@ -69,11 +69,13 @@ func newCreationID() string {
 type State string
 
 const (
-	StateRunning  State = "running"
-	StateStopped  State = "stopped"
-	StateStopping State = "stopping"
-	StateCreated  State = "created"
-	StateUnknown  State = "unknown"
+	StateRunning    State = "running"
+	StateStopped    State = "stopped"
+	StateStopping   State = "stopping"
+	StateCreated    State = "created"
+	StateRestarting State = "restarting"
+	StatePaused     State = "paused"
+	StateUnknown    State = "unknown"
 )
 
 // Container is a handle to a container created by Run.

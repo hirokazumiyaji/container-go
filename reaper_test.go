@@ -62,6 +62,45 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force "+one, "delete --force "+two)
 }
 
+func TestReaperRejectsReplacedLockInode(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("replace-lock", "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.mu.Lock()
+	path := r.entries[0].lockPaths[0]
+	identities := append([]string(nil), r.entries[0].lockIdentities...)
+	r.mu.Unlock()
+	if len(identities) != 3 {
+		t.Fatalf("lock identities = %v, want one per barrier", identities)
+	}
+	for _, identity := range identities {
+		if !validReaperLockIdentity(identity) {
+			t.Fatalf("invalid lock identity %q", identity)
+		}
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	time.Sleep(150 * time.Millisecond)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force replace-lock") {
+		t.Fatalf("reaper deleted through a replaced lock inode: %q", data)
+	}
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")

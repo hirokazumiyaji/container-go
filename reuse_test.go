@@ -323,7 +323,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 		n.createAttempts++
 		n.seenNotFound.Store(true)
 		return nil, nil, &cli.CLIError{
-			Args: args, ExitCode: 1,
+			Binary: "container", Args: args, ExitCode: 1,
 			Stderr: "Error: container with ID myctr not found\n",
 		}
 	}

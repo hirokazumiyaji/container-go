@@ -150,6 +150,12 @@ func TestDockerLifecycleArgs(t *testing.T) {
 
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
+	args := e.listArgs()
+	for _, want := range []string{"--all", "--no-trunc", "status=exited", "status=dead", "{{.ID}}"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {
 		t.Errorf("listArgs = %v, want daemon-side filters", got)
 	}

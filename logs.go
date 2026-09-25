@@ -74,30 +74,29 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 		return nil, err
 	}
 	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
+	// The identity check and stream creation are protected by the Apple
+	// name lock, but the lock must not span the stream lifetime. Wait
+	// strategies such as ForAny may probe State/Endpoint while this stream
+	// is still open; retaining the exclusive lock would deadlock those
+	// probes until the stream context expires.
+	unlock()
 	if err != nil {
-		unlock()
 		return nil, err
 	}
-	return newLockedReadCloser(ctx, stream, unlock), nil
+	return newContextReadCloser(ctx, stream), nil
 }
 
-// lockedReadCloser keeps an Apple name lock for the complete lifetime of
-// a streaming operation. Close is idempotent and also releases the lock
-// when a context cancellation races with the caller.
-type lockedReadCloser struct {
+// contextReadCloser preserves cancellation-driven cleanup without holding
+// any backend name lock after FollowLogs has established the stream.
+type contextReadCloser struct {
 	io.ReadCloser
-	unlock func()
-	done   chan struct{}
-	once   sync.Once
-	err    error
+	done chan struct{}
+	once sync.Once
+	err  error
 }
 
-func newLockedReadCloser(ctx context.Context, stream io.ReadCloser, unlock func()) io.ReadCloser {
-	r := &lockedReadCloser{
-		ReadCloser: stream,
-		unlock:     unlock,
-		done:       make(chan struct{}),
-	}
+func newContextReadCloser(ctx context.Context, stream io.ReadCloser) io.ReadCloser {
+	r := &contextReadCloser{ReadCloser: stream, done: make(chan struct{})}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -108,11 +107,10 @@ func newLockedReadCloser(ctx context.Context, stream io.ReadCloser, unlock func(
 	return r
 }
 
-func (r *lockedReadCloser) Close() error {
+func (r *contextReadCloser) Close() error {
 	r.once.Do(func() {
 		r.err = r.ReadCloser.Close()
 		close(r.done)
-		r.unlock()
 	})
 	return r.err
 }

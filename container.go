@@ -614,7 +614,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isDeleteNotFound(c.eng, target, err) {
 		return nil
 	}
 	return c.classify(ctx, err)
@@ -628,7 +628,11 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if info.ip == "" {
+	return c.ipFromInfo(info)
+}
+
+func (c *Container) ipFromInfo(info *engineInfo) (string, error) {
+	if info == nil || info.ip == "" {
 		return "", fmt.Errorf("container %s has no reported IP address", c.id)
 	}
 	return info.ip, nil
@@ -639,7 +643,14 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
+	info, err := c.cachedInfo(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(c.published) > 0 {
+		if !hasPublishedBinding(info.bound, c.published[0]) {
+			return "", fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, c.published[0].raw)
+		}
 		addr := c.published[0].connectAddr()
 		if !c.eng.directIP() {
 			addr = dockerConnectHost(addr, c.eng)
@@ -647,7 +658,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		return addr, nil
 	}
 	if c.eng.directIP() {
-		return c.ContainerIP(ctx)
+		return c.ipFromInfo(info)
 	}
 	return c.eng.defaultHost(), nil
 }
@@ -674,30 +685,44 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
+	var published *publishSpec
+	for i := range c.published {
+		p := &c.published[i]
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+			published = p
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
+
+	// Endpoint data is dynamic. Always inspect the current identity before
+	// returning either an explicit published endpoint or an auto-published
+	// host binding; the configuration supplied at create time is not proof
+	// that the binding still exists.
+	info, err := c.cachedInfo(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	if published != nil {
+		if !hasPublishedBinding(info.bound, *published) {
+			return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, published.raw)
+		}
+		addr := published.connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, published.hostPort, nil
+	}
 	if c.eng.directIP() {
-		ip, err := c.ContainerIP(ctx)
+		ip, err := c.ipFromInfo(info)
 		if err != nil {
 			return "", 0, err
 		}
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.cachedInfo(ctx)
-	if err != nil {
-		return "", 0, err
-	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
 			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
@@ -706,47 +731,12 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first complete successful inspect result. An
-// Apple inspect can briefly report a running container before its network
-// address or host bindings are published; do not pin that incomplete
-// baseline, because a later Endpoint/ContainerIP call must be able to see
-// the completed metadata.
+// cachedInfo retains the historical helper name but deliberately performs
+// a fresh identity-checked inspect. Endpoint addresses and bindings are
+// dynamic, so returning a previous inspect would make an explicit
+// published endpoint look live after the backend changed underneath it.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		if c.infoEndpointReady(c.info) {
-			return c.info, nil
-		}
-		info, err := c.inspectFresh(ctx)
-		if err != nil {
-			return nil, err
-		}
-		if c.infoEndpointReady(info) {
-			c.info = info
-		}
-		return info, nil
-	}
-	info, err := c.inspectFresh(ctx)
-	if err != nil {
-		return nil, err
-	}
-	if c.infoEndpointReady(info) {
-		c.info = info
-	}
-	return info, nil
-}
-
-func (c *Container) infoEndpointReady(info *engineInfo) bool {
-	if info == nil {
-		return false
-	}
-	// ContainerIP is a direct-IP operation even when no port was declared,
-	// so an empty Apple address is never a cacheable baseline.
-	if c.eng.directIP() && info.ip == "" {
-		return false
-	}
-	return endpointMetadataReady(info, c.eng, c.exposed, c.published)
+	return c.inspectFresh(ctx)
 }
 
 // inspectFresh serializes a name-addressed Apple inspect with the same

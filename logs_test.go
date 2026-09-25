@@ -5,8 +5,11 @@ import (
 	"io"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // streamRunner adds a canned Stream implementation to fakeRunner.
@@ -88,6 +91,80 @@ func TestFollowLogsStreamsAndPropagatesClose(t *testing.T) {
 	}
 	if !f.closed {
 		t.Error("Close not propagated to the underlying stream")
+	}
+}
+
+type blockingFollowStream struct {
+	done chan struct{}
+	once sync.Once
+}
+
+func (s *blockingFollowStream) Read([]byte) (int, error) {
+	<-s.done
+	return 0, io.EOF
+}
+
+func (s *blockingFollowStream) Close() error {
+	s.once.Do(func() { close(s.done) })
+	return nil
+}
+
+type followLockRunner struct {
+	*fakeRunner
+	stream *blockingFollowStream
+}
+
+func (r *followLockRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	return r.stream, nil
+}
+
+func TestFollowLogsReleasesAppleLockBeforeProbes(t *testing.T) {
+	runner := &followLockRunner{
+		fakeRunner: newTestRunner(),
+		stream:     &blockingFollowStream{done: make(chan struct{})},
+	}
+	ctr := runTestContainer(t, runner)
+	stream, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatalf("FollowLogs: %v", err)
+	}
+	defer stream.Close()
+
+	probeCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	state, err := ctr.State(probeCtx)
+	if err != nil {
+		t.Fatalf("State while FollowLogs is open: %v", err)
+	}
+	if state != StateRunning {
+		t.Fatalf("State = %s, want running", state)
+	}
+}
+
+type endpointProbeStrategy struct{}
+
+func (endpointProbeStrategy) WaitUntilReady(ctx context.Context, target wait.Target) error {
+	_, err := target.Endpoint(ctx, "6379/tcp")
+	return err
+}
+
+func TestForAnyCanProbeWhileFollowLogsIsOpen(t *testing.T) {
+	runner := &followLockRunner{
+		fakeRunner: newTestRunner(),
+		stream:     &blockingFollowStream{done: make(chan struct{})},
+	}
+	ctr := runTestContainer(t, runner, WithExposedPorts("6379/tcp"))
+
+	started := time.Now()
+	err := wait.ForAny(
+		wait.ForLog("never appears").WithStartupTimeout(5*time.Second),
+		endpointProbeStrategy{},
+	).WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if err != nil {
+		t.Fatalf("ForAny: %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("ForAny took %s while FollowLogs was open", elapsed)
 	}
 }
 

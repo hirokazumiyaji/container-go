@@ -33,6 +33,20 @@ sub="$2"
 key="$3"
 ids=""
 tab=$(printf '\t')
+stat_bin=$(command -v stat 2>/dev/null)
+file_identity() {
+  [ -n "$stat_bin" ] || return 1
+  "$stat_bin" -c '%d:%i:%u' "$1" 2>/dev/null || "$stat_bin" -f '%d:%i:%u' "$1" 2>/dev/null
+}
+verify_lock_identity() {
+  path=$1
+  expected=$2
+  [ -n "$path" ] && [ -n "$expected" ] || return 1
+  [ -L "$path" ] && return 1
+  [ -f "$path" ] || return 1
+  actual=$(file_identity "$path") || return 1
+  [ "$actual" = "$expected" ]
+}
 while IFS= read -r line; do
   ids="$ids
 $line"
@@ -47,6 +61,40 @@ run_with_timeout() {
   return $rc
 }
 entry_script='
+stat_bin=$(command -v stat 2>/dev/null)
+file_identity() {
+  [ -n "$stat_bin" ] || return 1
+  "$stat_bin" -c '\''%d:%i:%u'\'' "$1" 2>/dev/null || "$stat_bin" -f '\''%d:%i:%u'\'' "$1" 2>/dev/null
+}
+verify_lock_identity() {
+  path=$1
+  expected=$2
+  [ -n "$path" ] && [ -n "$expected" ] || return 1
+  [ -L "$path" ] && return 1
+  [ -f "$path" ] || return 1
+  actual=$(file_identity "$path") || return 1
+  [ "$actual" = "$expected" ]
+}
+verify_entry_locks() {
+  [ -n "$REAPER_LOCK_PATHS" ] || return 0
+  old_ifs=$IFS
+  IFS=";"
+  set -- $REAPER_LOCK_PATHS
+  IFS=$old_ifs
+  path1=$1
+  path2=$2
+  path3=$3
+  IFS=";"
+  set -- $REAPER_LOCK_IDS
+  IFS=$old_ifs
+  id1=$1
+  id2=$2
+  id3=$3
+  verify_lock_identity "$path1" "$id1" || return 1
+  verify_lock_identity "$path2" "$id2" || return 1
+  verify_lock_identity "$path3" "$id3" || return 1
+}
+verify_entry_locks || exit 0
 id=$1
 creation=$2
 bin=$REAPER_BIN
@@ -70,6 +118,7 @@ if [ -n "$creation" ]; then
     target="$uid"
   fi
 fi
+verify_entry_locks || exit 0
 ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
 '
 helper=$(mktemp 2>/dev/null) || exit 0
@@ -119,30 +168,24 @@ run_locked() {
       set -- $lockpath
       IFS=$old_ifs
       path1=$1
-      path2=$2
-      path3=$3
-      for path in "$path1" "$path2" "$path3"; do
-        [ -n "$path" ] || return 0
-        [ -L "$path" ] && return 0
-        [ -f "$path" ] || return 0
-      done
+      lockid1=$2
+      path2=$3
+      lockid2=$4
+      path3=$5
+      lockid3=$6
+      verify_lock_identity "$path1" "$lockid1" || return 0
+      verify_lock_identity "$path2" "$lockid2" || return 0
+      verify_lock_identity "$path3" "$lockid3" || return 0
       REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
+      REAPER_LOCK_PATHS="$path1;$path2;$path3" REAPER_LOCK_IDS="$lockid1;$lockid2;$lockid3" \
       REAPER_LOCKF=$(command -v lockf 2>/dev/null) REAPER_FLOCK=$(command -v flock 2>/dev/null) \
         "$helper" --lock "$path1" "$path2" "$path3" --run "$id" "$creation" || true
       return
       ;;
   esac
-  [ -L "$lockpath" ] && return 0
-  [ -f "$lockpath" ] || return 0
-  if flock_bin=$(command -v flock 2>/dev/null); then
-    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
-      "$flock_bin" -w 30 "$lockpath" sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
-    return
-  fi
-  if lockf_bin=$(command -v lockf 2>/dev/null); then
-    REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
-      "$lockf_bin" -k -w -t 30 "$lockpath" sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
-  fi
+  # A path-only name entry has no registered inode identity. Fail closed
+  # instead of acquiring a potentially replaced path.
+  return 0
 }
 printf '%s\n' "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
@@ -198,6 +241,12 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+var reaperLockIdentityRE = regexp.MustCompile(`^[0-9]+:[0-9]+:[0-9]+$`)
+
+func validReaperLockIdentity(identity string) bool {
+	return reaperLockIdentityRE.MatchString(identity)
+}
+
 const reaperLockPathSeparator = ";"
 
 type reaperEntry struct {
@@ -206,8 +255,9 @@ type reaperEntry struct {
 	// lockPath is retained for compatibility with entries constructed by
 	// older in-package callers. New name entries carry all migration
 	// barriers in lockPaths, in lockName acquisition order.
-	lockPath  string
-	lockPaths []string
+	lockPath       string
+	lockPaths      []string
+	lockIdentities []string
 }
 
 type reaper struct {
@@ -246,15 +296,19 @@ func (r *reaper) register(id, creation string) error {
 
 	lockPath := ""
 	var lockPaths []string
+	var lockIdentities []string
 	if creation != "" && !dockerIDRE.MatchString(id) {
 		var err error
-		lockPaths, err = reaperNameLockPaths(id)
+		lockPaths, lockIdentities, err = reaperNameLockMetadata(id)
 		if err != nil {
 			return fmt.Errorf("reaper: prepare name locks for %q: %w", id, err)
 		}
-		for _, path := range lockPaths {
-			if !validNameLockProtocolPath(path) {
-				return fmt.Errorf("reaper: invalid name lock path %q", path)
+		if len(lockPaths) != len(lockIdentities) || len(lockPaths) == 0 {
+			return fmt.Errorf("reaper: incomplete name lock metadata for %q", id)
+		}
+		for i, path := range lockPaths {
+			if !validNameLockProtocolPath(path) || !validReaperLockIdentity(lockIdentities[i]) {
+				return fmt.Errorf("reaper: invalid name lock metadata %q", path)
 			}
 		}
 		lockPath = lockPaths[len(lockPaths)-1]
@@ -262,7 +316,13 @@ func (r *reaper) register(id, creation string) error {
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry := reaperEntry{id: id, creation: creation, lockPath: lockPath, lockPaths: append([]string(nil), lockPaths...)}
+	entry := reaperEntry{
+		id:             id,
+		creation:       creation,
+		lockPath:       lockPath,
+		lockPaths:      append([]string(nil), lockPaths...),
+		lockIdentities: append([]string(nil), lockIdentities...),
+	}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
@@ -278,22 +338,28 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 	}
 	var line string
 	paths := append([]string(nil), e.lockPaths...)
-	if len(paths) == 0 && e.lockPath != "" {
-		paths = []string{e.lockPath}
-	}
 	if len(paths) > 0 {
-		for _, path := range paths {
-			if !validNameLockProtocolPath(path) {
-				return fmt.Errorf("reaper: missing stable name lock for %q", e.id)
-			}
+		if len(e.lockIdentities) != len(paths) {
+			return fmt.Errorf("reaper: incomplete name lock metadata for %q", e.id)
 		}
-		// The third field remains the historical path field. Multiple
-		// barriers use an additive separator; old reapers fail closed on
-		// the unknown composite path rather than deleting unlocked.
-		line = e.id + "\t" + e.creation + "\t" + strings.Join(paths, reaperLockPathSeparator)
+		fields := make([]string, 0, len(paths)*2)
+		for i, path := range paths {
+			if !validNameLockProtocolPath(path) || !validReaperLockIdentity(e.lockIdentities[i]) {
+				return fmt.Errorf("reaper: invalid name lock metadata %q", path)
+			}
+			fields = append(fields, path, e.lockIdentities[i])
+		}
+		// The third field carries path/identity pairs. The shell rechecks
+		// each identity before locking, after inspect, and before delete;
+		// old path-only entries fail closed rather than losing the pin.
+		line = e.id + "\t" + e.creation + "\t" + strings.Join(fields, reaperLockPathSeparator)
 	} else if e.creation != "" {
-		// Retain the legacy space-delimited form for an immutable ID that
-		// nevertheless carries a generation for an additional guard.
+		// Retain the legacy space-delimited form only for an immutable
+		// Docker ID. A name entry without its identity-bearing lock paths
+		// must never be downgraded to an unlocked delete.
+		if !dockerIDRE.MatchString(e.id) {
+			return fmt.Errorf("reaper: name entry %q has no inode-pinned lock metadata", e.id)
+		}
 		line = e.id + " " + e.creation
 	} else {
 		line = e.id

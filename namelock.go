@@ -325,8 +325,28 @@ func openNameLock(name string) (*os.File, error) {
 
 // reaperNameLockPaths prepares every barrier used by lockName for the
 // shell reaper. The values are returned in the same order as lockName.
+//
+//nolint:unused // retained for callers that only need paths
 func reaperNameLockPaths(name string) ([]string, error) {
+	paths, _, err := reaperNameLockMetadata(name)
+	return paths, err
+}
+
+func reaperLockIdentity(f *os.File) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", errors.New("lock file inode metadata is unavailable")
+	}
+	return fmt.Sprintf("%d:%d:%d", stat.Dev, stat.Ino, stat.Uid), nil
+}
+
+func reaperNameLockMetadata(name string) ([]string, []string, error) {
 	paths := make([]string, 0, 3)
+	identities := make([]string, 0, 3)
 	for _, resolve := range []func(string) (string, error){
 		legacyNameLockPath,
 		transitionalNameLockPath,
@@ -334,18 +354,24 @@ func reaperNameLockPaths(name string) ([]string, error) {
 	} {
 		path, err := resolve(name)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		f, err := openNameLockPath(path)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		if err := f.Close(); err != nil {
-			return nil, fmt.Errorf("close prepared reaper lock file %s: %w", path, err)
+		identity, identityErr := reaperLockIdentity(f)
+		closeErr := f.Close()
+		if identityErr != nil {
+			return nil, nil, identityErr
+		}
+		if closeErr != nil {
+			return nil, nil, fmt.Errorf("close prepared reaper lock file %s: %w", path, closeErr)
 		}
 		paths = append(paths, path)
+		identities = append(identities, identity)
 	}
-	return paths, nil
+	return paths, identities, nil
 }
 
 // reaperNameLockPath retains the historical single-path helper and returns

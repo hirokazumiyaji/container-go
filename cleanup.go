@@ -87,7 +87,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	if err != nil {
 		return nil, err
 	}
-	if reuseGroup != "" && eng.name() == "docker" {
+	if eng.name() == "docker" {
 		return pruneDockerReuseGroupListed(ctx, r, eng, ids, errKind, reuseGroup)
 	}
 
@@ -122,7 +122,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isDeleteNotFound(eng, id, err) {
 			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
 			continue
 		}
@@ -190,7 +190,7 @@ func pruneDockerReuseGroupListed(ctx context.Context, r cli.Runner, eng engine, 
 		dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
 		_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
 		dCancel()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isDeleteNotFound(eng, target, err) {
 			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, listedID, err))
 			continue
 		}
@@ -223,10 +223,15 @@ func inspectDockerPruneCandidate(ctx context.Context, r cli.Runner, eng engine, 
 }
 
 func dockerPruneCandidateEligible(candidate dockerPruneCandidate, reuseGroup string) bool {
-	return dockerIDRE.MatchString(candidate.listedID) &&
-		dockerIDRE.MatchString(candidate.uid) &&
-		candidate.managed && candidate.reuse &&
-		validCreationID(candidate.creation) &&
+	if !dockerIDRE.MatchString(candidate.listedID) ||
+		!dockerIDRE.MatchString(candidate.uid) ||
+		!candidate.managed || !validCreationID(candidate.creation) {
+		return false
+	}
+	if reuseGroup == "" {
+		return candidate.state == StateStopped
+	}
+	return candidate.reuse &&
 		(candidate.state == StateRunning || candidate.state == StateStopped) &&
 		candidate.reuseGroup == reuseGroup
 }
@@ -353,7 +358,7 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errK
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isDeleteNotFound(eng, target, err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	return true, nil
@@ -387,7 +392,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
-	if err != nil && !isNotFound(err) {
+	if err != nil && !isDeleteNotFound(eng, target, err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	return true, nil

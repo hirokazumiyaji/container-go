@@ -128,7 +128,7 @@ func TestReviewAppleOperationsRecheckGenerationBeforeNameUse(t *testing.T) {
 	}
 }
 
-func TestReviewAppleLogTailAndStreamingHoldGenerationLock(t *testing.T) {
+func TestReviewAppleLogTailAndStreamingReleaseGenerationLock(t *testing.T) {
 	const name = "review-stream"
 	runner := &reviewOperationRunner{
 		inspectA: reviewAppleInspect(name, reviewCreationB, "running", ""),
@@ -160,19 +160,14 @@ func TestReviewAppleLogTailAndStreamingHoldGenerationLock(t *testing.T) {
 	}()
 	select {
 	case err := <-lockResult:
-		t.Fatalf("stream did not retain name lock: %v", err)
-	case <-time.After(30 * time.Millisecond):
+		if err != nil {
+			t.Fatalf("lock while stream is open: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("name lock remained held for the stream lifetime")
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("stream close: %v", err)
-	}
-	select {
-	case err := <-lockResult:
-		if err != nil {
-			t.Fatalf("lock after stream close: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("name lock was not released with stream")
 	}
 }
 

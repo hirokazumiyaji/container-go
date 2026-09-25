@@ -99,6 +99,16 @@ func TestReuseDoesNotBindDockerUIDFromUnverifiedInspect(t *testing.T) {
 	}
 }
 
+func TestReuseBaseIdentityRequiresDockerGeneration(t *testing.T) {
+	base := &Container{
+		uid:      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		creation: "",
+	}
+	if err := validateReuseBaseIdentity(dockerEngine{}, base, "generation-required"); err == nil {
+		t.Fatal("Docker base with an unbound creation generation was accepted")
+	}
+}
+
 func TestUnboundDockerStateAndIPDoNotPublishReplacementUID(t *testing.T) {
 	const uid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	runner := &unboundDockerReplacementRunner{

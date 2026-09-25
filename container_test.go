@@ -391,7 +391,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {
@@ -463,11 +463,18 @@ func TestMappedPortRejectsUndeclaredPort(t *testing.T) {
 	}
 }
 
+func setApplePublishedInspect(f *fakeRunner, hostAddr string, hostPort int) {
+	creation := f.creations["myctr"]
+	f.inspectJSON = fmt.Sprintf(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis:7-alpine"},"labels":{"%s":"true","%s":"%s","%s":%q},"publishedPorts":[{"hostAddress":%q,"hostPort":%d,"containerPort":6379,"proto":"tcp"}]},"status":{"state":"running","networks":[{"ipv4Address":"192.168.64.3/24","network":"default"}]}}]`,
+		managedLabel, sessionLabel, sessionID(), creationLabel, creation, hostAddr, hostPort)
+}
+
 func TestPublishedPortSwitchesToHostEndpoint(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f,
 		WithExposedPorts("6379/tcp"),
 		WithPublishedPort("127.0.0.1:16379:6379/tcp"))
+	setApplePublishedInspect(f, "127.0.0.1", 16379)
 
 	runCall := f.callWith("run")
 	joined := strings.Join(runCall, " ")
@@ -496,6 +503,7 @@ func TestPublishedPortWithUnspecifiedHostReturnsLoopback(t *testing.T) {
 	ctr := runTestContainer(t, f,
 		WithExposedPorts("6379/tcp"),
 		WithPublishedPort("16379:6379"))
+	setApplePublishedInspect(f, "", 16379)
 
 	host, err := ctr.Host(context.Background())
 	if err != nil {

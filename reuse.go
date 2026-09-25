@@ -47,6 +47,22 @@ func waitReuseReady(ctx context.Context, cfg *config, ctr *Container) (*engineIn
 	}
 }
 
+func validateReuseBaseIdentity(eng engine, base *Container, name string) error {
+	if base == nil {
+		return fmt.Errorf("reuse %s: missing base handle", name)
+	}
+	if !requiresImmutableID(eng) {
+		return nil
+	}
+	if !validImmutableID(eng, base.uid) {
+		return fmt.Errorf("reuse %s: refusing unverified Docker handle without an immutable ID", name)
+	}
+	if !validCreationID(base.creation) {
+		return fmt.Errorf("reuse %s: refusing unverified Docker handle without a valid creation generation", name)
+	}
+	return nil
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
 	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
@@ -60,8 +76,15 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
+	// Docker operations must begin with an already-bound identity from
+	// the create path. A name-addressed inspect is allowed to inform
+	// compatibility checks, but it cannot supply either the UID or the
+	// generation for a handle returned to callers.
+	if err := validateReuseBaseIdentity(cfg.eng, base, cfg.name); err != nil {
+		return nil, err
+	}
 	creation := base.creation
-	if creation == "" && base.info != nil {
+	if creation == "" && !requiresImmutableID(cfg.eng) && base.info != nil {
 		creation = base.info.labels[creationLabel]
 	}
 	ctr := &Container{
@@ -76,9 +99,6 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		uid:       base.uid,
 	}
 	info := base.info
-	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, ctr.uid) {
-		return nil, fmt.Errorf("reuse %s: refusing unverified Docker handle without an immutable ID", cfg.name)
-	}
 	if info == nil {
 		info, err = ctr.inspectFresh(ctx)
 		if err != nil {
@@ -599,19 +619,85 @@ func namedContainer(cfg *config, id string) *Container {
 	}
 }
 
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
+// createRaceMissing reports only Apple's anchored run/name race: the
+// command was `run`, the backend executable was `container`, and the
+// exact --name value appears in a line-anchored "container with id ...
+// not found" diagnostic. Generic "container not found" text is not
+// evidence of this race.
 func createRaceMissing(err error) bool {
 	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	if !errors.As(err, &cliErr) || len(cliErr.Args) == 0 || cliErr.Args[0] != "run" {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
-		return true
+	if strings.TrimSpace(cliErr.Binary) == "" || !cliBinaryMatches(cliErr.Binary, "container") {
+		return false
 	}
-	return strings.Contains(s, "container not found")
+	name := ""
+	for i, arg := range cliErr.Args {
+		if arg == "--name" {
+			if i+1 >= len(cliErr.Args) {
+				return false
+			}
+			name = cliErr.Args[i+1]
+			break
+		}
+		if value, ok := strings.CutPrefix(arg, "--name="); ok {
+			name = value
+			break
+		}
+	}
+	if name == "" {
+		return false
+	}
+	for _, line := range strings.Split(strings.ToLower(cliErr.Stderr), "\n") {
+		id, ok := appleRunMissingID(line)
+		if ok && strings.EqualFold(id, name) {
+			return true
+		}
+	}
+	return false
+}
+
+func appleRunMissingID(line string) (string, bool) {
+	line = strings.TrimSpace(line)
+	for {
+		changed := false
+		for _, prefix := range []string{"error: ", "failed to bootstrap container: "} {
+			if strings.HasPrefix(line, prefix) {
+				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+	const prefix = "container with id "
+	if !strings.HasPrefix(line, prefix) {
+		return "", false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	if strings.HasPrefix(rest, "\"") {
+		end := strings.IndexByte(rest[1:], '"')
+		if end < 0 {
+			return "", false
+		}
+		id := rest[1 : end+1]
+		if strings.TrimSpace(rest[end+2:]) != "not found" || id == "" {
+			return "", false
+		}
+		return id, true
+	}
+	const suffix = " not found"
+	if !strings.HasSuffix(rest, suffix) {
+		return "", false
+	}
+	id := strings.TrimSpace(strings.TrimSuffix(rest, suffix))
+	if id == "" || strings.ContainsAny(id, " \t\r\n") {
+		return "", false
+	}
+	return id, true
 }
 
 // checkReuseOwned reports whether an existing container may be adopted

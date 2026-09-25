@@ -394,13 +394,13 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
 // to the port clients should dial.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
-	_, p, err := c.resolve(ctx, port)
+	_, p, err := c.resolve(ctx, port, "MappedPort")
 	return p, err
 }
 
 // Endpoint returns "host:port" for a declared container port.
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
-	host, p, err := c.resolve(ctx, port)
+	host, p, err := c.resolve(ctx, port, "Endpoint")
 	if err != nil {
 		return "", err
 	}
@@ -408,10 +408,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 }
 
 // resolve maps a container port to the (host, port) pair to dial.
-func (c *Container) resolve(ctx context.Context, port string) (string, int, error) {
+func (c *Container) resolve(ctx context.Context, port, operation string) (string, int, error) {
 	spec, err := parsePortSpec(port)
 	if err != nil {
-		return "", 0, err
+		return "", 0, newValidationErrorWithField(operation, "port", port, err)
 	}
 	for _, p := range c.published {
 		if p.containerPort == spec.port && p.proto == spec.proto {

@@ -178,9 +178,15 @@ func TestReuseGroupValidationIsSharedByCreateAndPrune(t *testing.T) {
 				if createErr.Error() != pruneErr.Error() {
 					t.Errorf("create error %q != prune error %q", createErr, pruneErr)
 				}
-				var validationErr *ValidationError
-				if !errors.As(createErr, &validationErr) || !errors.As(pruneErr, &validationErr) {
+				var createValidationErr, pruneValidationErr *ValidationError
+				if !errors.As(createErr, &createValidationErr) || !errors.As(pruneErr, &pruneValidationErr) {
 					t.Fatalf("errors are not typed: create=%T prune=%T", createErr, pruneErr)
+				}
+				if createValidationErr.Option != "WithReuseGroup" || createValidationErr.Field != "group" {
+					t.Errorf("create validation option/field = %q/%q, want WithReuseGroup/group", createValidationErr.Option, createValidationErr.Field)
+				}
+				if pruneValidationErr.Option != "PruneReuseGroup" || pruneValidationErr.Field != "group" {
+					t.Errorf("prune validation option/field = %q/%q, want PruneReuseGroup/group", pruneValidationErr.Option, pruneValidationErr.Field)
 				}
 				if len(createRunner.calls) != 0 || len(pruneRunner.calls) != 0 {
 					t.Fatalf("backend was called for invalid group: create=%v prune=%v", createRunner.calls, pruneRunner.calls)

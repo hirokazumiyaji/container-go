@@ -109,8 +109,8 @@ func TestDockerRejectsOneCharacterVolumeNameBeforeBackend(t *testing.T) {
 		if !errors.Is(err, ErrInvalidOption) {
 			t.Fatalf("error = %v, want ErrInvalidOption", err)
 		}
-		if validationErr.Option != "mount" {
-			t.Errorf("validation option = %q, want mount", validationErr.Option)
+		if validationErr.Option != "WithMounts" || validationErr.Field != "mount" {
+			t.Errorf("validation option/field = %q/%q, want WithMounts/mount", validationErr.Option, validationErr.Field)
 		}
 	}
 

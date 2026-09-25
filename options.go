@@ -193,11 +193,15 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 var labelKeyRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:[./][a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$`)
 
 func validateReuseGroup(group string) error {
+	return validateReuseGroupFor("WithReuseGroup", group)
+}
+
+func validateReuseGroupFor(option, group string) error {
 	if group == "" {
-		return validationErrorf("reuse group", group, "reuse group must not be empty")
+		return newValidationErrorWithField(option, "group", group, fmt.Errorf("reuse group must not be empty"))
 	}
 	if len(group) > maxReuseGroupBytes || !labelKeyRE.MatchString(group) {
-		return validationErrorf("reuse group", group, "invalid reuse group %q", group)
+		return newValidationErrorWithField(option, "group", group, fmt.Errorf("invalid reuse group %q", group))
 	}
 	return nil
 }
@@ -484,40 +488,47 @@ type Mount struct {
 	ReadOnly bool
 }
 
+func mountValidationErrorf(m Mount, format string, args ...any) error {
+	return newValidationErrorWithField("WithMounts", "mount", m, fmt.Errorf(format, args...))
+}
+
 func (m Mount) validate() error {
 	if m.Type < MountBind || m.Type > MountTmpfs {
-		return validationErrorf("mount", m, "unknown mount type %d", m.Type)
+		return mountValidationErrorf(m, "unknown mount type %d", m.Type)
 	}
 	if len(m.Source) > maxMountPathBytes || len(m.Target) > maxMountPathBytes {
-		return validationErrorf("mount", m, "mount paths exceed the %d-byte maximum", maxMountPathBytes)
+		return mountValidationErrorf(m, "mount paths exceed the %d-byte maximum", maxMountPathBytes)
 	}
 	if !utf8.ValidString(m.Source) || !utf8.ValidString(m.Target) {
-		return validationErrorf("mount", m, "mount paths must be valid UTF-8")
+		return mountValidationErrorf(m, "mount paths must be valid UTF-8")
 	}
-	if strings.ContainsAny(m.Source, ",=\x00\r\n") || strings.ContainsAny(m.Target, ",=\x00\r\n") {
-		return validationErrorf("mount", m, "mount %q -> %q: paths must not contain ',' or '=' or control characters", m.Source, m.Target)
+	if strings.ContainsAny(m.Source, ",=\x00") || strings.ContainsAny(m.Target, ",=\x00") {
+		return mountValidationErrorf(m, "mount %q -> %q: paths must not contain ',' or '='", m.Source, m.Target)
+	}
+	if strings.ContainsAny(m.Source, "\r\n") || strings.ContainsAny(m.Target, "\r\n") {
+		return mountValidationErrorf(m, "mount %q -> %q: paths must not contain control characters", m.Source, m.Target)
 	}
 	if !strings.HasPrefix(m.Target, "/") {
-		return validationErrorf("mount", m, "mount target %q must be absolute", m.Target)
+		return mountValidationErrorf(m, "mount target %q must be absolute", m.Target)
 	}
 	switch m.Type {
 	case MountBind:
 		if !strings.HasPrefix(m.Source, "/") {
-			return validationErrorf("mount", m, "bind mount source %q must be an absolute host path", m.Source)
+			return mountValidationErrorf(m, "bind mount source %q must be an absolute host path", m.Source)
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return validationErrorf("mount", m, "volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+			return mountValidationErrorf(m, "volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
 		}
 		if len(m.Source) > maxVolumeNameBytes {
-			return validationErrorf("mount", m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
+			return mountValidationErrorf(m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
 		}
 		if !volumeNameRE.MatchString(m.Source) {
-			return validationErrorf("mount", m, "invalid volume name %q", m.Source)
+			return mountValidationErrorf(m, "invalid volume name %q", m.Source)
 		}
 	case MountTmpfs:
 		if m.Source != "" {
-			return validationErrorf("mount", m, "tmpfs mount for %q must not have a source", m.Target)
+			return mountValidationErrorf(m, "tmpfs mount for %q must not have a source", m.Target)
 		}
 	}
 	return nil

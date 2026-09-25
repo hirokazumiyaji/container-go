@@ -25,9 +25,10 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 var ErrInvalidOption = errors.New("invalid option")
 
 // ValidationError describes a public input rejected before a backend
-// operation starts. Option and Field contain the public option name,
-// Value contains the rejected value, and Message preserves the detailed
-// explanation returned to the caller.
+// operation starts. Option names the public option, operation, or input,
+// Field identifies the rejected field when it differs, Value contains the
+// rejected value, and Message preserves the detailed explanation returned
+// to the caller.
 type ValidationError struct {
 	Option  string
 	Field   string
@@ -75,6 +76,10 @@ type OptionError = ValidationError
 type InvalidOptionError = ValidationError
 
 func newValidationError(option string, value any, err error) error {
+	return newValidationErrorWithField(option, option, value, err)
+}
+
+func newValidationErrorWithField(option, field string, value any, err error) error {
 	if err == nil {
 		err = ErrInvalidOption
 	}
@@ -84,7 +89,7 @@ func newValidationError(option string, value any, err error) error {
 	}
 	return &ValidationError{
 		Option:  option,
-		Field:   option,
+		Field:   field,
 		Value:   value,
 		Message: err.Error(),
 		Err:     err,

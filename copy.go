@@ -34,7 +34,7 @@ func WithFiles(files ...File) Option {
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return err
+		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, err)
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
@@ -53,7 +53,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 // and returns its content. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
-		return nil, err
+		return nil, newValidationErrorWithField("CopyFileFromContainer", "containerPath", containerPath, err)
 	}
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
 		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)

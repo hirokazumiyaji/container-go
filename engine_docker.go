@@ -51,7 +51,7 @@ func (dockerEngine) checkConfig(cfg *config) error {
 	// permissive for Apple Container, which accepts them.
 	for _, m := range cfg.mounts {
 		if m.Type == MountVolume && len(m.Source) == 1 {
-			return validationErrorf("mount", m, "volume name %q is too short, names should be at least two alphanumeric characters", m.Source)
+			return mountValidationErrorf(m, "volume name %q is too short, names should be at least two alphanumeric characters", m.Source)
 		}
 	}
 	if !isRemoteDockerHost() {

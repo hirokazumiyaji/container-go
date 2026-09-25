@@ -49,6 +49,8 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
+func (dockerEngine) requiresImmutableID() bool { return true }
+
 // dockerDefaultNetwork asks the daemon which platform default it exposes.
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network
@@ -115,12 +117,12 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 		if err != nil {
 			return err
 		}
-		if reason := dockerNetworkIsolationReason(networkInfo); reason != "" {
+		if reason := dockerNetworkPublishUnsupportedReason(networkInfo); reason != "" {
 			return &ConfigError{
 				Backend: "docker",
 				Network: network,
 				Option:  option,
-				Detail:  reason + " networks are externally isolated; this library cannot create a reachable published endpoint on them",
+				Detail:  reason + "; this library cannot create a reachable published endpoint on this network",
 			}
 		}
 	}
@@ -140,19 +142,37 @@ func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, 
 
 type dockerNetworkInfo struct {
 	Name     string
+	Driver   string
 	Internal bool
 	Options  map[string]string
 }
 
 func parseDockerNetworkInspect(data []byte, requested string) (dockerNetworkInfo, error) {
+	if requested == "" {
+		return dockerNetworkInfo{}, errors.New("docker network inspect requires a non-empty network name")
+	}
 	var networks []dockerNetworkInfo
 	if err := json.Unmarshal(data, &networks); err != nil {
 		return dockerNetworkInfo{}, fmt.Errorf("decode Docker network inspect output: %w", err)
 	}
-	if len(networks) == 0 {
+	var match *dockerNetworkInfo
+	for i := range networks {
+		network := &networks[i]
+		if network.Name != requested {
+			continue
+		}
+		if match != nil {
+			return dockerNetworkInfo{}, fmt.Errorf("docker network inspect returned duplicate entries for %q", requested)
+		}
+		match = network
+	}
+	if match == nil {
 		return dockerNetworkInfo{}, fmt.Errorf("docker network %q missing from inspect output", requested)
 	}
-	return networks[0], nil
+	if strings.TrimSpace(match.Driver) == "" {
+		return dockerNetworkInfo{}, fmt.Errorf("docker network %q inspect returned no driver", requested)
+	}
+	return *match, nil
 }
 
 func dockerNetworkIsolationReason(network dockerNetworkInfo) string {
@@ -167,6 +187,28 @@ func dockerNetworkIsolationReason(network dockerNetworkInfo) string {
 		}
 	}
 	return ""
+}
+
+// dockerNetworkPublishUnsupportedReason reports network properties that
+// make the library's host-published endpoint contract impossible to prove.
+// Port publishing is implemented by the bridge-family drivers. In
+// particular, macvlan and ipvlan endpoints are directly attached to an
+// underlay and do not create host port mappings; an empty or third-party
+// driver is not safe to assume capable either.
+func dockerNetworkPublishUnsupportedReason(network dockerNetworkInfo) string {
+	if reason := dockerNetworkIsolationReason(network); reason != "" {
+		return reason
+	}
+	driver := strings.ToLower(strings.TrimSpace(network.Driver))
+	switch driver {
+	case "bridge", "nat", "overlay":
+		return ""
+	default:
+		if driver == "" {
+			return "network driver is unknown"
+		}
+		return fmt.Sprintf("network driver %q does not support host port publishing", driver)
+	}
 }
 
 func dockerPublishOptionError(mode, option string) error {
@@ -190,12 +232,11 @@ func dockerNetworkAllowsPublish(mode string) bool {
 	return mode != dockerNetworkHost && mode != dockerNetworkNone
 }
 
-// dockerNetworkModesMatch compares the requested mode with the mode
-// reported by inspect. Docker represents an omitted --network as the
-// special mode "default"; the attached network names provide the concrete
-// default identity, while defaultNetwork is the authoritative daemon
-// platform identity. Without that identity, an omitted request fails
-// closed instead of treating a user-defined bridge/nat as the default.
+// dockerNetworkModesMatch compares a requested mode with the inspected
+// mode and current network membership when no daemon-default identity is
+// available. The default-aware form below is used whenever Docker supplies
+// its platform default; this wrapper remains useful to backend callers that
+// only have concrete mode/name data.
 func dockerNetworkModesMatch(requested, actual string, nameSets ...[]string) bool {
 	var actualNames []string
 	if len(nameSets) > 0 {
@@ -212,8 +253,12 @@ func dockerNetworkModesMatchDefault(requested, actual string, actualNames []stri
 		return false
 	}
 
+	// HostConfig.NetworkMode describes how the container was configured;
+	// NetworkSettings.Networks describes what it is attached to now. A
+	// stale mode must not pass merely because its string equals the
+	// requested mode after a network connect/disconnect.
 	if actual == dockerNetworkDefault {
-		if defaultNetwork == "" || len(actualNames) == 0 || !containsNetworkName(actualNames, defaultNetwork) {
+		if defaultNetwork == "" || !containsNetworkName(actualNames, defaultNetwork) {
 			return false
 		}
 		if requested == "" || requested == dockerNetworkDefault {
@@ -221,12 +266,11 @@ func dockerNetworkModesMatchDefault(requested, actual string, actualNames []stri
 		}
 		return requested == defaultNetwork
 	}
-
+	if !containsNetworkName(actualNames, actual) {
+		return false
+	}
 	if requested == "" || requested == dockerNetworkDefault {
-		if defaultNetwork == "" {
-			return false
-		}
-		return actual == defaultNetwork
+		return defaultNetwork != "" && actual == defaultNetwork && containsNetworkName(actualNames, defaultNetwork)
 	}
 	return requested == actual
 }
@@ -253,9 +297,9 @@ func dockerNetworkModeErrorDefault(requested, actual string, actualNames []strin
 		return nil
 	}
 	if defaultNetwork != "" {
-		return fmt.Errorf("%w: requested Docker network mode %q, but inspect reported %q (daemon default %q)", ErrNetworkMismatch, requested, actual, defaultNetwork)
+		return fmt.Errorf("%w: requested Docker network mode %q, but inspect reported %q with networks %v (daemon default %q)", ErrNetworkMismatch, requested, actual, actualNames, defaultNetwork)
 	}
-	return fmt.Errorf("%w: requested Docker network mode %q, but inspect reported %q", ErrNetworkMismatch, requested, actual)
+	return fmt.Errorf("%w: requested Docker network mode %q, but inspect reported %q with networks %v; daemon default identity is unavailable", ErrNetworkMismatch, requested, actual, actualNames)
 }
 
 func firstNetworkNames(nameSets [][]string) []string {

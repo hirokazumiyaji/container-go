@@ -133,6 +133,15 @@ func TestDockerParseInspectInfersNetworkMode(t *testing.T) {
 	}
 }
 
+func TestDockerParseNetworkInspectRequiresMatchingIdentity(t *testing.T) {
+	if _, err := parseDockerNetworkInspect([]byte(`[{"Name":"other","Driver":"bridge"}]`), "private"); err == nil {
+		t.Fatal("mismatched network name was accepted")
+	}
+	if _, err := parseDockerNetworkInspect([]byte(`[{"Name":"private"}]`), "private"); err == nil {
+		t.Fatal("missing network driver was accepted")
+	}
+}
+
 func TestDockerStateMapping(t *testing.T) {
 	cases := map[string]State{
 		"running":    StateRunning,
@@ -218,7 +227,8 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		if d.networkInspectJSON != nil {
 			return d.networkInspectJSON, nil, nil
 		}
-		return []byte(`[{"Name":"bridge","Internal":false,"Options":{}}]`), nil, nil
+		name := args[len(args)-1]
+		return []byte(`[{"Name":"` + name + `","Driver":"bridge","Internal":false,"Options":{}}]`), nil, nil
 	case "run":
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
@@ -740,9 +750,15 @@ func TestDockerRunArgsNeverPublishInNonPublishableNetwork(t *testing.T) {
 func TestDockerReuseRejectsNetworkModeMismatch(t *testing.T) {
 	cfg := dockerTestConfig(t, WithName("myctr"), WithReuse(), WithNetwork("bridge"))
 	info := &engineInfo{
-		labels:      map[string]string{reuseLabel: "true"},
-		image:       "redis:7-alpine",
-		networkMode: dockerNetworkHost,
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: "0123456789abcdef",
+		},
+		uid:          dockerFixtureID,
+		image:        "redis:7-alpine",
+		networkMode:  dockerNetworkHost,
+		networkNames: []string{dockerNetworkBridge},
 	}
 	if err := checkReuseCompat(info, "redis:7-alpine", cfg); err == nil || !strings.Contains(err.Error(), "network mode") {
 		t.Fatalf("checkReuseCompat error = %v, want network mode mismatch", err)
@@ -812,7 +828,9 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
 			d := &dockerRunner{fakeRunner: newTestRunner()}
-			d.inspectJSON = []byte(strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1))
+			inspectJSON := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1)
+			inspectJSON = strings.Replace(inspectJSON, `"bridge": {`, `"`+tc.mode+`": {`, 1)
+			d.inspectJSON = []byte(inspectJSON)
 			opts := []Option{WithName("myctr"), WithNetwork(tc.mode), withRunner(d), withEngine(dockerEngine{})}
 			if tc.mode == "bridge" {
 				opts = append(opts, WithExposedPorts("6379/tcp"))
@@ -862,12 +880,12 @@ func TestDockerRejectsIsolatedNetworkPublishingBeforeRun(t *testing.T) {
 	}{
 		{
 			name:         "internal",
-			networkJSON:  `[{"Name":"private","Internal":true,"Options":{}}]`,
+			networkJSON:  `[{"Name":"private","Driver":"bridge","Internal":true,"Options":{}}]`,
 			wantContains: "internal",
 		},
 		{
 			name:         "isolated gateway",
-			networkJSON:  `[{"Name":"private","Internal":false,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}]`,
+			networkJSON:  `[{"Name":"private","Driver":"bridge","Internal":false,"Options":{"com.docker.network.bridge.gateway_mode_ipv4":"isolated"}}]`,
 			wantContains: "isolated",
 		},
 	}
@@ -1054,10 +1072,23 @@ func TestDockerReuseRejectsOmittedNetworkWildcard(t *testing.T) {
 	for _, actual := range []string{"host", "none", "test-net", "default", ""} {
 		t.Run("actual="+actual, func(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
+			names := []string(nil)
+			if actual != "" {
+				names = []string{actual}
+			}
+			if actual == dockerNetworkDefault {
+				names = []string{dockerNetworkBridge}
+			}
 			info := &engineInfo{
-				labels:      map[string]string{reuseLabel: "true"},
-				image:       "redis:7-alpine",
-				networkMode: actual,
+				labels: map[string]string{
+					managedLabel:  "true",
+					reuseLabel:    "true",
+					creationLabel: "0123456789abcdef",
+				},
+				uid:          dockerFixtureID,
+				image:        "redis:7-alpine",
+				networkMode:  actual,
+				networkNames: names,
 			}
 			if err := checkReuseCompat(info, "redis:7-alpine", cfg); err == nil || !errors.Is(err, ErrNetworkMismatch) {
 				t.Fatalf("checkReuseCompat error = %v, want ErrNetworkMismatch", err)
@@ -1081,7 +1112,12 @@ func TestDockerReuseCanonicalizesDaemonDefaultNetwork(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
 			info := &engineInfo{
-				labels:         map[string]string{reuseLabel: "true"},
+				labels: map[string]string{
+					managedLabel:  "true",
+					reuseLabel:    "true",
+					creationLabel: "0123456789abcdef",
+				},
+				uid:            dockerFixtureID,
 				image:          "redis:7-alpine",
 				networkMode:    tc.actual,
 				networkNames:   tc.names,
@@ -1107,7 +1143,12 @@ func TestDockerOmittedNetworkRejectsUserDefinedPlatformName(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
 			info := &engineInfo{
-				labels:         map[string]string{reuseLabel: "true"},
+				labels: map[string]string{
+					managedLabel:  "true",
+					reuseLabel:    "true",
+					creationLabel: "0123456789abcdef",
+				},
+				uid:            dockerFixtureID,
 				image:          "redis:7-alpine",
 				networkMode:    tc.actual,
 				networkNames:   tc.names,
@@ -1127,9 +1168,15 @@ func TestDockerReuseRejectsRemoteLoopbackBinding(t *testing.T) {
 		WithExposedPorts("6379/tcp"),
 	)
 	info := &engineInfo{
-		labels:      map[string]string{reuseLabel: "true"},
-		image:       "redis:7-alpine",
-		networkMode: "bridge",
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: "0123456789abcdef",
+		},
+		uid:          dockerFixtureID,
+		image:        "redis:7-alpine",
+		networkMode:  "bridge",
+		networkNames: []string{"bridge"},
 		bound: []boundPort{{
 			containerPort: 6379,
 			proto:         "tcp",
@@ -1152,6 +1199,7 @@ func TestDockerHostModeHostReturnsDaemonHostWithoutInventingPort(t *testing.T) {
 		t.Fatal(err)
 	}
 	inspectJSON := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "host"`, 1)
+	inspectJSON = strings.Replace(inspectJSON, `"bridge": {`, `"host": {`, 1)
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d, WithNetwork("host"))
 	d.inspectJSON = []byte(inspectJSON)

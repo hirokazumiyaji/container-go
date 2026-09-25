@@ -23,6 +23,13 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if creation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.inspectJSON = strings.ReplaceAll(r.inspectJSON, "__CONTAINER_CREATION__", creation)
+				}
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
@@ -51,7 +58,9 @@ func ownedInspectJSON(name string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
       }
     },
     "status": {"state": "created", "networks": []}
@@ -143,6 +152,8 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.runner = r
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
+	cfg.creation = "0123456789abcdef"
+	r.inspectJSON = strings.ReplaceAll(ownedInspectJSON("myctr"), "__CONTAINER_CREATION__", cfg.creation)
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	cleanupFailedCreate(ctx, cfg, runErr, runErr)
 	if len(r.deleted) != 1 {

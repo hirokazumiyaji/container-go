@@ -105,7 +105,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {

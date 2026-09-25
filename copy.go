@@ -45,7 +45,11 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.operationTarget(), abs, containerPath)...)
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
 	return c.classify(ctx, err)
 }
 
@@ -65,7 +69,12 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	dst := filepath.Join(dir, filepath.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.operationTarget(), containerPath, dst)...); err != nil {
+	target, err := c.verifiedOperationTarget()
+	if err != nil {
+		_ = os.RemoveAll(dir)
+		return nil, err
+	}
+	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, c.classify(ctx, err)
 	}

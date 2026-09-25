@@ -35,7 +35,7 @@ func TestLogTailContainsTrailingMarker(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
 	tr := &tailRunner{fakeRunner: base, logData: big}
-	ctr := &Container{id: "myctr", runner: tr, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", runner: tr, eng: appleEngine{}, creation: "0123456789abcdef"}
 	tail := ctr.logTail(context.Background())
 	if !strings.Contains(tail, "LATEST_FATAL_MARKER") {
 		t.Fatalf("tail missing marker, len=%d", len(tail))
@@ -90,8 +90,8 @@ func TestLogTailDoesNotReadReplacementLogs(t *testing.T) {
 		t.Fatalf("logTail returned replacement logs: %q", tail)
 	}
 	nameHandle := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
-	if tail := nameHandle.logTail(context.Background()); !strings.Contains(tail, "replacement container logs") {
-		t.Fatalf("name-target probe = %q, want replacement logs", tail)
+	if tail := nameHandle.logTail(context.Background()); tail != "" {
+		t.Fatalf("unverified Docker name-target probe = %q, want no logs", tail)
 	}
 	runner.mu.Lock()
 	calls := append([][]string(nil), runner.calls...)

@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -44,6 +45,38 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("log %s = %q, want all of %q", path, data, wants)
+}
+
+type blockingReaperWriter struct {
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+	closeOnce sync.Once
+	onClose   func()
+}
+
+func newBlockingReaperWriter(onClose func()) *blockingReaperWriter {
+	return &blockingReaperWriter{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+		onClose: onClose,
+	}
+}
+
+func (w *blockingReaperWriter) Write(p []byte) (int, error) {
+	w.startOnce.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+func (w *blockingReaperWriter) Close() error {
+	w.closeOnce.Do(func() {
+		if w.onClose != nil {
+			w.onClose()
+		}
+		close(w.release)
+	})
+	return nil
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
@@ -108,6 +141,117 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	r.closeStdin()
 
 	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
+}
+
+func TestReaperUnregisterCancellationIsContextBounded(t *testing.T) {
+	oldWriteTimeout := reaperWriteTimeout
+	reaperWriteTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { reaperWriteTimeout = oldWriteTimeout })
+
+	r := newReaper("unused", "delete")
+	exited := make(chan struct{})
+	writer := newBlockingReaperWriter(func() { close(exited) })
+	process := &reaperProcess{
+		stdin:  writer,
+		exited: exited,
+		pid:    12345,
+		pgid:   12345,
+	}
+	r.process = process
+	r.stdin = writer
+	r.exited = exited
+	r.pid, r.pgid = process.pid, process.pgid
+	r.entries = []reaperEntry{{id: "stuck"}}
+	r.killProcess = func(*reaperProcess) {}
+
+	result := make(chan error, 1)
+	go func() { result <- r.unregister("stuck", "") }()
+
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("cancellation write did not start")
+	}
+
+	// State must remain inspectable while the pipe writer is stalled.
+	stateAcquired := make(chan struct{})
+	go func() {
+		r.mu.Lock()
+		close(stateAcquired)
+		r.mu.Unlock()
+	}()
+	select {
+	case <-stateAcquired:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("unregister held the reaper state mutex during a blocked write")
+	}
+
+	select {
+	case <-result:
+	case <-time.After(time.Second):
+		t.Fatal("unregister remained blocked on a stalled reaper reader")
+	}
+}
+
+func TestReaperDelayedRegistrationAndUnregisterDoNotSignalReapedProcess(t *testing.T) {
+	r := newReaper("unused", "delete")
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+	r.command = func() *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", "exit 0")
+	}
+
+	// Start and fully reap a child, then leave it as the current process.
+	// The next lifecycle operation must observe the cleared identity, not
+	// use the old numeric PID/PGID for a replacement signal.
+	r.mu.Lock()
+	err := r.spawnLocked()
+	old := r.process
+	r.mu.Unlock()
+	if err != nil {
+		t.Fatalf("spawn short-lived reaper: %v", err)
+	}
+	<-old.exited
+	r.mu.Lock()
+	if r.pid != 0 || r.pgid != 0 {
+		t.Fatalf("reaped identity = pid:%d pgid:%d, want 0/0", r.pid, r.pgid)
+	}
+	r.mu.Unlock()
+	if old.pid != 0 || old.pgid != 0 {
+		t.Fatalf("process identity after reap = pid:%d pgid:%d, want 0/0", old.pid, old.pgid)
+	}
+
+	signalCalls := 0
+	r.killProcess = func(*reaperProcess) {
+		signalCalls++
+	}
+	r.command = func() *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	r.entries = []reaperEntry{{id: "active"}}
+	if err := r.unregister("active", ""); err != nil {
+		t.Fatalf("delayed unregister: %v", err)
+	}
+	if err := r.register("later", ""); err != nil {
+		t.Fatalf("delayed register: %v", err)
+	}
+	if err := r.unregister("later", ""); err != nil {
+		t.Fatalf("delayed unregister: %v", err)
+	}
+	if signalCalls != 0 {
+		t.Fatalf("reaped process signal calls = %d, want 0", signalCalls)
+	}
+	r.mu.Lock()
+	replaced := r.process != old
+	r.mu.Unlock()
+	if !replaced {
+		t.Fatal("delayed registration did not replace the reaped process")
+	}
+
+	r.closeStdin()
+	waitForReaperExit(t, r)
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
@@ -328,6 +472,76 @@ func TestReaperRespawnReplaysOnlyActiveEntries(t *testing.T) {
 	}
 }
 
+func TestReaperConcurrentUnregisterDuringReplay(t *testing.T) {
+	_, logPath := writeReaperStub(t)
+	readerPath := filepath.Join(t.TempDir(), "reader.sh")
+	reader := "#!/bin/sh\n" +
+		"awk 'substr($0, 1, 2) == \"+ \" { active[substr($0, 3)] = 1; next } " +
+		"substr($0, 1, 2) == \"- \" { delete active[substr($0, 3)]; next } " +
+		"END { for (entry in active) print \"active \" entry }' >> " + logPath + "\n"
+	if err := os.WriteFile(readerPath, []byte(reader), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd { return exec.Command(readerPath) }
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	const entries = 128
+	for i := 0; i < entries; i++ {
+		if err := r.register(fmt.Sprintf("replay-%d", i), ""); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+	}
+	r.killForTest()
+
+	errs := make(chan error, entries*2)
+	var wg sync.WaitGroup
+	for i := 0; i < entries; i++ {
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if i%2 == 0 {
+				if err := r.unregister(fmt.Sprintf("replay-%d", i), ""); err != nil {
+					errs <- fmt.Errorf("unregister %d: %w", i, err)
+				}
+				return
+			}
+			if err := r.register(fmt.Sprintf("replacement-%d", i), ""); err != nil {
+				errs <- fmt.Errorf("replacement %d: %w", i, err)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+
+	r.closeStdin()
+	waitForReaperExit(t, r)
+	data, _ := os.ReadFile(logPath)
+	for i := 0; i < entries; i++ {
+		id := fmt.Sprintf("replay-%d", i)
+		line := "active " + id + "\n"
+		if i%2 == 0 && strings.Contains(string(data), line) {
+			t.Errorf("concurrently unregistered entry was replayed: %s", id)
+		}
+		if i%2 == 1 {
+			if !strings.Contains(string(data), line) {
+				t.Errorf("active entry missing from replay: %s", id)
+			}
+			replacement := fmt.Sprintf("replacement-%d", i)
+			if !strings.Contains(string(data), "active "+replacement+"\n") {
+				t.Errorf("new entry missing from replay: %s", replacement)
+			}
+		}
+	}
+}
+
 func TestReaperCompletedEntriesAreBounded(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
@@ -336,25 +550,46 @@ func TestReaperCompletedEntriesAreBounded(t *testing.T) {
 		spawns++
 		return exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", bin, "delete", breQuote(creationLabel))
 	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
 
 	const lifecycles = 10_000
+	errs := make(chan error, lifecycles*2)
+	var wg sync.WaitGroup
 	for i := 0; i < lifecycles; i++ {
-		id := fmt.Sprintf("ctr-%d", i)
-		if err := r.register(id, ""); err != nil {
-			t.Fatalf("register %d: %v", i, err)
-		}
-		if err := r.unregister(id, ""); err != nil {
-			t.Fatalf("unregister %d: %v", i, err)
-		}
+		i := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			id := fmt.Sprintf("ctr-%d", i)
+			if err := r.register(id, ""); err != nil {
+				errs <- fmt.Errorf("register %d: %w", i, err)
+				return
+			}
+			if err := r.unregister(id, ""); err != nil {
+				errs <- fmt.Errorf("unregister %d: %w", i, err)
+			}
+		}()
 	}
-	if got := len(r.entries); got != 0 {
-		t.Fatalf("active entries after %d lifecycles = %d, want 0", lifecycles, got)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	activeEntries := len(r.entries)
+	completedEntries := len(r.completed)
+	r.mu.Unlock()
+	if activeEntries != 0 {
+		t.Fatalf("active entries after %d lifecycles = %d, want 0", lifecycles, activeEntries)
 	}
 	if spawns != 1 {
-		t.Fatalf("reaper spawns for %d sequential lifecycles = %d, want 1", lifecycles, spawns)
+		t.Fatalf("reaper spawns for %d concurrent lifecycles = %d, want 1", lifecycles, spawns)
 	}
-	if got := len(r.completed); got > maxReaperCompletedEntries {
-		t.Fatalf("completed entries = %d, want at most %d", got, maxReaperCompletedEntries)
+	if completedEntries > maxReaperCompletedEntries {
+		t.Fatalf("completed entries = %d, want at most %d", completedEntries, maxReaperCompletedEntries)
 	}
 
 	r.closeStdin()

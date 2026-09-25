@@ -222,7 +222,8 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
   script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  only as validated stdin data: an Apple Container name or Docker's
+  full 64-character lowercase hexadecimal container ID.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use

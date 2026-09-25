@@ -95,6 +95,65 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
 }
 
+func waitForPath(t *testing.T, path string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(path); err == nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", path)
+}
+
+func TestReaperSIGKILLDoesNotLeaveInspectSecret(t *testing.T) {
+	stagingDir := t.TempDir()
+	t.Setenv("TMPDIR", stagingDir)
+	workDir := t.TempDir()
+	started := filepath.Join(workDir, "inspect-started")
+	release := filepath.Join(workDir, "release-inspect")
+	binPath := filepath.Join(workDir, "container")
+	const secret = "reaper-secret-4f8c2a"
+
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = \"inspect\" ]; then\n" +
+		"  echo '  \"environment\": [\"PASSWORD=" + secret + "\"]'\n" +
+		"  echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'\n" +
+		"  : > " + started + "\n" +
+		"  while [ ! -e " + release + " ]; do sleep 1; done\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	if err := r.register("guarded", "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForPath(t, started)
+	r.killForTest()
+
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			continue
+		}
+		data, readErr := os.ReadFile(filepath.Join(stagingDir, entry.Name()))
+		if readErr == nil && strings.Contains(string(data), secret) {
+			t.Fatalf("secret remained in reaper staging file %s", entry.Name())
+		}
+	}
+
+	// Let a surviving fake inspect child finish so the test does not leave
+	// a process behind; the reaper itself has already been killed.
+	_ = os.WriteFile(release, nil, 0o600)
+}
+
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")

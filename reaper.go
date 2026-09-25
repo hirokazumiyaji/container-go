@@ -21,18 +21,23 @@ import (
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script
 // itself disables globbing and quotes every expansion the IDs reach.
-// Each backend call runs with a per-entry timeout implemented with
+// Each delete call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
-// hung daemon cannot wedge deletion of later entries. Failures stay
-// silent (|| true) by design: the reaper is last-resort insurance.
+// hung daemon cannot wedge deletion of later entries. Inspect output is
+// streamed through a field filter instead of being staged on disk. Failures
+// stay silent (|| true) by design: the reaper is last-resort insurance.
 // When a creation generation is known, the script inspects first and
 // reads the creation label as a structural JSON field: the match is
 // anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name.
+// text containing the same characters cannot satisfy it. Inspect output
+// is filtered before command substitution, so only the generation, ID,
+// and status are held in memory; it is never staged in a host file, so
+// a killed reaper cannot leave an environment-bearing inspect dump behind.
+// When inspect also reports an immutable "Id" (Docker), the delete
+// targets that ID instead of the name, so a same-name replacement
+// created after the check is simply not found.
+// Apple Container has no such ID; there the delete necessarily goes by
+// name.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -58,11 +63,22 @@ echo "$ids" | while IFS= read -r line; do
   [ "$id" = "$line" ] && creation=""
   target="$id"
   if [ -n "$creation" ]; then
-    tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
-    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
-    rm -f "$tmp"
+    # Apple has no inspect format; filter on the pipe before command
+    # substitution can materialize output.
+    inspect_fields=$(
+      {
+        "$bin" inspect "$id" 2>/dev/null
+        printf '\n__containergo_inspect_rc__%s\n' "$?"
+      } | sed -n \
+        -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
+        -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
+        -e 's/^__containergo_inspect_rc__\([0-9][0-9]*\)$/inspect_rc=\1/p'
+    ) || continue
+    got=$(printf '%s\n' "$inspect_fields" | sed -n 's/^creation=//p' | head -n 1)
+    uid=$(printf '%s\n' "$inspect_fields" | sed -n 's/^id=//p' | head -n 1)
+    inspect_rc=$(printf '%s\n' "$inspect_fields" | sed -n 's/^inspect_rc=//p' | tail -n 1)
+    unset inspect_fields
+    [ "$inspect_rc" = 0 ] || continue
     [ "$got" = "$creation" ] || continue
     [ -n "$uid" ] && target="$uid"
   fi

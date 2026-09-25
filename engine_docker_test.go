@@ -95,12 +95,27 @@ func TestDockerParseInspect(t *testing.T) {
 	if info.ip != "172.17.0.2" {
 		t.Errorf("ip = %q", info.ip)
 	}
+	if info.networkMode != "bridge" {
+		t.Errorf("networkMode = %q, want bridge", info.networkMode)
+	}
 	if info.image != "redis:7-alpine" {
 		t.Errorf("image = %q", info.image)
 	}
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)
+	}
+}
+
+func TestDockerParseInspectInfersNetworkMode(t *testing.T) {
+	info, err := (dockerEngine{}).parseInspect([]byte(`[
+  {"Id":"id","State":{"Status":"running"},"NetworkSettings":{"Networks":{"test-net":{"IPAddress":"172.20.0.2"}}}}
+]`), "id")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.networkMode != "test-net" {
+		t.Errorf("networkMode = %q, want test-net", info.networkMode)
 	}
 }
 
@@ -404,4 +419,260 @@ func TestDockerContainerIPComesFromInspect(t *testing.T) {
 	if ip != "172.17.0.2" {
 		t.Errorf("ContainerIP = %q", ip)
 	}
+}
+
+func TestDockerRejectsHostNetworkPublishingBeforeRun(t *testing.T) {
+	cases := []struct {
+		name    string
+		network string
+		option  Option
+		wantErr string
+	}{
+		{
+			name:    "host auto-publish",
+			network: "host",
+			option:  WithExposedPorts("80/tcp"),
+			wantErr: "WithExposedPorts",
+		},
+		{
+			name:    "host explicit publish",
+			network: "host",
+			option:  WithPublishedPort("127.0.0.1:18080:80"),
+			wantErr: "WithPublishedPort",
+		},
+		{
+			name:    "none auto-publish",
+			network: "none",
+			option:  WithExposedPorts("80/tcp"),
+			wantErr: "WithExposedPorts",
+		},
+		{
+			name:    "none explicit publish",
+			network: "none",
+			option:  WithPublishedPort("127.0.0.1:18080:80"),
+			wantErr: "WithPublishedPort",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &dockerRunner{fakeRunner: newTestRunner()}
+			_, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), WithNetwork(tc.network), tc.option,
+				withRunner(d), withEngine(dockerEngine{}))
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("Run error = %v, want %q", err, tc.wantErr)
+			}
+			if len(d.calls) != 0 {
+				t.Errorf("CLI called before configuration rejection: %v", d.calls)
+			}
+		})
+	}
+}
+
+func TestDockerRunArgsNetworkModeMatrix(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	cases := []struct {
+		name        string
+		network     string
+		opts        []Option
+		wantNetwork string
+		wantPublish []string
+	}{
+		{
+			name:        "default auto-publish",
+			opts:        []Option{WithExposedPorts("80/tcp")},
+			wantPublish: []string{"127.0.0.1::80/tcp"},
+		},
+		{
+			name:        "bridge auto-publish",
+			network:     "bridge",
+			opts:        []Option{WithExposedPorts("80/tcp")},
+			wantNetwork: "bridge",
+			wantPublish: []string{"127.0.0.1::80/tcp"},
+		},
+		{
+			name:        "named auto-publish",
+			network:     "test-net",
+			opts:        []Option{WithExposedPorts("80/tcp")},
+			wantNetwork: "test-net",
+			wantPublish: []string{"127.0.0.1::80/tcp"},
+		},
+		{
+			name:        "named explicit publish",
+			network:     "test-net",
+			opts:        []Option{WithPublishedPort("127.0.0.1:18080:80")},
+			wantNetwork: "test-net",
+			wantPublish: []string{"127.0.0.1:18080:80"},
+		},
+		{
+			name:        "host no publish",
+			network:     "host",
+			wantNetwork: "host",
+		},
+		{
+			name:        "none no publish",
+			network:     "none",
+			wantNetwork: "none",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := append([]Option(nil), tc.opts...)
+			if tc.network != "" {
+				opts = append(opts, WithNetwork(tc.network))
+			}
+			cfg := dockerTestConfig(t, opts...)
+			eng := dockerEngine{}
+			if err := eng.checkConfig(cfg); err != nil {
+				t.Fatalf("checkConfig: %v", err)
+			}
+			args := eng.runArgs(cfg, "redis:7-alpine", "")
+			if got := argvValue(args, "--network"); got != tc.wantNetwork {
+				t.Errorf("--network = %q, want %q (args=%v)", got, tc.wantNetwork, args)
+			}
+			if got := argvValues(args, "--publish"); !slices.Equal(got, tc.wantPublish) {
+				t.Errorf("publish args = %v, want %v (args=%v)", got, tc.wantPublish, args)
+			}
+		})
+	}
+}
+
+func TestDockerRunArgsNeverPublishInNonPublishableNetwork(t *testing.T) {
+	for _, network := range []string{"host", "none"} {
+		t.Run(network, func(t *testing.T) {
+			cfg := dockerTestConfig(t,
+				WithNetwork(network),
+				WithExposedPorts("80/tcp"),
+				WithPublishedPort("127.0.0.1:18080:80"),
+			)
+			if got := argvValues(dockerEngine{}.runArgs(cfg, "redis:7-alpine", ""), "--publish"); len(got) != 0 {
+				t.Fatalf("publish args = %v, want none", got)
+			}
+		})
+	}
+}
+
+func TestDockerReuseRejectsNetworkModeMismatch(t *testing.T) {
+	cfg := dockerTestConfig(t, WithName("myctr"), WithReuse(), WithNetwork("bridge"))
+	info := &engineInfo{
+		labels:      map[string]string{reuseLabel: "true"},
+		image:       "redis:7-alpine",
+		networkMode: dockerNetworkHost,
+	}
+	if err := checkReuseCompat(info, "redis:7-alpine", cfg); err == nil || !strings.Contains(err.Error(), "network mode") {
+		t.Fatalf("checkReuseCompat error = %v, want network mode mismatch", err)
+	}
+}
+
+func TestDockerExplicitEndpointUsesInspectBinding(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.inspectJSON = data
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithNetwork("bridge"),
+		WithPublishedPort("127.0.0.1:49153:6379"),
+		withRunner(d), withEngine(dockerEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	host, err := ctr.Host(context.Background())
+	if err != nil || host != "127.0.0.1" {
+		t.Fatalf("Host = %q, err = %v", host, err)
+	}
+	endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+	if err != nil || endpoint != "127.0.0.1:49153" {
+		t.Fatalf("Endpoint = %q, err = %v", endpoint, err)
+	}
+}
+
+func TestDockerEndpointDoesNotTrustRequestedBinding(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d.inspectJSON = data
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithNetwork("bridge"),
+		WithPublishedPort("127.0.0.1:18080:80"),
+		withRunner(d), withEngine(dockerEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if host, err := ctr.Host(context.Background()); err == nil {
+		t.Errorf("Host = %q, want an error for a binding absent from inspect", host)
+	}
+	if endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
+		t.Errorf("Endpoint = %q, want an error for a binding absent from inspect", endpoint)
+	}
+}
+
+func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		mode         string
+		wantEndpoint string
+		wantErr      bool
+	}{
+		{mode: "bridge", wantEndpoint: "127.0.0.1:49153"},
+		{mode: "host", wantErr: true},
+		{mode: "none", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.mode, func(t *testing.T) {
+			d := &dockerRunner{fakeRunner: newTestRunner()}
+			d.inspectJSON = []byte(strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1))
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), WithExposedPorts("6379/tcp"),
+				withRunner(d), withEngine(dockerEngine{}))
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			host, hostErr := ctr.Host(context.Background())
+			endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+			if tc.wantErr {
+				if hostErr == nil {
+					t.Errorf("Host = %q, want %s network mode error", host, tc.mode)
+				}
+				if err == nil {
+					t.Fatalf("Endpoint = %q, want %s network mode error", endpoint, tc.mode)
+				}
+				if !strings.Contains(err.Error(), tc.mode) {
+					t.Errorf("Endpoint error = %v, want %s mode mentioned", err, tc.mode)
+				}
+				return
+			}
+			if hostErr != nil || host != "127.0.0.1" {
+				t.Errorf("Host = %q, err = %v; want 127.0.0.1", host, hostErr)
+			}
+			if err != nil || endpoint != tc.wantEndpoint {
+				t.Errorf("Endpoint = %q, err = %v; want %q", endpoint, err, tc.wantEndpoint)
+			}
+		})
+	}
+}
+
+func argvValue(args []string, flag string) string {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func argvValues(args []string, flag string) []string {
+	var values []string
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			values = append(values, args[i+1])
+		}
+	}
+	return values
 }

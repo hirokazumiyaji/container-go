@@ -226,7 +226,8 @@ func WithEntrypoint(entrypoint string) Option {
 }
 
 // WithExposedPorts declares the container ports ("6379/tcp" or "6379")
-// that MappedPort and Endpoint may resolve.
+// that MappedPort and Endpoint may resolve. Docker auto-publishes these
+// ports; host and none network modes reject that combination.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
 		for _, p := range ports {
@@ -241,8 +242,10 @@ func WithExposedPorts(ports ...string) Option {
 }
 
 // WithPublishedPort publishes a container port on the host
-// ("[host-ip:]host-port:container-port[/proto]"). Without it, endpoints
-// resolve to the container's own IP, which needs no host port at all.
+// ("[host-ip:]host-port:container-port[/proto]"). On Apple Container,
+// endpoints resolve to the container's own IP when this is omitted; on
+// Docker, WithExposedPorts auto-publishes instead. Docker host and none
+// network modes reject both publish forms.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)
@@ -342,7 +345,9 @@ func WithWorkingDir(dir string) Option {
 }
 
 // WithNetwork attaches the container to a named network instead of
-// "default".
+// "default". Docker's "host" and "none" modes cannot be combined with
+// WithExposedPorts or WithPublishedPort; the Docker backend rejects
+// those combinations before creating the container.
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {

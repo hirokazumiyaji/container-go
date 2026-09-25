@@ -17,7 +17,8 @@ type CLIError = cli.CLIError
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was not declared via
-// WithExposedPorts.
+// WithExposedPorts or has no host binding in the backend's actual
+// network mode.
 var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 
 // ErrImageNotFound reports that an image is not in the backend's local

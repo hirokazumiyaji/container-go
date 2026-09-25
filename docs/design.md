@@ -214,6 +214,15 @@ unreachable in a given setup), publish explicitly with
 `WithPublishedPort("127.0.0.1:15432:5432")`. Then `Host` returns the
 given host address and `MappedPort` the host port.
 
+Docker's `host` and `none` network modes are different: Docker
+discards published ports in host mode and has no host namespace in
+none mode. The backend therefore rejects `WithExposedPorts` (which is
+Docker auto-publish) and `WithPublishedPort` with those modes before
+container creation. Host mode without port declarations is left to the
+application, and the library does not synthesize an endpoint for it.
+Endpoint resolution also checks the network mode and the actual inspect
+binding instead of trusting the requested publish string.
+
 `MappedPort` errors with `ErrPortNotExposed` for ports not declared
 via `WithExposedPorts`. The declarations also feed wait strategies
 (the default port of ForListeningPort, for example).

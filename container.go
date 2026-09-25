@@ -83,6 +83,9 @@ type Container struct {
 	eng       engine
 	exposed   []portSpec
 	published []publishSpec
+	// network is the requested backend network, retained so endpoint
+	// resolution can compare it with the mode reported by inspect.
+	network string
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
 	// process exit. Explicit Terminate still removes them.
@@ -171,6 +174,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		network:   cfg.network,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
@@ -372,15 +376,26 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
-	if len(c.published) > 0 {
-		addr := c.published[0].connectAddr()
-		if !c.eng.directIP() {
-			addr = dockerConnectHost(addr, c.eng)
-		}
-		return addr, nil
-	}
 	if c.eng.directIP() {
+		if len(c.published) > 0 {
+			return c.published[0].connectAddr(), nil
+		}
 		return c.ContainerIP(ctx)
+	}
+	info, err := c.cachedInfo(ctx)
+	if err != nil {
+		return "", err
+	}
+	if err := c.validateEndpointInfo(info); err != nil {
+		return "", err
+	}
+	if len(c.published) > 0 {
+		p := c.published[0]
+		b, ok := matchingPublishedBinding(info.bound, p)
+		if !ok {
+			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
+		}
+		return dockerConnectHost(b.hostAddr, c.eng), nil
 	}
 	return c.eng.defaultHost(), nil
 }
@@ -407,19 +422,21 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
+	var published *publishSpec
+	for i := range c.published {
+		p := &c.published[i]
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+			published = p
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
 	if c.eng.directIP() {
+		if published != nil {
+			return published.connectAddr(), published.hostPort, nil
+		}
 		ip, err := c.ContainerIP(ctx)
 		if err != nil {
 			return "", 0, err
@@ -427,16 +444,42 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
+	// Docker may discard -p in host mode, so the request is never used
+	// as proof that a binding exists; inspect must confirm it.
 	info, err := c.cachedInfo(ctx)
 	if err != nil {
 		return "", 0, err
 	}
+	if err := c.validateEndpointInfo(info); err != nil {
+		return "", 0, err
+	}
+	if published != nil {
+		b, ok := matchingPublishedBinding(info.bound, *published)
+		if !ok {
+			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
+		}
+		return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
+	}
 	for _, b := range info.bound {
-		if b.containerPort == spec.port && b.proto == spec.proto {
+		if b.containerPort == spec.port && b.proto == spec.proto && b.hostPort > 0 {
 			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
 		}
 	}
-	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
+	return "", 0, fmt.Errorf("%w: %s has no host binding in Docker network mode %q", ErrPortNotExposed, spec, info.networkMode)
+}
+
+// validateEndpointInfo prevents a requested network mode or publish
+// option from being mistaken for an endpoint that the daemon did not
+// actually create. Apple Container does not report networkMode, so this
+// check is intentionally Docker-specific.
+func (c *Container) validateEndpointInfo(info *engineInfo) error {
+	if c.eng.name() != "docker" {
+		return nil
+	}
+	if err := dockerNetworkModeError(c.network, info.networkMode); err != nil {
+		return err
+	}
+	return dockerNetworkEndpointError(info.networkMode)
 }
 
 // cachedInfo returns the first successful inspect result. Only fields

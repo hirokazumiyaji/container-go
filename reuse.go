@@ -46,6 +46,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		eng:       base.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		network:   cfg.network,
 		reused:    true,
 		info:      info,
 		creation:  info.labels[creationLabel],
@@ -119,6 +120,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				eng:       cfg.eng,
 				exposed:   cfg.exposed,
 				published: cfg.published,
+				network:   cfg.network,
 				reused:    true,
 				info:      info,
 				creation:  info.labels[creationLabel],
@@ -170,6 +172,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		network:   cfg.network,
 		reused:    true,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
@@ -227,6 +230,7 @@ func namedContainer(cfg *config, id string) *Container {
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		network:   cfg.network,
 	}
 }
 
@@ -261,6 +265,16 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	if err := checkReuseOwned(info, image, cfg); err != nil {
 		return err
 	}
+	if cfg.eng.name() == "docker" {
+		if err := dockerNetworkModeError(cfg.network, info.networkMode); err != nil {
+			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
+		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
+			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
+				return fmt.Errorf("reuse %s: %w", cfg.name, err)
+			}
+		}
+	}
 	// Auto-published exposed ports only appear as host bindings on
 	// published-port backends. Explicit WithPublishedPort always needs
 	// validation, including on direct-IP engines.
@@ -288,20 +302,25 @@ func hasBoundPort(bound []boundPort, port int, proto string) bool {
 	return false
 }
 
-func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
+func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool) {
 	for _, b := range bound {
-		if b.containerPort != p.containerPort || b.proto != p.proto {
+		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
 			continue
 		}
 		if p.hostPort != 0 && b.hostPort != p.hostPort {
 			continue
 		}
-		if p.hostAddr != "" && b.hostAddr != "" && b.hostAddr != p.hostAddr {
+		if p.hostAddr != "" && b.hostAddr != p.hostAddr {
 			continue
 		}
-		return true
+		return b, true
 	}
-	return false
+	return boundPort{}, false
+}
+
+func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
+	_, ok := matchingPublishedBinding(bound, p)
+	return ok
 }
 
 // imagesCompatible reports whether a requested image reference matches

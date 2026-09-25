@@ -19,6 +19,10 @@ type engineInfo struct {
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
+	// networkMode is the backend's reported network mode. Docker uses
+	// this to distinguish a real host binding from a request that the
+	// daemon discarded (for example, -p with host networking).
+	networkMode string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort

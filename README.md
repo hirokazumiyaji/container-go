@@ -102,6 +102,17 @@ in the daemon, so parallel tests do not race over ports here either.
 With a remote daemon, an explicit `WithPublishedPort` bound to loopback
 (`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
 on the remote machine.
+
+Docker's `host` and `none` network modes cannot create host-side port
+bindings. Consequently, `WithExposedPorts` (which auto-publishes on
+Docker) and `WithPublishedPort` are rejected before the container is
+created when combined with `WithNetwork("host")` or
+`WithNetwork("none")`. Host mode remains available without port options,
+but this library does not invent a host-mode `Endpoint`; an application
+using it is responsible for its host-network reachability. If a Docker
+installation disables host networking, the backend CLI error is
+returned rather than a fabricated endpoint.
+
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
 daemon is not detected.
 

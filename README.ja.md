@@ -90,9 +90,19 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。`docker context` 経由のリモート指定は検知しません。割り当ては
-デーモンが起動時に原子的に行うため、こちらでも並列テストがポートを
-奪い合うことはありません。
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。
+
+Docker の `host` / `none` ネットワークモードでは host 側のポート
+バインディングを作成できません。そのため `WithNetwork("host")` または
+`WithNetwork("none")` と `WithExposedPorts`(Docker では自動公開) /
+`WithPublishedPort` を組み合わせた場合は、コンテナ作成前に拒否します。
+ポート指定なしの host モードは利用可能ですが、このライブラリは host
+モード用の `Endpoint` を推測して返しません。host ネットワークの到達性は
+アプリケーション側の責務です。Docker 側で host ネットワークが無効な
+場合は、推測した endpoint ではなくバックエンド CLI のエラーを返します。
+`docker context` 経由のリモート指定は検知しません。割り当てはデーモンが
+起動時に原子的に行うため、こちらでも並列テストがポートを奪い合うことは
+ありません。
 
 クライアントが `localhost` を要求する場合(または構成上コンテナ IP に
 届かない場合)は、明示的に公開します。

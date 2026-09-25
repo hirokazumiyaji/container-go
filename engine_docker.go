@@ -17,8 +17,8 @@ import (
 
 // dockerEngine drives the `docker` CLI. Unlike Apple Container, the
 // container IP is generally not reachable from the host (Docker
-// Desktop), so exposed ports are published to daemon-assigned loopback
-// ports and endpoints resolve to those.
+// Desktop), so on publishable network modes exposed ports are published
+// to daemon-assigned loopback ports and endpoints resolve to those.
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
@@ -36,16 +36,28 @@ const (
 	dockerStderrNotFound     = "not found"
 	dockerStderrNoSuchObj    = "no such object"
 	dockerStderrNoSuchCtr    = "no such container"
+
+	dockerNetworkHost = "host"
+	dockerNetworkNone = "none"
 )
 
 func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
-// checkConfig rejects explicit loopback publish binds on a remote
-// daemon: Docker would listen on the remote machine's loopback, which
-// no rewrite of the client-facing address can make reachable.
+// checkConfig rejects publish options that Docker cannot honor before
+// any image or container command is issued. In particular, Docker
+// silently discards -p in host mode, and a none network has no host
+// port namespace at all.
 func (dockerEngine) checkConfig(cfg *config) error {
+	if !dockerNetworkAllowsPublish(cfg.network) {
+		if len(cfg.published) > 0 {
+			return dockerPublishOptionError(cfg.network, "WithPublishedPort")
+		}
+		if len(cfg.exposed) > 0 {
+			return dockerPublishOptionError(cfg.network, "WithExposedPorts")
+		}
+	}
 	if !isRemoteDockerHost() {
 		return nil
 	}
@@ -56,6 +68,57 @@ func (dockerEngine) checkConfig(cfg *config) error {
 		}
 	}
 	return nil
+}
+
+func dockerPublishOptionError(mode, option string) error {
+	if mode == dockerNetworkHost {
+		return fmt.Errorf("docker host network does not support %s; Docker discards published ports", option)
+	}
+	return fmt.Errorf("docker network mode %q does not support %s", mode, option)
+}
+
+// dockerNetworkAllowsPublish reports whether Docker can create a
+// host-side binding for a port in the requested network mode. Named and
+// bridge networks can publish ports; host and none cannot.
+func dockerNetworkAllowsPublish(mode string) bool {
+	return mode != dockerNetworkHost && mode != dockerNetworkNone
+}
+
+// dockerNetworkModesMatch compares the requested mode with the mode
+// reported by inspect. Docker may call the implicit default network
+// "default" or "bridge" depending on how it was selected.
+func dockerNetworkModesMatch(requested, actual string) bool {
+	requested = strings.TrimSpace(requested)
+	actual = strings.TrimSpace(actual)
+	if actual == "" {
+		// Older inspect output may omit NetworkMode. Keep bridge
+		// compatibility, but never treat a requested special mode as
+		// verified when the backend did not report it.
+		return requested != dockerNetworkHost && requested != dockerNetworkNone
+	}
+	if requested == "" || requested == actual {
+		return true
+	}
+	return (requested == "default" || requested == "bridge") &&
+		(actual == "default" || actual == "bridge")
+}
+
+func dockerNetworkModeError(requested, actual string) error {
+	if dockerNetworkModesMatch(requested, actual) {
+		return nil
+	}
+	return fmt.Errorf("requested Docker network mode %q, but inspect reported %q", requested, actual)
+}
+
+func dockerNetworkEndpointError(mode string) error {
+	switch mode {
+	case dockerNetworkHost:
+		return fmt.Errorf("%w: Docker network mode %q has no host port binding; use a bridge network or omit WithExposedPorts and WithPublishedPort", ErrPortNotExposed, mode)
+	case dockerNetworkNone:
+		return fmt.Errorf("%w: Docker network mode %q has no network interface for a host port binding", ErrPortNotExposed, mode)
+	default:
+		return nil
+	}
 }
 
 func (dockerEngine) probe() cli.Probe {
@@ -132,20 +195,32 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	if isRemoteDockerHost() {
 		bindAddr = "0.0.0.0"
 	}
+	// checkConfig rejects these combinations before Run reaches this
+	// method. Keep the argv builder safe for direct backend tests too:
+	// host and none networks must never receive a -p flag.
+	runCfg := cfg
+	publishable := dockerNetworkAllowsPublish(cfg.network)
+	if !publishable {
+		copy := *cfg
+		copy.published = nil
+		runCfg = &copy
+	}
 	var extraPublish []string
-	for _, spec := range cfg.exposed {
-		published := false
-		for _, p := range cfg.published {
-			if p.containerPort == spec.port && p.proto == spec.proto {
-				published = true
-				break
+	if publishable {
+		for _, spec := range cfg.exposed {
+			published := false
+			for _, p := range cfg.published {
+				if p.containerPort == spec.port && p.proto == spec.proto {
+					published = true
+					break
+				}
+			}
+			if !published {
+				extraPublish = append(extraPublish, bindAddr+"::"+spec.String())
 			}
 		}
-		if !published {
-			extraPublish = append(extraPublish, bindAddr+"::"+spec.String())
-		}
 	}
-	return append(args, cfg.commonRunArgs(image, envFile, extraPublish)...)
+	return append(args, runCfg.commonRunArgs(image, envFile, extraPublish)...)
 }
 
 // dockerIDRE matches the full container ID `docker run --detach` prints.
@@ -169,6 +244,9 @@ type dockerInspect struct {
 	State struct {
 		Status string `json:"Status"`
 	} `json:"State"`
+	HostConfig struct {
+		NetworkMode string `json:"NetworkMode"`
+	} `json:"HostConfig"`
 	Config struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
@@ -196,11 +274,27 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[0]
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		image:       c.Config.Image,
+		ip:          c.NetworkSettings.IPAddress,
+		networkMode: c.HostConfig.NetworkMode,
+	}
+	if info.networkMode == "" {
+		// HostConfig.NetworkMode is present in current Docker inspect
+		// output. The network map fallback keeps endpoint validation
+		// meaningful for older CLI versions that omitted HostConfig;
+		// some Docker versions leave it empty for user-defined networks.
+		if _, ok := c.NetworkSettings.Networks[dockerNetworkHost]; ok {
+			info.networkMode = dockerNetworkHost
+		} else if _, ok := c.NetworkSettings.Networks[dockerNetworkNone]; ok {
+			info.networkMode = dockerNetworkNone
+		} else if len(c.NetworkSettings.Networks) == 1 {
+			for name := range c.NetworkSettings.Networks {
+				info.networkMode = name
+			}
+		}
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

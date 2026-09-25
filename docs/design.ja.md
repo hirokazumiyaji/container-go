@@ -152,6 +152,15 @@ Apple Container ではこの方式を既定にしない。
 `localhost` 固定の接続先が必要な場合(コンテナ IP へ到達できない環境や、接続文字列に localhost を要求するクライアント)に限り、`WithPublishedPort("127.0.0.1:15432:5432")` で明示的に公開する。
 公開した場合、`Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
 
+Docker の `host` / `none` ネットワークモードでは host 側のポート
+バインディングを作れない。そのため `WithNetwork("host")` または
+`WithNetwork("none")` と `WithExposedPorts`(Docker の自動公開) /
+`WithPublishedPort` の組み合わせは、コンテナ作成前に拒否する。ポート
+指定なしの host モードは利用できるが、ライブラリは host モード用の
+`Endpoint` を推測しない。endpoint 解決は要求した publish 文字列を
+信用せず、inspect の network mode と実際の host binding の一致を
+確認する。
+
 `MappedPort` は `WithExposedPorts` で宣言されていないポートに対してエラーを返す。
 宣言は待機戦略(ForListeningPort の既定ポートなど)にも使う。
 

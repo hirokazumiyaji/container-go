@@ -594,9 +594,11 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if uid != "" && requiresImmutableID(c.eng) && info.uid != uid {
 		return nil, fmt.Errorf("%w: inspected Docker ID changed", ErrContainerNotFound)
 	}
-	if c.uid == "" {
-		c.uid = info.uid
-	}
+	// Do not publish info.uid here. A name-addressed inspect may have
+	// observed a replacement; callers that have verified the generation
+	// and ownership can use the returned info.uid locally, while a
+	// returned handle must remain unbound until its own identity is
+	// verified.
 	return info, nil
 }
 

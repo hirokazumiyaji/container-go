@@ -36,6 +36,9 @@ func parsePlatform(value string) (platformParts, bool) {
 // platformSelectorMatches treats omitted selector components as
 // unconstrained. Actual platforms must report every selected component.
 func platformSelectorMatches(selector, actual string) bool {
+	if selector == "" {
+		return true
+	}
 	want, ok := parsePlatform(selector)
 	if !ok {
 		return false
@@ -54,6 +57,9 @@ func platformPartMatches(selector, actual string) bool {
 }
 
 func platformSelectorUnverifiable(selector, actual string) bool {
+	if selector == "" {
+		return false
+	}
 	want, ok := parsePlatform(selector)
 	if !ok {
 		return true

@@ -267,7 +267,6 @@ func deleteStoppedReuseWithImage(ctx context.Context, cfg *config, info *engineI
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
-	ctr.uid = info.uid
 	if image != "" {
 		if err := checkReuseOwned(info, image, cfg); err != nil {
 			return err

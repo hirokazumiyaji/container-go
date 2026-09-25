@@ -166,6 +166,38 @@ func TestFreshReviewDockerOperationFailsClosedWithoutUID(t *testing.T) {
 	}
 }
 
+type freshReviewInspectRunner struct{}
+
+func (freshReviewInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "inspect" {
+		return []byte(`[{"Id":"` + freshReviewDockerUID + `","Name":"/logical-name","State":{"Status":"running"},"Config":{"Image":"replacement:latest","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"bbbbbbbbbbbbbbbb"}}}]`), nil, nil
+	}
+	return nil, nil, nil
+}
+
+func TestFreshReviewInspectDoesNotBindUnverifiedDockerUID(t *testing.T) {
+	ctr := &Container{
+		id:          "logical-name",
+		creation:    "aaaaaaaaaaaaaaaa",
+		runner:      freshReviewInspectRunner{},
+		eng:         dockerEngine{},
+		nameInspect: true,
+	}
+	info, err := ctr.inspectFresh(context.Background())
+	if err != nil {
+		t.Fatalf("inspectFresh: %v", err)
+	}
+	if info.uid != freshReviewDockerUID {
+		t.Fatalf("local inspect UID = %q, want replacement UID", info.uid)
+	}
+	if ctr.uid != "" {
+		t.Fatalf("unverified same-name replacement published UID %q", ctr.uid)
+	}
+	if _, err := ctr.verifiedOperationTarget(); err == nil {
+		t.Fatal("handle without a verified UID became operational")
+	}
+}
+
 type freshReviewReuseRunner struct {
 	mu          sync.Mutex
 	deleteCalls int
@@ -255,6 +287,19 @@ func TestFreshReviewAppleImagePlatformFailsClosed(t *testing.T) {
 		if !(appleEngine{}).parseImageExists([]byte(data), "linux") {
 			t.Errorf("parseImageExists(%s, linux) = false, want OS-only presence", data)
 		}
+	}
+}
+
+func TestFreshReviewAppleEmptyPlatformIsUnconstrained(t *testing.T) {
+	if !(appleEngine{}).platformCompatible("", "linux/arm64") {
+		t.Fatal("empty Apple platform selector was treated as constrained")
+	}
+	if !(appleEngine{}).platformCompatible("", "") {
+		t.Fatal("empty Apple platform selector rejected an unconstrained match")
+	}
+	malformed := []byte(`[{"variants":[{"platform":"not-an-object"}]}]`)
+	if !(appleEngine{}).parseImageExists(malformed, "") {
+		t.Fatal("empty Apple platform selector did not preserve image presence")
 	}
 }
 

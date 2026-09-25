@@ -569,3 +569,139 @@ func TestExecZeroTimeoutKeepsCallerDeadline(t *testing.T) {
 		t.Fatalf("deadline = %v (has=%t), want caller deadline %v", f.deadline, f.has, callerDeadline)
 	}
 }
+
+type issue116PreCanceledRunner struct {
+	*fakeRunner
+	execCalls int
+}
+
+func (r *issue116PreCanceledRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		r.execCalls++
+		return []byte("unexpected"), nil, &cli.CLIError{Args: args, ExitCode: 7, Stderr: "unexpected"}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecPreCanceledContextDoesNotLaunchCLI(t *testing.T) {
+	f := &issue116PreCanceledRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	code, out, err := ctr.Exec(ctx, []string{"true"})
+	if code != 0 || out == nil {
+		t.Fatalf("code/output = %d/%v, want zero and an output reader", code, out)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if errors.As(err, new(*ExecTerminationError)) {
+		t.Fatalf("error = %v, pre-canceled context must not claim remote termination", err)
+	}
+	if f.execCalls != 0 {
+		t.Fatalf("exec calls = %d, want no launch", f.execCalls)
+	}
+}
+
+type issue116PlainCLIErrorRaceRunner struct {
+	*fakeRunner
+	started chan struct{}
+}
+
+func (r *issue116PlainCLIErrorRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		close(r.started)
+		<-ctx.Done()
+		// Deliberately omit ctx.Err from the returned error. Exec must
+		// normalize the effective context from the runner's context.
+		return []byte("race stdout"), []byte("race stderr"), &cli.CLIError{Args: args, ExitCode: 7, Stderr: "race"}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecNormalizesPlainCLIErrorCancellationRace(t *testing.T) {
+	f := &issue116PlainCLIErrorRaceRunner{fakeRunner: newTestRunner(), started: make(chan struct{})}
+	ctr := runTestContainer(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan issue116ExecResult, 1)
+	go func() {
+		code, out, err := ctr.Exec(ctx, []string{"true"})
+		result <- issue116ExecResult{code: code, out: out, err: err}
+	}()
+	waitForIssue116ExecStart(t, f.started)
+	cancel()
+	got := waitForIssue116ExecResult(t, result)
+
+	if got.code != 7 || got.out == nil {
+		t.Fatalf("code/output = %d/%v, want status 7 and output", got.code, got.out)
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("error = %v, want normalized context.Canceled", got.err)
+	}
+	var cliErr *CLIError
+	if !errors.As(got.err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want original CLIError status 7", got.err)
+	}
+	assertExecTerminationError(t, got.err)
+}
+
+type issue116TimeoutError struct{}
+
+func (issue116TimeoutError) Error() string   { return "structured operation timeout" }
+func (issue116TimeoutError) Timeout() bool   { return true }
+func (issue116TimeoutError) Temporary() bool { return true }
+
+func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{
+			name: "i/o timeout",
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout"},
+			code: 7,
+		},
+		{
+			name: "command timed out",
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 8, Stderr: "command timed out"},
+			code: 8,
+		},
+		{
+			name: "operation timed out",
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 9, Stderr: "operation timed out"},
+			code: 9,
+		},
+		{
+			name: "structured timeout",
+			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 10}, issue116TimeoutError{}),
+			code: 10,
+		},
+		{
+			name: "negative signal",
+			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: -1, Stderr: "signal"},
+			code: -1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{fakeRunner: newTestRunner(), execStdout: "partial stdout", execErr: tc.err}
+			ctr := runTestContainer(t, f)
+			code, out, err := ctr.Exec(context.Background(), []string{"true"})
+			if err == nil {
+				t.Fatal("Exec returned nil error for an operation timeout/signal")
+			}
+			if code != tc.code || out == nil {
+				t.Fatalf("code/output = %d/%v, want code %d and output", code, out, tc.code)
+			}
+			var cliErr *CLIError
+			if !errors.As(err, &cliErr) || cliErr.ExitCode != tc.code {
+				t.Fatalf("error = %v, want CLIError status %d", err, tc.code)
+			}
+			if f.callWith("inspect") != nil {
+				t.Fatalf("timeout/signal triggered a verification probe: %v", f.calls)
+			}
+		})
+	}
+}

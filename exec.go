@@ -114,6 +114,20 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
+	// Exec is a buffered, bounded operation by default. An explicit zero
+	// timeout opts out of the library default. A positive custom timeout
+	// is combined with the caller's deadline, so the earlier one wins.
+	execCtx, cancel := withExecTimeout(ctx, cfg)
+	defer cancel()
+
+	// Do not hand an already-finished context to a runner. In particular,
+	// exec.CommandContext can otherwise return a plain context error before
+	// Start, which must not be reported as an unsupported remote-process
+	// termination. Keep the output contract even for this early return.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
+		return 0, emptyExecOutput(), ctxErr
+	}
+
 	var envFile string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
@@ -123,68 +137,115 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		defer os.RemoveAll(dir)
 		envFile = path
 	}
-
-	// Exec is a buffered, bounded operation by default. An explicit zero
-	// timeout opts out of the library default. A positive custom timeout
-	// is combined with the caller's deadline, so the earlier one wins.
-	execCtx, cancel := withExecTimeout(ctx, cfg)
-	defer cancel()
+	// Setup (for example an env-file write) may itself race with
+	// cancellation. Recheck immediately before handing control to the
+	// runner so that path remains a no-launch result.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
+		return 0, emptyExecOutput(), ctxErr
+	}
 
 	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	// A runner call is considered a launch for legacy/custom runners that
+	// do not report process-start metadata. ExecRunner annotates failures
+	// with the authoritative local Start result below.
+	launched := true
+	if reported, ok := cli.StartedStatus(err); ok {
+		launched = reported
+	}
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
 	}
-	if !cli.IsCommandExit(err) {
-		// A launch, context, or transport failure has no command exit
-		// code, but the CLI may still have emitted useful diagnostics.
-		classified := wrapNotFound(c.classify(execCtx, err))
-		if isExecContextError(err) {
-			classified = &ExecTerminationError{Err: classified}
-		}
-		return 0, output, classified
+
+	// A custom runner may return a plain CLIError when cancellation races
+	// with its return. Normalize the effective context into the chain before
+	// deciding whether this is a context result.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
 	}
+	finish := func(code int, classified error) (int, io.Reader, error) {
+		if contextErr, ok := execContextualError(ctx, execCtx, classified, launched); ok {
+			return code, output, contextErr
+		}
+		return code, output, classified
+	}
+	if isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil {
+		code := 0
+		var cliErr *cli.CLIError
+		if errors.As(err, &cliErr) {
+			code = cliErr.ExitCode
+		}
+		return finish(code, err)
+	}
+
 	var cliErr *cli.CLIError
-	errors.As(err, &cliErr)
+	if !errors.As(err, &cliErr) {
+		// A launch, transport, or timeout failure has no command exit code,
+		// but the CLI may still have emitted useful diagnostics.
+		return finish(0, wrapNotFound(c.classify(execCtx, err)))
+	}
+
+	// A timeout-shaped command exit is an operation failure, not an
+	// application result. Classify preserves the original diagnostic and
+	// does not issue a misleading liveness probe.
+	if cli.IsOperationTimeoutError(err) {
+		return finish(cliErr.ExitCode, wrapNotFound(c.classify(execCtx, err)))
+	}
+
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		if contextErr := execContextResultError(err, cliErr); contextErr != nil {
-			return cliErr.ExitCode, output, contextErr
-		}
-		return cliErr.ExitCode, output, nil
+		return finish(cliErr.ExitCode, nil)
 	}
 	if c.execContainerRunning(execCtx) {
-		if contextErr := execContextResultError(err, cliErr); contextErr != nil {
-			return cliErr.ExitCode, output, contextErr
-		}
-		return cliErr.ExitCode, output, nil
+		return finish(cliErr.ExitCode, nil)
 	}
 	// Preserve both the CLI exit code and the classified infrastructure
 	// error. The output reader is intentionally non-nil on this path.
-	classified := wrapNotFound(c.classify(execCtx, err))
-	if isExecContextError(err) {
-		classified = &ExecTerminationError{Err: classified}
-	}
-	return cliErr.ExitCode, output, classified
+	return finish(cliErr.ExitCode, wrapNotFound(c.classify(execCtx, err)))
+}
+
+func emptyExecOutput() io.Reader {
+	return io.MultiReader(bytes.NewReader(nil), bytes.NewReader(nil))
 }
 
 func isExecContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-func execContextResultError(err error, _ *cli.CLIError) error {
-	if !isExecContextError(err) {
-		return nil
+func effectiveExecContextErr(ctx, execCtx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return &ExecTerminationError{Err: err}
+	return execCtx.Err()
+}
+
+func execContextualError(ctx, execCtx context.Context, err error, launched bool) (error, bool) {
+	ctxErr := effectiveExecContextErr(ctx, execCtx)
+	if ctxErr == nil && !isExecContextError(err) {
+		return nil, false
+	}
+	if ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
+	}
+	err = wrapNotFound(err)
+	if launched {
+		err = &ExecTerminationError{Err: err}
+	}
+	return err, true
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
 func maybeInfraExecErr(err error) bool {
+	// Timeout and signal-shaped errors are operation failures even when a
+	// CLI happens to print a generic application-looking stderr diagnostic.
+	// Check this before the application-result fast path below.
+	if cli.IsOperationTimeoutError(err) {
+		return true
+	}
 	s, ok := execCLIStderr(err)
 	if !ok {
 		return true

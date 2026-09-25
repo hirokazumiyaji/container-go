@@ -164,6 +164,22 @@ func TestCommandErrorPreservesExitStatusWhenContextExpires(t *testing.T) {
 	}
 }
 
+func TestExecRunnerReportsWhetherLocalProcessStarted(t *testing.T) {
+	missing := &ExecRunner{Binary: filepath.Join(t.TempDir(), "missing")}
+	_, _, err := missing.Run(context.Background(), "exec")
+	started, reported := StartedStatus(err)
+	if !reported || started {
+		t.Fatalf("missing binary start status = %t/%t, want false/true", started, reported)
+	}
+
+	failed := &ExecRunner{Binary: writeStub(t, `exit 7`)}
+	_, _, err = failed.Run(context.Background(), "exec")
+	started, reported = StartedStatus(err)
+	if !reported || !started {
+		t.Fatalf("started command status = %t/%t, want true/true", started, reported)
+	}
+}
+
 func TestCLIErrorIncludesBinaryName(t *testing.T) {
 	err := &CLIError{Binary: "docker", Args: []string{"run", "--detach"}, ExitCode: 125, Stderr: "conflict"}
 	got := err.Error()
@@ -326,3 +342,51 @@ func TestIsCommandExit(t *testing.T) {
 		t.Error("nil must not count as command exit")
 	}
 }
+
+type cliTimeoutProbeRunner struct {
+	calls int
+}
+
+func (r *cliTimeoutProbeRunner) Run(context.Context, ...string) ([]byte, []byte, error) {
+	r.calls++
+	return nil, nil, &CLIError{ExitCode: 1, Stderr: "probe failed"}
+}
+
+func TestIsOperationTimeoutErrorRecognizesStructuredAndDiagnosticForms(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{name: "context", err: context.DeadlineExceeded},
+		{name: "timeout interface", err: timeoutInterfaceError{}},
+		{name: "negative status", err: &CLIError{ExitCode: -1}},
+		{name: "i/o timeout", err: &CLIError{ExitCode: 7, Stderr: "client: i/o timeout"}},
+		{name: "command timed out", err: &CLIError{ExitCode: 7, Stderr: "command timed out"}},
+		{name: "operation timed out", err: &CLIError{ExitCode: 7, Stderr: "operation timed out"}},
+		{name: "plain diagnostic", err: errors.New("operation timed out")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsOperationTimeoutError(tc.err) {
+				t.Fatalf("IsOperationTimeoutError(%v) = false", tc.err)
+			}
+		})
+	}
+}
+
+func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
+	original := &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command timed out"}
+	probe := &cliTimeoutProbeRunner{}
+	got := Classify(context.Background(), probe, original, Probe{Args: []string{"version"}, Hint: "start daemon"})
+	if !errors.Is(got, original) {
+		t.Fatalf("classified error = %v, want original", got)
+	}
+	if probe.calls != 0 {
+		t.Fatalf("probe calls = %d, want zero", probe.calls)
+	}
+}
+
+type timeoutInterfaceError struct{}
+
+func (timeoutInterfaceError) Error() string { return "timeout" }
+func (timeoutInterfaceError) Timeout() bool { return true }

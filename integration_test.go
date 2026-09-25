@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -36,6 +37,16 @@ func requireSystem(t *testing.T) {
 	if err := exec.Command("container", "system", "status").Run(); err != nil {
 		t.Skip("apple container system service not running; run `container system start`")
 	}
+}
+
+// expectedKilledExitCode is the status reported by the local CLI after
+// context cancellation. Unix signals are normalized to a context result
+// with no usable status, while Windows Process.Kill reports status 1.
+func expectedKilledExitCode() int {
+	if runtime.GOOS == "windows" {
+		return 1
+	}
+	return 0
 }
 
 func TestIntegrationRedisLifecycle(t *testing.T) {
@@ -132,8 +143,8 @@ func TestIntegrationExecPreservesPartialOutputOnTimeout(t *testing.T) {
 	if !errors.As(err, &terminationErr) || !errors.Is(err, container.ErrExecTerminationUnsupported) {
 		t.Fatalf("Exec error = %v, want typed unsupported termination error", err)
 	}
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0 on infrastructure timeout", code)
+	if wantCode := expectedKilledExitCode(); code != wantCode {
+		t.Errorf("exit code = %d, want %d on infrastructure timeout", code, wantCode)
 	}
 	if out == nil {
 		t.Fatal("Exec returned nil output on timeout")

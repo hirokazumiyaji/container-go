@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -111,7 +112,49 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
-	return stdout.Bytes(), stderr.Bytes(), commandError(ctx, bin, args, stderr.Bytes(), err)
+	commandErr := commandError(ctx, bin, args, stderr.Bytes(), err)
+	if commandErr != nil {
+		// ProcessState is non-nil only after os/exec has successfully
+		// started and waited for the child. Preserve that fact across the
+		// error chain so callers do not mistake a pre-canceled launch
+		// failure for a process that needs remote termination cleanup.
+		commandErr = markStarted(commandErr, cmd.ProcessState != nil)
+	}
+	return stdout.Bytes(), stderr.Bytes(), commandErr
+}
+
+// startedError carries the local process-start fact alongside the
+// original command error. It is intentionally transparent to errors.Is
+// and errors.As callers.
+type startedError struct {
+	err     error
+	started bool
+}
+
+func (e *startedError) Error() string { return e.err.Error() }
+
+func (e *startedError) Unwrap() error { return e.err }
+
+// Started reports whether the local CLI process reached Start before the
+// error was returned.
+func (e *startedError) Started() bool { return e.started }
+
+func markStarted(err error, started bool) error {
+	if err == nil {
+		return nil
+	}
+	return &startedError{err: err, started: started}
+}
+
+// StartedStatus returns the local process-start fact attached by ExecRunner,
+// when available. The bool result reports whether the error carried the
+// fact; runners that return ordinary errors do not need to implement it.
+func StartedStatus(err error) (started, reported bool) {
+	var status interface{ Started() bool }
+	if !errors.As(err, &status) {
+		return false, false
+	}
+	return status.Started(), true
 }
 
 func commandError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
@@ -122,9 +165,9 @@ func commandError(ctx context.Context, bin string, args []string, stderr []byte,
 	if errors.As(err, &exitErr) {
 		exitCode := exitErr.ExitCode()
 		if ctxErr := ctx.Err(); ctxErr != nil && exitCode < 0 {
-			// A signal has no usable process exit status. Let the
-			// caller surface the context/termination limitation rather
-			// than presenting -1 as a command result.
+			// A Unix signal has no usable application status. Preserve the
+			// context contract while StartedStatus above records that the
+			// local process did launch.
 			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
 		cliErr := &CLIError{
@@ -146,10 +189,61 @@ func commandError(ctx context.Context, bin string, args []string, stderr []byte,
 	return err
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
+// IsOperationTimeoutError reports whether err is a timeout, cancellation,
+// or signal-shaped operation failure rather than an application result.
+// Backend CLIs do not all expose these conditions as context errors, so
+// the structured error and the bounded diagnostic text are both checked.
+func IsOperationTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return hasOperationTimeoutText(err.Error())
+	}
+	// A negative status is the standard-library representation of a
+	// signal. It is not an application exit result.
+	if cliErr.ExitCode < 0 {
+		return true
+	}
+	return hasOperationTimeoutText(cliErr.Stderr + "\n" + err.Error())
+}
+
+func hasOperationTimeoutText(value string) bool {
+	text := strings.ToLower(value)
+	for _, fragment := range []string{
+		"context deadline exceeded",
+		"deadline exceeded",
+		"context canceled",
+		"context cancelled",
+		"operation timed out",
+		"operation timeout",
+		"command timed out",
+		"command/operation timed out",
+		"i/o timeout",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// truncateStderr bounds the diagnostic copy kept in CLIError. Keep the
+// tail so a final timeout or daemon diagnostic is not hidden behind a
+// large amount of preceding application output.
 func truncateStderr(s string) string {
 	if len(s) > maxStderr {
-		return s[:maxStderr]
+		return s[len(s)-maxStderr:]
 	}
 	return s
 }
@@ -181,6 +275,12 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if ctx.Err() != nil {
 		// Caller already gave up; preserve the original failure
 		// instead of masking it with a probe cancellation.
+		return err
+	}
+	// A timeout or signal reported by the operation itself is already a
+	// known termination result. Probing the backend after it would turn
+	// a useful operation error into a second, misleading operation.
+	if IsOperationTimeoutError(err) {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)

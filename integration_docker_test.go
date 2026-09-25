@@ -135,8 +135,8 @@ func TestIntegrationDockerExecReportsDaemonProcessMaySurviveTimeout(t *testing.T
 	if !errors.As(err, &terminationErr) || !errors.Is(err, container.ErrExecTerminationUnsupported) {
 		t.Fatalf("Exec error = %v, want typed unsupported termination error", err)
 	}
-	if code != 0 {
-		t.Errorf("exit code = %d, want 0 on infrastructure timeout", code)
+	if wantCode := expectedKilledExitCode(); code != wantCode {
+		t.Errorf("exit code = %d, want %d on infrastructure timeout", code, wantCode)
 	}
 	if out == nil {
 		t.Fatal("Exec returned nil output on timeout")

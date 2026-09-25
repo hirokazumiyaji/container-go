@@ -441,6 +441,50 @@ func TestForAnySucceedsWhenOneSucceeds(t *testing.T) {
 	}
 }
 
+type issue116ForAnyLoser struct {
+	started  chan struct{}
+	returned chan struct{}
+}
+
+func (s *issue116ForAnyLoser) WaitUntilReady(ctx context.Context, _ Target) error {
+	close(s.started)
+	<-ctx.Done()
+	close(s.returned)
+	return errors.New("losing exec was canceled")
+}
+
+type issue116ForAnyWinner struct {
+	loserStarted <-chan struct{}
+}
+
+func (s *issue116ForAnyWinner) WaitUntilReady(ctx context.Context, _ Target) error {
+	select {
+	case <-s.loserStarted:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestForAnyDrainsCanceledLosersBeforeSuccess(t *testing.T) {
+	loser := &issue116ForAnyLoser{
+		started:  make(chan struct{}),
+		returned: make(chan struct{}),
+	}
+	winner := &issue116ForAnyWinner{loserStarted: loser.started}
+
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
+		t.Fatalf("ForAny success = %v, want nil", err)
+	}
+	select {
+	case <-loser.returned:
+		// The success result was returned only after the canceled loser
+		// completed its lifecycle path.
+	default:
+		t.Fatal("ForAny returned before the canceled loser finished")
+	}
+}
+
 func TestForAllWithStartupTimeout(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // dead port

@@ -72,30 +72,74 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if len(s.strategies) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waitCtx := runCtx
 	if s.startupTimeout > 0 {
 		var timeoutCancel context.CancelFunc
-		ctx, timeoutCancel = context.WithTimeout(ctx, s.startupTimeout)
+		waitCtx, timeoutCancel = context.WithTimeout(waitCtx, s.startupTimeout)
 		defer timeoutCancel()
 	}
 
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
-		go func() { results <- strategy.WaitUntilReady(ctx, target) }()
+		go func(strategy Strategy) {
+			results <- strategy.WaitUntilReady(waitCtx, target)
+		}(strategy)
 	}
+
 	var errs []error
-	for range s.strategies {
+	remaining := len(s.strategies)
+	var terminalErr error
+	for remaining > 0 {
+		if terminalErr != nil {
+			// Cancellation is cooperative. Drain every strategy before
+			// returning so a canceled ForExec/stream has completed its
+			// local Wait/reap path and its ExecTerminationError is not left
+			// in an abandoned goroutine.
+			err := <-results
+			remaining--
+			if err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+
 		select {
 		case err := <-results:
+			remaining--
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if waitCtx.Err() != nil {
+				terminalErr = waitCtx.Err()
+				continue
+			}
 			if err == nil {
+				// ForAny's success contract is first-success-wins. Cancel
+				// the other strategies, but wait for their terminal errors
+				// before returning so their lifecycle work is complete.
+				cancel()
+				for remaining > 0 {
+					loserErr := <-results
+					remaining--
+					_ = loserErr // success remains the public result
+				}
 				return nil
 			}
-			errs = append(errs, err)
-		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+		case <-waitCtx.Done():
+			terminalErr = waitCtx.Err()
+			if terminalErr == nil {
+				terminalErr = context.Canceled
+			}
 		}
+	}
+	if terminalErr != nil {
+		errs = append(errs, terminalErr)
 	}
 	return errors.Join(errs...)
 }

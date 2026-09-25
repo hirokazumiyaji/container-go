@@ -145,9 +145,13 @@ func TestIntegrationAppleLogsCLICompatibility(t *testing.T) {
 }
 
 // TestIntegrationAppleLogsOptionsLive exercises LogsWithOptions against a
-// real Apple backend. The parser-only compatibility test above remains
-// runnable when the system service is unavailable.
+// real Apple backend. Run it with CONTAINERGO_APPLE_LIVE=1; optionally set
+// CONTAINERGO_APPLE_CLI to the versioned binary to test. The parser-only
+// compatibility test above remains part of ordinary integration runs.
 func TestIntegrationAppleLogsOptionsLive(t *testing.T) {
+	if !appleLogsLiveEnabled() {
+		t.Skipf("set %s=1 to run the service-dependent Apple compatibility test", appleLogsLiveEnv)
+	}
 	binary, version := requireAppleLogsCompatCLI(t)
 	if out, err := runAppleCompatCommand(t, binary, "system", "status"); err != nil {
 		t.Skipf("Apple Container CLI %s is installed, but its system service is unavailable (%v): %s", version, err, strings.TrimSpace(string(out)))

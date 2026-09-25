@@ -32,7 +32,8 @@ var ErrImageNotFound = errors.New("image not found in local store")
 
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, Logs, and FollowLogs wrap it with %w so callers can use
-// errors.Is instead of matching CLI stderr text.
+// errors.Is instead of matching CLI stderr text. For FollowLogs,
+// a failure after the stream has started is reported by Read.
 var ErrContainerNotFound = wait.ErrContainerNotFound
 
 // ErrGenerationReplaced reports that Terminate refused to delete because

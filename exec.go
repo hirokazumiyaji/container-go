@@ -80,10 +80,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
+	defer unlock()
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
@@ -138,14 +139,10 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	target := c.inspectTarget()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, target)
+	// Exec calls this while verifiedOperationTargetWithLock holds the Apple
+	// name lock. Inspect through the lock-aware path so an ambiguous command
+	// result cannot fall back to an unlocked replacement name.
+	info, err := c.inspectFreshLocked(ctx)
 	if err != nil {
 		return false
 	}

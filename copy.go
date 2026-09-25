@@ -36,16 +36,24 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	if err := validateContainerPath(containerPath); err != nil {
 		return err
 	}
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return c.copyToContainerTarget(ctx, target, hostPath, containerPath)
+}
+
+// copyToContainerTarget performs the backend copy while the caller holds
+// any required name lock. Keeping this separate lets reuse initialization
+// revalidate once and then copy without recursively taking the same flock.
+func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath, containerPath string) error {
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
 		return err
 	}
 	if _, err := os.Stat(abs); err != nil {
 		return fmt.Errorf("copy to container: %w", err)
-	}
-	target, err := c.verifiedOperationTarget()
-	if err != nil {
-		return err
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
@@ -67,11 +75,12 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 	dst := filepath.Join(dir, filepath.Base(containerPath))
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	defer unlock()
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {

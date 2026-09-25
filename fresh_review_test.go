@@ -18,8 +18,9 @@ import (
 const freshReviewDockerUID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
 type freshReviewOperationRunner struct {
-	mu    sync.Mutex
-	calls [][]string
+	mu          sync.Mutex
+	calls       [][]string
+	inspectJSON string
 }
 
 func (r *freshReviewOperationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -27,6 +28,10 @@ func (r *freshReviewOperationRunner) Run(_ context.Context, args ...string) ([]b
 	r.calls = append(r.calls, append([]string(nil), args...))
 	r.mu.Unlock()
 	switch args[0] {
+	case "inspect":
+		if r.inspectJSON != "" {
+			return []byte(r.inspectJSON), nil, nil
+		}
 	case "cp":
 		// Materialize a container-to-host copy so CopyFileFromContainer can
 		// complete its normal post-run validation.
@@ -142,8 +147,11 @@ func containsArg(args []string, want string) bool {
 }
 
 func TestFreshReviewAppleOperationsKeepLogicalName(t *testing.T) {
-	runner := &freshReviewOperationRunner{}
-	ctr := &Container{id: "apple-name", runner: runner, eng: appleEngine{}}
+	const creation = "aaaaaaaaaaaaaaaa"
+	runner := &freshReviewOperationRunner{
+		inspectJSON: issue83ReviewAppleInspect("apple-name", creation, "running"),
+	}
+	ctr := &Container{id: "apple-name", runner: runner, eng: appleEngine{}, creation: creation}
 	if got := ctr.operationTarget(); got != "apple-name" {
 		t.Fatalf("operationTarget = %q, want logical name", got)
 	}

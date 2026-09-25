@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -38,6 +39,14 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a variable so
+	// tests can exercise the bounded cleanup contract without waiting for the
+	// production timeout.
+	terminateTimeout = queryTimeout
+	// reuseFinalVerifyTimeout bounds the final name-lock/inspect critical
+	// section. A caller with a shorter deadline still wins.
+	reuseFinalVerifyTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -169,14 +178,14 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
 		err := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
-		cleanupFailedCreate(ctx, cfg, err, err)
-		return nil, err
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
+		return nil, withCleanupError(err, cleanupErr)
 	}
 
 	c := &Container{
@@ -189,17 +198,27 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		uid:       uid,
 	}
 	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
+	// test runner there is nothing external to clean up. Validate the
+	// exact managed/session/generation ownership before handing a name or
+	// immutable target to the external reaper. A successful `run` alone is
+	// not proof that the requested labels were actually attached.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
+		if err := verifyCreatedOwnership(ctx, c, cfg); err != nil {
+			// Re-check ownership before any best-effort cleanup. A
+			// verification failure must never turn into an unconditional
+			// name delete, but an exactly owned generation can still be
+			// cleaned up without hiding the verification error.
+			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
+			return nil, withCleanupError(err, cleanupErr)
+		}
 		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
+		if requiresImmutableID(cfg.eng) {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
-		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		} else if validCreationID(c.creation) {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, c.creation)
 		}
 	}
 
@@ -245,10 +264,63 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
-	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+	if keepContainers() {
+		return cause
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
+	defer cancel()
+	if err := c.Terminate(cleanupCtx); err != nil {
+		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
+		return withCleanupError(cause, cleanupErr)
 	}
 	return cause
+}
+
+// verifyCreatedOwnership checks the exact labels and backend identity of a
+// just-created container before it is registered with the external reaper.
+// It is intentionally separate from the normal lazy inspect path: test
+// runners and callers that do not use a reaper retain the historical lazy
+// behavior, while a real external process gets fail-closed registration.
+func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) error {
+	verifyCtx, cancel := withMaxTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer cancel()
+	var info *engineInfo
+	for {
+		var err error
+		info, err = c.inspectFresh(verifyCtx)
+		if err == nil {
+			break
+		}
+		if !isNotFound(err) {
+			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		}
+		if err := waitReusePoll(verifyCtx); err != nil {
+			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		}
+	}
+	if info == nil || info.labels[managedLabel] != "true" {
+		return fmt.Errorf("verify created container %s: managed ownership label is missing", c.id)
+	}
+	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
+		return fmt.Errorf("verify created container %s: session ownership label does not match", c.id)
+	}
+	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("verify created container %s: creation generation does not match", c.id)
+	}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("verify created container %s: reuse ownership label is missing", c.id)
+	}
+	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("verify created container %s: reuse group label does not match", c.id)
+	}
+	if requiresImmutableID(cfg.eng) {
+		if !validImmutableID(cfg.eng, c.uid) || info.uid != c.uid {
+			return fmt.Errorf("verify created container %s: immutable ID does not match", c.id)
+		}
+	} else if info.uid != "" {
+		return fmt.Errorf("verify created container %s: unexpected immutable ID", c.id)
+	}
+	return nil
 }
 
 // cleanupFailedCreate best-effort removes the container this Run left
@@ -259,44 +331,66 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // create must also carry the reuse label. Docker additionally requires
 // a valid ID from that same fresh inspect and never falls back to the
 // logical name.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
-	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
+		return nil
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
 	}
 	defer unlock()
-	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	ctr := namedContainer(cfg, cfg.name)
+	info, err := ctr.inspectFreshLocked(cleanupCtx)
 	if err != nil {
-		return
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
+	}
+	if info == nil {
+		return fmt.Errorf("cleanup container %s: inspect returned no identity", cfg.name)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.reuse && info.labels[reuseLabel] != "true" {
-		return
+		return nil
 	}
-	if !creationRE.MatchString(cfg.creation) {
-		return
+	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return nil
+	}
+	if !validCreationID(cfg.creation) {
+		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
 	}
 	actual, ok := info.labels[creationLabel]
-	if !ok || actual != cfg.creation {
-		return
+	if !ok || !validCreationID(actual) {
+		return fmt.Errorf("cleanup container %s: live creation generation is missing or invalid", cfg.name)
+	}
+	if actual != cfg.creation {
+		return nil
+	}
+	if cfg.reuse && info.state == StateRunning {
+		return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
 	}
 	target, err := verifiedDeleteTarget(cfg.eng, info, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if err := ctr.delete(delCtx, target); err != nil {
+		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -332,26 +426,70 @@ func (c *Container) operationTarget() string {
 	c.inspectMu.Lock()
 	uid := c.uid
 	c.inspectMu.Unlock()
-	if requiresImmutableID(c.eng) && validImmutableID(c.eng, uid) {
-		return uid
+	if requiresImmutableID(c.eng) {
+		if validImmutableID(c.eng, uid) {
+			return uid
+		}
+		return ""
+	}
+	if c.eng.name() == "apple" && !validCreationID(c.creation) {
+		return ""
 	}
 	return c.id
 }
 
+// verifiedOperationTarget retains the historical no-argument helper for
+// package users and tests. It performs the same identity check as the
+// operation path, but releases the lock before returning; backend operations
+// must use verifiedOperationTargetWithLock so the lock spans the command.
 func (c *Container) verifiedOperationTarget() (string, error) {
+	target, unlock, err := c.verifiedOperationTargetWithLock(context.Background())
+	if unlock != nil {
+		unlock()
+	}
+	return target, err
+}
+
+// verifiedOperationTargetWithLock verifies the target and, for Apple,
+// returns a release function that keeps the name lock until the caller has
+// finished the complete backend operation. The returned release function is
+// always safe to call, including on an error path.
+func (c *Container) verifiedOperationTargetWithLock(ctx context.Context) (string, func(), error) {
+	noop := func() {}
 	c.inspectMu.Lock()
 	uid := c.uid
 	c.inspectMu.Unlock()
 	if requiresImmutableID(c.eng) {
 		if !validImmutableID(c.eng, uid) {
-			return "", fmt.Errorf("container %s: invalid immutable container ID %q", c.id, uid)
+			return "", noop, fmt.Errorf("container %s: invalid immutable container ID %q", c.id, uid)
 		}
-		return uid, nil
+		return uid, noop, nil
+	}
+	if c.eng.name() != "apple" {
+		return "", noop, fmt.Errorf("unknown backend cannot address a container")
 	}
 	if c.id == "" {
-		return "", fmt.Errorf("container has no logical name")
+		return "", noop, fmt.Errorf("container has no logical name")
 	}
-	return c.id, nil
+	if !validCreationID(c.creation) {
+		return "", noop, fmt.Errorf("%w: container %s has no valid creation generation", ErrGenerationReplaced, c.id)
+	}
+
+	lockCtx, cancel := withMaxTimeout(ctx, queryTimeout)
+	unlock, err := lockName(lockCtx, c.id)
+	if err != nil {
+		cancel()
+		return "", noop, fmt.Errorf("lock name: %w", err)
+	}
+	if _, err := c.inspectFreshLocked(lockCtx); err != nil {
+		unlock()
+		cancel()
+		return "", noop, err
+	}
+	return c.id, func() {
+		unlock()
+		cancel()
+	}, nil
 }
 
 func (c *Container) classify(ctx context.Context, err error) error {
@@ -370,10 +508,11 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
@@ -389,6 +528,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // identity with which to prove that a same-name replacement is not the
 // object the caller meant.
 func (c *Container) Terminate(ctx context.Context) error {
+	ctx, cancel := withMaxTimeout(ctx, terminateTimeout)
+	defer cancel()
 	c.inspectMu.Lock()
 	uid := c.uid
 	c.inspectMu.Unlock()
@@ -415,13 +556,15 @@ func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, s
 }
 
 func (c *Container) terminateByNameWithImage(ctx context.Context, expected *engineInfo, stoppedOnly bool, image string) (bool, error) {
+	ctx, cancel := withMaxTimeout(ctx, terminateTimeout)
+	defer cancel()
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
 		return false, fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
 
-	fresh, err := c.inspectFresh(ctx)
+	fresh, err := c.inspectFreshLocked(ctx)
 	if isNotFound(err) {
 		return false, nil
 	}
@@ -569,7 +712,30 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	return info, nil
 }
 
+// inspectFresh serializes a name-addressed Apple inspect with the same
+// lock used by operations. Callers that already hold that lock must use
+// inspectFreshLocked instead.
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	if c.eng.name() == "apple" {
+		lockCtx, cancel := withMaxTimeout(ctx, queryTimeout)
+		unlock, err := lockName(lockCtx, c.id)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("inspect %s: lock name: %w", c.id, err)
+		}
+		info, err := c.inspectFreshLocked(lockCtx)
+		unlock()
+		cancel()
+		return info, err
+	}
+	return c.inspectFreshLocked(ctx)
+}
+
+// inspectFreshLocked performs the backend inspect while the caller's
+// name lock (when one is required) is held. It also verifies the identity
+// of a returned Apple handle; short-lived name lookups opt out via
+// nameInspect until their caller has established ownership.
+func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error) {
 	c.inspectMu.Lock()
 	defer c.inspectMu.Unlock()
 
@@ -581,18 +747,36 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 		return nil, fmt.Errorf("container %s: refusing Docker name inspect without an immutable ID", c.id)
 	}
 	target := c.inspectTargetLocked()
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withMaxTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		classified := wrapNotFound(c.classify(ctx, err))
+		if c.reused && isNotFound(classified) {
+			return nil, errors.Join(fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id), classified)
+		}
+		return nil, classified
 	}
 	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
+		if c.reused {
+			return nil, errors.Join(fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id), err)
+		}
 		return nil, err
 	}
 	if uid != "" && requiresImmutableID(c.eng) && info.uid != uid {
 		return nil, fmt.Errorf("%w: inspected Docker ID changed", ErrContainerNotFound)
+	}
+	if c.eng.name() == "apple" && !c.nameInspect {
+		if info.uid != "" {
+			return nil, fmt.Errorf("%w: generation verification returned an unexpected immutable ID", ErrGenerationReplaced)
+		}
+		if !validCreationID(c.creation) {
+			return nil, fmt.Errorf("%w: generation is missing or invalid for %s", ErrGenerationReplaced, c.id)
+		}
+		if !validCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != c.creation {
+			return nil, fmt.Errorf("%w: live generation changed for %s", ErrGenerationReplaced, c.id)
+		}
 	}
 	// Do not publish info.uid here. A name-addressed inspect may have
 	// observed a replacement; callers that have verified the generation
@@ -605,6 +789,8 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 // inspectTarget prefers an immutable ID so a same-name replacement cannot
 // satisfy a Docker inspect. A non-empty malformed value is retained as the
 // target and rejected by the caller rather than falling back to the name.
+//
+//nolint:unused // retained for package callers that inspect the cached target helper
 func (c *Container) inspectTarget() string {
 	c.inspectMu.Lock()
 	defer c.inspectMu.Unlock()
@@ -620,6 +806,15 @@ func (c *Container) inspectTargetLocked() string {
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
+		return ctx, func() {}
+	}
+	return context.WithTimeout(ctx, d)
+}
+
+// withMaxTimeout is used for lock waits and other safety gates. Unlike
+// withDefaultTimeout it also shortens an already-long caller deadline.
+func withMaxTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= d {
 		return ctx, func() {}
 	}
 	return context.WithTimeout(ctx, d)

@@ -16,6 +16,37 @@ import (
 // own compatibility check and wait strategy afterward.
 var reuseFlights flightGroup[*Container]
 
+func waitReusePoll(ctx context.Context) error {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+func waitReuseReady(ctx context.Context, cfg *config, ctr *Container) (*engineInfo, error) {
+	readyCtx, cancel := withMaxTimeout(ctx, reuseAttachTimeout)
+	defer cancel()
+	for {
+		info, err := ctr.inspectFresh(readyCtx)
+		if err != nil {
+			return nil, err
+		}
+		if info.state == StateRunning && reusePortsReady(info, cfg) {
+			return info, nil
+		}
+		if err := waitReusePoll(readyCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("reuse %s: timed out waiting for running ports: %w", cfg.name, err)
+			}
+			return nil, err
+		}
+	}
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
 	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
@@ -29,17 +60,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	info := base.info
-	if info == nil {
-		info, err = inspectNamed(ctx, cfg, cfg.name)
-		if err != nil {
-			return nil, err
-		}
+	creation := base.creation
+	if creation == "" && base.info != nil {
+		creation = base.info.labels[creationLabel]
 	}
-	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, err
-	}
-
 	ctr := &Container{
 		id:        base.id,
 		runner:    base.runner,
@@ -47,10 +71,37 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		info:      info,
-		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		info:      base.info,
+		creation:  creation,
+		uid:       base.uid,
 	}
+	info := base.info
+	if info == nil {
+		info, err = ctr.inspectFresh(ctx)
+		if err != nil {
+			return nil, err
+		}
+	}
+	// The ensure path already waited for running state. Only perform an
+	// additional poll when the list-time snapshot does not yet contain all
+	// requested bindings; this preserves the baseline inspect contract for
+	// ordinary ready containers while closing the post-start binding race.
+	if !reusePortsReady(info, cfg) {
+		info, err = waitReuseReady(ctx, cfg, ctr)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if err := checkReuseCompat(info, image, cfg); err != nil {
+		return nil, err
+	}
+	ctr.mu.Lock()
+	ctr.info = info
+	ctr.mu.Unlock()
+	ctr.inspectMu.Lock()
+	ctr.creation = info.labels[creationLabel]
+	ctr.uid = info.uid
+	ctr.inspectMu.Unlock()
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
@@ -60,12 +111,18 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// keeps the stable name lock across this final inspect so the reaper
 	// cannot delete and recreate the name between verification and
 	// publication of the handle.
-	unlock, err := lockReuseFinal(ctx, cfg)
+	finalTimeout := reuseFinalVerifyTimeout
+	if reuseAttachTimeout > 0 && reuseAttachTimeout < finalTimeout {
+		finalTimeout = reuseAttachTimeout
+	}
+	finalCtx, finalCancel := withMaxTimeout(ctx, finalTimeout)
+	defer finalCancel()
+	unlock, err := lockReuseFinal(finalCtx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
 	}
 	defer unlock()
-	fresh, err := ctr.inspectFresh(ctx)
+	fresh, err := ctr.inspectFreshLocked(finalCtx)
 	if err != nil {
 		// A Docker handle with a resolved immutable ID that disappears
 		// from its final inspect is necessarily no longer the generation
@@ -113,7 +170,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
-				time.Sleep(reusePollInterval)
+				if err := waitReusePoll(ctx); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, createErr
@@ -121,7 +180,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
 			continue
 		case StateStopped:
 			if recreated {
@@ -153,7 +214,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				uid:       info.uid,
 			}, nil
 		default:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
@@ -191,8 +254,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	ctr := &Container{
@@ -205,7 +268,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	if err := reusePostCreate(ctx, cfg, ctr); err != nil {
+	if err := reusePostCreateWithImage(ctx, cfg, ctr, image); err != nil {
 		// The successful run has already published this generation by
 		// name. A peer may have attached to it, so a failed local inspect,
 		// identity check, or copy is not proof that this caller owns the
@@ -217,39 +280,128 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 }
 
 // reusePostCreate verifies and initializes a newly-created reuse
-// generation. Apple creation is name-addressed, so hold the stable name
-// lock across the post-create inspect and file copies; otherwise a delete
-// and replacement could occur between those steps. Docker is already bound
-// to its immutable UID.
+// generation. A successful `run` can return before Apple reaches running
+// state or publishes all requested port bindings, so wait for both before
+// establishing the baseline used by the caller's compatibility check.
+//
+//nolint:unused // retained for package callers using the original post-create helper
 func reusePostCreate(ctx context.Context, cfg *config, ctr *Container) error {
+	return reusePostCreateWithImage(ctx, cfg, ctr, "")
+}
+
+func reusePostCreateWithImage(ctx context.Context, cfg *config, ctr *Container, image string) error {
+	postCtx, cancel := withMaxTimeout(ctx, reuseAttachTimeout)
+	defer cancel()
+
+	var ready *engineInfo
+	for {
+		info, err := ctr.inspectFresh(postCtx)
+		if err != nil {
+			return err
+		}
+		if err := verifyReusePostCreateInfo(cfg, ctr, info); err != nil {
+			return err
+		}
+		if image != "" && cfg.reuse {
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return err
+			}
+		}
+		if info.state == StateRunning && reusePortsReady(info, cfg) {
+			ready = info
+			break
+		}
+		if err := waitReusePoll(postCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("reuse %s: timed out waiting for post-create readiness: %w", cfg.name, err)
+			}
+			return err
+		}
+	}
+
+	// Recheck under the Apple name lock and keep it through all file copies.
+	// The baseline and the copy therefore cannot target different
+	// generations. Docker is already bound to its immutable UID.
+	target := ready.uid
 	if cfg.eng.name() == "apple" {
-		unlock, err := lockName(ctx, cfg.name)
+		unlock, err := lockName(postCtx, cfg.name)
 		if err != nil {
 			return fmt.Errorf("reuse %s: lock post-create generation: %w", cfg.name, err)
 		}
 		defer unlock()
+		fresh, err := ctr.inspectFreshLocked(postCtx)
+		if err != nil {
+			return err
+		}
+		if err := verifyReusePostCreateInfo(cfg, ctr, fresh); err != nil {
+			return err
+		}
+		if image != "" && cfg.reuse {
+			if err := checkReuseOwned(fresh, image, cfg); err != nil {
+				return err
+			}
+		}
+		if fresh.state != StateRunning || !reusePortsReady(fresh, cfg) {
+			return fmt.Errorf("reuse %s: post-create generation changed before initialization", cfg.name)
+		}
+		if err := sameContainerIdentity(cfg.eng, ready, fresh); err != nil {
+			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
+		ready = fresh
+		target = cfg.name
+		for _, f := range cfg.files {
+			if err := ctr.copyToContainerTarget(postCtx, target, f.HostPath, f.ContainerPath); err != nil {
+				// The shared generation remains available to peers; a
+				// caller-specific copy failure must not delete it.
+				return err
+			}
+		}
+	} else {
+		if !validImmutableID(cfg.eng, target) || target != ctr.uid {
+			return fmt.Errorf("reuse %s: %w: post-create Docker ID changed", cfg.name, ErrGenerationReplaced)
+		}
+		for _, f := range cfg.files {
+			if err := ctr.copyToContainerTarget(postCtx, target, f.HostPath, f.ContainerPath); err != nil {
+				return err
+			}
+		}
 	}
-	info, err := ctr.cachedInfo(ctx)
-	if err != nil {
-		return err
-	}
-	if info == nil || info.labels[managedLabel] != "true" || (cfg.reuse && info.labels[reuseLabel] != "true") ||
+
+	ctr.mu.Lock()
+	ctr.info = ready
+	ctr.mu.Unlock()
+	return nil
+}
+
+func verifyReusePostCreateInfo(cfg *config, ctr *Container, info *engineInfo) error {
+	if info == nil || info.labels[managedLabel] != "true" ||
+		(cfg.reuse && info.labels[reuseLabel] != "true") ||
 		!validCreationID(cfg.creation) || info.labels[creationLabel] != cfg.creation {
 		return fmt.Errorf("reuse %s: %w: post-create generation could not be verified", cfg.name, ErrGenerationReplaced)
 	}
-	if requiresImmutableID(cfg.eng) && info.uid != ctr.uid {
+	if requiresImmutableID(cfg.eng) && (!validImmutableID(cfg.eng, info.uid) || info.uid != ctr.uid) {
 		return fmt.Errorf("reuse %s: %w: post-create Docker ID changed", cfg.name, ErrGenerationReplaced)
 	}
-	for _, f := range cfg.files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			// Do not roll back a generation after it has been published:
-			// another process may already be using it. The next caller can
-			// attach to the same generation, and explicit Terminate or
-			// PruneReuseGroup remains available for deliberate cleanup.
-			return err
+	return nil
+}
+
+func reusePortsReady(info *engineInfo, cfg *config) bool {
+	if info == nil {
+		return false
+	}
+	if !cfg.eng.directIP() {
+		for _, spec := range cfg.exposed {
+			if !hasBoundPort(info.bound, spec.port, spec.proto) {
+				return false
+			}
 		}
 	}
-	return nil
+	for _, p := range cfg.published {
+		if !hasPublishedBinding(info.bound, p) {
+			return false
+		}
+	}
+	return true
 }
 
 // deleteStoppedReuse removes a stopped reuse container only after
@@ -315,7 +467,7 @@ func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) err
 	if fresh.image != before.image {
 		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
 	}
-	if fresh.platform != before.platform {
+	if !sameEnginePlatform(before, fresh) {
 		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
 	}
 	if !sameReusePorts(before.bound, fresh.bound) {
@@ -399,7 +551,7 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
 			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
 		}
-		if !cfg.eng.platformCompatible(cfg.platform, info.platform) {
+		if !enginePlatformCompatible(cfg.eng, cfg.platform, info) {
 			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
 		}
 	}
@@ -455,7 +607,7 @@ func hasBoundPort(bound []boundPort, port int, proto string) bool {
 
 func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
 	for _, b := range bound {
-		if b.containerPort != p.containerPort || b.proto != p.proto {
+		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
 			continue
 		}
 		if p.hostPort != 0 && b.hostPort != p.hostPort {

@@ -63,11 +63,20 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			continue
 		}
 		platform := c.Configuration.Platform
+		platformMeta := platformMetadataFromParts(
+			platform.OS,
+			platform.Architecture,
+			platform.Variant,
+			platform.OSPresent || platform.OS != "",
+			platform.ArchPresent || platform.Architecture != "",
+			platform.VariantPresent || platform.Variant != "",
+		)
 		info := &engineInfo{
-			state:    State(c.Status.State),
-			labels:   c.Configuration.Labels,
-			image:    c.Configuration.Image.Reference,
-			platform: formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
+			state:        State(c.Status.State),
+			labels:       c.Configuration.Labels,
+			image:        c.Configuration.Image.Reference,
+			platform:     platformMeta.normalized(),
+			platformMeta: platformMeta,
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -85,14 +94,12 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	return nil, fmt.Errorf("container %s not in inspect output", id)
 }
 
+//nolint:unused // retained for callers formatting OCI platform components
 func formatInspectPlatform(os, architecture, variant string) string {
-	parts := make([]string, 0, 3)
-	for _, part := range []string{os, architecture, variant} {
-		if part != "" {
-			parts = append(parts, part)
-		}
-	}
-	return strings.Join(parts, "/")
+	return platformMetadataFromParts(
+		os, architecture, variant,
+		os != "", architecture != "", variant != "",
+	).normalized()
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
@@ -200,9 +207,9 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 	var images []struct {
 		Variants []struct {
 			Platform struct {
-				Os           string `json:"os"`
-				Architecture string `json:"architecture"`
-				Variant      string `json:"variant"`
+				OS           *string `json:"os"`
+				Architecture *string `json:"architecture"`
+				Variant      *string `json:"variant"`
 			} `json:"platform"`
 		} `json:"variants"`
 	}
@@ -217,11 +224,29 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 			continue
 		}
 		for _, v := range img.Variants {
-			actual := formatInspectPlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant)
-			if actual == "" && osOnly {
+			actualMeta := platformMetadata{
+				valid:      true,
+				osSet:      v.Platform.OS != nil,
+				archSet:    v.Platform.Architecture != nil,
+				variantSet: v.Platform.Variant != nil,
+			}
+			if v.Platform.OS != nil {
+				actualMeta.os = *v.Platform.OS
+			}
+			if v.Platform.Architecture != nil {
+				actualMeta.architecture = *v.Platform.Architecture
+			}
+			if v.Platform.Variant != nil {
+				actualMeta.variant = *v.Platform.Variant
+			}
+			// Image presence is allowed to fall back to the unconstrained
+			// OS-only result for old responses that omit the entire
+			// variants platform object. An explicitly empty selected field
+			// is retained and does not satisfy an architecture selector.
+			if osOnly && !actualMeta.osSet && !actualMeta.archSet && !actualMeta.variantSet {
 				return true
 			}
-			if (appleEngine{}).platformCompatible(platform, actual) {
+			if platformMetadataMatches(platform, actualMeta) {
 				return true
 			}
 		}

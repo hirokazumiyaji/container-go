@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -39,10 +40,11 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // output. Long-lived reuse containers can grow unbounded logs, so
 // prefer Tail for diagnostics.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return nil, err
 	}
+	defer unlock()
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	args := c.eng.logsArgs(target, false)
@@ -67,9 +69,50 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return s.Stream(ctx, c.eng.logsArgs(target, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
+	if err != nil {
+		unlock()
+		return nil, err
+	}
+	return newLockedReadCloser(ctx, stream, unlock), nil
+}
+
+// lockedReadCloser keeps an Apple name lock for the complete lifetime of
+// a streaming operation. Close is idempotent and also releases the lock
+// when a context cancellation races with the caller.
+type lockedReadCloser struct {
+	io.ReadCloser
+	unlock func()
+	done   chan struct{}
+	once   sync.Once
+	err    error
+}
+
+func newLockedReadCloser(ctx context.Context, stream io.ReadCloser, unlock func()) io.ReadCloser {
+	r := &lockedReadCloser{
+		ReadCloser: stream,
+		unlock:     unlock,
+		done:       make(chan struct{}),
+	}
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = r.Close()
+		case <-r.done:
+		}
+	}()
+	return r
+}
+
+func (r *lockedReadCloser) Close() error {
+	r.once.Do(func() {
+		r.err = r.ReadCloser.Close()
+		close(r.done)
+		r.unlock()
+	})
+	return r.err
 }

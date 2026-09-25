@@ -61,10 +61,18 @@ const logTailLimit = 1024 * 1024
 // so neither the CLI output nor the Go buffer grows with total log
 // size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	target, err := c.verifiedOperationTarget()
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return ""
 	}
+	defer unlock()
+	return c.logTailTarget(ctx, target)
+}
+
+// logTailTarget runs the diagnostic read while its caller already owns any
+// required Apple name lock. Keeping the backend call separate prevents a
+// lock-held reuse/wait path from recursively taking the same flock.
+func (c *Container) logTailTarget(ctx context.Context, target string) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)

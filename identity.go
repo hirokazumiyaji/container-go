@@ -41,6 +41,12 @@ func verifiedDeleteTarget(eng engine, info *engineInfo, fallback string) (string
 		}
 		return info.uid, nil
 	}
+	if eng.name() != "apple" {
+		return "", fmt.Errorf("unknown backend cannot provide a safe delete target")
+	}
+	if info == nil || info.uid != "" {
+		return "", fmt.Errorf("refusing Apple name delete: inspect returned an unexpected immutable ID")
+	}
 	if fallback == "" {
 		return "", fmt.Errorf("refusing empty container name delete")
 	}

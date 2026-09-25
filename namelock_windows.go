@@ -20,6 +20,10 @@ func reaperNameLockPath(string) (string, error) {
 	return "", errors.New("reaper: name locks are unavailable on windows")
 }
 
+func reaperNameLockPaths(string) ([]string, error) {
+	return nil, errors.New("reaper: name locks are unavailable on windows")
+}
+
 func validNameLockProtocolPath(path string) bool {
-	return filepath.IsAbs(path) && !strings.ContainsAny(path, "\x00\n\r\t")
+	return filepath.IsAbs(path) && !strings.ContainsAny(path, "\x00\n\r\t;")
 }

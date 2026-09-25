@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	backendinspect "github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
 // keepContainers reports whether CONTAINERGO_KEEP=1 disables all
@@ -23,7 +24,9 @@ func TerminateContainer(ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	return ctr.Terminate(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+	defer cancel()
+	return ctr.Terminate(ctx)
 }
 
 // Cleanup registers container removal via tb.Cleanup. It is nil-safe,
@@ -51,11 +54,24 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
 }
 
-// pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. Apple candidates are re-inspected under the same stable
-// per-name lock used by create, Terminate, and the reaper. errKind prefixes
-// per-ID delete failures
-// ("prune", …).
+// pruneCandidate is the list-time identity snapshot for a name-addressed
+// delete. A list response is not a lock: a replacement can occur before the
+// fresh inspect, so every field that authorizes deletion is compared again
+// while the per-name lock is held.
+type pruneCandidate struct {
+	id         string
+	labels     map[string]string
+	creation   string
+	state      State
+	managed    bool
+	reuse      bool
+	reuseGroup string
+}
+
+// pruneListed lists containers with listArgs, parses IDs, and removes each
+// still-current candidate. Apple candidates are revalidated under their
+// stable per-name lock before the name is used. errKind prefixes per-ID
+// delete failures ("prune", …).
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
 	return pruneListedWithGroup(ctx, r, eng, listArgs, parse, errKind, "")
 }
@@ -72,11 +88,24 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		return nil, err
 	}
 
+	var listed map[string]pruneCandidate
+	if eng.name() == "apple" {
+		listed, err = applePruneCandidates(stdout)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	var removed []string
 	var errs []error
 	for _, id := range ids {
 		if eng.name() == "apple" {
-			didRemove, deleteErr := pruneNamedCandidate(ctx, r, eng, id, errKind, reuseGroup)
+			candidate, ok := listed[id]
+			if !ok {
+				errs = append(errs, fmt.Errorf("%s %s: list candidate metadata missing", errKind, id))
+				continue
+			}
+			didRemove, deleteErr := pruneNamedCandidateWithMetadata(ctx, r, eng, candidate, errKind, reuseGroup)
 			if deleteErr != nil {
 				errs = append(errs, deleteErr)
 				continue
@@ -87,7 +116,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 			continue
 		}
 
-		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
+		dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
 		if err != nil && !isNotFound(err) {
@@ -99,36 +128,149 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	return removed, errors.Join(errs...)
 }
 
+func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
+	containers, err := backendinspect.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make(map[string]pruneCandidate, len(containers))
+	for _, c := range containers {
+		labels := c.Configuration.Labels
+		candidates[c.ID] = pruneCandidate{
+			id:         c.ID,
+			labels:     labels,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    labels[managedLabel] == "true",
+			reuse:      labels[reuseLabel] == "true",
+			reuseGroup: labels[reuseGroupLabel],
+		}
+	}
+	return candidates, nil
+}
+
+func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
+	if candidate.id == "" || !nameRE.MatchString(candidate.id) ||
+		!candidate.managed || !validCreationID(candidate.creation) ||
+		candidate.state == "" || candidate.state == StateUnknown {
+		return false
+	}
+	if reuseGroup == "" {
+		return candidate.state == StateStopped
+	}
+	// Group prune is deliberately narrower than the old label-only query:
+	// a group label alone does not prove that the object is a reusable
+	// generation owned by this library. Only settled running/stopped
+	// generations are eligible; transitional states remain untouched.
+	return candidate.reuse && candidate.reuseGroup == reuseGroup &&
+		(candidate.state == StateRunning || candidate.state == StateStopped)
+}
+
+func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
+	if fresh == nil || !pruneCandidateEligible(pruneCandidate{
+		id:         candidate.id,
+		labels:     fresh.labels,
+		creation:   fresh.labels[creationLabel],
+		state:      fresh.state,
+		managed:    fresh.labels[managedLabel] == "true",
+		reuse:      fresh.labels[reuseLabel] == "true",
+		reuseGroup: fresh.labels[reuseGroupLabel],
+	}, reuseGroup) {
+		return false
+	}
+	if fresh.state != candidate.state || fresh.labels[creationLabel] != candidate.creation {
+		return false
+	}
+	// Compare the ownership-bearing labels captured at list time. This
+	// catches a replacement that happens to reuse a name or generation but
+	// is no longer the managed/reuse/group object the caller selected.
+	for _, key := range []string{managedLabel, reuseLabel, reuseGroupLabel, sessionLabel} {
+		if candidate.labels[key] != fresh.labels[key] {
+			return false
+		}
+	}
+	return true
+}
+
+// pruneNamedCandidate retains the historical helper signature for package
+// users. It performs a fresh, fail-closed verification when no list-time
+// snapshot is available; the prune path uses the metadata-aware variant
+// below to close the list/inspect race.
+//
+//nolint:unused // retained for package callers using the pre-metadata helper
 func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
-	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
+	if eng.name() != "apple" || !nameRE.MatchString(id) {
+		return false, nil
+	}
+	dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
 	defer dCancel()
 	unlock, err := lockName(dCtx, id)
 	if err != nil {
 		return false, fmt.Errorf("%s %s: lock name: %w", errKind, id, err)
 	}
 	defer unlock()
-
-	ctr := &Container{id: id, runner: r, eng: eng}
-	fresh, err := ctr.inspectFresh(dCtx)
+	fresh, err := (&Container{id: id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(dCtx)
 	if isNotFound(err) {
 		return true, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, err)
 	}
-	if fresh == nil || fresh.labels[managedLabel] != "true" || !creationRE.MatchString(fresh.labels[creationLabel]) {
+	if !pruneCandidateEligible(pruneCandidate{
+		id:         id,
+		labels:     fresh.labels,
+		creation:   fresh.labels[creationLabel],
+		state:      fresh.state,
+		managed:    fresh.labels[managedLabel] == "true",
+		reuse:      fresh.labels[reuseLabel] == "true",
+		reuseGroup: fresh.labels[reuseGroupLabel],
+	}, reuseGroup) {
 		return false, nil
 	}
-	if reuseGroup == "" {
-		if fresh.state != StateStopped {
-			return false, nil
-		}
-	} else if fresh.labels[reuseGroupLabel] != reuseGroup {
+	if reuseGroup != "" && fresh.labels[reuseGroupLabel] != reuseGroup {
 		return false, nil
 	}
-	_, _, err = r.Run(dCtx, eng.deleteArgs(id)...)
+	target, err := verifiedDeleteTarget(eng, fresh, id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
+	}
+	_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
 	if err != nil && !isNotFound(err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
+	}
+	return true, nil
+}
+
+func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+	if eng.name() != "apple" || !pruneCandidateEligible(candidate, reuseGroup) {
+		return false, nil
+	}
+	dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
+	defer dCancel()
+	unlock, err := lockName(dCtx, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: lock name: %w", errKind, candidate.id, err)
+	}
+	defer unlock()
+
+	ctr := &Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}
+	fresh, err := ctr.inspectFreshLocked(dCtx)
+	if isNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
+		return false, nil
+	}
+	target, err := verifiedDeleteTarget(eng, fresh, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
+	}
+	_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
+	if err != nil && !isNotFound(err) {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	return true, nil
 }

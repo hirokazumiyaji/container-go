@@ -12,6 +12,30 @@ import (
 // an internal package.
 type CLIError = cli.CLIError
 
+// CleanupError reports a primary operation failure together with a failure
+// from automatic cleanup or verification of the retained container. Both
+// causes remain available through errors.Is/errors.As.
+type CleanupError struct {
+	Err        error
+	CleanupErr error
+}
+
+func (e *CleanupError) Error() string {
+	return fmt.Sprintf("%v; cleanup failed: %v", e.Err, e.CleanupErr)
+}
+
+// Unwrap preserves both the operation and cleanup branches.
+func (e *CleanupError) Unwrap() []error {
+	return []error{e.Err, e.CleanupErr}
+}
+
+func withCleanupError(err, cleanupErr error) error {
+	if cleanupErr == nil {
+		return err
+	}
+	return &CleanupError{Err: err, CleanupErr: cleanupErr}
+}
+
 // ErrSystemNotRunning reports that the Apple Container system service is
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
@@ -33,7 +57,11 @@ var ErrContainerNotFound = errors.New("container not found")
 // ErrGenerationReplaced reports that an operation refused to use or
 // delete a live container because its creation generation or backend
 // identity no longer matches the handle.
-var ErrGenerationReplaced = errors.New("container was recreated; generation was replaced")
+var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+
+// ErrNameLockCompatibility reports that a name-addressed operation could
+// not establish every historical lock namespace required during migration.
+var ErrNameLockCompatibility = errors.New("name lock compatibility")
 
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).

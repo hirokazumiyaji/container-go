@@ -130,8 +130,8 @@ func TestExecSuccessAddsNoProbe(t *testing.T) {
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
-	if got := r.count() - before; got != 1 {
-		t.Fatalf("exec success calls = %d, want 1", got)
+	if got := r.count() - before; got != 2 {
+		t.Fatalf("exec success calls = %d, want generation check + exec", got)
 	}
 }
 

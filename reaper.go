@@ -18,10 +18,12 @@ import (
 // container. While this process lives, the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
-// Name-addressed entries carry the stable lock-file path prepared by the
-// Go process. The shell holds that same lock across its generation
-// inspect and delete calls. If the lock helper or file is unavailable,
-// the entry is skipped rather than deleting by name without coordination.
+// Name-addressed entries carry the stable historical and durable lock-file
+// paths prepared by the Go process. The shell holds all of those barriers,
+// in lockName's order, across its generation inspect and delete calls. If a
+// lock helper or file is unavailable, the entry is skipped rather than
+// deleting by name without coordination. The original single-path line
+// format remains accepted; the multi-path form is an additive extension.
 // Each backend call remains bounded by a portable background-job timeout.
 // Failures stay silent (|| true) by design: the reaper is last-resort
 // insurance.
@@ -70,6 +72,37 @@ if [ -n "$creation" ]; then
 fi
 ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
 '
+helper=$(mktemp 2>/dev/null) || exit 0
+trap 'rm -f "$helper"' EXIT
+cat >"$helper" <<'REAPER_MULTI_LOCK'
+#!/bin/sh
+if [ "$1" = "--lock" ]; then
+  path=$2
+  shift 2
+  if [ -n "$REAPER_LOCKF" ]; then
+    exec "$REAPER_LOCKF" -k -w -t 30 "$path" "$0" --held "$@"
+  fi
+  if [ -n "$REAPER_FLOCK" ]; then
+    exec "$REAPER_FLOCK" -w 30 "$path" "$0" --held "$@"
+  fi
+  exit 0
+fi
+[ "$1" = "--held" ] || exit 0
+shift
+next=$1
+shift
+if [ "$next" = "--run" ]; then
+  id=$1
+  creation=$2
+  REAPER_BIN="$REAPER_BIN" REAPER_SUB="$REAPER_SUB" REAPER_KEY="$REAPER_KEY" REAPER_ENTRY_SCRIPT="$REAPER_ENTRY_SCRIPT" \
+    sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation"
+  exit $?
+fi
+[ -n "$next" ] || exit 0
+"$0" --lock "$next" "$@"
+exit $?
+REAPER_MULTI_LOCK
+chmod 700 "$helper" 2>/dev/null || exit 0
 run_locked() {
   id=$1
   creation=$2
@@ -79,6 +112,26 @@ run_locked() {
       sh -c 'sh -c "$REAPER_ENTRY_SCRIPT" sh "$@"' sh "$id" "$creation" || true
     return
   fi
+  case "$lockpath" in
+    *";"*)
+      old_ifs=$IFS
+      IFS=';'
+      set -- $lockpath
+      IFS=$old_ifs
+      path1=$1
+      path2=$2
+      path3=$3
+      for path in "$path1" "$path2" "$path3"; do
+        [ -n "$path" ] || return 0
+        [ -L "$path" ] && return 0
+        [ -f "$path" ] || return 0
+      done
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" REAPER_ENTRY_SCRIPT="$entry_script" \
+      REAPER_LOCKF=$(command -v lockf 2>/dev/null) REAPER_FLOCK=$(command -v flock 2>/dev/null) \
+        "$helper" --lock "$path1" "$path2" "$path3" --run "$id" "$creation" || true
+      return
+      ;;
+  esac
   [ -L "$lockpath" ] && return 0
   [ -f "$lockpath" ] || return 0
   if flock_bin=$(command -v flock 2>/dev/null); then
@@ -145,12 +198,16 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+const reaperLockPathSeparator = ";"
+
 type reaperEntry struct {
 	id       string
 	creation string
-	// lockPath is present for name-addressed entries. Immutable-ID
-	// entries leave it empty and do not need a name lock.
-	lockPath string
+	// lockPath is retained for compatibility with entries constructed by
+	// older in-package callers. New name entries carry all migration
+	// barriers in lockPaths, in lockName acquisition order.
+	lockPath  string
+	lockPaths []string
 }
 
 type reaper struct {
@@ -188,20 +245,24 @@ func (r *reaper) register(id, creation string) error {
 	}
 
 	lockPath := ""
+	var lockPaths []string
 	if creation != "" && !dockerIDRE.MatchString(id) {
 		var err error
-		lockPath, err = reaperNameLockPath(id)
+		lockPaths, err = reaperNameLockPaths(id)
 		if err != nil {
-			return fmt.Errorf("reaper: prepare name lock for %q: %w", id, err)
+			return fmt.Errorf("reaper: prepare name locks for %q: %w", id, err)
 		}
-		if !validNameLockProtocolPath(lockPath) {
-			return fmt.Errorf("reaper: invalid name lock path %q", lockPath)
+		for _, path := range lockPaths {
+			if !validNameLockProtocolPath(path) {
+				return fmt.Errorf("reaper: invalid name lock path %q", path)
+			}
 		}
+		lockPath = lockPaths[len(lockPaths)-1]
 	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	entry := reaperEntry{id: id, creation: creation, lockPath: lockPath}
+	entry := reaperEntry{id: id, creation: creation, lockPath: lockPath, lockPaths: append([]string(nil), lockPaths...)}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
@@ -216,11 +277,20 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 		return io.ErrClosedPipe
 	}
 	var line string
-	if e.lockPath != "" {
-		if !validNameLockProtocolPath(e.lockPath) {
-			return fmt.Errorf("reaper: missing stable name lock for %q", e.id)
+	paths := append([]string(nil), e.lockPaths...)
+	if len(paths) == 0 && e.lockPath != "" {
+		paths = []string{e.lockPath}
+	}
+	if len(paths) > 0 {
+		for _, path := range paths {
+			if !validNameLockProtocolPath(path) {
+				return fmt.Errorf("reaper: missing stable name lock for %q", e.id)
+			}
 		}
-		line = e.id + "\t" + e.creation + "\t" + e.lockPath
+		// The third field remains the historical path field. Multiple
+		// barriers use an additive separator; old reapers fail closed on
+		// the unknown composite path rather than deleting unlocked.
+		line = e.id + "\t" + e.creation + "\t" + strings.Join(paths, reaperLockPathSeparator)
 	} else if e.creation != "" {
 		// Retain the legacy space-delimited form for an immutable ID that
 		// nevertheless carries a generation for an additional guard.

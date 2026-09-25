@@ -179,7 +179,11 @@ type dockerInspect struct {
 			Variant      string `json:"variant"`
 		} `json:"platform"`
 	} `json:"ImageManifestDescriptor"`
-	State struct {
+
+	descriptorOSPresent      bool
+	descriptorArchPresent    bool
+	descriptorVariantPresent bool
+	State                    struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -196,6 +200,27 @@ type dockerInspect struct {
 			IPAddress string `json:"IPAddress"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
+}
+
+func (c *dockerInspect) UnmarshalJSON(data []byte) error {
+	type plain dockerInspect
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*c = dockerInspect(decoded)
+	var raw struct {
+		ImageManifestDescriptor struct {
+			Platform map[string]json.RawMessage `json:"platform"`
+		} `json:"ImageManifestDescriptor"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	_, c.descriptorOSPresent = raw.ImageManifestDescriptor.Platform["os"]
+	_, c.descriptorArchPresent = raw.ImageManifestDescriptor.Platform["architecture"]
+	_, c.descriptorVariantPresent = raw.ImageManifestDescriptor.Platform["variant"]
+	return nil
 }
 
 func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
@@ -225,37 +250,48 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		return nil, fmt.Errorf("docker inspect for %s returned invalid container ID %q", target, c.ID)
 	}
 
-	platform := c.Platform
+	platformMeta := platformMetadataFromString(c.Platform)
 	descriptor := c.ImageManifestDescriptor.Platform
-	if descriptor.OS != "" || descriptor.Architecture != "" || descriptor.Variant != "" {
-		// A descriptor may omit OS on some API responses; the top-level
-		// value remains the authoritative OS in that case. Missing
-		// architecture/variant are intentionally not invented: explicit
-		// selectors must fail closed when Docker cannot verify them.
-		if descriptor.Architecture == "" {
-			// A variant without an architecture is not a complete OCI
-			// platform. Keep the verified OS-only value rather than
-			// accidentally interpreting the variant as an architecture.
-			platform = c.Platform
-		} else {
-			if descriptor.OS == "" {
-				if osParts, ok := parsePlatform(c.Platform); ok {
-					descriptor.OS = osParts.os
-				} else {
-					descriptor.OS = c.Platform
-				}
-			}
-			platform = formatInspectPlatform(descriptor.OS, descriptor.Architecture, descriptor.Variant)
+	descriptorMeta := platformMetadata{
+		valid:        true,
+		osSet:        c.descriptorOSPresent,
+		archSet:      c.descriptorArchPresent,
+		variantSet:   c.descriptorVariantPresent,
+		os:           descriptor.OS,
+		architecture: descriptor.Architecture,
+		variant:      descriptor.Variant,
+	}
+	// A descriptor may omit OS on some API responses; the top-level value
+	// remains the authoritative OS in that case. Do not discard an
+	// explicitly empty architecture/variant: retaining its presence bit is
+	// what makes architecture-specific selectors fail closed.
+	if descriptorMeta.osSet {
+		if descriptorMeta.os == "" && platformMeta.osSet {
+			descriptorMeta.os = platformMeta.os
 		}
+		platformMeta.os = descriptorMeta.os
+		platformMeta.osSet = true
+	}
+	if descriptorMeta.archSet {
+		platformMeta.architecture = descriptorMeta.architecture
+		platformMeta.archSet = true
+	}
+	if descriptorMeta.variantSet {
+		platformMeta.variant = descriptorMeta.variant
+		platformMeta.variantSet = true
+	}
+	if platformMeta.valid || c.descriptorOSPresent || c.descriptorArchPresent || c.descriptorVariantPresent {
+		platformMeta.valid = true
 	}
 
 	info := &engineInfo{
-		state:    dockerState(c.State.Status),
-		labels:   c.Config.Labels,
-		uid:      c.ID,
-		image:    c.Config.Image,
-		platform: platform,
-		ip:       c.NetworkSettings.IPAddress,
+		state:        dockerState(c.State.Status),
+		labels:       c.Config.Labels,
+		uid:          c.ID,
+		image:        c.Config.Image,
+		platform:     platformMeta.normalized(),
+		platformMeta: platformMeta,
+		ip:           c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

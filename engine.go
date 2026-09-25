@@ -1,7 +1,6 @@
 package container
 
 import (
-	"errors"
 	"strings"
 	"time"
 
@@ -99,9 +98,9 @@ type engine interface {
 // a CLIError. Some CLI liveness failures are reported on stdout rather
 // than stderr, so probe classifiers must inspect both streams.
 func cliDiagnosticText(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	stdout, stderr, ok := cli.DiagnosticText(err)
+	if !ok {
 		return "", false
 	}
-	return strings.ToLower(strings.Join([]string{cliErr.Stdout, cliErr.Stderr}, "\n")), true
+	return strings.ToLower(strings.Join([]string{stdout, stderr}, "\n")), true
 }

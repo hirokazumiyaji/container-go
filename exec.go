@@ -85,11 +85,26 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if err == nil {
 		return 0, output, nil
 	}
-	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
-	}
+
+	// A context cancellation can be reported by os/exec as an ExitError
+	// with a signal status. It is not an application result, even when
+	// the CLI also returns a real non-zero status. Preserve the context
+	// and any CLI diagnostic in the returned error.
 	var cliErr *cli.CLIError
-	errors.As(err, &cliErr)
+	hasCLIError := errors.As(err, &cliErr)
+	if isExecContextError(err) || (hasCLIError && cliErr.ExitCode < 0) || ctx.Err() != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			err = errors.Join(err, ctxErr)
+		}
+		code := 0
+		if hasCLIError && cliErr.ExitCode >= 0 {
+			code = cliErr.ExitCode
+		}
+		return code, output, err
+	}
+	if !cli.IsCommandExit(err) {
+		return 0, output, wrapNotFound(c.classify(ctx, err))
+	}
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
@@ -100,6 +115,10 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return cliErr.ExitCode, output, nil
 	}
 	return 0, nil, wrapNotFound(c.classify(ctx, err))
+}
+
+func isExecContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

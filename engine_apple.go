@@ -17,7 +17,7 @@ type appleEngine struct{}
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
 // Diagnostic substrings below are matched case-insensitively on the
-// CLIError stdout and stderr streams.
+// CLIError's diagnostic streams.
 // Sources (apple/container):
 //   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,
 //     message: "container with id \(id) already exists")

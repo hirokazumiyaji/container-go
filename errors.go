@@ -9,8 +9,8 @@ import (
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
 // internal/cli.CLIError so callers can use errors.As without importing
-// an internal package; failed invocations retain bounded stdout and
-// stderr diagnostics.
+// an internal package. The public four-field layout is retained for
+// compatibility; classification may use additional bounded diagnostics.
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that the selected container backend is

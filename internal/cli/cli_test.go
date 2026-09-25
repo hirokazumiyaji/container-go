@@ -20,6 +20,13 @@ func writeStub(t *testing.T, script string) string {
 	return path
 }
 
+func TestCLIErrorRetainsUnkeyedFieldLayout(t *testing.T) {
+	err := CLIError{"docker", []string{"version"}, 1, "failed"}
+	if err.Binary != "docker" || err.ExitCode != 1 || err.Stderr != "failed" {
+		t.Fatalf("CLIError = %#v, want the historical four-field layout", err)
+	}
+}
+
 func TestExecRunnerReturnsStdout(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `echo "out $1"; echo "err" >&2`)}
 
@@ -68,11 +75,12 @@ func TestExecRunnerPreservesFailureStdout(t *testing.T) {
 	if got := string(stdout); got != "probe diagnostic\n" {
 		t.Errorf("raw stdout = %q, want %q", got, "probe diagnostic\\n")
 	}
-	if got := cliErr.Stdout; got != "probe diagnostic\n" {
-		t.Errorf("CLIError.Stdout = %q, want %q", got, "probe diagnostic\\n")
+	stdoutDiagnostic, _, ok := DiagnosticText(err)
+	if !ok || stdoutDiagnostic != "probe diagnostic\n" {
+		t.Errorf("stdout diagnostic = %q (ok=%t), want %q", stdoutDiagnostic, ok, "probe diagnostic\\n")
 	}
-	if !strings.Contains(cliErr.Error(), "probe diagnostic") {
-		t.Errorf("Error() = %q, want stdout diagnostic", cliErr.Error())
+	if !strings.Contains(err.Error(), "probe diagnostic") {
+		t.Errorf("Error() = %q, want stdout diagnostic", err.Error())
 	}
 }
 
@@ -127,8 +135,8 @@ func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
 	if len(cliErr.Stderr) > maxStderr {
 		t.Errorf("len(CLIError.Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
 	}
-	if len(cliErr.Stdout) > maxStderr {
-		t.Errorf("len(CLIError.Stdout) = %d, want <= %d", len(cliErr.Stdout), maxStderr)
+	if stdoutDiagnostic, _, ok := DiagnosticText(err); !ok || len(stdoutDiagnostic) > maxStderr {
+		t.Errorf("len(stdout diagnostic) = %d (ok=%t), want <= %d", len(stdoutDiagnostic), ok, maxStderr)
 	}
 	if cliErr.ExitCode != 7 {
 		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
@@ -342,6 +350,33 @@ func (h *hangingProbeRunner) Run(ctx context.Context, _ ...string) ([]byte, []by
 		return nil, nil, h.afterContextErr
 	}
 	return nil, nil, ctx.Err()
+}
+
+type issue104RecordingProbeRunner struct {
+	calls int
+	err   error
+}
+
+func (r *issue104RecordingProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+	r.calls++
+	return nil, nil, r.err
+}
+
+func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
+	original := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command timed out"}
+	operationErr := errors.Join(original, context.DeadlineExceeded)
+	runner := &issue104RecordingProbeRunner{err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}}
+
+	got := Classify(context.Background(), runner, operationErr, appleProbe)
+	if runner.calls != 0 {
+		t.Fatalf("probe calls = %d, want 0 after operation timeout", runner.calls)
+	}
+	if !errors.Is(got, original) || !errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want original and operation timeout chains", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, operation timeout must not be classified as daemon down", got)
+	}
 }
 
 func TestClassifyProbeTimeoutPreservesExplicitDeadline(t *testing.T) {

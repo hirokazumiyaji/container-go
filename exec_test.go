@@ -81,6 +81,43 @@ func TestExecReturnsCommandExitCodeWithoutError(t *testing.T) {
 	}
 }
 
+type issue104CanceledExecRunner struct {
+	*execRunner
+}
+
+func (r *issue104CanceledExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		return []byte("partial output"), []byte("process killed"), errors.Join(
+			&cli.CLIError{Args: args, ExitCode: -1, Stderr: "process killed"},
+			context.Canceled,
+		)
+	}
+	return r.execRunner.Run(ctx, args...)
+}
+
+func TestExecReturnsCancellationWhenCLIExitIsSignal(t *testing.T) {
+	f := &issue104CanceledExecRunner{execRunner: &execRunner{fakeRunner: newTestRunner()}}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"sleep"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a canceled CLI process")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != -1 {
+		t.Fatalf("error = %v, want original signal CLIError in the chain", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 for an unobservable signal exit", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a canceled CLI process")
+	}
+}
+
 func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{

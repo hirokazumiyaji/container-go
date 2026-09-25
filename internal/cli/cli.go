@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-// maxStderr bounds each diagnostic stream copied into a CLIError.
+// maxStderr bounds each diagnostic stream copied into a CLI failure.
 const maxStderr = 64 * 1024
 
 // ErrSystemNotRunning reports that the container backend (Apple
@@ -61,16 +61,17 @@ func (r *ExecRunner) External() bool { return true }
 func (r *ExecRunner) ExternalBinary() string { return r.Binary }
 
 // CLIError is a non-zero exit from a backend CLI.
+//
+// Keep this struct's four-field shape stable. Callers have historically
+// used unkeyed CLIError literals; stdout is therefore carried by the
+// internal diagnosticError wrapper below instead of being added here.
 type CLIError struct {
 	// Binary is the CLI executable that failed (e.g. "container" or
 	// "docker"). Empty means the historical default of "container".
 	Binary   string
 	Args     []string
 	ExitCode int
-	// Stdout and Stderr retain bounded diagnostic copies from a failed
-	// invocation. Raw output remains available from Runner.Run.
-	Stdout string
-	Stderr string
+	Stderr   string
 }
 
 func (e *CLIError) Error() string {
@@ -82,15 +83,75 @@ func (e *CLIError) Error() string {
 	if e.Stderr != "" {
 		msg += ": " + strings.TrimSpace(e.Stderr)
 	}
-	if e.Stdout != "" {
-		if e.Stderr != "" {
-			msg += "; stdout: "
-		} else {
-			msg += ": "
-		}
-		msg += strings.TrimSpace(e.Stdout)
-	}
 	return msg
+}
+
+// diagnosticError keeps stdout available to classifiers without changing
+// the public CLIError layout. Unwrap preserves errors.As/errors.Is behavior
+// for the original CLIError.
+type diagnosticError struct {
+	cause  error
+	cliErr *CLIError
+	stdout string
+}
+
+func (e *diagnosticError) Error() string {
+	msg := e.cliErr.Error()
+	if e.stdout == "" {
+		return msg
+	}
+	if e.cliErr.Stderr != "" {
+		msg += "; stdout: "
+	} else {
+		msg += ": "
+	}
+	return msg + strings.TrimSpace(e.stdout)
+}
+
+func (e *diagnosticError) Unwrap() error { return e.cause }
+
+// WithStdout attaches bounded stdout diagnostics to a CLIError. It is
+// internal to this module so the public four-field CLIError remains source
+// compatible with unkeyed literals.
+func WithStdout(err *CLIError, stdout string) error {
+	return withStdout(err, stdout)
+}
+
+func withStdout(err error, stdout string) error {
+	if err == nil || stdout == "" {
+		return err
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return err
+	}
+	var existing *diagnosticError
+	if errors.As(err, &existing) && existing.cliErr == cliErr && existing.stdout != "" {
+		return err
+	}
+	return &diagnosticError{
+		cause:  err,
+		cliErr: cliErr,
+		stdout: truncateOutput(stdout),
+	}
+}
+
+// DiagnosticText returns the diagnostic streams carried by a CLI failure.
+// The bool reports whether err contains a CLIError. The stdout side channel
+// is available even when the public CLIError remains unchanged.
+func DiagnosticText(err error) (stdout, stderr string, ok bool) {
+	if err == nil {
+		return "", "", false
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return "", "", false
+	}
+	var diagnostic *diagnosticError
+	if errors.As(err, &diagnostic) && diagnostic.cliErr == cliErr {
+		stdout = diagnostic.stdout
+	}
+	return stdout, cliErr.Stderr, true
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
@@ -129,16 +190,16 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
-				Stdout:   truncateOutput(stdout.String()),
 				Stderr:   truncateStderr(stderr.String()),
 			}
+			commandErr := WithStdout(cliErr, stdout.String())
 			// Cancellation can race with observing a real command exit.
 			// Preserve both facts so classification can still inspect the
 			// CLIError after Run returns.
 			if ctxErr := ctx.Err(); ctxErr != nil {
-				return stdout.Bytes(), stderr.Bytes(), errors.Join(cliErr, ctxErr)
+				return stdout.Bytes(), stderr.Bytes(), errors.Join(commandErr, ctxErr)
 			}
-			return stdout.Bytes(), stderr.Bytes(), cliErr
+			return stdout.Bytes(), stderr.Bytes(), commandErr
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
@@ -192,10 +253,22 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		// from the original command failure.
 		return errors.Join(err, ctxErr)
 	}
+	// A timeout or signal reported by the operation itself is already a
+	// known termination result. Probing the backend after it would turn a
+	// useful operation error into a second, misleading operation.
+	if isOperationTimeoutError(err) {
+		return err
+	}
 
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	_, _, probeErr := r.Run(probeCtx, probe.Args...)
+	probeStdout, _, probeErr := r.Run(probeCtx, probe.Args...)
+	if probeErr != nil {
+		// Runners may return stdout separately from the error. Attach it
+		// to the CLI side representation before backend classifiers inspect
+		// the probe, without replacing the probe's original error chain.
+		probeErr = withStdout(probeErr, string(probeStdout))
+	}
 	if probeErr == nil {
 		// A runner can return successfully just as the caller cancels.
 		// Do not lose that cancellation, but never invent a liveness
@@ -282,6 +355,46 @@ func classifySystemNotRunning(ctx, probeCtx context.Context, original, probeErr 
 	return classified
 }
 
+func isOperationTimeoutError(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	// A signal exit has no application status to report and cannot benefit
+	// from a liveness probe.
+	if cliErr.ExitCode < 0 {
+		return true
+	}
+	texts := []string{
+		strings.ToLower(cliDiagnosticText(err)),
+		strings.ToLower(err.Error()),
+	}
+	for _, text := range texts {
+		for _, fragment := range []string{
+			"context deadline exceeded",
+			"deadline exceeded",
+			"context canceled",
+			"context cancelled",
+			"operation timed out",
+			"operation timeout",
+			"i/o timeout",
+		} {
+			if strings.Contains(text, fragment) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func isProbeNonLiveness(probeCtx context.Context, err error) bool {
 	if !isNonLivenessError(err) {
 		return false
@@ -347,11 +460,11 @@ func defaultProbeUnavailable(err error) bool {
 }
 
 func cliDiagnosticText(err error) string {
-	var cliErr *CLIError
-	if errors.As(err, &cliErr) {
-		return strings.Join([]string{cliErr.Stdout, cliErr.Stderr}, "\n")
+	stdout, stderr, ok := DiagnosticText(err)
+	if !ok {
+		return err.Error()
 	}
-	return err.Error()
+	return strings.Join([]string{stdout, stderr}, "\n")
 }
 
 // IsNonLivenessError reports whether err identifies a client-side
@@ -409,10 +522,17 @@ func containsNonLivenessText(s string) bool {
 		"context canceled",
 		"context cancelled",
 		"deadline exceeded",
-		// TLS and certificate verification failures. A bare "certificate"
-		// can also be a hostname or endpoint-path component.
-		"tls",
-		"x509",
+		// TLS and certificate verification failures. Keep the
+		// diagnostic-specific forms: bare "tls" and "x509" are valid
+		// endpoint hostname/path components.
+		"tls handshake",
+		"tls: ",
+		"tls alert",
+		"tls record",
+		"tls version",
+		"x509: ",
+		"x509 error",
+		"x509 certificate",
 		"certificate signed by unknown authority",
 		"certificate verification failed",
 		"certificate verify failed",

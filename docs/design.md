@@ -401,7 +401,8 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and bounded stdout/stderr diagnostics (capped at 64KiB per stream)
+  code, and bounded stderr diagnostic (capped at 64KiB). Classification
+  also inspects bounded stdout internally for liveness probes.
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

@@ -23,7 +23,7 @@ type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
 // Diagnostic substrings below are matched case-insensitively on the
-// CLIError stdout and stderr streams.
+// CLIError's diagnostic streams.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
 //   - image missing: "Error response from daemon: No such image: …"

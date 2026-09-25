@@ -11,13 +11,14 @@ import (
 )
 
 type classifyProbeRunner struct {
-	probeErr error
-	calls    []string
+	probeErr    error
+	probeStdout string
+	calls       []string
 }
 
 func (r *classifyProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls = append(r.calls, strings.Join(args, " "))
-	return nil, nil, r.probeErr
+	return []byte(r.probeStdout), nil, r.probeErr
 }
 
 func TestAppleSystemStatusRealStdoutClassifiesProbeFailure(t *testing.T) {
@@ -31,10 +32,9 @@ func TestAppleSystemStatusRealStdoutClassifiesProbeFailure(t *testing.T) {
 		Binary:   "container",
 		Args:     []string{"system", "status"},
 		ExitCode: 1,
-		Stdout:   string(stdout),
 	}
 	original := &cli.CLIError{Binary: "container", Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
-	runner := &classifyProbeRunner{probeErr: probeErr}
+	runner := &classifyProbeRunner{probeErr: probeErr, probeStdout: string(stdout)}
 
 	got := cli.Classify(context.Background(), runner, original, appleEngine{}.probe())
 	if !errors.Is(got, ErrSystemNotRunning) {
@@ -64,6 +64,22 @@ func TestClassifyDaemonDownWithTermsInEndpointPaths(t *testing.T) {
 		{
 			name:       "certificate",
 			diagnostic: "Cannot connect to the Docker daemon at tcp://certificate.internal:2376: connect: connection refused",
+		},
+		{
+			name:       "tls",
+			diagnostic: "Cannot connect to the Docker daemon at tcp://tls.internal:2376: connect: connection refused",
+		},
+		{
+			name:       "x509",
+			diagnostic: "Cannot connect to the Docker daemon at tcp://x509.internal:2376: connect: connection refused",
+		},
+		{
+			name:       "tls port",
+			diagnostic: "Cannot connect to the Docker daemon at tcp://tls:2376: connect: connection refused",
+		},
+		{
+			name:       "x509 port",
+			diagnostic: "Cannot connect to the Docker daemon at tcp://x509:2376: connect: connection refused",
 		},
 	}
 

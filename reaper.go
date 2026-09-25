@@ -17,6 +17,8 @@ import (
 // pipe reaches EOF, and the reaper force-deletes every registered
 // container. While this process lives, the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
+// If the child exits unexpectedly while the parent is alive, the parent
+// starts a replacement and replays every entry into it.
 //
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script
@@ -103,6 +105,7 @@ type reaper struct {
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	exited        chan struct{}
+	closed        bool
 	entries       []reaperEntry
 	spawnFailures int
 	gaveUp        bool
@@ -114,8 +117,8 @@ func newReaper(binary, subcommand string) *reaper {
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// ID from creationLabel; empty is reserved for immutable container IDs
+// that do not need a generation check.
 func (r *reaper) register(id, creation string) error {
 	if !nameRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
@@ -125,9 +128,12 @@ func (r *reaper) register(id, creation string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return errors.New("reaper: closed")
+	}
 	entry := reaperEntry{id: id, creation: creation}
 	r.entries = append(r.entries, entry)
-	if r.stdin != nil {
+	if r.spawnFailures < maxReaperSpawnFailures && r.stdin != nil {
 		if r.writeLocked(entry) == nil {
 			return nil
 		}
@@ -148,6 +154,11 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 // every known ID with it. Success resets the consecutive-failure count;
 // giving up logs once so a permanently broken reaper is visible.
 func (r *reaper) respawnAndReplayLocked() error {
+	// A completed retry cycle does not permanently discard the retained
+	// entries. A later registration gets a fresh set of spawn attempts.
+	if r.spawnFailures >= maxReaperSpawnFailures {
+		r.spawnFailures = 0
+	}
 	for r.spawnFailures < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
 			r.spawnFailures++
@@ -188,7 +199,22 @@ func (r *reaper) spawnLocked() error {
 		close(exited)
 	}()
 	r.cmd, r.stdin, r.exited = cmd, stdin, exited
+	go r.respawnAfterUnexpectedExit(cmd, exited)
 	return nil
+}
+
+// respawnAfterUnexpectedExit keeps the insurance alive while the parent is
+// still running. A normal parent exit needs no replacement: the parent is
+// already gone, and closeStdin marks the one intentional EOF used by tests
+// and best-effort shutdown.
+func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{}) {
+	<-exited
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.closed || r.cmd != cmd {
+		return
+	}
+	_ = r.respawnAndReplayLocked()
 }
 
 // closeStdin hands the reaper the same EOF it would see on parent
@@ -196,19 +222,26 @@ func (r *reaper) spawnLocked() error {
 func (r *reaper) closeStdin() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.closed {
+		return
+	}
+	r.closed = true
 	if r.stdin != nil {
 		_ = r.stdin.Close()
+		r.stdin = nil
 	}
 }
 
-// killForTest kills the reaper child and waits until it is reaped, so
-// the next write deterministically fails.
+// killForTest kills the current reaper child and waits until it is reaped.
 func (r *reaper) killForTest() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cmd != nil {
-		_ = r.cmd.Process.Kill()
-		<-r.exited
+	cmd, exited := r.cmd, r.exited
+	if cmd != nil {
+		_ = cmd.Process.Kill()
+	}
+	r.mu.Unlock()
+	if exited != nil {
+		<-exited
 	}
 }
 

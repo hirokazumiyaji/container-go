@@ -269,14 +269,16 @@ containers.
 `t.Cleanup`. Mid-`Run` failures are rolled back by `Run` itself.
 
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
-`t.Cleanup` run, so an external **watchdog reaper** takes over. At
-library initialization one `/bin/sh` child is spawned; container IDs
-are registered by writing them down a pipe. However the parent dies,
-the pipe reaches EOF, and the reaper runs `container delete --force`
-for every registered ID and exits. While the parent lives the reaper
-does nothing (deletion belongs to the normal path; the reaper is
-insurance). This mirrors container-rs's watchdog and covers SIGKILL,
-which no signal handler can.
+`t.Cleanup` run, so an external **watchdog reaper** takes over. Before
+an external backend run, its name and generation are written to one
+`/bin/sh` child through a pipe. If that child exits unexpectedly while
+the parent is alive, the parent starts a replacement and replays every
+entry. When the parent dies, the pipe reaches EOF instead: the reaper
+runs the backend delete command for every registered entry and exits,
+with no pointless respawn. While the parent lives the reaper does not
+delete (that belongs to the normal path); it is insurance. This mirrors
+container-rs's watchdog and covers SIGKILL, which no signal handler
+can.
 
 **Session labels**: every created container carries
 
@@ -320,10 +322,13 @@ immutable ID or an atomic conditional delete that Apple Container does
 not provide. An inspect
 failure other than not-found aborts the delete (fail closed); `Run`'s
 rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Docker containers by
-`Id`; for Apple it stores the generation, reads the label as a
-line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each backend call carries a 10-30s timeout
+than hiding it. Before create, the watchdog reaper registers both the
+name and generation. At cleanup it reads the generation as a
+line-anchored JSON field (`"key": "value"`, never a substring) from a
+fresh inspect and skips deletion on mismatch, so a pre-existing
+same-name container is safe. Docker also keeps its immutable `Id`
+registration as a second, generation-independent path. Each backend
+call carries a 10-30s timeout
 via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
 daemon call cannot wedge the rest. The leader's own pull/create uses an
 independent `runTimeout` budget; `reuseAttachTimeout` bounds only

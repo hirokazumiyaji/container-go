@@ -1,11 +1,16 @@
 package container
 
 import (
+	"context"
+	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // writeReaperStub creates a fake `container` binary that logs its argv.
@@ -75,24 +80,283 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 }
 
-func TestReaperRespawnsAndReRegisters(t *testing.T) {
+func TestReaperRespawnsAndReplaysAfterUnexpectedExit(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("before-crash", ""); err != nil {
+	for _, id := range []string{"before-crash", "second-entry"} {
+		if err := r.register(id, ""); err != nil {
+			t.Fatalf("register %q: %v", id, err)
+		}
+	}
+
+	r.mu.Lock()
+	oldCmd := r.cmd
+	r.mu.Unlock()
+	r.killForTest()
+	waitForReaperReplacement(t, r, oldCmd)
+
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force second-entry")
+}
+
+func waitForReaperReplacement(t *testing.T, r *reaper, old *exec.Cmd) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		replaced := r.cmd != nil && r.cmd != old
+		r.mu.Unlock()
+		if replaced {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("reaper child was not replaced after unexpected exit")
+}
+
+func TestReaperIntentionalEOFDoesNotRespawn(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	if err := r.register("eof-once", ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
-	// Kill the reaper child; killing closes its stdin read side, so it
-	// reaps what it knows, then the next register must respawn it.
-	r.killForTest()
+	r.mu.Lock()
+	oldCmd, exited := r.cmd, r.exited
+	r.mu.Unlock()
+	r.closeStdin()
+	<-exited
 
-	if err := r.register("after-crash", ""); err != nil {
-		t.Fatalf("register after crash: %v", err)
+	// Give the exit watcher time to observe EOF before checking that it
+	// treated the close as intentional rather than an unexpected exit.
+	time.Sleep(100 * time.Millisecond)
+	r.mu.Lock()
+	current := r.cmd
+	r.mu.Unlock()
+	if current != oldCmd {
+		t.Fatal("reaper respawned after intentional EOF")
+	}
+	waitForLogLines(t, logPath, "delete --force eof-once")
+}
+
+func TestReaperRegistrationRetryReplaysRetainedEntries(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	r.entries = []reaperEntry{{id: "retained", creation: ""}}
+	r.spawnFailures = maxReaperSpawnFailures
+	r.gaveUp = true
+
+	if err := r.register("retained", ""); err != nil {
+		t.Fatalf("retry after spawn failure: %v", err)
 	}
 	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force retained")
+}
 
-	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
+const reaperTestImmutableID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+type reaperBoundaryRunner struct {
+	*fakeRunner
+	binary string
+	onRun  func([]string) ([]byte, error)
+}
+
+func (r *reaperBoundaryRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "run" {
+		stdout, err := r.onRun(args)
+		return stdout, nil, err
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func (r *reaperBoundaryRunner) External() bool         { return true }
+func (r *reaperBoundaryRunner) ExternalBinary() string { return r.binary }
+
+func isolateGlobalReapers(t *testing.T) {
+	t.Helper()
+	t.Setenv("CONTAINERGO_KEEP", "")
+	globalReapersMu.Lock()
+	previous := globalReapers
+	globalReapers = make(map[string]*reaper)
+	globalReapersMu.Unlock()
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		current := globalReapers
+		globalReapers = previous
+		globalReapersMu.Unlock()
+		for _, r := range current {
+			r.closeStdin()
+		}
+	})
+}
+
+func closeGlobalReaper(binary string) error {
+	globalReapersMu.Lock()
+	r := globalReapers[binary]
+	globalReapersMu.Unlock()
+	if r == nil {
+		return errors.New("reaper was not registered before run")
+	}
+	r.closeStdin()
+	return nil
+}
+
+func runCreation(args []string) string {
+	for i, arg := range args {
+		if arg == "--label" && i+1 < len(args) {
+			if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+				return value
+			}
+		}
+	}
+	return ""
+}
+
+func writeGenerationReaperStub(t *testing.T, docker bool) (binPath, logPath, generationPath string) {
+	t.Helper()
+	dir := t.TempDir()
+	binPath = filepath.Join(dir, "container")
+	logPath = filepath.Join(dir, "calls.log")
+	generationPath = filepath.Join(dir, "generation")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  generation=$(cat " + generationPath + ")\n" +
+		"  printf '    \"" + creationLabel + "\": \"%s\"\\n' \"$generation\"\n"
+	if docker {
+		script += "  printf '    \"Id\": \"" + reaperTestImmutableID + "\"\\n'\n"
+	}
+	script += "fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return binPath, logPath, generationPath
+}
+
+func TestRunPreRegistersReaperBeforeCreate(t *testing.T) {
+	tests := []struct {
+		name       string
+		engine     engine
+		docker     bool
+		deleteCall string
+	}{
+		{name: "apple", engine: appleEngine{}, deleteCall: "delete --force pre-register-ctr"},
+		{name: "docker", engine: dockerEngine{}, docker: true, deleteCall: "rm --force " + reaperTestImmutableID},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bin, logPath, generationPath := writeGenerationReaperStub(t, tt.docker)
+			isolateGlobalReapers(t)
+			base := newTestRunner()
+			base.imagePresent = true
+			var runGeneration string
+			runner := &reaperBoundaryRunner{
+				fakeRunner: base,
+				binary:     bin,
+				onRun: func(args []string) ([]byte, error) {
+					creation := runCreation(args)
+					if !creationRE.MatchString(creation) {
+						return nil, errors.New("run did not carry a valid generation")
+					}
+					runGeneration = creation
+					if err := os.WriteFile(generationPath, []byte(creation), 0o600); err != nil {
+						return nil, err
+					}
+					// Simulate the parent receiving EOF at the exact boundary
+					// between backend run success and the old registration.
+					if err := closeGlobalReaper(bin); err != nil {
+						return nil, err
+					}
+					if tt.docker {
+						return []byte(reaperTestImmutableID + "\n"), nil
+					}
+					return []byte("pre-register-ctr\n"), nil
+				},
+			}
+
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("pre-register-ctr"),
+				WithPullPolicy(PullNever),
+				withRunner(runner),
+				withEngine(tt.engine),
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if ctr.creation != runGeneration {
+				t.Fatalf("handle generation = %q, run generation = %q", ctr.creation, runGeneration)
+			}
+			waitForLogLines(t, logPath, "inspect pre-register-ctr", tt.deleteCall)
+		})
+	}
+}
+
+func TestRunPreRegistrationPreservesNameConflict(t *testing.T) {
+	tests := []struct {
+		name       string
+		engine     engine
+		docker     bool
+		conflict   string
+		deleteCall string
+	}{
+		{
+			name:       "apple",
+			engine:     appleEngine{},
+			conflict:   `container with id "conflict-ctr" already exists`,
+			deleteCall: "delete --force conflict-ctr",
+		},
+		{
+			name:       "docker",
+			engine:     dockerEngine{},
+			docker:     true,
+			conflict:   `Conflict. The container name "/conflict-ctr" is already in use`,
+			deleteCall: "rm --force " + reaperTestImmutableID,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			bin, logPath, generationPath := writeGenerationReaperStub(t, tt.docker)
+			isolateGlobalReapers(t)
+			base := newTestRunner()
+			base.imagePresent = true
+			runner := &reaperBoundaryRunner{
+				fakeRunner: base,
+				binary:     bin,
+				onRun: func(args []string) ([]byte, error) {
+					if !creationRE.MatchString(runCreation(args)) {
+						return nil, errors.New("run did not carry a valid generation")
+					}
+					if err := os.WriteFile(generationPath, []byte("ffffffffffffffff"), 0o600); err != nil {
+						return nil, err
+					}
+					if err := closeGlobalReaper(bin); err != nil {
+						return nil, err
+					}
+					return nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: tt.conflict}
+				},
+			}
+
+			_, err := Run(context.Background(), "redis:7-alpine",
+				WithName("conflict-ctr"),
+				WithPullPolicy(PullNever),
+				withRunner(runner),
+				withEngine(tt.engine),
+			)
+			if err == nil {
+				t.Fatal("Run succeeded, want name conflict")
+			}
+			waitForLogLines(t, logPath, "inspect conflict-ctr")
+			deadline := time.Now().Add(time.Second)
+			for time.Now().Before(deadline) {
+				data, _ := os.ReadFile(logPath)
+				if strings.Contains(string(data), tt.deleteCall) {
+					t.Fatalf("pre-registration deleted conflicting container: %q", data)
+				}
+				time.Sleep(20 * time.Millisecond)
+			}
+		})
+	}
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {

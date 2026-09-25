@@ -158,6 +158,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+	// Register the name and generation before the backend can create the
+	// container. If this process dies immediately after run succeeds, the
+	// reaper can still find and delete only this exact generation.
+	preRegisterRunWithGlobalReaper(cfg)
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -174,18 +178,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
-		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
-		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+	// Keep Docker's existing immutable-ID insurance in addition to the
+	// pre-registration. The guarded name entry remains available if this
+	// best-effort update cannot reach the child.
+	if c.uid != "" {
+		if bin, subcommand, ok := runReaperTarget(cfg); ok {
+			registerWithGlobalReaper(bin, subcommand, c.uid, "")
 		}
 	}
 
@@ -206,6 +204,27 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 	}
 	return c, nil
+}
+
+func preRegisterRunWithGlobalReaper(cfg *config) {
+	if bin, subcommand, ok := runReaperTarget(cfg); ok {
+		registerWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
+	}
+}
+
+func runReaperTarget(cfg *config) (binary, subcommand string, ok bool) {
+	if keepContainers() {
+		return "", "", false
+	}
+	er, external := cfg.runner.(cli.ExternalRunner)
+	if !external || !er.External() {
+		return "", "", false
+	}
+	binary = er.ExternalBinary()
+	if binary == "" {
+		binary = cfg.eng.binary()
+	}
+	return binary, cfg.eng.reaperSubcommand(), true
 }
 
 // rollback removes a container Run created but cannot return. A failed

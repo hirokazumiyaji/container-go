@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -120,6 +123,76 @@ func (r review91ReplacementInspectRunner) Run(_ context.Context, args ...string)
 		return []byte(r.data), nil, nil
 	}
 	return nil, nil, nil
+}
+
+type review91TerminalStream struct {
+	err    error
+	closed chan struct{}
+	reads  atomic.Int32
+}
+
+func (s *review91TerminalStream) Read([]byte) (int, error) {
+	if s.reads.Add(1) == 1 {
+		return 0, s.err
+	}
+	return 0, io.EOF
+}
+func (s *review91TerminalStream) Close() error          { return nil }
+func (s *review91TerminalStream) Done() <-chan struct{} { return s.closed }
+func (s *review91TerminalStream) TerminalError() error  { return s.err }
+
+func TestReview91ClassifyingStreamCachesOriginalTerminalCLIError(t *testing.T) {
+	runner := &fakeRunner{systemUp: false}
+	terminal := &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 31, Stderr: "terminal failure"}
+	underlying := &review91TerminalStream{err: terminal, closed: make(chan struct{})}
+	stream := &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: &Container{
+		id: "myctr", runner: runner, eng: appleEngine{},
+	}}
+
+	_, err := stream.Read(make([]byte, 1))
+	var got *cli.CLIError
+	if !errors.As(err, &got) || got.ExitCode != terminal.ExitCode {
+		t.Fatalf("Read error = %v, want original CLIError", err)
+	}
+	if terminalErr := stream.TerminalError(); !errors.As(terminalErr, &got) || got.ExitCode != terminal.ExitCode {
+		t.Fatalf("TerminalError = %v, want cached original CLIError", terminalErr)
+	}
+	runner.mu.Lock()
+	probeCalls := 0
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "system" {
+			probeCalls++
+		}
+	}
+	runner.mu.Unlock()
+	if probeCalls != 1 {
+		t.Fatalf("system probe calls = %d, want one cached classification", probeCalls)
+	}
+}
+
+func TestReview91ReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
+	cases := map[string]map[string]string{
+		"unmanaged":   {reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa"},
+		"ungenerated": {managedLabel: "true", reuseLabel: "true"},
+	}
+	for name, labels := range cases {
+		t.Run(name, func(t *testing.T) {
+			err := checkReuseOwned(&engineInfo{labels: labels}, "redis:7-alpine", &config{name: "shared"})
+			if err == nil {
+				t.Fatal("checkReuseOwned accepted an unverifiable adoption")
+			}
+		})
+	}
+}
+
+func TestReview91DeleteStoppedReuseRefusesEmptyGeneration(t *testing.T) {
+	runner := &review91ReplacementInspectRunner{}
+	err := deleteStoppedReuse(context.Background(), &config{
+		runner: runner, eng: appleEngine{}, name: "shared",
+	}, &engineInfo{state: StateStopped, labels: map[string]string{managedLabel: "true", reuseLabel: "true"}})
+	if err == nil {
+		t.Fatal("deleteStoppedReuse accepted an empty generation")
+	}
 }
 
 func TestReview91LazyCacheRejectsReplacementNameLookup(t *testing.T) {

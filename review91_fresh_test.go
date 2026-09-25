@@ -50,6 +50,7 @@ func review91ReuseInspectJSON(uid, generation string, bound bool) string {
 		"Id":%q,
 		"Name":"/shared",
 		"Config":{"Image":"redis:7-alpine","Labels":{
+			"com.github.hirokazumiyaji.container-go":"true",
 			"com.github.hirokazumiyaji.container-go.reuse":"true",
 			"com.github.hirokazumiyaji.container-go.creation":%q
 		}},
@@ -167,6 +168,7 @@ func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		return []byte(`[{
 			"Id":"uid-a",
 			"Config":{"Image":"redis:7-alpine","Labels":{
+				"com.github.hirokazumiyaji.container-go":"true",
 				"com.github.hirokazumiyaji.container-go.reuse":"true",
 				"com.github.hirokazumiyaji.container-go.creation":"generation-a"
 			}},

@@ -326,6 +326,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 		return c.delete(ctx, uid)
 	}
 	if c.creation == "" {
+		if c.reused {
+			return fmt.Errorf("terminate %s: refusing name delete without a creation generation", c.id)
+		}
 		return c.delete(ctx, c.id)
 	}
 	unlock, err := lockName(ctx, c.id)
@@ -513,7 +516,10 @@ func (c *Container) validateInfoLocked(info *engineInfo) error {
 		return fmt.Errorf("%w: %s expected generation %q, got %q", ErrGenerationReplaced, c.id, c.creation, info.labels[creationLabel])
 	}
 	if c.reused {
-		if info.labels[reuseLabel] != "true" {
+		if c.creation == "" {
+			return fmt.Errorf("%w: container %s has no creation generation", errUnverifiedContainer, c.id)
+		}
+		if info.labels[managedLabel] != "true" || info.labels[reuseLabel] != "true" || info.labels[creationLabel] == "" {
 			return fmt.Errorf("%w: container %s was not created with WithReuse", errUnverifiedContainer, c.id)
 		}
 		return nil

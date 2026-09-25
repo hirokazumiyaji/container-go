@@ -184,6 +184,10 @@ func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}
+	var original *CLIError
+	if !errors.As(err, &original) || original.ExitCode != orig.ExitCode {
+		t.Fatalf("error = %v, want original CLIError preserved", err)
+	}
 	if !strings.Contains(err.Error(), "container system start") {
 		t.Errorf("Error() = %q, want hint to run 'container system start'", err.Error())
 	}

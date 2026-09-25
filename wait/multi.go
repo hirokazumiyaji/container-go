@@ -96,6 +96,12 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			if contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("after strategy %d final lifecycle check", i)); contextErr != nil {
 				return contextErr
 			}
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				runCancel()
+				return lifecycleErrValue
+			default:
+			}
 		case <-waitCtx.Done():
 			contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("in strategy %d", i))
 			if contextErr == nil {
@@ -188,6 +194,12 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				if contextErr := compositeContextError("wait for any", callerCtx, waitCtx, s.startupTimeout, startupDeadline, "after the final lifecycle check"); contextErr != nil {
 					return contextErr
 				}
+				select {
+				case lifecycleErrValue := <-lifecycleErr:
+					runCancel()
+					return lifecycleErrValue
+				default:
+				}
 				return nil
 			}
 			errs = append(errs, err)
@@ -233,34 +245,54 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 	if terminalWaitState(state) {
 		return stateFailure(what, state, nil, nil)
 	}
+	if state != StateRunning {
+		return fmt.Errorf("%s: final lifecycle state %s; want running", what, state)
+	}
 	return nil
 }
 
-// startLifecycleMonitor performs the initial lifecycle check and then
-// watches for terminal transitions while custom strategies run. The
-// returned channel is buffered and the monitor stops when the caller's
-// context ends; a custom strategy that ignores cancellation cannot hold up
-// the composite strategy's fail-fast return.
+// startLifecycleMonitor starts the initial lifecycle observation in the
+// background, then watches for terminal transitions while custom strategies
+// run. Each observation is independently bounded, so a slow backend cannot
+// consume the child-start budget synchronously.
 func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%s: %w", what, err)
 	}
-	var lastStateErr error
-	state, err := targetState(ctx, target)
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return nil, fmt.Errorf("%s: %w", what, ctxErr)
-	}
-	if err != nil {
-		if permanentProbeError(err) {
-			return nil, fmt.Errorf("%s: %w", what, err)
-		}
-		lastStateErr = err
-	} else if terminalWaitState(state) {
-		return nil, stateFailure(what, state, nil, lastStateErr)
-	}
-
 	lifecycleErr := make(chan error, 1)
 	go func() {
+		var lastStateErr error
+		check := func() bool {
+			probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+			state, err := targetState(probeCtx, target)
+			probeErr := probeCtx.Err()
+			cancel()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false
+			}
+			if probeErr != nil {
+				if err != nil {
+					lastStateErr = err
+				}
+				return true
+			}
+			if err != nil {
+				if permanentProbeError(err) {
+					lifecycleErr <- fmt.Errorf("%s: %w", what, err)
+					return false
+				}
+				lastStateErr = err
+				return true
+			}
+			if terminalWaitState(state) {
+				lifecycleErr <- stateFailure(what, state, nil, lastStateErr)
+				return false
+			}
+			return true
+		}
+		if !check() {
+			return
+		}
 		ticker := time.NewTicker(stateCheckInterval)
 		defer ticker.Stop()
 		for {
@@ -268,20 +300,7 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				state, err := targetState(ctx, target)
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return
-				}
-				if err != nil {
-					if permanentProbeError(err) {
-						lifecycleErr <- fmt.Errorf("%s: %w", what, err)
-						return
-					}
-					lastStateErr = err
-					continue
-				}
-				if terminalWaitState(state) {
-					lifecycleErr <- stateFailure(what, state, nil, lastStateErr)
+				if !check() {
 					return
 				}
 			}

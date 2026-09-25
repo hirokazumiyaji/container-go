@@ -137,7 +137,8 @@ func TestReview91CompositeRejectsSuccessAfterLifecycleStop(t *testing.T) {
 }
 
 type review91SlowFinalStateTarget struct {
-	calls atomic.Int32
+	calls          atomic.Int32
+	firstStateDone chan struct{}
 }
 
 func (*review91SlowFinalStateTarget) Endpoint(context.Context, string) (string, error) {
@@ -152,16 +153,28 @@ func (*review91SlowFinalStateTarget) ExecCommand(context.Context, []string) (int
 }
 func (t *review91SlowFinalStateTarget) State(ctx context.Context) (State, error) {
 	if t.calls.Add(1) == 1 {
+		if t.firstStateDone != nil {
+			close(t.firstStateDone)
+		}
 		return StateRunning, nil
 	}
 	<-ctx.Done()
 	return StateUnknown, ctx.Err()
 }
 
+type review91WaitForFirstStateStrategy struct {
+	done <-chan struct{}
+}
+
+func (s review91WaitForFirstStateStrategy) WaitUntilReady(context.Context, Target) error {
+	<-s.done
+	return nil
+}
+
 func TestReview91CompositeFinalLifecycleCheckIsBounded(t *testing.T) {
-	target := &review91SlowFinalStateTarget{}
+	target := &review91SlowFinalStateTarget{firstStateDone: make(chan struct{})}
 	start := time.Now()
-	err := ForAll(&review91CountingSuccessStrategy{}).WaitUntilReady(context.Background(), target)
+	err := ForAll(review91WaitForFirstStateStrategy{done: target.firstStateDone}).WaitUntilReady(context.Background(), target)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want bounded final lifecycle deadline", err)
 	}

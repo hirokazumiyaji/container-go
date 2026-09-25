@@ -224,10 +224,10 @@ func (r *dockerStateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 	r.mu.Unlock()
 	return []byte(fmt.Sprintf(`[{
 		"Id": "myctr",
-		"Config": {"Image": "redis:7-alpine", "Labels": {}},
+		"Config": {"Image": "redis:7-alpine", "Labels": {%q:"true",%q:"true",%q:"aaaaaaaaaaaaaaaa"}},
 		"State": {"Status": %q},
 		"NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
-	}]`, r.status)), nil, nil
+	}]`, managedLabel, reuseLabel, creationLabel, r.status)), nil, nil
 }
 
 func TestReuseFailsFastForPausedAndStoppingContainers(t *testing.T) {

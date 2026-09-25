@@ -164,7 +164,7 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
-	return reuseInspectJSONWithCreation(id, state, image, "")
+	return reuseInspectJSONWithCreation(id, state, image, "aaaaaaaaaaaaaaaa")
 }
 
 func reuseInspectJSONWithCreation(id, state, image, creation string) string {

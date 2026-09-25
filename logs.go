@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -77,14 +78,20 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 
 type classifyingStream struct {
 	io.ReadCloser
-	ctx       context.Context
-	container *Container
+	ctx          context.Context
+	container    *Container
+	terminalOnce sync.Once
+	terminalErr  error
 }
 
 func (s *classifyingStream) Read(p []byte) (int, error) {
 	n, err := s.ReadCloser.Read(p)
 	if err == nil || errors.Is(err, io.EOF) {
 		return n, err
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return n, s.classifyTerminal(err)
 	}
 	return n, wrapNotFound(s.container.classify(s.ctx, err))
 }
@@ -104,9 +111,16 @@ func (s *classifyingStream) TerminalError() error {
 	if !ok {
 		return nil
 	}
-	err := status.TerminalError()
-	if err == nil || errors.Is(err, io.EOF) {
-		return err
-	}
-	return wrapNotFound(s.container.classify(s.ctx, err))
+	return s.classifyTerminal(status.TerminalError())
+}
+
+func (s *classifyingStream) classifyTerminal(err error) error {
+	s.terminalOnce.Do(func() {
+		if err == nil || errors.Is(err, io.EOF) {
+			s.terminalErr = err
+			return
+		}
+		s.terminalErr = wrapNotFound(s.container.classify(s.ctx, err))
+	})
+	return s.terminalErr
 }

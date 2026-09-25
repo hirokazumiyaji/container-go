@@ -170,7 +170,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		if ctx.Err() != nil {
 			return err
 		}
-		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
+		return fmt.Errorf("%w: %s: %w", ErrSystemNotRunning, probe.Hint, err)
 	}
 	return err
 }

@@ -247,6 +247,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if info == nil || info.labels[creationLabel] == "" {
+		return fmt.Errorf("reuse %s: refusing name delete without a creation generation", cfg.name)
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.unverifiedLookup = false
 	ctr.reused = true
@@ -386,6 +389,9 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 	creation := base.creation
 	uid := base.uid
 	base.mu.Unlock()
+	if base.reused && creation == "" {
+		return nil, fmt.Errorf("reuse %s: %w", cfg.name, errUnverifiedContainer)
+	}
 
 	if reuseInfoReady(cfg, initial) && reuseInfoIdentityMatches(initial, creation, uid) {
 		if err := ctx.Err(); err != nil {
@@ -487,8 +493,11 @@ func createRaceMissing(err error) bool {
 // checkReuseOwned reports whether a stopped container may be deleted
 // and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
+	if info.labels[reuseLabel] != "true" || info.labels[managedLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if info.labels[creationLabel] == "" {
+		return fmt.Errorf("reuse %s: existing container has no creation generation", cfg.name)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)

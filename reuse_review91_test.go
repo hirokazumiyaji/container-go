@@ -50,7 +50,7 @@ func (r *review91ReuseRunner) inspectCount() int {
 }
 
 func review91DockerInspect(bound bool) string {
-	return review91DockerInspectIdentity(bound, "myctr", "")
+	return review91DockerInspectIdentity(bound, "myctr", "aaaaaaaaaaaaaaaa")
 }
 
 func review91DockerInspectIdentity(bound bool, uid, creation string) string {
@@ -64,7 +64,7 @@ func review91DockerInspectIdentity(bound bool, uid, creation string) string {
 	}
 	return fmt.Sprintf(`[{
 		"Id":%q,
-		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go.reuse":"true"%s}},
+		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true"%s}},
 		"State":{"Status":"running"},
 		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s}
 	}]`, uid, creationLabel, ports)

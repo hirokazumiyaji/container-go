@@ -147,6 +147,9 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			}
 			replay = scanResult.replay
 			matches := replay.matches
+			if scanResult.matches > matches {
+				matches = scanResult.matches
+			}
 			// A terminal stream error wins over a matching line that may
 			// have been returned in the same read.
 			if scanResult.err != nil && permanentLogStreamError(scanResult.err) {
@@ -229,36 +232,56 @@ func (s *LogStrategy) scanStream(
 	go func() {
 		scanner := bufio.NewScanner(stream)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		scanner.Split(scanCompleteLogLine)
+		var unterminated bool
+		scanner.Split(logLineSplitter(&unterminated))
 		digest := sha256.New()
 		var digestSum [sha256.Size]byte
 		var lineLength [8]byte
 		var lineCount uint64
 		next := replay
+		scanMatches := replay.matches
 		divergentMatches := 0
+		unterminatedMatches := 0
 		reachedBaseline := replay.complete && replay.lines == 0
 		ended := true
 		for scanner.Scan() {
 			line := scanner.Text()
-			binary.LittleEndian.PutUint64(lineLength[:], uint64(len(line)))
-			_, _ = digest.Write(lineLength[:])
-			_, _ = digest.Write([]byte(line))
-			lineCount++
-			currentDigest := [sha256.Size]byte(digest.Sum(digestSum[:0]))
-			countLine := !replay.complete || reachedBaseline
-			if replay.complete && !reachedBaseline && lineCount == replay.lines && currentDigest == replay.digest {
-				reachedBaseline = true
-				countLine = false
-			}
-			if countLine {
-				next.matches += match(line)
+			lineIsUnterminated := unterminated
+			lineMatches := match(line)
+			if !lineIsUnterminated {
+				binary.LittleEndian.PutUint64(lineLength[:], uint64(len(line)))
+				_, _ = digest.Write(lineLength[:])
+				_, _ = digest.Write([]byte(line))
+				lineCount++
+				currentDigest := [sha256.Size]byte(digest.Sum(digestSum[:0]))
+				countLine := !replay.complete || reachedBaseline
+				if replay.complete && !reachedBaseline && lineCount == replay.lines && currentDigest == replay.digest {
+					reachedBaseline = true
+					countLine = false
+				}
+				if countLine {
+					next.matches += lineMatches
+					scanMatches += lineMatches
+				} else {
+					divergentMatches += lineMatches
+				}
+			} else if !replay.complete || reachedBaseline {
+				scanMatches += lineMatches
 			} else {
-				divergentMatches += match(line)
+				unterminatedMatches += lineMatches
 			}
-			if next.matches >= s.occurrences {
+			if scanMatches >= s.occurrences {
 				ended = false
-				if settleErr := settleScanner(ctx, scanner); settleErr != nil && !errors.Is(settleErr, io.EOF) {
+				settleErr, intentionalClose := settleScanner(ctx, scanner, stream)
+				if settleErr != nil && !errors.Is(settleErr, io.EOF) {
 					results <- logScanResult{err: settleErr, replay: replay}
+					return
+				}
+				if intentionalClose {
+					// settleScanner owns the scanner until it has
+					// stopped reading; its close-induced read error is
+					// not a transport failure.
+					results <- logScanResult{matches: scanMatches, replay: next}
 					return
 				}
 				break
@@ -276,13 +299,14 @@ func (s *LogStrategy) scanStream(
 		replaceHistory := ended && replay.complete && !reachedBaseline && lineCount > 0 && lineCount == replay.lines
 		if replaceHistory {
 			next.matches += divergentMatches
+			scanMatches += divergentMatches + unterminatedMatches
 		}
-		if ended && scanErr == nil && (!replay.complete || reachedBaseline || replaceHistory) {
+		if ended && (!replay.complete || reachedBaseline || replaceHistory) {
 			next.complete = true
 			next.digest = [sha256.Size]byte(digest.Sum(digestSum[:0]))
 			next.lines = lineCount
 		}
-		results <- logScanResult{matches: next.matches, err: scanErr, replay: next}
+		results <- logScanResult{matches: scanMatches, replay: next}
 	}()
 
 	ticker := time.NewTicker(stateCheckInterval)
@@ -315,22 +339,28 @@ func (s *LogStrategy) scanStream(
 	}
 }
 
-// scanCompleteLogLine emits only newline-terminated log records. At EOF an
-// unterminated suffix may be a truncated write; consume it without adding it
-// to replay state so a later full-history connection can observe its
-// completed form and any following ready line.
-func scanCompleteLogLine(data []byte, atEOF bool) (int, []byte, error) {
-	if i := bytes.IndexByte(data, '\n'); i >= 0 {
-		line := data[:i]
-		if len(line) > 0 && line[len(line)-1] == '\r' {
-			line = line[:len(line)-1]
+// logLineSplitter emits complete lines and records whether the final token
+// was newline-terminated. The token is still returned for matching at a clean
+// EOF, but scanStream keeps it out of replay identity and baseline state.
+func logLineSplitter(unterminated *bool) bufio.SplitFunc {
+	return func(data []byte, atEOF bool) (int, []byte, error) {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			*unterminated = false
+			line := data[:i]
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
+			}
+			return i + 1, line, nil
 		}
-		return i + 1, line, nil
+		if atEOF && len(data) > 0 {
+			*unterminated = true
+			return len(data), data, nil
+		}
+		if atEOF {
+			return 0, nil, io.EOF
+		}
+		return 0, nil, nil
 	}
-	if atEOF && len(data) > 0 {
-		return len(data), nil, nil
-	}
-	return 0, nil, nil
 }
 
 func permanentLogStreamError(err error) bool {
@@ -341,28 +371,55 @@ func permanentLogStreamError(err error) bool {
 	return errors.As(err, &cliErr)
 }
 
-func settleScanner(ctx context.Context, scanner *bufio.Scanner) error {
-	result := make(chan error, 1)
-	go func() {
-		for scanner.Scan() {
-			// A readiness line was already found; drain briefly to let a
-			// terminal stream error that follows it become observable.
-		}
-		result <- scanner.Err()
-	}()
+func settleScanner(ctx context.Context, scanner *bufio.Scanner, stream io.ReadCloser) (error, bool) {
+	stop := make(chan struct{})
+	forced := make(chan struct{})
+	closerDone := make(chan struct{})
 	timer := time.NewTimer(5 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case err := <-result:
-		return err
-	case <-ctx.Done():
-		if err, ok := scannerErrorOnContextDone(result); ok {
-			return err
+	go func() {
+		defer close(closerDone)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			close(forced)
+			_ = stream.Close()
+		case <-ctx.Done():
+			close(forced)
+			_ = stream.Close()
+		case <-stop:
 		}
-		return ctx.Err()
-	case <-timer.C:
-		return nil
+	}()
+	for scanner.Scan() {
+		// Keep the scanner as the sole reader while the process either
+		// terminates, exposes a terminal error, or is closed after the
+		// bounded settle window.
 	}
+	err := scanner.Err()
+	close(stop)
+	<-closerDone
+	forcedClose := false
+	select {
+	case <-forced:
+		forcedClose = true
+	default:
+	}
+	if err == nil || errors.Is(err, io.EOF) {
+		return err, forcedClose
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return err, forcedClose
+	}
+	if !forcedClose {
+		return err, false
+	}
+	if status, ok := stream.(interface{ TerminalError() error }); ok {
+		terminalErr := status.TerminalError()
+		if errors.As(terminalErr, &cliErr) {
+			return terminalErr, true
+		}
+	}
+	return nil, true
 }
 
 func terminalLogStreamError(ctx context.Context, stream io.ReadCloser) error {

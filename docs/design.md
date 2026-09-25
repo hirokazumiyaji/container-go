@@ -242,10 +242,14 @@ provides:
   composition can also be bounded with `WithStartupTimeout` (or
   `context.WithTimeout` from the caller).
 
-Every strategy carries `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). If the container transitions to
-stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+Every leaf strategy carries `WithStartupTimeout` (default 60s) and
+`WithPollInterval` (default 100ms). For logs, the interval is the delay
+before reconnecting a stream that ends before the pattern is found.
+`ForAll` / `ForAny` can bound the composition with
+`WithStartupTimeout`. Invalid wait configuration and permanent target
+errors fail fast; if the container transitions to stopped while waiting,
+the wait also fails immediately (no timeout burn) and the error carries
+a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:
 

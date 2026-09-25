@@ -19,14 +19,21 @@ func ForAll(strategies ...Strategy) *AllStrategy {
 }
 
 // WithStartupTimeout bounds the total time spent waiting across all
-// strategies in the sequence. A non-positive d leaves the sequence
-// unbounded, relying on each strategy's own startup timeout.
+// strategies in the sequence. A zero d leaves the sequence unbounded,
+// relying on each strategy's own startup timeout. A negative d is
+// invalid.
 func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 	s.startupTimeout = d
 	return s
 }
 
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := validateDuration("startup timeout", s.startupTimeout); err != nil {
+		return err
+	}
+	if err := validateStrategies(s.strategies); err != nil {
+		return err
+	}
 	if s.startupTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.startupTimeout)
@@ -61,14 +68,20 @@ func ForAny(strategies ...Strategy) *AnyStrategy {
 }
 
 // WithStartupTimeout bounds the total time spent waiting for any
-// strategy to succeed. A non-positive d leaves the wait unbounded,
-// relying on each strategy's own startup timeout.
+// strategy to succeed. A zero d leaves the wait unbounded, relying on
+// each strategy's own startup timeout. A negative d is invalid.
 func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	s.startupTimeout = d
 	return s
 }
 
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := validateDuration("startup timeout", s.startupTimeout); err != nil {
+		return err
+	}
+	if err := validateStrategies(s.strategies); err != nil {
+		return err
+	}
 	if len(s.strategies) == 0 {
 		return nil
 	}

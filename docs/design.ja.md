@@ -166,8 +166,11 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
-すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+各待機戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
+ログでは、パターンを検出する前にログストリームが終了した場合の再接続間隔として `WithPollInterval` を使う。
+`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトも設定できる。
+不正な待機設定や恒久的な対象エラーは即座に失敗する。
+待機中にコンテナが停止状態へ遷移した場合もタイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
 
 戦略のインターフェースは次のとおり。
 

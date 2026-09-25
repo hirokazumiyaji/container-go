@@ -85,6 +85,9 @@ func TestForListeningPortTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("want timeout error")
 	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
 }
 
 func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {

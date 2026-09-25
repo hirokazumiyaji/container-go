@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
@@ -18,7 +19,7 @@ var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts.
-var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
+var ErrPortNotExposed = wait.ErrPortNotExposed
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
@@ -26,9 +27,9 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 var ErrImageNotFound = errors.New("image not found in local store")
 
 // ErrContainerNotFound reports that the container does not exist.
-// Inspect, State, Exec, and Logs wrap it with %w so callers can use
+// Inspect, State, Exec, Logs, and FollowLogs wrap it with %w so callers can use
 // errors.Is instead of matching CLI stderr text.
-var ErrContainerNotFound = errors.New("container not found")
+var ErrContainerNotFound = wait.ErrContainerNotFound
 
 // ErrGenerationReplaced reports that Terminate refused to delete because
 // the live container's creation label no longer matches this handle.

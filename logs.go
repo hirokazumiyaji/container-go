@@ -63,5 +63,6 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	return stream, wrapNotFound(err)
 }

@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -84,5 +85,26 @@ func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 	}
 	if _, err := ctr.Logs(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Logs error = %v, want ErrContainerNotFound", err)
+	}
+}
+
+type notFoundStreamRunner struct {
+	*fakeRunner
+	err error
+}
+
+func (r *notFoundStreamRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	return nil, r.err
+}
+
+func TestFollowLogsWrapsErrContainerNotFound(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	ctr.runner = &notFoundStreamRunner{
+		fakeRunner: f,
+		err:        &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 1, Stderr: `No such container: myctr`},
+	}
+	if _, err := ctr.FollowLogs(context.Background()); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("FollowLogs error = %v, want ErrContainerNotFound", err)
 	}
 }

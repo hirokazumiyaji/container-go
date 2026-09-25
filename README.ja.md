@@ -123,8 +123,11 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
-すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`
-(既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
+各待機戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持ちます。
+ログでは、パターンを検出する前にログストリームが終了した場合の再接続間隔として `WithPollInterval` を使います。
+`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定できます。
+不正な待機設定や恒久的な対象エラーは即座に失敗します。
+待機中にコンテナが停止した場合も即座に失敗します。
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
 ## クリーンアップの契約

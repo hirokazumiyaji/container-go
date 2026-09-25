@@ -3,7 +3,6 @@ package container
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -27,7 +26,7 @@ type waitTarget struct {
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
 		if len(t.c.exposed) == 0 {
-			return "", fmt.Errorf("no ports declared via WithExposedPorts")
+			return "", ErrPortNotExposed
 		}
 		port = t.c.exposed[0].String()
 	}

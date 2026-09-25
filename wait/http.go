@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -103,7 +104,37 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 	return s
 }
 
+func (s *HTTPStrategy) validate() error {
+	if err := s.options.validate(); err != nil {
+		return err
+	}
+	if err := validateTCPPortSpec(s.port, true); err != nil {
+		return err
+	}
+	if s.path != "" && !strings.HasPrefix(s.path, "/") {
+		return invalidConfigf("invalid HTTP path %q: path must start with /", s.path)
+	}
+	for i := 0; i < len(s.path); i++ {
+		if s.path[i] <= ' ' || s.path[i] == 0x7f {
+			return invalidConfigf("invalid HTTP path %q: path contains a control or space", s.path)
+		}
+	}
+	if _, err := http.NewRequestWithContext(context.Background(), s.method, "http://wait.invalid"+s.path, nil); err != nil {
+		return invalidConfigf("invalid HTTP method or path: %v", err)
+	}
+	for key, value := range s.headers {
+		if err := validateHTTPHeader(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+
 	matcher := s.statusMatcher
 	if matcher == nil {
 		matcher = func(status int) bool { return status >= 200 && status < 300 }
@@ -131,7 +162,7 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		}
 		req, err := http.NewRequestWithContext(ctx, s.method, scheme+"://"+endpoint+s.path, nil)
 		if err != nil {
-			return err
+			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
 		}
 		for k, v := range s.headers {
 			req.Header.Set(k, v)

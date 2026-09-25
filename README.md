@@ -134,10 +134,13 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
-Every strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back with a tail of its
-logs attached to the error.
+Every leaf strategy accepts `WithStartupTimeout` (default 60s) and
+`WithPollInterval` (default 100ms). For logs, the interval is the delay
+before reconnecting a stream that ends before the pattern is found.
+`ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition.
+Invalid wait configuration and permanent target errors fail fast;
+waiting also fails fast if the container stops, and a failed wait rolls
+the container back with a tail of its logs attached to the error.
 
 ## Image pulls
 

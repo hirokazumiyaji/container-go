@@ -11,13 +11,14 @@ import (
 // endpoint succeeds.
 type HostPortStrategy struct {
 	options
-	port string
+	port    string
+	portSet bool
 }
 
 // ForListeningPort waits for the given declared port ("6379/tcp" or
 // "6379") to accept TCP connections.
 func ForListeningPort(port string) *HostPortStrategy {
-	return &HostPortStrategy{port: port}
+	return &HostPortStrategy{port: port, portSet: true}
 }
 
 // ForExposedPort waits on the first port declared via
@@ -37,6 +38,13 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 }
 
 func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	if err := validateTCPPortSpec(s.port, !s.portSet); err != nil {
+		return err
+	}
+
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for listening port %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {

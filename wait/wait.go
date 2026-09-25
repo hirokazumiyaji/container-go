@@ -63,6 +63,9 @@ func (o options) effective() (timeout, interval time.Duration) {
 // container (ForExec) pass false and rely on the final classification
 // below.
 func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
+	if err := o.validate(); err != nil {
+		return err
+	}
 	timeout, interval := o.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -71,11 +74,8 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	var lastStateCheck time.Time
 	for {
 		if err := check(ctx); err != nil {
-			var fatal fatalCheckError
-			if errors.As(err, &fatal) {
-				// The check could not run at all; retrying cannot
-				// help, so surface the error right away.
-				return fmt.Errorf("%s: %w", what, fatal.err)
+			if isPermanentCheckError(err) {
+				return fmt.Errorf("%s: %w", what, permanentCause(err))
 			}
 			if ctx.Err() == nil {
 				lastErr = err
@@ -86,8 +86,12 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
-			if running, err := target.Running(ctx); err == nil && !running {
-				return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+			running, err := target.Running(ctx)
+			if isPermanentCheckError(err) {
+				return fmt.Errorf("%s: %w", what, permanentCause(err))
+			}
+			if err == nil && !running {
+				return pollFailure(what, "container stopped while waiting", lastErr)
 			}
 		}
 
@@ -103,22 +107,66 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
 				running, err := target.Running(probeCtx)
 				probeCancel()
+				if isPermanentCheckError(err) {
+					return fmt.Errorf("%s: %w", what, permanentCause(err))
+				}
 				if err == nil && !running {
-					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+					return pollFailure(what, "container stopped while waiting", lastErr)
 				}
 			}
 			if errors.Is(ctx.Err(), context.Canceled) {
 				return fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr)
 			}
-			return fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr)
+			return pollTimeout(what, timeout, lastErr)
 		case <-time.After(interval):
 		}
 	}
 }
 
+func permanentCause(err error) error {
+	var fatal fatalCheckError
+	if errors.As(err, &fatal) {
+		return fatal.err
+	}
+	var fatalPointer *fatalCheckError
+	if errors.As(err, &fatalPointer) && fatalPointer != nil {
+		return fatalPointer.err
+	}
+	return err
+}
+
+func pollFailure(what, status string, lastErr error) error {
+	if lastErr == nil {
+		return fmt.Errorf("%s: %s (last error: %v)", what, status, lastErr)
+	}
+	return fmt.Errorf("%s: %s (last error: %w)", what, status, lastErr)
+}
+
+type pollTimeoutError struct {
+	what    string
+	timeout time.Duration
+	lastErr error
+}
+
+func (e pollTimeoutError) Error() string {
+	return fmt.Sprintf("%s: timed out after %v (last error: %v)", e.what, e.timeout, e.lastErr)
+}
+
+func (e pollTimeoutError) Unwrap() []error {
+	if e.lastErr == nil {
+		return []error{context.DeadlineExceeded}
+	}
+	return []error{e.lastErr, context.DeadlineExceeded}
+}
+
+func pollTimeout(what string, timeout time.Duration, lastErr error) error {
+	return pollTimeoutError{what: what, timeout: timeout, lastErr: lastErr}
+}
+
 // fatalCheckError wraps a check error that must end the poll
-// immediately instead of being retried: the check could not run at all
-// (CLI launch failure, unknown container), so retrying cannot help.
+// immediately instead of being retried: the check cannot succeed as
+// configured (for example, a CLI launch failure, unknown container, or
+// invalid request), so retrying cannot help.
 type fatalCheckError struct{ err error }
 
 func (e fatalCheckError) Error() string { return e.err.Error() }

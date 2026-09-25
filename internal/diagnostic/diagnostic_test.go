@@ -181,6 +181,53 @@ func TestStreamRedactorBoundsOutputAndLargeValues(t *testing.T) {
 	}
 }
 
+func TestStreamRedactorRejectsValuesBeyondBoundedWindow(t *testing.T) {
+	secret := strings.Repeat("s", MaxStreamOverlap+1)
+	stream := NewContextRedactor(secret).NewStream(2 * MaxStreamOverlap)
+	if n, err := stream.Write([]byte("before" + secret + "after")); err == nil || n != 0 {
+		t.Fatalf("Write() = (%d, %v), want rejected oversized value", n, err)
+	}
+	if err := stream.Close(); err == nil {
+		t.Fatal("Close() = nil, want oversized value error")
+	}
+	if got := stream.String(); got != "" {
+		t.Fatalf("stream = %q, want no output for an unsafe configuration", got)
+	}
+}
+
+func TestStreamRedactorDropsOversizedMultilineStructuralValue(t *testing.T) {
+	first := "password=\"" + strings.Repeat("x", MaxStreamOverlap-32) + "\n"
+	second := strings.Repeat("x", streamChunkSize) + "\"\n"
+	stream := NewRedactor().NewStream(2 * MaxStreamOverlap)
+	if _, err := stream.Write([]byte(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte(second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := stream.String(); strings.Contains(got, strings.Repeat("x", 1024)) {
+		t.Fatalf("stream leaked an oversized multiline structural value: len=%d", len(got))
+	}
+}
+
+func TestStreamRedactorDropsOversizedStructuralLine(t *testing.T) {
+	secret := strings.Repeat("s", MaxStreamOverlap+streamChunkSize+1)
+	stream := NewRedactor().NewStream(2 * MaxStreamOverlap)
+	if n, err := stream.Write([]byte("password=\"" + secret + "\"\nvisible\n")); err != nil || n == 0 {
+		t.Fatalf("Write() = (%d, %v)", n, err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := stream.String()
+	if strings.Contains(got, secret) || strings.Contains(got, secret[:32]) || strings.Contains(got, secret[len(secret)-32:]) {
+		t.Fatalf("stream leaked an oversized structural value: len=%d", len(got))
+	}
+}
+
 func TestRedactTailIsBoundedAndPreservesReadError(t *testing.T) {
 	wantErr := errors.New("terminal read error")
 	input := &errorAfterReader{data: []byte(strings.Repeat("a", 4096)), err: wantErr}
@@ -190,6 +237,73 @@ func TestRedactTailIsBoundedAndPreservesReadError(t *testing.T) {
 	}
 	if len(got) > 64 || !strings.Contains(got, "a") {
 		t.Fatalf("tail = %q, want bounded terminal data", got)
+	}
+}
+
+func TestExplicitValuesRedactBeforeStructuralParsing(t *testing.T) {
+	tests := []struct {
+		name   string
+		secret string
+		text   string
+	}{
+		{
+			name:   "assignment delimiters",
+			secret: `semi;colon, space [bracket] "quoted"`,
+			text:   "password=semi;colon, space [bracket] \"quoted\"",
+		},
+		{
+			name:   "cookie form",
+			secret: "session=abc; theme=dark",
+			text:   "cookie session=abc; theme=dark",
+		},
+		{
+			name:   "public marker injection",
+			secret: "[REDACTED] forged suffix",
+			text:   "token=[REDACTED] forged suffix",
+		},
+		{
+			name:   "single quoted JSON",
+			secret: "single quoted, [value]",
+			text:   "{'password':'single quoted, [value]'}",
+		},
+		{
+			name:   "escaped single quoted JSON",
+			secret: "apostrophe's [value]",
+			text:   `{'password':'apostrophe\'s [value]'}`,
+		},
+		{
+			name:   "single quoted cookie JSON",
+			secret: "cookie-value with, [brackets]",
+			text:   "{'cookie':{'session':'cookie-value with, [brackets]'}}",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := NewContextRedactor(tc.secret).Text(tc.text)
+			if strings.Contains(got, tc.secret) {
+				t.Fatalf("Text() = %q, contains exact configured value %q", got, tc.secret)
+			}
+		})
+	}
+}
+
+func TestStructuralRedactionDoesNotTrustPublicRedactionMarker(t *testing.T) {
+	const injected = "token=[REDACTED]injected-secret"
+	got := NewRedactor().Text(injected)
+	if strings.Contains(got, "injected-secret") {
+		t.Fatalf("Text() = %q, trusted an input-provided public marker", got)
+	}
+	if !strings.Contains(got, Redacted) {
+		t.Fatalf("Text() = %q, want a redaction", got)
+	}
+}
+
+func TestRedactorHandlesSingleQuotedJSONAndCookieObjects(t *testing.T) {
+	const secret = "single-quoted-json-secret"
+	text := `{'password':'` + secret + `','cookie':{'session':'cookie {value} secret'}}`
+	got := NewRedactor().Text(text)
+	if strings.Contains(got, secret) || strings.Contains(got, "cookie {value} secret") {
+		t.Fatalf("Text() = %q, contains single-quoted JSON secret", got)
 	}
 }
 
@@ -213,7 +327,10 @@ func TestRedactorHandlesCookieMapsAndCompactTokens(t *testing.T) {
 }
 
 func TestRedactorDoesNotPartiallyMatchCompactTokens(t *testing.T) {
-	const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl"
+	const (
+		token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl"
+		jwe   = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTMjU2In0..aXY.Y2lwaGVy.dGFn"
+	)
 	for _, text := range []string{
 		"prefix " + token + " suffix",
 		"prefix " + token + ".",
@@ -226,12 +343,25 @@ func TestRedactorDoesNotPartiallyMatchCompactTokens(t *testing.T) {
 	}
 	for _, text := range []string{
 		"prefix" + token + "suffix",
-		"prefix." + token + ".suffix",
 		"foo.bar.baz",
 	} {
 		if got := NewRedactor().Text(text); got != text {
 			t.Fatalf("Text() = %q, want maximal dotted run preserved as %q", got, text)
 		}
+	}
+	if got, want := NewRedactor().Text("trace."+token+".suffix"), "trace."+Redacted+".suffix"; got != want {
+		t.Fatalf("Text() = %q, want embedded token redacted as %q", got, want)
+	}
+	if got, want := NewRedactor().Text("trace."+jwe+".suffix"), "trace."+Redacted+".suffix"; got != want {
+		t.Fatalf("Text() = %q, want embedded JWE redacted as %q", got, want)
+	}
+}
+
+func TestRedactJWTScansRepeatedDottedCandidatesOnce(t *testing.T) {
+	const candidates = 10000
+	input := strings.Repeat("eyJ.", candidates)
+	if got := NewRedactor().Text(input); got != input {
+		t.Fatalf("Text() changed %d invalid dotted candidates", candidates)
 	}
 }
 

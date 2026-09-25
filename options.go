@@ -195,7 +195,8 @@ func WithName(name string) Option {
 }
 
 // WithEnv adds environment variables. They are passed to the CLI via a
-// temporary env file so values never appear in the process table.
+// temporary env file so values never appear in the process table. Values whose
+// raw or escaped forms exceed the bounded diagnostic stream size are rejected.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range env {
@@ -204,6 +205,9 @@ func WithEnv(env map[string]string) Option {
 			}
 			if strings.ContainsAny(v, "\n\x00") {
 				return invalidOption("environment variable value", "must not contain newline or NUL")
+			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("environment variable value", "is too large to redact safely from streamed diagnostics")
 			}
 		}
 		for k, v := range env {

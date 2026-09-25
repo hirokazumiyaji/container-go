@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
 
 // execRunner extends fakeRunner with canned exec results.
@@ -155,6 +156,18 @@ func TestExecPassesOptionsAndEnvFile(t *testing.T) {
 	}
 	if len(f.envFiles) != 1 || !strings.Contains(f.envFiles[0], "TOKEN=xyz\n") {
 		t.Errorf("env-file captures = %q", f.envFiles)
+	}
+}
+
+func TestExecRejectsEnvValueBeyondStreamSafetyLimit(t *testing.T) {
+	secret := strings.Repeat("s", diagnostic.MaxStreamOverlap+1)
+	ctr := runTestContainer(t, &execRunner{fakeRunner: newTestRunner()})
+	_, _, err := ctr.Exec(context.Background(), []string{"true"}, WithExecEnv(map[string]string{"TOKEN": secret}))
+	if err == nil || !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("validation error echoes oversized value")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -122,6 +123,20 @@ func TestRunRejectsOptionValuesWithoutEchoingThem(t *testing.T) {
 				t.Fatalf("error = %T %v, want typed validation error", err, err)
 			}
 		})
+	}
+}
+
+func TestRunRejectsEnvValueBeyondStreamSafetyLimit(t *testing.T) {
+	secret := strings.Repeat("s", diagnostic.MaxStreamOverlap+1)
+	_, err := Run(context.Background(), "redis:7-alpine", WithEnv(map[string]string{"TOKEN": secret}), withRunner(newTestRunner()))
+	if err == nil {
+		t.Fatal("want validation error")
+	}
+	if strings.Contains(err.Error(), secret) {
+		t.Fatal("validation error echoes oversized value")
+	}
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
 	}
 }
 

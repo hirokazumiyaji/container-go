@@ -134,6 +134,14 @@ func TestDiagnosticValuesRegisterCookieComponentsAndEncodings(t *testing.T) {
 			t.Errorf("DiagnosticValues() = %v, missing %q", values, want)
 		}
 	}
+
+	const complex = `"semi; colon, [value]"`
+	complexValues := strings.Join(cookieDiagnosticValues("session="+complex+"; theme=dark"), "\x00")
+	for _, want := range []string{"semi; colon, [value]", "session=" + complex} {
+		if !strings.Contains(complexValues, want) {
+			t.Errorf("cookieDiagnosticValues() = %v, missing %q", complexValues, want)
+		}
+	}
 }
 
 func TestHTTPWaitErrorUsesHeaderAndBasicAuthContext(t *testing.T) {

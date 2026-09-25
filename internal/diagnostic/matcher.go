@@ -125,7 +125,7 @@ func longestHashMatch(s string, start int, entries []valueHash, force bool) int 
 	return matched
 }
 
-func replaceHashedValues(s string, hashes []valueHash, force bool) string {
+func replaceHashedValues(s string, hashes []valueHash, force bool, replacement string) string {
 	if len(hashes) == 0 || s == "" {
 		return s
 	}
@@ -142,11 +142,6 @@ func replaceHashedValues(s string, hashes []valueHash, force bool) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
-		if strings.HasPrefix(s[i:], Redacted) {
-			b.WriteString(Redacted)
-			i += len(Redacted)
-			continue
-		}
 		matched := longestHashMatch(s, i, byShort[shortPrefixAt(s, i)], force)
 		if len(s)-i >= 4 {
 			if n := longestHashMatch(s, i, byPrefix[valuePrefixAt(s, i)], force); n > matched {
@@ -154,7 +149,7 @@ func replaceHashedValues(s string, hashes []valueHash, force bool) string {
 			}
 		}
 		if matched > 0 {
-			b.WriteString(Redacted)
+			b.WriteString(replacement)
 			i += matched
 			continue
 		}

@@ -28,6 +28,24 @@ const (
 	minimumTokenLength = 4
 )
 
+func privateRedactionSentinel(s string) string {
+	longestRun := 0
+	for i := 0; i < len(s); {
+		if s[i] != 0 {
+			i++
+			continue
+		}
+		start := i
+		for i < len(s) && s[i] == 0 {
+			i++
+		}
+		if run := i - start; run > longestRun {
+			longestRun = run
+		}
+	}
+	return strings.Repeat("\x00", longestRun+1)
+}
+
 var (
 	// These expressions deliberately use ASCII name characters rather
 	// than \b: underscore is a word character in the secret names this
@@ -119,6 +137,25 @@ func usefulValue(value string) bool {
 	return true
 }
 
+func singleQuotedEscape(value string) string {
+	if !strings.ContainsAny(value, "\\'") {
+		return value
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '\\':
+			b.WriteString(`\\`)
+		case '\'':
+			b.WriteString(`\'`)
+		default:
+			b.WriteByte(value[i])
+		}
+	}
+	return b.String()
+}
+
 func (r *Redactor) expandedValues() []string {
 	seen := make(map[string]struct{}, len(r.source)*5)
 	values := make([]string, 0, len(r.source)*5)
@@ -136,6 +173,9 @@ func (r *Redactor) expandedValues() []string {
 		add(value)
 		if quoted := strconv.Quote(value); len(quoted) >= 2 {
 			add(quoted[1 : len(quoted)-1])
+		}
+		if quoted := singleQuotedEscape(value); quoted != value {
+			add(quoted)
 		}
 		if escaped := url.QueryEscape(value); escaped != value {
 			add(escaped)
@@ -226,28 +266,32 @@ func (r *Redactor) Text(s string) string {
 		r = NewRedactor()
 	}
 
-	// Do the structural passes before replacing explicitly supplied values.
-	// This lets a field name (for example, "password") remain useful while
-	// its value disappears, and also makes the result idempotent.
-	s = redactPEM(s)
-	s = redactCookieObjects(s)
-	s = redactHeaders(s)
-	s = redactJWT(s)
-	s = redactAuth(s)
-	s = redactQuotedAssignments(s)
-	s = redactFlags(s)
-	s = redactShortAttached(s)
-	s = redactUnquotedAssignments(s)
-	s = redactURLCredentials(s)
-	s = redactSecretShaped(s)
+	// Exact values must be replaced before structural parsing. A structural
+	// parser may otherwise truncate a value at a delimiter and leave a suffix
+	// that no longer matches the configured value. The private sentinel is
+	// selected outside the current input, so an input that imitates the public
+	// [REDACTED] marker cannot forge an internal placeholder.
+	sentinel := privateRedactionSentinel(s)
 	if len(r.hashes) > 0 {
-		s = replaceHashedValues(s, r.hashes, r.force)
+		s = replaceHashedValues(s, r.hashes, r.force, sentinel)
 	} else {
 		for _, value := range r.values {
-			s = replaceKnownValue(s, value, r.force)
+			s = replaceKnownValue(s, value, r.force, sentinel)
 		}
 	}
-	return Sanitize(s)
+
+	s = redactPEM(s, sentinel)
+	s = redactCookieObjects(s, sentinel)
+	s = redactHeaders(s, sentinel)
+	s = redactJWT(s, sentinel)
+	s = redactAuth(s, sentinel)
+	s = redactQuotedAssignments(s, sentinel)
+	s = redactFlags(s, sentinel)
+	s = redactShortAttached(s, sentinel)
+	s = redactUnquotedAssignments(s, sentinel)
+	s = redactURLCredentials(s, sentinel)
+	s = redactSecretShaped(s, sentinel)
+	return Sanitize(strings.ReplaceAll(s, sentinel, Redacted))
 }
 
 // Args returns a copy of args with sensitive flags, assignments, labels,
@@ -371,7 +415,7 @@ func attachedFlag(arg string) (flag, value string, ok bool) {
 	return "", "", false
 }
 
-func redactCookieObjects(s string) string {
+func redactCookieObjects(s, replacement string) string {
 	var b strings.Builder
 	last := 0
 	for i := 0; i < len(s); {
@@ -408,7 +452,7 @@ func redactCookieObjects(s string) string {
 			continue
 		}
 		b.WriteString(s[last : j+1])
-		b.WriteString(Redacted)
+		b.WriteString(replacement)
 		b.WriteByte('}')
 		last = end + 1
 		i = last
@@ -432,23 +476,23 @@ func isCookieKeyAt(s string, i int) bool {
 
 func matchingBrace(s string, start int) int {
 	depth := 0
-	quoted := false
+	var quote byte
 	escaped := false
 	for i := start; i < len(s); i++ {
 		c := s[i]
-		if quoted {
+		if quote != 0 {
 			if escaped {
 				escaped = false
 			} else if c == '\\' {
 				escaped = true
-			} else if c == '"' {
-				quoted = false
+			} else if c == quote {
+				quote = 0
 			}
 			continue
 		}
 		switch c {
-		case '"':
-			quoted = true
+		case '"', '\'':
+			quote = c
 		case '{':
 			depth++
 		case '}':
@@ -461,18 +505,18 @@ func matchingBrace(s string, start int) int {
 	return -1
 }
 
-func redactPEM(s string) string {
-	return pemRE.ReplaceAllString(s, Redacted)
+func redactPEM(s, replacement string) string {
+	return pemRE.ReplaceAllString(s, replacement)
 }
 
-func redactHeaders(s string) string {
+func redactHeaders(s, replacement string) string {
 	redact := func(re *regexp.Regexp) string {
 		return re.ReplaceAllStringFunc(s, func(match string) string {
 			parts := re.FindStringSubmatch(match)
 			if len(parts) != 4 || !isSecretHeader(parts[2]) || strings.TrimSpace(parts[3]) == "" {
 				return match
 			}
-			return parts[1] + parts[2] + Redacted
+			return parts[1] + parts[2] + replacement
 		})
 	}
 	s = redact(headerBlockRE)
@@ -481,79 +525,79 @@ func redactHeaders(s string) string {
 		if len(parts) != 4 || !isSecretHeader(parts[2]) || strings.TrimSpace(parts[3]) == "" {
 			return match
 		}
-		return parts[1] + parts[2] + Redacted
+		return parts[1] + parts[2] + replacement
 	})
 }
 
-func redactAuth(s string) string {
+func redactAuth(s, replacement string) string {
 	return basicRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := basicRE.FindStringSubmatch(match)
 		if len(parts) != 5 || len(parts[4]) < minimumTokenLength {
 			return match
 		}
-		return parts[1] + parts[2] + parts[3] + Redacted
+		return parts[1] + parts[2] + parts[3] + replacement
 	})
 }
 
-func redactQuotedAssignments(s string) string {
+func redactQuotedAssignments(s, replacement string) string {
 	s = doubleQuotedRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := doubleQuotedRE.FindStringSubmatch(match)
-		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == Redacted {
+		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == replacement {
 			return match
 		}
-		return parts[1] + Redacted + parts[3]
+		return parts[1] + replacement + parts[3]
 	})
 	s = singleQuotedRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := singleQuotedRE.FindStringSubmatch(match)
-		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == Redacted {
+		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == replacement {
 			return match
 		}
-		return parts[1] + Redacted + parts[3]
+		return parts[1] + replacement + parts[3]
 	})
 	s = doubleValueRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := doubleValueRE.FindStringSubmatch(match)
-		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == Redacted {
+		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == replacement {
 			return match
 		}
-		return parts[1] + `"` + Redacted + parts[3]
+		return parts[1] + `"` + replacement + parts[3]
 	})
 	return singleValueRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := singleValueRE.FindStringSubmatch(match)
-		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == Redacted {
+		if len(parts) != 4 || !nameFromAssignment(parts[1]) || parts[2] == "" || parts[2] == replacement {
 			return match
 		}
-		return parts[1] + `'` + Redacted + parts[3]
+		return parts[1] + `'` + replacement + parts[3]
 	})
 }
 
-func redactShortAttached(s string) string {
+func redactShortAttached(s, replacement string) string {
 	s = shortAttachedRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := shortAttachedRE.FindStringSubmatch(match)
 		if len(parts) != 4 || parts[3] == "" {
 			return match
 		}
-		return parts[1] + parts[2] + Redacted
+		return parts[1] + parts[2] + replacement
 	})
 	return shortSeparateRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := shortSeparateRE.FindStringSubmatch(match)
 		if len(parts) != 4 || parts[3] == "" {
 			return match
 		}
-		return parts[1] + parts[2] + parts[3] + Redacted
+		return parts[1] + parts[2] + parts[3] + replacement
 	})
 }
 
-func redactFlags(s string) string {
+func redactFlags(s, replacement string) string {
 	return flagValueRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := flagValueRE.FindStringSubmatch(match)
 		if len(parts) != 4 || !isSensitiveFlag(strings.TrimSpace(parts[2])) && !isOpaqueFlag(strings.TrimSpace(parts[2])) {
 			return match
 		}
-		return parts[1] + parts[2] + Redacted
+		return parts[1] + parts[2] + replacement
 	})
 }
 
-func redactUnquotedAssignments(s string) string {
+func redactUnquotedAssignments(s, replacement string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	last := 0
@@ -582,10 +626,6 @@ func redactUnquotedAssignments(s string) string {
 		if valueStart >= len(s) || s[valueStart] == '\r' || s[valueStart] == '\n' || s[valueStart] == '"' || s[valueStart] == '\'' {
 			continue
 		}
-		if strings.HasPrefix(s[valueStart:], Redacted) {
-			i = valueStart + len(Redacted)
-			continue
-		}
 		valueEnd := valueStart
 		for valueEnd < len(s) {
 			c := s[valueEnd]
@@ -597,12 +637,12 @@ func redactUnquotedAssignments(s string) string {
 		if valueEnd == valueStart {
 			continue
 		}
-		if (isSecretName(name) || isOpaqueName(name)) && s[valueStart:valueEnd] != Redacted {
+		if (isSecretName(name) || isOpaqueName(name)) && s[valueStart:valueEnd] != replacement {
 			if isSecretName(name) {
 				valueEnd = extendMultilineSecret(s, valueEnd)
 			}
 			b.WriteString(s[last:valueStart])
-			b.WriteString(Redacted)
+			b.WriteString(replacement)
 			last = valueEnd
 			i = valueEnd
 			continue
@@ -664,9 +704,10 @@ func isNameByte(c byte) bool {
 }
 
 // redactJWT replaces complete compact JWS/JWE tokens. It scans maximal
-// base64url/dot runs instead of matching an eyJ prefix, so a valid token is
-// never partially matched and an arbitrary dotted word is not overmatched.
-func redactJWT(s string) string {
+// base64url/dot runs and validates a candidate when its segment window closes,
+// so a valid token is recognized inside dotted compound text without decoding
+// every dotted prefix.
+func redactJWT(s, replacement string) string {
 	var b strings.Builder
 	b.Grow(len(s))
 	for i := 0; i < len(s); {
@@ -679,15 +720,7 @@ func redactJWT(s string) string {
 		for i < len(s) && isCompactTokenByte(s[i]) {
 			i++
 		}
-		token := s[start:i]
-		if isCompactJWSOrJWE(token) {
-			b.WriteString(Redacted)
-		} else if cut, ok := compactTokenBeforeTrailingDots(token); ok {
-			b.WriteString(Redacted)
-			b.WriteString(token[cut:])
-		} else {
-			b.WriteString(token)
-		}
+		b.WriteString(redactCompactRun(s[start:i], replacement))
 	}
 	return b.String()
 }
@@ -701,50 +734,97 @@ func isBase64URLByte(c byte) bool {
 		(c >= '0' && c <= '9') || c == '_' || c == '-'
 }
 
-func compactTokenBeforeTrailingDots(token string) (int, bool) {
-	for cut := len(token) - 1; cut > 0; cut-- {
-		if token[cut] != '.' {
-			continue
-		}
-		if isCompactJWSOrJWE(token[:cut]) {
-			return cut, true
-		}
-	}
-	return 0, false
+type compactHeaderKind uint8
+
+const (
+	compactHeaderInvalid compactHeaderKind = iota
+	compactHeaderJWS
+	compactHeaderJWE
+)
+
+type compactSegment struct {
+	start int
+	end   int
+	kind  compactHeaderKind
 }
 
-func isCompactJWSOrJWE(token string) bool {
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 && len(parts) != 5 {
+func redactCompactRun(run, replacement string) string {
+	var b strings.Builder
+	b.Grow(len(run))
+	var window [5]compactSegment
+	windowLen := 0
+	cursor := 0
+	for start := 0; start < len(run); {
+		end := start
+		for end < len(run) && isCompactTokenByte(run[end]) && run[end] != '.' {
+			end++
+		}
+		segment := compactSegment{start: start, end: end}
+		if end-start >= 3 && run[start:start+3] == "eyJ" {
+			if header, ok := decodeCompactJSON(run[start:end]); ok {
+				_, hasAlg := header["alg"]
+				_, hasEnc := header["enc"]
+				switch {
+				case hasAlg && hasEnc:
+					segment.kind = compactHeaderJWE
+				case hasAlg:
+					segment.kind = compactHeaderJWS
+				}
+			}
+		}
+		if windowLen < len(window) {
+			window[windowLen] = segment
+			windowLen++
+		} else {
+			copy(window[:len(window)-1], window[1:])
+			window[len(window)-1] = segment
+		}
+
+		if windowLen >= 3 {
+			startIndex := windowLen - 3
+			if window[startIndex].kind == compactHeaderJWS && compactSegmentsValid(window[startIndex:windowLen], compactHeaderJWS) {
+				b.WriteString(run[cursor:window[startIndex].start])
+				b.WriteString(replacement)
+				cursor = window[windowLen-1].end
+				windowLen = 0
+			}
+		}
+		if windowLen >= 5 {
+			startIndex := windowLen - 5
+			if window[startIndex].kind == compactHeaderJWE && compactSegmentsValid(window[startIndex:windowLen], compactHeaderJWE) {
+				b.WriteString(run[cursor:window[startIndex].start])
+				b.WriteString(replacement)
+				cursor = window[windowLen-1].end
+				windowLen = 0
+			}
+		}
+
+		if end == len(run) {
+			break
+		}
+		start = end + 1
+	}
+	b.WriteString(run[cursor:])
+	return b.String()
+}
+
+func compactSegmentsValid(segments []compactSegment, kind compactHeaderKind) bool {
+	if len(segments) == 0 || segments[0].end-segments[0].start == 0 {
 		return false
 	}
-	for i, part := range parts {
-		if part == "" {
-			// A JWS may have an empty payload or an unsecured empty
-			// signature. A JWE may have an empty encrypted-key segment;
-			// all of its other segments are required to be present.
-			if (len(parts) == 3 && i != 1 && i != 2) || (len(parts) == 5 && i != 1) {
-				return false
-			}
-			continue
-		}
-		for i := 0; i < len(part); i++ {
-			if !isBase64URLByte(part[i]) {
+	for i, segment := range segments {
+		empty := segment.start == segment.end
+		if empty {
+			if kind == compactHeaderJWS {
+				if i == 0 {
+					return false
+				}
+			} else if i != 1 {
 				return false
 			}
 		}
 	}
-	header, ok := decodeCompactJSON(parts[0])
-	if !ok {
-		return false
-	}
-	if len(parts) == 3 {
-		_, ok = header["alg"]
-		return ok
-	}
-	_, hasAlg := header["alg"]
-	_, hasEnc := header["enc"]
-	return hasAlg && hasEnc
+	return true
 }
 
 func decodeCompactJSON(segment string) (map[string]any, bool) {
@@ -765,7 +845,7 @@ func decodeCompactJSON(segment string) (map[string]any, bool) {
 	return header, true
 }
 
-func redactURLCredentials(s string) string {
+func redactURLCredentials(s, replacement string) string {
 	return urlCredentialRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := urlCredentialRE.FindStringSubmatch(match)
 		if len(parts) != 4 {
@@ -778,11 +858,11 @@ func redactURLCredentials(s string) string {
 		}
 		// An empty username is valid URL syntax and still carries a
 		// password, so do not require a non-empty user component.
-		return parts[1] + userinfo[:colon] + ":" + Redacted + parts[3]
+		return parts[1] + userinfo[:colon] + ":" + replacement + parts[3]
 	})
 }
 
-func redactSecretShaped(s string) string {
+func redactSecretShaped(s, replacement string) string {
 	return secretShapedRE.ReplaceAllStringFunc(s, func(match string) string {
 		parts := secretShapedRE.FindStringSubmatch(match)
 		if len(parts) != 3 {
@@ -805,7 +885,7 @@ func redactSecretShaped(s string) string {
 		if len(value) < minimumTokenLength || (len(value) < 10 && !strings.ContainsAny(value, "-_.")) {
 			return match
 		}
-		return parts[1] + Redacted + parts[2]
+		return parts[1] + replacement + parts[2]
 	})
 }
 
@@ -888,7 +968,7 @@ func redactLabel(value string) string {
 	return key + "=" + Redacted
 }
 
-func replaceKnownValue(s, value string, force bool) string {
+func replaceKnownValue(s, value string, force bool, replacement string) string {
 	if !usefulValue(value) || value == Redacted || (!force && len(value) < minimumTokenLength) {
 		return s
 	}
@@ -902,19 +982,11 @@ func replaceKnownValue(s, value string, force bool) string {
 		}
 		i += start
 		end := i + len(value)
-		if marker := strings.Index(s[start:], Redacted); marker >= 0 {
-			marker += start
-			if i < marker+len(Redacted) && end > marker {
-				b.WriteString(s[start : marker+len(Redacted)])
-				start = marker + len(Redacted)
-				continue
-			}
-		}
 		boundarySafe := (!wordByte(value[0]) || i == 0 || !wordByte(s[i-1])) &&
 			(!wordByte(value[len(value)-1]) || end == len(s) || !wordByte(s[end]))
 		if force || boundarySafe {
 			b.WriteString(s[start:i])
-			b.WriteString(Redacted)
+			b.WriteString(replacement)
 			start = end
 		} else {
 			b.WriteString(s[start : i+1])

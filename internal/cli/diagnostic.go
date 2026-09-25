@@ -12,6 +12,12 @@ import (
 // addition to the structural redaction applied to every CLIError.
 type Redactor = diagnostic.Redactor
 
+const MaxStreamOverlap = diagnostic.MaxStreamOverlap
+
+// StreamValueFits reports whether a value and its common escaped forms can be
+// protected by a bounded streaming redactor.
+func StreamValueFits(value string) bool { return diagnostic.StreamValueFits(value) }
+
 // NewRedactor creates a boundary-aware redactor for values supplied by a
 // caller.
 func NewRedactor(values ...string) *Redactor {

@@ -20,13 +20,17 @@ type execConfig struct {
 	workdir string
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. Values whose raw or escaped forms exceed the bounded
+// diagnostic stream size are rejected.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
 				return invalidOption("exec environment variable", "name and value contain an invalid character")
+			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("exec environment variable", "value is too large to redact safely from streamed diagnostics")
 			}
 		}
 		for k, v := range env {

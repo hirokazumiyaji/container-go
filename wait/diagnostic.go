@@ -119,14 +119,15 @@ func cookieDiagnosticValues(value string) []string {
 			add(base64.URLEncoding.EncodeToString([]byte(v)))
 		}
 	}
-	for _, part := range strings.Split(value, ";") {
+	for _, part := range splitCookieParts(value) {
 		part = strings.TrimSpace(part)
 		if part == "" {
 			continue
 		}
-		name, cookieValue, ok := strings.Cut(part, "=")
+		name, rawCookieValue, ok := strings.Cut(part, "=")
 		name = strings.TrimSpace(name)
-		cookieValue = strings.Trim(strings.TrimSpace(cookieValue), "\"")
+		rawCookieValue = strings.TrimSpace(rawCookieValue)
+		cookieValue := unquoteCookieValue(rawCookieValue)
 		if !ok {
 			addEncoded(name)
 			continue
@@ -134,6 +135,55 @@ func cookieDiagnosticValues(value string) []string {
 		addEncoded(name)
 		addEncoded(cookieValue)
 		addEncoded(name + "=" + cookieValue)
+		addEncoded(name + "=" + rawCookieValue)
 	}
 	return values
+}
+
+func splitCookieParts(value string) []string {
+	var parts []string
+	start := 0
+	var quote byte
+	escaped := false
+	for i := 0; i < len(value); i++ {
+		c := value[i]
+		if quote != 0 {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case ';', ',':
+			parts = append(parts, value[start:i])
+			start = i + 1
+		}
+	}
+	return append(parts, value[start:])
+}
+
+func unquoteCookieValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) < 2 || (value[0] != '"' && value[0] != '\'') || value[len(value)-1] != value[0] {
+		return value
+	}
+	inner := value[1 : len(value)-1]
+	if !strings.Contains(inner, `\`) {
+		return inner
+	}
+	var b strings.Builder
+	b.Grow(len(inner))
+	for i := 0; i < len(inner); i++ {
+		if inner[i] == '\\' && i+1 < len(inner) {
+			i++
+		}
+		b.WriteByte(inner[i])
+	}
+	return b.String()
 }

@@ -33,8 +33,9 @@ func TestLogTailContainsTrailingMarker(t *testing.T) {
 	big := strings.Repeat("A", 2*1024*1024) + "LATEST_FATAL_MARKER"
 	base := newTestRunner()
 	base.imagePresent = true
+	base.creations = map[string]string{"myctr": "aaaaaaaaaaaaaaaa"}
 	tr := &tailRunner{fakeRunner: base, logData: big}
-	ctr := &Container{id: "myctr", runner: tr, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", runner: tr, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	tail := ctr.logTail(context.Background())
 	if !strings.Contains(tail, "LATEST_FATAL_MARKER") {
 		t.Fatalf("tail missing marker, len=%d", len(tail))

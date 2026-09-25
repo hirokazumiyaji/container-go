@@ -105,7 +105,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		// Docker's detached run output is a full immutable ID. Apple
+		// ignores this value and continues to address the container by
+		// its generated name.
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {

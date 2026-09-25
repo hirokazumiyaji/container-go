@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -167,7 +168,10 @@ type dockerInspect struct {
 	ID       string `json:"Id"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
-	State    struct {
+	// Image is Docker's top-level immutable image ID. Config.Image is
+	// the user-facing reference and may be a mutable tag.
+	ImageID string `json:"Image"`
+	State   struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -194,13 +198,37 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	if len(containers) == 0 {
 		return nil, fmt.Errorf("container %s not in inspect output", id)
 	}
-	c := containers[0]
+
+	// `docker inspect name` can return more than one object, and an
+	// immutable-ID target must never be satisfied by whichever object
+	// happens to be first in the response. Match the exact target first;
+	// names are only accepted when the target is not a full Docker ID.
+	match := -1
+	for i, candidate := range containers {
+		if candidate.ID != "" && candidate.ID == id {
+			match = i
+			break
+		}
+	}
+	if match < 0 && !dockerIDRE.MatchString(id) {
+		for i, candidate := range containers {
+			if strings.TrimPrefix(candidate.Name, "/") == id {
+				match = i
+				break
+			}
+		}
+	}
+	if match < 0 {
+		return nil, fmt.Errorf("container %s not in inspect output", id)
+	}
+	c := containers[match]
 
 	info := &engineInfo{
 		state:    dockerState(c.State.Status),
 		labels:   c.Config.Labels,
 		uid:      c.ID,
 		image:    c.Config.Image,
+		imageID:  c.ImageID,
 		platform: c.Platform,
 		ip:       c.NetworkSettings.IPAddress,
 	}
@@ -231,6 +259,56 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 	}
 	return info, nil
+}
+
+// dockerImageInspect is the subset of `docker image inspect` needed to
+// recover the complete OCI platform. Docker container inspect's
+// top-level Platform is only an OS on current Engine releases.
+type dockerImageInspect struct {
+	ID           string `json:"Id"`
+	OS           string `json:"Os"`
+	Architecture string `json:"Architecture"`
+	Variant      string `json:"Variant"`
+}
+
+// resolvePlatform fills an OS-only container platform from the image
+// actually used by the container. The image ID is preferred over the
+// mutable Config.Image tag so a tag update cannot change the identity
+// observed for an already-running container.
+func (dockerEngine) resolvePlatform(ctx context.Context, r cli.Runner, info *engineInfo, requested string) (string, error) {
+	if info == nil {
+		return "", fmt.Errorf("container image identity is missing")
+	}
+	if !platformNeedsResolution(requested, info.platform) {
+		return info.platform, nil
+	}
+	if !validDockerImageID(info.imageID) {
+		return "", fmt.Errorf("container image identity is missing or not immutable")
+	}
+	ref := info.imageID
+	stdout, _, err := r.Run(ctx, "image", "inspect", ref)
+	if err != nil {
+		return "", fmt.Errorf("inspect image %q platform: %w", ref, err)
+	}
+	var images []dockerImageInspect
+	if err := json.Unmarshal(stdout, &images); err != nil {
+		return "", fmt.Errorf("decode docker image inspect output: %w", err)
+	}
+	var image *dockerImageInspect
+	for i := range images {
+		if images[i].ID == ref {
+			image = &images[i]
+			break
+		}
+	}
+	if image == nil {
+		return "", fmt.Errorf("docker image inspect returned no image for immutable ID %q", ref)
+	}
+	full := formatInspectPlatform(image.OS, image.Architecture, image.Variant)
+	if full == "" {
+		return "", fmt.Errorf("docker image inspect returned no OCI platform for %q", ref)
+	}
+	return full, nil
 }
 
 // dockerState maps Docker's status vocabulary onto State.

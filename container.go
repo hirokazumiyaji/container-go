@@ -96,9 +96,23 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// requestedPlatform is retained so identity-checked inspects can
+	// resolve Docker's OS-only top-level Platform field to a complete OCI
+	// platform when the caller explicitly selected one.
+	requestedPlatform string
+	// bootstrap permits a just-created handle to resolve a missing Docker
+	// UID from a generation-verified inspect. It is never enabled on a
+	// handle returned by WithReuse.
+	bootstrap bool
+	// identityOptional is used only for short-lived name lookups before a
+	// reuse/cleanup caller has established which generation it owns.
+	identityOptional bool
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	// inspectMu protects uid and serializes target-bound inspects. The
+	// identity cache is protected separately by mu.
+	inspectMu sync.RWMutex
+	mu        sync.Mutex
+	info      *engineInfo // immutable identity snapshot
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -165,26 +179,34 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, classified
 	}
 
+	uid := cfg.eng.parseRunID(stdout)
+	if cfg.eng.name() == "docker" && !validDockerUID(uid) {
+		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
+		cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
+		return nil, identityErr
+	}
 	c := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:                cfg.name,
+		runner:            cfg.runner,
+		eng:               cfg.eng,
+		exposed:           cfg.exposed,
+		published:         cfg.published,
+		creation:          cfg.creation,
+		uid:               uid,
+		requestedPlatform: cfg.platform,
 	}
 	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
+	// test runner there is nothing external to clean up. Docker must be
+	// registered by its immutable UID; Apple is registered by a valid
+	// generation because it has no immutable target.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
 		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
-		} else {
+		if cfg.eng.name() == "docker" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
+		} else if validCreationGeneration(cfg.creation) {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
 	}
@@ -245,14 +267,27 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
+	if !validCreationGeneration(cfg.creation) {
+		return
+	}
+	actual, ok := info.labels[creationLabel]
+	if !ok || !validCreationGeneration(actual) || actual != cfg.creation {
+		return
+	}
+	var target string
+	switch cfg.eng.name() {
+	case "docker":
+		if !validDockerUID(info.uid) {
 			return
 		}
-	}
-	target := cfg.name
-	if info.uid != "" {
 		target = info.uid
+	case "apple":
+		if info.uid != "" {
+			return
+		}
+		target = cfg.name
+	default:
+		return
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
@@ -278,8 +313,108 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 	return path, dir, nil
 }
 
-// ID returns the container ID (identical to its name).
+// ID returns the logical container name. Docker also has an immutable
+// backend ID, but changing the public result would break callers that
+// use the name for display and diagnostics.
 func (c *Container) ID() string { return c.id }
+
+// operationTarget returns the strongest backend target currently bound
+// to this handle. Apple uses its name only after generation verification;
+// a missing or malformed Docker UID returns an empty string rather than
+// falling back to a name.
+func (c *Container) operationTarget() string {
+	c.inspectMu.RLock()
+	uid := c.uid
+	c.inspectMu.RUnlock()
+	if validDockerUID(uid) {
+		return uid
+	}
+	if c.eng.name() == "apple" {
+		c.inspectMu.RLock()
+		valid := validCreationGeneration(c.creation)
+		c.inspectMu.RUnlock()
+		if valid {
+			return c.id
+		}
+	}
+	return ""
+}
+
+// targetForInspect returns the target to inspect. A just-created handle
+// may use its name once to discover a Docker UID, but only while its
+// valid generation label can bind the result. Returned reuse handles do
+// not get that bootstrap exception.
+func (c *Container) targetForInspect() (string, error) {
+	if c.identityOptional {
+		return c.id, nil
+	}
+	c.inspectMu.RLock()
+	uid := c.uid
+	creation := c.creation
+	bootstrap := c.bootstrap
+	c.inspectMu.RUnlock()
+	switch c.eng.name() {
+	case "docker":
+		if validDockerUID(uid) {
+			return uid, nil
+		}
+		if bootstrap && validCreationGeneration(creation) {
+			return c.id, nil
+		}
+		return "", generationReplaced(c.id)
+	case "apple":
+		if uid != "" {
+			return "", generationReplaced(c.id)
+		}
+		if !validCreationGeneration(creation) {
+			return "", generationReplaced(c.id)
+		}
+		return c.id, nil
+	default:
+		return "", errIdentity("unknown backend cannot inspect a container identity")
+	}
+}
+
+// verifiedOperationTarget closes the name-addressed operation race for
+// Apple handles. Docker operations use a validated immutable UID. For
+// Apple, the generation check and the operation are serialized by the
+// cooperating-process name lock; an external CLI remains outside that
+// coordination, so every use of a returned name still checks the
+// generation again.
+func (c *Container) verifiedOperationTarget(ctx context.Context) (string, func(), error) {
+	noop := func() {}
+	if c.identityOptional {
+		return "", noop, generationReplaced(c.id)
+	}
+	c.inspectMu.RLock()
+	uid := c.uid
+	creation := c.creation
+	c.inspectMu.RUnlock()
+	if c.eng.name() == "docker" {
+		if !validDockerUID(uid) {
+			return "", noop, generationReplaced(c.id)
+		}
+		return uid, noop, nil
+	}
+	if c.eng.name() != "apple" {
+		return "", noop, errIdentity("unknown backend cannot address a container")
+	}
+	if !validCreationGeneration(creation) {
+		return "", noop, generationReplaced(c.id)
+	}
+	unlock, err := lockName(ctx, c.id)
+	if err != nil {
+		return "", noop, fmt.Errorf("lock name: %w", err)
+	}
+	_, err = c.inspectFreshLocked(ctx)
+	if err != nil {
+		unlock()
+		// inspectFreshLocked already joins the replacement sentinel
+		// with a missing reused target; do not duplicate its text.
+		return "", noop, err
+	}
+	return c.id, unlock, nil
+}
 
 func (c *Container) classify(ctx context.Context, err error) error {
 	return cli.Classify(ctx, c.runner, err, c.eng.probe())
@@ -297,9 +432,14 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	target, unlock, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
 	return c.classify(ctx, err)
 }
 
@@ -314,32 +454,64 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	c.inspectMu.RLock()
+	uid := c.uid
+	creation := c.creation
+	bootstrap := c.bootstrap
+	c.inspectMu.RUnlock()
+	if c.eng.name() == "docker" {
+		if validDockerUID(uid) {
+			return c.delete(ctx, uid)
+		}
+		// A just-created handle may resolve a missing run ID once, but
+		// only through a generation-verified inspect. Never fall back to
+		// the name for a returned or reused handle.
+		if !bootstrap || !validCreationGeneration(creation) {
+			return fmt.Errorf("terminate %s: %w: handle has no valid immutable ID", c.id, ErrGenerationReplaced)
+		}
+		unlock, err := lockName(ctx, c.id)
+		if err != nil {
+			return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		}
+		defer unlock()
+		if _, err := c.inspectFreshLocked(ctx); err != nil {
+			if isNotFound(err) {
+				return nil
+			}
+			return fmt.Errorf("terminate %s: verify immutable ID: %w", c.id, err)
+		}
+		c.inspectMu.RLock()
+		uid = c.uid
+		c.inspectMu.RUnlock()
+		if !validDockerUID(uid) {
+			return fmt.Errorf("terminate %s: %w: inspect returned no valid immutable ID", c.id, ErrGenerationReplaced)
+		}
+		return c.delete(ctx, uid)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if c.eng.name() != "apple" {
+		return errIdentity("unknown backend cannot terminate a container")
+	}
+	// A name-addressed handle without a valid generation cannot prove
+	// that it still owns the name. Never turn an invalid identity into an
+	// unconditional delete.
+	if !validCreationGeneration(creation) {
+		return fmt.Errorf("terminate %s: %w: handle has no valid creation generation", c.id, ErrGenerationReplaced)
 	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
 		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
-	info, err := c.inspectFresh(ctx)
+	_, err = c.inspectFreshLocked(ctx)
 	if isNotFound(err) {
 		return nil
 	}
 	if err != nil {
 		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
-	}
+	// The locked, identity-bound inspect has already rejected a missing,
+	// malformed, or different Apple generation. The only safe target is
+	// the name under this lock.
 	return c.delete(ctx, c.id)
 }
 
@@ -357,12 +529,16 @@ func (c *Container) delete(ctx context.Context, target string) error {
 // network. With the Docker backend on Docker Desktop this address is
 // usually not reachable from the host; prefer Endpoint.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
-	info, err := c.cachedInfo(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", err
 	}
+	return ipFromInfo(c.id, info)
+}
+
+func ipFromInfo(id string, info *engineInfo) (string, error) {
 	if info.ip == "" {
-		return "", fmt.Errorf("container %s has no reported IP address", c.id)
+		return "", fmt.Errorf("container %s has no reported IP address", id)
 	}
 	return info.ip, nil
 }
@@ -372,6 +548,13 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
+	// Resolve against a fresh identity-checked inspect even for an
+	// explicitly published address. This prevents a stale handle from
+	// silently returning an endpoint for a replacement.
+	info, err := c.inspectDynamic(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(c.published) > 0 {
 		addr := c.published[0].connectAddr()
 		if !c.eng.directIP() {
@@ -380,7 +563,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		return addr, nil
 	}
 	if c.eng.directIP() {
-		return c.ContainerIP(ctx)
+		return ipFromInfo(c.id, info)
 	}
 	return c.eng.defaultHost(), nil
 }
@@ -407,30 +590,40 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
+	var published *publishSpec
+	for i := range c.published {
+		p := &c.published[i]
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+			published = p
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
+
+	// Always inspect once before returning an endpoint. Explicit
+	// published bindings still need an identity check; otherwise a stale
+	// handle could advertise the replacement's address.
+	info, err := c.inspectDynamic(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	if published != nil {
+		addr := published.connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, published.hostPort, nil
+	}
 	if c.eng.directIP() {
-		ip, err := c.ContainerIP(ctx)
+		ip, err := ipFromInfo(c.id, info)
 		if err != nil {
 			return "", 0, err
 		}
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.cachedInfo(ctx)
-	if err != nil {
-		return "", 0, err
-	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
 			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
@@ -439,36 +632,133 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns the first successful inspect result. Callers that
+// need current state, addresses, or bindings use inspectDynamic.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	cached := c.info
+	c.mu.Unlock()
+	if cached != nil {
+		if err := c.bindInspectInfo(cached); err != nil {
+			return nil, err
+		}
+		return cached, nil
 	}
-	info, err := c.inspectFresh(ctx)
+	return c.inspectFresh(ctx)
+}
+
+// inspectDynamic reads current state and verifies the immutable identity
+// of the target before returning it.
+func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
+	return c.inspectFresh(ctx)
+}
+
+// bindInspectInfo validates the identity represented by info and records
+// an immutable snapshot. It is deliberately strict for reused handles:
+// missing or malformed generation/UID values are replacement errors.
+func (c *Container) bindInspectInfo(info *engineInfo) error {
+	if info == nil {
+		return withGenerationReplaced(c.id, errIdentity("empty inspect result"))
+	}
+	c.inspectMu.RLock()
+	uid := c.uid
+	creation := c.creation
+	bootstrap := c.bootstrap
+	c.inspectMu.RUnlock()
+
+	switch c.eng.name() {
+	case "docker":
+		if !validDockerUID(info.uid) {
+			return withGenerationReplaced(c.id, errIdentity("Docker inspect returned no valid immutable container ID"))
+		}
+		if uid != "" {
+			if !validDockerUID(uid) || info.uid != uid {
+				return generationReplaced(c.id)
+			}
+		} else if !bootstrap || !validCreationGeneration(creation) ||
+			info.labels[creationLabel] != creation {
+			// A name lookup can bind a just-created handle only when
+			// its own generation label proves ownership.
+			return generationReplaced(c.id)
+		}
+		if uid == "" {
+			c.inspectMu.Lock()
+			c.uid = info.uid
+			c.bootstrap = false
+			c.inspectMu.Unlock()
+		}
+	case "apple":
+		if info.uid != "" {
+			return withGenerationReplaced(c.id, errIdentity("Apple inspect unexpectedly returned a container ID"))
+		}
+		if !validCreationGeneration(creation) ||
+			!validCreationGeneration(info.labels[creationLabel]) ||
+			info.labels[creationLabel] != creation {
+			return generationReplaced(c.id)
+		}
+	default:
+		return errIdentity("unknown backend cannot bind a container identity")
+	}
+
+	c.mu.Lock()
+	if c.info != nil && !sameEngineIdentity(c.eng, c.info, info) {
+		c.mu.Unlock()
+		return generationReplaced(c.id)
+	}
+	if c.info == nil {
+		c.info = info
+	}
+	c.mu.Unlock()
+	return nil
+}
+func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	if !c.identityOptional && c.eng.name() == "apple" {
+		unlock, err := lockName(ctx, c.id)
+		if err != nil {
+			return nil, fmt.Errorf("inspect %s: lock name: %w", c.id, err)
+		}
+		info, err := c.inspectFreshLocked(ctx)
+		unlock()
+		return info, err
+	}
+	return c.inspectFreshLocked(ctx)
+}
+
+func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error) {
+	target, err := c.targetForInspect()
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if err != nil {
+		classified := wrapNotFound(c.classify(ctx, err))
+		if c.reused && isNotFound(classified) {
+			return nil, withGenerationReplaced(c.id, classified)
+		}
+		return nil, classified
+	}
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		if c.reused {
+			return nil, withGenerationReplaced(c.id, err)
+		}
+		return nil, err
+	}
+	if c.requestedPlatform != "" {
+		info.platform, err = resolveContainerPlatform(qCtx, c.eng, c.runner, info, c.requestedPlatform)
+		if err != nil {
+			return nil, fmt.Errorf("resolve container platform: %w", err)
+		}
+	}
+	if !c.identityOptional {
+		if err := c.bindInspectInfo(info); err != nil {
+			return nil, err
+		}
 	}
 	return info, nil
 }
-
-func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
-	}
-	return c.eng.parseInspect(stdout, c.id)
-}
-
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}

@@ -46,10 +46,12 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("ctr-one", ""); err != nil {
+	first := strings.Repeat("a", 64)
+	second := strings.Repeat("b", 64)
+	if err := r.register(first, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two", ""); err != nil {
+	if err := r.register(second, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -57,7 +59,7 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	// dies, however it dies.
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
+	waitForLogLines(t, logPath, "delete --force "+first, "delete --force "+second)
 }
 
 func TestReaperRejectsInvalidID(t *testing.T) {
@@ -79,7 +81,9 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("before-crash", ""); err != nil {
+	before := strings.Repeat("c", 64)
+	after := strings.Repeat("d", 64)
+	if err := r.register(before, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -87,12 +91,12 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash", ""); err != nil {
+	if err := r.register(after, ""); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
+	waitForLogLines(t, logPath, "delete --force "+before, "delete --force "+after)
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
@@ -119,7 +123,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
-	if err := r.register("ok", ""); err != nil {
+	if err := r.register(strings.Repeat("e", 64), ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()

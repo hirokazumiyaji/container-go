@@ -16,7 +16,13 @@ type engineInfo struct {
 	uid string
 	// image is the image reference the container was created from.
 	image string
-	// platform is the platform reported by inspect, normalized when possible.
+	// imageID is Docker's immutable image identity, when inspect
+	// reports it. It is used to resolve a complete OCI platform without
+	// confusing a mutable image tag with the image the container uses.
+	imageID string
+	// platform is the complete OCI platform reported by inspect when
+	// available. Docker's top-level Platform field may contain only the
+	// OS; the Docker adapter enriches it from image inspect when needed.
 	platform string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.

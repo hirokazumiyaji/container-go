@@ -65,6 +65,12 @@ echo "$ids" | while IFS= read -r line; do
     rm -f "$tmp"
     [ "$got" = "$creation" ] || continue
     [ -n "$uid" ] && target="$uid"
+    [ "$sub" = "rm" ] && [ -z "$uid" ] && continue
+  else
+    # An entry without a generation must already be a full Docker UID;
+    # names are not safe deletion targets without a generation check.
+    [ "${#target}" -eq 64 ] || continue
+    case "$target" in *[!0-9a-f]*) continue;; esac
   fi
   run_with_timeout "$bin" "$sub" --force "$target" || true
 done
@@ -113,15 +119,18 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// respawning the reaper process as needed. Name targets must carry a
+// valid creation generation; Docker entries may instead carry a full
+// immutable container ID.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
+	if creation == "" && !dockerIDRE.MatchString(id) {
+		return fmt.Errorf("reaper: missing creation generation for name target %q", id)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

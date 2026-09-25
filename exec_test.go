@@ -81,6 +81,95 @@ func TestExecReturnsCommandExitCodeWithoutError(t *testing.T) {
 	}
 }
 
+func TestExecKeepsPositiveWorkloadPermissionTextAsResult(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "workload output\n",
+		execErr: &cli.CLIError{
+			Binary:   "container",
+			Args:     []string{"exec", "myctr", "app"},
+			ExitCode: 23,
+			Stderr:   "permission denied: /var/lib/app/data\n",
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"app"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want ordinary positive workload result", err)
+	}
+	if code != 23 {
+		t.Errorf("exit code = %d, want 23", code)
+	}
+	data, _ := io.ReadAll(out)
+	if got, want := string(data), "workload output\npermission denied: /var/lib/app/data\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+func TestExecReturnsStructuredPermissionAndConfigFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{
+			name: "permission sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 17, Stderr: "permission denied",
+				},
+				os.ErrPermission,
+			),
+			code: 17,
+		},
+		{
+			name: "configuration sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 18, Stderr: "invalid configuration",
+				},
+				os.ErrInvalid,
+			),
+			code: 18,
+		},
+		{
+			name: "command execution status",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"exec", "myctr", "app"},
+				ExitCode: 126, Stderr: "permission denied",
+			},
+			code: 126,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "diagnostic output\n",
+				execErr:    tc.err,
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"app"})
+			if err == nil {
+				t.Fatal("Exec returned nil for a structured client-side failure")
+			}
+			if code != tc.code {
+				t.Errorf("exit code = %d, want %d", code, tc.code)
+			}
+			if out == nil {
+				t.Fatal("Exec returned nil output for a structured client-side failure")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Errorf("error = %v, want original structured failure", err)
+			}
+		})
+	}
+}
+
 type issue104CanceledExecRunner struct {
 	*execRunner
 }

@@ -110,11 +110,12 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if cli.IsOperationTimeoutError(err) {
 		return cliErr.ExitCode, output, c.classify(ctx, err)
 	}
-	// Textual cancellation, permission, and configuration diagnostics are
-	// structured client-side failures even when the CLI also reports a
-	// positive application-style status. Do not turn them into a normal
-	// application result.
-	if cli.IsDefinitiveNonLivenessError(err) {
+	// Exec diagnostics can come from the workload itself. Do not use the
+	// broad text-based liveness classifier here: a positive workload exit
+	// is still a result even when it says "permission denied" or mentions
+	// configuration. Only structured OS errors and the CLI's 126/127
+	// command-exec statuses are definitive client-side failures.
+	if isDefinitiveExecError(err) {
 		return cliErr.ExitCode, output, err
 	}
 	// App stderr alone must not decide infrastructure state. Only
@@ -135,6 +136,26 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 func isExecContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// isDefinitiveExecError identifies client-side failures that are
+// represented by structured evidence rather than workload output. Exec
+// forwards the workload's stderr through CLIError, so diagnostic phrases
+// alone cannot establish that the backend or the CLI invocation failed.
+func isDefinitiveExecError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	var cliErr *cli.CLIError
+	return errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

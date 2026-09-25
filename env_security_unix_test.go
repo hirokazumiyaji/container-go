@@ -371,6 +371,108 @@ func TestIssue97RunRetainsEnvOwnershipWhenCacheRootReplaced(t *testing.T) {
 	}
 }
 
+func TestIssue97PublishesOwnershipBeforeRootReplacement(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	root := filepath.Join(base, envFileRootName)
+	if err := withEnvFileRoot(base, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	oldHook := envFileAfterRenameHook
+	oldRoot := root + "-old"
+	var hookErr error
+	envFileAfterRenameHook = func() {
+		if err := os.Rename(root, oldRoot); err != nil {
+			hookErr = err
+			return
+		}
+		hookErr = os.Mkdir(root, envDirMode)
+	}
+	defer func() { envFileAfterRenameHook = oldHook }()
+
+	path, dir, err := createEnvFile(root, map[string]string{"TOKEN": "secret"})
+	if hookErr != nil {
+		t.Fatal(hookErr)
+	}
+	if err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("create error = %v, want root replacement safety error", err)
+	}
+	if path == "" || dir == "" {
+		t.Fatalf("create result = (%q, %q), want retained published ownership", path, dir)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("rename/publication replacement dropped env ownership")
+	}
+	state.mu.Lock()
+	lock, recordedRoot := state.lock, state.rootInfo
+	state.mu.Unlock()
+	if lock == nil || recordedRoot == nil {
+		t.Fatal("rename/publication replacement did not retain lock and root identity")
+	}
+	state.mu.Lock()
+	state.lock = nil
+	state.mu.Unlock()
+	_ = closeEnvFileLock(lock)
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(oldRoot)
+	_ = os.RemoveAll(root)
+}
+
+func TestIssue97RejectsRootReplacementAfterCallback(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	var oldRoot string
+	err := withEnvFileRootContextWithCallback(context.Background(), base, func(_ context.Context, root string) error {
+		oldRoot = root + "-old"
+		if err := os.Rename(root, oldRoot); err != nil {
+			return err
+		}
+		return os.Mkdir(root, envDirMode)
+	})
+	if err == nil || !errors.Is(err, errUnsafeEnvFile) {
+		t.Fatalf("callback root replacement error = %v, want safety error", err)
+	}
+	_ = os.RemoveAll(oldRoot)
+	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
+}
+
+func TestIssue97RootCallbackUsesBoundedContext(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	oldTimeout := envFileSecurityTimeout
+	envFileSecurityTimeout = 20 * time.Millisecond
+	t.Cleanup(func() { envFileSecurityTimeout = oldTimeout })
+	base := t.TempDir()
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- withEnvFileRootContextWithCallback(context.Background(), base, func(ctx context.Context, _ string) error {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-release:
+				return errors.New("callback released before timeout")
+			}
+		})
+	}()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("bounded callback error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		close(release)
+		<-result
+		t.Fatal("root callback did not receive the bounded child context")
+	}
+}
+
 func TestIssue97CleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")

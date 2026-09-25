@@ -227,8 +227,11 @@ provides:
 - `wait.ForLog(s string)`: wait until a substring (or regexp via
   `AsRegexp`) appears in `container logs --follow` output;
   `WithOccurrence(n)` for repeat counts
-- `wait.ForListeningPort(port string)`: wait until `net.DialTimeout`
-  to the container IP succeeds
+- `wait.ForListeningPort(port string)`: wait until a TCP connection to
+  the container endpoint succeeds. The specification may be `PORT` or
+  `PORT/tcp`; UDP and malformed specifications return a typed
+  `*wait.ConfigError` before any target probe. The error matches
+  `wait.ErrInvalidConfiguration`.
 - `wait.ForHTTP(path string)`: wait until an HTTP request via
   `net/http` matches the status predicate (2xx by default,
   `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select

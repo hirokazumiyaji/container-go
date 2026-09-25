@@ -127,6 +127,16 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
+`ForListeningPort` とポート宣言では、対応プロトコルが異なります。
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | 対応 | 対応 |
+| `wait.ForListeningPort` | `6379` または `6379/tcp` | 接続を試みる前に `*wait.ConfigError` |
+
+`ForListeningPort` は、不正なポート指定にも `*wait.ConfigError` を返します。
+エラーメッセージを比較せず分類する場合は、`errors.Is(err, wait.ErrInvalidConfiguration)` を使えます。
+
 ## クリーンアップの契約
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -55,35 +56,85 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err
 	}
-	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
+	requestedPath := containerPath
+	containerPath = path.Clean(containerPath)
+	base := path.Base(containerPath)
+	if base == "/" || base == "." || strings.HasSuffix(requestedPath, "/") {
+		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", requestedPath)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
 		return nil, err
 	}
-	dst := filepath.Join(dir, filepath.Base(containerPath))
+	keepDir := false
+	defer func() {
+		if !keepDir {
+			_ = os.RemoveAll(dir)
+		}
+	}()
+	// The destination name is fixed so container path components can
+	// never escape the private directory or become a host path.
+	dst := filepath.Join(dir, "payload")
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
-		_ = os.RemoveAll(dir)
 		return nil, c.classify(ctx, err)
 	}
-	info, err := os.Stat(dst)
-	if err != nil {
-		_ = os.RemoveAll(dir)
+	if err := qCtx.Err(); err != nil {
 		return nil, err
 	}
-	if info.IsDir() {
-		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("copy file from container %q: target is a directory", containerPath)
-	}
-	f, err := os.Open(dst)
+
+	info, err := os.Lstat(dst)
 	if err != nil {
-		_ = os.RemoveAll(dir)
 		return nil, err
 	}
+	if !info.Mode().IsRegular() {
+		return nil, copyFileNotRegularError(requestedPath, info.Mode())
+	}
+	if err := qCtx.Err(); err != nil {
+		return nil, err
+	}
+
+	f, err := openCopyFile(dst)
+	if err != nil {
+		// A no-follow open can fail after the path changes to a link
+		// or special file. Prefer the same typed error in that case.
+		if changed, statErr := os.Lstat(dst); statErr == nil && !changed.Mode().IsRegular() {
+			return nil, copyFileNotRegularError(requestedPath, changed.Mode())
+		}
+		return nil, err
+	}
+	openedInfo, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, statErr
+	}
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, copyFileNotRegularError(requestedPath, openedInfo.Mode())
+	}
+	if err := qCtx.Err(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	keepDir = true
 	return &tempFileReader{File: f, dir: dir}, nil
+}
+
+func copyFileNotRegularError(containerPath string, mode os.FileMode) error {
+	if mode.IsDir() {
+		return fmt.Errorf("copy file from container %q: target is a directory: %w", containerPath, ErrCopyFileNotRegular)
+	}
+	return fmt.Errorf("copy file from container %q: target is not a regular file (mode %s): %w", containerPath, mode.Type(), ErrCopyFileNotRegular)
 }
 
 type tempFileReader struct {
@@ -100,7 +151,7 @@ func (r *tempFileReader) Close() error {
 // validateContainerPath enforces the invariants the copy protocol
 // relies on: absolute, valid UTF-8, and free of NUL bytes.
 func validateContainerPath(p string) error {
-	if !strings.HasPrefix(p, "/") {
+	if !path.IsAbs(p) {
 		return fmt.Errorf("container path %q must be absolute", p)
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {

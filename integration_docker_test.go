@@ -96,6 +96,7 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	if string(round) != "hello docker" {
 		t.Errorf("round-tripped content = %q", round)
 	}
+	assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 
 	logs, err := ctr.Logs(ctx)
 	if err != nil {

@@ -91,6 +91,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if string(round) != "hello from host" {
 		t.Errorf("round-tripped content = %q", round)
 	}
+	assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 
 	// Logs snapshot.
 	logs, err := ctr.Logs(ctx)

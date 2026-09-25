@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +17,7 @@ import (
 type cpRunner struct {
 	*fakeRunner
 	fileContent string
+	materialize func(dst string) error
 }
 
 func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -26,7 +28,11 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		}
 		dst := args[2]
 		if !strings.Contains(dst, ":") {
-			if err := os.WriteFile(dst, []byte(c.fileContent), 0o600); err != nil {
+			if c.materialize != nil {
+				if err := c.materialize(dst); err != nil {
+					return nil, nil, err
+				}
+			} else if err := os.WriteFile(dst, []byte(c.fileContent), 0o600); err != nil {
 				return nil, nil, err
 			}
 		}
@@ -145,5 +151,97 @@ func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
 		if _, err := ctr.CopyFileFromContainer(context.Background(), path); err == nil {
 			t.Errorf("path %q: want error for root or directory path", path)
 		}
+	}
+}
+
+func TestCopyFileFromContainerUsesCleanPOSIXPathAndFixedDestination(t *testing.T) {
+	root := t.TempDir()
+	t.Setenv("TMPDIR", root)
+	t.Setenv("TMP", root)
+	t.Setenv("TEMP", root)
+
+	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "safe"}
+	ctr := runTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/a/b/..")
+	if err != nil {
+		t.Fatalf("CopyFileFromContainer: %v", err)
+	}
+	defer rc.Close()
+
+	call := f.callWith("cp")
+	if call == nil {
+		t.Fatal("cp call not recorded")
+	}
+	if call[1] != "myctr:/a" {
+		t.Errorf("cp source = %q, want cleaned POSIX path", call[1])
+	}
+	dst := call[2]
+	if filepath.Base(dst) != "payload" {
+		t.Errorf("copy destination = %q, want fixed payload name", dst)
+	}
+	rel, err := filepath.Rel(root, dst)
+	if err != nil {
+		t.Fatalf("filepath.Rel: %v", err)
+	}
+	if rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		t.Errorf("copy destination %q escaped temp root %q", dst, root)
+	}
+	if filepath.Dir(dst) == root {
+		t.Errorf("copy destination %q is not inside a private directory", dst)
+	}
+}
+
+func TestCopyFileFromContainerRejectsSymlinkWithoutReadingTarget(t *testing.T) {
+	secretDir := t.TempDir()
+	secret := filepath.Join(secretDir, "host-secret")
+	if err := os.WriteFile(secret, []byte("host secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var linkErr error
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(dst string) error {
+			linkErr = os.Symlink(secret, dst)
+			return linkErr
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/container/link")
+	if linkErr != nil {
+		if rc != nil {
+			_ = rc.Close()
+		}
+		t.Skipf("symlink creation unavailable: %v", linkErr)
+	}
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("symlink target returned a reader")
+	}
+	if err == nil {
+		t.Fatal("symlink target was accepted")
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Errorf("symlink error = %v, want ErrCopyFileNotRegular", err)
+	}
+}
+
+func TestCopyFileFromContainerRejectsCopiedDirectory(t *testing.T) {
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(dst string) error {
+			return os.Mkdir(dst, 0o700)
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	_, err := ctr.CopyFileFromContainer(context.Background(), "/container/dir")
+	if err == nil {
+		t.Fatal("copied directory was accepted")
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Errorf("directory error = %v, want ErrCopyFileNotRegular", err)
 	}
 }

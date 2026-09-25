@@ -34,29 +34,29 @@ func WithFiles(files ...File) Option {
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return err
+		return c.redactError(err, hostPath, containerPath)
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
-		return err
+		return c.redactError(err, hostPath, containerPath)
 	}
 	if _, err := os.Stat(abs); err != nil {
-		return fmt.Errorf("copy to container: %w", err)
+		return c.redactError(fmt.Errorf("copy to container: %w", err), abs)
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return c.classifyWithSecrets(ctx, err, abs, containerPath)
 }
 
 // CopyFileFromContainer copies one file out of the running container
 // and returns its content. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
-		return nil, err
+		return nil, c.redactError(err, containerPath)
 	}
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
+		return nil, c.redactError(fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath), containerPath)
 	}
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
@@ -67,7 +67,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, c.classify(ctx, err)
+		return nil, c.classifyWithSecrets(ctx, err, containerPath, dst)
 	}
 	info, err := os.Stat(dst)
 	if err != nil {

@@ -96,6 +96,9 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// diagnosticSecrets are caller-supplied values that must be removed
+	// from backend and readiness diagnostics.
+	diagnosticSecrets []string
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -109,17 +112,18 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	cfg := newConfig()
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return nil, err
+			return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 		}
 	}
+	cfg.diagnosticSecrets = append([]string(nil), cfg.diagnosticValues()...)
 	if !imageRE.MatchString(image) {
-		return nil, fmt.Errorf("invalid image reference %q", image)
+		return nil, cli.WithRedactor(fmt.Errorf("invalid image reference %q", image), cfg.diagnosticRedactor())
 	}
 	if cfg.reuse && cfg.name == "" {
-		return nil, fmt.Errorf("WithReuse requires WithName")
+		return nil, cli.WithRedactor(fmt.Errorf("WithReuse requires WithName"), cfg.diagnosticRedactor())
 	}
 	if cfg.reuseGroup != "" && !cfg.reuse {
-		return nil, fmt.Errorf("WithReuseGroup requires WithReuse")
+		return nil, cli.WithRedactor(fmt.Errorf("WithReuseGroup requires WithReuse"), cfg.diagnosticRedactor())
 	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()
@@ -130,7 +134,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	applyEngineBinary(cfg)
 	if err := cfg.eng.checkConfig(cfg); err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 	}
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
@@ -156,23 +160,24 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// run command; both share the aggregated flight so concurrent Runs
 	// of the same image pull once.
 	if err := cfg.ensureImage(runCtx, image); err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		return nil, cli.WithRedactor(classified, cfg.diagnosticRedactor())
 	}
 
 	c := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:                cfg.name,
+		runner:            cfg.runner,
+		eng:               cfg.eng,
+		exposed:           cfg.exposed,
+		published:         cfg.published,
+		creation:          cfg.creation,
+		uid:               cfg.eng.parseRunID(stdout),
+		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -198,9 +203,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
 			tail := c.logTail(cleanupCtx)
-			err = fmt.Errorf("container %s failed to become ready: %w", c.id, err)
+			err = c.redactError(fmt.Errorf("container %s failed to become ready: %w", c.id, err))
 			if tail != "" {
-				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
+				err = c.redactError(fmt.Errorf("%w; container logs: %s", err, tail))
 			}
 			return nil, c.rollback(ctx, err)
 		}
@@ -282,7 +287,7 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 func (c *Container) ID() string { return c.id }
 
 func (c *Container) classify(ctx context.Context, err error) error {
-	return cli.Classify(ctx, c.runner, err, c.eng.probe())
+	return c.redactError(cli.Classify(ctx, c.runner, err, c.eng.probe()))
 }
 
 // State returns the current lifecycle state.
@@ -466,7 +471,11 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, c.id)
+	if err != nil {
+		return nil, c.redactError(err)
+	}
+	return info, nil
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

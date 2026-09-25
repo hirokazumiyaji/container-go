@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/wait"
 )
@@ -67,7 +68,9 @@ func (c *Container) logTail(ctx context.Context) string {
 	if err != nil {
 		return ""
 	}
-	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	tail := lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	tail = c.diagnosticRedactor().Text(tail)
+	return lastNBytes(strings.NewReader(tail), logTailLimit)
 }
 
 // lastNBytes keeps only the trailing n bytes of r using a fixed-size

@@ -62,7 +62,7 @@ func (o options) effective() (timeout, interval time.Duration) {
 // container stopped; strategies whose check itself talks to the
 // container (ForExec) pass false and rely on the final classification
 // below.
-func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
+func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool, values ...string) error {
 	timeout, interval := o.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -75,7 +75,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			if errors.As(err, &fatal) {
 				// The check could not run at all; retrying cannot
 				// help, so surface the error right away.
-				return fmt.Errorf("%s: %w", what, fatal.err)
+				return safeDiagnosticError(fmt.Errorf("%s: %w", what, fatal.err), values...)
 			}
 			if ctx.Err() == nil {
 				lastErr = err
@@ -87,7 +87,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
 			if running, err := target.Running(ctx); err == nil && !running {
-				return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+				return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr), values...)
 			}
 		}
 
@@ -104,13 +104,13 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				running, err := target.Running(probeCtx)
 				probeCancel()
 				if err == nil && !running {
-					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+					return safeDiagnosticError(fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr), values...)
 				}
 			}
 			if errors.Is(ctx.Err(), context.Canceled) {
-				return fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr)
+				return safeDiagnosticError(fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr), values...)
 			}
-			return fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr)
+			return safeDiagnosticError(fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr), values...)
 		case <-time.After(interval):
 		}
 	}

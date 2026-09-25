@@ -62,9 +62,26 @@ type CLIError struct {
 	Args     []string
 	ExitCode int
 	Stderr   string
+
+	redactor *Redactor
+	raw      *CLIError
 }
 
+// Error renders a safe diagnostic. Secret-shaped arguments and stderr
+// values are redacted, and control characters are escaped so the result
+// cannot alter a terminal. Use RawError only when the unredacted text is
+// explicitly needed and the caller will keep it out of logs.
 func (e *CLIError) Error() string {
+	if e.redactor != nil {
+		return e.format(e.redactor)
+	}
+	return e.format(NewRedactor())
+}
+
+// RawError returns the original command and stderr without redaction or
+// control-character escaping. It is an explicit escape hatch for local
+// debugging; do not write the result to CI logs or issue reports.
+func (e *CLIError) RawError() string {
 	bin := e.Binary
 	if bin == "" {
 		bin = "container"
@@ -74,6 +91,49 @@ func (e *CLIError) Error() string {
 		msg += ": " + strings.TrimSpace(e.Stderr)
 	}
 	return msg
+}
+
+func (e *CLIError) Is(target error) bool {
+	raw, ok := target.(*CLIError)
+	return ok && e.raw != nil && raw == e.raw
+}
+
+func (e *CLIError) Unwrap() error {
+	if e.raw == nil {
+		return nil
+	}
+	return e.raw
+}
+
+func (e *CLIError) Format(state fmt.State, _ rune) {
+	_, _ = fmt.Fprint(state, e.Error())
+}
+
+func (e *CLIError) format(r *Redactor) string {
+	bin := e.Binary
+	if bin == "" {
+		bin = "container"
+	}
+	args := r.Args(e.Args)
+	msg := fmt.Sprintf("%s %s: exit code %d", r.Text(bin), strings.Join(args, " "), e.ExitCode)
+	stderr := r.Text(e.Stderr)
+	if stderr != "" {
+		msg += ": " + strings.TrimSpace(stderr)
+	}
+	return msg
+}
+
+func (e *CLIError) withRedactor(r *Redactor) *CLIError {
+	clone := *e
+	clone.Args = append([]string(nil), e.Args...)
+	clone.Stderr = e.Stderr
+	clone.redactor = r
+	if e.raw != nil {
+		clone.raw = e.raw
+	} else {
+		clone.raw = e
+	}
+	return &clone
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
@@ -107,7 +167,8 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
 		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+			safeArgs := NewRedactor().Args(args)
+			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(safeArgs, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {

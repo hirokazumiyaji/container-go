@@ -37,6 +37,10 @@ type config struct {
 	reuse        bool
 	reuseGroup   string
 	creation     string
+	// diagnosticSecrets are values supplied by the caller that may be
+	// echoed by a backend or by a readiness log tail. They are kept out
+	// of formatted errors and diagnostics.
+	diagnosticSecrets []string
 }
 
 func newConfig() *config {

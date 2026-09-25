@@ -124,6 +124,10 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		scheme = "https"
 	}
 
+	values := []string{s.path, s.password}
+	for _, value := range s.headers {
+		values = append(values, value)
+	}
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for HTTP %s %s", s.method, s.path), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {
@@ -148,5 +152,5 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("status %d not accepted", resp.StatusCode)
 		}
 		return nil
-	}, true)
+	}, true, values...)
 }

@@ -167,7 +167,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用に秘匿情報をマスクして制御文字をエスケープしたログ末尾(上限 1MiB)を添えてエラーを返す。
 
 戦略のインターフェースは次のとおり。
 
@@ -230,6 +230,7 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 
 **ログに秘密を書かない**。
 デバッグログ(`WithLogger` で注入)に CLI の argv を出す場合、env-file の中身は出力しない。
+`CLIError.Error()` と readiness log tail は設定値と secret らしい値をマスクし、制御文字をエスケープする。元の CLI 診断が必要なら `RawError()` を明示的に呼び出す。
 
 ## パフォーマンス設計
 
@@ -260,7 +261,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する。`Error()` は秘匿情報をマスクして制御文字をエスケープし、`RawError()` は明示的な未マスクのデバッグ経路
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 
@@ -279,8 +280,9 @@ container-go/
 ├── logs.go           // Logs
 ├── copy.go           // CopyToContainer、CopyFileFromContainer
 ├── errors.go         // エラー型
-├── internal/cli/     // CLI ランナー(コマンド組み立て、実行、タイムアウト)
-├── internal/inspect/ // inspect JSON モデルとデコード
+├── internal/cli/         // CLI ランナー(コマンド組み立て、実行、タイムアウト)
+├── internal/diagnostic/ // 秘匿情報と制御文字のサニタイズ
+├── internal/inspect/     // inspect JSON モデルとデコード
 └── wait/             // 待機戦略
 ```
 

@@ -54,7 +54,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if s.isRegexp {
 		re, err := regexp.Compile(s.pattern)
 		if err != nil {
-			return fmt.Errorf("wait for log: %w", err)
+			return safeDiagnosticError(fmt.Errorf("wait for log: %w", err), s.pattern)
 		}
 		match = func(line string) int { return len(re.FindAllString(line, -1)) }
 	} else {
@@ -63,7 +63,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 
 	stream, err := target.FollowLogs(ctx)
 	if err != nil {
-		return fmt.Errorf("wait for log: %w", err)
+		return safeDiagnosticError(fmt.Errorf("wait for log: %w", err), s.pattern)
 	}
 	// Closing the stream unblocks the scanner goroutine on timeout.
 	defer stream.Close()
@@ -96,10 +96,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		running, rErr := target.Running(probeCtx)
 		probeCancel()
 		if rErr == nil && !running {
-			return fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern)
+			return safeDiagnosticError(fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern), s.pattern)
 		}
-		return fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %v)", s.pattern, err)
+		return safeDiagnosticError(fmt.Errorf("wait for log %q: log stream ended before pattern appeared (read error: %v)", s.pattern, err), s.pattern)
 	case <-ctx.Done():
-		return fmt.Errorf("wait for log %q: timed out after %v", s.pattern, timeout)
+		return safeDiagnosticError(fmt.Errorf("wait for log %q: timed out after %v", s.pattern, timeout), s.pattern)
 	}
 }

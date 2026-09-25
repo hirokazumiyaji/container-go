@@ -35,15 +35,15 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	for i, strategy := range s.strategies {
 		if err := ctx.Err(); err != nil {
 			if s.startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err)
+				return safeDiagnosticError(fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err))
 			}
-			return err
+			return safeDiagnosticError(err)
 		}
 		if err := strategy.WaitUntilReady(ctx, target); err != nil {
 			if s.startupTimeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err)
+				return safeDiagnosticError(fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err))
 			}
-			return err
+			return safeDiagnosticError(err)
 		}
 	}
 	return nil
@@ -94,8 +94,8 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			}
 			errs = append(errs, err)
 		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+			return safeDiagnosticError(errors.Join(append(errs, ctx.Err())...))
 		}
 	}
-	return errors.Join(errs...)
+	return safeDiagnosticError(errors.Join(errs...))
 }

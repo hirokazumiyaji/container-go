@@ -26,7 +26,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
 	if err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 	}
 
 	info := base.info
@@ -37,19 +37,20 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 	}
 
 	ctr := &Container{
-		id:        base.id,
-		runner:    base.runner,
-		eng:       base.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		info:      info,
-		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		id:                base.id,
+		runner:            base.runner,
+		eng:               base.eng,
+		exposed:           cfg.exposed,
+		published:         cfg.published,
+		reused:            true,
+		info:              info,
+		creation:          info.labels[creationLabel],
+		uid:               info.uid,
+		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -114,15 +115,16 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			continue
 		case StateRunning:
 			return &Container{
-				id:        cfg.name,
-				runner:    cfg.runner,
-				eng:       cfg.eng,
-				exposed:   cfg.exposed,
-				published: cfg.published,
-				reused:    true,
-				info:      info,
-				creation:  info.labels[creationLabel],
-				uid:       info.uid,
+				id:                cfg.name,
+				runner:            cfg.runner,
+				eng:               cfg.eng,
+				exposed:           cfg.exposed,
+				published:         cfg.published,
+				reused:            true,
+				info:              info,
+				creation:          info.labels[creationLabel],
+				uid:               info.uid,
+				diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -149,7 +151,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
 	if err := cfg.ensureImage(runCtx, image); err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, cfg.diagnosticRedactor())
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
@@ -161,18 +163,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		return nil, cli.WithRedactor(classified, cfg.diagnosticRedactor())
 	}
 
 	ctr := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:                cfg.name,
+		runner:            cfg.runner,
+		eng:               cfg.eng,
+		exposed:           cfg.exposed,
+		published:         cfg.published,
+		reused:            true,
+		creation:          cfg.creation,
+		uid:               cfg.eng.parseRunID(stdout),
+		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -208,10 +211,11 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
 		tail := ctr.logTail(context.WithoutCancel(ctx))
+		safeErr := ctr.redactError(fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err))
 		if tail != "" {
-			return fmt.Errorf("reuse %s failed to become ready: %w\ncontainer logs:\n%s", ctr.id, err, tail)
+			return ctr.redactError(fmt.Errorf("%w; container logs: %s", safeErr, tail))
 		}
-		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
+		return safeErr
 	}
 	return nil
 }
@@ -222,11 +226,12 @@ func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, err
 
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:        id,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
+		id:                id,
+		runner:            cfg.runner,
+		eng:               cfg.eng,
+		exposed:           cfg.exposed,
+		published:         cfg.published,
+		diagnosticSecrets: append([]string(nil), cfg.diagnosticSecrets...),
 	}
 }
 

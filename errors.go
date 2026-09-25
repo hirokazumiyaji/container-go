@@ -7,7 +7,9 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// CLIError is a non-zero exit from the backend CLI. It aliases
+// CLIError is a non-zero exit from the backend CLI. Its Error method
+// redacts diagnostic secrets and escapes control characters; RawError is
+// the explicit local-debugging escape hatch. It aliases
 // internal/cli.CLIError so callers can use errors.As without importing
 // an internal package.
 type CLIError = cli.CLIError

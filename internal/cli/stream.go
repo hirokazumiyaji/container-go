@@ -32,7 +32,7 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, fmt.Errorf("container %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("container %s: %w", strings.Join(NewRedactor().Args(args), " "), err)
 	}
 	// The child holds its own copy of the write end; releasing ours
 	// lets the reader see EOF when the child exits.

@@ -245,7 +245,8 @@ provides:
 Every strategy carries `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms). If the container transitions to
 stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+and the error carries a redacted, control-character-sanitized log tail
+capped at 1MiB for diagnosis.
 
 The strategy interface:
 
@@ -361,7 +362,10 @@ future CLI changes.
 the library has no credential input path.
 
 **No secrets in logs**. Debug logging of CLI argv never includes
-env-file contents.
+env-file contents. `CLIError.Error()` and readiness log tails additionally
+redact configured and secret-shaped values and escape terminal control
+characters before they reach CI output; callers that need the original
+CLI diagnostic must explicitly use `RawError()`.
 
 ## Performance design
 
@@ -399,7 +403,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+  code, and stderr (capped at 64KiB). Its `Error()` rendering redacts
+  configured and secret-shaped values and escapes control characters;
+  `RawError()` is the explicit unredacted local-debugging path.
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.
@@ -420,8 +426,9 @@ container-go/
 ├── logs.go           // Logs
 ├── copy.go           // CopyToContainer, CopyFileFromContainer
 ├── errors.go         // error types
-├── internal/cli/     // CLI runner (argv assembly, execution, timeouts)
-├── internal/inspect/ // inspect JSON models and decoding
+├── internal/cli/         // CLI runner (argv assembly, execution, timeouts)
+├── internal/diagnostic/ // redaction and control-character sanitization
+├── internal/inspect/     // inspect JSON models and decoding
 └── wait/             // wait strategies
 ```
 

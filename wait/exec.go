@@ -71,5 +71,5 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("exit code %d not accepted", code)
 		}
 		return nil
-	}, false)
+	}, false, s.cmd...)
 }

@@ -1,12 +1,15 @@
-//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
+//go:build !aix && !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
 
 package container
 
-import "os/exec"
+import (
+	"context"
+	"os/exec"
+)
 
 func prepareReaperCommand(*exec.Cmd) {}
 
-func killReaperCommand(cmd *exec.Cmd) error {
+func killReaperCommand(_ context.Context, cmd *exec.Cmd) error {
 	if cmd.Process == nil {
 		return nil
 	}

@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -137,6 +139,7 @@ done
 const (
 	maxReaperSpawnFailures      = 3
 	defaultReaperTimeoutSeconds = 30
+	reaperCleanupTimeout        = 2 * time.Second
 )
 
 // breQuote escapes a literal for use inside the reaper's sed basic
@@ -285,17 +288,30 @@ func (r *reaper) closeStdin() {
 
 // killForTest kills the reaper process group and waits until the child is
 // reaped, so fake descendants cannot survive the test and the next write
-// deterministically fails.
-func (r *reaper) killForTest() {
+// deterministically fails. The cleanup is bounded because a test must not
+// be able to wedge the whole suite on a stalled pgrep or an expanding tree.
+func (r *reaper) killForTest() error {
 	r.mu.Lock()
 	cmd, exited := r.cmd, r.exited
 	r.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
+	defer cancel()
+	var cleanupErrors []error
 	if cmd != nil {
-		_ = killReaperCommand(cmd)
+		if err := killReaperCommand(ctx, cmd); err != nil {
+			log.Printf("container-go: reaper cleanup: %v", err)
+			cleanupErrors = append(cleanupErrors, err)
+		}
 	}
 	if exited != nil {
-		<-exited
+		select {
+		case <-exited:
+		case <-ctx.Done():
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("reaper: cleanup timed out: %w", ctx.Err()))
+		}
 	}
+	return errors.Join(cleanupErrors...)
 }
 
 var (

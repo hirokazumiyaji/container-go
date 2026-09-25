@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 type review90Cause struct{ message string }
@@ -74,6 +76,83 @@ func TestForLogEOFProbeHonorsCallerBudgetAndRetainsCauses(t *testing.T) {
 	}
 	if target.probeBudget <= 0 || target.probeBudget > 40*time.Millisecond {
 		t.Fatalf("probe budget = %v, want caller deadline remainder", target.probeBudget)
+	}
+}
+
+type review90CloseTerminalLogStream struct {
+	*strings.Reader
+	done        chan struct{}
+	expire      func()
+	terminalErr error
+}
+
+func newReview90CloseTerminalLogStream(
+	expire func(),
+	terminalErr error,
+) *review90CloseTerminalLogStream {
+	done := make(chan struct{})
+	close(done)
+	return &review90CloseTerminalLogStream{
+		Reader:      strings.NewReader("ready\n"),
+		done:        done,
+		expire:      expire,
+		terminalErr: terminalErr,
+	}
+}
+
+func (s *review90CloseTerminalLogStream) Close() error {
+	s.expire()
+	return nil
+}
+func (s *review90CloseTerminalLogStream) Done() <-chan struct{}     { return s.done }
+func (*review90CloseTerminalLogStream) Drain(context.Context) error { return nil }
+func (s *review90CloseTerminalLogStream) TerminalError() error {
+	return s.terminalErr
+}
+
+func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T) {
+	tests := map[string]struct {
+		newContext func() (context.Context, func())
+		want       error
+	}{
+		"cancellation": {
+			newContext: func() (context.Context, func()) {
+				return context.WithCancel(context.Background())
+			},
+			want: context.Canceled,
+		},
+		"deadline": {
+			newContext: func() (context.Context, func()) {
+				ctx := newReview90DeadlineContext(time.Now().Add(time.Hour))
+				return ctx, ctx.expire
+			},
+			want: context.DeadlineExceeded,
+		},
+	}
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			terminal := &cli.CLIError{
+				Binary:   "docker",
+				Args:     []string{"logs", "--follow", "myctr"},
+				ExitCode: 17,
+				Stderr:   "logs stream failed",
+			}
+			ctx, expire := tc.newContext()
+			stream := newReview90CloseTerminalLogStream(expire, terminal)
+			target := &issue90Target{logs: []io.ReadCloser{stream}}
+
+			err := ForLog("ready").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, target)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("error = %v, want %v", err, tc.want)
+			}
+			var got *cli.CLIError
+			if !errors.As(err, &got) {
+				t.Fatalf("error = %v, want settled terminal *cli.CLIError", err)
+			}
+			if got != terminal {
+				t.Fatalf("CLIError = %p, want original terminal error %p", got, terminal)
+			}
+		})
 	}
 }
 

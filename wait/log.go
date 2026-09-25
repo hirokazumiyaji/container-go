@@ -2,6 +2,7 @@ package wait
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -89,6 +90,7 @@ type logScanResult struct {
 	lines       [][sha256.Size]byte
 	lineStart   int
 	lineCount   int
+	partial     []byte
 }
 
 type logReplay struct {
@@ -96,6 +98,7 @@ type logReplay struct {
 	previousStart int
 	previousLines int
 	count         int
+	partial       []byte
 }
 
 // matchesPrevious reports whether index is in the replayed prefix. Only a
@@ -122,15 +125,15 @@ func appendReplayLine(lines [][sha256.Size]byte, start *int, line [sha256.Size]b
 	return lines
 }
 
-// scanLogStream reads a complete stream unless the requested number of
-// occurrences is found. A read error returned together with a matching
-// final line is reported as an error rather than allowing that line to
-// satisfy readiness.
+// scanLogStream reads complete logical lines unless the requested number of
+// occurrences is found. A trailing unterminated line remains a partial and
+// is neither matched nor fingerprinted until a later connection completes it.
 func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
 	results := make(chan logScanResult, 1)
 	go func() {
 		reader := bufio.NewReader(stream)
 		var lines [][sha256.Size]byte
+		partial := replay.partial
 		lineStart := 0
 		observedLines := 0
 		lineCount := replay.previousLines
@@ -145,22 +148,38 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 				lines:       lines,
 				lineStart:   lineStart,
 				lineCount:   lineCount,
+				partial:     partial,
 			}
 		}
 		for {
-			line, err := readLogLine(reader)
-			if len(line) > 0 {
-				hash := sha256.Sum256([]byte(line))
+			line, complete, err := readLogLine(reader)
+			if complete {
+				observed := []byte(line)
+				hash := sha256.Sum256(observed)
 				if replaying && !replay.matchesPrevious(observedLines, hash) {
 					replaying = false
 					lineCount = observedLines
 				}
 				if !replaying {
-					count += match(line)
+					logical, reconcileErr := reconcileLogLine(partial, observed)
+					if reconcileErr != nil {
+						results <- result(false, reconcileErr, nil)
+						return
+					}
+					partial = nil
+					count += match(string(logical))
 					lineCount++
+					hash = sha256.Sum256(logical)
 				}
 				lines = appendReplayLine(lines, &lineStart, hash)
 				observedLines++
+			} else if len(line) > 0 {
+				var reconcileErr error
+				partial, reconcileErr = reconcileLogLine(partial, []byte(line))
+				if reconcileErr != nil {
+					results <- result(false, reconcileErr, nil)
+					return
+				}
 			}
 			if err != nil {
 				if isPermanentCheckError(err) || isTerminalStreamError(err) {
@@ -214,22 +233,40 @@ func receiveLogScanResult(results <-chan logScanResult, done <-chan struct{}) (l
 	return logScanResult{}, false
 }
 
-func readLogLine(reader *bufio.Reader) (string, error) {
+func readLogLine(reader *bufio.Reader) (string, bool, error) {
 	var line []byte
 	for {
 		fragment, err := reader.ReadSlice('\n')
 		if len(line)+len(fragment) > maxLogLineSize {
-			return "", errLogLineTooLong
+			return "", false, errLogLineTooLong
 		}
 		line = append(line, fragment...)
 		if err == nil {
-			return string(line), nil
+			return string(line), true, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		return string(line), err
+		return string(line), false, err
 	}
+}
+
+// reconcileLogLine carries a partial prefix into the next connection. A
+// replayed line already starts with that prefix, so it replaces the carried
+// bytes rather than duplicating them.
+func reconcileLogLine(partial, observed []byte) ([]byte, error) {
+	if len(observed) == 0 {
+		return partial, nil
+	}
+	if len(partial) > 0 && bytes.HasPrefix(observed, partial) {
+		return observed, nil
+	}
+	if len(partial)+len(observed) > maxLogLineSize {
+		return nil, errLogLineTooLong
+	}
+	line := make([]byte, 0, len(partial)+len(observed))
+	line = append(line, partial...)
+	return append(line, observed...), nil
 }
 
 type logSettleRead struct {
@@ -424,19 +461,17 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		}
 
 		result := scanLogStream(waitCtx, stream, match, s.occurrences, replay)
+		terminalStreamErr := result.terminalErr
+		resultErr := joinNonNil(lastErr, terminalStreamErr)
 		if result.found {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr); terminalErr != nil {
+			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
 				_ = stream.Close()
 				return terminalErr
 			}
 		}
-		var terminalStreamErr error
-		if result.found {
-			terminalStreamErr = result.terminalErr
-		}
 		_ = stream.Close()
 		if result.found {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr); terminalErr != nil {
+			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
 				return terminalErr
 			}
 			if terminalStreamErr != nil {
@@ -450,6 +485,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			previousStart: result.lineStart,
 			previousLines: result.lineCount,
 			count:         result.count,
+			partial:       result.partial,
 		}
 		if result.err != nil {
 			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, result.err)); terminalErr != nil {

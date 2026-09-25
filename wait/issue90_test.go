@@ -416,6 +416,61 @@ func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
 	}
 }
 
+func TestScanLogStreamDefersAndCarriesPartialLine(t *testing.T) {
+	match := func(line string) int { return strings.Count(line, "ready") }
+	first := scanLogStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader("ready")),
+		match,
+		1,
+		logReplay{},
+	)
+	if first.err != nil {
+		t.Fatalf("first scan: %v", first.err)
+	}
+	if first.count != 0 || first.lineCount != 0 || len(first.lines) != 0 {
+		t.Fatalf(
+			"partial line was observed: count=%d lines=%d fingerprints=%d",
+			first.count,
+			first.lineCount,
+			len(first.lines),
+		)
+	}
+	if got := string(first.partial); got != "ready" {
+		t.Fatalf("partial = %q, want %q", got, "ready")
+	}
+
+	replay := logReplay{
+		previous:      first.lines,
+		previousStart: first.lineStart,
+		previousLines: first.lineCount,
+		count:         first.count,
+		partial:       first.partial,
+	}
+	second := scanLogStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader("ready\n")),
+		match,
+		1,
+		replay,
+	)
+	if second.err != nil {
+		t.Fatalf("second scan: %v", second.err)
+	}
+	if !second.found || second.count != 1 || second.lineCount != 1 || len(second.lines) != 1 {
+		t.Fatalf(
+			"completed replayed line = found:%v count:%d lines:%d fingerprints:%d, want one logical line",
+			second.found,
+			second.count,
+			second.lineCount,
+			len(second.lines),
+		)
+	}
+	if len(second.partial) != 0 {
+		t.Fatalf("partial after completed line = %q, want empty", second.partial)
+	}
+}
+
 func TestForAllValidatesChildrenBeforeRunning(t *testing.T) {
 	target := &issue90Target{}
 	err := ForAll(
@@ -491,6 +546,40 @@ func TestForLogDeduplicatesReplayedHistoryAcrossReconnect(t *testing.T) {
 	}
 	if got := target.followCalls.Load(); got != 3 {
 		t.Fatalf("FollowLogs calls = %d, want 3 after two replayed snapshots", got)
+	}
+}
+
+func TestForLogWaitsForPartialLineCompletionAcrossReconnect(t *testing.T) {
+	target := &issue90Target{logs: []io.ReadCloser{
+		io.NopCloser(strings.NewReader("starting\nread")),
+		io.NopCloser(strings.NewReader("y\n")),
+	}}
+	if err := ForLog("ready").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.followCalls.Load(); got != 2 {
+		t.Fatalf("FollowLogs calls = %d, want 2 after partial line completion", got)
+	}
+}
+
+func TestForLogReconcilesPartialReadyWithReplayedLine(t *testing.T) {
+	target := &issue90Target{logs: []io.ReadCloser{
+		io.NopCloser(strings.NewReader("ready")),
+		io.NopCloser(strings.NewReader("ready\n")),
+		io.NopCloser(strings.NewReader("ready\nready\n")),
+	}}
+	if err := ForLog("ready").
+		WithOccurrence(2).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.followCalls.Load(); got != 3 {
+		t.Fatalf("FollowLogs calls = %d, want 3 logical ready occurrences", got)
 	}
 }
 

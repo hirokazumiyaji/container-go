@@ -44,7 +44,11 @@ import (
 // the pipe backlog are bounded by the number of live registrations,
 // rather than by the number of containers created during the process
 // lifetime.
+//
+// SHELLOPTS may enable monitor mode. Disable it before any background
+// helpers so they remain in the reaper's process group.
 const reaperScript = `set -f
+set +m
 bin="$1"
 sub="$2"
 key="$3"

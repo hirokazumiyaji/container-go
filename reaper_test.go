@@ -268,6 +268,46 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	}
 }
 
+func TestReaperDisablesMonitorMode(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "shellopts.log")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"printf 'called:%s\\n' \"$SHELLOPTS\" >> " + logPath + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	r.command = func() *exec.Cmd {
+		cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", binPath, "delete", breQuote(creationLabel))
+		cmd.Env = append(os.Environ(), "SHELLOPTS=monitor")
+		return cmd
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	if err := r.register("monitor-test", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	// EOF makes the shell flush the active set to the backend.
+	r.closeStdin()
+	waitForLogLines(t, logPath, "called:")
+	data, _ := os.ReadFile(logPath)
+	opts := strings.TrimPrefix(strings.TrimSpace(string(data)), "called:")
+	for _, option := range strings.Split(opts, ":") {
+		if option == "monitor" {
+			t.Fatalf("reaper helper inherited monitor mode from SHELLOPTS: %q", opts)
+		}
+	}
+}
+
 func TestBreQuoteEscapesLabelKey(t *testing.T) {
 	if got := breQuote("com.github.x-y"); got != `com\.github\.x-y` {
 		t.Errorf("breQuote = %q", got)

@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make `CONTAINERGO_KEEP=1` retain containers across failed-create and
+  post-create copy/wait rollback, matching the registered cleanup and
+  watchdog policy; explicit termination and pruning remain available.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

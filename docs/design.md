@@ -125,8 +125,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
 `Run` fetches the image (the CLI auto-pulls when missing), creates and
-starts the container, and completes the wait strategy; on failure it
-rolls back whatever it created before returning the error.
+starts the container, and completes the wait strategy; by default, on
+failure it rolls back whatever it created before returning the error.
 
 Options use the functional options pattern. The initial release
 provides:
@@ -262,11 +262,11 @@ reader, exec, state query) implemented by adapting
 
 ## Cleanup
 
-Every way a test process can exit has a path that still deletes its
-containers.
+Every way a test process can exit has an automatic deletion path.
 
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
-`t.Cleanup`. Mid-`Run` failures are rolled back by `Run` itself.
+`t.Cleanup`. By default, mid-`Run` failures are rolled back by `Run`
+itself, including failed-create cleanup and copy/wait rollback.
 
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
 `t.Cleanup` run, so an external **watchdog reaper** takes over. At
@@ -289,8 +289,15 @@ The CLI has no label filter, so orphan sweeps filter
 removes stopped containers carrying the managed label from any
 session.
 
-Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
-reaper (for debugging).
+Setting `CONTAINERGO_KEEP=1` makes this diagnostic switch retain
+containers instead of deleting them automatically: `Cleanup` /
+`TerminateContainer`, failed-create cleanup, copy/wait rollback, and
+watchdog registration are all skipped. The operation still returns its
+failure; a rollback that is attempted and cannot delete reports the
+left-behind container in that error. Explicit `Container.Terminate`,
+`Prune`, and `PruneReuseGroup` remain deletion operations. The reuse
+get-or-create rules, including stopped-container replacement, are
+unchanged.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -402,7 +409,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   code, and stderr (capped at 64KiB)
 
 When `Run` fails on a wait timeout, the returned error includes the
-container's log tail, and the rollback delete follows.
+container's log tail. By default the rollback delete follows; with
+`CONTAINERGO_KEEP=1` the container is retained and no rollback delete is
+issued.
 
 The library never runs `container system start` itself: the command
 can prompt interactively for a kernel install, which a test library

@@ -17,7 +17,8 @@ type File struct {
 }
 
 // WithFiles copies files into the container after it starts. Copy
-// failures fail Run and roll the container back.
+// failures fail Run and, unless CONTAINERGO_KEEP=1, roll the container
+// back.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		for _, f := range files {

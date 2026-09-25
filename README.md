@@ -136,8 +136,9 @@ wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back with a tail of its
-logs attached to the error.
+stops, and a failed wait rolls the container back by default with a tail
+of its logs attached to the error. `CONTAINERGO_KEEP=1` retains the
+container instead, as described in the cleanup contract.
 
 ## Image pulls
 
@@ -163,17 +164,26 @@ Three layers make sure containers do not outlive your tests:
 1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
-2. If `Run` fails partway, it removes whatever it created before
-   returning.
+2. By default, if `Run` fails partway, it removes whatever it created
+   before returning. This includes cleanup after a failed create and
+   rollback after a `WithFiles` copy or wait failure.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
    unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
-Extras:
+`CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
+automatic deletion by `Cleanup` / `TerminateContainer`, failed-create
+cleanup, and copy/wait rollback, and skips watchdog registration.
+When a rollback is skipped, the operation's error is still returned; if
+a normal rollback is attempted and deletion fails, the error also says
+that the container was left behind. Explicit `ctr.Terminate`, `Prune`,
+and `PruneReuseGroup` still delete containers. `WithReuse` keeps its
+existing shared-handle and stopped-container get-or-create rules.
 
-- `CONTAINERGO_KEEP=1` keeps containers around for debugging.
+Other helpers:
+
 - `container.Prune(ctx)` removes stopped containers this library
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label).

@@ -102,6 +102,8 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
 			}
+			// This is an explicit WithReuse lifecycle step, not a Run
+			// rollback; CONTAINERGO_KEEP does not suppress it.
 			// Only recycle containers this library created for reuse
 			// with a compatible image; never delete foreign leftovers.
 			if err := checkReuseOwned(info, image, cfg); err != nil {
@@ -175,13 +177,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, ctr.rollback(ctx, err)
 		}
 	}
 	return ctr, nil

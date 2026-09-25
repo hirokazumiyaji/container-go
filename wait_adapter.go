@@ -10,8 +10,8 @@ import (
 )
 
 // WithWaitStrategy blocks Run until the strategy reports the container
-// ready. On failure the container is removed and the error carries a
-// tail of its logs.
+// ready. On failure the container is removed by default and the error
+// carries a tail of its logs; CONTAINERGO_KEEP=1 retains it instead.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
 		c.waitStrategy = s

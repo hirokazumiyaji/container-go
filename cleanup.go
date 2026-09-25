@@ -10,8 +10,10 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// keepContainers reports whether CONTAINERGO_KEEP=1 disables all
-// automatic cleanup (for debugging).
+// keepContainers reports whether CONTAINERGO_KEEP=1 disables automatic
+// cleanup for newly created containers, registered Cleanup, and the
+// watchdog (for debugging). Explicit Terminate, Prune, PruneReuseGroup,
+// and WithReuse's stopped-container replacement still delete containers.
 func keepContainers() bool {
 	return os.Getenv("CONTAINERGO_KEEP") == "1"
 }

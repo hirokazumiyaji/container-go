@@ -102,8 +102,9 @@ type Container struct {
 }
 
 // Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
+// returns a handle to it. On a non-reuse failure after creation, the
+// container is automatically removed before returning unless
+// CONTAINERGO_KEEP=1 is set. WithReuse switches to get-or-create; see
 // WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
@@ -208,11 +209,15 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. It honors
+// CONTAINERGO_KEEP=1 by leaving the container in place. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete
+// when it cannot verify the generation, and the caller must know the
+// container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	if keepContainers() {
+		return cause
+	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
 		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
 	}
@@ -220,11 +225,15 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 }
 
 // cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
+// behind after a failed create, unless CONTAINERGO_KEEP=1 requests
+// diagnostic retention. It never deletes a pre-existing same-name
+// container: name conflicts are skipped, and only a container carrying
+// this process's managed+session labels is removed. When the creation
+// generation is known it must also match.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+	if keepContainers() {
+		return
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return
 	}
@@ -303,7 +312,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	return c.classify(ctx, err)
 }
 
-// Terminate force-removes the container. Removing a container that no
+// Terminate force-removes the container. It is an explicit operation
+// and is not disabled by CONTAINERGO_KEEP. Removing a container that no
 // longer exists is a success. A handle with an immutable ID deletes by
 // it, so a same-name replacement is never touched. Without one (Apple
 // Container) the delete goes by name: the creation generation must

@@ -15,13 +15,17 @@ type HostPortStrategy struct {
 }
 
 // ForListeningPort waits for the given declared port ("6379/tcp" or
-// "6379") to accept TCP connections.
+// "6379") to accept TCP connections. It is TCP-only. The current
+// implementation does not reject UDP or malformed specifications before
+// probing: malformed specifications are retried, while a UDP specification
+// is passed to a TCP dial until the wait ends (#77).
 func ForListeningPort(port string) *HostPortStrategy {
 	return &HostPortStrategy{port: port}
 }
 
 // ForExposedPort waits on the first port declared via
-// WithExposedPorts.
+// WithExposedPorts. It shares the TCP-only implementation: if the first
+// declaration is UDP, the current probe may dial it as TCP (#77).
 func ForExposedPort() *HostPortStrategy {
 	return &HostPortStrategy{}
 }

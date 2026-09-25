@@ -16,8 +16,10 @@ type engineInfo struct {
 	uid string
 	// image is the image reference the container was created from.
 	image string
-	// ip is the container's address on its first network; it can change
-	// after the first inspect and may therefore be stale when cached.
+	// ip is the address reported for the container. Apple inspect data
+	// uses the first attached network; Docker selection is unspecified
+	// when multiple networks are present and no top-level address exists.
+	// It can change after the first inspect and may be stale when cached.
 	ip string
 	// bound lists host-side bindings of container ports, as reported by
 	// the backend. Docker-assigned bindings can change or appear later,

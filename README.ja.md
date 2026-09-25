@@ -13,8 +13,9 @@ Go のテストから使い捨てコンテナを起動できます。サード�
 下記のインストールコマンドはリリース版 API のものです。
 このコマンドで、後述の開発版 API が入るわけではありません。
 
-現在のチェックアウトには Go 1.23 以降が必要です。
-`v0.2.0` モジュールには Go 1.27 以降が必要です。
+root ライブラリのチェックアウトには Go 1.23 以降が必要です。
+`make bench-integration` が使う nested `bench/` モジュールには
+Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が必要です。
 
 | API または動作 | `v0.2.0` | 現在の開発チェックアウト |
 |---|---|---|
@@ -49,6 +50,24 @@ Go のテストから使い捨てコンテナを起動できます。サード�
   operation target の修正を担当します。
 - Docker の `Prune` は現在 exited コンテナだけを選び、dead 状態は
   選びません。dead 状態の対応は #113 が担当します。
+- Apple の外部 reaper は per-name lock を取らないため、inspect / delete
+  window と通常の library path の coordination は #98 が担当します。
+- Windows Docker の bind source と remote Docker の bind source semantics は
+  現在の validation path では扱えていません。#76 が host path と remote mount を
+  担当します。
+- `ForListeningPort` と `ForExposedPort` は TCP 専用 probe です。UDP は endpoint
+  設定には宣言できますが、UDP readiness request は現在 TCP dial に渡され、timeout
+  または別の TCP listener に接続する可能性があります。#77 が protocol validation を
+  担当します。
+- `Stop` の非 nil timeout は whole second へ truncation し、negative や極端な値を
+  reject しません。#89 が timeout validation を担当します。
+- wait の timeout/cancellation error は error chain に一様に保持されません。#92 が
+  built-in strategy の error contract を担当します。
+- public option の validation は部分的です。negative log tail、zero memory、unknown
+  mount type、reuse-group grammar は一様に reject されません。#102 が typed validation を
+  担当します。
+- reaper は full inspect output を一時 file に staging するため、環境 data が残る
+  可能性があります。#111 が staging exposure と cleanup を担当します。
 
 以下の節は、後続ブランチの動作ではなく、現在の上限を説明します。
 
@@ -164,12 +183,15 @@ loopback（`-p 127.0.0.1::<port>`）、リモートデーモン
 束縛します。`Host` は `127.0.0.1`（`tcp://` の `DOCKER_HOST` ならそのホスト）、
 `MappedPort` は割り当てられたポートを返します。割り当てをデーモンが起動時に
 原子的に行うため、並列テストがポートを奪い合うことはありません。
-remote デーモンで loopback（`127.0.0.1:...`、`[::1]:...`）を明示した
-`WithPublishedPort` はリモート側でしか待受けられないため拒否します。
-`DOCKER_HOST` だけを検出し、remote Docker context は検出しません。
+検出した non-loopback `DOCKER_HOST=tcp://...` デーモンで loopback
+（`127.0.0.1:...`、`[::1]:...`）を明示した `WithPublishedPort` は
+リモート側でしか待受けられないため拒否します。`DOCKER_HOST` だけを
+検出し、remote Docker context は検出しません。
 
-クライアントが `localhost` を要求する場合（または構成上コンテナ IP に
-届かない場合）、ポートを明示的に公開します。
+ローカルの Docker daemon でクライアントが `localhost` を要求する場合
+（または構成上コンテナ IP に届かない場合）、ポートを明示的に公開します。
+以下の loopback example は local-only です。non-loopback の
+`DOCKER_HOST` では loopback binding を reject します。
 
 ```go
 package docexample
@@ -222,7 +244,9 @@ host binding がない場合は `ErrPortNotExposed` を返します。`Container
 含まれますが、どちらも container の lifecycle 中に変更されます。`State`
 は新しい inspect を実行しますが、endpoint の結果には古い値が
 含まれることがあります。この値は immutable な事実ではなく snapshot
-として扱い、動的データの更新は #85 が担当します。
+として扱い、動的データの更新は #85 が担当します。Docker が複数 network を
+報告し top-level address がない場合、現在の network selection は
+決定的な first-network contract ではなく unspecified です。
 
 ## 待機戦略
 
@@ -260,6 +284,26 @@ func ReleasedWaitStrategies() {
 最大 1 秒間隔で停止状態を調べます。`ForExec` は poll 中には fail-fast
 しません。wait の期限到来時にコンテナ状態を調べます。`ForLog` は
 pattern が出る前にログ stream が終了した場合に停止を報告します。
+
+`ForListeningPort` と `ForExposedPort` は TCP 専用の readiness probe です。
+UDP は endpoint 設定には宣言できますが、現在の実装は probe 前に `/udp` を
+reject せず TCP dial に渡します。そのため timeout したりする別の TCP listener に
+接続する可能性があります。不正な port specification も wait の終了まで
+retry されます。#77 を参照してください。
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | 現在の option parser が受理 | endpoint / publish 設定では受理 |
+| `wait.ForListeningPort` | `PORT` または `PORT/tcp` | UDP probe ではない。UDP declaration を TCP dial する場合がある |
+| `wait.ForExposedPort` | 最初の TCP declaration を使う | 解決する場合、最初の UDP declaration も TCP dial に渡される |
+
+### Stop の timeout
+
+非 nil の `Container.Stop` timeout は、両 backend が fractional value を
+truncate して whole seconds に変換します。negative や極端な duration は reject
+されず、timeout を saturation なしで query budget に加算するため、library 側の
+maximum も強制されません。backend 固有の limit が適用されます。#89 を適用する
+までは sub-second、negative、maximum 付近の duration に依存しないでください。
 
 現在の開発チェックアウトには次の API が追加されています。
 これらは `v0.2.0` にはありません。
@@ -310,6 +354,12 @@ context をキャンセルするとバックエンド CLI を停止します。`
 `FollowLogs` を使い、`Logs` は新しい出力を追尾しません。
 `LogsOptions` と `LogsWithOptions` は開発版 API であり、`v0.2.0` には
 ありません。
+
+現在のチェックアウトでは validation は一様ではありません（#102）。
+negative な `LogsOptions.Tail` は 0/all として扱われ、`WithMemory("0")` は現在の
+parser に受理され、unknown な `MountType` は `WithMounts` で reject されず、
+`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。これらは
+現在の動作であり、backend がその設定を受け付ける保証ではありません。
 
 次の例は Docker 固有です。`v0.2.0` 以降に追加された log stream、exec
 option、公開 error symbol も示しますが、Apple の
@@ -440,6 +490,15 @@ reaper の spawn failure は retry 上限後に一度だけ log へ残ります�
 delete failure は shell が無視します。reaper の動作を cleanup の成功確認に
 使わないでください。
 
+現在の reaper は full `inspect` output を namespace のない `mktemp` file に
+staging し、通常の完了または inspect-error path では削除します。reaper が
+kill されると、環境 data を含む file が残る可能性があります。cleanup 前に container-go と reaper
+process を停止し、実効 `TMPDIR` で user 所有の regular file だけを metadata-only
+listing し、affected time window に限定してください。file content を表示・grep
+したり、symlink を追跡したり、broad recursive delete を実行しないでください。
+該当 run に確実に帰属する file だけを削除し、inspect output に含まれた可能性が
+ある credential を rotate してください（#111）。これは no-leak 保証ではありません。
+
 `CONTAINERGO_KEEP=1` は `Cleanup`、`TerminateContainer`、reaper 登録を
 省略し、コンテナを調査用に残します。明示的な `Container.Terminate`、
 作成後の失敗に対する rollback、create 失敗後の best-effort cleanup の
@@ -514,6 +573,10 @@ func TestReuse(t *testing.T) {
   name を使います。
 - `Cleanup` / `TerminateContainer` / watchdog reaper は reused handle を
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを削除できる。
+- 名前単位の `flock` は通常の library delete / cleanup 経路を保護するが、
+  外部 reaper はその lock を取らない。reaper の inspect / delete window は
+  same-name replacement と競合する。#83/#84 と #98 の reaper coordination が
+  適用されるまで generation guard を不完全として扱う。
 - `container.PruneReuseGroup(ctx, "integration")` はその group の
   コンテナを強制削除する（CI teardown）。group は再利用 key ではなく
   label である。通常の `Prune` は上記の backend filter を使い、現在の
@@ -544,7 +607,7 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 | Dockerfile からの build | スコープ外（`container build` / `docker build` を直接使用） |
 | Ryuk reaper container | ローカルの watchdog reaper process で代替。ただし上記の制限がある |
 | random host port mapping | Apple はコンテナ IP へ直接接続。Docker はランダム loopback port へ自動公開 |
-| network / volume の作成と lifecycle 管理 | 当面スコープ外。`WithNetwork` は既存 network へ接続し、`WithMounts` は mount 指定を受け取る |
+| network / volume の作成と lifecycle 管理 | 当面スコープ外。`WithNetwork` は既存 network へ接続し、`WithMounts` は mount 指定を受け取るが、Windows / remote bind source の制限は #76 |
 | `GenericContainerRequest.Reuse` | `WithReuse` + `WithName`: process 間 get-or-create。再 wait 必須、Cleanup / reaper は所有しない |
 
 ## 開発
@@ -554,7 +617,7 @@ make test                # backend 不要の unit test
 make vet
 make integration         # integration test（bench / singleflight を除外）。backend がなければ skip
 make integration-docker  # Docker backend の integration test のみ
-make bench-integration   # pull が重い bench / singleflight
+make bench-integration   # pull が重い bench / singleflight（bench module は Go 1.25+）
 ```
 
 Integration test の image は Docker Hub の匿名 pull 制限を避けるため

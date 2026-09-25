@@ -135,7 +135,8 @@ func WithReuse() Option {
 
 // WithReuseGroup tags a reused container for later PruneReuseGroup.
 // The group is not part of the reuse key; WithName alone identifies the
-// shared container. Requires WithReuse.
+// shared container. Requires WithReuse. PruneReuseGroup currently applies
+// a weaker, separate validation grammar (#102).
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
 		if group == "" {
@@ -245,8 +246,10 @@ func WithExposedPorts(ports ...string) Option {
 // ("[host-ip:]host-port:container-port[/proto]"). Apple normally uses
 // the container's own IP, while Docker auto-publishes ports declared with
 // WithExposedPorts to daemon-assigned host ports. Use WithPublishedPort
-// when a caller needs a specific host binding; on a remote Docker daemon a
-// loopback bind is rejected because it would listen on the remote machine.
+// when a caller needs a specific host binding; when Docker is selected
+// through a non-loopback tcp:// DOCKER_HOST, a loopback bind is rejected
+// because it would listen on the remote machine. A remote Docker context
+// is not detected by this validation.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)
@@ -282,7 +285,9 @@ func WithLabels(labels map[string]string) Option {
 	}
 }
 
-// WithMounts adds bind, volume, or tmpfs mounts.
+// WithMounts adds bind, volume, or tmpfs mounts. On this checkout,
+// bind-source validation requires a Unix-style absolute path; Windows
+// host paths and remote Docker bind-source semantics are pending #76.
 func WithMounts(mounts ...Mount) Option {
 	return func(c *config) error {
 		for _, m := range mounts {
@@ -309,7 +314,9 @@ func WithCPUs(n int) Option {
 // memoryRE accepts sizes like "512M" or "1G".
 var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
 
-// WithMemory sets the VM memory size, e.g. "512M" or "1G".
+// WithMemory sets the VM memory size, e.g. "512M" or "1G". The
+// current parser accepts zero and does not enforce backend capability
+// limits; see #102.
 func WithMemory(size string) Option {
 	return func(c *config) error {
 		if !memoryRE.MatchString(size) {
@@ -387,8 +394,8 @@ const (
 // Mount describes one filesystem mount.
 type Mount struct {
 	Type     MountType
-	Source   string // host path (bind) or volume name (volume); empty for tmpfs
-	Target   string // absolute path inside the container
+	Source   string // host path (bind; current validation is Unix-style) or volume name (volume); empty for tmpfs
+	Target   string // absolute POSIX path inside the container
 	ReadOnly bool
 }
 

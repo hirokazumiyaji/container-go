@@ -42,7 +42,8 @@ func Cleanup(tb testing.TB, ctr *Container) {
 // the active backend's list filter. Apple selects managed containers in
 // the stopped state. The current Docker filter selects managed containers
 // in the exited state only; dead-state selection is tracked by issue #113.
-// It returns the IDs it removed.
+// It returns the backend list identifiers it removed; Docker currently
+// returns container names.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {

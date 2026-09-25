@@ -9,8 +9,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 This section describes development after the tagged `v0.2.0` release.
 The APIs listed under this section are not part of `v0.2.0` unless a
-release note explicitly says otherwise. The current checkout requires Go
-1.23 or later; the tagged `v0.2.0` module requires Go 1.27 or later.
+release note explicitly says otherwise. The root checkout requires Go
+1.23 or later; the nested `bench/` module requires Go 1.25 or later;
+the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
@@ -63,11 +64,17 @@ release note explicitly says otherwise. The current checkout requires Go
 - Dynamic endpoint cache refresh is tracked by issue #85; the current
   first-inspect cache can expose stale IP or binding data.
 - Reuse ownership and final generation verification are tracked by issues
-  #83 and #84; this base still has missing-generation and post-wait
+  #83 and #84; reaper coordination with the Apple name lock is tracked by
+  #98. This base still has missing-generation, post-wait, and reaper-lock
   fail-open paths.
 - Docker deletion uses an immutable ID on this base, but other operations
   still address the logical name; #74 tracks the stale-handle fix.
 - Docker `Prune` does not select dead containers until issue #113.
+- Windows and remote bind-source handling is qualified by issue #76;
+  `ForListeningPort`/`ForExposedPort` remain TCP-only until #77.
+- `Stop` timeout validation/rounding is pending #89; wait error-chain
+  normalization is pending #92; public option validation gaps are tracked
+  by #102; reaper staging exposure and mitigation are tracked by #111.
 
 ## [0.2.0] - 2026-09-02
 

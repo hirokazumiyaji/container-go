@@ -26,7 +26,8 @@ func TestExampleNginx(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Direct container-IP access: no published host port needed.
+	// Apple uses the container IP directly; Docker uses the
+	// daemon-assigned published endpoint for this exposed port.
 	endpoint, err := ctr.Endpoint(ctx, "80/tcp")
 	if err != nil {
 		t.Fatal(err)

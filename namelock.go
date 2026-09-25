@@ -15,15 +15,16 @@ import (
 // container name across processes on this host. Apple Container has no
 // immutable container ID, so an inspect-then-delete by name is only
 // safe for a non-empty, matching generation if no other process can
-// delete and recreate the name in between. The generation-checked paths
-// in this library take this lock first; an empty-generation legacy path
-// does not. That covers cooperating processes using this library only:
-// a direct `container` CLI invocation or another implementation does not
-// take the lock and can still replace the name inside the window. Closing
-// that would need an immutable ID or an atomic conditional delete from
-// the backend, which Apple Container does not offer. The lock file lives
-// in the temp directory and is never removed, since removing it would
-// race with a concurrent locker.
+// delete and recreate the name in between. The ordinary library
+// delete/cleanup paths take this lock first; an empty-generation legacy
+// path and the external reaper do not. The lock therefore serializes
+// cooperating library processes, but not the reaper's inspect/delete
+// window or a direct `container` CLI invocation. Closing that race would
+// need an immutable ID or an atomic conditional delete from the backend,
+// which Apple Container does not offer; #98 tracks coordinating the
+// reaper with this lock, while #83/#84 track the broader generation and
+// ownership boundary. The lock file lives in the temp directory and is
+// never removed, since removing it would race with a concurrent locker.
 func lockName(ctx context.Context, name string) (unlock func(), err error) {
 	f, err := os.OpenFile(filepath.Join(os.TempDir(), "containergo-"+name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {

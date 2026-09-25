@@ -12,8 +12,9 @@ The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The install command below is for the released
 API; it does not install the development-only APIs documented below.
 
-The current checkout requires Go 1.23 or later. The `v0.2.0` module
-requires Go 1.27 or later.
+The root library checkout requires Go 1.23 or later. The nested
+`bench/` module used by `make bench-integration` requires Go 1.25 or
+later. The `v0.2.0` module requires Go 1.27 or later.
 
 | API or behavior | `v0.2.0` | Current development checkout |
 |---|---|---|
@@ -49,6 +50,23 @@ backend-specific behavior. In particular:
   operation-target fix.
 - Docker `Prune` currently selects exited containers, not containers in the
   dead state; #113 tracks dead-state coverage.
+- The external Apple reaper does not take the per-name lock; #98 tracks
+  coordinating that inspect/delete window with ordinary library paths.
+- Windows Docker bind sources and remote Docker bind-source semantics are
+  not supported by the current validation path; #76 tracks host-path and
+  remote-mount handling.
+- `ForListeningPort` and `ForExposedPort` are TCP-only probes. UDP may be
+  declared for endpoint configuration, but a UDP readiness request is
+  currently passed to a TCP dial; #77 tracks protocol validation.
+- `Stop` converts non-nil durations to whole seconds by truncation and does
+  not reject negative or extreme values; #89 tracks timeout validation.
+- Wait timeout/cancellation errors are not uniformly preserved in the
+  error chain; #92 tracks the built-in strategy error contract.
+- Public option validation is partial: negative log tails, zero memory,
+  unknown mount types, and reuse-group grammar are not uniformly rejected;
+  #102 tracks the typed validation work.
+- The reaper can stage full inspect output, including environment data, in
+  a temporary file; #111 tracks the staging exposure and cleanup gap.
 
 The sections below describe these current limitations rather than the
 behavior of those follow-up branches.
@@ -165,14 +183,17 @@ testcontainers model. Locally this binds loopback (`-p
 so the client can reach it. `Host` returns `127.0.0.1` (or the host from a
 `tcp://` `DOCKER_HOST`) and `MappedPort` returns the assigned port.
 Assignment happens atomically in the daemon, so parallel tests do not race
-over ports here either. With a remote daemon, an explicit
-`WithPublishedPort` bound to loopback (`127.0.0.1:...`, `[::1]:...`) is
-rejected, since it would only listen on the remote machine. Only
+over ports here either. With a detected non-loopback
+`DOCKER_HOST=tcp://...` daemon, an explicit `WithPublishedPort` bound to
+loopback (`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only
+listen on the remote machine. Only
 `DOCKER_HOST` is honored; a `docker context` pointing at a remote daemon
 is not detected.
 
-When a client insists on `localhost` (or the container IP is not reachable
-in your setup), publish the port explicitly:
+For a local Docker daemon, when a client insists on `localhost` (or the
+container IP is not reachable in your setup), publish the port
+explicitly. The loopback example below is local-only; a non-loopback
+`DOCKER_HOST` rejects loopback bindings.
 
 ```go
 package docexample
@@ -225,7 +246,10 @@ endpoint-related methods. The cached record includes the container IP and
 host-side bindings, even though both can change during the container's
 lifetime. `State` performs a fresh inspect, but an endpoint result can
 therefore be stale. Treat these values as a snapshot rather than as
-immutable facts; issue #85 tracks the refresh fix.
+immutable facts; issue #85 tracks the refresh fix. If Docker reports
+multiple networks and no top-level address, network selection is
+currently unspecified rather than a deterministic first-network
+contract.
 
 ## Wait strategies
 
@@ -264,6 +288,27 @@ strategies probe the stopped state at most once per second. `ForExec` does
 not fail fast while polling; it checks the container state when its wait
 deadline expires. `ForLog` reports a stopped container when its log stream
 ends before the pattern appears.
+
+`ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
+UDP may be declared for endpoint configuration, but the current
+implementation does not reject `/udp` before probing: it is passed to a
+TCP dial and may time out or reach an unrelated TCP listener. Malformed
+port specifications are likewise retried until the wait ends. See #77.
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | Accepted by the current option parser | Accepted for endpoint/publish configuration |
+| `wait.ForListeningPort` | `PORT` or `PORT/tcp` | Not a UDP probe; a UDP declaration may be TCP-dialed |
+| `wait.ForExposedPort` | Uses the first TCP declaration | If it resolves, a first UDP declaration is still passed to a TCP dial |
+
+### Stop timeouts
+
+For a non-nil `Container.Stop` timeout, both current backends convert the
+value to whole seconds by truncating fractional values; negative and
+extreme durations are not rejected, and the duration is added to the
+query budget without saturation. No library-side maximum is enforced;
+backend-specific limits apply. Do not rely on sub-second, negative, or
+near-maximum durations until #89 is applied.
 
 The current development checkout adds the following APIs, which are not in
 `v0.2.0`:
@@ -314,6 +359,13 @@ does not add a byte cap. `FollowLogs` returns a streaming `io.ReadCloser`; close
 cancel its context to stop the backend CLI. `ForLog` uses `FollowLogs`, while
 `Logs` does not follow new output. `LogsOptions` and `LogsWithOptions` are
 current-development APIs, not part of `v0.2.0`.
+
+Validation is not uniform in this checkout (#102): a negative
+`LogsOptions.Tail` is treated as zero/all, `WithMemory("0")` is accepted
+by the current parser, unknown `MountType` values are not rejected by
+`WithMounts`, and `PruneReuseGroup` accepts a weaker grammar than
+`WithReuseGroup`. These are current behaviors, not guarantees that the
+backend will accept the resulting configuration.
 
 The example below is Docker-specific. It also shows the log stream, exec
 options, and public error symbols added after `v0.2.0`; it is not an Apple
@@ -449,6 +501,17 @@ Repeated reaper spawn failures are logged once after the retry limit;
 delete failures are ignored by the shell. Do not use reaper behavior as a
 cleanup acknowledgement.
 
+The current reaper stages the full `inspect` output in an un-namespaced
+`mktemp` file and removes it on its ordinary completion or inspect-error
+paths. If the reaper is killed, a file containing environment data can
+remain. Before cleanup, stop container-go and reaper processes, then use a
+metadata-only listing of regular files owned by the user in the effective
+`TMPDIR`, restricted to the affected time window. Do not print or grep
+file contents, follow symlinks, or run a broad recursive delete. Remove
+only files positively tied to the affected run, and rotate credentials
+that may have appeared in inspect output (#111). This is not a no-leak
+guarantee.
+
 `CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`, and reaper
 registration so containers can be inspected during debugging. It does not
 change explicit `Container.Terminate`, rollback after a post-create
@@ -527,6 +590,10 @@ Contract:
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
+- The per-name `flock` protects ordinary library delete/cleanup paths, but
+  the external reaper does not take that lock; its inspect/delete window
+  can still race a same-name replacement. Treat the generation guard as
+  incomplete until #83/#84 and the reaper coordination in #98 are applied.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). The group is a label,
   not part of the reuse key. Ordinary `Prune` uses the backend filter
@@ -559,7 +626,7 @@ Not supported (Apple Container has no equivalent, or out of scope):
 | Building from a Dockerfile | Out of scope (use `container build` / `docker build` yourself) |
 | Ryuk reaper container | Replaced by the local watchdog reaper process, with the limitations described above |
 | Random host port mapping | Apple backend connects to the container IP directly; Docker backend auto-publishes to random loopback ports |
-| Network/volume creation and lifecycle management | Out of scope for now; `WithNetwork` attaches an existing network and `WithMounts` accepts mounts |
+| Network/volume creation and lifecycle management | Out of scope for now; `WithNetwork` attaches an existing network and `WithMounts` accepts mounts, with current Windows/remote bind-source limitations pending #76 |
 | `GenericContainerRequest.Reuse` | `WithReuse` + `WithName`: cross-process get-or-create with mandatory re-wait and no Cleanup/reaper ownership |
 
 ## Development
@@ -569,7 +636,7 @@ make test                # unit tests (no backend needed)
 make vet
 make integration         # integration tests (skips bench/singleflight); each backend skips if unavailable
 make integration-docker  # Docker-backend integration tests only
-make bench-integration   # pull-heavy bench and singleflight scenarios
+make bench-integration   # pull-heavy bench and singleflight (bench module needs Go 1.25+)
 ```
 
 Integration tests pull library images via `public.ecr.aws/docker/library/...`

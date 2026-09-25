@@ -10,8 +10,9 @@ import (
 )
 
 // WithWaitStrategy blocks Run until the strategy reports the container
-// ready. On failure the container is removed and the error carries a
-// tail of its logs.
+// ready. On failure, a non-reuse Run attempts to remove the container
+// and, when available, attaches a bounded tail of its logs; a reuse wait
+// leaves the shared container in place.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
 		c.waitStrategy = s

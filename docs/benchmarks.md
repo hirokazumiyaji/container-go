@@ -20,10 +20,11 @@ Run→ready measurement infrastructure for the performance issues
   counting scenarios. Each `Run` shape runs against a real backend
   wrapped in a counting runner; every iteration records duration and
   spawn count.
-- `bench/`: separate Go module holding the testcontainers-go
-  comparison. The dependency on testcontainers-go lives only here so
-  the library keeps its zero-dependency constraint. `result.go`
-  re-exports the shared schema; `scenario_test.go` (`integration` tag)
+- `bench/`: separate Go module (requires Go 1.25+) holding the
+  testcontainers-go comparison. The dependency on testcontainers-go
+  lives only here so the library keeps its zero-dependency constraint.
+  `result.go` re-exports the shared schema; `scenario_test.go`
+  (`integration` tag)
   runs the wall-clock scenarios.
 
 ## Scenarios
@@ -54,8 +55,8 @@ make bench-integration
 
 This runs the counting scenarios (`go test -tags integration -run
 TestIntegrationBench ./...`) and the bench module (testcontainers-go
-comparison). Backends that are not available are skipped, same as the
-other integration tests:
+comparison). The nested `bench/` module requires Go 1.25+; backends that
+are not available are skipped, same as the other integration tests:
 
 - docker: needs the `docker` CLI and a running daemon
 - apple: needs the `container` CLI and `container system start` to

@@ -102,9 +102,10 @@ type Container struct {
 }
 
 // Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
-// WithReuse for the shared-handle lifecycle.
+// returns a handle to it. On failure after creation, a non-reuse Run
+// attempts to remove the container before returning. A WithReuse wait
+// failure leaves the shared container in place; see WithReuse for the
+// shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -175,8 +176,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
+	// test runner there is nothing external to clean up. An immutable
+	// ID can be used as a deletion target, but this checkout still
+	// rejects full Docker IDs during reaper registration; #73 is required
+	// before the reaper can register them.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
 		bin := er.ExternalBinary()
 		if bin == "" {
@@ -300,7 +303,11 @@ func (c *Container) State(ctx context.Context) (State, error) {
 }
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
-// period before the process is killed.
+// period before the process is killed. For a non-nil timeout, the
+// current backends convert the value to whole seconds by truncating
+// fractional values; negative and extreme durations are not rejected,
+// and the library adds the duration to its query budget without
+// saturation. No library-side maximum is enforced; see #89.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
@@ -358,8 +365,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	return c.classify(ctx, err)
 }
 
-// ContainerIP returns the container's address on its first attached
-// network. With the Docker backend on Docker Desktop this address is
+// ContainerIP returns the address reported for the container. Apple
+// inspect data uses the first attached network. For Docker, selection
+// among multiple networks is unspecified when no top-level address is
+// present. With the Docker backend on Docker Desktop this address is
 // usually not reachable from the host; prefer Endpoint. On this checkout
 // the first successful endpoint inspect is cached, so a later network
 // change can leave this value stale; issue #85 tracks refreshing dynamic

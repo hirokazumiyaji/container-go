@@ -17,8 +17,9 @@ import (
 
 // dockerEngine drives the `docker` CLI. Unlike Apple Container, the
 // container IP is generally not reachable from the host (Docker
-// Desktop), so exposed ports are published to daemon-assigned loopback
-// ports and endpoints resolve to those.
+// Desktop), so exposed ports are published to daemon-assigned host ports
+// and endpoints resolve to those (loopback locally; all interfaces for a
+// detected non-loopback tcp:// DOCKER_HOST).
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
@@ -42,9 +43,10 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
-// checkConfig rejects explicit loopback publish binds on a remote
-// daemon: Docker would listen on the remote machine's loopback, which
-// no rewrite of the client-facing address can make reachable.
+// checkConfig rejects explicit loopback publish binds on a detected
+// non-loopback tcp:// DOCKER_HOST: Docker would listen on the remote
+// machine's loopback, which no rewrite of the client-facing address can
+// make reachable. A remote Docker context is not detected.
 func (dockerEngine) checkConfig(cfg *config) error {
 	if !isRemoteDockerHost() {
 		return nil
@@ -67,9 +69,10 @@ func (dockerEngine) probe() cli.Probe {
 	}
 }
 
-// defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
-// else publishes on loopback. Note: a `docker context` pointing at a
-// remote daemon is not detected; only DOCKER_HOST is honored.
+// defaultHost honors a non-loopback tcp:// DOCKER_HOST (the detected
+// remote daemon); everything else publishes on loopback. Note: a
+// `docker context` pointing at a remote daemon is not detected; only
+// DOCKER_HOST is honored.
 func (dockerEngine) defaultHost() string {
 	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
 		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
@@ -102,10 +105,10 @@ func isLoopbackOrUnspecified(addr string) bool {
 }
 
 // dockerConnectHost rewrites binds to the client-facing host. On a
-// remote daemon, loopback and unspecified addresses become
-// defaultHost(). Locally, unspecified binds still map to defaultHost(),
-// but an explicit loopback (127.0.0.1, ::1, …) is preserved so an
-// IPv6-only published port stays reachable.
+// detected non-loopback tcp:// DOCKER_HOST, loopback and unspecified
+// addresses become defaultHost(). Locally, unspecified binds still map
+// to defaultHost(), but an explicit loopback (127.0.0.1, ::1, …) is
+// preserved so an IPv6-only published port stays reachable.
 func dockerConnectHost(addr string, eng engine) string {
 	if isRemoteDockerHost() {
 		if isLoopbackOrUnspecified(addr) {

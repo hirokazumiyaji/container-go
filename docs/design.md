@@ -250,8 +250,11 @@ stream that ends before the pattern is found. A stopping, stopped, or
 paused container fails the wait without burning the remaining timeout.
 Created, restarting, unknown, and transient inspect states remain
 retryable; transient log-stream open and EOF failures reopen the stream,
-while a terminal log-stream error is returned. `ForLog` counts occurrences
-across reconnects after de-duplicating the replayed log prefix. Failed
+while a terminal log-stream error is returned. A marker match is accepted
+only after a bounded final lifecycle observation reports `Running`; `ForLog`
+therefore targets long-lived services rather than one-shot job completion.
+`ForLog` counts occurrences across reconnects after de-duplicating the
+replayed log prefix. Failed
 waits carry a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:

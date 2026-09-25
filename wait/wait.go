@@ -20,6 +20,9 @@ const (
 	// stateCheckInterval bounds lifecycle probes during an ongoing
 	// readiness poll. Stream failures are reclassified immediately.
 	stateCheckInterval = time.Second
+	// finalLifecycleProbeTimeout matches the backend query budget. It is
+	// clamped by the strategy's remaining context rather than replacing it.
+	finalLifecycleProbeTimeout = 30 * time.Second
 )
 
 // ErrTargetNotFound can wrap a Target method error when the target no

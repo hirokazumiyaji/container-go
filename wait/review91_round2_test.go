@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +14,35 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
+
+type review91RealStreamTarget struct {
+	binary string
+}
+
+func (*review91RealStreamTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*review91RealStreamTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*review91RealStreamTarget) State(context.Context) (State, error)  { return StateRunning, nil }
+func (t *review91RealStreamTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	return (&cli.ExecRunner{Binary: t.binary}).Stream(ctx)
+}
+func (*review91RealStreamTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+func TestReview91ForLogSucceedsAfterRealStreamSettleClose(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell stream fixture is unavailable on Windows")
+	}
+	binary := filepath.Join(t.TempDir(), "log-stream")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf 'ready\\n'\nexec sleep 10\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), &review91RealStreamTarget{binary: binary}); err != nil {
+		t.Fatalf("ForLog with a real stream: %v", err)
+	}
+}
 
 func TestReview91ForLogMatchesCleanUnterminatedFinalLine(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)

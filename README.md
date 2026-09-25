@@ -145,8 +145,10 @@ unbounded and lets each child strategy's timeout apply.
 Waiting fails fast when the container is stopping, stopped, or paused.
 Created, restarting, unknown, and transient inspect states retry under the
 timeout; transient log stream open/EOF failures are reopened, while a
-terminal log-stream error is returned. `ForLog` counts occurrences across
-reconnects after de-duplicating the replayed log prefix. A failed wait rolls
+terminal log-stream error is returned. A successful marker is accepted only
+after a bounded final lifecycle observation reports `Running`; `ForLog` is for
+long-lived services, not one-shot job completion. `ForLog` counts occurrences
+across reconnects after de-duplicating the replayed log prefix. A failed wait rolls
 the container back with a tail of its logs attached to the error.
 
 For custom strategies, `wait.Target` retains its original `Running` method.

@@ -174,7 +174,7 @@ func (s review91WaitForFirstStateStrategy) WaitUntilReady(context.Context, Targe
 func TestReview91CompositeFinalLifecycleCheckIsBounded(t *testing.T) {
 	target := &review91SlowFinalStateTarget{firstStateDone: make(chan struct{})}
 	start := time.Now()
-	err := ForAll(review91WaitForFirstStateStrategy{done: target.firstStateDone}).WaitUntilReady(context.Background(), target)
+	err := ForAll(review91WaitForFirstStateStrategy{done: target.firstStateDone}).WithStartupTimeout(100*time.Millisecond).WaitUntilReady(context.Background(), target)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want bounded final lifecycle deadline", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,9 @@ import (
 )
 
 func TestReview91ForLogReturnsTerminalFollowError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell stream fixture is unavailable on Windows")
+	}
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then
@@ -54,6 +58,9 @@ exit 17
 }
 
 func TestReview91FollowLogsClassifiesTerminalNotFound(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX shell stream fixture is unavailable on Windows")
+	}
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then

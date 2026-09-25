@@ -65,9 +65,10 @@ func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
 }
 
 type logScanResult struct {
-	matches int
-	err     error
-	replay  logReplay
+	matches          int
+	err              error
+	replay           logReplay
+	intentionalClose bool
 }
 
 // logReplay is a fixed-size cursor over the longest complete log history
@@ -162,7 +163,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				if terminalErr := logContextTermination(callerCtx, waitCtx); terminalErr != nil {
 					return logContextScanError(callerCtx, waitCtx, what, timeout, lastCheckErr, terminalErr)
 				}
-				if terminalErr != nil {
+				if terminalErr != nil && (!scanResult.intentionalClose || !errors.Is(terminalErr, io.EOF)) {
 					return fmt.Errorf("%s: %w", what, terminalErr)
 				}
 				finalErr := finalLifecycleCheck(waitCtx, target, what)
@@ -281,7 +282,7 @@ func (s *LogStrategy) scanStream(
 					// settleScanner owns the scanner until it has
 					// stopped reading; its close-induced read error is
 					// not a transport failure.
-					results <- logScanResult{matches: scanMatches, replay: next}
+					results <- logScanResult{matches: scanMatches, replay: next, intentionalClose: true}
 					return
 				}
 				break

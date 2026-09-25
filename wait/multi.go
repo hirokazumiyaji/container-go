@@ -226,18 +226,18 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+	probeCtx, cancel := context.WithTimeout(ctx, finalLifecycleProbeTimeout)
 	defer cancel()
 	if err := probeCtx.Err(); err != nil {
-		return err
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
 	}
 	state, err := targetState(probeCtx, target)
 	probeErr := probeCtx.Err()
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return ctxErr
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, ctxErr), ctxErr, err)
 	}
 	if probeErr != nil {
-		return probeErr
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, probeErr), probeErr, err)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: final lifecycle check: %w", what, err)

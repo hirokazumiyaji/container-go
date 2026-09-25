@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -128,8 +129,11 @@ func TestDockerPruneIDListRevalidatesOwnershipAndGroup(t *testing.T) {
 		t.Fatal("matching Docker ID candidate was rejected")
 	}
 	fresh.state = StateRunning
-	if pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
-		t.Fatal("running Docker candidate was accepted")
+	if !pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
+		t.Fatal("running Docker reuse-group candidate was rejected")
+	}
+	if pruneCandidateStillCurrent(candidates[0], fresh, "") {
+		t.Fatal("running Docker candidate was accepted by ordinary Prune")
 	}
 }
 
@@ -159,6 +163,40 @@ func TestAppleReuseGroupRequiresListTimeGeneration(t *testing.T) {
 		if len(call) > 0 && (call[0] == "inspect" || call[0] == "delete") {
 			t.Fatalf("missing list generation reached name operation: %v", call)
 		}
+	}
+}
+
+type dockerRunningGroupRunner struct {
+	uid     string
+	deleted []string
+}
+
+func (r *dockerRunningGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "ps":
+		return []byte(r.uid + "\n"), nil, nil
+	case "inspect":
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Created":"2026-08-19T01:23:45.678901234Z","Name":"/group-member","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:%q,%q:%q}}}]`, r.uid, managedLabel, reuseLabel, creationLabel, "0123456789abcdef", reuseGroupLabel, "ci")), nil, nil
+	case "rm":
+		r.deleted = append(r.deleted, args[len(args)-1])
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestDockerPruneReuseGroupRemovesRunningMember(t *testing.T) {
+	uid := strings.Repeat("d", 64)
+	r := &dockerRunningGroupRunner{uid: uid}
+	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "ci")
+	if err != nil {
+		t.Fatalf("PruneReuseGroup: %v", err)
+	}
+	if !slices.Equal(removed, []string{uid}) {
+		t.Fatalf("removed = %v, want [%s]", removed, uid)
+	}
+	if !slices.Equal(r.deleted, []string{uid}) {
+		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
 	}
 }
 

@@ -115,7 +115,7 @@ func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 			!validCreationGeneration(info.labels[creationLabel]) {
 			return false, fmt.Errorf("%s %s: candidate is not a managed generation", errKind, id)
 		}
-		if info.state != StateStopped {
+		if reuseGroup == "" && info.state != StateStopped {
 			return false, fmt.Errorf("%s %s: candidate is no longer stopped", errKind, id)
 		}
 		if reuseGroup != "" {
@@ -193,9 +193,10 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 		return false
 	}
 	// Docker's ID-only list has no creation/state metadata. In that case
-	// the fresh inspect is the first complete snapshot, so require the
-	// stopped state and a valid ownership generation there. Apple list
-	// records carry a complete snapshot and must match it exactly.
+	// ordinary Prune uses the fresh inspect as the first complete snapshot
+	// and requires a stopped state; group cleanup is a force operation and
+	// may target running members. Apple list records carry a complete
+	// snapshot and must match it exactly.
 	if candidate.creation != "" && !validCreationGeneration(candidate.creation) {
 		return false
 	}
@@ -210,7 +211,10 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 		if fresh.state != candidate.state {
 			return false
 		}
-	} else if fresh.state != StateStopped {
+	} else if reuseGroup == "" && fresh.state != StateStopped {
+		// Ordinary Prune is limited to stopped candidates. A reuse-group
+		// sweep is explicitly a force-remove operation and may include
+		// running members; its group/ownership checks still ran above.
 		return false
 	}
 	if reuseGroup != "" {

@@ -287,7 +287,10 @@ which no signal handler can.
 The CLI has no label filter, so orphan sweeps filter
 `container ls -a --format json` client-side. A helper `Prune(ctx)`
 removes stopped containers carrying the managed label from any
-session.
+session. On Apple Container the list-time creation generation, managed
+label, and state are rechecked with a fresh inspect while the per-name
+flock is held; a stale or foreign candidate is skipped rather than
+name-deleted.
 
 Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
 reaper (for debugging).
@@ -312,12 +315,16 @@ needed: a replacement never shares the ID. Apple Container addresses
 containers by name only, so there the delete is name-based: the
 generation must match a fresh inspect, and inspect plus delete run
 under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
-limited to cooperating processes using this library on the same host:
-a direct `container delete` plus re-create by an external tool inside
-that window is indistinguishable by name, and closing it would need an
-immutable ID or an atomic conditional delete that Apple Container does
-not provide. An inspect
+that every such delete in this library takes. The create path takes the
+same lock around the `run` command, so a library peer cannot replace a
+name between a prune's checks and delete. `Prune` and
+`PruneReuseGroup` retain the list-time generation, managed/group labels,
+and state, and skip a candidate when any of them no longer match. That
+guarantee is limited to cooperating processes using this library on the
+same host: a direct `container delete` plus re-create by an external
+tool inside that window is indistinguishable by name, and closing it
+would need an immutable ID or an atomic conditional delete that Apple
+Container does not provide. An inspect
 failure other than not-found aborts the delete (fail closed); `Run`'s
 rollback reports a container left behind that way in its error rather
 than hiding it. The watchdog reaper registers Docker containers by

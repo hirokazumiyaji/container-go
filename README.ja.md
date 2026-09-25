@@ -147,6 +147,9 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。
+  Apple Container では、名前ごとのロックを保持したまま各候補を再検査し、
+  世代、managed ラベル、状態が一致する場合だけ削除します。
+  ロックを取得しない直接の `container` CLI による削除と再作成は、この保証の対象外です。
 
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 
@@ -176,7 +179,9 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
-  コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
+  コンテナを強制削除する(CI 終了時)。
+  Apple Container では `Prune` と同じ世代、managed ラベル、グループ、
+  状態の再検査と名前ロックを適用する。通常の `Prune` は stopped のみ。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って

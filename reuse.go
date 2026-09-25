@@ -151,8 +151,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
@@ -388,8 +391,12 @@ func stripImageDigest(ref string) string {
 }
 
 // PruneReuseGroup force-removes every container tagged with the given
-// WithReuseGroup value, running or stopped. Use it as a CI teardown
-// step; ordinary Prune still only removes stopped managed containers.
+// WithReuseGroup value, running or stopped. On Apple Container, the
+// list-time generation, managed label, group, and state are rechecked under
+// the per-name lock before a name-based delete. Use it as a CI teardown
+// step; ordinary Prune still only removes stopped managed containers. A
+// direct Apple Container CLI replacement outside the lock is outside the
+// guarantee.
 func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if group == "" {
 		return nil, fmt.Errorf("reuse group must not be empty")
@@ -402,7 +409,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]pruneCandidate, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group)
+	}, "prune reuse group "+group, group)
 }

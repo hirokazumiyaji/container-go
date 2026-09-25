@@ -308,8 +308,12 @@ func (dockerEngine) listArgs() []string {
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+	var candidates []pruneCandidate
+	for _, id := range splitNonEmptyLines(data) {
+		candidates = append(candidates, pruneCandidate{id: id, managed: true})
+	}
+	return candidates, nil
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -347,9 +351,15 @@ func (dockerEngine) listReuseGroupArgs(group string) []string {
 	}
 }
 
-func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
+	var candidates []pruneCandidate
+	for _, id := range splitNonEmptyLines(data) {
+		candidates = append(candidates, pruneCandidate{id: id, managed: true})
+	}
+	return candidates, nil
 }
+
+func (dockerEngine) nameAddressedDeletes() bool { return false }
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {

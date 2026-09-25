@@ -176,7 +176,11 @@ Extras:
 - `CONTAINERGO_KEEP=1` keeps containers around for debugging.
 - `container.Prune(ctx)` removes stopped containers this library
   created in any previous session (they carry the
-  `com.github.hirokazumiyaji.container-go` label).
+  `com.github.hirokazumiyaji.container-go` label). On Apple Container,
+  pruning re-inspects each candidate under a per-name lock and requires
+  its generation, managed label, and state to still match. A direct
+  `container` CLI delete/re-create that does not take the lock remains
+  outside this guarantee.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -212,8 +216,10 @@ Contract:
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
-  container tagged with that group (CI teardown). Ordinary `Prune` still
-  only deletes stopped managed containers.
+  container tagged with that group (CI teardown). On Apple Container it
+  applies the same fresh generation, managed/group-label, state, and
+  per-name lock checks as `Prune`. Ordinary `Prune` still only deletes
+  stopped managed containers.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup

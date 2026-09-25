@@ -199,7 +199,9 @@ type Strategy interface {
 - `com.github.hirokazumiyaji.container-go.session`：プロセスごとの乱数 ID
 
 CLI にラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側でフィルタして行う。
-この掃除を行うヘルパー `Prune(ctx)` (自セッション以外も含め、本ライブラリのラベルを持つ停止済みコンテナを削除する)を提供する。
+この掃除を行うヘルパー `Prune(ctx)` は、停止済みコンテナを削除する。
+Apple Container では、一覧時の世代、managed ラベル、状態を残し、名前ごとの `flock` を保持したまま再検査する。
+一致しない候補は削除せず、直接の CLI による置換にはこの保証を適用しない。
 
 環境変数 `CONTAINERGO_KEEP=1` を設定した場合、`Cleanup` とリーパーは削除を行わない(デバッグ用)。
 
@@ -331,6 +333,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
 `Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+Apple Container では、作成時と削除時の同じ名前ロック、作成世代、managed ラベル、状態の再検査を使う。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
 

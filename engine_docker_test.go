@@ -150,12 +150,12 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {
 		t.Errorf("listArgs = %v, want daemon-side filters", got)
 	}
-	ids, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	candidates, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []string{"one", "two"}) {
-		t.Errorf("ids = %v", ids)
+	if len(candidates) != 2 || candidates[0].id != "one" || candidates[1].id != "two" {
+		t.Errorf("candidates = %+v", candidates)
 	}
 }
 

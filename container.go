@@ -158,8 +158,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
@@ -206,6 +209,22 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 	}
 	return c, nil
+}
+
+// runCreateLocked serializes a name-addressed create with the guarded
+// prune/delete paths. The attempted result is separate from the error so
+// callers do not run failed-create cleanup when acquiring the lock itself
+// failed and no create command was issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
+	if cfg.eng.nameAddressedDeletes() {
+		unlock, lockErr := lockName(ctx, cfg.name)
+		if lockErr != nil {
+			return nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, lockErr)
+		}
+		defer unlock()
+	}
+	stdout, _, err = cfg.runner.Run(ctx, args...)
+	return stdout, true, err
 }
 
 // rollback removes a container Run created but cannot return. A failed

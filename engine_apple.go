@@ -136,19 +136,28 @@ func (appleEngine) listArgs() []string {
 }
 
 // parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter.
-func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
+// label or status filter. The list-time generation and state are kept so
+// a later name-based delete can be checked against a fresh inspect.
+func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[managedLabel] == "true" && c.Status.State == string(StateStopped) {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[managedLabel] != "true" || c.Status.State != string(StateStopped) {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    true,
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
 
 func (appleEngine) imageInspectArgs(image, _ string) []string {
@@ -226,19 +235,29 @@ func (appleEngine) listReuseGroupArgs(string) []string {
 	return []string{"ls", "--all", "--format", "json"}
 }
 
-func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
+func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[reuseGroupLabel] == group {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[reuseGroupLabel] != group {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    labels[managedLabel] == "true",
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
+
+func (appleEngine) nameAddressedDeletes() bool { return true }
 
 // nameConflict matches Apple Container's duplicate-name wording.
 func (appleEngine) nameConflict(err error) bool {

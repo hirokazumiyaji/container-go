@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"time"
 
@@ -131,15 +130,6 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 }
 
 func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
-	var envFile string
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(dir)
-		envFile = path
-	}
 	if cfg.creation == "" {
 		cfg.creation = newCreationID()
 	}
@@ -151,7 +141,23 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+
+	// Keep the secret file out of the image-pull and attach/retry windows;
+	// it exists only for the run command that consumes it.
+	var envFile, envDir string
+	if len(cfg.env) > 0 {
+		path, dir, err := writeEnvFile(cfg.env)
+		if err != nil {
+			return nil, err
+		}
+		envFile, envDir = path, dir
+		defer func() {
+			cleanupEnvFile(envDir)
+		}()
+	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	cleanupEnvFile(envDir)
+	envDir = ""
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||

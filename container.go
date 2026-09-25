@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -132,6 +130,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(cfg); err != nil {
 		return nil, err
 	}
+	cleanupStaleEnvFiles()
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}
@@ -139,16 +138,6 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.name = newContainerName()
 	}
 	cfg.creation = newCreationID()
-
-	var envFile string
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(dir)
-		envFile = path
-	}
 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
@@ -158,7 +147,24 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+
+	// Do not put secrets on disk while an image pull may be waiting for
+	// minutes. The backend reads this file only while handling run, so the
+	// deferred cleanup below also removes it immediately after that call.
+	var envFile, envDir string
+	if len(cfg.env) > 0 {
+		path, dir, err := writeEnvFile(cfg.env)
+		if err != nil {
+			return nil, err
+		}
+		envFile, envDir = path, dir
+		defer func() {
+			cleanupEnvFile(envDir)
+		}()
+	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	cleanupEnvFile(envDir)
+	envDir = ""
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
@@ -257,25 +263,6 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
 	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
-}
-
-// writeEnvFile stores env vars in a 0600 file under a private temporary
-// directory, keeping values out of the process table.
-func writeEnvFile(env map[string]string) (path, dir string, err error) {
-	dir, err = os.MkdirTemp("", "containergo-env-")
-	if err != nil {
-		return "", "", err
-	}
-	var b []byte
-	for _, k := range sortedKeys(env) {
-		b = append(b, k+"="+env[k]+"\n"...)
-	}
-	path = filepath.Join(dir, "env")
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", "", err
-	}
-	return path, dir, nil
 }
 
 // ID returns the container ID (identical to its name).

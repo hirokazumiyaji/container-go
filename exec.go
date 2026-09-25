@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -22,13 +21,14 @@ type execConfig struct {
 }
 
 // WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// passed via a temporary env file. It uses the same key and value
+// validation as WithEnv.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
+		if key, _, err := firstInvalidEnv(env); err != nil {
+			return fmt.Errorf("invalid exec environment variable %q: %w", key, err)
+		}
 		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("invalid exec environment variable %q", k)
-			}
 			c.env[k] = v
 		}
 		return nil
@@ -70,17 +70,23 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
-	var envFile string
+	var envFile, envDir string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
 			return 0, nil, err
 		}
-		defer os.RemoveAll(dir)
-		envFile = path
+		envFile, envDir = path, dir
+		defer func() {
+			cleanupEnvFile(envDir)
+		}()
 	}
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	// The CLI has finished reading the env file. Remove it before any
+	// result classification or caller-visible output processing.
+	cleanupEnvFile(envDir)
+	envDir = ""
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil

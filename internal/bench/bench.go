@@ -14,6 +14,11 @@ import (
 	"time"
 )
 
+// CurrentSchemaVersion is the strict, reproducible result schema. ParseDoc
+// remains permissive for older documents, but ValidateDoc and CompareDocs
+// accept only this version.
+const CurrentSchemaVersion = 2
+
 // Library names a code path under measurement.
 const (
 	LibraryContainerGo      = "container-go"
@@ -30,6 +35,14 @@ type Result struct {
 	Image string `json:"image"`
 	// ImageDigest is the content digest resolved for Image.
 	ImageDigest string `json:"image_digest,omitempty"`
+	// RyukImage is the immutable reaper image used by a
+	// testcontainers-go scenario. It is empty for container-go scenarios.
+	RyukImage string `json:"ryuk_image,omitempty"`
+	// RyukImageDigest is the content digest of RyukImage.
+	RyukImageDigest string `json:"ryuk_image_digest,omitempty"`
+	// CacheState is "cold" or "warm" for tc/session-init and empty for
+	// every other scenario.
+	CacheState string `json:"cache_state,omitempty"`
 	// Scenario identifies the measurement, e.g. "run/warm".
 	Scenario string `json:"scenario"`
 	// Iteration is the 1-based repetition of the scenario.
@@ -52,20 +65,26 @@ func (r Result) Duration() time.Duration { return time.Duration(r.DurationNS) }
 
 // Env records the environment a run happened in.
 type Env struct {
-	OS         string            `json:"os"`
-	Arch       string            `json:"arch"`
-	CPUs       int               `json:"cpus"`
-	Go         string            `json:"go"`
-	Host       string            `json:"host,omitempty"`
-	Commit     string            `json:"commit,omitempty"`
+	OS     string `json:"os"`
+	Arch   string `json:"arch"`
+	CPUs   int    `json:"cpus"`
+	Go     string `json:"go"`
+	Host   string `json:"host,omitempty"`
+	Commit string `json:"commit,omitempty"`
+	// Tree is the Git tree object of Commit.
+	Tree string `json:"tree,omitempty"`
+	// Dirty records whether tracked or untracked source files differed
+	// from Commit when the run started. Strict validation rejects true.
+	Dirty      bool              `json:"dirty"`
 	CLIs       map[string]string `json:"clis"`
 	RecordedAt time.Time         `json:"recorded_at"`
 }
 
-// Doc is a complete recorded run: environment plus results.
+// Doc is a complete recorded run: schema version, environment, and results.
 type Doc struct {
-	Env     Env      `json:"env"`
-	Results []Result `json:"results"`
+	SchemaVersion int      `json:"schema_version"`
+	Env           Env      `json:"env"`
+	Results       []Result `json:"results"`
 }
 
 // WriteJSON writes the doc as formatted JSON.

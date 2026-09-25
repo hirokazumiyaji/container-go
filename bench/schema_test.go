@@ -10,9 +10,8 @@ import (
 	"testing"
 )
 
-// TestFixtureMatchesSchema validates the committed fixture against the
-// result schema so field renames and missing reproducibility metadata are
-// caught without a backend.
+// TestFixtureMatchesSchema validates the committed fixture against the strict
+// result schema without requiring a backend.
 func TestFixtureMatchesSchema(t *testing.T) {
 	data := readFixture(t, "result-doc.json")
 	doc, err := ParseDoc(data)
@@ -22,8 +21,11 @@ func TestFixtureMatchesSchema(t *testing.T) {
 	if err := ValidateDoc(doc); err != nil {
 		t.Fatalf("ValidateDoc: %v", err)
 	}
-	if doc.Env.OS == "" || doc.Env.Arch == "" || doc.Env.Go == "" || doc.Env.Commit == "" {
-		t.Errorf("env incomplete: %+v", doc.Env)
+	if doc.SchemaVersion != CurrentSchemaVersion || doc.Env.OS == "" || doc.Env.Arch == "" || doc.Env.Go == "" || doc.Env.Commit == "" || doc.Env.Tree == "" {
+		t.Errorf("env/schema incomplete: version=%d env=%+v", doc.SchemaVersion, doc.Env)
+	}
+	if doc.Env.CLIs[DockerClientVersionKey] == "" || doc.Env.CLIs[DockerServerVersionKey] == "" {
+		t.Errorf("Docker client/server metadata incomplete: %+v", doc.Env.CLIs)
 	}
 	if len(doc.Results) == 0 {
 		t.Fatal("fixture has no results")
@@ -36,8 +38,7 @@ func TestFixtureMatchesSchema(t *testing.T) {
 			t.Errorf("result[%d] missing reproducibility fields: %+v", i, result)
 		}
 	}
-	table := Table(Summarize(doc.Results))
-	if table == "" {
+	if Table(Summarize(doc.Results)) == "" {
 		t.Fatal("table output is empty")
 	}
 }
@@ -54,13 +55,13 @@ func TestParseDocKeepsLegacyDocumentsParseable(t *testing.T) {
 	if len(doc.Results) != 1 || doc.Results[0].Iteration != 1 {
 		t.Fatalf("legacy results = %+v", doc.Results)
 	}
-	if doc.Results[0].ImageDigest != "" || doc.Results[0].Iterations != 0 || doc.Env.Commit != "" {
+	if doc.Results[0].ImageDigest != "" || doc.Results[0].Iterations != 0 || doc.Env.Commit != "" || doc.SchemaVersion != 0 {
 		t.Fatalf("legacy metadata unexpectedly synthesized: %+v", doc)
 	}
 }
 
 func TestPinnedBenchmarkImages(t *testing.T) {
-	for _, image := range []string{RedisImage, NginxImage} {
+	for _, image := range []string{RedisImage, NginxImage, TestcontainersRyukImage} {
 		if got := ImageDigest(image); got == "" {
 			t.Errorf("image %q is not pinned", image)
 		}
@@ -83,28 +84,24 @@ func TestBenchmarkDocsMatchScenarioPolicy(t *testing.T) {
 	if len(rows) != len(ScenarioNames()) {
 		t.Fatalf("baseline has %d scenario rows, want %d", len(rows), len(ScenarioNames()))
 	}
-	policies := make(map[string]ScenarioPolicy)
-	for _, policy := range ScenarioPolicies() {
-		policies[policy.Name] = policy
-	}
-	for scenario := range rows {
-		if _, ok := policies[scenario]; !ok {
-			t.Errorf("baseline has unknown scenario %q", scenario)
+	for scenario, row := range rows {
+		if _, ok := ScenarioPolicyForKey(row.Backend, row.Library, scenario); !ok {
+			t.Errorf("baseline has unknown scenario key %s/%s/%s", row.Backend, row.Library, scenario)
 		}
 	}
 	for _, policy := range ScenarioPolicies() {
-		iterations, ok := rows[policy.Name]
+		row, ok := rows[policy.Name]
 		if !ok {
 			t.Errorf("baseline is missing scenario %q", policy.Name)
 			continue
 		}
-		if iterations != policy.Iterations {
-			t.Errorf("baseline %q iterations = %d, want %d", policy.Name, iterations, policy.Iterations)
+		if row.Iterations != policy.Iterations {
+			t.Errorf("baseline %q iterations = %d, want %d", policy.Name, row.Iterations, policy.Iterations)
 		}
 	}
-	for _, image := range []string{RedisImage, NginxImage} {
-		if !bytes.Contains(data, []byte(image)) {
-			t.Errorf("benchmark documentation does not pin %q", image)
+	for _, required := range []string{RedisImage, NginxImage, TestcontainersRyukImage, "schema_version", "env.tree", "docker.client", "docker.server", "apple.service", "ryuk_image", "cache_state"} {
+		if !bytes.Contains(data, []byte(required)) {
+			t.Errorf("benchmark documentation does not describe %q", required)
 		}
 	}
 	for _, mutable := range []string{
@@ -117,7 +114,13 @@ func TestBenchmarkDocsMatchScenarioPolicy(t *testing.T) {
 	}
 }
 
-func parseBaselineRows(t *testing.T, data []byte) map[string]int {
+type baselineRow struct {
+	Backend    string
+	Library    string
+	Iterations int
+}
+
+func parseBaselineRows(t *testing.T, data []byte) map[string]baselineRow {
 	t.Helper()
 	lines := strings.Split(string(data), "\n")
 	start := -1
@@ -130,7 +133,7 @@ func parseBaselineRows(t *testing.T, data []byte) map[string]int {
 	if start < 0 {
 		t.Fatal("baseline table header not found")
 	}
-	rows := make(map[string]int)
+	rows := make(map[string]baselineRow)
 	for _, line := range lines[start+2:] {
 		line = strings.TrimSpace(line)
 		if line == "" {
@@ -143,6 +146,8 @@ func parseBaselineRows(t *testing.T, data []byte) map[string]int {
 		if len(cells) < 4 {
 			t.Fatalf("malformed baseline row: %q", line)
 		}
+		backend := strings.TrimSpace(cells[0])
+		library := strings.TrimSpace(cells[1])
 		scenario := strings.TrimSpace(cells[2])
 		iterations, err := strconv.Atoi(strings.TrimSpace(cells[3]))
 		if err != nil {
@@ -151,7 +156,7 @@ func parseBaselineRows(t *testing.T, data []byte) map[string]int {
 		if _, exists := rows[scenario]; exists {
 			t.Errorf("baseline has duplicate scenario %q", scenario)
 		}
-		rows[scenario] = iterations
+		rows[scenario] = baselineRow{Backend: backend, Library: library, Iterations: iterations}
 	}
 	return rows
 }

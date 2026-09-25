@@ -6,39 +6,19 @@ import (
 	"strings"
 )
 
-// ValidateDoc checks the metadata contract for a newly recorded result
-// document. ParseDoc intentionally remains permissive so documents written
-// by older harnesses can still be read; callers that need reproducibility
-// can opt into this strict check.
+// ValidateDoc checks the strict metadata and complete scenario contract for
+// a newly recorded result document. ParseDoc intentionally remains
+// permissive so historical documents can still be inspected.
 func ValidateDoc(d Doc) error {
-	if d.Env.OS == "" {
-		return fmt.Errorf("env.os is required")
+	if d.SchemaVersion != CurrentSchemaVersion {
+		return fmt.Errorf("schema_version = %d, want %d", d.SchemaVersion, CurrentSchemaVersion)
 	}
-	if d.Env.Arch == "" {
-		return fmt.Errorf("env.arch is required")
-	}
-	if d.Env.Host == "" {
-		return fmt.Errorf("env.host is required")
-	}
-	if d.Env.Go == "" {
-		return fmt.Errorf("env.go is required")
-	}
-	if d.Env.CPUs < 1 {
-		return fmt.Errorf("env.cpus = %d, want >= 1", d.Env.CPUs)
-	}
-	if len(d.Env.CLIs) == 0 {
-		return fmt.Errorf("env.clis is required")
-	}
-	if d.Env.Commit == "" {
-		return fmt.Errorf("env.commit is required")
-	}
-	if d.Env.RecordedAt.IsZero() {
-		return fmt.Errorf("env.recorded_at is required")
+	if err := validateEnvironment(d.Env); err != nil {
+		return err
 	}
 	if len(d.Results) == 0 {
 		return fmt.Errorf("doc has no results")
 	}
-	groups := make(map[string][]Result)
 	for i, result := range d.Results {
 		if err := ValidateResult(result); err != nil {
 			return fmt.Errorf("result[%d]: %w", i, err)
@@ -46,14 +26,87 @@ func ValidateDoc(d Doc) error {
 		if result.Commit != d.Env.Commit {
 			return fmt.Errorf("result[%d] commit = %q, want %q", i, result.Commit, d.Env.Commit)
 		}
-		key := result.Backend + "\x00" + result.Library + "\x00" + result.Image + "\x00" + result.Scenario
-		groups[key] = append(groups[key], result)
 	}
-	return validateResultGroups(groups)
+	if err := validateVersionMetadata(d.Env, d.Results); err != nil {
+		return err
+	}
+	if err := ValidateScenarioSet(d.Results); err != nil {
+		return fmt.Errorf("scenario set: %w", err)
+	}
+	return nil
 }
 
-// ValidateResult checks one result's identity, pinned image, and iteration
-// metadata against the scenario policy.
+func validateEnvironment(env Env) error {
+	if strings.TrimSpace(env.OS) == "" {
+		return fmt.Errorf("env.os is required")
+	}
+	if strings.TrimSpace(env.Arch) == "" {
+		return fmt.Errorf("env.arch is required")
+	}
+	if strings.TrimSpace(env.Host) == "" || strings.EqualFold(env.Host, "unknown") {
+		return fmt.Errorf("env.host is required and must not be unknown")
+	}
+	if strings.TrimSpace(env.Go) == "" {
+		return fmt.Errorf("env.go is required")
+	}
+	if env.CPUs < 1 {
+		return fmt.Errorf("env.cpus = %d, want >= 1", env.CPUs)
+	}
+	if !validGitObjectID(env.Commit) {
+		return fmt.Errorf("env.commit = %q, want a full Git object ID", env.Commit)
+	}
+	if !validGitObjectID(env.Tree) {
+		return fmt.Errorf("env.tree = %q, want a full Git tree object ID", env.Tree)
+	}
+	if env.Dirty {
+		return fmt.Errorf("env.dirty is true; benchmark source must be clean")
+	}
+	if len(env.CLIs) == 0 {
+		return fmt.Errorf("env.clis is required")
+	}
+	for name, version := range env.CLIs {
+		if strings.TrimSpace(version) == "" {
+			return fmt.Errorf("env.clis[%q] is required", name)
+		}
+		if strings.TrimSpace(version) != version || strings.ContainsAny(version, "\r\n") {
+			return fmt.Errorf("env.clis[%q] must be one normalized value", name)
+		}
+		if strings.EqualFold(version, "unknown") {
+			return fmt.Errorf("env.clis[%q] must not be unknown", name)
+		}
+	}
+	if env.RecordedAt.IsZero() {
+		return fmt.Errorf("env.recorded_at is required")
+	}
+	return nil
+}
+
+func validateVersionMetadata(env Env, results []Result) error {
+	required := make(map[string]bool)
+	for _, result := range results {
+		switch result.Backend {
+		case "docker":
+			required[DockerClientVersionKey] = true
+			required[DockerServerVersionKey] = true
+		case "apple":
+			required[AppleClientVersionKey] = true
+		}
+	}
+	keys := make([]string, 0, len(required))
+	for key := range required {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if strings.TrimSpace(env.CLIs[key]) == "" {
+			return fmt.Errorf("env.clis[%q] is required for the recorded backends", key)
+		}
+	}
+	return nil
+}
+
+// ValidateResult checks one result's backend/library identity, immutable
+// images, optional Ryuk provenance, and iteration metadata against policy.
 func ValidateResult(result Result) error {
 	if result.Backend == "" {
 		return fmt.Errorf("backend is required")
@@ -67,8 +120,8 @@ func ValidateResult(result Result) error {
 	if result.Scenario == "" {
 		return fmt.Errorf("scenario is required")
 	}
-	if result.Commit == "" {
-		return fmt.Errorf("commit is required")
+	if !validGitObjectID(result.Commit) {
+		return fmt.Errorf("commit = %q, want a full Git object ID", result.Commit)
 	}
 	if result.Iteration < 1 {
 		return fmt.Errorf("iteration = %d, want >= 1", result.Iteration)
@@ -76,9 +129,9 @@ func ValidateResult(result Result) error {
 	if result.Iterations < 1 {
 		return fmt.Errorf("iterations = %d, want >= 1", result.Iterations)
 	}
-	policy, ok := ScenarioPolicyFor(result.Scenario)
+	policy, ok := ScenarioPolicyForKey(result.Backend, result.Library, result.Scenario)
 	if !ok {
-		return fmt.Errorf("unknown scenario %q", result.Scenario)
+		return fmt.Errorf("unknown scenario key %s/%s/%s", result.Backend, result.Library, result.Scenario)
 	}
 	if result.Iterations != policy.Iterations {
 		return fmt.Errorf("%s iterations = %d, want %d", result.Scenario, result.Iterations, policy.Iterations)
@@ -93,9 +146,35 @@ func ValidateResult(result Result) error {
 		return fmt.Errorf("%s image digest = %q, want %q", result.Scenario, result.ImageDigest, policy.ImageDigest)
 	}
 	if referenceDigest := ImageDigest(result.Image); referenceDigest == "" {
-		return fmt.Errorf("%s image %q is not pinned to a sha256 digest", result.Scenario, result.Image)
+		return fmt.Errorf("%s image %q is not pinned to a valid sha256 digest", result.Scenario, result.Image)
 	} else if referenceDigest != result.ImageDigest {
 		return fmt.Errorf("%s image reference digest = %q, recorded %q", result.Scenario, referenceDigest, result.ImageDigest)
+	}
+
+	if policy.RyukImage == "" {
+		if result.RyukImage != "" || result.RyukImageDigest != "" {
+			return fmt.Errorf("%s has unexpected Ryuk image metadata", result.Scenario)
+		}
+	} else {
+		if result.RyukImage != policy.RyukImage {
+			return fmt.Errorf("%s Ryuk image = %q, want pinned image %q", result.Scenario, result.RyukImage, policy.RyukImage)
+		}
+		if result.RyukImageDigest != policy.RyukImageDigest {
+			return fmt.Errorf("%s Ryuk image digest = %q, want %q", result.Scenario, result.RyukImageDigest, policy.RyukImageDigest)
+		}
+		if referenceDigest := ImageDigest(result.RyukImage); referenceDigest == "" {
+			return fmt.Errorf("%s Ryuk image %q is not pinned to a valid sha256 digest", result.Scenario, result.RyukImage)
+		} else if referenceDigest != result.RyukImageDigest {
+			return fmt.Errorf("%s Ryuk image reference digest = %q, recorded %q", result.Scenario, referenceDigest, result.RyukImageDigest)
+		}
+	}
+
+	if len(policy.CacheStates) == 0 {
+		if result.CacheState != "" {
+			return fmt.Errorf("%s cache_state = %q, want empty", result.Scenario, result.CacheState)
+		}
+	} else if !containsString(policy.CacheStates, result.CacheState) {
+		return fmt.Errorf("%s cache_state = %q, want one of %v", result.Scenario, result.CacheState, policy.CacheStates)
 	}
 	if result.DurationNS < 0 {
 		return fmt.Errorf("duration is negative")
@@ -106,15 +185,24 @@ func ValidateResult(result Result) error {
 	return nil
 }
 
-// ValidateScenarioSet checks a complete result collection. Each scenario
-// group must contain exactly one result for every planned iteration, and
-// every documented scenario must be represented at least once.
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// ValidateScenarioSet checks that every result is valid, every backend and
+// library identity has the exact policy-defined scenario set, and every
+// group has each planned iteration exactly once.
 func ValidateScenarioSet(results []Result) error {
 	if len(results) == 0 {
 		return fmt.Errorf("scenario set has no results")
 	}
 	groups := make(map[string][]Result)
-	seen := make(map[string]bool)
+	identities := make(map[scenarioIdentity]map[string]bool)
 	commit := ""
 	for i, result := range results {
 		if err := ValidateResult(result); err != nil {
@@ -125,24 +213,51 @@ func ValidateScenarioSet(results []Result) error {
 		} else if result.Commit != commit {
 			return fmt.Errorf("result[%d] commit = %q, want %q", i, result.Commit, commit)
 		}
-		key := result.Backend + "\x00" + result.Library + "\x00" + result.Image + "\x00" + result.Scenario
+		key := resultGroupKey(result)
 		groups[key] = append(groups[key], result)
-		seen[result.Scenario] = true
+		identity := scenarioIdentity{Backend: result.Backend, Library: result.Library}
+		if identities[identity] == nil {
+			identities[identity] = make(map[string]bool)
+		}
+		identities[identity][result.Scenario] = true
 	}
 	if err := validateResultGroups(groups); err != nil {
 		return err
 	}
-	for _, name := range ScenarioNames() {
-		if !seen[name] {
-			return fmt.Errorf("scenario set is missing %q", name)
+
+	identityKeys := make([]scenarioIdentity, 0, len(identities))
+	for identity := range identities {
+		identityKeys = append(identityKeys, identity)
+	}
+	sort.Slice(identityKeys, func(i, j int) bool {
+		if identityKeys[i].Backend != identityKeys[j].Backend {
+			return identityKeys[i].Backend < identityKeys[j].Backend
+		}
+		return identityKeys[i].Library < identityKeys[j].Library
+	})
+	for _, identity := range identityKeys {
+		policies := ScenarioPoliciesFor(identity.Backend, identity.Library)
+		if len(policies) == 0 {
+			return fmt.Errorf("no policies for backend/library %s/%s", identity.Backend, identity.Library)
+		}
+		for _, policy := range policies {
+			if !identities[identity][policy.Name] {
+				return fmt.Errorf("%s/%s is missing %q", identity.Backend, identity.Library, policy.Name)
+			}
 		}
 	}
 	return nil
 }
 
 func validateResultGroups(groups map[string][]Result) error {
-	for _, group := range groups {
-		policy, ok := ScenarioPolicyFor(group[0].Scenario)
+	keys := make([]string, 0, len(groups))
+	for key := range groups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		group := groups[key]
+		policy, ok := ScenarioPolicyForKey(group[0].Backend, group[0].Library, group[0].Scenario)
 		if !ok {
 			return fmt.Errorf("unknown scenario %q", group[0].Scenario)
 		}
@@ -165,18 +280,24 @@ func validateResultGroups(groups map[string][]Result) error {
 	return nil
 }
 
-// CompareDocs checks whether two result documents have comparable inputs.
-// It deliberately compares metadata as well as scenario groups, so changing
-// a mutable tag or the source revision fails before numbers are compared.
+type scenarioIdentity struct {
+	Backend string
+	Library string
+}
+
+func resultGroupKey(result Result) string {
+	return result.Backend + "\x00" + result.Library + "\x00" + result.Scenario
+}
+
+// CompareDocs checks whether two strictly valid result documents have
+// comparable inputs. Source commits and trees are intentionally excluded so
+// before/after runs can compare different clean revisions.
 func CompareDocs(baseline, candidate Doc) error {
-	if len(baseline.Results) == 0 || len(candidate.Results) == 0 {
-		return fmt.Errorf("both documents must contain results")
+	if err := ValidateDoc(baseline); err != nil {
+		return fmt.Errorf("invalid baseline document: %w", err)
 	}
-	if baseline.Env.Commit == "" || candidate.Env.Commit == "" {
-		return fmt.Errorf("both documents must record a commit")
-	}
-	if baseline.Env.Commit != candidate.Env.Commit {
-		return fmt.Errorf("commit mismatch: baseline %q, candidate %q", baseline.Env.Commit, candidate.Env.Commit)
+	if err := ValidateDoc(candidate); err != nil {
+		return fmt.Errorf("invalid candidate document: %w", err)
 	}
 	if err := compareEnvironment(baseline.Env, candidate.Env); err != nil {
 		return err
@@ -184,16 +305,26 @@ func CompareDocs(baseline, candidate Doc) error {
 
 	baselineGroups := resultGroups(baseline.Results)
 	candidateGroups := resultGroups(candidate.Results)
-	for key, baselineGroup := range baselineGroups {
+	keys := make([]string, 0, len(baselineGroups))
+	for key := range baselineGroups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		candidateGroup, ok := candidateGroups[key]
 		if !ok {
 			return fmt.Errorf("candidate is missing result group %q", displayGroupKey(key))
 		}
-		if err := compareGroups(baselineGroup, candidateGroup); err != nil {
+		if err := compareGroups(baselineGroups[key], candidateGroup); err != nil {
 			return err
 		}
 	}
+	keys = keys[:0]
 	for key := range candidateGroups {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
 		if _, ok := baselineGroups[key]; !ok {
 			return fmt.Errorf("candidate has unexpected result group %q", displayGroupKey(key))
 		}
@@ -220,9 +351,14 @@ func compareEnvironment(baseline, candidate Env) error {
 	if len(baseline.CLIs) != len(candidate.CLIs) {
 		return fmt.Errorf("CLI version set mismatch")
 	}
-	for name, version := range baseline.CLIs {
-		if candidate.CLIs[name] != version {
-			return fmt.Errorf("CLI %q version mismatch: baseline %q, candidate %q", name, version, candidate.CLIs[name])
+	keys := make([]string, 0, len(baseline.CLIs))
+	for key := range baseline.CLIs {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		if candidate.CLIs[key] != baseline.CLIs[key] {
+			return fmt.Errorf("CLI %q version mismatch: baseline %q, candidate %q", key, baseline.CLIs[key], candidate.CLIs[key])
 		}
 	}
 	return nil
@@ -235,7 +371,7 @@ type resultGroup struct {
 func resultGroups(results []Result) map[string]resultGroup {
 	groups := make(map[string]resultGroup)
 	for _, result := range results {
-		key := result.Backend + "\x00" + result.Library + "\x00" + result.Scenario
+		key := resultGroupKey(result)
 		groups[key] = resultGroup{results: append(groups[key].results, result)}
 	}
 	return groups
@@ -251,20 +387,11 @@ func compareGroups(baseline, candidate resultGroup) error {
 
 	baselineResults := append([]Result(nil), baseline.results...)
 	candidateResults := append([]Result(nil), candidate.results...)
-	sort.SliceStable(baselineResults, func(i, j int) bool {
-		return baselineResults[i].Iteration < baselineResults[j].Iteration
-	})
-	sort.SliceStable(candidateResults, func(i, j int) bool {
-		return candidateResults[i].Iteration < candidateResults[j].Iteration
-	})
-	seen := make(map[int]bool, len(baselineResults))
+	sort.SliceStable(baselineResults, func(i, j int) bool { return baselineResults[i].Iteration < baselineResults[j].Iteration })
+	sort.SliceStable(candidateResults, func(i, j int) bool { return candidateResults[i].Iteration < candidateResults[j].Iteration })
 	for i := range baselineResults {
 		first := baselineResults[i]
 		other := candidateResults[i]
-		if seen[first.Iteration] {
-			return fmt.Errorf("duplicate iteration %d for %q", first.Iteration, first.Scenario)
-		}
-		seen[first.Iteration] = true
 		if first.Iteration != other.Iteration {
 			return fmt.Errorf("iteration values mismatch for %q", first.Scenario)
 		}
@@ -274,11 +401,17 @@ func compareGroups(baseline, candidate resultGroup) error {
 		if first.ImageDigest != other.ImageDigest {
 			return fmt.Errorf("image digest mismatch for %q: baseline %q, candidate %q", first.Scenario, first.ImageDigest, other.ImageDigest)
 		}
+		if first.RyukImage != other.RyukImage {
+			return fmt.Errorf("ryuk image mismatch for %q: baseline %q, candidate %q", first.Scenario, first.RyukImage, other.RyukImage)
+		}
+		if first.RyukImageDigest != other.RyukImageDigest {
+			return fmt.Errorf("ryuk image digest mismatch for %q: baseline %q, candidate %q", first.Scenario, first.RyukImageDigest, other.RyukImageDigest)
+		}
+		if first.CacheState != other.CacheState {
+			return fmt.Errorf("cache state mismatch for %q: baseline %q, candidate %q", first.Scenario, first.CacheState, other.CacheState)
+		}
 		if first.Iterations != other.Iterations {
 			return fmt.Errorf("iteration policy mismatch for %q: baseline %d, candidate %d", first.Scenario, first.Iterations, other.Iterations)
-		}
-		if first.Commit != other.Commit {
-			return fmt.Errorf("result commit mismatch for %q: baseline %q, candidate %q", first.Scenario, first.Commit, other.Commit)
 		}
 	}
 	return nil

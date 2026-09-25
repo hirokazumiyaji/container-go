@@ -6,10 +6,8 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,7 +56,7 @@ func benchPortOptions(b bench.Backend, eng engine) func(cli.Runner) []Option {
 // Terminate happens after the measurement.
 func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenario string, prep func(*testing.T), opts func(cli.Runner) []Option) {
 	t.Helper()
-	policy, ok := bench.ScenarioPolicyFor(scenario)
+	policy, ok := bench.ScenarioPolicyForKey(b.Name, bench.LibraryContainerGo, scenario)
 	if !ok {
 		t.Fatalf("no benchmark policy for scenario %q", scenario)
 	}
@@ -107,11 +105,20 @@ func TestIntegrationBenchCounting(t *testing.T) {
 			}
 			image := bench.PinnedRedisImage
 
-			doc := bench.Doc{Env: benchEnv(t, b)}
+			doc := bench.Doc{SchemaVersion: bench.CurrentSchemaVersion, Env: benchEnv(t, b)}
 			benchScenario(t, &doc, b, image, "run/cold", func(t *testing.T) {
 				b.EnsureImageAbsent(t, image)
 			}, benchPortOptions(b, eng))
 			benchScenario(t, &doc, b, image, "run/warm", nil, benchPortOptions(b, eng))
+			nginxImage := bench.PinnedNginxImage
+			benchScenario(t, &doc, b, nginxImage, "run/warm-nginx", nil, func(r cli.Runner) []Option {
+				return []Option{
+					withRunner(r),
+					withEngine(eng),
+					WithExposedPorts("80/tcp"),
+					WithWaitStrategy(wait.ForListeningPort("80/tcp")),
+				}
+			})
 			benchScenario(t, &doc, b, image, "run/no-wait", nil, func(r cli.Runner) []Option {
 				return []Option{withRunner(r), withEngine(eng)}
 			})
@@ -129,6 +136,7 @@ func TestIntegrationBenchCounting(t *testing.T) {
 					WithWaitStrategy(wait.ForExec([]string{"redis-cli", "ping"})),
 				}
 			})
+			benchMulti(t, &doc, b, eng, image)
 			benchParallel(t, &doc, b, eng, image)
 
 			if err := bench.ValidateDoc(doc); err != nil {
@@ -141,6 +149,50 @@ func TestIntegrationBenchCounting(t *testing.T) {
 	}
 }
 
+// benchMulti measures five sequential containers in one process. Setup and
+// termination stay outside the measured interval.
+func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image string) {
+	t.Helper()
+	b.EnsureImage(t, image)
+	policy, ok := bench.ScenarioPolicyForKey(b.Name, bench.LibraryContainerGo, "run/multi-5")
+	if !ok {
+		t.Fatal("no benchmark policy for run/multi-5")
+	}
+	for i := 1; i <= policy.Iterations; i++ {
+		r := newCountingRunner(&cli.ExecRunner{Binary: b.Bin})
+		var containers []*Container
+		start := time.Now()
+		for range 5 {
+			ctr, err := Run(context.Background(), image, benchPortOptions(b, eng)(r)...)
+			if err != nil {
+				for _, started := range containers {
+					_ = started.Terminate(context.Background())
+				}
+				t.Fatalf("multi iteration %d: %v", i, err)
+			}
+			containers = append(containers, ctr)
+		}
+		elapsed := time.Since(start)
+		for _, ctr := range containers {
+			if err := ctr.Terminate(context.Background()); err != nil {
+				t.Logf("multi iteration %d: terminate: %v", i, err)
+			}
+		}
+		doc.Results = append(doc.Results, bench.Result{
+			Backend:      b.Name,
+			Library:      bench.LibraryContainerGo,
+			Image:        image,
+			ImageDigest:  policy.ImageDigest,
+			Scenario:     "run/multi-5",
+			Iteration:    i,
+			Iterations:   policy.Iterations,
+			Commit:       doc.Env.Commit,
+			DurationNS:   int64(elapsed),
+			Subprocesses: r.count(),
+		})
+	}
+}
+
 // benchParallel measures the wall-clock time until N containers
 // started in parallel are all ready. Individual durations are not
 // summed: the scenario reports one elapsed time per iteration.
@@ -149,7 +201,7 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 	const n = 8
 	b.EnsureImage(t, image)
 
-	policy, ok := bench.ScenarioPolicyFor("run/parallel-8")
+	policy, ok := bench.ScenarioPolicyForKey(b.Name, bench.LibraryContainerGo, "run/parallel-8")
 	if !ok {
 		t.Fatal("no benchmark policy for run/parallel-8")
 	}
@@ -206,31 +258,30 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 
 func benchEnv(t *testing.T, b bench.Backend) bench.Env {
 	t.Helper()
-	commit, err := bench.CurrentCommit()
+	source, err := bench.RequireCleanSource()
 	if err != nil {
-		t.Fatalf("resolve benchmark commit: %v", err)
+		t.Fatalf("resolve clean benchmark source: %v", err)
 	}
 	host, err := os.Hostname()
 	if err != nil || host == "" {
-		host = "unknown"
+		t.Fatalf("resolve benchmark host: %v", err)
 	}
-	env := bench.Env{
+	versions, err := b.Versions()
+	if err != nil {
+		t.Fatalf("record backend versions: %v", err)
+	}
+	return bench.Env{
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
 		CPUs:       runtime.NumCPU(),
 		Go:         runtime.Version(),
 		Host:       host,
-		Commit:     commit,
-		CLIs:       map[string]string{},
+		Commit:     source.Commit,
+		Tree:       source.Tree,
+		Dirty:      source.Dirty,
+		CLIs:       versions,
 		RecordedAt: time.Now().UTC(),
 	}
-	out, err := exec.Command(b.Bin, b.VersionArgs...).Output()
-	if err != nil {
-		env.CLIs[b.Name] = "unknown"
-	} else {
-		env.CLIs[b.Name] = strings.TrimSpace(string(out))
-	}
-	return env
 }
 
 func writeBenchDoc(t *testing.T, backend string, doc bench.Doc) string {

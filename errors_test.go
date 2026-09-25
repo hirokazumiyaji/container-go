@@ -124,3 +124,59 @@ func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 		t.Fatalf("Logs error = %v, want ErrContainerNotFound", err)
 	}
 }
+
+func TestContainerNotFoundClassificationIsExact(t *testing.T) {
+	positive := []*cli.CLIError{
+		{Binary: "docker", Args: []string{"inspect", "myctr"}, Stderr: "Error: No such object: myctr"},
+		{Binary: "docker", Args: []string{"rm", "--force", "myctr"}, Stderr: "Error response from daemon: No such container: myctr"},
+		{Binary: "container", Args: []string{"inspect", "myctr"}, Stderr: "container not found: myctr"},
+		{Binary: "container", Args: []string{"exec", "myctr", "true"}, Stderr: "get failed: container myctr not found"},
+		{Binary: "container", Args: []string{"delete", "--force", "myctr"}, Stderr: "failed to delete container: container with ID myctr not found"},
+		{Binary: "container", Args: []string{"logs", "myctr"}, Stderr: "failed to get logs for container myctr: failed to open container logs: container with ID myctr not found"},
+	}
+	for _, err := range positive {
+		if !isNotFound(err) || !errors.Is(wrapNotFound(err), ErrContainerNotFound) {
+			t.Errorf("isNotFound(%v) = false, want structured absence", err)
+		}
+	}
+
+	negative := []*cli.CLIError{
+		{Binary: "container", Args: []string{"inspect", "myctr"}, Stderr: "permission denied: not found"},
+		{Binary: "container", Args: []string{"run"}, Stderr: "application error: container not found: myctr"},
+		{Binary: "container", Args: []string{"inspect", "myctr"}, Stderr: "container not found: other"},
+		{Binary: "docker", Args: []string{"inspect", "myctr"}, Stderr: "configuration error: no such object: myctr"},
+	}
+	for _, err := range negative {
+		if isNotFound(err) || errors.Is(wrapNotFound(err), ErrContainerNotFound) {
+			t.Errorf("isNotFound(%v) = true, want permission/config/application error", err)
+		}
+	}
+}
+
+type emptyInspectRunner struct{}
+
+func (emptyInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		return []byte(`[]`), nil, nil
+	case "system", "version", "info":
+		return []byte("running"), nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestEmptyInspectIsContainerNotFound(t *testing.T) {
+	ctr := &Container{
+		id:       "missing",
+		runner:   emptyInspectRunner{},
+		eng:      appleEngine{},
+		creation: "0123456789abcdef",
+	}
+	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
+	}
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate empty inspect = %v, want idempotent nil", err)
+	}
+}

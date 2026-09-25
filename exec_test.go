@@ -85,7 +85,7 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			execErr:    &cli.CLIError{Args: []string{"exec", "myctr", "true"}, ExitCode: 1, Stderr: `not found: "myctr"`},
 		},
 	}
 	ctr := runTestContainer(t, f)

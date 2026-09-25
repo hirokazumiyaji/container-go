@@ -38,6 +38,10 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -97,8 +101,9 @@ type Container struct {
 	// check unnecessary: a replacement never shares it.
 	uid string
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	mu        sync.Mutex
+	info      *engineInfo // cached first inspect; immutable fields only
+	inspectMu sync.Mutex  // serializes fresh inspects and protects uid
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -213,7 +218,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
-	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
+	if c.reused {
+		cleanupErr := fmt.Errorf("container %s is a shared reuse generation; refusing automatic deletion", c.id)
+		return withCleanupError(cause, cleanupErr)
+	}
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
+	defer cancel()
+	if err := c.Terminate(cleanupCtx); err != nil {
 		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
 		return withCleanupError(cause, cleanupErr)
 	}
@@ -231,7 +242,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
@@ -241,7 +252,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	ctr := namedContainer(cfg, cfg.name)
 	info, err := ctr.inspectFresh(cleanupCtx)
 	if err != nil {
-		if isNotFound(err) {
+		if isNotFoundFor(cfg.eng, err) {
 			return nil
 		}
 		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
@@ -252,19 +263,90 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return nil
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return nil
-		}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("cleanup container %s: reuse marker is missing", cfg.name)
 	}
-	target := cfg.name
-	if info.uid != "" {
-		target = info.uid
+	if !validCreationID(cfg.creation) {
+		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
-	defer delCancel()
-	if err := ctr.delete(delCtx, target); err != nil {
+	actual, ok := info.labels[creationLabel]
+	if !ok || !validCreationID(actual) {
+		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
+	}
+	if actual != cfg.creation {
+		return nil
+	}
+	target, err := verifiedDeleteTarget(cfg.eng, info, cfg.name)
+	if err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
+	}
+	if cfg.reuse && info.state == StateRunning {
+		return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
+	}
+	if err := ctr.delete(cleanupCtx, target); err != nil {
+		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
+	}
+	return nil
+}
+
+// verifiedDeleteTarget returns the only safe target for a fresh inspect.
+// Docker must provide its immutable ID; Apple is name-addressed and must not
+// report an unexpected backend ID.
+func verifiedDeleteTarget(eng engine, info *engineInfo, name string) (string, error) {
+	if info == nil {
+		return "", fmt.Errorf("inspect returned no container identity")
+	}
+	if requiresImmutableID(eng) {
+		if !validImmutableContainerID(eng, info.uid) {
+			return "", fmt.Errorf("backend returned no valid immutable container ID")
+		}
+		return info.uid, nil
+	}
+	if eng.name() == "apple" {
+		if info.uid != "" {
+			return "", fmt.Errorf("backend returned an unexpected immutable container ID")
+		}
+		return name, nil
+	}
+	return "", fmt.Errorf("unknown backend cannot provide a safe delete target")
+}
+
+func validCreationID(id string) bool {
+	return creationRE.MatchString(id)
+}
+
+func validImmutableContainerID(eng engine, id string) bool {
+	return eng.name() == "docker" && dockerIDRE.MatchString(id)
+}
+
+func requiresImmutableID(eng engine) bool {
+	return eng.name() == "docker"
+}
+
+func sameContainerIdentity(eng engine, before, fresh *engineInfo) error {
+	if before == nil || fresh == nil {
+		return fmt.Errorf("%w: inspect returned no container identity", ErrGenerationReplaced)
+	}
+	if requiresImmutableID(eng) {
+		if !validImmutableContainerID(eng, before.uid) || !validImmutableContainerID(eng, fresh.uid) {
+			return fmt.Errorf("%w: container has no valid immutable ID", ErrGenerationReplaced)
+		}
+		if before.uid != fresh.uid {
+			return fmt.Errorf("%w: immutable container ID changed", ErrGenerationReplaced)
+		}
+		if !validCreationID(before.labels[creationLabel]) || !validCreationID(fresh.labels[creationLabel]) {
+			return fmt.Errorf("%w: container has no valid creation generation", ErrGenerationReplaced)
+		}
+		if before.labels[creationLabel] != fresh.labels[creationLabel] {
+			return fmt.Errorf("%w: creation generation changed", ErrGenerationReplaced)
+		}
+		return nil
+	}
+	if !validCreationID(before.labels[creationLabel]) || !validCreationID(fresh.labels[creationLabel]) {
+		return fmt.Errorf("%w: container has no valid creation generation", ErrGenerationReplaced)
+	}
+	if before.labels[creationLabel] != fresh.labels[creationLabel] {
+		return fmt.Errorf("%w: creation generation changed", ErrGenerationReplaced)
 	}
 	return nil
 }
@@ -324,43 +406,78 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
+	defer cancel()
+	c.inspectMu.Lock()
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if uid != "" {
+		if !validImmutableContainerID(c.eng, uid) {
+			return fmt.Errorf("terminate %s: invalid immutable container ID: %w", c.id, ErrGenerationReplaced)
+		}
+		return c.delete(ctx, uid)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if !validCreationID(c.creation) {
+		return fmt.Errorf("terminate %s: missing valid creation generation: %w", c.id, ErrGenerationReplaced)
 	}
+	_, err := c.terminateByName(ctx, nil, false, nil)
+	return err
+}
+
+// terminateByName performs the locked inspect/delete critical section for
+// a name-addressed operation. expected, when non-nil, is the generation or
+// immutable identity observed before the fresh inspect. stoppedOnly makes a
+// stopped-generation delete fail closed if the object became running.
+func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, stoppedOnly bool, verify func(*engineInfo) error) (bool, error) {
+	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
+	defer cancel()
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
-		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		return false, fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
-	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
-		return nil
+
+	fresh, err := c.inspectFresh(ctx)
+	if isNotFoundFor(c.eng, err) {
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		return false, fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	if expected != nil {
+		if err := sameContainerIdentity(c.eng, expected, fresh); err != nil {
+			return false, err
+		}
+	} else if !validCreationID(c.creation) || fresh.labels[creationLabel] != c.creation {
+		return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
+	if verify != nil {
+		if err := verify(fresh); err != nil {
+			return false, err
+		}
 	}
-	return c.delete(ctx, c.id)
+	if stoppedOnly && fresh.state != StateStopped {
+		return false, nil
+	}
+	target, err := verifiedDeleteTarget(c.eng, fresh, c.id)
+	if err != nil {
+		return false, err
+	}
+	return true, c.delete(ctx, target)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil {
 		return nil
 	}
-	return c.classify(ctx, err)
+	classified := wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	if isNotFoundFor(c.eng, classified) {
+		return nil
+	}
+	return classified
 }
 
 // ContainerIP returns the container's address on its first attached
@@ -463,20 +580,41 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
 	return info, nil
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+
+	uid := c.uid
+	if uid != "" && !validImmutableContainerID(c.eng, uid) {
+		return nil, fmt.Errorf("container %s has invalid immutable ID %q", c.id, uid)
+	}
+	target := uid
+	if target == "" {
+		target = c.id
+	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return nil, err
+	}
+	if uid != "" && requiresImmutableID(c.eng) && info.uid != uid {
+		return nil, fmt.Errorf("%w: inspected immutable ID changed", ErrContainerNotFound)
+	}
+	if c.uid == "" && requiresImmutableID(c.eng) {
+		if !validImmutableContainerID(c.eng, info.uid) {
+			return nil, fmt.Errorf("container %s: inspect returned no valid immutable ID", c.id)
+		}
+		c.uid = info.uid
+	}
+	return info, nil
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

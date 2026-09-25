@@ -141,7 +141,7 @@ func TestDockerRunArgsNeverPullImplicitly(t *testing.T) {
 
 func TestImageMissingClassification(t *testing.T) {
 	imageErr := func(stderr string) error {
-		return &cli.CLIError{Args: []string{"image", "inspect", "x"}, ExitCode: 1, Stderr: stderr}
+		return &cli.CLIError{Args: []string{"image", "inspect", "redis:7-alpine"}, ExitCode: 1, Stderr: stderr}
 	}
 	if !(dockerEngine{}).imageMissing(imageErr("Error response from daemon: No such image: redis:7-alpine")) {
 		t.Error("docker: daemon not-found not classified as missing")

@@ -54,6 +54,16 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
+	fresh, err := ctr.inspectFresh(ctx)
+	if err != nil {
+		if ctr.uid != "" && isNotFoundFor(cfg.eng, err) {
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+		}
+		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+	}
+	if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -73,7 +83,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if !isNotFoundFor(cfg.eng, err) {
 				return nil, err
 			}
 			// Creation carries its own runTimeout budget detached from
@@ -86,8 +96,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// nameConflict: another process won create. createRaceMissing
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
-			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+			// Only the primary operation branch is retryable; a cleanup
+			// conflict must not make a failed create look like a peer win.
+			primaryErr := primaryOperationError(createErr)
+			if cfg.eng.nameConflict(primaryErr) || createRaceMissing(primaryErr) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -113,6 +125,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -191,13 +206,57 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
-	err := ctr.Terminate(ctx)
+	_, err := ctr.terminateByName(ctx, info, true, func(fresh *engineInfo) error {
+		if err := checkReuseLabels(fresh, cfg); err != nil {
+			return err
+		}
+		return nil
+	})
 	if errors.Is(err, ErrGenerationReplaced) {
 		return nil
 	}
 	return err
+}
+
+func sameReusePorts(before, fresh []boundPort) bool {
+	if len(before) != len(fresh) {
+		return false
+	}
+	counts := make(map[boundPort]int, len(before))
+	for _, port := range before {
+		counts[port]++
+	}
+	for _, port := range fresh {
+		if counts[port] == 0 {
+			return false
+		}
+		counts[port]--
+	}
+	return true
+}
+
+func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) error {
+	if err := checkReuseCompat(fresh, image, cfg); err != nil {
+		return err
+	}
+	if err := sameContainerIdentity(cfg.eng, before, fresh); err != nil {
+		return fmt.Errorf("reuse %s: %w", cfg.name, err)
+	}
+	if before.state != StateRunning || fresh.state != StateRunning {
+		return fmt.Errorf("reuse %s: state changed from %s to %s before return", cfg.name, before.state, fresh.state)
+	}
+	if before.image != fresh.image {
+		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
+	}
+	if !sameReusePorts(before.bound, fresh.bound) {
+		return fmt.Errorf("reuse %s: published ports changed before return", cfg.name)
+	}
+	return nil
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -228,29 +287,82 @@ func namedContainer(cfg *config, id string) *Container {
 	}
 }
 
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
+// createRaceMissing reports only Apple's anchored concurrent-create form:
+// a run command that reaches bootstrap and then loses the named object.
+// Generic application output containing "not found" is deliberately excluded.
 func createRaceMissing(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return false
+	var cliErrs []*cli.CLIError
+	collectCLIErrors(err, &cliErrs)
+	for _, cliErr := range cliErrs {
+		if binary := normalizedCLIBinary(cliErr.Binary); binary != "" && binary != "container" {
+			continue
+		}
+		if len(cliErr.Args) == 0 || strings.ToLower(cliErr.Args[0]) != "run" {
+			continue
+		}
+		target := ""
+		for i, arg := range cliErr.Args {
+			if arg == "--name" && i+1 < len(cliErr.Args) {
+				target = cliErr.Args[i+1]
+				break
+			}
+		}
+		if target == "" {
+			continue
+		}
+		for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
+			line := stripCLIErrorPrefix(rawLine)
+			for range 3 {
+				if exactAppleIDNotFound(line, target) {
+					return true
+				}
+				var rest string
+				switch {
+				case strings.HasPrefix(strings.ToLower(line), "failed to bootstrap container:"):
+					rest = strings.TrimSpace(line[len("failed to bootstrap container:"):])
+				case strings.HasPrefix(strings.ToLower(line), "failed to run container:"):
+					rest = strings.TrimSpace(line[len("failed to run container:"):])
+				}
+				if rest == "" {
+					break
+				}
+				line = rest
+			}
+		}
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
-		return true
-	}
-	return strings.Contains(s, "container not found")
+	return false
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
+// checkReuseOwned reports whether a stopped or running container may be
+// adopted, deleted, or recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
+	}
+	if cfg.eng.name() == "docker" && !dockerIDRE.MatchString(info.uid) {
+		return fmt.Errorf("reuse %s: existing container has no valid immutable ID", cfg.name)
+	}
+	if cfg.eng.name() == "apple" && info.uid != "" {
+		return fmt.Errorf("reuse %s: existing container has an unexpected immutable ID", cfg.name)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	}
+	return nil
+}
+
+func checkReuseLabels(info *engineInfo, cfg *config) error {
+	if info == nil {
+		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
+	}
+	if info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if info.labels[managedLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: existing container has no valid creation generation: %w", cfg.name, ErrGenerationReplaced)
 	}
 	return nil
 }

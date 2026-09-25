@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -22,21 +21,7 @@ import (
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
-// Observed wording:
-//   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
-//   - image missing: "Error response from daemon: No such image: …"
-//   - container missing: "error: no such object: …" (also historically
-//     "No such container" / "not found")
-const (
-	dockerStderrConflict     = "conflict"
-	dockerStderrAlreadyInUse = "already in use"
-	dockerStderrName         = "name"
-	dockerStderrNoSuchImage  = "no such image"
-	dockerStderrNotFound     = "not found"
-	dockerStderrNoSuchObj    = "no such object"
-	dockerStderrNoSuchCtr    = "no such container"
-)
+// Backend error matching is operation- and target-aware in errors.go.
 
 func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
@@ -190,10 +175,27 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	match := -1
+	for i, container := range containers {
+		if dockerIDRE.MatchString(id) {
+			if container.ID == id {
+				match = i
+				break
+			}
+			continue
+		}
+		if strings.TrimPrefix(container.Name, "/") == strings.TrimPrefix(id, "/") {
+			match = i
+			break
+		}
 	}
-	c := containers[0]
+	if match < 0 {
+		return nil, fmt.Errorf("%w: %s not in inspect output", ErrContainerNotFound, id)
+	}
+	c := containers[match]
+	if !dockerIDRE.MatchString(c.ID) {
+		return nil, fmt.Errorf("docker inspect for %s returned invalid container ID %q", id, c.ID)
+	}
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
@@ -328,7 +330,7 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 
 // imageMissing matches the daemon's response for an absent image.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
+	return exactImageMissingFor(err, "docker")
 }
 
 func (dockerEngine) parseImageExists(data []byte, _ string) bool {
@@ -353,34 +355,10 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, dockerStderrConflict) ||
-		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
+	return exactNameConflictFor(err, "docker")
 }
 
 // containerMissing matches a CLI failure for an absent container.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
-}
-
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	return exactContainerNotFoundFor(err, "docker")
 }

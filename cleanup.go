@@ -23,7 +23,9 @@ func TerminateContainer(ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	return ctr.Terminate(context.Background())
+	ctx, cancel := withDefaultTimeout(context.Background(), terminateTimeout)
+	defer cancel()
+	return ctr.Terminate(ctx)
 }
 
 type cleanupTB interface {
@@ -93,9 +95,12 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
-		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
-			continue
+		if err != nil {
+			classified := wrapNotFoundFor(eng, err)
+			if !isNotFoundFor(eng, classified) {
+				errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, classified))
+				continue
+			}
 		}
 		removed = append(removed, id)
 	}

@@ -54,3 +54,58 @@ func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 		t.Errorf("deleteCalls = %d, want 0 while the name is locked elsewhere", r.deleteCalls)
 	}
 }
+
+func TestTerminateContainerBoundsNameLockWait(t *testing.T) {
+	oldTimeout := terminateTimeout
+	terminateTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { terminateTimeout = oldTimeout })
+
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lockName: %v", err)
+	}
+	defer unlock()
+
+	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	start := time.Now()
+	err = TerminateContainer(ctr)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("TerminateContainer = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("TerminateContainer took %v, want bounded wait", elapsed)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", r.deleteCalls)
+	}
+}
+
+func TestRollbackBoundsNameLockWait(t *testing.T) {
+	oldTimeout := terminateTimeout
+	terminateTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { terminateTimeout = oldTimeout })
+
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lockName: %v", err)
+	}
+	defer unlock()
+
+	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	cause := errors.New("copy failed")
+	start := time.Now()
+	err = ctr.rollback(context.Background(), cause)
+	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) {
+		t.Fatalf("rollback = %v, want primary and deadline errors", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("rollback took %v, want bounded wait", elapsed)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", r.deleteCalls)
+	}
+}

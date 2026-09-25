@@ -14,7 +14,7 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	dir := t.TempDir()
 	logPath = filepath.Join(dir, "calls.log")
 	binPath = filepath.Join(dir, "container")
-	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\nif [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -46,10 +46,10 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("ctr-one", ""); err != nil {
+	if err := r.register("ctr-one", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two", ""); err != nil {
+	if err := r.register("ctr-two", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -73,13 +73,16 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
 	}
+	if err := r.register("unidentified", ""); err == nil {
+		t.Error("register name without creation: want error")
+	}
 }
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
-	if err := r.register("before-crash", ""); err != nil {
+	if err := r.register("before-crash", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -87,7 +90,7 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash", ""); err != nil {
+	if err := r.register("after-crash", "0123456789abcdef"); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()
@@ -119,7 +122,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
-	if err := r.register("ok", ""); err != nil {
+	if err := r.register("ok", "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()

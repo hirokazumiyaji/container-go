@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -16,21 +15,7 @@ import (
 type appleEngine struct{}
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
-// Sources (apple/container):
-//   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,
-//     message: "container with id \(id) already exists")
-//   - image missing / container missing: ContainerizationError(.notFound)
-//     surfaces as "image not found: …" / "container not found: …"
-const (
-	appleStderrAlready   = "already"
-	appleStderrExist     = "exist"
-	appleStderrInUse     = "in use"
-	appleStderrTaken     = "taken"
-	appleStderrNotFound  = "not found"
-	appleStderrNoSuchObj = "no such object"    // defensive; not observed on 1.3.0
-	appleStderrNoSuchCtr = "no such container" // defensive; not observed on 1.3.0
-)
+// Backend error matching is operation- and target-aware in errors.go.
 
 func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
@@ -80,7 +65,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, fmt.Errorf("%w: %s not in inspect output", ErrContainerNotFound, id)
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
@@ -164,7 +149,7 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 
 // imageMissing matches the CLI's error for an absent image.
 func (appleEngine) imageMissing(err error) bool {
-	return appleStderrContains(err, appleStderrNotFound)
+	return exactImageMissingFor(err, "apple")
 }
 
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
@@ -242,36 +227,10 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 
 // nameConflict matches Apple Container's duplicate-name wording.
 func (appleEngine) nameConflict(err error) bool {
-	s, ok := appleCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, appleStderrAlready) &&
-		(strings.Contains(s, appleStderrExist) ||
-			strings.Contains(s, appleStderrInUse) ||
-			strings.Contains(s, appleStderrTaken))
+	return exactNameConflictFor(err, "apple")
 }
 
 // containerMissing matches a CLI failure for an absent container.
 func (appleEngine) containerMissing(err error) bool {
-	s, ok := appleCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, appleStderrNotFound) ||
-		strings.Contains(s, appleStderrNoSuchObj) ||
-		strings.Contains(s, appleStderrNoSuchCtr)
-}
-
-func appleCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func appleStderrContains(err error, substr string) bool {
-	s, ok := appleCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	return exactContainerNotFoundFor(err, "apple")
 }

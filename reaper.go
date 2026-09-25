@@ -114,11 +114,14 @@ func newReaper(binary, subcommand string) *reaper {
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// ID from creationLabel; it may be empty only for a Docker-style
+// immutable container ID, never for a name-addressed target.
 func (r *reaper) register(id, creation string) error {
 	if !nameRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
+	}
+	if creation == "" && !dockerIDRE.MatchString(id) {
+		return fmt.Errorf("reaper: creation id is required for name-addressed container %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)

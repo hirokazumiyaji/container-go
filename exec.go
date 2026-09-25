@@ -86,7 +86,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -99,7 +99,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if c.execContainerRunning(ctx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

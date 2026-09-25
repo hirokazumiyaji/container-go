@@ -485,6 +485,34 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 	}
 }
 
+type waitTypedCause struct{ message string }
+
+func (e *waitTypedCause) Error() string { return e.message }
+
+func TestForExecRetainsReadinessCauseAtTimeout(t *testing.T) {
+	cause := &waitTypedCause{message: "readiness backend failed"}
+	target := newFakeTarget()
+	target.execErr = cause
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(30*time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want readiness cause", err)
+	}
+	var typed *waitTypedCause
+	if !errors.As(err, &typed) || typed != cause {
+		t.Fatalf("typed cause = %v, want %v", typed, cause)
+	}
+	if got := errors.Unwrap(err); got != context.DeadlineExceeded {
+		t.Fatalf("errors.Unwrap = %v, want context deadline", got)
+	}
+}
+
 func TestForExecRejectsEmptyCommand(t *testing.T) {
 	target := newFakeTarget()
 	s := ForExec(nil).WithStartupTimeout(60 * time.Second)

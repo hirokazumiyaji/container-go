@@ -388,7 +388,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "myctr"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

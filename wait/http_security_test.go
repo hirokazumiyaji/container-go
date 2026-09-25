@@ -333,6 +333,10 @@ func TestSameOrigin(t *testing.T) {
 	}{
 		{name: "same origin", a: "http://example.test/start", b: "http://example.test/ready", want: true},
 		{name: "case-insensitive host", a: "http://EXAMPLE.test/start", b: "http://example.TEST/ready", want: true},
+		{name: "same Unicode host", a: "http://ς.example:8080/start", b: "http://ς.example:8080/ready", want: true},
+		{name: "IDNA-distinct Unicode hosts", a: "http://ς.example:8080/start", b: "http://Σ.example:8080/ready", want: false},
+		{name: "same IPv6 zone", a: "http://[fe80::1%25eth0]:8080/start", b: "http://[fe80::1%25eth0]:8080/ready", want: true},
+		{name: "case-distinct IPv6 zones", a: "http://[fe80::1%25eth0]:8080/start", b: "http://[fe80::1%25ETH0]:8080/ready", want: false},
 		{name: "implicit HTTP port", a: "http://example.test/start", b: "http://example.test:80/ready", want: true},
 		{name: "implicit HTTPS port", a: "https://example.test/start", b: "https://example.test:443/ready", want: true},
 		{name: "different host", a: "http://example.test/start", b: "http://attacker.test/ready", want: false},
@@ -350,6 +354,65 @@ func TestSameOrigin(t *testing.T) {
 			}
 			if got := sameOrigin(a, b); got != test.want {
 				t.Errorf("sameOrigin(%q, %q) = %t, want %t", test.a, test.b, got, test.want)
+			}
+		})
+	}
+}
+
+func TestForHTTPRedirectRejectsDistinctDialingAuthorities(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		initial  string
+		location string
+	}{
+		{
+			name:     "IDNA-distinct Unicode hosts",
+			initial:  "http://ς.example:8080/start",
+			location: "http://Σ.example:8080/ready",
+		},
+		{
+			name:     "case-distinct IPv6 zones",
+			initial:  "http://[fe80::1%25eth0]:8080/start",
+			location: "http://[fe80::1%25ETH0]:8080/ready",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			var requests atomic.Int32
+			leaked := make(chan string, 1)
+			client := &http.Client{
+				Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+					if requests.Add(1) == 1 {
+						return &http.Response{
+							StatusCode: http.StatusFound,
+							Status:     "302 Found",
+							Header:     http.Header{"Location": []string{test.location}},
+							Body:       io.NopCloser(strings.NewReader("")),
+							Request:    req,
+						}, nil
+					}
+					leaked <- req.Header.Get("X-Probe-Secret")
+					return successfulHTTPResponse(req), nil
+				}),
+				CheckRedirect: checkHTTPProbeRedirect,
+			}
+
+			req, err := http.NewRequest(http.MethodGet, test.initial, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			req.Header.Set("X-Probe-Secret", "custom-secret")
+			resp, err := client.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if got := requests.Load(); got != 1 {
+				t.Fatalf("requests = %d, want 1", got)
+			}
+			select {
+			case got := <-leaked:
+				t.Errorf("redirect target received X-Probe-Secret %q", got)
+			default:
 			}
 		})
 	}

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -216,8 +217,43 @@ func checkHTTPProbeRedirect(req *http.Request, via []*http.Request) error {
 
 func sameOrigin(a, b *url.URL) bool {
 	return strings.EqualFold(a.Scheme, b.Scheme) &&
-		strings.EqualFold(a.Hostname(), b.Hostname()) &&
+		sameOriginHost(a.Hostname(), b.Hostname()) &&
 		effectivePort(a) == effectivePort(b)
+}
+
+func sameOriginHost(a, b string) bool {
+	if a == b {
+		return true
+	}
+
+	// net/http canonicalizes non-ASCII hostnames with IDNA before dialing,
+	// while net/url leaves them as Unicode. Unicode case folding is not an
+	// IDNA equivalence check (for example, final sigma and capital sigma),
+	// so fail closed instead of treating distinct dialing authorities as
+	// equal. Exact raw host matches above remain valid.
+	if !isASCII(a) || !isASCII(b) {
+		return false
+	}
+
+	// IPv6 zone identifiers are part of the dialing authority. netip.Addr
+	// equality compares the address and preserves the zone exactly, unlike
+	// strings.EqualFold.
+	if addr, err := netip.ParseAddr(a); err == nil {
+		other, err := netip.ParseAddr(b)
+		return err == nil && addr == other
+	}
+
+	// DNS names are ASCII case-insensitive.
+	return strings.EqualFold(a, b)
+}
+
+func isASCII(s string) bool {
+	for _, r := range s {
+		if r > 127 {
+			return false
+		}
+	}
+	return true
 }
 
 func effectivePort(u *url.URL) string {

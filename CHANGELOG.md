@@ -16,11 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   output and log-tail diagnostics use a fixed-size ring.
 - Document the compatibility policy: legacy full-output calls remain
   available, while callers handling untrusted output should opt into a
-  positive limit or streaming sink.
+  positive limit or streaming sink. The new `LogsOptions.MaxBytes` field
+  intentionally requires keyed struct literals.
 - Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
+
+- Preserve output-delivery errors alongside CLI terminal errors, retain
+  bounded partial readers on backend failures, and make the large-output
+  integration check deadline-bounded with explicit stderr/wait coverage.
+  `CLIError` diagnostics now retain the trailing 64 KiB of stderr; full
+  `Run` output remains unchanged.
 
 ### Changed
 

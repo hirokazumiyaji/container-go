@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -35,10 +36,19 @@ func (w *cappedTestWriter) Truncated() bool { return w.truncated }
 type legacyOutputRunner struct {
 	stdout []byte
 	stderr []byte
+	err    error
 }
 
 func (r *legacyOutputRunner) Run(context.Context, ...string) ([]byte, []byte, error) {
-	return r.stdout, r.stderr, nil
+	return r.stdout, r.stderr, r.err
+}
+
+type failingTestWriter struct {
+	err error
+}
+
+func (w *failingTestWriter) Write([]byte) (int, error) {
+	return 0, w.err
 }
 
 func TestRunToAdaptsLegacyRunner(t *testing.T) {
@@ -55,6 +65,24 @@ func TestRunToAdaptsLegacyRunner(t *testing.T) {
 	}
 	if stats.StdoutBytes != 8 || stats.StderrBytes != 8 || !stats.Truncated() {
 		t.Fatalf("stats = %+v, want full byte counts and truncation", stats)
+	}
+}
+
+func TestRunToLegacyPreservesTerminalAndWriterErrors(t *testing.T) {
+	sinkErr := errors.New("stdout sink failed")
+	terminal := &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command failed"}
+	runner := &legacyOutputRunner{stdout: []byte("out"), stderr: []byte("err"), err: terminal}
+
+	stats, err := RunTo(runner, context.Background(), &failingTestWriter{err: sinkErr}, &cappedTestWriter{}, "exec")
+	if !errors.Is(err, sinkErr) {
+		t.Fatalf("error = %v, want writer error", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want terminal CLI exit 7", err)
+	}
+	if stats.StdoutBytes != 3 || stats.StderrBytes != 3 {
+		t.Fatalf("stats = %+v, want observed byte counts", stats)
 	}
 }
 
@@ -78,8 +106,56 @@ func TestExecRunnerRunToWritesLargeOutputDirectlyToBoundedSinks(t *testing.T) {
 	}
 }
 
+func TestExecRunnerRunToPreservesWriterAndTerminalErrors(t *testing.T) {
+	sinkErr := errors.New("sink rejected output")
+	r := &ExecRunner{Binary: writeStub(t, `printf 'stdout data'; printf 'stderr terminal marker' >&2; exit 7`)}
+
+	_, err := r.RunTo(context.Background(), &failingTestWriter{err: sinkErr}, io.Discard, "exec", "ctr")
+	if !errors.Is(err, sinkErr) || !errors.Is(err, ErrOutputDelivery) {
+		t.Fatalf("error = %v, want writer and output-delivery errors", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want terminal CLI exit 7", err)
+	}
+	if cliErr.Stderr != "stderr terminal marker" {
+		t.Fatalf("CLIError.Stderr = %q, want stderr diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestExecRunnerRunToPreservesStderrWriterError(t *testing.T) {
+	sinkErr := errors.New("stderr sink rejected output")
+	r := &ExecRunner{Binary: writeStub(t, `printf 'stderr terminal marker' >&2; exit 7`)}
+
+	_, err := r.RunTo(context.Background(), io.Discard, &failingTestWriter{err: sinkErr}, "exec")
+	if !errors.Is(err, sinkErr) {
+		t.Fatalf("error = %v, want stderr writer error", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want terminal CLI exit 7", err)
+	}
+	if cliErr.Stderr != "stderr terminal marker" {
+		t.Fatalf("CLIError.Stderr = %q, want independent diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestExecRunnerRunToReportsWriterErrorAfterSuccess(t *testing.T) {
+	sinkErr := errors.New("sink rejected successful output")
+	r := &ExecRunner{Binary: writeStub(t, `printf output`)}
+
+	_, err := r.RunTo(context.Background(), &failingTestWriter{err: sinkErr}, io.Discard, "exec")
+	if !errors.Is(err, sinkErr) {
+		t.Fatalf("error = %v, want writer error", err)
+	}
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		t.Fatalf("successful command was reported as CLI exit: %v", cliErr)
+	}
+}
+
 func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
-	r := &ExecRunner{Binary: writeStub(t, `head -c 131072 /dev/zero >&2; exit 7`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_DIAGNOSTIC_MARKER\\n'; head -c 131072 /dev/zero >&2; printf 'LAST_DIAGNOSTIC_MARKER\\n' >&2; exit 7`)}
 
 	_, err := r.RunTo(context.Background(), io.Discard, io.Discard, "exec")
 	var cliErr *CLIError
@@ -91,5 +167,11 @@ func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
 	}
 	if len(cliErr.Stderr) != maxStderr {
 		t.Errorf("len(CLIError.Stderr) = %d, want %d", len(cliErr.Stderr), maxStderr)
+	}
+	if !strings.Contains(cliErr.Stderr, "LAST_DIAGNOSTIC_MARKER") {
+		t.Errorf("CLIError.Stderr does not retain the terminal diagnostic")
+	}
+	if strings.Contains(cliErr.Stderr, "FIRST_DIAGNOSTIC_MARKER") {
+		t.Errorf("CLIError.Stderr retained the discarded prefix")
 	}
 }

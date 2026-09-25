@@ -2,8 +2,11 @@ package container
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"sync"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // ErrOutputTruncated is returned as the terminal read error when a
@@ -168,8 +171,15 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 		keep = room
 	}
 	n, err := w.dst.Write(p[:int(keep)])
+	if n < 0 || n > int(keep) {
+		return 0, fmt.Errorf("invalid write count %d for %d-byte buffer", n, keep)
+	}
 	w.written += int64(n)
-	if int64(len(p)) > int64(n) {
+	// Truncation means that this wrapper intentionally discarded bytes
+	// beyond its configured limit. A short/error return from the
+	// destination is an output-delivery failure, not evidence that the
+	// limit discarded bytes.
+	if int64(len(p)) > keep {
 		w.truncated = true
 	}
 	if err == nil && n != int(keep) {
@@ -215,6 +225,75 @@ func streamWriter(dst io.Writer) io.Writer {
 		dst = io.Discard
 	}
 	return &synchronizedWriter{dst: dst}
+}
+
+// outputTrackingWriter records delivery failures even when a custom
+// WriterRunner forgets to return an error from its Write method. The
+// outer synchronized/limited writer still provides the synchronization
+// and configured-limit behavior.
+type outputTrackingWriter struct {
+	mu  sync.Mutex
+	dst io.Writer
+	err error
+}
+
+func newOutputTrackingWriter(dst io.Writer) *outputTrackingWriter {
+	if dst == nil {
+		dst = io.Discard
+	}
+	return &outputTrackingWriter{dst: dst}
+}
+
+func (w *outputTrackingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	if n < 0 || n > len(p) {
+		err = fmt.Errorf("invalid write count %d for %d-byte buffer", n, len(p))
+	} else if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
+		w.mu.Lock()
+		switch {
+		case w.err == nil:
+			w.err = err
+		case !errors.Is(w.err, err):
+			w.err = errors.Join(w.err, err)
+		}
+		w.mu.Unlock()
+	}
+	return n, err
+}
+
+func (w *outputTrackingWriter) Err() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.err
+}
+
+func (w *outputTrackingWriter) Truncated() bool {
+	type truncationReporter interface{ Truncated() bool }
+	tr, ok := w.dst.(truncationReporter)
+	return ok && tr.Truncated()
+}
+
+// preserveOutputDeliveryError adds a sink failure observed at the API
+// boundary to a runner error that did not report it. This protects the
+// public methods even when an injected WriterRunner violates its error
+// contract, while avoiding duplicate wrappers when RunTo already joined
+// the same writer error.
+func preserveOutputDeliveryError(err error, tracked *outputTrackingWriter) error {
+	if tracked == nil {
+		return err
+	}
+	writerErr := tracked.Err()
+	if writerErr == nil || (cli.IsOutputError(err) && errors.Is(err, writerErr)) {
+		return err
+	}
+	deliveryErr := &cli.OutputError{Stream: "combined output", Err: writerErr}
+	if err == nil {
+		return deliveryErr
+	}
+	return errors.Join(err, deliveryErr)
 }
 
 func limitedStreamWriter(dst io.Writer, limit int64) *limitedWriter {

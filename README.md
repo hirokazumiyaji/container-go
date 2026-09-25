@@ -80,21 +80,38 @@ New CLI output paths capture through bounded or caller-owned sinks so a
 container cannot make the host allocate an unbounded response:
 
 - `LogsWithOptions{MaxBytes: n}` retains at most `n` combined bytes and
-  returns a reader implementing `Truncated() bool`. A positive
-  `WithExecMaxBytes(n)` applies the same policy to `Exec`.
+  returns a reader implementing `Truncated() bool`. `Tail` is a
+  backend **line-based tail** (`--tail`); it is applied before the byte
+  cap. `MaxBytes` is a **prefix** cap: it retains the first bytes of the
+  combined stdout/stderr arrival stream, not the trailing bytes. A
+  positive `WithExecMaxBytes(n)` applies the same prefix policy to
+  `Exec`. Legacy unbounded readers retain their historical
+  stdout-then-stderr concatenation; bounded captures use arrival order
+  when the runner implements streaming `RunTo` (a legacy-only runner is
+  adapted in that order).
 - `ExecTo` and `LogsTo` stream directly to an `io.Writer`; use
   `WithExecMaxBytes` or `LogsOptions.MaxBytes` to drain and discard
-  bytes beyond a caller-selected limit. `OutputStats.Bytes` is the
+  bytes beyond a caller-selected prefix. `OutputStats.Bytes` is the
   total observed, including discarded bytes. These streaming methods
-  merge stdout and stderr in arrival order.
+  merge stdout and stderr in arrival order. A writer error is returned
+  even when the child exits successfully; it is joined with a terminal
+  CLI error when both occur. Use `errors.Is(err,
+  container.ErrOutputDelivery)` for the category while retaining the
+  original writer error in the chain.
 - A bounded reader returns `ErrOutputTruncated` as its terminal read
   error, while still returning all retained bytes. Check
   `errors.Is(readErr, container.ErrOutputTruncated)` or the
-  `Truncated()` method; truncation is never silent.
+  `Truncated()` method; truncation is never silent. On a backend,
+  cancellation, launch, or missing-container error, bounded APIs still
+  return the partial reader and its truncation state.
 - `FollowLogs` is intentionally a long-lived stream and has no
   automatic byte limit. The caller owns its lifetime and backpressure.
 - `wait.ForExec` discards command output for every poll, and wait-failure
-  diagnostics use a fixed 1 MiB trailing log buffer.
+  diagnostics use a fixed 1 MiB trailing log buffer. That diagnostic tail
+  is separate from the public prefix cap. The internal ExecRunner
+  `CLIError` keeps at most the trailing 64 KiB of stderr per failed
+  invocation; this diagnostic limit does not bound `Run` output or a
+  caller-owned sink.
 
 `Logs`, `Exec` without `WithExecMaxBytes`, and `MaxBytes == 0` retain
 the historical full-output behavior for source compatibility. That
@@ -102,6 +119,16 @@ compatibility path is deprecated for untrusted or long-lived output;
 new code should select a positive limit or use a streaming method.
 The legacy path will be reconsidered in a future minor release, but
 this change does not silently discard existing output.
+
+`LogsOptions` now has a `MaxBytes` field. Go cannot add a field to a
+struct without breaking old unkeyed literals, so this release
+intentionally requires keyed `LogsOptions` literals; update existing
+`LogsOptions{tail, since}` calls to `LogsOptions{Tail: tail, Since:
+since}`. The repository is pre-1.0 and documents this narrow source
+compatibility tradeoff rather than hiding it behind a second option
+representation. The large-output integration check verifies bounded
+forwarding and draining; it does not measure peak host memory, which
+would require an external RSS sampler.
 
 ## Connection endpoints
 

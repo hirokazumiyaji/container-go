@@ -199,6 +199,17 @@ change their default. New code should use a positive
 `WithExecMaxBytes` or `LogsOptions.MaxBytes`, or stream directly with
 `ExecTo` / `LogsTo`.
 
+`LogsOptions.Tail` is a backend line-based tail (`--tail`) and
+`Since` is a backend timestamp filter. `MaxBytes` is applied after
+that selection and is a **prefix** cap: it retains the first bytes of
+the combined stdout/stderr arrival stream, not a byte tail. The same
+prefix policy applies to `WithExecMaxBytes` and to `LogsTo`. The wait
+failure log path is intentionally different: it keeps a trailing
+1 MiB ring so the latest diagnostic survives. Legacy unbounded readers
+retain stdout-then-stderr concatenation; bounded and streaming captures
+use observed arrival order when the runner implements `RunTo`, while the
+compatibility adapter for a legacy-only runner writes stdout then stderr.
+
 A positive byte limit applies to combined stdout and stderr. The child
 process is drained after the retained prefix is full, so truncation
 cannot leave it blocked on a pipe. Bounded readers expose
@@ -206,14 +217,30 @@ cannot leave it blocked on a pipe. Bounded readers expose
 read error after yielding the retained prefix. `OutputStats` reports
 both total observed bytes and whether a limit discarded data.
 `FollowLogs` is deliberately an uncapped long-lived stream; its caller
-controls the reader and backpressure.
+controls the reader and backpressure. A sink failure is never converted
+into a successful result: `RunTo`, `ExecTo`, and `LogsTo` preserve a
+writer error alongside any CLI terminal error, and bounded snapshot
+APIs return a partial reader on infrastructure, cancellation, launch,
+and missing-container failures.
 
 The wait adapter never materializes `ForExec` output: it sends both
 streams to `io.Discard` and keeps only a fixed 1 MiB trailing log ring
 for failure diagnostics. The CLI runner exposes this behavior through
 `RunTo`; runners implementing only the historical `Run` interface are
 adapted for compatibility, but such adapters cannot provide a hard
-peak-memory bound before their own `Run` returns.
+peak-memory bound before their own `Run` returns. The large-output
+integration check verifies bounded forwarding and draining, not peak
+host memory; RSS measurement would require an external sampler.
+
+`LogsOptions` now contains `MaxBytes` in addition to `Tail` and
+`Since`. Go cannot extend a struct without breaking old unkeyed
+literals, so this pre-1.0 release makes the source break explicit:
+callers must use keyed `LogsOptions` literals. This is preferable to
+maintaining a second, subtly different options representation. The
+internal ExecRunner diagnostic is separate again: each failed
+invocation keeps at most the trailing 64 KiB of stderr for `CLIError`,
+while `Run` and caller-owned `RunTo` sinks retain their own documented
+behavior.
 
 `Terminate` maps to `container delete --force` and is idempotent
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
@@ -430,6 +457,8 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
+  the original writer error remains in the chain
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit

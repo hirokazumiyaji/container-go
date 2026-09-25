@@ -77,20 +77,37 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 ## 出力の契約
 
 CLI の出力は bounded または caller 所有の sink へ流します。
-`LogsWithOptions{MaxBytes: n}` と `WithExecMaxBytes(n)` は stdout と
-stderr の合計を `n` byte に制限します。`ExecTo` と `LogsTo` は
-`io.Writer` へ直接ストリームし、`OutputStats` が破棄前の総観測量と
-truncation を返します。bounded reader は `Truncated() bool` を提供し、
-保持したデータを返した後の terminal read error が
-`ErrOutputTruncated` になります。`FollowLogs` は長期ストリームなので
-自動 byte 上限はありません。`wait.ForExec` は各 poll の出力を
-`io.Discard` へ送り、失敗診断のログは固定長 1MiB の末尾リングに
-保持します。
+`LogsOptions.Tail` は backend の**行単位の末尾**(`--tail`)で、
+`MaxBytes` はその後に適用される**先頭 byte の prefix 上限**です。
+つまり `MaxBytes` は stdout/stderr の結合到着ストリームの先頭を保持し、
+末尾を保持する tail ではありません。`WithExecMaxBytes(n)` も同じ
+prefix ポリシーを `Exec` に適用します。旧 unbounded reader は stdout の後に stderr を連結し、bounded capture は到着順を使います。
+`ExecTo` と `LogsTo` は `io.Writer` へ直接ストリームし、
+`OutputStats` が破棄前の総観測量と truncation を返します。writer が
+失敗した場合は、子プロセスの終了が成功でも出力 delivery エラーを必ず
+返します。CLI の終端エラーも同時に発生した場合は同じ error chain に
+保持します。分類は `errors.Is(err, container.ErrOutputDelivery)` で確認し、
+元の writer error も chain に残ります。
+bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の
+terminal read error が `ErrOutputTruncated` になります。backend の
+infrastructure、cancellation、launch、missing-container エラー時も
+partial reader と truncation state を返します。`FollowLogs` は長期
+ストリームなので自動 byte 上限はありません。`wait.ForExec` は各 poll の
+出力を `io.Discard` へ送り、失敗診断のログは固定長 1MiB の末尾リングに
+保持します。internal `CLIError` は失敗した invocation ごとに stderr の
+末尾最大 64KiB だけを診断用に保持します。これは `Run` の全量出力や
+caller-owned sink の上限ではありません。
 
 `Logs`、`WithExecMaxBytes` を指定しない `Exec`、`MaxBytes == 0` は
 ソース互換性のため従来の全量保持を維持します。これは信頼できない
 出力には deprecated であり、新コードでは正の制限値または
 `ExecTo` / `LogsTo` を選んでください。
+`LogsOptions` に `MaxBytes` を追加したため、Go の構造体の性質上、旧
+2 要素 unkeyed literal はコンパイルできません。`LogsOptions{Tail: ...,
+Since: ...}` の keyed literal へ移行してください。これは pre-1.0 の
+意図的な source compatibility tradeoff として明記しています。
+大きな出力の integration test は bounded forwarding と draining のみを
+確認し、peak host memory は外部の RSS sampler なしには測定しません。
 
 ## 接続エンドポイント
 

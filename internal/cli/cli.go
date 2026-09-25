@@ -8,13 +8,67 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
-// maxStderr bounds the stderr captured into a CLIError.
+// maxStderr is the maximum number of trailing stderr bytes ExecRunner
+// retains when constructing one CLIError diagnostic. It does not bound
+// the output returned by Run or the caller-owned sinks passed to RunTo;
+// those paths keep their own contract. Custom Runner implementations
+// remain responsible for applying their own diagnostic bound.
 const maxStderr = 64 * 1024
+
+// ErrOutputDelivery identifies a failure to deliver CLI output to a
+// caller-provided sink. The underlying writer error remains in the
+// error chain for errors.Is/errors.As checks.
+var ErrOutputDelivery = errors.New("CLI output delivery failed")
+
+// OutputError annotates a sink failure with the CLI stream that could not
+// be written. It is kept in internal/cli because callers should normally
+// inspect their own writer error rather than depend on this wrapper type.
+type OutputError struct {
+	Stream string
+	Err    error
+}
+
+func (e *OutputError) Error() string {
+	if e == nil {
+		return ErrOutputDelivery.Error()
+	}
+	if e.Err == nil {
+		return ErrOutputDelivery.Error()
+	}
+	if e.Stream == "" {
+		return fmt.Sprintf("%s: %v", ErrOutputDelivery, e.Err)
+	}
+	return fmt.Sprintf("%s: write CLI %s: %v", ErrOutputDelivery, e.Stream, e.Err)
+}
+
+// Unwrap exposes the original writer error. Is handles the delivery
+// sentinel as well, so errors.Is works for either one without requiring
+// callers to know about this wrapper type.
+func (e *OutputError) Unwrap() error {
+	if e == nil || e.Err == nil {
+		return ErrOutputDelivery
+	}
+	return e.Err
+}
+
+func (e *OutputError) Is(target error) bool {
+	return target == ErrOutputDelivery || (e != nil && e.Err != nil && errors.Is(e.Err, target))
+}
+
+// IsOutputError reports whether err contains a caller-sink delivery
+// failure. WriterRunner implementations should return OutputError (or an
+// error chain containing it) when a sink rejects output.
+func IsOutputError(err error) bool {
+	var outputErr *OutputError
+	return errors.As(err, &outputErr)
+}
 
 // ErrSystemNotRunning reports that the container backend (Apple
 // Container system service or Docker daemon) is not running.
@@ -50,7 +104,10 @@ func (s OutputStats) Truncated() bool {
 
 // WriterRunner is the streaming form of Runner. Implementations write
 // directly to the supplied sinks, so a sink can keep a fixed-size view
-// without first allocating the complete CLI output. Runner remains
+// without first allocating the complete CLI output. A sink failure must
+// be represented in the returned error (preferably as *OutputError), even
+// when the child exits successfully; a terminal CLIError and a sink error
+// should be joined rather than one replacing the other. Runner remains
 // separate for compatibility with existing test and embedding runners.
 type WriterRunner interface {
 	Runner
@@ -60,7 +117,9 @@ type WriterRunner interface {
 // RunTo executes a CLI invocation through WriterRunner when available.
 // Runners that only implement the historical Runner interface are
 // adapted for compatibility; that fallback necessarily has already
-// materialized their returned byte slices.
+// materialized their returned byte slices. A sink failure is returned
+// together with the CLI's terminal error, rather than replacing either
+// one or being mistaken for a successful invocation.
 func RunTo(r Runner, ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	if wr, ok := r.(WriterRunner); ok {
 		return wr.RunTo(ctx, stdout, stderr, args...)
@@ -79,20 +138,28 @@ func RunTo(r Runner, ctx context.Context, stdout, stderr io.Writer, args ...stri
 		StdoutTruncated: writerTruncated(stdout),
 		StderrTruncated: writerTruncated(stderr),
 	}
+
+	// Try both streams even if the first sink fails. Both failures are
+	// useful to a caller, and observing stderr does not change the
+	// already-materialized legacy-runner result.
+	var deliveryErr error
 	if err := writeOutput(stdout, dataOut); err != nil {
-		return stats, fmt.Errorf("write CLI stdout: %w", err)
+		deliveryErr = joinErrors(deliveryErr, &OutputError{Stream: "stdout", Err: err})
 	}
 	if err := writeOutput(stderr, dataErr); err != nil {
-		return stats, fmt.Errorf("write CLI stderr: %w", err)
+		deliveryErr = joinErrors(deliveryErr, &OutputError{Stream: "stderr", Err: err})
 	}
 	stats.StdoutTruncated = writerTruncated(stdout)
 	stats.StderrTruncated = writerTruncated(stderr)
-	return stats, runErr
+	return stats, joinErrors(runErr, deliveryErr)
 }
 
 func writeOutput(dst io.Writer, data []byte) error {
 	for len(data) > 0 {
 		n, err := dst.Write(data)
+		if n < 0 || n > len(data) {
+			return fmt.Errorf("invalid write count %d for %d-byte buffer", n, len(data))
+		}
 		if n > 0 {
 			data = data[n:]
 		}
@@ -104,6 +171,23 @@ func writeOutput(dst io.Writer, data []byte) error {
 		}
 	}
 	return nil
+}
+
+func joinErrors(errs ...error) error {
+	nonNil := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			nonNil = append(nonNil, err)
+		}
+	}
+	switch len(nonNil) {
+	case 0:
+		return nil
+	case 1:
+		return nonNil[0]
+	default:
+		return errors.Join(nonNil...)
+	}
 }
 
 func writerTruncated(w io.Writer) bool {
@@ -185,6 +269,9 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 // RunTo runs the CLI while sending stdout and stderr directly to the
 // supplied writers. The process is still fully drained after a sink
 // reaches its own limit, so a bounded sink cannot deadlock the child.
+// Sink errors are drained and remembered rather than returned from the
+// write itself; the final error still contains them together with the
+// process's terminal status.
 func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -196,78 +283,196 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 	}
 	stdoutCount := &countingWriter{dst: stdout}
 	stderrCount := &countingWriter{dst: stderr}
-	diagnostic := &headWriter{max: maxStderr}
+	diagnostic := newTailBuffer(maxStderr)
 	cmd.Stdout = stdoutCount
-	cmd.Stderr = io.MultiWriter(stderrCount, diagnostic)
+	cmd.Stderr = &diagnosticWriter{output: stderrCount, diagnostic: diagnostic}
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
 	runErr := cmd.Run()
+	stdoutBytes, stdoutErr := stdoutCount.snapshot()
+	stderrBytes, stderrErr := stderrCount.snapshot()
 	stats := OutputStats{
-		StdoutBytes:     stdoutCount.bytes,
-		StderrBytes:     stderrCount.bytes,
+		StdoutBytes:     stdoutBytes,
+		StderrBytes:     stderrBytes,
 		StdoutTruncated: writerTruncated(stdout),
 		StderrTruncated: writerTruncated(stderr),
 	}
-	// Output sinks are intentionally not allowed to hide the command's
-	// terminal status. The diagnostic stderr copy is bounded separately
-	// from the caller's sink.
-	if runErr != nil {
-		if ctx.Err() != nil {
-			return stats, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+	terminalErr := commandError(ctx, bin, args, cmd.ProcessState, runErr, diagnostic.String())
+	deliveryErr := joinErrors(
+		outputDeliveryError("stdout", stdoutErr),
+		outputDeliveryError("stderr", stderrErr),
+	)
+	return stats, joinErrors(terminalErr, deliveryErr)
+}
+
+// commandError builds the terminal CLI error after the child has been
+// reaped. A sink is deliberately drained even after it fails, so a
+// non-zero process status remains available to callers instead of being
+// hidden by os/exec's copy error.
+func commandError(ctx context.Context, bin string, args []string, state *os.ProcessState, runErr error, stderr string) error {
+	var terminal error
+	var exitErr *exec.ExitError
+	hasExitError := errors.As(runErr, &exitErr)
+	if state != nil && state.ExitCode() > 0 {
+		terminal = &CLIError{
+			Binary:   bin,
+			Args:     args,
+			ExitCode: state.ExitCode(),
+			Stderr:   truncateStderr(stderr),
 		}
-		var exitErr *exec.ExitError
-		if errors.As(runErr, &exitErr) {
-			return stats, &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(diagnostic.String()),
-			}
+	} else if hasExitError && exitErr.ExitCode() >= 0 {
+		terminal = &CLIError{
+			Binary:   bin,
+			Args:     args,
+			ExitCode: exitErr.ExitCode(),
+			Stderr:   truncateStderr(stderr),
 		}
-		return stats, runErr
 	}
-	return stats, nil
+	if terminal != nil {
+		// A process-state error and the os/exec error describe the same
+		// exit status. Keep unrelated wait/transport errors as well.
+		if runErr != nil && !hasExitError {
+			terminal = joinErrors(terminal, runErr)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			terminal = joinErrors(terminal, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr))
+		}
+		return terminal
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return joinErrors(fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr), runErr)
+	}
+	return runErr
+}
+
+func outputDeliveryError(stream string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return &OutputError{Stream: stream, Err: err}
 }
 
 type countingWriter struct {
+	mu    sync.Mutex
 	dst   io.Writer
 	bytes int64
+	err   error
 }
 
 func (w *countingWriter) Write(p []byte) (int, error) {
-	n, err := w.dst.Write(p)
+	// Count the bytes observed from the child, even when the destination
+	// rejects them. The child is drained by returning a complete count.
+	w.mu.Lock()
 	w.bytes += int64(len(p))
-	if err == nil && n != len(p) {
+	w.mu.Unlock()
+
+	n, err := w.dst.Write(p)
+	if n < 0 || n > len(p) {
+		err = fmt.Errorf("invalid write count %d for %d-byte buffer", n, len(p))
+	} else if err == nil && n != len(p) {
 		err = io.ErrShortWrite
 	}
-	return n, err
-}
-
-// headWriter retains only the first max bytes for CLIError diagnostics.
-type headWriter struct {
-	buf bytes.Buffer
-	max int
-}
-
-func (w *headWriter) Write(p []byte) (int, error) {
-	if room := w.max - w.buf.Len(); room > 0 {
-		if len(p) > room {
-			_, _ = w.buf.Write(p[:room])
-		} else {
-			_, _ = w.buf.Write(p)
+	if err != nil {
+		w.mu.Lock()
+		switch {
+		case w.err == nil:
+			w.err = err
+		case !errors.Is(w.err, err):
+			w.err = errors.Join(w.err, err)
 		}
+		w.mu.Unlock()
+	}
+	// Returning the full input count is intentional: a sink failure must
+	// not stop os/exec's copy pump and leave a child blocked on a pipe.
+	return len(p), nil
+}
+
+func (w *countingWriter) snapshot() (int64, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.bytes, w.err
+}
+
+// diagnosticWriter forwards stderr to the caller and independently
+// retains the bounded diagnostic copy. A failed caller sink must not
+// prevent the diagnostic copy from seeing the CLI's terminal message.
+type diagnosticWriter struct {
+	output     *countingWriter
+	diagnostic io.Writer
+}
+
+func (w *diagnosticWriter) Write(p []byte) (int, error) {
+	_, _ = w.output.Write(p)
+	if _, err := w.diagnostic.Write(p); err != nil {
+		w.output.recordError(err)
 	}
 	return len(p), nil
 }
 
-func (w *headWriter) String() string { return w.buf.String() }
+func (w *countingWriter) recordError(err error) {
+	if err == nil {
+		return
+	}
+	w.mu.Lock()
+	switch {
+	case w.err == nil:
+		w.err = err
+	case !errors.Is(w.err, err):
+		w.err = errors.Join(w.err, err)
+	}
+	w.mu.Unlock()
+}
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
+// tailBuffer retains the trailing max bytes for one CLIError diagnostic.
+// It always reports complete writes, so diagnostic capture cannot block
+// the child or hide a later terminal error.
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+	max  int
+}
+
+func newTailBuffer(max int) *tailBuffer {
+	return &tailBuffer{max: max}
+}
+
+func (w *tailBuffer) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.max <= 0 {
+		return len(p), nil
+	}
+	if len(p) >= w.max {
+		if cap(w.data) < w.max {
+			w.data = make([]byte, w.max)
+		} else {
+			w.data = w.data[:w.max]
+		}
+		copy(w.data, p[len(p)-w.max:])
+		return len(p), nil
+	}
+	overflow := len(w.data) + len(p) - w.max
+	if overflow > 0 {
+		copy(w.data, w.data[overflow:])
+		w.data = w.data[:len(w.data)-overflow]
+	}
+	w.data = append(w.data, p...)
+	return len(p), nil
+}
+
+func (w *tailBuffer) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return string(append([]byte(nil), w.data...))
+}
+
+// truncateStderr is the final safety bound for a diagnostic assembled
+// by a custom runner. The normal ExecRunner path already uses a tail.
 func truncateStderr(s string) string {
 	if len(s) > maxStderr {
-		return s[:maxStderr]
+		return s[len(s)-maxStderr:]
 	}
 	return s
 }
@@ -286,8 +491,8 @@ func IsCommandExit(err error) bool {
 const probeTimeout = 5 * time.Second
 
 // Classify augments a failed CLI call: if the backend does not answer
-// the probe, the failure is reported as ErrSystemNotRunning instead of
-// the original error.
+// the probe, the failure is reported as ErrSystemNotRunning without
+// discarding the original CLI, sink, or probe errors.
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
@@ -296,18 +501,21 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if ctx.Err() != nil {
-		// Caller already gave up; preserve the original failure
-		// instead of masking it with a probe cancellation.
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// Caller already gave up; retain both facts even when a runner
+		// returned only the command error.
+		return joinErrors(err, ctxErr)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
-		if ctx.Err() != nil {
-			return err
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return joinErrors(err, probeErr, ctxErr)
 		}
-		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
+		return fmt.Errorf("%w: %s (underlying error: %w)", ErrSystemNotRunning, probe.Hint, err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return joinErrors(err, ctxErr)
 	}
 	return err
 }

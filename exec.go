@@ -59,8 +59,9 @@ func WithExecWorkDir(dir string) ExecOption {
 }
 
 // WithExecMaxBytes caps the combined stdout+stderr retained by Exec or
-// ExecTo. The limit must be positive; leaving the option unset keeps
-// the historical full-output behavior. Streaming paths merge the two
+// ExecTo. It retains the prefix observed from the CLI, not a byte tail.
+// The limit must be positive; leaving the option unset keeps the
+// historical full-output behavior. Streaming paths merge the two
 // streams in arrival order.
 func WithExecMaxBytes(maxBytes int64) ExecOption {
 	return func(c *execConfig) error {
@@ -75,7 +76,10 @@ func WithExecMaxBytes(maxBytes int64) ExecOption {
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error. The
 // historical full-output behavior remains when WithExecMaxBytes is not
-// supplied; bounded callers should set that option.
+// supplied; bounded callers should set that option. If the backend,
+// context, or CLI launch fails, output still contains the bytes observed
+// before the failure; bounded readers expose whether their prefix was
+// truncated.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	cfg, envFile, cleanup, err := prepareExec(cmd, opts)
 	if err != nil {
@@ -97,15 +101,16 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	code, resolvedErr := c.resolveExecError(ctx, err)
 	if resolvedErr != nil {
-		return code, nil, resolvedErr
+		return code, output, resolvedErr
 	}
 	return code, output, nil
 }
 
 // ExecTo runs a command and streams its combined stdout+stderr to
 // output while the command is running. WithExecMaxBytes applies a hard
-// limit to that stream; bytes beyond it are drained and discarded. The
-// returned stats count all bytes observed, not just bytes forwarded.
+// prefix limit to that stream; bytes beyond it are drained and discarded.
+// The returned stats count all bytes observed, not just bytes forwarded.
+// A sink failure is returned with the CLI's terminal error, if any.
 func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error) {
 	cfg, envFile, cleanup, err := prepareExec(cmd, opts)
 	if err != nil {
@@ -113,15 +118,17 @@ func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, 
 	}
 	defer cleanup()
 
+	tracked := newOutputTrackingWriter(output)
 	var sink io.Writer
 	var limited *limitedWriter
 	if cfg.maxBytes > 0 {
-		limited = limitedStreamWriter(output, cfg.maxBytes)
+		limited = limitedStreamWriter(tracked, cfg.maxBytes)
 		sink = limited
 	} else {
-		sink = streamWriter(output)
+		sink = streamWriter(tracked)
 	}
 	stats, runErr := cli.RunTo(c.runner, ctx, sink, sink, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	runErr = preserveOutputDeliveryError(runErr, tracked)
 	result := OutputStats{
 		Bytes:     stats.StdoutBytes + stats.StderrBytes,
 		Truncated: stats.Truncated(),
@@ -158,26 +165,51 @@ func prepareExec(cmd []string, opts []ExecOption) (*execConfig, string, func(), 
 }
 
 // resolveExecError preserves application exit results while retaining
-// the existing infrastructure/not-found classification behavior.
+// the existing infrastructure/not-found classification behavior. When a
+// runner joins a sink failure to a command exit, the joined error is not
+// converted into a successful result.
 func (c *Container) resolveExecError(ctx context.Context, err error) (int, error) {
 	if err == nil {
 		return 0, nil
 	}
-	if !cli.IsCommandExit(err) {
-		return 0, wrapNotFound(c.classify(ctx, err))
-	}
 	var cliErr *cli.CLIError
-	_ = errors.As(err, &cliErr)
+	if !errors.As(err, &cliErr) {
+		return 0, preserveError(wrapNotFound(c.classify(ctx, err)), err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// A command can finish with an exit status just as its context
+		// is canceled. Keep both facts instead of treating the status
+		// as a clean application result.
+		return cliErr.ExitCode, errors.Join(err, ctxErr)
+	}
+
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
-	// results return immediately with no extra CLI call.
+	// results return immediately with no extra CLI call. A direct
+	// *CLIError is the only error shape that can be a successful result;
+	// wrappers and joined sink errors must remain observable.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, nil
+		if directCLIError(err) {
+			return cliErr.ExitCode, nil
+		}
+		return cliErr.ExitCode, err
 	}
 	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, nil
+		if directCLIError(err) {
+			return cliErr.ExitCode, nil
+		}
+		return cliErr.ExitCode, err
 	}
-	return 0, wrapNotFound(c.classify(ctx, err))
+
+	// Preserve the backend exit code even when verification classifies
+	// the failure as infrastructure, cancellation, or missing-container.
+	classified := wrapNotFound(c.classify(ctx, err))
+	return cliErr.ExitCode, preserveError(classified, err)
+}
+
+func directCLIError(err error) bool {
+	_, ok := err.(*cli.CLIError)
+	return ok
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

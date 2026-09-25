@@ -55,8 +55,9 @@ func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) 
 	return code, err
 }
 
-// logTailLimit bounds the diagnostic log tail attached to wait
-// failures.
+// logTailLimit bounds the trailing diagnostic log tail attached to
+// wait failures. It is independent of the public MaxBytes prefix cap
+// and of the internal 64 KiB CLIError stderr diagnostic.
 const logTailLimit = 1024 * 1024
 
 // logTail fetches up to logTailLimit trailing bytes of the container's

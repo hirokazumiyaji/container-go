@@ -145,6 +145,30 @@ func imageReferenceWithDigest(requested, reported, digest, id string) imageIdent
 	return imageIdentity{}
 }
 
+// imageIdentitiesCompatible compares only immutable identities. A
+// mutable name or tag is not identity proof: a container can retain the
+// tag it was created with after that tag is reassigned.
+func imageIdentitiesCompatible(a, b imageIdentity) bool {
+	if !a.pinned || !b.pinned {
+		return false
+	}
+	if isImageID(a.id) && isImageID(b.id) && a.id == b.id {
+		return true
+	}
+	if !validImageDigest(a.digest) || !validImageDigest(b.digest) || a.digest != b.digest {
+		return false
+	}
+	// A digest is content-addressed, but a reference also names the
+	// repository from which that content was resolved. Do not accept a
+	// same-digest identity from a different registry or namespace.
+	abase := stripImageDigest(a.reference)
+	bbase := stripImageDigest(b.reference)
+	if abase != "" && bbase != "" && !isImageID(abase) && !isImageID(bbase) {
+		return imageRepository(abase) == imageRepository(bbase)
+	}
+	return true
+}
+
 // isImageID recognizes Docker's content-addressed local image ID. The
 // backend controls this value, but keeping it to a single safe token
 // prevents malformed inspect output from becoming an image argument.

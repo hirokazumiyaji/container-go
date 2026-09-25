@@ -36,13 +36,20 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			return nil, err
 		}
 	}
-	if err := checkReuseCompat(info, image, cfg); err != nil {
+	// The shared ensure may have been started with another caller's image
+	// or options. Resolve this caller's request independently before
+	// comparing it with the live container.
+	resolvedImage, err := cfg.ensureImageRef(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
 		return nil, err
 	}
 
 	containerImage := imageFromInfo(info)
-	if base.image.pinned {
-		containerImage = base.image
+	if resolvedImage.pinned {
+		containerImage = resolvedImage
 	}
 	ctr := &Container{
 		id:        base.id,
@@ -67,6 +74,20 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 // reuseRun so every concurrent caller applies its own configuration.
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	recreated := false
+	var resolvedImage imageIdentity
+	imageResolved := false
+	resolveImage := func() error {
+		if imageResolved {
+			return nil
+		}
+		var err error
+		resolvedImage, err = cfg.ensureImageRef(context.WithoutCancel(ctx), image)
+		if err != nil {
+			return err
+		}
+		imageResolved = true
+		return nil
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -81,10 +102,15 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if !isNotFound(err) {
 				return nil, err
 			}
+			// Resolve before create so compatibility is based on the
+			// immutable image that will actually be passed to run.
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
 			// Creation carries its own runTimeout budget detached from
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
-			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
+			ctr, createErr := reuseCreateResolved(context.WithoutCancel(ctx), image, cfg, resolvedImage)
 			if createErr == nil {
 				return ctr, nil
 			}
@@ -107,9 +133,13 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
 			}
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
 			// Only recycle containers this library created for reuse
-			// with a compatible image; never delete foreign leftovers.
-			if err := checkReuseOwned(info, image, cfg); err != nil {
+			// with a compatible resolved image; never delete foreign
+			// leftovers or a container whose image cannot be verified.
+			if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
 				return nil, err
 			}
 			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
@@ -118,6 +148,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -128,7 +161,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				info:      info,
 				creation:  info.labels[creationLabel],
 				uid:       info.uid,
-				image:     imageFromInfo(info),
+				image:     resolvedImage,
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -137,6 +170,16 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 }
 
 func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
+	defer cancel()
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
+		return nil, err
+	}
+	return reuseCreateResolved(ctx, image, cfg, resolvedImage)
+}
+
+func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolvedImage imageIdentity) (*Container, error) {
 	var envFile string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
@@ -150,14 +193,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		cfg.creation = newCreationID()
 	}
 
-	// The leader's pull and create get an independent runTimeout budget
-	// even when the caller's context carries a tighter attach deadline.
+	// The leader's create gets an independent runTimeout budget even
+	// when the caller's context carries a tighter attach deadline.
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
-	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
-	if err != nil {
-		return nil, err
-	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -182,17 +221,29 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 		image:     resolvedImage,
 	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+	info, err := ctr.cachedInfo(ctx)
+	if err != nil {
+		return nil, cleanupReuseCreate(ctx, ctr, err)
+	}
+	// Validate the image identity and requested ports before exposing the
+	// new shared container to the flight. A failed post-create check must
+	// not leave an unusable container behind.
+	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
+		return nil, cleanupReuseCreate(ctx, ctr, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, cleanupReuseCreate(ctx, ctr, err)
 		}
 	}
 	return ctr, nil
+}
+
+func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error {
+	if err := ctr.Terminate(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("%w (container %s left behind: %v)", cause, ctr.id, err)
+	}
+	return cause
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a
@@ -259,11 +310,24 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	if info == nil {
 		return imageIdentity{}
 	}
-	if validImageDigest(info.imageDigest) && info.image != "" {
-		return imageIdentity{reference: info.image, digest: info.imageDigest, pinned: true}
+	if validImageDigest(info.imageDigest) {
+		reference := info.image
+		if reference == "" {
+			reference = info.imageID
+		}
+		if reference == "" {
+			reference = info.imageDigest
+		}
+		return imageIdentity{reference: reference, digest: info.imageDigest, id: info.imageID, pinned: true}
 	}
 	if isImageID(info.imageID) {
 		return imageIdentity{reference: info.imageID, id: info.imageID, pinned: true}
+	}
+	if digest := imageDigest(info.image); validImageDigest(digest) {
+		return imageIdentity{reference: info.image, digest: digest, pinned: true}
+	}
+	if isImageID(info.image) {
+		return imageIdentity{reference: info.image, id: info.image, pinned: true}
 	}
 	if info.image != "" {
 		return imageIdentity{reference: info.image}
@@ -271,20 +335,31 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	return imageIdentity{}
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
-func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+// checkReuseOwnedIdentity reports whether a stopped container may be
+// deleted and recreated for this reuse request. The requested image is
+// the identity resolved immediately before the create/attach decision,
+// not the caller's mutable tag.
+func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
 	}
-	if !imagesCompatible(image, info.image) {
-		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	if requested.pinned {
+		actual := imageFromInfo(info)
+		if !imageIdentitiesCompatible(requested, actual) {
+			return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
+		}
+		return nil
+	}
+	if !imagesCompatible(original, info.image) {
+		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
 	}
 	return nil
 }
 
-func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
-	if err := checkReuseOwned(info, image, cfg); err != nil {
+// checkReuseCompatIdentity applies the resolved image and port checks
+// for a reuse request.
+func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
+	if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
 		return err
 	}
 	// Auto-published exposed ports only appear as host bindings on

@@ -149,34 +149,47 @@ only through this aggregated path.
 
 After the inspect (and after a pull, when needed), `Run` resolves the
 image identity and passes that identity to the backend instead of the
-caller's mutable tag. Docker prefers `RepoDigests` and falls back to its
-local image `Id`; Apple Container uses the image descriptor (or the
-selected platform variant) digest. The handle retains the resolved
-identity for compatibility checks. If a backend/version reports no
-usable identity, `Run` fails closed with
-`errors.Is(err, container.ErrImageIdentityUnavailable)`.
+caller's mutable tag. Docker prefers a matching `RepoDigests` entry and
+falls back to the inspected local image `Id`. A local Docker tag whose
+`RepoDigests` belong to another repository is treated as a local alias
+and safely uses that `Id`; only an explicit `image@digest` whose
+repository or digest conflicts is rejected as
+`ErrImageIdentityMismatch`. Apple Container uses the image descriptor
+(or the selected platform variant) digest, normalizing an ID-only
+record to a digest reference. Reuse compares the resolved digest/ID
+identity, not the original tag, and removes a newly-created reused
+container if its post-create identity or port validation fails.
 
-For compatibility with a backend that cannot report or locally address
-an identity, opt in explicitly:
+If a backend/version reports no usable identity, `Run` fails closed with
+`errors.Is(err, container.ErrImageIdentityUnavailable)`. For an
+Apple-only ID-derived reference that is not locally addressable, the
+library first tries an explicit exact-digest pull when the policy allows
+one; otherwise it fails closed. `WithAllowMutableImageTag` is the
+explicit escape hatch for a mutable input:
 
 ```go
 container.Run(ctx, "redis:7-alpine",
     container.WithAllowMutableImageTag())
 ```
 
-That option deliberately runs the original tag and therefore retains
-the tag-replacement window; it is not an identity guarantee. Pinning
-also cannot make a mutable registry tag's pull-to-inspect resolution
-atomic when another actor can modify the shared backend. Prefer a
-caller-supplied `image@sha256:...` and treat the backend's identity
-metadata as the compatibility boundary. Apple Container has no
-`--pull=never` run flag; with `PullMissing` or `PullAlways`, a digest
-reference that is not already present may be fetched exactly by
-`container run`. `PullNever` checks that pinned reference first and
-returns `ErrImageIdentityNotLocal` rather than allowing that implicit
-fetch. A locally built Apple image may therefore need
-`WithAllowMutableImageTag`, or a backend-supported digest reference,
-to run without a registry pull.
+With that option, an Apple image that cannot be addressed by its
+resolved digest runs the original mutable tag; this deliberately
+retains the tag-replacement window and is not an identity guarantee. It
+does not downgrade a caller-supplied digest. Under `PullNever`, a
+resolved Apple digest must already be locally addressable: an absent
+reference returns `ErrImageIdentityNotLocal` (and an identity-less
+successful Apple inspect returns `ErrImageIdentityUnavailable`) before
+`container run`, so Apple cannot silently fetch during create. The
+mutable-tag option is the one exception: with it, a mutable input may
+run the original tag even when its resolved digest is not local. Apple has
+no runtime `--pull=never` flag, so a normal Apple `PullMissing` or
+`PullAlways` run may still need an exact-digest fetch for a registry
+image. Pinning cannot make a mutable registry tag's pull-to-inspect
+resolution atomic when another actor can modify the shared backend.
+Prefer a caller-supplied `image@sha256:...` and treat the backend's
+identity metadata as the compatibility boundary. Locally built Apple
+images may require `WithAllowMutableImageTag` when no locally
+addressable digest reference exists.
 
 ```go
 container.Run(ctx, "redis:7-alpine",
@@ -234,9 +247,11 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Only image and ports are compared; `env` / `cmd` / `mounts`
-  differences attach silently by design (use distinct names when they
-  matter).
+  Image compatibility uses the resolved digest or image ID (never the
+  original mutable tag); only image and ports are compared. `env` /
+  `cmd` / `mounts` differences attach silently by design (use distinct
+  names when they matter). A newly-created reused container is removed
+  if its post-create validation fails.
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

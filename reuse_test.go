@@ -160,13 +160,19 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 	}
 }
 
+const reuseInspectDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONWithDigest(id, state, image, reuseInspectDigest)
+}
+
+func reuseInspectJSONWithDigest(id, state, image, digest string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": %q},
+      "image": {"reference": %q, "descriptor": {"digest": %q}},
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
@@ -178,7 +184,7 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, digest, state)
 }
 
 type attachRunner struct {
@@ -418,7 +424,7 @@ func (m *mismatchRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 		m.mu.Lock()
 		m.calls = append(m.calls, args)
 		m.mu.Unlock()
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", m.image)), nil, nil
+		return []byte(reuseInspectJSONWithDigest(args[len(args)-1], "running", m.image, reuseInspectDigest)), nil, nil
 	}
 	return m.attachRunner.Run(ctx, args...)
 }

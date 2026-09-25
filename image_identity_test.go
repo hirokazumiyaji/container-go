@@ -234,16 +234,16 @@ func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
 	}
 }
 
-func TestIssue115CallerPinnedDigestSurvivesIdentitylessInspectResponse(t *testing.T) {
+func TestIssue115PullNeverRejectsIdentitylessAppleInspect(t *testing.T) {
 	r := &issue115IdentityLessRunner{}
 	image := "redis:7-alpine@" + issue115ImageIdentityOld
-	ctr, err := Run(context.Background(), image,
+	_, err := Run(context.Background(), image,
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
+	if !errors.Is(err, ErrImageIdentityUnavailable) {
+		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
 	}
-	if r.runImage != image || !ctr.image.pinned {
-		t.Fatalf("run image = %q, handle = %+v, want caller-pinned image", r.runImage, ctr.image)
+	if r.runCalls != 0 {
+		t.Fatalf("run issued after identityless Apple inspect: %q", r.runImage)
 	}
 }
 
@@ -304,11 +304,11 @@ func TestIssue115DockerImageIdentityUsesRepoDigestWithoutTag(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerImageIdentityRejectsForeignRepoDigest(t *testing.T) {
+func TestIssue115DockerImageIdentityFallsBackToIDForForeignRepoDigest(t *testing.T) {
 	data := []byte(`[{"Id":"` + issue115ImageIdentityOld + `","RepoDigests":["evil.example/library/redis@` + issue115ImageIdentityNew + `"]}]`)
 	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists || !identity.mismatch {
-		t.Fatalf("identity = %+v, exists = %v, want mismatch", identity, exists)
+	if !exists || identity.mismatch || !identity.pinned || identity.id != issue115ImageIdentityOld {
+		t.Fatalf("identity = %+v, exists = %v, want immutable local ID fallback", identity, exists)
 	}
 }
 

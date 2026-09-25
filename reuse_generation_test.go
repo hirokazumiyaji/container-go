@@ -200,10 +200,12 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 
 	// Pull takes longer than the attach timeout; the leader's own
 	// create must still succeed with its runTimeout budget.
-	r := &slowPullRunner{pullDelay: 400 * time.Millisecond}
+	base := newTestRunner()
+	base.inspectJSON = reuseInspectJSON("shared-reuse", "running", "redis:7-alpine")
+	r := &slowPullRunner{fakeRunner: base, pullDelay: 400 * time.Millisecond}
 	cfg := &config{
 		runner: r, eng: appleEngine{}, name: "shared-reuse",
-		pullPolicy: PullAlways,
+		pullPolicy: PullAlways, reuse: true,
 	}
 	ctx := context.Background()
 	ctr, err := reuseCreate(ctx, "redis:7-alpine", cfg)

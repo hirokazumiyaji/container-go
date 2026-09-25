@@ -234,22 +234,31 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 **create 前の image identity を固定する**。
 `PullMissing` と `PullAlways` は local store を準備した後にも image inspect
 を行い、解決した immutable identity を backend の `run` に渡す。
-Docker は registry digest を優先し、取得できない場合は local image ID を使う。
-Apple Container は descriptor または指定 platform の variant digest を使う。
+Docker は repository が一致する registry digest を優先し、取得できない
+場合は inspect した local image ID にフォールバックする。別の repository
+の `RepoDigests` を持つ local alias も同じ local ID で実行し、明示的な
+pinned repository / digest の conflict だけを mismatch として扱う。
+Apple Container は descriptor または指定 platform の variant digest を使い、
+ID だけの record は digest 参照に正規化する。
 この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
 ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
 identity を返さない backend version では既定で
 `ErrImageIdentityUnavailable` を返して fail closed する。
 `WithAllowMutableImageTag` は identity が取得できない、または local から
 直接指定できない backend の明示的な互換 fallback であり、identity の
-保証ではない。
-Apple Container の `run` に `--pull=never` はないため、`PullMissing` と
-`PullAlways` では、local store にない digest 参照を `container run` が
-exact digest として fetch することがある。
-`PullNever` は先に pinned reference の存在を確認し、暗黙の fetch を許さず
-`ErrImageIdentityNotLocal` を返す。
-local build の Apple image で local digest 参照がない場合は、明示的な
-mutable tag fallback が必要である。
+保証ではない。呼び出し側が digest を指定した場合を mutable tag に
+降格させることもない。
+Apple Container の `run` に `--pull=never` はないため、ID 由来 digest が
+local にない場合は、pull 可能な policy で exact digest の pull を一度試す。
+それでも address できない場合は既定で fail closed し、明示的な mutable
+tag option だけが元の tag を実行する。
+`PullNever` では pinned Apple reference がすでに local に存在する必要が
+ある。存在しなければ `ErrImageIdentityNotLocal`、identity がない inspect が
+成功した場合は `ErrImageIdentityUnavailable` を返し、`container run` の
+暗黙の fetch を許さない。
+通常の Apple `PullMissing` / `PullAlways` では registry image の exact digest
+fetch が必要になることがある。local build の Apple image で local digest
+参照がない場合は、明示的な mutable tag fallback が必要になることがある。
 
 ## パフォーマンス設計
 

@@ -299,10 +299,14 @@ volumes must be named, and their lifecycle belongs to the caller.
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. `env`,
-`cmd`, and `mounts` differences attach silently to the existing
-container by design; callers needing isolation should use distinct
-names or reset state via `Exec`.
+narrow: the resolved image identity (digest or local image ID) and
+declared/published ports only. It never treats the original mutable tag
+as proof that an existing container uses the same image. A newly-created
+reuse container that fails its post-create identity or port validation
+is removed before the error is returned. `env`, `cmd`, and `mounts`
+differences attach silently to the existing container by design;
+callers needing isolation should use distinct names or reset state via
+`Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
@@ -366,21 +370,29 @@ env-file contents.
 **Image identity is resolved before create**. After `PullMissing` or
 `PullAlways` prepares the local store, `Run` inspects the image again and
 passes the reported immutable identity to the backend. Docker prefers a
-registry digest and falls back to its local image ID; Apple Container
-uses the descriptor or selected platform-variant digest. This prevents a
-later local tag reassignment from changing that create, but it does not
+matching registry digest and falls back to the inspected local image ID;
+a local alias with a foreign `RepoDigests` entry also uses that ID, while
+an explicit pinned repository/digest conflict is an error. Apple
+Container uses the descriptor or selected platform-variant digest and
+normalizes an ID-only image record to a digest reference. This prevents
+a later local tag reassignment from changing that create, but it does not
 make a mutable tag's pull-to-inspect operation atomic. If a backend
 version reports no identity, the default policy fails closed with
 `ErrImageIdentityUnavailable`. `WithAllowMutableImageTag` is an explicit
 compatibility escape hatch for an identity-less or not-locally-addressable
-backend and carries no identity guarantee. Apple
-Container has no `--pull=never` run flag; with `PullMissing` or
-`PullAlways`, an absent local digest reference may cause
-`container run` to fetch that exact digest. `PullNever` checks the
-pinned reference first and returns `ErrImageIdentityNotLocal` instead
-of allowing that implicit fetch. Locally built Apple images may
-therefore require the explicit mutable-tag fallback when no local
-digest reference is available.
+backend and carries no identity guarantee; it never downgrades a
+caller-supplied digest. Apple Container has no `--pull=never` run flag.
+For an Apple ID-derived reference, a pull-allowed policy first tries an
+explicit exact-digest pull; if that reference still cannot be addressed,
+the default fails closed and only the explicit mutable-tag option can
+run the original tag. Under `PullNever`, the pinned Apple reference must
+already be local: an absent reference returns
+`ErrImageIdentityNotLocal`, and an identity-less successful inspect
+returns `ErrImageIdentityUnavailable`, before `container run` can fetch
+anything. With ordinary Apple `PullMissing` or `PullAlways`, a registry
+image may still require an exact-digest fetch. Locally built Apple
+images may therefore require the explicit mutable-tag fallback when no
+local digest reference is available.
 
 ## Performance design
 

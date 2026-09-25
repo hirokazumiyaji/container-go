@@ -359,6 +359,9 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 	if err := json.Unmarshal(data, &images); err != nil || len(images) == 0 {
 		return imageIdentity{}, false
 	}
+	explicitPinned := image != "" && validImageDigest(imageDigest(image))
+	sawExplicitConflict := false
+	fallbackID := ""
 	for _, img := range images {
 		for _, repoDigest := range img.RepoDigests {
 			digest := imageDigest(repoDigest)
@@ -368,31 +371,45 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 			if image != "" && !isImageID(image) {
 				requestedDigest := imageDigest(image)
 				if requestedDigest != "" {
-					if requestedDigest != digest {
+					// An explicit digest is a claim about both the
+					// manifest and its repository. A foreign RepoDigest
+					// is a conflict, even when its digest happens to be
+					// the same.
+					if requestedDigest != digest || imageRepository(image) != imageRepository(repoDigest) {
+						sawExplicitConflict = true
 						continue
 					}
 				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
 					// Docker's RepoDigests commonly omit the tag. In
-					// that form the repository still has to match,
-					// but an explicitly pinned digest must match too.
+					// that form the repository still has to match.
 					continue
 				}
 			}
 			return imageReferenceWithDigest(image, repoDigest, digest, img.ID), true
 		}
-		if image != "" && !isImageID(image) && len(img.RepoDigests) > 0 {
-			return imageIdentity{mismatch: true}, true
-		}
 		if img.ID != "" {
-			if image == "" || isImageID(image) {
+			// A tag can be a local alias whose RepoDigests came from a
+			// different registry. The inspected local ID is still the
+			// safe immutable target for that alias. An explicit pinned
+			// request remains a conflict when a RepoDigest contradicted
+			// it, even if the local content ID is available.
+			if !explicitPinned {
 				return imageReferenceWithDigest(image, "", "", img.ID), true
 			}
-			// The image was inspected by this exact reference. An ID is
-			// still a safe fallback when Docker omitted RepoDigests.
-			return imageReferenceWithDigest(image, "", "", img.ID), true
+			if fallbackID == "" {
+				fallbackID = img.ID
+			}
 		}
 		// A non-empty Docker inspect array proves existence even when
 		// this old/versioned response has no usable identity fields.
+	}
+	if explicitPinned {
+		if sawExplicitConflict {
+			return imageIdentity{mismatch: true}, true
+		}
+		if fallbackID != "" {
+			return imageReferenceWithDigest(image, "", "", fallbackID), true
+		}
 	}
 	return imageIdentity{}, true
 }

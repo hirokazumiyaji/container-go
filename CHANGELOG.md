@@ -14,8 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
 - Resolve inspected image digests or Docker image IDs before create, retain
-  the identity on the handle, and expose `WithAllowMutableImageTag` plus
-  identity-related errors for explicit fallback and fail-closed policies.
+  the identity on the handle, compare reuse by that identity, and remove
+  newly-created reuse containers when post-create validation fails.
+  Expose `WithAllowMutableImageTag` plus identity-related errors for
+  explicit fallback and fail-closed policies; handle foreign Docker
+  RepoDigests with the inspected local ID and make Apple digest/local-
+  address behavior explicit.
 
 ### Changed
 

@@ -50,6 +50,9 @@ func requireSystem(t *testing.T) {
 }
 
 func TestExampleRedis(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this example uses WithEnv, which is unsupported on Windows")
+	}
 	requireSystem(t)
 	ctx := context.Background()
 

@@ -223,8 +223,24 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Every CLI call is an argv vector; no shell is involved. The one shell
   script (the reaper) is a fixed string that receives container IDs
   only as validated stdin data.
-- Environment variables are passed via a temporary `0600` env file, so
-  secrets never appear in the process table (`ps`).
+- On Unix, environment variables are passed through a `0600` file in a
+  validated, current-user-owned `0700` directory under
+  `os.UserCacheDir()`. The library deliberately does not use `TMPDIR`.
+  Stale cleanup requires a version marker, exact ownership/mode and child
+  names, and an unlocked writer lock; a live backend call cannot be aged out.
+  It never scans shared temporary directories, so files left there by an older
+  build cannot be attributed safely and must be inspected and removed by the
+  user. Cleanup failures are returned and retried before `Run`, reuse creation,
+  or `Exec` returns.
+- Windows cannot provide the claimed per-user secrecy with Go `chmod`, so
+  `Run`/`Exec` fail with `ErrEnvFileUnsupported` when a non-empty environment
+  map requires an env file. Other Windows operations remain supported.
+- Env keys must be valid, non-empty UTF-8 without `=`, Unicode whitespace or
+  controls, a leading `#`, or a leading BOM. Values must be valid UTF-8
+  without Unicode controls, NUL, CR/LF, U+2028, or U+2029. Other non-control
+  Unicode, spaces, and `=` remain valid values. Rejecting controls (including
+  tab) and invalid UTF-8 is an intentional compatibility change: a backend may
+  accept a value that the library refuses to put in a line-delimited env file.
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
 

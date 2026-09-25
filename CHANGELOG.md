@@ -13,9 +13,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
+- Add `ErrEnvFileUnsupported` for Windows operations that would need a
+  per-user secret env file.
 
 ### Changed
 
+- Reject invalid UTF-8 and Unicode control/line-separator characters in env
+  values, and invalid Unicode whitespace/control characters in keys. This is
+  an intentional compatibility tightening; printable Unicode, spaces, and
+  `=` remain valid values.
+- Store Unix env files under a marked, current-user-owned cache root instead
+  of `TMPDIR`; make stale cleanup marker/mode/owner/child aware, protect
+  live calls with locks, and return plus retry cleanup failures.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

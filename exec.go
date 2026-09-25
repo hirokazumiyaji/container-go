@@ -20,9 +20,9 @@ type execConfig struct {
 	workdir string
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file. It uses the same key and value
-// validation as WithEnv.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. It uses the same key and value validation as WithEnv.
+// Exec returns ErrEnvFileUnsupported on Windows.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
 		if key, _, err := firstInvalidEnv(env); err != nil {
@@ -77,22 +77,23 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 			return 0, nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() {
-			cleanupEnvFile(envDir)
-		}()
+		defer func() { retryEnvFileCleanup(&envDir) }()
 	}
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	// The CLI has finished reading the env file. Remove it before any
-	// result classification or caller-visible output processing.
-	cleanupEnvFile(envDir)
-	envDir = ""
+	// result classification or caller-visible output processing. Retain
+	// envDir for a deferred retry if removal fails, and preserve the error.
+	envCleanupErr := cleanupEnvFile(envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
-		return 0, output, nil
+		return 0, output, envCleanupErr
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -100,12 +101,12 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
 	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

@@ -25,6 +25,12 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
+// ErrEnvFileUnsupported reports that the current platform cannot provide
+// the per-user private temporary storage required for environment files.
+// On Windows, Run and Exec return this error when a non-empty WithEnv or
+// WithExecEnv option would require such a file.
+var ErrEnvFileUnsupported = errors.New("secure environment files are not supported on this platform")
+
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, and Logs wrap it with %w so callers can use
 // errors.Is instead of matching CLI stderr text.

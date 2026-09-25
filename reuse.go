@@ -143,7 +143,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 
 	// Keep the secret file out of the image-pull and attach/retry windows;
-	// it exists only for the run command that consumes it.
+	// it exists only for the run command that consumes it. A failed first
+	// removal is returned and retried by the deferred cleanup.
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
@@ -151,23 +152,23 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() {
-			cleanupEnvFile(envDir)
-		}()
+		defer func() { retryEnvFileCleanup(&envDir) }()
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
-	cleanupEnvFile(envDir)
-	envDir = ""
-	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
-			createRaceMissing(err) || createRaceMissing(classified) {
+	stdout, _, runErr := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	envCleanupErr := cleanupEnvFile(envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+	if runErr != nil {
+		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
+		if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) ||
+			createRaceMissing(runErr) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
-			return nil, err
+			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupFailedCreate(ctx, cfg, runErr, classified)
+		return nil, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
 	ctr := &Container{
@@ -182,15 +183,15 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, joinEnvFileCleanupError(err, envCleanupErr)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
 	}
-	return ctr, nil
+	return ctr, envCleanupErr
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a

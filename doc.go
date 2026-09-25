@@ -5,6 +5,8 @@
 // library. Two backends are supported: Apple Container
 // (github.com/apple/container) on macOS 26+ Apple Silicon (`container
 // system start`), and Docker on Linux, Windows, and macOS (`docker`,
-// selected with CONTAINERGO_BACKEND=docker). See README.md for backend
-// selection and endpoint differences.
+// selected with CONTAINERGO_BACKEND=docker). On Windows, operations that
+// need an environment file fail with ErrEnvFileUnsupported because the
+// library does not treat chmod bits as a per-user ACL. See README.md for
+// backend selection, environment validation, and endpoint differences.
 package container

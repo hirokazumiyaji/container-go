@@ -130,7 +130,18 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(cfg); err != nil {
 		return nil, err
 	}
-	cleanupStaleEnvFiles()
+	// Reject Windows before an image pull or any env-file storage setup.
+	// chmod's 0600/0700 bits do not provide per-user secrecy there.
+	if len(cfg.env) > 0 {
+		if err := ensureEnvFileSecurity(); err != nil {
+			return nil, err
+		}
+		// Validate the private root and reclaim provably stale directories
+		// before spending time on an image pull or backend create.
+		if err := cleanupStaleEnvFiles(); err != nil {
+			return nil, err
+		}
+	}
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}
@@ -149,8 +160,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 
 	// Do not put secrets on disk while an image pull may be waiting for
-	// minutes. The backend reads this file only while handling run, so the
-	// deferred cleanup below also removes it immediately after that call.
+	// minutes. The backend reads this file only while handling run. If the
+	// first removal fails, envDir remains set so the deferred path retries
+	// before returning; the first error is still preserved below.
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
@@ -158,17 +170,17 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() {
-			cleanupEnvFile(envDir)
-		}()
+		defer func() { retryEnvFileCleanup(&envDir) }()
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
-	cleanupEnvFile(envDir)
-	envDir = ""
-	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+	stdout, _, runErr := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	envCleanupErr := cleanupEnvFile(envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+	if runErr != nil {
+		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
+		cleanupFailedCreate(ctx, cfg, runErr, classified)
+		return nil, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
 	c := &Container{
@@ -197,7 +209,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, c.rollback(ctx, err)
+			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
 	}
 	if cfg.waitStrategy != nil {
@@ -208,10 +220,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			if tail != "" {
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, c.rollback(ctx, err)
+			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
 	}
-	return c, nil
+	return c, envCleanupErr
 }
 
 // rollback removes a container Run created but cannot return. A failed

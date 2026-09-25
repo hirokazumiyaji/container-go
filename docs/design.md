@@ -323,9 +323,11 @@ rollback reports a container left behind that way in its error rather
 than hiding it. The watchdog reaper registers Docker containers by
 `Id`; for Apple it stores the generation, reads the label as a
 line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each backend call carries a 10-30s timeout
-via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
-daemon call cannot wedge the rest. The leader's own pull/create uses an
+skips deletion on mismatch. Each reaper entry's complete
+inspect/status-marker/filter/delete pipeline carries a bounded 30s timeout
+via POSIX `sleep`/`kill` (no `timeout(1)` dependency), and the timeout kills
+and reaps the local pipeline and descendants so one hung daemon call cannot
+wedge the rest. The leader's own pull/create uses an
 independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 
@@ -362,6 +364,19 @@ the library has no credential input path.
 
 **No secrets in logs**. Debug logging of CLI argv never includes
 env-file contents.
+
+**Legacy reaper staging files**. The current reaper streams inspect output
+through the structural field filter and does not create a raw inspect file.
+Versions before that change used an un-namespaced `mktemp` file; a reaper
+killed during inspect could therefore leave a file containing environment
+values. Those names are not safely attributable to this library. An
+operator handling legacy files must first stop all container-go and reaper
+processes, use a metadata-only listing in the effective per-user `TMPDIR`
+restricted to regular files owned by that user and the affected time window,
+avoid printing file contents, avoid following symlinks, and remove only files
+positively tied to the affected run. A broad temp-directory cleanup is unsafe.
+Credentials that may have appeared in inspect output should be rotated;
+deletion does not revoke them.
 
 ## Performance design
 

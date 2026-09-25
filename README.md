@@ -228,6 +228,21 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
 
+### Legacy reaper staging files
+
+The current watchdog streams inspect output through a structural filter and
+never writes the raw output to disk. Older versions used an un-namespaced
+`mktemp` file, so a reaper killed during inspect can leave a file containing
+container environment data. Those legacy names cannot be safely attributed
+to this library. To investigate or clean them up, first stop all
+container-go and watchdog processes, inspect the per-user temporary directory
+(the effective `TMPDIR`, not an assumed `/tmp`) using a metadata-only listing
+restricted to regular files owned by that user and the affected time window.
+Do not grep file contents into a terminal, follow symlinks, or run a broad
+recursive delete. Remove only files that you can positively attribute to the
+affected run. Treat any credentials that may have appeared in inspect output
+as exposed and rotate them; deleting a stale file does not revoke a secret.
+
 ## Differences from testcontainers-go
 
 Not supported (Apple Container has no equivalent, or out of scope):

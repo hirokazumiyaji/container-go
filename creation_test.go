@@ -121,7 +121,7 @@ func TestReaperSkipsReplacedGeneration(t *testing.T) {
 	if err := r.register("myctr", oldCreation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	r.closeStdin()
+	closeReaperForTest(t, r)
 	// Give the reaper a moment to run; it must NOT delete.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
@@ -147,6 +147,6 @@ func TestReaperDeletesMatchingGeneration(t *testing.T) {
 	if err := r.register("myctr", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	r.closeStdin()
+	closeReaperForTest(t, r)
 	waitForLogLines(t, logPath, "delete --force myctr")
 }

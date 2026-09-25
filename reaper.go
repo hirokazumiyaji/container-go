@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -21,11 +22,13 @@ import (
 // The script is a fixed string; container IDs enter it only as stdin
 // data validated against Apple Container's name rule, and the script
 // itself disables globbing and quotes every expansion the IDs reach.
-// Each delete call runs with a per-entry timeout implemented with
-// background jobs and kill (timeout(1) is not standard on macOS), so a
-// hung daemon cannot wedge deletion of later entries. Inspect output is
-// streamed through a field filter instead of being staged on disk. Failures
-// stay silent (|| true) by design: the reaper is last-resort insurance.
+// Every backend entry runs behind a bounded timeout. The timeout covers
+// the complete inspect, status-marker, filter, and delete pipeline; it
+// kills the whole local process group when the shell supports one and
+// falls back to killing descendants individually otherwise. Inspect
+// output is streamed through a field filter instead of being staged on
+// disk. Failures stay silent (|| true) by design: the reaper is
+// last-resort insurance.
 // When a creation generation is known, the script inspects first and
 // reads the creation label as a structural JSON field: the match is
 // anchored at line start on the quoted key, so label values or other
@@ -42,29 +45,52 @@ const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
+timeout="${4:-30}"
 ids=""
 while IFS= read -r line; do
   ids="$ids
 $line"
 done
+kill_descendants() {
+  children=$(pgrep -P "$1" 2>/dev/null)
+  for child in $children; do
+    kill_descendants "$child"
+  done
+  kill -9 "$1" 2>/dev/null || true
+}
+kill_pipeline() {
+  pid="$1"
+  group=0
+  if [ "$process_groups" = 1 ] && kill -0 -"$pid" 2>/dev/null; then
+    group=1
+  fi
+  # Kill descendants first so a nested monitor-mode group cannot escape;
+  # the group signal below also catches descendants not seen by pgrep.
+  kill_descendants "$pid"
+  if [ "$group" = 1 ]; then
+    kill -9 -"$pid" 2>/dev/null || true
+  fi
+}
 run_with_timeout() {
-  "$@" >/dev/null 2>&1 & pid=$!
-  (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
+  "$@" & pid=$!
+  (sleep "$timeout"; kill_pipeline "$pid") & killer=$!
   wait "$pid" 2>/dev/null
   rc=$?
   kill "$killer" 2>/dev/null
   wait "$killer" 2>/dev/null
-  return $rc
+  return "$rc"
 }
-echo "$ids" | while IFS= read -r line; do
-  [ -z "$line" ] && continue
-  id=${line%% *}
-  creation=${line#* }
-  [ "$id" = "$line" ] && creation=""
+process_entry() {
+  bin="$1"
+  sub="$2"
+  id="$3"
+  creation="$4"
+  key="$5"
   target="$id"
   if [ -n "$creation" ]; then
     # Apple has no inspect format; filter on the pipe before command
-    # substitution can materialize output.
+    # substitution can materialize output. This whole pipeline runs in
+    # the process group protected by run_with_timeout.
     inspect_fields=$(
       {
         "$bin" inspect "$id" 2>/dev/null
@@ -73,20 +99,45 @@ echo "$ids" | while IFS= read -r line; do
         -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
         -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
         -e 's/^__containergo_inspect_rc__\([0-9][0-9]*\)$/inspect_rc=\1/p'
-    ) || continue
+    ) || return 0
     got=$(printf '%s\n' "$inspect_fields" | sed -n 's/^creation=//p' | head -n 1)
     uid=$(printf '%s\n' "$inspect_fields" | sed -n 's/^id=//p' | head -n 1)
     inspect_rc=$(printf '%s\n' "$inspect_fields" | sed -n 's/^inspect_rc=//p' | tail -n 1)
     unset inspect_fields
-    [ "$inspect_rc" = 0 ] || continue
-    [ "$got" = "$creation" ] || continue
+    [ "$inspect_rc" = 0 ] || return 0
+    [ "$got" = "$creation" ] || return 0
     [ -n "$uid" ] && target="$uid"
   fi
-  run_with_timeout "$bin" "$sub" --force "$target" || true
+  run_with_timeout "$bin" "$sub" --force "$target" >/dev/null 2>&1 || true
+}
+monitor_enabled() {
+  set -o 2>/dev/null | grep -q '^monitor[[:space:]]*on'
+}
+process_groups=0
+if monitor_enabled; then
+  process_groups=1
+fi
+echo "$ids" | while IFS= read -r line; do
+  # The input loop runs in a pipeline subshell. Re-enable monitor mode
+  # there so each timed entry gets its own process group where supported.
+  set -m 2>/dev/null
+  if monitor_enabled; then
+    process_groups=1
+  else
+    process_groups=0
+  fi
+  [ -z "$line" ] && continue
+  id=${line%% *}
+  creation=${line#* }
+  [ "$id" = "$line" ] && creation=""
+  run_with_timeout process_entry "$bin" "$sub" "$id" "$creation" "$key" || true
 done
 `
 
-const maxReaperSpawnFailures = 3
+const (
+	maxReaperSpawnFailures      = 3
+	defaultReaperTimeoutSeconds = 30
+)
 
 // breQuote escapes a literal for use inside the reaper's sed basic
 // regular expression, so the label key's dots match only dots.
@@ -122,10 +173,17 @@ type reaper struct {
 	entries       []reaperEntry
 	spawnFailures int
 	gaveUp        bool
+	// timeoutSeconds is an internal test seam; production reapers use
+	// defaultReaperTimeoutSeconds.
+	timeoutSeconds int
 }
 
 func newReaper(binary, subcommand string) *reaper {
-	return &reaper{binary: binary, subcommand: subcommand}
+	return &reaper{
+		binary:         binary,
+		subcommand:     subcommand,
+		timeoutSeconds: defaultReaperTimeoutSeconds,
+	}
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
@@ -190,7 +248,15 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	timeout := r.timeoutSeconds
+	if timeout <= 0 {
+		timeout = defaultReaperTimeoutSeconds
+	}
+	cmd := exec.Command(
+		"/bin/sh", "-c", reaperScript, "containergo-reaper",
+		r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout),
+	)
+	prepareReaperCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -217,14 +283,18 @@ func (r *reaper) closeStdin() {
 	}
 }
 
-// killForTest kills the reaper child and waits until it is reaped, so
-// the next write deterministically fails.
+// killForTest kills the reaper process group and waits until the child is
+// reaped, so fake descendants cannot survive the test and the next write
+// deterministically fails.
 func (r *reaper) killForTest() {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cmd != nil {
-		_ = r.cmd.Process.Kill()
-		<-r.exited
+	cmd, exited := r.cmd, r.exited
+	r.mu.Unlock()
+	if cmd != nil {
+		_ = killReaperCommand(cmd)
+	}
+	if exited != nil {
+		<-exited
 	}
 }
 

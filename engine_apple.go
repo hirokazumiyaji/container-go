@@ -65,15 +65,23 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			continue
 		}
 		image := c.Configuration.Image.Reference
-		imageDigest := c.Configuration.Image.Descriptor.Digest
-		if image != "" && validOCIDigest(imageDigest) {
-			image = stripImageDigest(image) + "@" + imageDigest
+		imageDigestValue := imageDigest(image)
+		operatorPinned := validOCIDigest(imageDigestValue)
+		descriptorDigest := c.Configuration.Image.Descriptor.Digest
+		if !operatorPinned && image != "" && validOCIDigest(descriptorDigest) {
+			// The reference the operator passed may pin an image index
+			// while the descriptor reports the resolved child manifest for
+			// this platform. A pinned digest is the identity the caller
+			// asked for, so only a reference without one is completed from
+			// the descriptor.
+			imageDigestValue = descriptorDigest
+			image = qualifyImageReference(image, descriptorDigest)
 		}
 		info := &engineInfo{
 			state:       State(c.Status.State),
 			labels:      c.Configuration.Labels,
 			image:       image,
-			imageDigest: imageDigest,
+			imageDigest: imageDigestValue,
 			platform:    formatInspectPlatform(c.Configuration.Platform.OS, c.Configuration.Platform.Architecture, c.Configuration.Platform.Variant),
 		}
 		if ip, err := c.IPv4(); err == nil {
@@ -112,6 +120,12 @@ func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
 
 func (appleEngine) deleteArgs(id string) []string {
 	return []string{"delete", "--force", id}
+}
+
+// stoppedDeleteArgs omits --force so a generation that started after the
+// stopped-state verification is not removed; the delete fails instead.
+func (appleEngine) stoppedDeleteArgs(id string) []string {
+	return []string{"delete", id}
 }
 
 func (appleEngine) copyToArgs(id, hostPath, containerPath string) []string {

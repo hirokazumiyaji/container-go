@@ -230,8 +230,15 @@ copy の前後は Docker の immutable UID、または Apple の generation と 
 検査後に同じ name が別 generation に置き換わった場合は copy を失敗させる。
 
 Apple Container は name で delete するため、本ライブラリの create、generation-checked delete、prune は同じ stable lock を使う。
+その lock は 3 つの barrier を固定順序(旧 TMPDIR、user cache、account の state directory に uid を含む durable な位置)で取得する。
+/home や XDG_CACHE_HOME、TMPDIR が違っても、durable な barrier は同じファイルに解決される。
 `Prune` は list 時の managed label、generation、state、reuse group を記録し、lock 内で再 inspect してから削除する。
 直接の `container` CLI 呼び出しや別の implementation はこの lock を使わないため、保証は対象としない。
+
+stopped generation の再利用は、labels と generation を確認し、かつ replacement image(platform 指定があればそれも)
+が取得可能であることを確認してから行う。`PullNever` や `PullMissing` で image を用意できない場合は、
+既存 container を残すので、呼び出し側がどちらもない状態になることはない。
+その削除は `--force` なしで実行し、検証後に起動した generation は kill せず失敗として扱う。
 
 failed create が running generation を残した場合、ライブラリはそれを自動削除しない。
 peer がすでに引き継いでいる可能性があるためである。
@@ -268,7 +275,9 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 
 **子プロセス数を最小にする**。
 作成と起動は `container run --detach` の 1 回で行う。
-起動後に不変な情報(設定、ラベル、公開ポート)は初回の inspect 結果をキャッシュし、状態(`status.state`)のみ毎回取得する。
+起動後に不変な情報(設定、ラベル)は初回の inspect 結果をキャッシュし、状態(`status.state`)のみ毎回取得する。
+アドレス解決(`Endpoint`、`Host`、`MappedPort`、`ContainerIP`)だけは毎回 inspect する。
+再起動で host port や IP が変わったときに、古いアドレスを返す方が 1 回の追加呼び出しより害が大きいためである。
 
 **待機を接続確認で行う**。
 ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TCP/HTTP 接続する。
@@ -277,6 +286,7 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 **並列起動を妨げない**。
 Docker の immutable-ID 経路には name lock を置かない。
 Apple の create、generation-checked delete、prune、reaper だけが同じ stable per-name lock を使うため、異なる name の起動は並列できる。
+reaper の record 書き込みは mutex と書き込み期限で保護する。
 ホストポートを消費しない既定設計により、並列数の上限は主にホストのリソースで決まる。
 
 **ストリームを有限に保つ**。

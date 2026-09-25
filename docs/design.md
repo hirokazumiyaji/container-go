@@ -278,6 +278,21 @@ does nothing (deletion belongs to the normal path; the reaper is
 insurance). This mirrors container-rs's watchdog and covers SIGKILL,
 which no signal handler can.
 
+A name-addressed create registers a **pending** record (name, generation,
+barriers) before the create command runs, so a process that dies during
+create still leaves a guarded target. A successful, verified create
+**confirms** the record; an immutable-ID backend instead registers the ID
+the create printed. A create that was never issued **withdraws** it, and
+a verified failed create registers its cleanup target before the delete
+is attempted. The child keeps the last record per ID and generation, and
+never deletes a pending record whose container carries the reuse marker,
+because a peer may have adopted it while the create was still settling.
+The child runs detached in its own process group so a group-wide signal
+does not remove the watchdog before it sees the pipe EOF, a supervisor
+replaces a child that exits unexpectedly and replays the records, and
+each registration write is bounded by a deadline so a wedged child cannot
+block the caller.
+
 **Session labels**: every created container carries
 
 - `com.github.hirokazumiyaji.container-go`: `true` (managed-by marker)
@@ -316,16 +331,26 @@ attach-only fetch. `WithPlatform` is compared field by field (OS,
 architecture, and variant), and Apple inspect output carries the OCI
 descriptor digest into the normalized image identity. A stopped
 generation is recycled only after its labels and generation are
-verified; a failed create that left a running generation is not
-auto-deleted because a peer may have adopted it. Such a failure is
-reported as cleanup/partial-handle information. If a generation becomes
-stopped after readiness, the call fails instead of returning a stopped
-handle.
+verified, and only after the replacement image (with the requested
+platform, when one was selected) is known to be available, so a
+`PullNever` or `PullMissing` run that cannot fetch it keeps the
+existing container instead of leaving the caller with neither. That
+recycled delete omits `--force`, so a generation that started in the
+window is reported instead of being killed. A failed create that left a
+running generation is not auto-deleted because a peer may have adopted
+it. Such a failure is reported as cleanup/partial-handle information.
+If a generation becomes stopped after readiness, the call fails instead
+of returning a stopped handle. `Endpoint`, `Host`, `MappedPort`, and
+`ContainerIP` verify the handle's current identity and answer from that
+final inspect, so a restart that changed a host port or IP is not masked
+by the snapshot taken when the handle was created.
 
 `WithFiles` is also per-caller. The shared ensure flight only creates or
 attaches the generation; it never applies a leader's files. After the
 flight returns, every caller—including the create leader—applies its own
-files before its wait strategy. Consequently, one caller's copy failure
+files before its wait strategy, on the caller's own context: the attach
+budget bounds only the wait for a usable container, never the copy or
+readiness work that follows it. Consequently, one caller's copy failure
 does not poison successful waiters. Docker copies target the inspected
 immutable UID. Apple copies hold the stable per-name lock and verify the
 creation generation immediately before the copy; a replacement between
@@ -350,12 +375,18 @@ On Docker the handle keeps the immutable `Id` printed by `docker run` (or
 returned by inspect) and deletes by it, so no generation check is needed:
 a replacement never shares the ID. Apple Container addresses containers
 by name only, so there the delete is name-based: the generation must
-match a fresh inspect, and inspect plus delete run under a stable,
-user-scoped per-name `flock` in the user cache directory. Apple create,
-generation-checked delete, and prune all take that same lock, and prune
-revalidates each list candidate's managed label, generation, state, and
-reuse group while holding it. The lock file is persistent so a process
-cannot unlink an inode another process is using. The guarantee is limited
+match a fresh inspect, and inspect plus delete run under stable,
+account-scoped per-name `flock` files. Apple create, generation-checked
+delete, and prune all take those same barriers, and prune revalidates
+each list candidate's managed label, generation, state, and reuse group
+while holding them. Three barriers are acquired in a fixed order: the
+original `TMPDIR` location, then the user-cache location, then a durable
+location derived from the account's own state directory and scoped by
+uid. The first two keep a process built against an older lock location
+mutually exclusive with this one; the durable one is the barrier every
+cooperating process agrees on even when `HOME`, `XDG_CACHE_HOME`, or
+`TMPDIR` differ. The lock files are persistent so a process cannot
+unlink an inode another process is using. The guarantee is limited
 to cooperating processes using this guarded library protocol on the same
 host: a direct `container` CLI call or another implementation does not
 take the lock and can still replace the name after the point-in-time
@@ -383,9 +414,11 @@ As a library that spawns subprocesses, these rules hold.
 is the watchdog reaper's shell script. Its body is fixed; validated
 Apple names or Docker's full 64-hex IDs enter only as stdin data. The
 script defeats word splitting and globbing (`set -f`, `IFS=`, `read -r`,
-quoted expansions). Apple name-addressed entries also carry a stable
-lock path, validated before the child receives it, and the child must
-acquire that lock before its inspect/delete pair. The two layers
+quoted expansions). Apple name-addressed entries also carry all three
+stable lock paths plus each one's device, inode, and owner, validated
+before the child receives them; the child takes them in the same fixed
+order as the library and skips an entry whose barrier was replaced or is
+no longer private. The two layers
 together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
@@ -411,9 +444,11 @@ env-file contents.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
-`container run --detach` call. Immutable facts (config, labels,
-published ports) are cached from the first inspect; only the state is
-re-queried.
+`container run --detach` call. Immutable facts (config, labels) are
+cached from the first inspect; only the state is re-queried. Address
+lookups are the exception: `Endpoint`, `Host`, `MappedPort`, and
+`ContainerIP` re-inspect, because a restart can move a host port or IP
+and a stale address is worse than one extra call.
 
 **Wait via connections, not subprocesses**. ForListeningPort and
 ForHTTP dial the container IP directly without spawning the CLI. Only
@@ -422,8 +457,9 @@ the 100ms interval.
 
 **Serialize only cooperating name operations**. Docker's immutable-ID
 paths do not need a name lock. Apple create, generation-checked delete,
-prune, and reaper operations use a stable per-name lock; unrelated names
-still start in parallel. Reaper ID registration takes a short mutex.
+prune, and reaper operations use the three per-name barriers above;
+unrelated names still start in parallel. Reaper record writes take a
+short mutex and a bounded write deadline.
 Because the default design consumes no host ports, parallelism is
 bounded mainly by host resources.
 

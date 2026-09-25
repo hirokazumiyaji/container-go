@@ -1,3 +1,5 @@
+//go:build !windows
+
 package container
 
 import (
@@ -24,7 +26,10 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 
 func waitForLogLines(t *testing.T, path string, wants ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	// The child now consolidates its records and takes three name
+	// barriers before it deletes, so allow generous headroom on a loaded
+	// machine while still failing when the call never happens.
+	deadline := time.Now().Add(20 * time.Second)
 	var data []byte
 	for time.Now().Before(deadline) {
 		data, _ = os.ReadFile(path)
@@ -60,7 +65,10 @@ func TestReaperRejectsGenerationlessAppleDelete(t *testing.T) {
 	if err := r.register("ungenerated-reuse", ""); err == nil {
 		t.Fatal("generationless Apple reaper entry should be rejected")
 	}
-	if len(r.entries) != 0 || r.cmd != nil {
+	r.mu.Lock()
+	entries, cmd := len(r.entries), r.cmd
+	r.mu.Unlock()
+	if entries != 0 || cmd != nil {
 		t.Fatal("generationless Apple entry reached reaper process state")
 	}
 	if data, err := os.ReadFile(logPath); err == nil && len(data) != 0 {
@@ -186,8 +194,11 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
-	if r.spawnFailures != 0 {
-		t.Errorf("spawnFailures = %d, want 0 after success (consecutive counting)", r.spawnFailures)
+	r.mu.Lock()
+	spawnFailures := r.spawnFailures
+	r.mu.Unlock()
+	if spawnFailures != 0 {
+		t.Errorf("spawnFailures = %d, want 0 after success (consecutive counting)", spawnFailures)
 	}
 }
 
@@ -198,8 +209,38 @@ func TestReaperNameEntriesCarryStableLockPath(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	defer r.closeStdin()
-	if len(r.entries) != 1 || !validReaperLockPath(r.entries[0].lockPath) {
-		t.Fatalf("entry = %+v, want stable lock path", r.entries)
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 {
+		t.Fatalf("entries = %+v, want one", entries)
+	}
+	entry := entries[0]
+	if len(entry.lockPaths) != nameLockBarrierCount || len(entry.lockIDs) != nameLockBarrierCount {
+		t.Fatalf("entry barriers = %v / %v, want %d of each", entry.lockPaths, entry.lockIDs, nameLockBarrierCount)
+	}
+	for i, path := range entry.lockPaths {
+		if !validReaperLockPath(path) {
+			t.Errorf("barrier %d path = %q, want an absolute protocol path", i, path)
+		}
+		if !reaperLockIdentityRE.MatchString(entry.lockIDs[i]) {
+			t.Errorf("barrier %d identity = %q, want dev:inode:uid", i, entry.lockIDs[i])
+		}
+	}
+	// The barriers must be the ones lockName uses for the same name, in
+	// the same fixed order, or the reaper and the library would guard
+	// different files.
+	resolved, err := resolveNameLocks("guarded-name")
+	if err != nil {
+		t.Fatalf("resolveNameLocks: %v", err)
+	}
+	for i, want := range resolved.ordered() {
+		if entry.lockPaths[i] != want {
+			t.Errorf("barrier %d = %q, want %q", i, entry.lockPaths[i], want)
+		}
+	}
+	if entry.lockPaths[0] == entry.lockPaths[nameLockBarrierCount-1] {
+		t.Error("legacy and durable barriers must be distinct files")
 	}
 }
 

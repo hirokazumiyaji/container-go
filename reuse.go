@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/netip"
 	"os"
 	"strings"
 	"time"
@@ -25,6 +26,19 @@ func waitReusePoll(ctx context.Context) error {
 	case <-timer.C:
 		return nil
 	}
+}
+
+// attachWaitError describes an exhausted attach budget while keeping the
+// context sentinel, so a caller can still tell an expired deadline from a
+// cancelled call with errors.Is.
+func attachWaitError(name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, err)
+	}
+	return err
 }
 
 func reuseFailureResult(ctx context.Context, ctr *Container, err error) (*Container, error) {
@@ -52,15 +66,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		cfg.imagePrepared = true
 	}
 
-	resolveCtx, cancel := context.WithTimeout(ctx, reuseAttachTimeout)
-	defer cancel()
+	resolveCtx, attachCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer attachCancel()
 	stoppedRecreated := false
 	for {
 		if err := resolveCtx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, attachWaitError(cfg.name, err)
 		}
 
 		base, err := reuseEnsureFlight(resolveCtx, image, cfg)
@@ -69,9 +80,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			// KEEP still requires a fresh identity check before exposing
 			// it.  A failed/stopped/unverifiable generation is discarded.
 			if base != nil && keepContainers() && base.verifiedRetainedHandle(resolveCtx) {
-				return base, err
+				return base, attachWaitError(cfg.name, err)
 			}
-			return nil, err
+			return nil, attachWaitError(cfg.name, err)
 		}
 		info, err := inspectNamed(resolveCtx, cfg, cfg.name)
 		if err != nil {
@@ -99,6 +110,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
+			// Make the replacement image available before the stopped
+			// generation is discarded, so a PullNever run that cannot
+			// find it and a PullMissing run whose pull fails keep the
+			// existing container instead of leaving the caller with
+			// neither.
+			if err := prepareReuseReplacement(ctx, image, cfg); err != nil {
+				return nil, err
+			}
 			removed, err := deleteStoppedReuseChecked(resolveCtx, cfg, info)
 			if err != nil {
 				return nil, err
@@ -108,7 +127,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 				// stopping. Re-inspect it; never turn a refusal into a
 				// create race.
 				if err := waitReusePoll(resolveCtx); err != nil {
-					return nil, err
+					return nil, attachWaitError(cfg.name, err)
 				}
 				continue
 			}
@@ -117,14 +136,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			continue
 		case StateCreated, StateStopping, StateUnknown:
 			if err := waitReusePoll(resolveCtx); err != nil {
-				return nil, err
+				return nil, attachWaitError(cfg.name, err)
 			}
 			continue
 		case StateRunning:
 			// Continue below with a freshly inspected, running identity.
 		default:
 			if err := waitReusePoll(resolveCtx); err != nil {
-				return nil, err
+				return nil, attachWaitError(cfg.name, err)
 			}
 			continue
 		}
@@ -146,12 +165,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			creation:  info.labels[creationLabel],
 		}
 		ctr.rememberImmutableID(info.uid)
-		// File application is deliberately outside the shared ensure
-		// flight. Every caller, including the creator, applies its own
-		// files after the generation is known and its identity has been
-		// checked under the backend's safe target path.
-		if err := copyReuseFiles(resolveCtx, ctr, cfg.files); err != nil {
-			return reuseFailureResult(resolveCtx, ctr, err)
+		// The attach budget only bounds polling for a usable container.
+		// From here the generation is known, so file application, the
+		// wait strategy, and the final verification run on the caller's
+		// own context: a long copy or a readiness wait must not be cut off
+		// by the attach deadline that has already been satisfied.
+		attachCancel()
+		if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
+			return reuseFailureResult(ctx, ctr, err)
 		}
 		if err := reuseWait(ctx, cfg, ctr); err != nil {
 			return reuseFailureResult(ctx, ctr, err)
@@ -160,7 +181,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		// A wait strategy or a concurrent replacement can outlive the
 		// inspect above. Never return a handle for a different, stopped,
 		// or otherwise changed generation.
-		unlock, err := lockReuseFinal(resolveCtx, cfg)
+		unlock, err := lockReuseFinal(ctx, cfg)
 		if err != nil {
 			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
 		}
@@ -170,7 +191,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		// detect a same-name replacement generation. Apple is already
 		// holding the name lock here, so use a raw name inspect without
 		// recursively taking that lock.
-		fresh, err := ctr.inspectTargetFreshRetry(resolveCtx, ctr.id)
+		fresh, err := ctr.inspectTargetFreshRetry(ctx, ctr.id)
 		if err != nil {
 			// The operation itself failed and the final identity could not
 			// be proven.  KEEP must not return this handle.
@@ -228,10 +249,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 	for {
 		if err := ctx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, attachWaitError(cfg.name, err)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
@@ -262,7 +280,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			}
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
 				if err := waitReusePoll(ctx); err != nil {
-					return nil, err
+					return nil, attachWaitError(cfg.name, err)
 				}
 				continue
 			}
@@ -275,7 +293,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
 			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
+				return nil, attachWaitError(cfg.name, err)
 			}
 			continue
 		case StateStopped:
@@ -287,13 +305,21 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
+			// Make the replacement image available before the stopped
+			// generation is discarded, so a PullNever run that cannot
+			// find it and a PullMissing run whose pull fails keep the
+			// existing container instead of leaving the caller with
+			// neither.
+			if err := prepareReuseReplacement(ctx, image, cfg); err != nil {
+				return nil, err
+			}
 			removed, err := deleteStoppedReuseChecked(ctx, cfg, info)
 			if err != nil {
 				return nil, err
 			}
 			if !removed {
 				if err := waitReusePoll(ctx); err != nil {
-					return nil, err
+					return nil, attachWaitError(cfg.name, err)
 				}
 				continue
 			}
@@ -321,7 +347,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			return ctr, nil
 		default:
 			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
+				return nil, attachWaitError(cfg.name, err)
 			}
 		}
 	}
@@ -388,9 +414,18 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 	}
+	// Record the name and generation with the watchdog before the create
+	// runs. A reuse generation is shared state, so the pending record is
+	// never promoted to an active one: the child refuses to delete a
+	// pending reuse generation, and a verified failed create is handed
+	// over explicitly by the cleanup paths instead.
+	pending := registerPendingContainerReaper(cfg)
 	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		if !attempted {
+			// No create command was issued, so nothing can exist under
+			// this generation.
+			discardPendingContainerReaper(pending)
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -532,6 +567,27 @@ func (c *Container) verifyReuseCopyIdentity(ctx context.Context, identity reuseC
 	return nil
 }
 
+// prepareReuseReplacement makes the requested image, and the requested
+// platform variant when one was selected, available in the backend's
+// local store before a stopped generation is deleted. Deleting first and
+// discovering afterwards that the replacement image cannot be fetched
+// would leave a reuse caller with no container at all under PullNever,
+// and would pull a large image only to fail under PullMissing.
+func prepareReuseReplacement(ctx context.Context, image string, cfg *config) error {
+	if cfg.imagePrepared {
+		return nil
+	}
+	// The leader's image fetch gets an independent runTimeout budget even
+	// when the caller's context carries a tighter attach deadline.
+	prepCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
+	defer cancel()
+	if err := cfg.ensureImage(prepCtx, image); err != nil {
+		return err
+	}
+	cfg.imagePrepared = true
+	return nil
+}
+
 // deleteStoppedReuse removes a stopped reuse container only after
 // rechecking its state and identity.  The checked form reports whether a
 // delete actually happened; callers must re-inspect instead of assuming a
@@ -550,6 +606,13 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+	// Every delete below targets a generation that was just verified
+	// stopped, so it omits --force: a generation that started in the
+	// meantime is reported as a failure and adopted by the next poll
+	// instead of being killed.
+	remove := func(ctx context.Context, target string) error {
+		return ctr.deleteWithArgs(ctx, target, stoppedDeleteArgsFor(cfg.eng, target))
+	}
 
 	if usesImmutableIDs(cfg.eng) {
 		if !dockerIDRE.MatchString(info.uid) {
@@ -566,7 +629,11 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 			checkReuseLabels(fresh, cfg) != nil {
 			return false, nil
 		}
-		if err := ctr.delete(ctx, fresh.uid); err != nil {
+		// Hand the verified generation to the watchdog before the delete so
+		// a failed removal can be retried after this process exits.
+		ctr.rememberImmutableID(fresh.uid)
+		registerContainerReaper(cfg, ctr)
+		if err := remove(ctx, fresh.uid); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -591,7 +658,7 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 			checkReuseLabels(fresh, cfg) != nil {
 			return false, nil
 		}
-		if err := ctr.delete(guardCtx, cfg.name); err != nil {
+		if err := remove(guardCtx, cfg.name); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -610,7 +677,7 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 	if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped || checkReuseLabels(fresh, cfg) != nil {
 		return false, nil
 	}
-	return true, ctr.delete(ctx, cfg.name)
+	return true, remove(ctx, cfg.name)
 }
 
 func sameStoppedGeneration(before, fresh *engineInfo) bool {
@@ -902,7 +969,21 @@ func hasBoundPort(bound []boundPort, port int, proto string) bool {
 	return false
 }
 
+// hasPublishedBinding matches one configured publish spec against the
+// bindings inspect reported. An explicit host address is compared as a
+// parsed netip address and must match exactly: a textual comparison would
+// accept a differently spelled address, and treating an unreported
+// address as a wildcard would adopt a binding published on another
+// interface than the caller asked for.
 func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
+	want, wantAddr := netip.Addr{}, false
+	if p.hostAddr != "" {
+		parsed, err := netip.ParseAddr(p.hostAddr)
+		if err != nil {
+			return false
+		}
+		want, wantAddr = parsed, true
+	}
 	for _, b := range bound {
 		if b.containerPort != p.containerPort || b.proto != p.proto {
 			continue
@@ -910,8 +991,11 @@ func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
 		if p.hostPort != 0 && b.hostPort != p.hostPort {
 			continue
 		}
-		if p.hostAddr != "" && b.hostAddr != "" && b.hostAddr != p.hostAddr {
-			continue
+		if wantAddr {
+			got, err := netip.ParseAddr(b.hostAddr)
+			if err != nil || got != want {
+				continue
+			}
 		}
 		return true
 	}

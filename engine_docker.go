@@ -301,6 +301,12 @@ func (dockerEngine) deleteArgs(id string) []string {
 	return []string{"rm", "--force", id}
 }
 
+// stoppedDeleteArgs omits --force so a container that started after the
+// stopped-state verification is not removed; `docker rm` refuses it.
+func (dockerEngine) stoppedDeleteArgs(id string) []string {
+	return []string{"rm", id}
+}
+
 func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
 	return []string{"cp", hostPath, id + ":" + containerPath}
 }

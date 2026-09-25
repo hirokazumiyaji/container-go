@@ -7,26 +7,107 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// registerContainerReaper registers only real CLI-backed containers. The
-// reaper is registered before a recovery delete so a failed cleanup still
-// has an immutable watchdog target.
-func registerContainerReaper(cfg *config, c *Container) {
+// reaperBinaryFor resolves the CLI binary a container's watchdog target
+// belongs to and reports whether reaper registration applies at all. Only
+// real CLI-backed containers are registered, and CONTAINERGO_KEEP opts out
+// of automatic removal entirely.
+func reaperBinaryFor(cfg *config) (string, bool) {
 	if keepContainers() {
-		return
+		return "", false
 	}
 	er, ok := cfg.runner.(cli.ExternalRunner)
 	if !ok || !er.External() {
-		return
+		return "", false
 	}
 	bin := er.ExternalBinary()
 	if bin == "" {
 		bin = cfg.eng.binary()
 	}
-	if usesImmutableIDs(cfg.eng) {
-		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.immutableID(), "")
+	return bin, true
+}
+
+// pendingReaper is the pre-create watchdog state of one create attempt.
+type pendingReaper struct {
+	binary     string
+	subcommand string
+	name       string
+	creation   string
+	active     bool
+}
+
+// registerPendingContainerReaper records the name and its ownership
+// generation before the backend create runs, so a process that dies
+// during create still leaves a generation-guarded watchdog target. A
+// backend that addresses containers by immutable ID cannot name its
+// target before the create returns it; those are registered after the
+// create instead.
+func registerPendingContainerReaper(cfg *config) pendingReaper {
+	if usesImmutableIDs(cfg.eng) || !creationRE.MatchString(cfg.creation) {
+		return pendingReaper{}
+	}
+	bin, ok := reaperBinaryFor(cfg)
+	if !ok {
+		return pendingReaper{}
+	}
+	subcommand := cfg.eng.reaperSubcommand()
+	registerPendingWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
+	return pendingReaper{binary: bin, subcommand: subcommand, name: cfg.name, creation: cfg.creation, active: true}
+}
+
+// promoteContainerReaper completes a pending registration. A
+// name-addressed target is confirmed, so the child stops treating its
+// create as still settling; an immutable-ID target is registered by the ID
+// the create returned.
+func promoteContainerReaper(cfg *config, c *Container, pending pendingReaper) {
+	bin, ok := reaperBinaryFor(cfg)
+	if !ok {
 		return
 	}
-	registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.id, c.creation)
+	subcommand := cfg.eng.reaperSubcommand()
+	if usesImmutableIDs(cfg.eng) {
+		uid := c.immutableID()
+		if !dockerIDRE.MatchString(uid) {
+			return
+		}
+		registerWithGlobalReaper(bin, subcommand, uid, "")
+		return
+	}
+	if pending.active {
+		confirmPendingWithGlobalReaper(pending.binary, pending.subcommand, pending.name, pending.creation)
+	}
+}
+
+// discardPendingContainerReaper withdraws a pending record when no
+// create command was issued, so the child does not spend its retry budget
+// on a generation that cannot exist.
+func discardPendingContainerReaper(pending pendingReaper) {
+	if !pending.active {
+		return
+	}
+	discardPendingWithGlobalReaper(pending.binary, pending.subcommand, pending.name, pending.creation)
+}
+
+// registerContainerReaper registers a verified cleanup target with the
+// watchdog before a destructive delete is attempted, so a failed removal
+// still has a target that can be retried after the process exits.
+func registerContainerReaper(cfg *config, c *Container) {
+	bin, ok := reaperBinaryFor(cfg)
+	if !ok {
+		return
+	}
+	subcommand := cfg.eng.reaperSubcommand()
+	if usesImmutableIDs(cfg.eng) {
+		uid := c.immutableID()
+		if !dockerIDRE.MatchString(uid) {
+			return
+		}
+		registerWithGlobalReaper(bin, subcommand, uid, "")
+		return
+	}
+	if !creationRE.MatchString(c.creation) {
+		return
+	}
+	registerWithGlobalReaper(bin, subcommand, c.id, c.creation)
 }
 
 // recoverDockerRunOutput handles a successful or failed Docker run whose
@@ -34,8 +115,10 @@ func registerContainerReaper(cfg *config, c *Container) {
 // created the container before the output was truncated or malformed, so
 // the only safe recovery is a name/generation ownership inspection. A
 // verified UID is registered with the reaper after reuse ownership/state
-// checks and before cleanup is attempted; every recovery failure is joined
-// to the original run error.
+// checks, the state is revalidated once more immediately before the
+// delete, and the delete itself refuses to force-kill a generation that
+// started in the meantime; every recovery failure is joined to the
+// original run error.
 func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Container, error) {
 	if cause == nil {
 		cause = fmt.Errorf("run %s: backend did not return a full 64-hex container ID", cfg.name)
@@ -87,10 +170,17 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		if info.state != StateStopped && info.state != StateCreated {
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state))
 		}
-		// A stopped reuse generation can be adopted or replaced between
-		// the recovery lookup and rm. Reinspect the name and require the
-		// same owned UID and a stopped/created state before registering or
-		// deleting it.
+	}
+	// Register only after the ownership/state refusals above. If rm fails,
+	// the reaper still owns the verified UID and can retry after the process
+	// exits.
+	registerContainerReaper(cfg, ctr)
+	if cfg.reuse {
+		// A reuse generation can be adopted or replaced between the
+		// recovery lookup and the delete. Reinspect the name immediately
+		// before the delete and require the same owned UID and a
+		// stopped/created state; the delete then runs without --force so a
+		// concurrent start is reported instead of killed.
 		fresh, freshErr := ctr.inspectTargetFreshRetry(delCtx, cfg.name)
 		if isNotFound(freshErr) {
 			return nil, cause
@@ -105,11 +195,7 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation became %s; refusing automatic deletion", cfg.name, fresh.state))
 		}
 	}
-	// Register only after all ownership/state refusals above. If rm fails,
-	// the reaper still owns the verified UID and can retry after the process
-	// exits.
-	registerContainerReaper(cfg, ctr)
-	if err := ctr.delete(delCtx, ctr.immutableID()); err != nil {
+	if err := ctr.deleteWithArgs(delCtx, ctr.immutableID(), stoppedDeleteArgsFor(cfg.eng, ctr.immutableID())); err != nil {
 		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: cleanup: %w", cfg.name, err))
 	}
 	return nil, cause

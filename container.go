@@ -171,9 +171,16 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+	// Record the name and generation with the watchdog before the create
+	// runs: a process that dies mid-create must still leave a
+	// generation-guarded target behind.
+	pending := registerPendingContainerReaper(cfg)
 	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		if !attempted {
+			// No create command was issued, so nothing can exist under
+			// this generation.
+			discardPendingContainerReaper(pending)
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -204,7 +211,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
 	// immutable ID the reaper deletes by it and needs no generation.
-	registerContainerReaper(cfg, c)
+	// Promotion confirms the pre-create pending record, or registers the
+	// immutable ID the create returned.
+	promoteContainerReaper(cfg, c, pending)
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
@@ -325,9 +334,24 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 		target = info.uid
 	}
+	ctr.creation = cfg.creation
+	ctr.rememberImmutableID(info.uid)
+	// The ownership and state refusals above are what make this target
+	// safe for automatic removal, so hand it to the watchdog before the
+	// delete: a failed removal can then be retried after this process
+	// exits.
+	registerContainerReaper(cfg, ctr)
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	if err := ctr.delete(delCtx, target); err != nil {
+	// A generation that never started is removed without --force, so a
+	// concurrent start is reported as a failure instead of killed. A
+	// failed create that did start is this run's own container and still
+	// needs the force delete.
+	args := cfg.eng.deleteArgs(target)
+	if cfg.reuse || info.state == StateStopped || info.state == StateCreated {
+		args = stoppedDeleteArgsFor(cfg.eng, target)
+	}
+	if err := ctr.deleteWithArgs(delCtx, target, args); err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
 	return nil
@@ -431,9 +455,16 @@ func (c *Container) Terminate(ctx context.Context) error {
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
+	return c.deleteWithArgs(ctx, target, c.eng.deleteArgs(target))
+}
+
+// deleteWithArgs runs a backend delete with explicit argv. A caller that
+// verified a stopped state passes the backend's non-forced form so a
+// generation that started in the meantime is not removed.
+func (c *Container) deleteWithArgs(ctx context.Context, target string, args []string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
+	_, _, err := c.runner.Run(delCtx, args...)
 	if err == nil {
 		return nil
 	}
@@ -448,7 +479,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 // network. With the Docker backend on Docker Desktop this address is
 // usually not reachable from the host; prefer Endpoint.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
-	info, err := c.cachedInfo(ctx)
+	info, err := c.finalInfo(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -462,7 +493,15 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // published ports use different host IPs, prefer Endpoint for the
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
+//
+// A published-port answer does not come from inspect, so the handle's
+// current generation is verified first: a handle whose generation was
+// replaced must not hand out an address for the replacement.
 func (c *Container) Host(ctx context.Context) (string, error) {
+	info, err := c.finalInfo(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(c.published) > 0 {
 		addr := c.published[0].connectAddr()
 		if !c.eng.directIP() {
@@ -471,7 +510,10 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		return addr, nil
 	}
 	if c.eng.directIP() {
-		return c.ContainerIP(ctx)
+		if info.ip == "" {
+			return "", fmt.Errorf("container %s has no reported IP address", c.id)
+		}
+		return info.ip, nil
 	}
 	return c.eng.defaultHost(), nil
 }
@@ -498,29 +540,38 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
-		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+	var published *publishSpec
+	for i := range c.published {
+		if c.published[i].containerPort == spec.port && c.published[i].proto == spec.proto {
+			published = &c.published[i]
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
-	if c.eng.directIP() {
-		ip, err := c.ContainerIP(ctx)
-		if err != nil {
-			return "", 0, err
-		}
-		return ip, spec.port, nil
-	}
-	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.cachedInfo(ctx)
+	// Verify the handle's current identity before handing out an address.
+	// The address itself may come from configuration, but a replaced or
+	// removed generation must not receive one either.
+	info, err := c.finalInfo(ctx)
 	if err != nil {
 		return "", 0, err
+	}
+	if published != nil {
+		addr := published.connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, published.hostPort, nil
+	}
+	// The backend assigned a host port or an IP at start, so the answer
+	// comes from the final inspect. A snapshot taken before a restart
+	// would report the previous generation's address.
+	if c.eng.directIP() {
+		if info.ip == "" {
+			return "", 0, fmt.Errorf("container %s has no reported IP address", c.id)
+		}
+		return info.ip, spec.port, nil
 	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
@@ -528,6 +579,25 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 		}
 	}
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
+}
+
+// finalInfo returns the freshest identity-verified inspect result and
+// refreshes the cached snapshot with it. Address lookups use it instead
+// of cachedInfo: the first inspect can be arbitrarily old by the time a
+// caller resolves an endpoint, and a stale IP or host port sends clients
+// to an address that a restart has already replaced. inspectCurrent
+// already refuses a replaced identity: the immutable ID for Docker, the
+// generation under the name lock for Apple.
+func (c *Container) finalInfo(ctx context.Context) (*engineInfo, error) {
+	info, err := c.inspectCurrent(ctx)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	c.info = info
+	c.mu.Unlock()
+	c.rememberImmutableID(info.uid)
+	return info, nil
 }
 
 // cachedInfo returns an identity-safe inspect result. Docker snapshots

@@ -8,5 +8,7 @@ func lockName(context.Context, string) (func(), error) {
 	return func() {}, nil
 }
 
-// The watchdog reaper is disabled on Windows, so no lock path is needed.
-func reaperNameLockPath(string) (string, error) { return "", nil }
+// The watchdog reaper is disabled on Windows, so no barrier is needed.
+// The reaper protocol is fail-closed, so reporting no barrier makes the
+// child skip name-addressed entries instead of deleting unguarded.
+func reaperNameLockMetadata(string) ([]string, []string, error) { return nil, nil, nil }

@@ -1,3 +1,5 @@
+//go:build !windows
+
 package container
 
 import (
@@ -231,7 +233,7 @@ func closeMalformedRecoveryReaper(t *testing.T, binary string, r *reaper) {
 	}
 	select {
 	case <-exited:
-	case <-time.After(2 * time.Second):
+	case <-time.After(10 * time.Second):
 		t.Fatal("reaper did not exit after test cleanup")
 	}
 }

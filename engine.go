@@ -132,6 +132,23 @@ type immutableIDEngine interface {
 	immutableIDDeletes() bool
 }
 
+// stoppedDeleteEngine is an optional backend capability for removing a
+// container whose stopped state was just verified. A backend that
+// refuses to delete a running container implements it, so a generation
+// that starts between the verification and the delete is reported as a
+// failure instead of being force-killed. Engines without the capability
+// keep the force delete used for Terminate and the watchdog reaper.
+type stoppedDeleteEngine interface {
+	stoppedDeleteArgs(id string) []string
+}
+
+func stoppedDeleteArgsFor(eng engine, id string) []string {
+	if capability, ok := eng.(stoppedDeleteEngine); ok {
+		return capability.stoppedDeleteArgs(id)
+	}
+	return eng.deleteArgs(id)
+}
+
 func usesNameAddressedDeletes(eng engine) bool {
 	capability, ok := eng.(nameAddressedEngine)
 	return ok && capability.nameAddressedDeletes()

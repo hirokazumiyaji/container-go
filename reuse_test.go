@@ -169,6 +169,14 @@ func reuseInspectJSON(id, state, image string) string {
 }
 
 func reuseInspectJSONWithCreation(id, state, image, creation string) string {
+	return reuseInspectJSONWithCreationAndReuse(id, state, image, creation, true)
+}
+
+func reuseInspectJSONWithCreationAndReuse(id, state, image, creation string, reuse bool) string {
+	reuseLabelValue := "false"
+	if reuse {
+		reuseLabelValue = "true"
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -178,7 +186,8 @@ func reuseInspectJSONWithCreation(id, state, image, creation string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.reuse": %q,
         "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
@@ -187,12 +196,15 @@ func reuseInspectJSONWithCreation(id, state, image, creation string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, creation, state)
+]`, id, id, image, sessionID(), reuseLabelValue, creation, state)
 }
 
 type attachRunner struct {
 	*fakeRunner
 	state string
+	// image overrides the image reference inspect reports, so a test can
+	// make the existing generation incompatible.
+	image string
 }
 
 func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -200,7 +212,11 @@ func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		a.mu.Lock()
 		a.calls = append(a.calls, args)
 		a.mu.Unlock()
-		return []byte(reuseInspectJSON(args[len(args)-1], a.state, "redis:7-alpine")), nil, nil
+		image := a.image
+		if image == "" {
+			image = "redis:7-alpine"
+		}
+		return []byte(reuseInspectJSON(args[len(args)-1], a.state, image)), nil, nil
 	}
 	if args[0] == "run" {
 		return nil, nil, &cli.CLIError{

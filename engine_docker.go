@@ -191,15 +191,16 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	match := -1
-	for i, c := range containers {
-		if c.ID != "" && c.ID == target {
-			match = i
-			break
-		}
-	}
-	if match < 0 && !dockerIDRE.MatchString(target) {
+	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
-			if c.ID != "" && strings.TrimPrefix(c.Name, "/") == target {
+			if dockerIDRE.MatchString(c.ID) && c.ID == target {
+				match = i
+				break
+			}
+		}
+	} else {
+		for i, c := range containers {
+			if dockerIDRE.MatchString(c.ID) && strings.TrimPrefix(c.Name, "/") == target {
 				match = i
 				break
 			}

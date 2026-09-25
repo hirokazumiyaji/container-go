@@ -223,6 +223,22 @@ func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
 	}
 }
 
+func TestDockerParseInspectNameSkipsMalformedIDAndNonmatchingName(t *testing.T) {
+	data := []byte(`[{"Id":"myctr","Name":"/other","State":{"Status":"exited"}},` +
+		`{"Id":"malicious","Name":"/myctr","State":{"Status":"exited"}},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Errorf("uid = %q, want %q", info.uid, dockerFixtureID)
+	}
+	if info.state != StateRunning {
+		t.Errorf("state = %q, want %q", info.state, StateRunning)
+	}
+}
+
 func TestDockerInspectUsesRunIDAndRejectsMismatch(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d)

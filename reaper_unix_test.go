@@ -3,12 +3,14 @@
 package container
 
 import (
+	"context"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -70,6 +72,238 @@ func waitForReaperTestReadyFiles(t *testing.T, dir string, want int) {
 	}
 	entries, _ := os.ReadDir(dir)
 	t.Fatalf("timeout helper readiness files = %v, want at least %d", entries, want)
+}
+
+func TestReaperSetsidHelper(t *testing.T) {
+	if os.Getenv("CONTAINERGO_REAPER_SETSID_HELPER") != "1" {
+		return
+	}
+	if _, err := syscall.Setsid(); err != nil {
+		os.Exit(2)
+	}
+	path := os.Getenv("CONTAINERGO_REAPER_SETSID_PID_PATH")
+	if err := os.WriteFile(path, []byte(strconv.Itoa(os.Getpid())), 0o600); err != nil {
+		os.Exit(3)
+	}
+	for {
+		time.Sleep(time.Second)
+	}
+}
+
+func TestReaperHeadlessDashKillsLiveNestedCommand(t *testing.T) {
+	if _, err := os.Stat("/bin/dash"); err != nil {
+		t.Skipf("/bin/dash unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	nestedPIDPath := filepath.Join(dir, "nested.pid")
+	siblingPIDPath := filepath.Join(dir, "sibling.pid")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = delete ]; then\n" +
+		"  CONTAINERGO_REAPER_SETSID_HELPER=1 CONTAINERGO_REAPER_SETSID_PID_PATH=" + reaperTestShellQuote(nestedPIDPath) + " " + reaperTestShellQuote(os.Args[0]) + " -test.run '^TestReaperSetsidHelper$' >/dev/null 2>&1 &\n" +
+		"  nested=$!\n" +
+		"  /bin/sleep 30 &\n" +
+		"  sibling=$!\n" +
+		"  printf '%s\\n' \"$sibling\" > " + reaperTestShellQuote(siblingPIDPath) + "\n" +
+		"  wait \"$nested\"\n" +
+		"  wait \"$sibling\"\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	r.timeoutSeconds = 1
+	r.command = func() *exec.Cmd {
+		return exec.Command("/bin/dash", "-c", reaperScript, "containergo-reaper", binPath, "delete", breQuote(creationLabel), "1")
+	}
+	if err := r.register("headless", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	nestedPID := waitForReaperTestPIDFile(t, nestedPIDPath)
+	siblingPID := waitForReaperTestPIDFile(t, siblingPIDPath)
+	waitForReaperTestProcessGone(t, nestedPID)
+	waitForReaperTestProcessGone(t, siblingPID)
+	waitForReaperExit(t, r)
+}
+
+func TestReaperTimeoutIgnoresPathShadowedPgrep(t *testing.T) {
+	if _, err := os.Stat("/bin/dash"); err != nil {
+		t.Skipf("/bin/dash unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	markerPath := filepath.Join(dir, "pgrep-invoked")
+	pgrepPath := filepath.Join(dir, "pgrep")
+	pidPath := filepath.Join(dir, "backend.pid")
+	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nprintf invoked > "+reaperTestShellQuote(markerPath)+"\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	binPath := filepath.Join(dir, "container")
+	backend := "#!/bin/sh\nprintf '%s\\n' \"$$\" > " + reaperTestShellQuote(pidPath) + "\n/bin/sleep 30\n"
+	if err := os.WriteFile(binPath, []byte(backend), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	r.timeoutSeconds = 1
+	r.command = func() *exec.Cmd {
+		cmd := exec.Command("/bin/dash", "-c", reaperScript, "containergo-reaper", binPath, "delete", breQuote(creationLabel), "1")
+		cmd.Env = append(os.Environ(), "PATH="+dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		return cmd
+	}
+	if err := r.register("shadowed-pgrep", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	pid := waitForReaperTestPIDFile(t, pidPath)
+	waitForReaperTestProcessGone(t, pid)
+	if _, err := os.Stat(markerPath); err == nil {
+		t.Fatal("timeout cleanup trusted a PATH-shadowed pgrep")
+	}
+	waitForReaperExit(t, r)
+}
+
+// startReaperTestTree starts root -> middle -> leaf, where leaf is a long
+// running sleep, and returns the three PIDs. Each script reports its child
+// before waiting, so the whole branch is live when the walk starts.
+func startReaperTestTree(t *testing.T) (root, middle, leaf int) {
+	t.Helper()
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	leafPath := filepath.Join(dir, "leaf")
+	middlePath := filepath.Join(dir, "middle")
+	rootPath := filepath.Join(dir, "root")
+	write := func(path, body string) {
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write(leafPath, "#!/bin/sh\n/bin/sleep 30 &\nprintf '%s\\n' \"$!\"\nwait\n")
+	write(middlePath, "#!/bin/sh\n"+reaperTestShellQuote(leafPath)+" &\nprintf '%s\\n' \"$!\"\nwait\n")
+	write(rootPath, "#!/bin/sh\n"+reaperTestShellQuote(middlePath)+" &\nprintf '%s\\n' \"$!\"\nwait\n")
+
+	cmd := exec.Command("/bin/sh", rootPath)
+	prepareReaperCommand(cmd)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		// Unconditional: a failed assertion must not leave the tree running.
+		for _, pid := range []int{leaf, middle, cmd.Process.Pid} {
+			if pid > 0 {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+		_ = cmd.Wait()
+	})
+	root = cmd.Process.Pid
+	middle = readReaperTestPID(t, stdout)
+	leaf = readReaperTestPID(t, stdout)
+	return root, middle, leaf
+}
+
+func readReaperTestPID(t *testing.T, stdout io.Reader) int {
+	t.Helper()
+	type result struct {
+		pid int
+		err error
+	}
+	parsed := make(chan result, 1)
+	go func() {
+		var buf [64]byte
+		n, err := stdout.Read(buf[:])
+		if err != nil {
+			parsed <- result{err: err}
+			return
+		}
+		pid, err := strconv.Atoi(strings.TrimSpace(string(buf[:n])))
+		parsed <- result{pid: pid, err: err}
+	}()
+	select {
+	case got := <-parsed:
+		if got.err != nil {
+			t.Fatalf("read child pid: %v", got.err)
+		}
+		if got.pid <= 0 {
+			t.Fatalf("child pid = %d, want positive", got.pid)
+		}
+		return got.pid
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out reading child pid")
+		return 0
+	}
+}
+
+// killReaperTree treats an unavailable child listing as unknown rather than
+// empty: reading a slow lookup as "no children" used to abandon the whole
+// branch and let the timed command's nested group survive.
+func TestKillReaperTreeRetriesUnlistedBranch(t *testing.T) {
+	root, middle, leaf := startReaperTestTree(t)
+
+	original := reaperTreeLookup
+	t.Cleanup(func() { reaperTreeLookup = original })
+	var failed atomic.Bool
+	reaperTreeLookup = func(ctx context.Context, pgrep string, parent int) ([]int, bool) {
+		if parent == root && failed.CompareAndSwap(false, true) {
+			return nil, false
+		}
+		return original(ctx, pgrep, parent)
+	}
+
+	killReaperTree(root)
+	waitForReaperTestProcessGone(t, leaf)
+	waitForReaperTestProcessGone(t, middle)
+}
+
+// A branch that cannot be enumerated must be left running: killing its
+// leader reparents the unvisited processes and removes the only path a
+// later pass could use.
+func TestKillReaperTreeKeepsUnenumeratedBranchReachable(t *testing.T) {
+	root, middle, leaf := startReaperTestTree(t)
+
+	original := reaperTreeLookup
+	t.Cleanup(func() { reaperTreeLookup = original })
+	var fail atomic.Bool
+	fail.Store(true)
+	reaperTreeLookup = func(ctx context.Context, pgrep string, parent int) ([]int, bool) {
+		if parent == middle && fail.Load() {
+			return nil, false
+		}
+		return original(ctx, pgrep, parent)
+	}
+
+	killReaperTree(root)
+	if state, _ := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(leaf)).Output(); strings.TrimSpace(string(state)) == "" {
+		t.Fatal("leaf was reparented even though its branch was not enumerated")
+	}
+
+	fail.Store(false)
+	killReaperTree(root)
+	waitForReaperTestProcessGone(t, leaf)
+	waitForReaperTestProcessGone(t, middle)
+}
+
+// Repeatedly unavailable listings must not turn recovery into a stall: the
+// walk stays inside its own budget and leaves the tree to the group signal.
+func TestKillReaperTreeStaysBoundedWhenLookupsFail(t *testing.T) {
+	original := reaperTreeLookup
+	t.Cleanup(func() { reaperTreeLookup = original })
+	reaperTreeLookup = func(context.Context, string, int) ([]int, bool) {
+		return nil, false
+	}
+
+	start := time.Now()
+	killReaperTree(os.Getpid())
+	if elapsed := time.Since(start); elapsed > 4*reaperTreeCleanupTimeout {
+		t.Fatalf("killReaperTree with failing lookups took %s, want <= %s", elapsed, 4*reaperTreeCleanupTimeout)
+	}
 }
 
 func TestReaperProcessGroupIsStoppedBeforeWait(t *testing.T) {

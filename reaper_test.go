@@ -1035,6 +1035,70 @@ func TestReaperFailedSpawnSchedulesDurableRecovery(t *testing.T) {
 	t.Fatalf("failed spawn was not actively reconciled; attempts=%d", attempts.Load())
 }
 
+func TestReaperReconciliationBackoffEscalatesAndBounds(t *testing.T) {
+	oldLockTimeout := reaperReconcileLockTimeout
+	reaperReconcileLockTimeout = 5 * time.Millisecond
+	t.Cleanup(func() { reaperReconcileLockTimeout = oldLockTimeout })
+
+	r := newReaper("unused", "delete")
+	r.entries = []reaperEntry{{id: "active"}}
+	r.backoff = func(level int) time.Duration { return time.Duration(level) * time.Millisecond }
+	r.command = func() *exec.Cmd { return exec.Command("/bin/sh", "-c", "cat >/dev/null") }
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+	r.opMu.Lock()
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			r.opMu.Unlock()
+		}
+	}()
+	r.requestReconcile()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		level := r.reconcileRetryLevel
+		r.mu.Unlock()
+		if level >= maxReaperReconcileRetryLevel {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	r.mu.Lock()
+	level := r.reconcileRetryLevel
+	r.mu.Unlock()
+	if level != maxReaperReconcileRetryLevel {
+		t.Fatalf("reconciliation retry level = %d, want bounded level %d", level, maxReaperReconcileRetryLevel)
+	}
+	r.mu.Lock()
+	delay := r.reconcileRetryDelayLocked()
+	r.mu.Unlock()
+	if delay <= 0 || delay > maxReaperSpawnBackoff {
+		t.Fatalf("bounded reconciliation delay = %s, want (0,%s]", delay, maxReaperSpawnBackoff)
+	}
+
+	r.opMu.Unlock()
+	gateHeld = false
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		process := r.process
+		pending := r.reconcilePending
+		level := r.reconcileRetryLevel
+		r.mu.Unlock()
+		if process != nil && processLive(process) && !pending && level == 0 {
+			r.closeStdin()
+			waitForReaperExit(t, r)
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("reconciliation did not recover after bounded gate retries")
+}
+
 func TestReaperSpawnFailuresRetryAfterBackoff(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")

@@ -60,15 +60,17 @@ case "$timeout_seconds" in
   ''|*[!0-9]*) timeout_seconds=30 ;;
 esac
 [ "$timeout_seconds" -gt 0 ] 2>/dev/null || timeout_seconds=30
-pgrep_bin=$(command -v pgrep 2>/dev/null) || pgrep_bin=
-case "$pgrep_bin" in
-  /*) [ -x "$pgrep_bin" ] || pgrep_bin= ;;
-  *) pgrep_bin= ;;
-esac
+# Never resolve a process-tree helper through PATH: a shadowed pgrep could
+# otherwise make the cleanup signal an unrelated PID.
+pgrep_bin=
+for pgrep_candidate in /usr/bin/pgrep /bin/pgrep; do
+  if [ -f "$pgrep_candidate" ] && [ -x "$pgrep_candidate" ]; then
+    pgrep_bin=$pgrep_candidate
+    break
+  fi
+done
 kill_descendants() {
-  kill_parent="$1"
-  kill_depth="$2"
-  kill_skip="$3"
+  local kill_parent="$1" kill_depth="$2" kill_skip="$3" kill_children kill_child
   [ "$kill_depth" -ge 32 ] 2>/dev/null && return 0
   [ -n "$pgrep_bin" ] || return 0
   kill_children=$("$pgrep_bin" -P "$kill_parent" 2>/dev/null) || kill_children=
@@ -77,18 +79,29 @@ kill_descendants() {
       ''|*[!0-9]*) continue ;;
     esac
     [ "$kill_child" = "$kill_skip" ] && continue
-    kill_descendants "$kill_child" "$((kill_depth + 1))" "$kill_skip"
-    kill -KILL "$kill_child" 2>/dev/null || true
+    # Run the recursive frame in a subshell as well as declaring locals;
+    # this keeps the outer loop variable intact on headless dash.
+    (
+      kill_descendants "$kill_child" "$((kill_depth + 1))" "$kill_skip"
+      kill -KILL "$kill_child" 2>/dev/null || true
+    )
   done
 }
 kill_pipeline() {
-  pipeline_group="$1"
-  pipeline_root="$2"
+  local pipeline_group="$1" pipeline_root="$2"
   # The supervisor is still alive while this runs, so its process-group ID
   # is owned and cannot be recycled. Visit the command's descendants first
   # to catch a child that created a nested group, then signal the owned
   # supervisor group once.
+  #
+  # The explicit positive-PID kill is required because set -m does not
+  # always create a group for the command: a headless dash supervisor keeps
+  # it in the supervisor's own group, so the group signal alone would leave
+  # the command running. The supervisor has not reaped command_pid yet
+  # (it waits only after the timer is done), so the number is still ours to
+  # signal and cannot have been recycled.
   kill_descendants "$pipeline_root" 0 "$pipeline_root"
+  kill -KILL "$pipeline_root" 2>/dev/null || true
   kill -KILL -"$pipeline_group" 2>/dev/null || true
 }
 start_killer() {
@@ -228,9 +241,11 @@ const (
 	maxReaperSpawnFailures = 3
 	// Keep a short completion history for diagnostics without retaining
 	// one record for every container created by a long-lived process.
-	maxReaperCompletedEntries = 1024
-	initialReaperSpawnBackoff = time.Second
-	maxReaperSpawnBackoff     = 30 * time.Second
+	maxReaperCompletedEntries    = 1024
+	maxReaperSpawnRetryLevel     = 32
+	maxReaperReconcileRetryLevel = 32
+	initialReaperSpawnBackoff    = time.Second
+	maxReaperSpawnBackoff        = 30 * time.Second
 )
 
 // Reaper writes are deliberately short-lived operations. A reaper reader
@@ -452,9 +467,12 @@ type reaper struct {
 	gaveUpLogged  bool
 	retryAt       time.Time
 	retryLevel    int
-	now           func() time.Time
-	command       func() *exec.Cmd
-	backoff       func(int) time.Duration
+	// reconcileRetryLevel advances for every failed worker cycle, including
+	// gate and stop failures that do not reach spawnProcessLocked.
+	reconcileRetryLevel int
+	now                 func() time.Time
+	command             func() *exec.Cmd
+	backoff             func(int) time.Duration
 	// timeoutSeconds is an internal test seam; production uses 30 seconds.
 	timeoutSeconds int
 	killProcess    func(*reaperProcess)
@@ -515,6 +533,7 @@ func (r *reaper) requestReconcile() {
 	process := r.processLocked()
 	if len(r.entries) == 0 && process == nil {
 		r.reconcilePending = false
+		r.clearReconcileRetryLocked()
 		r.mu.Unlock()
 		return
 	}
@@ -562,6 +581,7 @@ func (r *reaper) reconcileLoop() {
 		if r.closed {
 			r.reconcilePending = false
 			r.reconcileRunning = false
+			r.clearReconcileRetryLocked()
 			r.mu.Unlock()
 			return
 		}
@@ -575,8 +595,12 @@ func (r *reaper) reconcileLoop() {
 		if r.closed {
 			r.reconcilePending = false
 			r.reconcileRunning = false
+			r.clearReconcileRetryLocked()
 			r.mu.Unlock()
 			return
+		}
+		if err != nil {
+			r.recordReconcileFailureLocked()
 		}
 		if r.stateGeneration != observed {
 			r.reconcileSeen = r.stateGeneration
@@ -586,6 +610,7 @@ func (r *reaper) reconcileLoop() {
 		if err == nil {
 			r.reconcilePending = false
 			r.reconcileRunning = false
+			r.clearReconcileRetryLocked()
 			r.mu.Unlock()
 			return
 		}
@@ -629,10 +654,23 @@ func (r *reaper) reconcileOnce() error {
 	return r.respawnAndReplay(ctx)
 }
 
+func (r *reaper) recordReconcileFailureLocked() {
+	if r.reconcileRetryLevel < maxReaperReconcileRetryLevel {
+		r.reconcileRetryLevel++
+	}
+}
+
+func (r *reaper) clearReconcileRetryLocked() {
+	r.reconcileRetryLevel = 0
+}
+
 func (r *reaper) reconcileRetryDelayLocked() time.Duration {
 	delay := time.Duration(0)
 	if !r.retryAt.IsZero() {
 		delay = r.retryAt.Sub(r.nowLocked())
+	}
+	if delay <= 0 && r.reconcileRetryLevel > 0 {
+		delay = r.backoffLocked(r.reconcileRetryLevel)
 	}
 	if delay <= 0 && r.retryLevel > 0 {
 		delay = r.backoffLocked(r.retryLevel)
@@ -1288,7 +1326,7 @@ func (r *reaper) backoffLocked(level int) time.Duration {
 }
 
 func (r *reaper) enterCooldownLocked() {
-	if r.retryLevel < 32 {
+	if r.retryLevel < maxReaperSpawnRetryLevel {
 		r.retryLevel++
 	}
 	r.gaveUp = true
@@ -1308,6 +1346,7 @@ func (r *reaper) clearSpawnFailureLocked() {
 	r.gaveUpLogged = false
 	r.retryAt = time.Time{}
 	r.retryLevel = 0
+	r.clearReconcileRetryLocked()
 }
 
 func (r *reaper) retryReadyLocked() bool {

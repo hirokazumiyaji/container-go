@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"strconv"
@@ -16,9 +17,15 @@ const (
 	maxReaperTreeDepth       = 64
 	maxReaperTreePIDs        = 2048
 	maxReaperTreePasses      = 4
-	reaperTreeCleanupTimeout = time.Second
-	reaperTreeLookupTTL      = 100 * time.Millisecond
+	reaperTreeCleanupTimeout = 750 * time.Millisecond
+	reaperTreeLookupTTL      = 250 * time.Millisecond
 )
+
+// reaperTreeLookup is the child enumeration seam. The bool result reports
+// whether the answer is authoritative: a failed or timed-out lookup says
+// nothing about the processes below it and must never be read as "this
+// process has no children".
+var reaperTreeLookup = reaperTreeChildren
 
 // killReaperTree walks descendants before the root group is signaled. A
 // timed command owns a nested process group, so a root-group signal alone
@@ -36,31 +43,63 @@ func killReaperTree(root int) {
 	signaled := make(map[int]struct{})
 	for pass := 0; pass < maxReaperTreePasses; pass++ {
 		before := len(signaled)
-		var walk func(int, int)
-		walk = func(parent, depth int) {
-			if ctx.Err() != nil || depth > maxReaperTreeDepth || len(signaled) >= maxReaperTreePIDs {
-				return
-			}
-			for _, child := range reaperTreeChildren(ctx, pgrep, parent) {
-				if child <= 0 {
-					continue
-				}
-				walk(child, depth+1)
-				if _, already := signaled[child]; already {
-					continue
-				}
-				// Capture the branch before stopping its leader. Do not use
-				// a liveness probe followed by a signal: the traversal is
-				// intentionally one-shot for each numeric PID.
-				_ = syscall.Kill(child, syscall.SIGKILL)
-				signaled[child] = struct{}{}
-			}
+		complete := signalReaperDescendants(ctx, pgrep, root, signaled)
+		if ctx.Err() != nil {
+			return
 		}
-		walk(root, 0)
-		if len(signaled) == before {
+		// Only a fully authoritative pass that found nothing new proves the
+		// subtree is contained. Every other outcome is retried, because an
+		// unenumerated branch would otherwise survive the root-group signal.
+		if complete && len(signaled) == before {
 			return
 		}
 	}
+}
+
+// signalReaperDescendants records one kill per discovered PID and reports
+// whether every visited node was enumerated authoritatively. A node whose
+// branch could not be enumerated is deliberately left running: killing it
+// would reparent the unvisited processes and remove the only path a later
+// pass could use to reach them.
+func signalReaperDescendants(ctx context.Context, pgrep string, root int, signaled map[int]struct{}) bool {
+	complete := true
+	var walk func(parent, depth int) bool
+	walk = func(parent, depth int) bool {
+		if ctx.Err() != nil {
+			complete = false
+			return false
+		}
+		if depth > maxReaperTreeDepth || len(signaled) >= maxReaperTreePIDs {
+			// The limits below are not retryable within this walk; the
+			// remaining budget is better spent on the branches already found.
+			return true
+		}
+		children, ok := reaperTreeLookup(ctx, pgrep, parent)
+		if !ok {
+			complete = false
+			return false
+		}
+		for _, child := range children {
+			if child <= 0 {
+				continue
+			}
+			if !walk(child, depth+1) {
+				complete = false
+				continue
+			}
+			if _, already := signaled[child]; already {
+				continue
+			}
+			// Capture the branch before stopping its leader. Do not use
+			// a liveness probe followed by a signal: the traversal is
+			// intentionally one-shot for each numeric PID.
+			_ = syscall.Kill(child, syscall.SIGKILL)
+			signaled[child] = struct{}{}
+		}
+		return true
+	}
+	walk(root, 0)
+	return complete
 }
 
 func trustedReaperPgrepPath() string {
@@ -73,14 +112,20 @@ func trustedReaperPgrepPath() string {
 	return ""
 }
 
-func reaperTreeChildren(parentCtx context.Context, pgrep string, parent int) []int {
+func reaperTreeChildren(parentCtx context.Context, pgrep string, parent int) ([]int, bool) {
 	ctx, cancel := context.WithTimeout(parentCtx, reaperTreeLookupTTL)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, pgrep, "-P", strconv.Itoa(parent))
 	cmd.WaitDelay = 50 * time.Millisecond
 	out, err := cmd.Output()
 	if err != nil {
-		return nil
+		// pgrep exits 1 when nothing matched, which is an authoritative
+		// empty answer. A canceled lookup or any other failure is not.
+		var exitErr *exec.ExitError
+		if ctx.Err() == nil && errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+			return nil, true
+		}
+		return nil, false
 	}
 	fields := strings.Fields(string(out))
 	if len(fields) > maxReaperTreePIDs {
@@ -93,5 +138,5 @@ func reaperTreeChildren(parentCtx context.Context, pgrep string, parent int) []i
 			children = append(children, pid)
 		}
 	}
-	return children
+	return children, true
 }

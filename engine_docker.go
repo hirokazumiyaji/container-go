@@ -62,9 +62,30 @@ func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
 	return cli.Probe{
-		Args: []string{"version", "--format", "{{.Server.Version}}"},
-		Hint: "start the Docker daemon",
+		Args:          []string{"version", "--format", "{{.Server.Version}}"},
+		Hint:          "start the Docker daemon",
+		IsUnavailable: dockerProbeUnavailable,
 	}
+}
+
+func dockerProbeUnavailable(err error) bool {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"error during connect",
+		"connection refused",
+		"dial unix",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything

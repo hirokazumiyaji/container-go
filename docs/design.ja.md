@@ -257,7 +257,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 エラーは `errors.Is`/`errors.As` で判別できる形で返す。
 
-- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
+- `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
@@ -332,7 +332,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
 `Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
 
-**システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
+**システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `version --format`)。
 
 ## スコープ外
 

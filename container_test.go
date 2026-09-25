@@ -52,7 +52,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		if f.systemUp {
 			return []byte("running"), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {

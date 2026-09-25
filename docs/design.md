@@ -392,9 +392,11 @@ cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 
 Errors are discriminable with `errors.Is`/`errors.As`.
 
-- `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
+- `ErrSystemNotRunning`: after a CLI failure, the backend-specific
+  liveness probe reports that the Apple Container service or Docker
+  daemon is unavailable. The original CLI error and probe error stay
+  in the error chain; permission, configuration, and caller
+  cancellation failures are not relabeled.
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
@@ -502,7 +504,7 @@ paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
 on Docker (`--filter label=... --filter status=exited`).
 
 **Liveness detection**: the probe command switches per backend
-(`system status` for Apple, `info` for Docker).
+(`system status` for Apple, `version --format` for Docker).
 
 ## Out of scope
 

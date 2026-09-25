@@ -41,7 +41,31 @@ func (appleEngine) checkConfig(*config) error { return nil }
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {
-	return cli.Probe{Args: []string{"system", "status"}, Hint: "run `container system start`"}
+	return cli.Probe{
+		Args:          []string{"system", "status"},
+		Hint:          "run `container system start`",
+		IsUnavailable: appleProbeUnavailable,
+	}
+}
+
+func appleProbeUnavailable(err error) bool {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	for _, fragment := range []string{
+		"xpc connection",
+		"container-apiserver",
+		"system is not running",
+		"system service is not running",
+		"connection refused",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (appleEngine) runArgs(cfg *config, image, envFile string) []string {

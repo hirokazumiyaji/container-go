@@ -160,6 +160,24 @@ func TestImageMissingClassification(t *testing.T) {
 	}
 }
 
+func TestAppleEnvelopeDrivesPullMissingFlow(t *testing.T) {
+	base := newTestRunner()
+	imageErr := &cli.CLIError{
+		Binary: "container", Args: []string{"image", "inspect", "redis:7-alpine"},
+		ExitCode: 1,
+		Stderr:   `Error: notFound: "image not found: redis:7-alpine"`,
+	}
+	r := &imageInspectErrorRunner{fakeRunner: base, err: imageErr}
+	cfg := &config{runner: r, eng: appleEngine{}, pullPolicy: PullMissing}
+
+	if err := cfg.ensureImage(context.Background(), "redis:7-alpine"); err != nil {
+		t.Fatalf("ensureImage: %v", err)
+	}
+	if base.pullCalls != 1 {
+		t.Fatalf("pull calls = %d, want 1 after Apple notFound envelope", base.pullCalls)
+	}
+}
+
 func TestParseImageExists(t *testing.T) {
 	if (dockerEngine{}).parseImageExists([]byte(`[]`), "") {
 		t.Error("docker: empty array means absent")

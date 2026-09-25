@@ -273,6 +273,13 @@ func createRaceMissing(err error) bool {
 	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
+	if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+		return message == "failed to bootstrap container" || message == "failed to run container"
+	}, "notfound", func(message string) bool {
+		return appleIDMissingLine(message, ctx.target)
+	}) {
+		return true
+	}
 	return hasCLIErrorLine(err, func(line string) bool {
 		if appleIDMissingLine(line, ctx.target) {
 			return true

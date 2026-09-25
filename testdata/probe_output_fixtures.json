@@ -19,15 +19,15 @@
     "name": "docker_desktop_unavailable",
     "backend": "docker",
     "operation": "version",
-    "stream": "stdout",
-    "output": "unable to start Docker Desktop",
+    "stream": "stderr",
+    "output": "Docker Desktop is unable to start",
     "unavailable": true
   },
   {
     "name": "docker_desktop_near_miss",
     "backend": "docker",
     "operation": "version",
-    "stream": "stdout",
+    "stream": "stderr",
     "output": "Docker Desktop is still starting",
     "unavailable": false
   },
@@ -36,7 +36,7 @@
     "backend": "docker",
     "operation": "version",
     "stream": "stderr",
-    "output": "unable to start Docker Desktop: proxy configuration is invalid",
+    "output": "Docker Desktop is unable to start: proxy configuration is invalid",
     "unavailable": false
   }
 ]

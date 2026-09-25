@@ -2,7 +2,7 @@
   {
     "name": "name_conflict",
     "operation": "run",
-    "stderr": "Error: container with id myctr already exists",
+    "stderr": "Error: exists: \"container with id myctr already exists\"",
     "nameConflict": true,
     "imageMissing": false,
     "containerMissing": false
@@ -10,7 +10,7 @@
   {
     "name": "image_missing",
     "operation": "image inspect",
-    "stderr": "Error: image not found: redis:7-alpine",
+    "stderr": "Error: notFound: \"image not found: redis:7-alpine\"",
     "nameConflict": false,
     "imageMissing": true,
     "containerMissing": false
@@ -18,7 +18,7 @@
   {
     "name": "container_missing_inspect",
     "operation": "inspect",
-    "stderr": "Error: container not found: myctr",
+    "stderr": "Error: notFound: \"container not found: myctr\"",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
@@ -26,7 +26,7 @@
   {
     "name": "container_missing_exec",
     "operation": "exec",
-    "stderr": "Error: get failed: container myctr not found",
+    "stderr": "Error: notFound: \"get failed: container myctr not found\"",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
@@ -34,7 +34,7 @@
   {
     "name": "container_missing_stop",
     "operation": "stop",
-    "stderr": "Error: failed to stop container: container with ID myctr not found",
+    "stderr": "Error: internalError: \"failed to stop container\" (cause: \"notFound: \"container with ID myctr not found\"\")",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
@@ -42,7 +42,7 @@
   {
     "name": "container_missing_delete",
     "operation": "delete",
-    "stderr": "Error: failed to delete container: container with ID myctr not found",
+    "stderr": "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID myctr not found\"\")",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
@@ -50,7 +50,7 @@
   {
     "name": "container_missing_logs",
     "operation": "logs",
-    "stderr": "Error: failed to get logs for container myctr: failed to open container logs: container with ID myctr not found",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"container with ID myctr not found\"\")",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
@@ -67,6 +67,14 @@
     "name": "application_container_not_found_on_delete",
     "operation": "delete",
     "stderr": "Error: application: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_containerization_envelope_on_run",
+    "operation": "run",
+    "stderr": "Error: unknown: \"application: container not found: myctr\"",
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": false

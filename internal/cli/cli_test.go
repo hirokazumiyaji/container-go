@@ -495,7 +495,7 @@ func TestClassifyDoesNotTreatExpiredProbeContextAsReturnedTimeout(t *testing.T) 
 	}
 }
 
-func TestClassifyOnlyTreatsPureReturnedTimeoutAsProbeTimeout(t *testing.T) {
+func TestClassifyReturnedTimeoutRequiresOnlyTimeoutOrCommandExitCauses(t *testing.T) {
 	causes := []struct {
 		name  string
 		cause error
@@ -535,6 +535,58 @@ func TestClassifyOnlyTreatsPureReturnedTimeoutAsProbeTimeout(t *testing.T) {
 	got := Classify(context.Background(), r, orig, appleProbe)
 	if !errors.Is(got, ErrSystemNotRunning) {
 		t.Fatalf("classified error = %v, pure joined timeout should be liveness", got)
+	}
+}
+
+func TestClassifyJoinedCLIErrorAndDeadlineUsesTimeoutLiveness(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	probeErr := &CLIError{
+		Args: []string{"system", "status"}, ExitCode: 1, Stderr: "probe command timed out",
+	}
+	returned := errors.Join(probeErr, context.DeadlineExceeded)
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: returned},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, want ErrSystemNotRunning from definitive timeout", got)
+	}
+	for _, cause := range []error{orig, probeErr, context.DeadlineExceeded} {
+		if !errors.Is(got, cause) {
+			t.Fatalf("classified error = %v, want chain %v", got, cause)
+		}
+	}
+}
+
+func TestClassifyJoinedCLIErrorAndDeadlineStillVetoesNonLiveness(t *testing.T) {
+	diagnostics := []string{
+		"permission denied while opening the endpoint",
+		"proxy configuration is invalid",
+		"tls certificate verification failed",
+		"context canceled by the probe",
+	}
+	for _, diagnostic := range diagnostics {
+		t.Run(diagnostic, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+			probeErr := &CLIError{
+				Args: []string{"system", "status"}, ExitCode: 1, Stderr: diagnostic,
+			}
+			returned := errors.Join(probeErr, context.DeadlineExceeded)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: returned},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, non-liveness diagnostic marked daemon down", got)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, probeErr) || !errors.Is(got, context.DeadlineExceeded) {
+				t.Fatalf("classified error = %v, want original, probe, and timeout chains", got)
+			}
+		})
 	}
 }
 

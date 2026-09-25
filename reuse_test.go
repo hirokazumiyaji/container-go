@@ -34,7 +34,11 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `container not found: "` + args[len(args)-1] + `"`}
+			id := args[len(args)-1]
+			return nil, nil, &cli.CLIError{
+				Binary: "container", Args: args, ExitCode: 1,
+				Stderr: fmt.Sprintf(`Error: notFound: "container not found: %s"`, id),
+			}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -275,7 +279,10 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `container not found: "myctr"`}
+			return nil, nil, &cli.CLIError{
+				Binary: "container", Args: args, ExitCode: 1,
+				Stderr: `Error: notFound: "container not found: myctr"`,
+			}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -283,8 +290,8 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 		c.createAttempts++
 		c.seenConflict.Store(true)
 		return nil, nil, &cli.CLIError{
-			Args: args, ExitCode: 1,
-			Stderr: `Error: container with id myctr already exists`,
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: `Error: exists: "container with id myctr already exists"`,
 		}
 	}
 	return nil, nil, nil
@@ -306,7 +313,10 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `container not found: "myctr"`}
+			return nil, nil, &cli.CLIError{
+				Binary: "container", Args: args, ExitCode: 1,
+				Stderr: `Error: notFound: "container not found: myctr"`,
+			}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -314,8 +324,8 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 		n.createAttempts++
 		n.seenNotFound.Store(true)
 		return nil, nil, &cli.CLIError{
-			Args: args, ExitCode: 1,
-			Stderr: "Error: container with ID myctr not found\n",
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: `Error: internalError: "failed to bootstrap container" (cause: "notFound: "container with ID myctr not found"")`,
 		}
 	}
 	return nil, nil, nil

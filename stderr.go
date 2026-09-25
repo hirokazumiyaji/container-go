@@ -7,16 +7,6 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// cliErrorLinePrefixes are backend-specific wrappers emitted by the
-// supported CLIs around their structured error messages. A generic
-// "Error: " prefix is intentionally absent: exec stderr may come from the
-// workload, so it is admitted only for operations known to emit it.
-var cliErrorLinePrefixes = []string{
-	"docker: ",
-	"container: ",
-	"error response from daemon: ",
-}
-
 // cliErrorContext is the small, structured part of a CLI failure that a
 // backend matcher is allowed to use.  In particular, stderr by itself is
 // not enough: a process running in a container can print the same words as
@@ -161,7 +151,7 @@ func cliErrorLines(err error) ([]string, bool) {
 	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {
-		line = normalizeCLIErrorLine(line, allowGenericError)
+		line = normalizeCLIErrorLine(line, cliErr, allowGenericError)
 		if line != "" {
 			lines = append(lines, line)
 		}
@@ -185,24 +175,44 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	}
 }
 
-func normalizeCLIErrorLine(line string, allowGenericError bool) string {
+func normalizeCLIErrorLine(line string, cliErr *cli.CLIError, allowGenericError bool) string {
 	line = strings.ToLower(strings.TrimSpace(line))
 	for {
-		changed := false
-		for _, prefix := range cliErrorLinePrefixes {
+		prefix, ok := cliErrorLinePrefix(line, cliErr)
+		if !ok || !strings.HasPrefix(line, prefix) {
+			break
+		}
+		line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+	}
+	if allowGenericError && strings.HasPrefix(line, "error: ") {
+		line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+	}
+	return line
+}
+
+func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
+	operation := commandOperation(cliErr.Args)
+	if cliBinaryMatches(cliErr.Binary, "docker") {
+		for _, prefix := range []string{"docker: ", "error response from daemon: "} {
 			if strings.HasPrefix(line, prefix) {
-				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
-				changed = true
-				break
+				return prefix, true
 			}
 		}
-		if allowGenericError && strings.HasPrefix(line, "error: ") {
-			line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
-			changed = true
-		}
-		if !changed {
-			return line
-		}
+	}
+	if cliBinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
+		return "container: ", true
+	}
+	return "", false
+}
+
+func appleContainerPrefixAllowed(operation string) bool {
+	// Exec and logs can carry workload output, so their "container: " prefix
+	// is not by itself evidence of an Apple backend diagnostic.
+	switch operation {
+	case "run", "inspect", "image inspect", "stop", "delete", "rm":
+		return true
+	default:
+		return false
 	}
 }
 
@@ -213,6 +223,119 @@ func hasCLIErrorLine(err error, match func(string) bool) bool {
 	}
 	for _, line := range lines {
 		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+const maxAppleContainerizationDepth = 8
+
+var appleContainerizationCodes = map[string]struct{}{
+	"unknown":         {},
+	"invalidargument": {},
+	"internalerror":   {},
+	"exists":          {},
+	"notfound":        {},
+	"cancelled":       {},
+	"invalidstate":    {},
+	"empty":           {},
+	"timeout":         {},
+	"unsupported":     {},
+	"interrupted":     {},
+}
+
+type appleContainerizationError struct {
+	code    string
+	message string
+	cause   *appleContainerizationError
+}
+
+// parseAppleContainerizationEnvelope parses ContainerizationError's
+// CustomStringConvertible form, with or without the CLI's generic "Error: "
+// wrapper. Swift embeds nested causes without escaping their quotes, so
+// parsing follows the explicit "(cause: " marker and strips exactly the
+// enclosing quote/parenthesis before recursing.
+func parseAppleContainerizationEnvelope(line string) (appleContainerizationError, bool) {
+	return parseAppleContainerizationEnvelopeAt(line, 0)
+}
+
+func parseAppleContainerizationEnvelopeAt(line string, depth int) (appleContainerizationError, bool) {
+	if depth > maxAppleContainerizationDepth {
+		return appleContainerizationError{}, false
+	}
+	line = strings.ToLower(strings.TrimSpace(line))
+	line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+	colon := strings.Index(line, ": ")
+	if colon <= 0 {
+		return appleContainerizationError{}, false
+	}
+	code := strings.ToLower(line[:colon])
+	if _, ok := appleContainerizationCodes[code]; !ok {
+		return appleContainerizationError{}, false
+	}
+	rest := line[colon+2:]
+	if !strings.HasPrefix(rest, `"`) {
+		return appleContainerizationError{}, false
+	}
+	rest = strings.TrimPrefix(rest, `"`)
+
+	const causeMarker = `" (cause: "`
+	if marker := strings.Index(rest, causeMarker); marker >= 0 {
+		causeText := rest[marker+len(causeMarker):]
+		if !strings.HasSuffix(causeText, `")`) {
+			return appleContainerizationError{}, false
+		}
+		causeText = strings.TrimSuffix(causeText, ")")
+		causeText = strings.TrimSuffix(causeText, `"`)
+		envelope := appleContainerizationError{code: code, message: rest[:marker]}
+		if cause, ok := parseAppleContainerizationEnvelopeAt(causeText, depth+1); ok {
+			envelope.cause = &cause
+		}
+		return envelope, true
+	}
+	if !strings.HasSuffix(rest, `"`) {
+		return appleContainerizationError{}, false
+	}
+	return appleContainerizationError{
+		code: code, message: strings.TrimSuffix(rest, `"`),
+	}, true
+}
+
+func (e appleContainerizationError) walk(match func(code, message string) bool) bool {
+	if match(e.code, e.message) {
+		return true
+	}
+	return e.cause != nil && e.cause.walk(match)
+}
+
+func hasAppleContainerizationError(err error, code string, match func(string) bool) bool {
+	return hasAppleContainerizationErrorPath(err, "", nil, code, match)
+}
+
+func hasAppleContainerizationErrorPath(
+	err error,
+	rootCode string,
+	matchRootMessage func(string) bool,
+	code string,
+	match func(string) bool,
+) bool {
+	lines, ok := cliErrorLines(err)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		envelope, ok := parseAppleContainerizationEnvelope(line)
+		if !ok {
+			continue
+		}
+		if rootCode != "" && (envelope.code != rootCode ||
+			(matchRootMessage != nil && !matchRootMessage(envelope.message))) {
+			continue
+		}
+		if envelope.walk(func(gotCode, message string) bool {
+			return gotCode == code && match(message)
+		}) {
 			return true
 		}
 	}

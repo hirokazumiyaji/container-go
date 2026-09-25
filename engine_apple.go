@@ -14,15 +14,11 @@ import (
 type appleEngine struct{}
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Matchers are both command- and binary-aware. Apple uses different
-// ContainerizationError messages for the client-side inspect path and
-// for the API-client paths used by exec/stop/delete/logs:
-//   - inspect: "container not found: …"
-//   - exec: "get failed: container <id> not found"
-//   - stop/delete: "container with ID <id> not found" (often wrapped by
-//     "failed to stop/delete container: …")
-//   - logs: "failed to get logs for container <id>: …"
-//
+// Matchers are command-, binary-, code-, and target-aware. Apple's
+// ContainerizationError envelope is either a direct code/message pair
+// (run conflict, inspect, image inspect, exec) or an internalError wrapper
+// whose cause is notFound (create race, stop, delete, logs). Legacy flat
+// spellings remain accepted only for the same operation-specific forms.
 // Generic application output containing "not found" is not a backend match.
 const (
 	appleStderrNameConflict  = "container with id"
@@ -41,7 +37,7 @@ func (appleEngine) defaultHost() string { return "127.0.0.1" }
 func (appleEngine) probe() cli.Probe {
 	return cli.Probe{
 		Args:          []string{"system", "status"},
-		Hint:          "run `container system start`",
+		Hint:          "Ensure container system service has been started with `container system start`.",
 		IsUnavailable: appleProbeUnavailable,
 	}
 }
@@ -196,6 +192,12 @@ func (appleEngine) imageMissing(err error) bool {
 	if !ok || ctx.operation != "image inspect" || !hasParsedCLITarget(ctx) {
 		return false
 	}
+	if hasAppleContainerizationError(err, "notfound", func(message string) bool {
+		rest, ok := strings.CutPrefix(message, appleStderrImageNotFound)
+		return ok && cliTargetListMatches(rest, ctx.target)
+	}) {
+		return true
+	}
 	return hasCLIErrorLine(err, func(line string) bool {
 		rest, ok := strings.CutPrefix(line, appleStderrImageNotFound)
 		return ok && cliTargetListMatches(rest, ctx.target)
@@ -283,9 +285,30 @@ func (appleEngine) nameConflict(err error) bool {
 	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
+	if hasAppleContainerizationError(err, "exists", func(message string) bool {
+		return appleNameConflictLine(message, ctx.target)
+	}) {
+		return true
+	}
+	if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+		return message == "failed to create container"
+	}, "exists", func(message string) bool {
+		return appleServerConflictLine(message, ctx.target)
+	}) {
+		return true
+	}
 	return hasCLIErrorLine(err, func(line string) bool {
-		return appleNameConflictLine(line, ctx.target)
+		return appleNameConflictLine(line, ctx.target) || appleServerConflictLine(line, ctx.target)
 	})
+}
+
+func appleServerConflictLine(message, target string) bool {
+	rest, ok := strings.CutPrefix(message, "container already exists:")
+	if !ok {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(rest), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") && sameCLITarget(id, target)
 }
 
 func appleNameConflictLine(line, target string) bool {
@@ -316,23 +339,63 @@ func (appleEngine) containerMissing(err error) bool {
 	}
 	switch ctx.operation {
 	case "inspect":
+		if hasAppleContainerizationError(err, "notfound", func(message string) bool {
+			rest, ok := strings.CutPrefix(message, "container not found:")
+			return ok && cliTargetListMatches(rest, ctx.target)
+		}) {
+			return true
+		}
 		return hasCLIErrorLine(err, func(line string) bool {
 			rest, ok := strings.CutPrefix(line, "container not found:")
 			return ok && cliTargetListMatches(rest, ctx.target)
 		})
 	case "exec":
+		if hasAppleContainerizationError(err, "notfound", func(message string) bool {
+			return appleExecMissingLine(message, ctx.target)
+		}) {
+			return true
+		}
+		if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+			return message == "failed to create process in container"
+		}, "notfound", func(message string) bool {
+			return appleIDMissingLine(message, ctx.target)
+		}) {
+			return true
+		}
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleExecMissingLine(line, ctx.target)
 		})
 	case "stop":
+		if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+			return message == "failed to stop container"
+		}, "notfound", func(message string) bool {
+			return appleIDMissingLine(message, ctx.target)
+		}) {
+			return true
+		}
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleStateMissingLine(line, ctx.target, "failed to stop container:")
 		})
 	case "delete", "rm":
+		if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+			return message == "failed to delete container"
+		}, "notfound", func(message string) bool {
+			return appleIDMissingLine(message, ctx.target)
+		}) {
+			return true
+		}
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleStateMissingLine(line, ctx.target, "failed to delete container:")
 		})
 	case "logs":
+		if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+			rest, ok := strings.CutPrefix(message, "failed to get logs for container ")
+			return ok && sameCLITarget(rest, ctx.target)
+		}, "notfound", func(message string) bool {
+			return appleIDMissingLine(message, ctx.target)
+		}) {
+			return true
+		}
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleLogsMissingLine(line, ctx.target)
 		})

@@ -81,7 +81,7 @@ func dockerProbeUnavailable(err error) bool {
 	for _, fragment := range []string{
 		"cannot connect to the docker daemon",
 		"is the docker daemon running",
-		"unable to start docker desktop",
+		"docker desktop is unable to start",
 		"connection refused",
 	} {
 		if strings.Contains(text, fragment) {

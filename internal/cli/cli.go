@@ -210,11 +210,11 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 			}
 			return errors.Join(err, probeErr)
 		}
-		// A returned timeout is liveness evidence only when every reachable
-		// cause is a timeout. A joined permission, cancellation, or
-		// configuration failure must veto classification.
+		// A returned timeout is liveness evidence when the only additional
+		// cause is the command exit produced by the probe itself. A joined
+		// permission, cancellation, or configuration failure must veto it.
 		if errors.Is(probeErr, context.DeadlineExceeded) {
-			if !isPureProbeTimeout(probeErr) {
+			if !isDefinitiveProbeTimeout(probeErr) {
 				if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
 					return classified
 				}
@@ -333,33 +333,48 @@ func defaultProbeUnavailable(err error) bool {
 	return defaultProbeUnavailableText(strings.ToLower(err.Error()))
 }
 
-func isPureProbeTimeout(err error) bool {
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+func isDefinitiveProbeTimeout(err error) bool {
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return false
 	}
 	if IsProbeConfigurationError(err) || containsDefinitiveNonLivenessText(err.Error()) {
 		return false
 	}
-	return errorTreeIsOnly(err, context.DeadlineExceeded)
+	return errorTreeHasOnlyTimeoutEvidence(err)
 }
 
-func errorTreeIsOnly(err error, target error) bool {
+// errorTreeHasOnlyTimeoutEvidence accepts the shape produced when an
+// ExecRunner's child exits as the probe deadline fires: a command CLIError
+// joined with context.DeadlineExceeded. Arbitrary joined failures still veto
+// liveness, as do CLI launch/permission exits and configuration diagnostics.
+func errorTreeHasOnlyTimeoutEvidence(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return false
+	}
 	if joined, ok := err.(interface{ Unwrap() []error }); ok {
 		causes := joined.Unwrap()
 		if len(causes) == 0 {
 			return false
 		}
 		for _, cause := range causes {
-			if cause == nil || !errorTreeIsOnly(cause, target) {
+			if !errorTreeHasOnlyTimeoutEvidence(cause) {
 				return false
 			}
 		}
 		return true
 	}
 	if cause := errors.Unwrap(err); cause != nil {
-		return errorTreeIsOnly(cause, target)
+		return errorTreeHasOnlyTimeoutEvidence(cause)
 	}
-	return errors.Is(err, target)
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		return cliErr.ExitCode != 126 && cliErr.ExitCode != 127
+	}
+	return errors.Is(err, context.DeadlineExceeded)
 }
 
 func defaultProbeUnavailableText(s string) bool {
@@ -439,6 +454,8 @@ func containsDefinitiveNonLivenessText(text string) bool {
 		"operation not permitted",
 		"operation canceled",
 		"operation cancelled",
+		"context canceled",
+		"context cancelled",
 		"eacces",
 		"eperm",
 		"access denied",

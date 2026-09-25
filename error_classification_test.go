@@ -106,6 +106,13 @@ func TestProductionProbeFixtures(t *testing.T) {
 				t.Fatalf("unknown fixture backend %q", fixture.Backend)
 			}
 			probe := eng.probe()
+			wantHint := "start the Docker daemon"
+			if fixture.Backend == "apple" {
+				wantHint = "Ensure container system service has been started with `container system start`."
+			}
+			if probe.Hint != wantHint {
+				t.Fatalf("probe hint = %q, want %q", probe.Hint, wantHint)
+			}
 			if commandOperation(probe.Args) != fixture.Operation {
 				t.Fatalf("probe operation = %q, want fixture %q", commandOperation(probe.Args), fixture.Operation)
 			}
@@ -128,6 +135,9 @@ func TestProductionProbeFixtures(t *testing.T) {
 			got := cli.Classify(context.Background(), runner, original, probe)
 			if errors.Is(got, ErrSystemNotRunning) != fixture.Unavailable {
 				t.Fatalf("Classify(%q) unavailable = %v, want %v; error = %v", fixture.Output, errors.Is(got, ErrSystemNotRunning), fixture.Unavailable, got)
+			}
+			if fixture.Unavailable && !strings.Contains(got.Error(), probe.Hint) {
+				t.Fatalf("Classify(%q) error = %v, want probe hint %q", fixture.Output, got, probe.Hint)
 			}
 			if !errors.Is(got, original) || !errors.Is(got, probeErr) {
 				t.Fatalf("Classify error = %v, want original and probe chains", got)
@@ -505,6 +515,20 @@ func TestClassifiersRejectCrossBackendOperationAndTarget(t *testing.T) {
 			}),
 		},
 		{
+			name: "application envelope on delete",
+			got: (appleEngine{}).containerMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"delete", "--force", "myctr"},
+				Stderr: `Error: notFound: "container with ID myctr not found"`,
+			}),
+		},
+		{
+			name: "application envelope on logs",
+			got: (appleEngine{}).containerMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"logs", "myctr"},
+				Stderr: `Error: notFound: "container with ID myctr not found"`,
+			}),
+		},
+		{
 			name: "image wording on pull",
 			got: (dockerEngine{}).imageMissing(&cli.CLIError{
 				Binary: "docker", Args: []string{"pull", "redis:7-alpine"},
@@ -551,10 +575,25 @@ func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "real envelope race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: `Error: internalError: "failed to bootstrap container" (cause: "notFound: "container with ID myctr not found"")`,
+			},
+			want: true,
+		},
+		{
 			name: "generic application message",
 			err: &cli.CLIError{
 				Binary: "container", Args: []string{"run", "--name", "myctr"},
 				Stderr: "Error: container not found: myctr",
+			},
+		},
+		{
+			name: "application envelope without run wrapper",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: `Error: notFound: "container with ID myctr not found"`,
 			},
 		},
 		{
@@ -585,6 +624,32 @@ func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
 				t.Fatalf("createRaceMissing() = %v, want %v", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestParseAppleContainerizationEnvelope(t *testing.T) {
+	envelope, ok := parseAppleContainerizationEnvelope(
+		`Error: internalError: "failed to delete container" (cause: "notFound: "container with ID myctr not found"")`,
+	)
+	if !ok {
+		t.Fatal("real Apple envelope did not parse")
+	}
+	if envelope.code != "internalerror" || envelope.message != "failed to delete container" {
+		t.Fatalf("root envelope = %+v", envelope)
+	}
+	if envelope.cause == nil || envelope.cause.code != "notfound" ||
+		envelope.cause.message != "container with id myctr not found" {
+		t.Fatalf("nested envelope = %+v", envelope.cause)
+	}
+
+	for _, invalid := range []string{
+		`application: notFound: "container not found: myctr"`,
+		`notFound: container not found: myctr`,
+		`madeUpCode: "container not found: myctr"`,
+	} {
+		if _, ok := parseAppleContainerizationEnvelope(invalid); ok {
+			t.Errorf("accepted invalid envelope %q", invalid)
+		}
 	}
 }
 
@@ -752,6 +817,33 @@ func TestProductionProbePredicatesKeepJoinedConfigurationAsVeto(t *testing.T) {
 	)
 	if appleProbeUnavailable(appleErr) {
 		t.Fatal("Apple joined proxy failure was classified as system down")
+	}
+}
+
+func TestContainerPrefixNormalizationIsAppleAndOperationScoped(t *testing.T) {
+	dockerWorkload := &cli.CLIError{
+		Binary: "docker", Args: []string{"exec", "myctr", "sh", "-c", "echo"},
+		ExitCode: 7,
+		Stderr:   "container: Error response from daemon: No such container: myctr",
+	}
+	if (dockerEngine{}).containerMissing(dockerWorkload) {
+		t.Fatal("Docker workload text spoofed the Apple container prefix")
+	}
+
+	appleInspect := &cli.CLIError{
+		Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1,
+		Stderr: `container: Error: notFound: "container not found: myctr"`,
+	}
+	if !(appleEngine{}).containerMissing(appleInspect) {
+		t.Fatal("Apple inspect envelope was not accepted through the container prefix")
+	}
+
+	appleExecOutput := &cli.CLIError{
+		Binary: "container", Args: []string{"exec", "myctr", "query"}, ExitCode: 7,
+		Stderr: `container: Error: notFound: "get failed: container myctr not found"`,
+	}
+	if (appleEngine{}).containerMissing(appleExecOutput) {
+		t.Fatal("Apple exec workload text spoofed the backend container prefix")
 	}
 }
 

@@ -401,7 +401,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
+	ferr := &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `Error: internalError: "failed to delete container" (cause: "notFound: "container with ID myctr not found"")`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

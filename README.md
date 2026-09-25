@@ -4,8 +4,9 @@
 
 A [testcontainers](https://testcontainers.com/)-style Go library for
 [Apple Container](https://github.com/apple/container) and Docker: run
-throwaway containers from Go tests, with zero third-party
-dependencies.
+throwaway containers from Go tests, with no runtime dependency on a
+third-party container client. The Windows build uses `golang.org/x/sys`
+for Job Objects; the rest of the library uses the standard library.
 
 ```go
 func TestRedis(t *testing.T) {
@@ -150,16 +151,16 @@ checks the optional terminal status before treating a matching line as
 readiness, so a merged CLI diagnostic cannot mask a terminal failure.
 
 The library always waits for and reaps the direct CLI child. On Unix-like
-systems it makes a best-effort attempt to terminate descendants in the
-child's process group, gated by the direct process handle; it does not
-reap descendants, so a descendant that becomes a zombie is the platform
-init/subreaper's responsibility. Once the direct child is reaped, Close
-does not use its former process-group ID, so descendants may outlive it.
-Detached or reparented descendants are outside the group guarantee. On
-Windows, an attached Job Object provides the descendant boundary; if the
-host prevents job assignment, only the direct process handle is covered.
-Other supported platforms cover only the direct child. Do not rely on
-descendant cleanup when a CLI deliberately detaches helpers.
+systems it intentionally guarantees only that direct child: process-group
+signals are not used because a numeric PGID cannot be made safe across a
+concurrent reap. Descendants may outlive the CLI and are not reaped here.
+On Windows, an attached Job Object provides a best-effort descendant
+boundary. Attachment happens immediately after the child is started, so
+helpers created before that attachment, or explicitly detached from the
+job, are outside the guarantee; if the host prevents assignment, only the
+direct process handle is covered. Other supported platforms cover only the
+direct child. Do not rely on descendant cleanup when a CLI deliberately
+detaches helpers.
 
 ## Image pulls
 

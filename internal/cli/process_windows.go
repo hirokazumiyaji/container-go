@@ -16,13 +16,17 @@ import (
 // numeric PID. The handle remains valid across child exit and cannot be
 // redirected to a reused PID. If the process cannot be assigned to a job
 // (for example, because the caller is already inside a restrictive job), the
-// caller falls back to the direct os.Process handle.
+// caller falls back to the direct os.Process handle. Assignment happens
+// after cmd.Start, so helpers already created in that short window are not
+// retroactively added to the job. Once Wait releases the job, late
+// termination requests return os.ErrProcessDone without touching the
+// process handle.
 func configureProcessTree(*exec.Cmd) {}
 
 type windowsProcessTree struct {
-	mu     sync.Mutex
-	job    windows.Handle
-	closed bool
+	mu       sync.Mutex
+	job      windows.Handle
+	released bool
 }
 
 func newProcessTree(cmd *exec.Cmd) (processTree, error) {
@@ -67,13 +71,17 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 func (t *windowsProcessTree) terminate(cmd *exec.Cmd) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.job != 0 && !t.closed {
-		if err := windows.TerminateJobObject(t.job, 1); err == nil {
-			return nil
-		}
+	// close runs only after the sole Wait call. Once the job handle is
+	// released, a late callback is already done and must not fall back to
+	// the numeric process handle.
+	if t.released || t.job == 0 {
+		return os.ErrProcessDone
 	}
-	// Job assignment can fail, and a job can be closed concurrently with a
-	// normal child exit. The direct handle remains a safe fallback.
+	if err := windows.TerminateJobObject(t.job, 1); err == nil {
+		return nil
+	}
+	// Job assignment can fail while the handle is still owned. The direct
+	// handle is a safe fallback in that pre-release state.
 	if cmd == nil || cmd.Process == nil {
 		return os.ErrProcessDone
 	}
@@ -87,11 +95,11 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) error {
 func (t *windowsProcessTree) close() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.job != 0 && !t.closed {
+	if t.job != 0 {
 		_ = windows.CloseHandle(t.job)
 		t.job = 0
-		t.closed = true
 	}
+	t.released = true
 }
 
 // terminateProcessTree is kept as the direct-child fallback used by package

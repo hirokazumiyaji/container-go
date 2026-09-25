@@ -169,14 +169,19 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 }
 
 type delayedTerminalLogReader struct {
-	reader    io.Reader
-	done      chan struct{}
-	closeOnce sync.Once
-	terminal  error
+	reader       io.Reader
+	done         chan struct{}
+	closeOnce    sync.Once
+	terminal     error
+	finishOnRead bool
 }
 
 func (r *delayedTerminalLogReader) Read(p []byte) (int, error) {
-	return r.reader.Read(p)
+	n, err := r.reader.Read(p)
+	if r.finishOnRead {
+		r.finish()
+	}
+	return n, err
 }
 
 func (r *delayedTerminalLogReader) Close() error { return nil }
@@ -209,14 +214,14 @@ func TestForLogRejectsMatchingLineWhenTerminalErrorAlreadySettled(t *testing.T) 
 	}
 }
 
-func TestForLogSettlesTerminalErrorAfterMatchingLine(t *testing.T) {
+func TestForLogObservesTerminalStatusAfterMatchingLine(t *testing.T) {
 	terminalErr := errors.New("terminal CLI failure after match")
 	reader := &delayedTerminalLogReader{
-		reader:   strings.NewReader("diagnostic matching line\n"),
-		done:     make(chan struct{}),
-		terminal: terminalErr,
+		reader:       strings.NewReader("diagnostic matching line\n"),
+		done:         make(chan struct{}),
+		terminal:     terminalErr,
+		finishOnRead: true,
 	}
-	time.AfterFunc(time.Millisecond, reader.finish)
 	target := newFakeTarget()
 	target.logs = reader
 

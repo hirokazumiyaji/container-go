@@ -92,12 +92,29 @@ func (r *ExecRunner) binary() string {
 	return r.Binary
 }
 
+type runHooks struct {
+	start          func(*exec.Cmd) error
+	beforePublish  func()
+	cancelObserved func()
+	terminate      func(*exec.Cmd) error
+}
+
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	return r.run(ctx, runHooks{}, args...)
+}
+
+func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
-	cmd.Cancel = lifecycle.terminate
+	var cancelObservedOnce sync.Once
+	cmd.Cancel = func() error {
+		if hooks.cancelObserved != nil {
+			cancelObservedOnce.Do(hooks.cancelObserved)
+		}
+		return lifecycle.terminate()
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -105,21 +122,35 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	if err := cmd.Start(); err != nil {
+	start := hooks.start
+	if start == nil {
+		start = func(command *exec.Cmd) error { return command.Start() }
+	}
+	if err := start(cmd); err != nil {
 		lifecycle.failStart()
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
-	tree, treeErr := newProcessTree(cmd)
-	if treeErr != nil {
-		// The direct os.Process handle is still a safe cancellation path
-		// when a platform tree cannot be attached.
-		tree = directProcessTree{}
+	if hooks.beforePublish != nil {
+		hooks.beforePublish()
+	}
+
+	var tree processTree
+	if hooks.terminate != nil {
+		tree = processTreeFunc(hooks.terminate)
+	} else {
+		var treeErr error
+		tree, treeErr = newProcessTree(cmd)
+		if treeErr != nil {
+			// The direct os.Process handle is still a safe cancellation path
+			// when a platform tree cannot be attached.
+			tree = directProcessTree{}
+		}
 	}
 	lifecycle.publishStart(tree)
 
 	// Run owns the sole Wait call through the same lifecycle used by Stream.
 	// This keeps context cancellation and the eventual reap from racing a
-	// stale numeric process-group signal.
+	// stale process-handle termination.
 	err := lifecycle.result()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the

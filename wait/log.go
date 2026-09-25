@@ -11,6 +11,9 @@ import (
 	"time"
 )
 
+// terminalSettleWindow is a short grace period for a process-backed stream
+// that has just produced a matching line. It observes an already-finishing
+// CLI without delaying readiness for a live follow stream.
 const terminalSettleWindow = 10 * time.Millisecond
 
 // LogStrategy waits for a pattern to appear in the container's log
@@ -121,21 +124,20 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		// useful than replacing it with a generic timeout.
 		terminalErr := terminalStreamError(stream)
 		_ = stream.Close()
-		select {
-		case result := <-results:
-			if terminalErr != nil {
-				return terminalLogError(ctx, s.pattern, terminalErr)
+		// Close is the stream contract that unblocks the scanner. Receive
+		// its result before classifying the context so a terminal CLI error
+		// is not lost to an arbitrary timing fallback.
+		result := <-results
+		if terminalErr != nil {
+			return terminalLogError(ctx, s.pattern, terminalErr)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			if result.err != nil && !errors.Is(result.err, io.EOF) && !errors.Is(result.err, io.ErrClosedPipe) && !errors.Is(result.err, context.Canceled) {
+				return wrapLogError(s.pattern, errors.Join(ctxErr, result.err))
 			}
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				if result.err != nil && !errors.Is(result.err, io.EOF) && !errors.Is(result.err, io.ErrClosedPipe) && !errors.Is(result.err, context.Canceled) {
-					return wrapLogError(s.pattern, errors.Join(ctxErr, result.err))
-				}
-				return logContextError(ctx, s.pattern, timeout)
-			}
-			return s.finishScan(ctx, target, stream, result, timeout)
-		case <-time.After(100 * time.Millisecond):
 			return logContextError(ctx, s.pattern, timeout)
 		}
+		return s.finishScan(ctx, target, stream, result, timeout)
 	}
 }
 

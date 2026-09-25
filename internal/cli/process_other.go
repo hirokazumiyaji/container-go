@@ -6,7 +6,7 @@ import "os/exec"
 
 // These platforms have no portable process-group or job-object API in this
 // package. Cancellation still terminates and reaps the direct CLI child;
-// detached descendants cannot be guaranteed and are not reaped here.
+// descendants are outside the guarantee and are not reaped here.
 func configureProcessTree(*exec.Cmd) {}
 
 type otherProcessTree struct{}

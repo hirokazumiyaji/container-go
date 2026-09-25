@@ -19,8 +19,8 @@ but with a different implementation strategy, described below.
 
 Three constraints shape the design.
 
-- **Zero dependencies**: no third-party Go modules; the standard
-  library only.
+- **Minimal dependencies**: the standard library plus `golang.org/x/sys`
+  for Windows Job Objects; no third-party container-client module.
 - **Security**: no injection or information-leak paths through
   subprocess invocation or user input.
 - **Performance**: container (VM) startup dominates test suite time;
@@ -68,10 +68,10 @@ Two candidate strategies exist.
 
 This library adopts the CLI wrapper, for three reasons.
 
-First, the zero-dependency constraint. Direct XPC needs cgo and a
+First, the minimal-dependency constraint. Direct XPC needs cgo and a
 hand-written C bridge, dragging the macOS SDK into the build. The CLI
-wrapper is pure Go on the standard library and builds with
-`CGO_ENABLED=0`.
+wrapper is pure Go apart from the Windows-only `golang.org/x/sys` Job
+Object support and builds with `CGO_ENABLED=0`.
 
 Second, stability. XPC route names and message shapes are Apple
 Container's internal implementation with no compatibility promise. The
@@ -383,14 +383,12 @@ bounded only by host resources.
 
 **Keep streams finite**. `FollowLogs` returns the `container logs --follow`
 child as an `io.ReadCloser`. `Close` or context cancellation terminates
-and reaps the direct CLI child. On Unix-like systems the runner makes a
-best-effort process-group termination attempt, but only after the direct
-process handle accepts the stop signal; it does not reap descendants. A
-descendant that becomes a zombie is the platform init/subreaper's
-responsibility. Once the direct child is reaped, Close does not use its
-former process-group ID, so descendants may outlive it. Detached or
-reparented descendants are outside the group boundary. On Windows, a
-Job Object handle is used for the descendant boundary; if job assignment
+and reaps the direct CLI child. Unix does not issue process-group signals:
+a numeric PGID cannot be made safe across a concurrent reap, so Unix
+guarantees only the direct child and descendants may outlive it. Windows
+uses a Job Object handle for a best-effort descendant boundary, but the
+child is started before assignment; helpers created in that attachment
+window, or detached from the job, are outside the guarantee. If assignment
 is unavailable, the direct process handle is the fallback. Other
 supported platforms cover only the direct child. ForLog's diagnostic
 buffer caps at 1MiB.
@@ -403,11 +401,11 @@ intentional terminal paths and may instead produce EOF or a context error.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the direct CLI child is killed and reaped. Unix process-group
-termination is gated by the direct process handle; Windows Job Object
-termination is handle-based, with direct-child fallback when assignment
-fails. Descendant cleanup is best effort and this package does not claim
-descendant reaping.
+cancellation the direct CLI child is killed and reaped. Unix does not
+terminate descendants because no portable process-group handle is safe
+across a concurrent reap. Windows Job Object termination is handle-based,
+with direct-child fallback when assignment fails. Descendant cleanup is
+best effort and this package does not claim descendant reaping.
 
 ## Error handling
 

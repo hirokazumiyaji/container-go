@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -137,6 +138,47 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestExecRunnerCancellationDuringStartUsesPublicationBarrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelObserved := make(chan struct{})
+	terminateEntered := make(chan struct{})
+	r := &ExecRunner{Binary: writeStub(t, `exec sleep 30`)}
+	hooks := runHooks{
+		start: func(cmd *exec.Cmd) error {
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+			// The process exists, but Run has not published its ownership
+			// barrier or started its lifecycle Wait yet.
+			cancel()
+			return nil
+		},
+		beforePublish: func() {
+			select {
+			case <-cancelObserved:
+			case <-time.After(5 * time.Second):
+				t.Error("context cancellation did not reach the publication barrier")
+			}
+			select {
+			case <-terminateEntered:
+				t.Error("termination ran before lifecycle publication")
+			default:
+			}
+		},
+		cancelObserved: func() { close(cancelObserved) },
+		terminate: func(cmd *exec.Cmd) error {
+			close(terminateEntered)
+			return terminateProcessTree(cmd)
+		},
+	}
+
+	_, _, err := r.run(ctx, hooks, "logs")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context.Canceled", err)
 	}
 }
 

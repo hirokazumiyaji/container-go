@@ -16,10 +16,9 @@ import (
 // Streamer starts a long-lived CLI invocation (e.g. `logs --follow`)
 // and exposes its combined stdout and stderr as a stream. A terminal
 // process failure is returned by Read after Stream has returned. Closing
-// the stream terminates the direct CLI child. On platforms with process
-// groups it also makes a best-effort attempt to terminate descendants
-// while that child is owned; this package does not reap those descendants.
-// Once the direct child is reaped, Close does not signal its former group.
+// the stream terminates the direct CLI child. Windows may also terminate
+// attached descendants through a Job Object; Unix guarantees only the
+// direct child because it has no safe process-group handle.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
@@ -34,6 +33,9 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 type streamHooks struct {
 	// start is a test seam around exec.Cmd.Start. Production leaves it nil.
 	start func(*exec.Cmd) error
+	// beforeAttach runs after Start but before platform tree attachment.
+	// Windows tests use it to characterize the post-Start attachment window.
+	beforeAttach func(*processStream)
 	// beforePublish runs after the process exists but before the lifecycle
 	// barrier is opened. It lets tests cancel during that publication gap.
 	beforePublish  func(*processStream)
@@ -108,6 +110,10 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	// race ownership of them.
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
+
+	if hooks.beforeAttach != nil {
+		hooks.beforeAttach(stream)
+	}
 
 	var tree processTree
 	if hooks.terminate != nil {
@@ -245,9 +251,9 @@ func (s *processStream) requestTermination(cancelled bool) error {
 		s.cancelObservedOnce.Do(s.cancelObserved)
 	}
 	err := s.lifecycle.terminate()
-	// Kill the owned process tree first so an output-heavy descendant
-	// cannot keep the CLI alive. closeSourceFiles then releases pumps that
-	// may be blocked writing to the public reader.
+	// Terminate the owned process tree first so an output-heavy descendant
+	// cannot keep a Windows Job Object member alive. closeSourceFiles then
+	// releases pumps that may be blocked writing to the public reader.
 	s.closeReader()
 	s.closeSourceFiles()
 	return err

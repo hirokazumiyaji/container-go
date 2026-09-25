@@ -63,8 +63,8 @@ func (l *commandLifecycle) failStart() {
 }
 
 // wait is the only place that calls cmd.Wait. In particular, no other
-// lifecycle path may reap the process and then race a numeric process-group
-// signal against that reap.
+// lifecycle path may reap the process and then race a platform termination
+// operation against that reap.
 func (l *commandLifecycle) wait() {
 	l.waitOnce.Do(func() {
 		err := l.cmd.Wait()

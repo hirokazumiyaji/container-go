@@ -4,87 +4,53 @@ package cli
 
 import (
 	"context"
-	"os"
 	"os/exec"
-	"path/filepath"
-	"strconv"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
-func TestStreamCloseTerminatesDescendants(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, descendantScript(`wait "$child"`))
-	stream, err := (&ExecRunner{Binary: stub}).Stream(context.Background(), pidFile)
+func TestStreamCloseReapsDirectChild(t *testing.T) {
+	sleepPath, err := exec.LookPath("sleep")
 	if err != nil {
-		t.Fatalf("Stream: %v", err)
+		t.Skipf("sleep is unavailable: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = stream.Close()
-		_ = writeDescendantStopFile(pidFile)
-	})
-	descendantPID := waitForDescendantPID(t, pidFile)
-
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-	select {
-	case <-stream.(*processStream).waitDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("direct child was not reaped after Close")
-	}
-	// A process group signal terminates descendants, but it does not reap
-	// them. Accept a zombie here: the platform init/subreaper owns that
-	// responsibility once the direct child is gone.
-	assertStreamProcessTerminated(t, descendantPID)
-}
-
-func TestStreamCloseAfterParentExitDoesNotWaitForDescendant(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, descendantScript(`exit 0`))
-	stream, err := (&ExecRunner{Binary: stub}).Stream(context.Background(), pidFile)
+	stream, err := (&ExecRunner{Binary: sleepPath}).Stream(context.Background(), "30")
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	ps := stream.(*processStream)
-	t.Cleanup(func() {
-		_ = stream.Close()
-		_ = writeDescendantStopFile(pidFile)
-	})
-	descendantPID := waitForDescendantPID(t, pidFile)
+	t.Cleanup(func() { _ = stream.Close() })
+
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
 	select {
 	case <-ps.waitDone:
 	case <-time.After(5 * time.Second):
-		t.Fatal("direct child was not reaped")
+		t.Fatal("direct child was not reaped after Close")
 	}
-
-	// Once the direct child is reaped, Close must not use its PID/PGID
-	// again. Closing the source descriptors still lets Close return even
-	// when a descendant inherited those descriptors.
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
 	}
-	if err := writeDescendantStopFile(pidFile); err != nil {
-		t.Fatalf("stop descendant: %v", err)
+	if ps.cmd.ProcessState == nil {
+		t.Fatal("ProcessState is nil after Wait")
 	}
-	assertStreamProcessTerminated(t, descendantPID)
 }
 
-func TestStreamCancellationTerminatesDescendantsWithoutReadOrClose(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	stub := writeStub(t, descendantScript(`wait "$child"`))
+func TestStreamCancellationReapsDirectChildWithoutReadOrClose(t *testing.T) {
+	sleepPath, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep is unavailable: %v", err)
+	}
 	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := (&ExecRunner{Binary: stub}).Stream(ctx, pidFile)
+	defer cancel()
+	stream, err := (&ExecRunner{Binary: sleepPath}).Stream(ctx, "30")
 	if err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
 	ps := stream.(*processStream)
-	t.Cleanup(func() {
-		_ = stream.Close()
-		_ = writeDescendantStopFile(pidFile)
-	})
-	descendantPID := waitForDescendantPID(t, pidFile)
+	t.Cleanup(func() { _ = stream.Close() })
 
 	cancel()
 	select {
@@ -92,50 +58,57 @@ func TestStreamCancellationTerminatesDescendantsWithoutReadOrClose(t *testing.T)
 	case <-time.After(5 * time.Second):
 		t.Fatal("direct child was not reaped after cancellation")
 	}
-	assertStreamProcessTerminated(t, descendantPID)
-}
-
-func descendantScript(action string) string {
-	return `done="$1.done"; (while [ ! -f "$done" ]; do sleep 0.05; done) & child=$!; printf '%s\n' "$child" > "$1"; ` + action
-}
-
-func writeDescendantStopFile(pidFile string) error {
-	return os.WriteFile(pidFile+".done", nil, 0o600)
-}
-
-func waitForDescendantPID(t *testing.T, path string) int {
-	t.Helper()
-	deadline := time.Now().Add(15 * time.Second)
-	for time.Now().Before(deadline) {
-		data, err := os.ReadFile(path)
-		if err == nil {
-			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
-			if parseErr == nil && pid > 1 {
-				return pid
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
 	}
-	t.Fatalf("descendant PID was not written to %s", path)
-	return 0
-}
-
-func processState(pid int) (string, error) {
-	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
-	return strings.TrimSpace(string(out)), err
-}
-
-func assertStreamProcessTerminated(t *testing.T, pid int) {
-	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
-	state := ""
-	for time.Now().Before(deadline) {
-		var err error
-		state, err = processState(pid)
-		if err != nil || state == "" || strings.HasPrefix(state, "Z") {
-			return
-		}
-		time.Sleep(10 * time.Millisecond)
+	if ps.cmd.ProcessState == nil {
+		t.Fatal("ProcessState is nil after Wait")
 	}
-	t.Fatalf("process %d was not terminated (state %q)", pid, state)
+}
+
+func TestStreamExitReapStress(t *testing.T) {
+	stub := writeStub(t, `exit 0`)
+	for i := 0; i < 50; i++ {
+		ctx, cancel := context.WithCancel(context.Background())
+		stream, err := (&ExecRunner{Binary: stub}).Stream(ctx, "logs")
+		if err != nil {
+			cancel()
+			t.Fatalf("iteration %d: Stream: %v", i, err)
+		}
+		ps := stream.(*processStream)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for operation := range 3 {
+			wg.Add(1)
+			go func(operation int) {
+				defer wg.Done()
+				<-start
+				switch (i + operation) % 3 {
+				case 0:
+					_ = stream.Close()
+				case 1:
+					cancel()
+				default:
+					_, _ = stream.Read(make([]byte, 32))
+				}
+			}(operation)
+		}
+		close(start)
+		wg.Wait()
+		select {
+		case <-ps.waitDone:
+		case <-time.After(5 * time.Second):
+			cancel()
+			_ = stream.Close()
+			t.Fatalf("iteration %d: direct child was not reaped", i)
+		}
+		if got := ps.waitCalls.Load(); got != 1 {
+			t.Fatalf("iteration %d: wait calls = %d, want exactly one", i, got)
+		}
+		if ps.cmd.ProcessState == nil {
+			t.Fatalf("iteration %d: ProcessState is nil after Wait", i)
+		}
+		cancel()
+		_ = stream.Close()
+	}
 }

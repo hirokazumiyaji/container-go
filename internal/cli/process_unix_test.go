@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -25,9 +27,9 @@ func TestTerminateProcessTreeAfterWaitUsesHandleDoneState(t *testing.T) {
 	}
 }
 
-func TestExecRunnerCancellationTerminatesProcessGroup(t *testing.T) {
+func TestExecRunnerCancellationReapsDirectChild(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "child.pid")
-	stub := writeStub(t, `sleep 30 & child=$!; printf '%s\n' "$child" > "$1"; wait "$child"`)
+	stub := writeStub(t, `printf '%s\n' "$$" > "$1"; exec sleep 30`)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	result := make(chan error, 1)
@@ -36,12 +38,7 @@ func TestExecRunnerCancellationTerminatesProcessGroup(t *testing.T) {
 		result <- err
 	}()
 
-	childPID := waitForDescendantPID(t, pidFile)
-	t.Cleanup(func() {
-		if process, err := os.FindProcess(childPID); err == nil {
-			_ = process.Kill()
-		}
-	})
+	childPID := waitForPIDFile(t, pidFile)
 	cancel()
 	select {
 	case err := <-result:
@@ -51,5 +48,29 @@ func TestExecRunnerCancellationTerminatesProcessGroup(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("ExecRunner.Run did not return after cancellation")
 	}
-	assertStreamProcessTerminated(t, childPID)
+	if state, err := processState(childPID); err == nil && strings.TrimSpace(state) != "" {
+		t.Fatalf("direct child state = %q, want reaped", state)
+	}
+}
+
+func waitForPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, parseErr := strconv.Atoi(strings.TrimSpace(string(data)))
+			if parseErr == nil && pid > 1 {
+				return pid
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("PID file was not written: %s", path)
+	return 0
+}
+
+func processState(pid int) (string, error) {
+	out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+	return strings.TrimSpace(string(out)), err
 }

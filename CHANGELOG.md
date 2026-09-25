@@ -17,12 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Clarify streaming log behavior: startup failures are returned by
-  `FollowLogs`, terminal CLI failures are delivered by `Read`, and
-  process-group descendants are only best-effort terminated (the direct
-  CLI child is the process this package reaps).
-- Give each CLI invocation one lifecycle owner for Start/Wait/termination;
-  Unix group signals are gated by the direct process handle, and Windows
-  uses a Job Object handle with a direct-child fallback.
+  `FollowLogs`, terminal CLI failures are delivered by `Read`, and the
+  direct CLI child is the process this package always reaps.
+- Give each CLI invocation one lifecycle owner for Start/Wait/termination.
+  Unix intentionally guarantees only the direct child; Windows uses a
+  Job Object handle with a documented post-Start attachment window and a
+  direct-child fallback.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

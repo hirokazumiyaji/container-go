@@ -224,7 +224,7 @@ func TestStreamCancellationDuringStartUsesImmutableEndpointOwnership(t *testing.
 	cancelObserved := make(chan struct{})
 	terminateEntered := make(chan struct{})
 	releaseTerminate := make(chan struct{})
-	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
+	r := &ExecRunner{Binary: writeStub(t, `exec sleep 30`)}
 	hooks := streamHooks{
 		start: func(cmd *exec.Cmd) error {
 			if err := cmd.Start(); err != nil {
@@ -297,7 +297,7 @@ func TestStreamDelayedCloseAndCancelDoNotSignalAfterReap(t *testing.T) {
 	}
 
 	// Simulate a context callback and a caller Close arriving after the
-	// direct child has been waited. Neither may signal the old PID/PGID.
+	// direct child has been waited. Neither may signal a released handle.
 	cancel()
 	if err := ps.requestTermination(true); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("late cancellation error = %v, want os.ErrProcessDone", err)

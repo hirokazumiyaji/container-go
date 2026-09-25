@@ -113,6 +113,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -187,12 +190,16 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	return ctr, nil
 }
 
-// deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation, so Terminate re-checks the
-// generation and deletes by immutable ID. A replaced generation means
+// deleteStoppedReuse removes a stopped reuse container only after
+// verifying the managed, reuse, and creation labels on the inspected
+// container. It then binds a handle to that generation so Terminate
+// re-checks it and deletes by immutable ID. A replaced generation means
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
 	err := ctr.Terminate(ctx)
@@ -245,14 +252,29 @@ func createRaceMissing(err error) bool {
 	return strings.Contains(s, "container not found")
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
+// checkReuseOwned reports whether an existing container may be adopted
+// or deleted for this reuse request. All three labels are required: a
+// reuse marker alone can be present on a foreign container, and a
+// generation is what makes a later name-based delete safe.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	}
+	return nil
+}
+
+func checkReuseLabels(info *engineInfo, cfg *config) error {
+	if info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if info.labels[managedLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: existing container has no valid creation generation", cfg.name)
 	}
 	return nil
 }

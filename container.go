@@ -222,8 +222,9 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // cleanupFailedCreate best-effort removes the container this Run left
 // behind after a failed create. It never deletes a pre-existing
 // same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
+// carrying this process's managed+session labels is removed. The
+// creation label must exist and match this Run's generation; a reuse
+// create must also carry the reuse label.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return
@@ -245,10 +246,15 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
-		}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return
+	}
+	if !creationRE.MatchString(cfg.creation) {
+		return
+	}
+	actual, ok := info.labels[creationLabel]
+	if !ok || actual != cfg.creation {
+		return
 	}
 	target := cfg.name
 	if info.uid != "" {

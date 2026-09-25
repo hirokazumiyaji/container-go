@@ -62,6 +62,40 @@ func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
 	}
 }
 
+func TestRunRejectsInvalidImageAsValidationErrorBeforeBackend(t *testing.T) {
+	t.Setenv(backendEnv, "not-a-backend")
+	const image = "-bad"
+
+	_, err := Run(context.Background(), image)
+	assertImageValidationError(t, err, image)
+	if strings.Contains(err.Error(), backendEnv) {
+		t.Fatalf("error = %v, want validation before backend detection", err)
+	}
+}
+
+func assertImageValidationError(t *testing.T, err error, image string) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("invalid image reference was accepted")
+	}
+	if got, want := err.Error(), fmt.Sprintf("invalid image reference %q", image); got != want {
+		t.Fatalf("error = %q, want %q", got, want)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %v, want *ValidationError", err, err)
+	}
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	if validationErr.Option != "image" || validationErr.Field != "image" {
+		t.Fatalf("validation option/field = %q/%q, want image/image", validationErr.Option, validationErr.Field)
+	}
+	if validationErr.Value != image {
+		t.Fatalf("validation value = %#v, want %q", validationErr.Value, image)
+	}
+}
+
 func TestPreviouslyValidLargeCollectionsRemainAccepted(t *testing.T) {
 	const n = 129 // just above the removed universal cap
 

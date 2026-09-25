@@ -207,6 +207,13 @@ func validateReuseGroup(group string) error {
 // a CLI flag.
 var imageRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$`)
 
+func validateImageReference(image string) error {
+	if !imageRE.MatchString(image) {
+		return validationErrorf("image", image, "invalid image reference %q", image)
+	}
+	return nil
+}
+
 func withRunner(r cli.Runner) Option {
 	return func(c *config) error {
 		c.runner = r

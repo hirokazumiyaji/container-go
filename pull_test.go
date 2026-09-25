@@ -455,13 +455,14 @@ func TestPullWithClassifiesBackendDown(t *testing.T) {
 	}
 }
 
-func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
-	f := newTestRunner()
-	if err := Pull(context.Background(), "-bad"); err == nil {
-		t.Fatal("want error for invalid image")
-	}
-	if len(f.calls) != 0 {
-		t.Errorf("CLI was called despite invalid image: %v", f.calls)
+func TestPullRejectsInvalidImageAsValidationErrorBeforeBackend(t *testing.T) {
+	t.Setenv(backendEnv, "not-a-backend")
+	const image = "-bad"
+
+	err := Pull(context.Background(), image)
+	assertImageValidationError(t, err, image)
+	if strings.Contains(err.Error(), backendEnv) {
+		t.Fatalf("error = %v, want validation before backend detection", err)
 	}
 }
 

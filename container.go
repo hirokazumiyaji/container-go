@@ -118,8 +118,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
-	if !imageRE.MatchString(image) {
-		return nil, fmt.Errorf("invalid image reference %q", image)
+	if err := validateImageReference(image); err != nil {
+		return nil, err
 	}
 	if cfg.reuse && cfg.name == "" {
 		return nil, validationErrorf("WithReuse", nil, "WithReuse requires WithName")

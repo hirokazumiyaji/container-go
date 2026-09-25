@@ -46,8 +46,8 @@ func WithPullPolicy(policy PullPolicy) Option {
 // caller whose context is cancelled stops waiting without affecting
 // the others.
 func Pull(ctx context.Context, image string) error {
-	if !imageRE.MatchString(image) {
-		return fmt.Errorf("invalid image reference %q", image)
+	if err := validateImageReference(image); err != nil {
+		return err
 	}
 	eng, err := detectEngine()
 	if err != nil {

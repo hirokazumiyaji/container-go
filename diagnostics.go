@@ -48,19 +48,43 @@ func (c *config) diagnosticRedactor(extra ...string) *cli.Redactor {
 	values := append([]string(nil), c.diagnosticSecrets...)
 	values = append(values, c.diagnosticValues()...)
 	values = append(values, extra...)
-	return cli.NewContextRedactor(values...)
+	return cli.NewHashedContextRedactor(values...)
 }
 
 func safePublicError(err error, values ...string) error {
-	return cli.WithRedactor(err, cli.NewRedactor(values...))
+	return cli.WithRedactor(err, cli.NewHashedRedactor(values...))
 }
 
 func (c *config) publicError(err error, extra ...string) error {
 	return cli.WithRedactor(err, c.diagnosticRedactor(extra...))
 }
 
+func newDiagnosticMatcher(values []string) *cli.Redactor {
+	return cli.NewHashedContextRedactor(values...)
+}
+
+func composeDiagnosticMatchers(matchers ...*cli.Redactor) *cli.Redactor {
+	return cli.ComposeRedactors(matchers...)
+}
+
 func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
-	values := append([]string(nil), c.diagnosticSecrets...)
+	c.secretsMu.RLock()
+	base := c.diagnosticRedactorValue
+	var values []string
+	if len(c.diagnosticSecrets) > 0 {
+		values = append(values, c.diagnosticSecrets...)
+	}
+	c.secretsMu.RUnlock()
+
+	var matchers []*cli.Redactor
+	if base != nil {
+		matchers = append(matchers, base)
+	}
+	if len(values) > 0 {
+		matchers = append(matchers, cli.NewHashedContextRedactor(values...))
+	}
+	// The handle identity and declared bindings are safe structural context
+	// too, but are kept out of the long-lived hashed matcher when possible.
 	values = append(values, c.id)
 	for _, exposed := range c.exposed {
 		values = append(values, exposed.String())
@@ -69,11 +93,29 @@ func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 		values = append(values, published.raw)
 	}
 	values = append(values, extra...)
-	return cli.NewContextRedactor(values...)
+	if len(values) > 0 {
+		matchers = append(matchers, cli.NewHashedContextRedactor(values...))
+	}
+	return composeDiagnosticMatchers(matchers...)
 }
 
 func (c *Container) publicError(err error, extra ...string) error {
 	return cli.WithRedactor(err, c.diagnosticRedactor(extra...))
+}
+
+func (c *Container) clearDiagnosticSecrets() {
+	if c == nil {
+		return
+	}
+	c.secretsMu.Lock()
+	for i := range c.diagnosticSecrets {
+		c.diagnosticSecrets[i] = ""
+	}
+	c.diagnosticSecrets = nil
+	// The matcher is immutable and may be shared with an in-flight error.
+	// Dropping the handle reference is sufficient; do not mutate it here.
+	c.diagnosticRedactorValue = nil
+	c.secretsMu.Unlock()
 }
 
 // redactError is retained as the short internal spelling used throughout

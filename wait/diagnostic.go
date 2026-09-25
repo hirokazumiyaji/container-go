@@ -2,7 +2,9 @@ package wait
 
 import (
 	"encoding/base64"
+	"net/url"
 	"sort"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -78,7 +80,7 @@ func DiagnosticSecrets(strategy Strategy) []string { return DiagnosticValues(str
 func SecretValues(strategy Strategy) []string { return DiagnosticValues(strategy) }
 
 func safeDiagnosticError(err error, values ...string) error {
-	return cli.WithRedactor(err, cli.NewContextRedactor(values...))
+	return cli.WithRedactor(err, cli.NewHashedContextRedactor(values...))
 }
 
 func basicAuthValues(username, password string) []string {
@@ -88,4 +90,50 @@ func basicAuthValues(username, password string) []string {
 		base64.StdEncoding.EncodeToString([]byte(joined)),
 		base64.RawStdEncoding.EncodeToString([]byte(joined)),
 	}
+}
+
+// cookieDiagnosticValues registers each cookie component as well as common
+// encoded spellings. Header-level redaction protects the complete header, but
+// backend logs often render a JSON/map field with only one cookie component.
+func cookieDiagnosticValues(value string) []string {
+	seen := make(map[string]struct{})
+	var values []string
+	add := func(v string) {
+		if v == "" {
+			return
+		}
+		if _, ok := seen[v]; ok {
+			return
+		}
+		seen[v] = struct{}{}
+		values = append(values, v)
+	}
+	addEncoded := func(v string) {
+		add(v)
+		add(url.QueryEscape(v))
+		add(url.PathEscape(v))
+		if v != "" {
+			add(base64.StdEncoding.EncodeToString([]byte(v)))
+			add(base64.RawStdEncoding.EncodeToString([]byte(v)))
+			add(base64.RawURLEncoding.EncodeToString([]byte(v)))
+			add(base64.URLEncoding.EncodeToString([]byte(v)))
+		}
+	}
+	for _, part := range strings.Split(value, ";") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, cookieValue, ok := strings.Cut(part, "=")
+		name = strings.TrimSpace(name)
+		cookieValue = strings.Trim(strings.TrimSpace(cookieValue), "\"")
+		if !ok {
+			addEncoded(name)
+			continue
+		}
+		addEncoded(name)
+		addEncoded(cookieValue)
+		addEncoded(name + "=" + cookieValue)
+	}
+	return values
 }

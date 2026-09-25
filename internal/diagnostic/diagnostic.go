@@ -6,8 +6,11 @@ package diagnostic
 
 import (
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
+	"reflect"
 	"regexp"
 	"sort"
 	"strconv"
@@ -41,7 +44,6 @@ var (
 	headerRE        = regexp.MustCompile(`(?im)(^|[ \t])([A-Za-z][A-Za-z0-9-]*[ \t]*:[ \t]*)([^\r\n]*)`)
 	basicRE         = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9])(Basic|Bearer)([ \t]+)([A-Za-z0-9+/=_-]+)`)
 	secretShapedRE  = regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_-])[A-Za-z0-9_-]*(?:password|passwd|secret|token|api[-_.]?key|access[-_.]?key|private[-_.]?key|client[-_.]?secret|credential|authorization|signature|jwt)[A-Za-z0-9_-]*($|[^A-Za-z0-9_-])`)
-	jwtRE           = regexp.MustCompile(`(^|[^A-Za-z0-9_-])eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*($|[^A-Za-z0-9_-])`)
 	pemRE           = regexp.MustCompile(`(?s)-----BEGIN [^-]*PRIVATE KEY-----.*?-----END [^-]*PRIVATE KEY-----`)
 	urlCredentialRE = regexp.MustCompile(`(?i)((?:[a-z][a-z0-9+.-]*://|//))([^/\s@]*)(@)`)
 )
@@ -55,6 +57,7 @@ var (
 type Redactor struct {
 	source []string
 	values []string
+	hashes []valueHash
 	force  bool
 }
 
@@ -88,6 +91,7 @@ func newRedactor(values []string, expand, force bool) *Redactor {
 	} else {
 		r.values = append([]string(nil), r.source...)
 	}
+	r.hashes = hashValues(r.values)
 	return r
 }
 
@@ -158,7 +162,9 @@ func (r *Redactor) WithValues(values ...string) *Redactor {
 	if r == nil {
 		return NewRedactor(values...)
 	}
-	return newRedactor(append(append([]string(nil), r.source...), values...), true, r.force)
+	combined := newRedactor(values, true, r.force)
+	combined.hashes = mergeValueHashes(r.hashes, combined.hashes)
+	return combined
 }
 
 // Add is an alias for WithValues, useful when composing independently-created
@@ -171,7 +177,9 @@ func (r *Redactor) WithForce() *Redactor {
 	if r == nil {
 		return NewContextRedactor()
 	}
-	return newRedactor(r.source, true, true)
+	combined := newRedactor(nil, true, true)
+	combined.hashes = mergeValueHashes(r.hashes)
+	return combined
 }
 
 // Compose combines redactors without mutating any of them.
@@ -179,19 +187,21 @@ func (r *Redactor) Compose(others ...*Redactor) *Redactor {
 	if r == nil && len(others) == 0 {
 		return NewRedactor()
 	}
-	var values []string
 	force := false
+	var hashes []valueHash
 	if r != nil {
-		values = append(values, r.source...)
 		force = r.force
+		hashes = append(hashes, r.hashes...)
 	}
 	for _, other := range others {
 		if other != nil {
-			values = append(values, other.source...)
 			force = force || other.force
+			hashes = append(hashes, other.hashes...)
 		}
 	}
-	return newRedactor(values, true, force)
+	combined := newRedactor(nil, true, force)
+	combined.hashes = mergeValueHashes(hashes)
+	return combined
 }
 
 // ComposeRedactors combines redactors in argument order.
@@ -220,6 +230,7 @@ func (r *Redactor) Text(s string) string {
 	// This lets a field name (for example, "password") remain useful while
 	// its value disappears, and also makes the result idempotent.
 	s = redactPEM(s)
+	s = redactCookieObjects(s)
 	s = redactHeaders(s)
 	s = redactJWT(s)
 	s = redactAuth(s)
@@ -229,8 +240,12 @@ func (r *Redactor) Text(s string) string {
 	s = redactUnquotedAssignments(s)
 	s = redactURLCredentials(s)
 	s = redactSecretShaped(s)
-	for _, value := range r.values {
-		s = replaceKnownValue(s, value, r.force)
+	if len(r.hashes) > 0 {
+		s = replaceHashedValues(s, r.hashes, r.force)
+	} else {
+		for _, value := range r.values {
+			s = replaceKnownValue(s, value, r.force)
+		}
 	}
 	return Sanitize(s)
 }
@@ -354,6 +369,96 @@ func attachedFlag(arg string) (flag, value string, ok bool) {
 		}
 	}
 	return "", "", false
+}
+
+func redactCookieObjects(s string) string {
+	var b strings.Builder
+	last := 0
+	for i := 0; i < len(s); {
+		if !isCookieKeyAt(s, i) {
+			i++
+			continue
+		}
+		keyEnd := i + len("cookie")
+		if keyEnd < len(s) && (s[keyEnd] == 's' || s[keyEnd] == 'S') {
+			keyEnd++
+		}
+		if keyEnd < len(s) && (s[keyEnd] == '\'' || s[keyEnd] == '"') {
+			keyEnd++
+		}
+		j := keyEnd
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n') {
+			j++
+		}
+		if j >= len(s) || s[j] != ':' {
+			i = keyEnd
+			continue
+		}
+		j++
+		for j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\r' || s[j] == '\n') {
+			j++
+		}
+		if j >= len(s) || s[j] != '{' {
+			i = keyEnd
+			continue
+		}
+		end := matchingBrace(s, j)
+		if end < 0 {
+			i = keyEnd
+			continue
+		}
+		b.WriteString(s[last : j+1])
+		b.WriteString(Redacted)
+		b.WriteByte('}')
+		last = end + 1
+		i = last
+	}
+	if last == 0 {
+		return s
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+func isCookieKeyAt(s string, i int) bool {
+	if i > 0 && isNameByte(s[i-1]) {
+		return false
+	}
+	if i+len("cookie") > len(s) || !strings.EqualFold(s[i:i+len("cookie")], "cookie") {
+		return false
+	}
+	return true
+}
+
+func matchingBrace(s string, start int) int {
+	depth := 0
+	quoted := false
+	escaped := false
+	for i := start; i < len(s); i++ {
+		c := s[i]
+		if quoted {
+			if escaped {
+				escaped = false
+			} else if c == '\\' {
+				escaped = true
+			} else if c == '"' {
+				quoted = false
+			}
+			continue
+		}
+		switch c {
+		case '"':
+			quoted = true
+		case '{':
+			depth++
+		case '}':
+			depth--
+			if depth == 0 {
+				return i
+			}
+		}
+	}
+	return -1
 }
 
 func redactPEM(s string) string {
@@ -558,14 +663,106 @@ func isNameByte(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.'
 }
 
+// redactJWT replaces complete compact JWS/JWE tokens. It scans maximal
+// base64url/dot runs instead of matching an eyJ prefix, so a valid token is
+// never partially matched and an arbitrary dotted word is not overmatched.
 func redactJWT(s string) string {
-	return jwtRE.ReplaceAllStringFunc(s, func(match string) string {
-		parts := jwtRE.FindStringSubmatch(match)
-		if len(parts) != 3 {
-			return match
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); {
+		if !isCompactTokenByte(s[i]) {
+			b.WriteByte(s[i])
+			i++
+			continue
 		}
-		return parts[1] + Redacted + parts[2]
-	})
+		start := i
+		for i < len(s) && isCompactTokenByte(s[i]) {
+			i++
+		}
+		token := s[start:i]
+		if isCompactJWSOrJWE(token) {
+			b.WriteString(Redacted)
+		} else if cut, ok := compactTokenBeforeTrailingDots(token); ok {
+			b.WriteString(Redacted)
+			b.WriteString(token[cut:])
+		} else {
+			b.WriteString(token)
+		}
+	}
+	return b.String()
+}
+
+func isCompactTokenByte(c byte) bool {
+	return isBase64URLByte(c) || c == '.'
+}
+
+func isBase64URLByte(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+		(c >= '0' && c <= '9') || c == '_' || c == '-'
+}
+
+func compactTokenBeforeTrailingDots(token string) (int, bool) {
+	for cut := len(token) - 1; cut > 0; cut-- {
+		if token[cut] != '.' {
+			continue
+		}
+		if isCompactJWSOrJWE(token[:cut]) {
+			return cut, true
+		}
+	}
+	return 0, false
+}
+
+func isCompactJWSOrJWE(token string) bool {
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 && len(parts) != 5 {
+		return false
+	}
+	for i, part := range parts {
+		if part == "" {
+			// A JWS may have an empty payload or an unsecured empty
+			// signature. A JWE may have an empty encrypted-key segment;
+			// all of its other segments are required to be present.
+			if (len(parts) == 3 && i != 1 && i != 2) || (len(parts) == 5 && i != 1) {
+				return false
+			}
+			continue
+		}
+		for i := 0; i < len(part); i++ {
+			if !isBase64URLByte(part[i]) {
+				return false
+			}
+		}
+	}
+	header, ok := decodeCompactJSON(parts[0])
+	if !ok {
+		return false
+	}
+	if len(parts) == 3 {
+		_, ok = header["alg"]
+		return ok
+	}
+	_, hasAlg := header["alg"]
+	_, hasEnc := header["enc"]
+	return hasAlg && hasEnc
+}
+
+func decodeCompactJSON(segment string) (map[string]any, bool) {
+	if segment == "" {
+		return nil, false
+	}
+	data, err := base64.RawURLEncoding.DecodeString(segment)
+	if err != nil {
+		data, err = base64.URLEncoding.DecodeString(segment)
+		if err != nil {
+			return nil, false
+		}
+	}
+	var header map[string]any
+	if err := json.Unmarshal(data, &header); err != nil || header == nil {
+		return nil, false
+	}
+	return header, true
 }
 
 func redactURLCredentials(s string) string {
@@ -856,10 +1053,25 @@ type safeError struct {
 
 // DiagnosticRedactor exposes the context to higher-level safe wrappers so
 // they can compose instead of dropping an earlier wait or public boundary.
-func (e *safeError) DiagnosticRedactor() *Redactor { return e.redactor }
+func (e *safeError) DiagnosticRedactor() *Redactor {
+	if e == nil {
+		return nil
+	}
+	return e.redactor
+}
+
+// UnwrapRaw is an explicit opt-in escape hatch. It is intentionally not named
+// Unwrap, because a safe wrapper must not let errors.As/errors.Unwrap reach a
+// raw diagnostic accidentally.
+func (e *safeError) UnwrapRaw() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
 
 // Wrap returns an error whose Error method is safe for terminal and log
-// output while retaining the original error in its unwrap chain.
+// output while retaining source identity for errors.Is and explicit UnwrapRaw.
 func Wrap(err error) error { return WithRedactor(err, NewRedactor()) }
 
 // WithRedactor is the configurable form of Wrap.
@@ -888,30 +1100,90 @@ func redactorsIn(err error) []*Redactor {
 		if current == nil {
 			return
 		}
-		if provider, ok := current.(interface{ DiagnosticRedactor() *Redactor }); ok {
-			redactors = append(redactors, provider.DiagnosticRedactor())
-		}
-		if joined, ok := current.(interface{ Unwrap() []error }); ok {
-			for _, child := range joined.Unwrap() {
-				walk(child)
+		if safe, ok := current.(*safeError); ok {
+			if safe.redactor != nil {
+				redactors = append(redactors, safe.redactor)
 			}
 			return
 		}
-		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap())
+		if provider, ok := current.(interface{ DiagnosticRedactor() *Redactor }); ok {
+			if redactor := provider.DiagnosticRedactor(); redactor != nil {
+				redactors = append(redactors, redactor)
+			}
+		}
+		for _, child := range rawChildren(current) {
+			walk(child)
 		}
 	}
 	walk(err)
 	return redactors
 }
 
-func (e *safeError) Error() string { return e.redactor.Text(e.err.Error()) }
-func (e *safeError) Unwrap() error { return e.err }
+func rawChildren(err error) []error {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		return joined.Unwrap()
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return []error{wrapped.Unwrap()}
+	}
+	if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
+		child := raw.UnwrapRaw()
+		if child != nil && !sameError(child, err) {
+			return []error{child}
+		}
+	}
+	return nil
+}
 
-func (e *safeError) As(target any) bool { return e.as(target, e.redactor) }
+func (e *safeError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return e.redactor.Text(e.err.Error())
+}
+
+func (e *safeError) Is(target error) bool {
+	return e != nil && errors.Is(e.err, target)
+}
+
+func (e *safeError) As(target any) bool {
+	if e == nil {
+		return false
+	}
+	return e.as(target, e.redactor)
+}
 
 func (e *safeError) AsRedacted(target any, r *Redactor) bool {
-	return e.as(target, e.redactor.Compose(r))
+	if e == nil {
+		return false
+	}
+	if r == nil {
+		r = NewRedactor()
+	}
+	combined := e.redactor
+	if combined == nil {
+		combined = r
+	} else {
+		combined = combined.Compose(r)
+	}
+	return e.as(target, combined)
+}
+
+func sameError(a, b error) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	if av.Type() != bv.Type() {
+		return false
+	}
+	if av.Type().Comparable() {
+		return av.Interface() == bv.Interface()
+	}
+	return false
 }
 
 func (e *safeError) as(target any, r *Redactor) bool {
@@ -925,16 +1197,13 @@ func (e *safeError) as(target any, r *Redactor) bool {
 		}); ok && provider.AsRedacted(target, r) {
 			return true
 		}
-		if joined, ok := current.(interface{ Unwrap() []error }); ok {
-			for _, child := range joined.Unwrap() {
-				if walk(child) {
-					return true
-				}
-			}
-			return false
+		if _, safe := current.(interface{ DiagnosticSafe() }); safe && errors.As(current, target) {
+			return true
 		}
-		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
-			return walk(wrapped.Unwrap())
+		for _, child := range rawChildren(current) {
+			if walk(child) {
+				return true
+			}
 		}
 		return false
 	}

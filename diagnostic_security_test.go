@@ -202,6 +202,23 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 	}
 }
 
+func TestContainerUsesBoundedHashedDiagnosticMatcher(t *testing.T) {
+	const secret = "handle-lifetime-secret-117"
+	ctr := runTestContainer(t, newTestRunner(), WithEnv(map[string]string{"TOKEN": secret}))
+	if len(ctr.diagnosticSecrets) != 0 || ctr.diagnosticRedactorValue == nil {
+		t.Fatalf("handle retained plaintext diagnostics: secrets=%v matcher=%v", ctr.diagnosticSecrets, ctr.diagnosticRedactorValue != nil)
+	}
+	if strings.Contains(ctr.diagnosticRedactor().Text(secret), secret) {
+		t.Fatal("hashed handle matcher failed to redact its value")
+	}
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if ctr.diagnosticRedactorValue != nil || len(ctr.diagnosticSecrets) != 0 {
+		t.Fatal("Terminate did not clear diagnostic matcher references")
+	}
+}
+
 func TestRunSystemNotRunningRetainsTypedChains(t *testing.T) {
 	f := &classifiedRunner{fakeRunner: newTestRunner()}
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("diag-system-117"), withRunner(f), withEngine(appleEngine{}))

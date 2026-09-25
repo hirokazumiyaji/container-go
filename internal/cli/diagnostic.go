@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
@@ -24,6 +25,18 @@ func NewContextRedactor(values ...string) *Redactor {
 	return diagnostic.NewContextRedactor(values...)
 }
 
+// NewHashedRedactor creates a redactor that retains hashes rather than
+// caller-provided plaintext after construction.
+func NewHashedRedactor(values ...string) *Redactor {
+	return diagnostic.NewHashedRedactor(values...)
+}
+
+// NewHashedContextRedactor is the force-replacement variant used for
+// operation context and handle lifetimes.
+func NewHashedContextRedactor(values ...string) *Redactor {
+	return diagnostic.NewHashedContextRedactor(values...)
+}
+
 // SanitizeDiagnostic escapes terminal control characters without redacting
 // application-defined values.
 func SanitizeDiagnostic(s string) string { return diagnostic.Sanitize(s) }
@@ -37,10 +50,10 @@ func ComposeRedactors(redactors ...*Redactor) *Redactor {
 func Compose(redactors ...*Redactor) *Redactor { return ComposeRedactors(redactors...) }
 
 // WithRedactor returns err with a safe diagnostic rendering. The original
-// error remains available through errors.Is/errors.As and Unwrap, while the
-// returned error's Error method uses the supplied redactor. Applying another
-// redactor composes it with an existing safe wrapper instead of discarding the
-// first context.
+// error remains available through errors.Is/errors.As, while the returned
+// error's Error method uses the supplied redactor. It deliberately has no
+// ordinary Unwrap method: raw diagnostics are available only through the
+// explicit UnwrapRaw escape hatch.
 func WithRedactor(err error, r *Redactor) error {
 	if err == nil {
 		return nil
@@ -50,10 +63,7 @@ func WithRedactor(err error, r *Redactor) error {
 	}
 	r = r.WithForce()
 	if existing, ok := err.(*safeError); ok {
-		return &safeError{
-			err:      existing.err,
-			redactor: existing.redactor.Compose(r),
-		}
+		return existing.withRedactor(r)
 	}
 	combined := r
 	for _, existing := range redactorsIn(err) {
@@ -62,35 +72,58 @@ func WithRedactor(err error, r *Redactor) error {
 	return &safeError{err: err, redactor: combined}
 }
 
-// safeError deliberately keeps the original error as its Unwrap target. Its
-// As method is important: returning the raw *CLIError through the ordinary
-// unwrap path would make errors.As hand callers an object whose fields and
-// Error method do not carry the public-boundary redaction context.
+// safeError is the public-boundary error facade. It keeps the source error
+// only for Is and explicit UnwrapRaw; ordinary Unwrap traversal would make a
+// raw CLI diagnostic reachable again through errors.As.
 type safeError struct {
 	err      error
 	redactor *Redactor
 }
 
 func (e *safeError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
 	if cliErr, ok := e.err.(*CLIError); ok {
 		return cliErr.format(e.redactor)
 	}
-	// A classified or otherwise wrapped error must retain its surrounding
-	// context and all probe details. Its nested CLIError.Error already
-	// applies structural rules; the outer redactor adds caller context.
 	return e.redactor.Text(e.err.Error())
 }
 
-func (e *safeError) Unwrap() error { return e.err }
+// UnwrapRaw is the explicit opt-in path to the source error. It is not named
+// Unwrap, so errors.Is/errors.As and errors.Unwrap cannot cross this boundary
+// accidentally.
+func (e *safeError) UnwrapRaw() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
 
-func (e *safeError) Is(target error) bool { return errors.Is(e.err, target) }
+func (e *safeError) Is(target error) bool {
+	return e != nil && errors.Is(e.err, target)
+}
 
 func (e *safeError) As(target any) bool {
+	if e == nil {
+		return false
+	}
 	return e.as(target, e.redactor)
 }
 
 func (e *safeError) AsRedacted(target any, r *diagnostic.Redactor) bool {
-	combined := e.redactor.Compose(r)
+	if e == nil {
+		return false
+	}
+	if r == nil {
+		r = NewRedactor()
+	}
+	combined := e.redactor
+	if combined == nil {
+		combined = r
+	} else {
+		combined = combined.Compose(r)
+	}
 	for _, existing := range redactorsIn(e.err) {
 		combined = existing.Compose(combined)
 	}
@@ -98,20 +131,134 @@ func (e *safeError) AsRedacted(target any, r *diagnostic.Redactor) bool {
 }
 
 func (e *safeError) as(target any, r *Redactor) bool {
-	ptr, ok := target.(**CLIError)
-	if !ok {
-		return false
+	if r == nil {
+		r = NewRedactor()
 	}
-	raw, ok := findRawCLIError(e.err)
-	if !ok {
-		return false
+	switch ptr := target.(type) {
+	case **CLIError:
+		raw, ok := findRawCLIError(e.err)
+		if !ok {
+			return false
+		}
+		*ptr = raw.withRedactor(r)
+		return true
+	case **SystemNotRunningError:
+		raw, ok := findRawSystemNotRunning(e.err)
+		if !ok {
+			return false
+		}
+		*ptr = raw.withRedactor(r)
+		return true
+	default:
+		return asSafeDiagnostic(e.err, target)
 	}
-	*ptr = raw.withRedactor(r)
-	return true
+}
+
+func (e *safeError) withRedactor(r *Redactor) *safeError {
+	if e == nil {
+		return nil
+	}
+	if r == nil {
+		r = NewRedactor()
+	}
+	combined := e.redactor
+	if combined == nil {
+		combined = r
+	} else {
+		combined = combined.Compose(r)
+	}
+	return &safeError{err: e.err, redactor: combined}
 }
 
 func (e *safeError) Format(state fmt.State, _ rune) {
 	_, _ = fmt.Fprint(state, e.Error())
+}
+
+// DiagnosticRedactor exposes the context to higher-level safe wrappers so
+// they can compose instead of dropping an earlier wait or public boundary.
+func (e *safeError) DiagnosticRedactor() *Redactor {
+	if e == nil {
+		return nil
+	}
+	return e.redactor
+}
+
+// withRedactor makes a safe SystemNotRunningError clone. Its children are
+// passed through redactErrorValue so Unwrap, OriginalError, and ProbeError
+// never expose a raw child after the clone is returned.
+func (e *SystemNotRunningError) withRedactor(r *Redactor) *SystemNotRunningError {
+	if e == nil {
+		return nil
+	}
+	if r == nil {
+		r = NewRedactor()
+	}
+	raw := e
+	if e.rawSystem != nil {
+		raw = e.rawSystem
+	}
+	combined := r
+	if e.redactor != nil {
+		combined = e.redactor.Compose(r)
+	}
+	return &SystemNotRunningError{
+		hint:      combined.Text(e.hint),
+		original:  redactErrorValue(e.original, combined),
+		probe:     redactErrorValue(e.probe, combined),
+		redactor:  combined,
+		rawSystem: raw,
+	}
+}
+
+func (e *SystemNotRunningError) DiagnosticRedactor() *Redactor {
+	if e == nil {
+		return nil
+	}
+	return e.redactor
+}
+
+func (e *SystemNotRunningError) AsRedacted(target any, r *diagnostic.Redactor) bool {
+	ptr, ok := target.(**SystemNotRunningError)
+	if !ok || e == nil {
+		return false
+	}
+	*ptr = e.withRedactor(r)
+	return true
+}
+
+func (e *CLIError) DiagnosticRedactor() *Redactor {
+	if e == nil {
+		return nil
+	}
+	return e.redactor
+}
+
+func (e *CLIError) AsRedacted(target any, r *diagnostic.Redactor) bool {
+	ptr, ok := target.(**CLIError)
+	if !ok || e == nil {
+		return false
+	}
+	*ptr = e.withRedactor(r)
+	return true
+}
+
+func redactErrorValue(err error, r *Redactor) error {
+	if err == nil {
+		return nil
+	}
+	if r == nil {
+		r = NewRedactor()
+	}
+	switch value := err.(type) {
+	case *CLIError:
+		return value.withRedactor(r)
+	case *SystemNotRunningError:
+		return value.withRedactor(r)
+	case *safeError:
+		return value.withRedactor(r)
+	default:
+		return &safeError{err: err, redactor: r}
+	}
 }
 
 func redactorsIn(err error) []*Redactor {
@@ -122,30 +269,24 @@ func redactorsIn(err error) []*Redactor {
 			return
 		}
 		if safe, ok := current.(*safeError); ok {
-			redactors = append(redactors, safe.redactor)
+			if safe.redactor != nil {
+				redactors = append(redactors, safe.redactor)
+			}
+			return
 		}
 		if provider, ok := current.(interface{ DiagnosticRedactor() *diagnostic.Redactor }); ok {
 			if redactor := provider.DiagnosticRedactor(); redactor != nil {
 				redactors = append(redactors, redactor)
 			}
 		}
-		if joined, ok := current.(interface{ Unwrap() []error }); ok {
-			for _, child := range joined.Unwrap() {
-				walk(child)
-			}
-			return
-		}
-		if wrapped, ok := current.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap())
+		for _, child := range rawChildren(current) {
+			walk(child)
 		}
 	}
 	walk(err)
 	return redactors
 }
 
-// findRawCLIError walks only Unwrap links. Calling errors.As here would
-// re-enter safeError.As and can return a redacted clone rather than the raw
-// source needed to compose multiple redactors.
 func findRawCLIError(err error) (*CLIError, bool) {
 	if err == nil {
 		return nil, false
@@ -153,16 +294,79 @@ func findRawCLIError(err error) (*CLIError, bool) {
 	if cliErr, ok := err.(*CLIError); ok {
 		return cliErr, true
 	}
-	if joined, ok := err.(interface{ Unwrap() []error }); ok {
-		for _, child := range joined.Unwrap() {
-			if raw, ok := findRawCLIError(child); ok {
-				return raw, true
-			}
+	for _, child := range rawChildren(err) {
+		if raw, ok := findRawCLIError(child); ok {
+			return raw, true
 		}
-		return nil, false
-	}
-	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
-		return findRawCLIError(wrapped.Unwrap())
 	}
 	return nil, false
+}
+
+func findRawSystemNotRunning(err error) (*SystemNotRunningError, bool) {
+	if err == nil {
+		return nil, false
+	}
+	if system, ok := err.(*SystemNotRunningError); ok {
+		return system, true
+	}
+	for _, child := range rawChildren(err) {
+		if raw, ok := findRawSystemNotRunning(child); ok {
+			return raw, true
+		}
+	}
+	return nil, false
+}
+
+// rawChildren is used only while constructing a safe clone. Standard
+// errors.As/errors.Is never call it, and safe facades expose it solely via
+// UnwrapRaw for explicit callers.
+func rawChildren(err error) []error {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		return joined.Unwrap()
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return []error{wrapped.Unwrap()}
+	}
+	if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
+		child := raw.UnwrapRaw()
+		if child != nil && !sameError(child, err) {
+			return []error{child}
+		}
+	}
+	return nil
+}
+
+// asSafeDiagnostic exposes only explicitly marked value-free concrete types.
+// This keeps errors.As useful for ValidationError and OptionError without
+// returning arbitrary raw application errors from a safe wrapper.
+func sameError(a, b error) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	av, bv := reflect.ValueOf(a), reflect.ValueOf(b)
+	if av.Type() != bv.Type() {
+		return false
+	}
+	if av.Type().Comparable() {
+		return av.Interface() == bv.Interface()
+	}
+	return false
+}
+
+func asSafeDiagnostic(err error, target any) bool {
+	if err == nil {
+		return false
+	}
+	if _, safe := err.(interface{ DiagnosticSafe() }); safe {
+		return errors.As(err, target)
+	}
+	for _, child := range rawChildren(err) {
+		if asSafeDiagnostic(child, target) {
+			return true
+		}
+	}
+	return false
 }

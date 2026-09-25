@@ -1,6 +1,7 @@
 package diagnostic
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -132,4 +133,135 @@ func TestSanitizeEscapesTerminalSequencesAndLineBreaks(t *testing.T) {
 	if !strings.Contains(got, `\x1b`) || !strings.Contains(got, `\r\n`) || !strings.Contains(got, `\u2028`) || !strings.Contains(got, `\u2029`) {
 		t.Fatalf("Sanitize() = %q, want visible escapes", got)
 	}
+}
+
+func TestStreamRedactorCarriesSecretAcrossChunks(t *testing.T) {
+	const secret = "stream-boundary-secret-value"
+	r := NewContextRedactor(secret)
+	stream := r.NewStream(1024 * 1024)
+	first := strings.Repeat("x", DefaultStreamOverlap-8) + "password=" + secret[:len(secret)/2]
+	second := secret[len(secret)/2:] + strings.Repeat("y", DefaultStreamOverlap)
+	if _, err := stream.Write([]byte(first)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := stream.Write([]byte(second)); err != nil {
+		t.Fatal(err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := stream.String()
+	if strings.Contains(got, secret) || strings.Contains(got, secret[:len(secret)/2]) || strings.Contains(got, secret[len(secret)/2:]) {
+		t.Fatalf("stream = %q, contains split secret", got)
+	}
+	if !strings.Contains(got, Redacted) {
+		t.Fatalf("stream = %q, want redaction marker", got)
+	}
+}
+
+func TestStreamRedactorDoesNotSplitLongStructuralValue(t *testing.T) {
+	secret := strings.Repeat("b", DefaultStreamOverlap+1024)
+	stream := NewRedactor().NewStream(2 * 1024 * 1024)
+	_, _ = stream.Write([]byte("Authorization: Basic " + secret[:len(secret)/2]))
+	_, _ = stream.Write([]byte(secret[len(secret)/2:] + "\n"))
+	_ = stream.Close()
+	got := stream.String()
+	if strings.Contains(got, secret) || strings.Contains(got, secret[:len(secret)/2]) || strings.Contains(got, secret[len(secret)/2:]) || !strings.Contains(got, Redacted) {
+		t.Fatalf("stream leaked a long structural value: len=%d", len(got))
+	}
+}
+
+func TestStreamRedactorBoundsOutputAndLargeValues(t *testing.T) {
+	secret := strings.Repeat("s", 4096)
+	stream := NewContextRedactor(secret).NewStream(32)
+	_, _ = stream.Write([]byte("password=" + secret + strings.Repeat("z", 128*1024)))
+	_ = stream.Close()
+	if got := stream.String(); len(got) > 32 || strings.Contains(got, secret) {
+		t.Fatalf("bounded stream = %q (len %d), want <=32 without secret", got, len(got))
+	}
+}
+
+func TestRedactTailIsBoundedAndPreservesReadError(t *testing.T) {
+	wantErr := errors.New("terminal read error")
+	input := &errorAfterReader{data: []byte(strings.Repeat("a", 4096)), err: wantErr}
+	got, err := NewRedactor().RedactTail(input, 64)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("RedactTail error = %v, want %v", err, wantErr)
+	}
+	if len(got) > 64 || !strings.Contains(got, "a") {
+		t.Fatalf("tail = %q, want bounded terminal data", got)
+	}
+}
+
+func TestRedactorHandlesCookieMapsAndCompactTokens(t *testing.T) {
+	const (
+		cookieName  = "session"
+		cookieValue = "json-cookie-secret"
+		jws         = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl"
+		jwe         = "eyJhbGciOiJkaXIiLCJlbmMiOiJBMjU2Q0JDLUhTMjU2In0..aXY.Y2lwaGVy.dGFn"
+	)
+	text := `prefix {"cookie":{"` + cookieName + `":"` + cookieValue + `"},"cookies":{"theme":"dark"}} ` + jws + ` ` + jwe + ` foo.bar.baz suffix`
+	got := NewRedactor().Text(text)
+	for _, secret := range []string{cookieName, cookieValue, jws, jwe} {
+		if strings.Contains(got, secret) {
+			t.Errorf("Text() = %q, contains %q", got, secret)
+		}
+	}
+	if !strings.Contains(got, "foo.bar.baz") || !strings.Contains(got, "prefix") || !strings.Contains(got, "suffix") {
+		t.Fatalf("Text() = %q, want non-token context preserved", got)
+	}
+}
+
+func TestRedactorDoesNotPartiallyMatchCompactTokens(t *testing.T) {
+	const token = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjMifQ.c2lnbmF0dXJl"
+	for _, text := range []string{
+		"prefix " + token + " suffix",
+		"prefix " + token + ".",
+		"prefix eyJhbGciOiJub25lIn0.. suffix",
+	} {
+		got := NewRedactor().Text(text)
+		if strings.Contains(got, token) {
+			t.Fatalf("Text() = %q, contains complete token", got)
+		}
+	}
+	for _, text := range []string{
+		"prefix" + token + "suffix",
+		"prefix." + token + ".suffix",
+		"foo.bar.baz",
+	} {
+		if got := NewRedactor().Text(text); got != text {
+			t.Fatalf("Text() = %q, want maximal dotted run preserved as %q", got, text)
+		}
+	}
+}
+
+func TestHashedRedactorDoesNotRetainPlaintext(t *testing.T) {
+	const secret = "hashed-secret-value"
+	r := NewHashedContextRedactor(secret)
+	if len(r.source) != 0 || len(r.values) != 0 || len(r.hashes) == 0 {
+		t.Fatalf("hashed redactor retained plaintext fields: source=%v values=%v hashes=%d", r.source, r.values, len(r.hashes))
+	}
+	if got := r.Text("prefix" + secret + "suffix"); strings.Contains(got, secret) {
+		t.Fatalf("Text() = %q, contains secret", got)
+	}
+	if err := r.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.Text("prefixplaintextsuffix"); got != "prefixplaintextsuffix" {
+		t.Fatalf("closed Text() = %q, want structural-only behavior", got)
+	}
+}
+
+type errorAfterReader struct {
+	data []byte
+	err  error
+	done bool
+}
+
+func (r *errorAfterReader) Read(p []byte) (int, error) {
+	if !r.done {
+		r.done = true
+		return copy(p, r.data), nil
+	}
+	return 0, r.err
 }

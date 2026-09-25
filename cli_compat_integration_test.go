@@ -140,11 +140,11 @@ func requireAppleCapabilityVersion(t *testing.T, r *cli.ExecRunner) string {
 		switch entry.AppName {
 		case "container":
 			if cliVersion == "" {
-				cliVersion = strings.TrimSpace(entry.Version)
+				cliVersion = normalizeAppleVersion(entry.Version)
 			}
 		case "container-apiserver":
 			if apiVersion == "" {
-				apiVersion = strings.TrimSpace(entry.Version)
+				apiVersion = normalizeAppleVersion(entry.Version)
 			}
 		}
 	}
@@ -168,7 +168,7 @@ func requireAppleCapabilityVersion(t *testing.T, r *cli.ExecRunner) string {
 		if err := json.Unmarshal(statusOut, &status); err != nil {
 			t.Skipf("cannot decode Apple Container system status %q: %v", statusOut, err)
 		}
-		apiVersion = strings.TrimSpace(status.APIServerVersion)
+		apiVersion = normalizeAppleVersion(status.APIServerVersion)
 	}
 	if apiVersion == "" {
 		t.Skipf("Apple Container CLI %s is available, but the API server version is unavailable; skipping the live matrix", cliVersion)
@@ -312,7 +312,7 @@ func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token str
 	}
 }
 
-func TestDockerLiveCleanupUsesImmutableID(t *testing.T) {
+func TestIntegrationDockerLiveCleanupUsesImmutableID(t *testing.T) {
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	uid := strings.Repeat("ab", 32)

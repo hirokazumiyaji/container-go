@@ -363,6 +363,19 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if info.ip == "" && !c.eng.directIP() {
+		// Published-port endpoint data can be complete without an IP.
+		// Do not let that cache satisfy a direct ContainerIP request.
+		c.mu.Lock()
+		if c.info == info {
+			c.info = nil
+		}
+		c.mu.Unlock()
+		info, err = c.cachedInfo(ctx)
+		if err != nil {
+			return "", err
+		}
+	}
 	if info.ip == "" {
 		return "", fmt.Errorf("container %s has no reported IP address", c.id)
 	}
@@ -441,9 +454,10 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns inspect data once all connection details needed by
+// this handle are present. A Created inspect can precede network/port
+// assignment, so incomplete data is returned to the current caller but
+// deliberately not cached for later polls.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -454,11 +468,41 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
+	c.cacheInfo(info)
+	return info, nil
+}
+
+// cacheInfo records immutable identity and complete connection data. The
+// caller must hold c.mu when the Container is already shared.
+func (c *Container) cacheInfo(info *engineInfo) {
 	if c.uid == "" {
 		c.uid = info.uid
 	}
-	return info, nil
+	if c.infoComplete(info) {
+		c.info = info
+	}
+}
+
+func (c *Container) infoComplete(info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	if c.eng.directIP() {
+		return info.ip != ""
+	}
+	for _, spec := range c.exposed {
+		bound := false
+		for _, binding := range info.bound {
+			if binding.containerPort == spec.port && binding.proto == spec.proto && binding.hostPort > 0 {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return false
+		}
+	}
+	return true
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

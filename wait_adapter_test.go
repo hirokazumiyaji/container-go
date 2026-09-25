@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -23,7 +24,7 @@ func TestWaitTargetBackendStatePolicy(t *testing.T) {
 		want   wait.State
 	}{
 		{name: "Apple created", engine: appleEngine{}, status: "created", want: wait.StateCreated},
-		{name: "Apple stopping is transient", engine: appleEngine{}, status: "stopping", want: wait.StateStopping},
+		{name: "Apple stopping is terminal", engine: appleEngine{}, status: "stopping", want: wait.StateStopping},
 		{name: "Apple unknown", engine: appleEngine{}, status: "future-state", want: wait.StateUnknown},
 		{name: "Docker restarting is transient", engine: dockerEngine{}, status: "restarting", want: wait.StateRestarting},
 		{name: "Docker paused is terminal", engine: dockerEngine{}, status: "paused", want: wait.StatePaused},
@@ -47,6 +48,25 @@ func TestWaitTargetBackendStatePolicy(t *testing.T) {
 				t.Errorf("State = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWaitTargetClassifiesContainerNotFound(t *testing.T) {
+	inspectErr := &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `container not found: "myctr"`}
+	runner := waitRunnerFunc(func(_ context.Context, args ...string) ([]byte, []byte, error) {
+		if len(args) > 0 && args[0] == "system" {
+			return nil, nil, nil
+		}
+		return nil, nil, inspectErr
+	})
+	target := waitTarget{c: &Container{id: "myctr", runner: runner, eng: appleEngine{}}}
+
+	_, err := target.State(context.Background())
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want root ErrContainerNotFound", err)
+	}
+	if !errors.Is(err, wait.ErrTargetNotFound) {
+		t.Fatalf("State error = %v, want wait.ErrTargetNotFound", err)
 	}
 }
 

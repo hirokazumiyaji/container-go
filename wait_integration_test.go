@@ -21,8 +21,10 @@ func (s *recordingStrategy) WaitUntilReady(ctx context.Context, target wait.Targ
 	if ep, err := target.Endpoint(ctx, "6379/tcp"); err == nil {
 		s.endpoint = ep
 	}
-	if state, err := target.State(ctx); err == nil {
-		s.state = state
+	if stateTarget, ok := target.(wait.StateTarget); ok {
+		if state, err := stateTarget.State(ctx); err == nil {
+			s.state = state
+		}
 	}
 	return s.err
 }

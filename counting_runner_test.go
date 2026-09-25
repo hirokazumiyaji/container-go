@@ -109,9 +109,9 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	}
 }
 
-// TestRunForLogSkipsInitialInspect pins that a successful ForLog wait
-// does not pay for an eager post-start inspect.
-func TestRunForLogSkipsInitialInspect(t *testing.T) {
+// TestRunForLogChecksInitialState pins the lifecycle inspect that lets
+// ForLog fail fast even when its log stream remains open.
+func TestRunForLogChecksInitialState(t *testing.T) {
 	inner := &streamRunner{
 		fakeRunner: newTestRunner(),
 		streamData: "Ready to accept connections\n",
@@ -126,16 +126,20 @@ func TestRunForLogSkipsInitialInspect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + logs stream; no container inspect.
-	if got := r.count(); got != 3 {
-		t.Fatalf("after ForLog Run: calls = %d, want 3", got)
+	// image inspect + run + initial state inspect + logs stream.
+	if got := r.count(); got != 4 {
+		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	inspects := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			t.Fatalf("unexpected container inspect during ForLog Run: %v", r.args)
+			inspects++
 		}
+	}
+	if inspects != 1 {
+		t.Fatalf("container inspect calls = %d, want one initial lifecycle check", inspects)
 	}
 }
 

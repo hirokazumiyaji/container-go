@@ -135,9 +135,17 @@ wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back with a tail of its
+`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept
+`WithStartupTimeout` to bound the composition). Waiting fails fast when the
+container is stopping, stopped, or paused. Created, restarting, unknown, and
+transient inspect states retry under the timeout; transient log stream open/EOF
+failures are reopened. A failed wait rolls the container back with a tail of its
 logs attached to the error.
+
+For custom strategies, `wait.Target` retains its original `Running` method.
+Implement the optional `wait.StateTarget` interface when the target can
+distinguish transient startup states; built-in strategies use it automatically
+and fall back to `Running` for compatibility.
 
 ## Image pulls
 

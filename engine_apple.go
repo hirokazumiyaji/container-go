@@ -63,7 +63,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			continue
 		}
 		info := &engineInfo{
-			state:  State(c.Status.State),
+			state:  appleState(c.Status.State),
 			labels: c.Configuration.Labels,
 			image:  c.Configuration.Image.Reference,
 		}
@@ -80,7 +80,22 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
+}
+
+func appleState(state string) State {
+	switch state {
+	case string(StateRunning):
+		return StateRunning
+	case string(StateStopped):
+		return StateStopped
+	case string(StateStopping):
+		return StateStopping
+	case string(StateCreated):
+		return StateCreated
+	default:
+		return StateUnknown
+	}
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {

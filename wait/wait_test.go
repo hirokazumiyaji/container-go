@@ -40,6 +40,11 @@ func (f *fakeTarget) Endpoint(_ context.Context, port string) (string, error) {
 	return f.endpoint, nil
 }
 
+func (f *fakeTarget) Running(context.Context) (bool, error) {
+	state, err := f.State(context.Background())
+	return state == StateRunning, err
+}
+
 func (f *fakeTarget) State(_ context.Context) (State, error) {
 	f.stateCalls.Add(1)
 	return f.state.Load().(State), f.stateErr
@@ -54,8 +59,10 @@ type firstStateTarget struct {
 func (t *firstStateTarget) State(_ context.Context) (State, error) {
 	t.stateCalls.Add(1)
 	if t.stateCalls.Load() == 1 {
+		t.state.Store(t.first)
 		return t.first, t.firstErr
 	}
+	t.state.Store(StateRunning)
 	return StateRunning, nil
 }
 
@@ -145,53 +152,46 @@ func TestPollRetriesCreatedUntilRunning(t *testing.T) {
 	checks := 0
 	err := poll(
 		context.Background(),
-		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
 		target,
 		"wait for test",
 		func(context.Context) error {
 			checks++
-			if checks == 1 {
+			if target.state.Load() != StateRunning {
 				return errors.New("not ready")
 			}
 			return nil
 		},
-		true,
 	)
 	if err != nil {
 		t.Fatalf("poll: %v", err)
 	}
-	if checks != 2 {
-		t.Fatalf("checks = %d, want retry after Created", checks)
+	if target.stateCalls.Load() < 2 {
+		t.Fatalf("State calls = %d, want Created -> Running transition", target.stateCalls.Load())
 	}
 }
 
-func TestPollRetriesBackendTransitionalStates(t *testing.T) {
-	cases := map[string]State{
-		"Apple stopping":    StateStopping,
-		"Docker restarting": StateRestarting,
-	}
-	for name, state := range cases {
-		t.Run(name, func(t *testing.T) {
-			target := &firstStateTarget{fakeTarget: newFakeTarget(), first: state}
-			checks := 0
-			err := poll(
-				context.Background(),
-				options{startupTimeout: time.Second, pollInterval: time.Millisecond},
-				target,
-				"wait for test",
-				func(context.Context) error {
-					checks++
-					if checks == 1 {
-						return errors.New("not ready")
-					}
-					return nil
-				},
-				true,
-			)
-			if err != nil {
-				t.Fatalf("poll: %v", err)
+func TestPollRetriesRestartingUntilRunning(t *testing.T) {
+	target := &firstStateTarget{fakeTarget: newFakeTarget(), first: StateRestarting}
+	checks := 0
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error {
+			checks++
+			if target.state.Load() != StateRunning {
+				return errors.New("not ready")
 			}
-		})
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if checks < 2 {
+		t.Fatalf("checks = %d, want retry after Restarting", checks)
 	}
 }
 
@@ -215,7 +215,6 @@ func TestPollRetriesUnknownAndTransientInspectErrorUntilTimeout(t *testing.T) {
 					checks++
 					return errors.New("not ready")
 				},
-				true,
 			)
 			if err == nil || !strings.Contains(err.Error(), "timed out") {
 				t.Fatalf("poll error = %v, want timeout", err)
@@ -231,7 +230,7 @@ func TestTerminalWaitStatePolicy(t *testing.T) {
 	cases := map[State]bool{
 		StateCreated:    false,
 		StateRunning:    false,
-		StateStopping:   false,
+		StateStopping:   true,
 		StateRestarting: false,
 		StateUnknown:    false,
 		StateStopped:    true,
@@ -387,18 +386,18 @@ func TestForListeningPortProbesStateDuringPoll(t *testing.T) {
 	}
 }
 
-func TestForExecSkipsStateDuringPoll(t *testing.T) {
+func TestForExecProbesStateDuringPoll(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
 
 	// Default ForExec interval is 250ms; a 3s timeout should exec a
-	// modest number of times and only inspect state once at the end.
+	// modest number of times and inspect state at the bounded cadence.
 	s := ForExec([]string{"pg_isready"}).WithStartupTimeout(3 * time.Second)
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
-	if n := target.stateCalls.Load(); n != 1 {
-		t.Errorf("State calls = %d, want 1 (final classification only)", n)
+	if n := target.stateCalls.Load(); n < 3 || n > 5 {
+		t.Errorf("State calls = %d, want periodic checks plus final classification", n)
 	}
 	// 3s / 250ms ≈ 12 intervals plus the initial check → ~13; allow slack.
 	if n := target.execCalls.Load(); n < 10 || n > 16 {
@@ -424,8 +423,8 @@ func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	if target.execCalls.Load() != 1 {
 		t.Errorf("exec calls = %d, want 1 (no retry)", target.execCalls.Load())
 	}
-	if target.stateCalls.Load() != 0 {
-		t.Errorf("State calls = %d, want 0 on fatal check error", target.stateCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want 1 initial lifecycle check", target.stateCalls.Load())
 	}
 	if !strings.Contains(err.Error(), "executable file not found") {
 		t.Errorf("error = %v, want launch failure", err)
@@ -488,8 +487,8 @@ func TestForExecFinalStateProbeRespectsCallerCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want context.Canceled", err)
 	}
-	if target.stateCalls.Load() != 0 {
-		t.Errorf("State calls = %d, want 0 when caller cancels", target.stateCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want only the initial lifecycle check", target.stateCalls.Load())
 	}
 }
 

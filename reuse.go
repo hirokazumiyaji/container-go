@@ -47,10 +47,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		info:      info,
 		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		uid:       base.uid,
 	}
+	ctr.cacheInfo(info)
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
@@ -95,9 +95,13 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 
 		switch info.state {
-		case StateCreated, StateStopping, StateUnknown:
+		case StateCreated, StateRestarting, StateUnknown:
 			time.Sleep(reusePollInterval)
 			continue
+		case StateStopping:
+			return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
+		case StatePaused:
+			return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
 		case StateStopped:
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
@@ -113,17 +117,17 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
-			return &Container{
+			ctr := &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
 				eng:       cfg.eng,
 				exposed:   cfg.exposed,
 				published: cfg.published,
 				reused:    true,
-				info:      info,
 				creation:  info.labels[creationLabel],
-				uid:       info.uid,
-			}, nil
+			}
+			ctr.cacheInfo(info)
+			return ctr, nil
 		default:
 			time.Sleep(reusePollInterval)
 		}

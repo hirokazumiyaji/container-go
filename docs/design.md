@@ -243,9 +243,11 @@ provides:
   `context.WithTimeout` from the caller).
 
 Every strategy carries `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). If the container transitions to
-stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+`WithPollInterval` (default 100ms). A stopping, stopped, or paused
+container fails the wait without burning the remaining timeout. Created,
+restarting, unknown, and transient inspect states remain retryable;
+transient log-stream open and EOF failures reopen the stream. Failed waits
+carry a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:
 
@@ -255,10 +257,12 @@ type Strategy interface {
 }
 ```
 
-`Target` is a small interface (container IP, declared ports, log
-reader, exec, state query) implemented by adapting
-`*container.Container`. The dependency points from `container` to
-`wait`, never back, avoiding an import cycle.
+`Target` keeps its original `Running` method for custom-strategy
+compatibility. Targets that distinguish startup transitions also implement
+the optional `StateTarget` interface; built-in strategies prefer `State` and
+fall back to `Running`. `container.Run` adapts `*container.Container` to both
+surfaces. The dependency points from `container` to `wait`, never back,
+avoiding an import cycle.
 
 ## Cleanup
 
@@ -366,14 +370,15 @@ env-file contents.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
-`container run --detach` call. Immutable facts (config, labels,
-published ports) are cached from the first inspect; only the state is
-re-queried.
+`container run --detach` call. Inspect data is cached after all connection
+details are present; incomplete Created data is refreshed instead of cached.
+The lifecycle state is re-queried.
 
 **Wait via connections, not subprocesses**. ForListeningPort and
-ForHTTP dial the container IP directly without spawning the CLI. Only
-ForExec and state queries poll through subprocesses, cheap enough at
-the 100ms interval.
+ForHTTP dial the container IP directly without spawning the CLI for each
+connection attempt. ForExec checks and lifecycle queries spawn subprocesses;
+ongoing lifecycle queries are limited to once per second, while a log-stream
+failure is classified immediately.
 
 **Never serialize parallel startups**. The library holds no global
 lock (reaper ID registration takes a mutex for a one-line write).
@@ -472,8 +477,8 @@ resolution stay the docker CLI's job.
 **Internal structure**: a backend is an internal interface owning only
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
-normalized record holds four things: state (mapped onto running /
-stopped / stopping / unknown), labels, the container IP, and host-side
+normalized record holds lifecycle state (created, running, restarting,
+stopping, stopped, paused, or unknown), labels, the container IP, and host-side
 port bindings (container port → host address and port).
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not

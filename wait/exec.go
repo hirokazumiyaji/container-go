@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os/exec"
 	"time"
 )
 
@@ -52,24 +51,14 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	if matcher == nil {
 		matcher = func(code int) bool { return code == 0 }
 	}
-	// checkState is false: each check already talks to the container
-	// via exec, so a concurrent state probe would only add spawns.
-	// A terminal container state is still reported once at timeout.
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		code, err := target.ExecCommand(ctx, s.cmd)
 		if err != nil {
-			// Command exits are returned as codes. Only a CLI launch
-			// failure (*exec.Error) is known to be permanent; other
-			// errors may be transient and are retried until timeout.
-			var launchErr *exec.Error
-			if errors.As(err, &launchErr) {
-				return fatalCheckError{err: err}
-			}
 			return err
 		}
 		if !matcher(code) {
 			return fmt.Errorf("exit code %d not accepted", code)
 		}
 		return nil
-	}, false)
+	})
 }

@@ -123,9 +123,15 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
-すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`
-(既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
-待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
+すべての戦略は `WithStartupTimeout`（既定 60 秒）と `WithPollInterval`（既定 100 ミリ秒）を持ちます。
+`ForAll` と `ForAny` では `WithStartupTimeout` で合成全体のタイムアウトも設定できます。
+コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
+created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF も再-open します。
+待機に失敗した場合はロールバック削除し、エラーにログ末尾を添付します。
+
+カスタム戦略向けの `wait.Target` は従来の `Running` メソッドを維持します。
+起動中の一時状態を区別できるターゲットでは、任意の `wait.StateTarget` インターフェースも実装してください。
+組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
 
 ## クリーンアップの契約
 

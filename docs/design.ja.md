@@ -166,8 +166,10 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
-すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+すべての戦略は `WithStartupTimeout`（既定 60 秒）と `WithPollInterval`（既定 100 ミリ秒）を持つ。
+コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。
+created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。
+失敗した待機には、診断用に上限 1 MiB のログ末尾を添える。
 
 戦略のインターフェースは次のとおり。
 
@@ -177,7 +179,10 @@ type Strategy interface {
 }
 ```
 
-`Target` はコンテナ IP、宣言済みポート、ログリーダー、exec、状態照会を提供する小さなインターフェースで、`*container.Container` が実装する。
+`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。
+起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。
+組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。
+`container.Run` が `*container.Container` を両方のインターフェースへ適応する。
 `wait` パッケージが `container` パッケージへ依存しない向きに保ち、循環参照を避ける。
 
 ## クリーンアップ
@@ -235,11 +240,14 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 
 **子プロセス数を最小にする**。
 作成と起動は `container run --detach` の 1 回で行う。
-起動後に不変な情報(設定、ラベル、公開ポート)は初回の inspect 結果をキャッシュし、状態(`status.state`)のみ毎回取得する。
+起動後の inspect では接続に必要な情報がそろった結果だけをキャッシュする。
+created 状態で IP や公開ポートが未確定ならキャッシュせず、次の inspect で再取得する。
+状態 (`status.state`) は毎回取得する。
 
 **待機を接続確認で行う**。
-ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TCP/HTTP 接続する。
-ポーリングのたびに子プロセスを起動するのは ForExec と状態照会だけで、これらも 100 ミリ秒間隔のポーリングで問題ない程度に軽い。
+ForListeningPort と ForHTTP は接続のたびに CLI を呼び出さず、コンテナ IP へ直接 TCP/HTTP 接続する。
+子プロセス生成は ForExec とライフサイクル照会に限る。
+通常のライフサイクル照会を最大 1 秒間隔に制限し、ログストリームの失敗時は直ちに状態を分類する。
 
 **並列起動を妨げない**。
 ライブラリ内にグローバルロックを置かない(watchdog リーパーへの ID 登録のみミューテックスで直列化するが、書き込みは 1 行で済む)。
@@ -320,7 +328,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
 プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
-正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
+正規化した情報には、ライフサイクル状態(created、running、restarting、stopping、stopped、paused、unknown)、ラベル、コンテナ IP、公開ポートの束縛（コンテナポート → ホストアドレスとポート）を含める。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`docker context` 経由のリモート指定は検知できない。

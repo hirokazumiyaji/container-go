@@ -81,6 +81,43 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		defer timeoutCancel()
 	}
 
+	var lastStateErr error
+	state, err := targetState(ctx, target)
+	if err != nil {
+		if permanentProbeError(err) {
+			return fmt.Errorf("wait for any: %w", err)
+		}
+		lastStateErr = err
+	} else if terminalWaitState(state) {
+		return stateFailure("wait for any", state, nil, nil)
+	}
+
+	lifecycleErr := make(chan error, 1)
+	go func() {
+		ticker := time.NewTicker(stateCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				state, err := targetState(ctx, target)
+				if err != nil {
+					if permanentProbeError(err) {
+						lifecycleErr <- fmt.Errorf("wait for any: %w", err)
+						return
+					}
+					lastStateErr = err
+					continue
+				}
+				if terminalWaitState(state) {
+					lifecycleErr <- stateFailure("wait for any", state, nil, lastStateErr)
+					return
+				}
+			}
+		}
+	}()
+
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
 		go func() { results <- strategy.WaitUntilReady(ctx, target) }()
@@ -93,6 +130,8 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				return nil
 			}
 			errs = append(errs, err)
+		case err := <-lifecycleErr:
+			return err
 		case <-ctx.Done():
 			return errors.Join(append(errs, ctx.Err())...)
 		}

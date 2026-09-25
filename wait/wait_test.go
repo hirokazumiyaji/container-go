@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -163,6 +164,97 @@ func TestStreamingLogMatcherCountsGlobalOccurrencesAcrossChunks(t *testing.T) {
 				t.Fatalf("count = %d, want %d", matcher.count, tc.occurrences)
 			}
 		})
+	}
+}
+
+func TestStreamingLogMatcherPreservesSemanticsAcrossChunkPermutations(t *testing.T) {
+	input := "ababa\naba\n\nlast"
+	chunkings := chunkingsAt(input, []int{1, 3, 7, 12})
+	patterns := []struct {
+		pattern string
+		regexp  bool
+	}{
+		{pattern: "aba"},
+		{pattern: "a+", regexp: true},
+		{pattern: "^", regexp: true},
+		{pattern: "$", regexp: true},
+		{pattern: ""},
+	}
+	for _, pattern := range patterns {
+		want := countPatternLines(t, input, pattern.pattern, pattern.regexp)
+		for chunkingIndex, chunks := range chunkings {
+			matcher, err := newStreamingLogMatcher(pattern.pattern, pattern.regexp, want+1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, chunk := range chunks {
+				if err := matcher.write(chunk); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := matcher.finishLine(); err != nil {
+				t.Fatal(err)
+			}
+			if matcher.count != want {
+				t.Fatalf("pattern %q chunking %d count = %d, want %d", pattern.pattern, chunkingIndex, matcher.count, want)
+			}
+		}
+	}
+}
+
+func countPatternLines(t *testing.T, input, pattern string, isRegexp bool) int {
+	t.Helper()
+	count := 0
+	for len(input) > 0 {
+		line := input
+		if i := strings.IndexByte(input, '\n'); i >= 0 {
+			line = input[:i]
+			input = input[i+1:]
+		} else {
+			input = ""
+		}
+		if isRegexp {
+			re := regexp.MustCompile(pattern)
+			count += len(re.FindAllIndex([]byte(line), -1))
+		} else {
+			count += strings.Count(line, pattern)
+		}
+	}
+	return count
+}
+
+func chunkingsAt(input string, boundaries []int) [][][]byte {
+	var out [][][]byte
+	for mask := 0; mask < 1<<len(boundaries); mask++ {
+		cuts := []int{0}
+		for i, boundary := range boundaries {
+			if mask&(1<<i) != 0 && boundary > 0 && boundary < len(input) {
+				cuts = append(cuts, boundary)
+			}
+		}
+		cuts = append(cuts, len(input))
+		var chunks [][]byte
+		for i := 1; i < len(cuts); i++ {
+			if cuts[i] > cuts[i-1] {
+				chunks = append(chunks, []byte(input[cuts[i-1]:cuts[i]]))
+			}
+		}
+		out = append(out, chunks)
+	}
+	return out
+}
+
+func TestStreamingLogMatcherRejectsUnboundedPatternOrLine(t *testing.T) {
+	oversizedPattern := strings.Repeat("x", maxLogLineSize+1)
+	if _, err := newStreamingLogMatcher(oversizedPattern, false, 1); !errors.Is(err, errLogPatternTooLong) {
+		t.Fatalf("pattern error = %v, want bounded-pattern error", err)
+	}
+	matcher, err := newStreamingLogMatcher("never", false, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := matcher.write([]byte(strings.Repeat("x", maxLogLineSize+1))); !errors.Is(err, errLogLineTooLong) {
+		t.Fatalf("line error = %v, want bounded-line error", err)
 	}
 }
 

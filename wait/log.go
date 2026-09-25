@@ -3,6 +3,7 @@ package wait
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"regexp"
@@ -18,7 +19,8 @@ type LogStrategy struct {
 	occurrences int
 }
 
-// ForLog waits for a substring to appear in the logs.
+// ForLog waits for a substring to appear in the logs. Patterns and individual
+// log lines are bounded; oversized inputs are reported as matcher errors.
 func ForLog(pattern string) *LogStrategy {
 	return &LogStrategy{pattern: pattern, occurrences: 1}
 }
@@ -51,22 +53,26 @@ func (s *LogStrategy) DiagnosticValues() []string { return []string{s.pattern} }
 // DiagnosticSecrets is an alias for DiagnosticValues.
 func (s *LogStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
 
-const maxLogMatchOverlap = 64 * 1024
+const maxLogLineSize = 8 * 1024 * 1024
+
+var (
+	errLogLineTooLong    = errors.New("log line exceeds bounded matcher size")
+	errLogPatternTooLong = errors.New("log pattern exceeds bounded matcher size")
+)
 
 type streamingLogMatcher struct {
-	pattern      string
-	re           *regexp.Regexp
-	occurrences  int
-	count        int
-	carry        []byte
-	position     int
-	countedStart int
-	countedEnd   int
-	haveMatch    bool
-	lineOpen     bool
+	pattern     string
+	re          *regexp.Regexp
+	occurrences int
+	count       int
+	line        []byte
+	lineOpen    bool
 }
 
 func newStreamingLogMatcher(pattern string, isRegexp bool, occurrences int) (*streamingLogMatcher, error) {
+	if len(pattern) > maxLogLineSize {
+		return nil, errLogPatternTooLong
+	}
 	if occurrences < 1 {
 		occurrences = 1
 	}
@@ -81,111 +87,48 @@ func newStreamingLogMatcher(pattern string, isRegexp bool, occurrences int) (*st
 	return m, nil
 }
 
-func (m *streamingLogMatcher) write(data []byte) {
+func (m *streamingLogMatcher) write(data []byte) error {
 	for len(data) > 0 {
 		if i := bytes.IndexByte(data, '\n'); i >= 0 {
-			m.lineOpen = true
-			m.writeSegment(data[:i])
-			m.finishLine()
+			if err := m.appendLine(data[:i]); err != nil {
+				return err
+			}
+			if err := m.finishLine(); err != nil {
+				return err
+			}
 			data = data[i+1:]
-			m.position++
-			m.carry = m.carry[:0]
-			m.countedStart = m.position
-			m.countedEnd = m.position
-			m.haveMatch = false
+			m.line = m.line[:0]
+			m.lineOpen = false
 			continue
 		}
-		m.writeSegment(data)
-		return
+		if err := m.appendLine(data); err != nil {
+			return err
+		}
+		return nil
 	}
+	return nil
 }
 
-func (m *streamingLogMatcher) writeSegment(segment []byte) {
-	if len(segment) == 0 {
-		return
+func (m *streamingLogMatcher) appendLine(data []byte) error {
+	if len(m.line)+len(data) > maxLogLineSize {
+		return errLogLineTooLong
 	}
+	m.line = append(m.line, data...)
 	m.lineOpen = true
-	if m.re == nil {
-		overlap := len(m.pattern) - 1
-		if overlap < 0 {
-			overlap = 0
-		}
-		if overlap > maxLogMatchOverlap {
-			overlap = maxLogMatchOverlap
-		}
-		combined := make([]byte, 0, len(m.carry)+len(segment))
-		combined = append(combined, m.carry...)
-		combined = append(combined, segment...)
-		base := m.position - len(m.carry)
-		for searchFrom := 0; searchFrom <= len(combined); {
-			index := bytes.Index(combined[searchFrom:], []byte(m.pattern))
-			if index < 0 {
-				break
-			}
-			index += searchFrom
-			m.recordMatch(base+index, base+index+len(m.pattern))
-			if m.pattern == "" {
-				searchFrom = index + 1
-			} else {
-				searchFrom = index + len(m.pattern)
-			}
-		}
-		m.position += len(segment)
-		if overlap == 0 {
-			m.carry = m.carry[:0]
-		} else if len(combined) > overlap {
-			m.carry = append(m.carry[:0], combined[len(combined)-overlap:]...)
-		} else {
-			m.carry = append(m.carry[:0], combined...)
-		}
-		return
-	}
-
-	overlap := maxLogMatchOverlap
-	if len(m.carry) > overlap {
-		m.carry = m.carry[len(m.carry)-overlap:]
-	}
-	combined := make([]byte, 0, len(m.carry)+len(segment))
-	combined = append(combined, m.carry...)
-	combined = append(combined, segment...)
-	base := m.position - len(m.carry)
-	for _, match := range m.re.FindAllIndex(combined, -1) {
-		if match[1] == len(combined) {
-			// An end-anchored or extensible match is not stable until more
-			// line data arrives or the line is known to have ended.
-			continue
-		}
-		m.recordMatch(base+match[0], base+match[1])
-	}
-	m.position += len(segment)
-	if len(combined) > overlap {
-		m.carry = append(m.carry[:0], combined[len(combined)-overlap:]...)
-	} else {
-		m.carry = append(m.carry[:0], combined...)
-	}
+	return nil
 }
 
-func (m *streamingLogMatcher) finishLine() {
+func (m *streamingLogMatcher) finishLine() error {
 	if !m.lineOpen {
-		return
+		return nil
 	}
-	if m.re != nil {
-		base := m.position - len(m.carry)
-		for _, match := range m.re.FindAllIndex(m.carry, -1) {
-			m.recordMatch(base+match[0], base+match[1])
-		}
+	if m.re == nil {
+		m.count += bytes.Count(m.line, []byte(m.pattern))
+	} else {
+		m.count += len(m.re.FindAllIndex(m.line, -1))
 	}
 	m.lineOpen = false
-}
-
-func (m *streamingLogMatcher) recordMatch(start, end int) {
-	if m.haveMatch && (start <= m.countedStart || end <= m.countedEnd) {
-		return
-	}
-	m.count++
-	m.countedStart = start
-	m.countedEnd = end
-	m.haveMatch = true
+	return nil
 }
 
 func (m *streamingLogMatcher) found() bool { return m.count >= m.occurrences }
@@ -214,14 +157,20 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		for {
 			n, readErr := stream.Read(buf)
 			if n > 0 {
-				matcher.write(buf[:n])
+				if err := matcher.write(buf[:n]); err != nil {
+					scanDone <- err
+					return
+				}
 				if matcher.found() {
 					close(found)
 					return
 				}
 			}
 			if readErr != nil {
-				matcher.finishLine()
+				if err := matcher.finishLine(); err != nil {
+					scanDone <- err
+					return
+				}
 				if matcher.found() {
 					close(found)
 					return

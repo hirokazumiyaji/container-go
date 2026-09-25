@@ -1,6 +1,8 @@
 package container
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -63,6 +65,17 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperAcceptsFullDockerID(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	id := strings.Repeat("ab", 32)
+	if err := r.register(id, ""); err != nil {
+		t.Fatalf("register full Docker ID: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+id)
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
@@ -75,6 +88,44 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
+	}
+
+	docker := newReaper(bin, "rm")
+	if err := docker.register("docker-name", ""); err == nil {
+		t.Error("Docker name without generation was accepted")
+	}
+	if err := docker.register(strings.Repeat("A", 64), ""); err == nil {
+		t.Error("uppercase Docker ID was accepted")
+	}
+}
+
+func TestRegisterWithGlobalReaperRecordsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	binary := filepath.Join(t.TempDir(), "docker")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	if err := registerWithGlobalReaper(binary, "rm", "bad id", ""); err == nil {
+		t.Fatal("registration unexpectedly succeeded")
+	}
+	if got := logs.String(); !strings.Contains(got, "reaper registration failed") || !strings.Contains(got, "invalid container id") {
+		t.Fatalf("registration log = %q, want validation error", got)
+	}
+	if err := registerWithGlobalReaper(binary, "rm", "docker-name", ""); err == nil {
+		t.Fatal("generationless Docker name registration unexpectedly succeeded")
+	}
+	if got := logs.String(); !strings.Contains(got, "no generation") {
+		t.Fatalf("registration log = %q, want generationless Docker rejection", got)
 	}
 }
 
@@ -293,5 +344,34 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	}
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
+	}
+}
+
+func TestReaperDockerGenerationRequiresImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "docker")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "rm")
+	if err := r.register("ctr", creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect --type=container ctr")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "rm --force") {
+			t.Fatalf("Docker generation-guarded entry fell back to name: %q", data)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

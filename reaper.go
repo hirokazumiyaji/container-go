@@ -19,8 +19,8 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated as an Apple Container name or a full Docker ID, and the
+// script itself disables globbing and quotes every expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -72,7 +72,12 @@ echo "$ids" | while IFS= read -r line; do
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
     [ "$got" = "$creation" ] || continue
-    [ -n "$uid" ] && target="$uid"
+    if [ "$sub" = "rm" ]; then
+      # A generation-guarded Docker entry must never fall back to its
+      # mutable name when inspect omitted a valid immutable ID.
+      [ -n "$uid" ] || continue
+      target="$uid"
+    fi
   fi
   run_with_timeout "$bin" "$sub" --force "$target" || true
 done
@@ -122,16 +127,36 @@ func newReaper(binary, subcommand string) *reaper {
 	return &reaper{binary: binary, subcommand: subcommand}
 }
 
-// register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
-func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
-		return fmt.Errorf("reaper: invalid container id %q", id)
+func validReaperID(subcommand, id string) bool {
+	return nameRE.MatchString(id) || (subcommand == "rm" && dockerIDRE.MatchString(id))
+}
+
+func validateReaperEntry(subcommand, id, creation string) (bool, error) {
+	if !validReaperID(subcommand, id) {
+		return false, fmt.Errorf("reaper: invalid container id %q", id)
+	}
+	// A full Docker ID is already immutable and needs no generation. A
+	// Docker name entry is only safe when it is generation-guarded.
+	if subcommand == "rm" && !dockerIDRE.MatchString(id) && creation == "" {
+		return false, fmt.Errorf("reaper: Docker name entry %q has no generation", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
-		return fmt.Errorf("reaper: invalid creation id %q", creation)
+		return false, fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
+	return subcommand == "rm" && dockerIDRE.MatchString(id), nil
+}
+
+// register adds a container ID to the reaper's kill list, spawning or
+// respawning the reaper process as needed. creation is the generation
+// ID from creationLabel; empty skips the generation check for Apple and
+// immutable Docker IDs, but never for a Docker name.
+func (r *reaper) register(id, creation string) error {
+	immutableID, err := validateReaperEntry(r.subcommand, id, creation)
+	if err != nil {
+		return err
+	}
+	if immutableID {
+		creation = ""
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -228,12 +253,12 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+// process-wide reaper for its backend binary. Reaper trouble is logged
+// but never fails container startup. The reaper needs /bin/sh, so on
+// Windows this is a no-op and cleanup relies on the normal paths.
+func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
 	if runtime.GOOS == "windows" {
-		return
+		return nil
 	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[binary]
@@ -242,5 +267,9 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
 }

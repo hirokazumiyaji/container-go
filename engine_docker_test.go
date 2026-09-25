@@ -108,6 +108,30 @@ func TestDockerParseInspect(t *testing.T) {
 	}
 }
 
+func TestDockerInspectArgsRestrictTargetToContainers(t *testing.T) {
+	got := (dockerEngine{}).inspectArgs("myctr")
+	want := []string{"inspect", "--type=container", "myctr"}
+	if !slices.Equal(got, want) {
+		t.Errorf("inspectArgs = %v, want %v", got, want)
+	}
+}
+
+func TestDockerParseInspectSkipsNetworkBeforeContainer(t *testing.T) {
+	networkID := strings.Repeat("b", 64)
+	data := []byte(`[{"Id":"` + networkID + `","Name":"/myctr","Driver":"bridge","Scope":"local"},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Errorf("uid = %q, want container %q", info.uid, dockerFixtureID)
+	}
+	if info.state != StateRunning {
+		t.Errorf("state = %q, want %q", info.state, StateRunning)
+	}
+}
+
 func TestParseInspectTargetErrors(t *testing.T) {
 	engines := []struct {
 		name       string
@@ -123,11 +147,13 @@ func TestParseInspectTargetErrors(t *testing.T) {
 		backendData     bool
 		wantNotFound    bool
 		wantSyntaxError bool
+		wantSchemaError bool
 	}{
 		{name: "empty", data: `[]`, wantNotFound: true},
 		{name: "target absent", backendData: true, wantNotFound: true},
 		{name: "ID missing", data: `[{}]`, wantNotFound: true},
 		{name: "malformed JSON", data: `{not json`, wantSyntaxError: true},
+		{name: "top-level null", data: `null`, wantSchemaError: true},
 	}
 	for _, backend := range engines {
 		for _, tc := range cases {
@@ -146,6 +172,11 @@ func TestParseInspectTargetErrors(t *testing.T) {
 				var syntaxErr *json.SyntaxError
 				if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
 					t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
+				}
+				if tc.wantSchemaError {
+					if errors.Is(err, ErrContainerNotFound) || !strings.Contains(err.Error(), "expected a JSON array") {
+						t.Errorf("error = %v, want a schema error distinct from ErrContainerNotFound", err)
+					}
 				}
 			})
 		}
@@ -362,6 +393,98 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	wantTargets := []string{"myctr", dockerFixtureID}
 	if got := runner.targets(); !slices.Equal(got, wantTargets) {
 		t.Errorf("inspect targets = %v, want %v", got, wantTargets)
+	}
+}
+
+type cancelingDockerInspectRunner struct {
+	*fakeRunner
+	data []byte
+
+	mu           sync.Mutex
+	inspectCalls int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+}
+
+func (r *cancelingDockerInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 || args[0] != "inspect" {
+		return r.fakeRunner.Run(ctx, args...)
+	}
+	r.mu.Lock()
+	r.inspectCalls++
+	call := r.inspectCalls
+	r.mu.Unlock()
+	if call == 1 {
+		close(r.firstStarted)
+		select {
+		case <-r.releaseFirst:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return r.data, nil, nil
+}
+
+func (r *cancelingDockerInspectRunner) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inspectCalls
+}
+
+func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
+	runner := &cancelingDockerInspectRunner{
+		fakeRunner:   newTestRunner(),
+		data:         []byte(`[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`),
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+
+	release := func() {
+		select {
+		case <-runner.releaseFirst:
+		default:
+			close(runner.releaseFirst)
+		}
+	}
+	defer release()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(ctx)
+		secondDone <- err
+	}()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second inspect error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-firstDone
+		t.Fatal("canceled second inspect waited behind the first inspect")
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+	if got := runner.calls(); got != 1 {
+		t.Errorf("inspect calls = %d, want 1", got)
 	}
 }
 

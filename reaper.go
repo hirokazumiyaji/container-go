@@ -51,6 +51,13 @@ run_with_timeout() {
   wait "$killer" 2>/dev/null
   return $rc
 }
+inspect_container() {
+  if [ "$sub" = "rm" ]; then
+    "$bin" inspect --type=container "$1"
+  else
+    "$bin" inspect "$1"
+  fi
+}
 echo "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
   id=${line%% *}
@@ -59,7 +66,7 @@ echo "$ids" | while IFS= read -r line; do
   target="$id"
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
+    (inspect_container "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
     got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"

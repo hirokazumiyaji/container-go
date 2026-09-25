@@ -76,6 +76,42 @@ const (
 	StateUnknown  State = "unknown"
 )
 
+// contextLock is a zero-value mutex whose acquisition can be canceled.
+// It protects the inspect cache and serializes inspect calls.
+type contextLock struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (l *contextLock) channel() chan struct{} {
+	l.once.Do(func() {
+		l.gate = make(chan struct{}, 1)
+		l.gate <- struct{}{}
+	})
+	return l.gate
+}
+
+func (l *contextLock) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gate := l.channel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func (l *contextLock) Unlock() {
+	l.channel() <- struct{}{}
+}
+
 // Container is a handle to a container created by Run.
 type Container struct {
 	id        string
@@ -97,9 +133,9 @@ type Container struct {
 	// check unnecessary: a replacement never shares it.
 	uid string
 
-	mu        sync.Mutex
+	mu        contextLock
 	info      *engineInfo // cached first inspect; immutable fields only
-	inspectMu sync.Mutex  // serializes inspect and protects uid after publication
+	inspectMu contextLock // serializes inspect and protects uid after publication
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -444,7 +480,9 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 // that cannot change while the container exists (labels, network
 // address, port bindings) should be read from it.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
-	c.mu.Lock()
+	if err := c.mu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer c.mu.Unlock()
 	if c.info != nil {
 		return c.info, nil
@@ -458,7 +496,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	c.inspectMu.Lock()
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer c.inspectMu.Unlock()
 
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
@@ -481,7 +521,9 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 // inspectTarget prefers an immutable ID so a same-name replacement cannot
 // satisfy a Docker inspect.
 func (c *Container) inspectTarget() string {
-	c.inspectMu.Lock()
+	if err := c.inspectMu.Lock(context.Background()); err != nil {
+		return c.id
+	}
 	defer c.inspectMu.Unlock()
 	return c.inspectTargetLocked()
 }

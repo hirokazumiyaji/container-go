@@ -159,14 +159,21 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
-func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
+func (dockerEngine) inspectArgs(id string) []string {
+	// Docker resolves an unqualified target across object types by default.
+	// Restrict the CLI lookup to containers so a network or volume cannot
+	// shadow the requested container name.
+	return []string{"inspect", "--type=container", id}
+}
 
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
+	// State is present on container inspect objects, but not on Docker
+	// network or volume inspect objects.
+	State *struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -190,17 +197,20 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
+	if containers == nil {
+		return nil, fmt.Errorf("decode docker inspect output: expected a JSON array, got null")
+	}
 	match := -1
 	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
-			if dockerIDRE.MatchString(c.ID) && c.ID == target {
+			if c.State != nil && dockerIDRE.MatchString(c.ID) && c.ID == target {
 				match = i
 				break
 			}
 		}
 	} else {
 		for i, c := range containers {
-			if dockerIDRE.MatchString(c.ID) && strings.TrimPrefix(c.Name, "/") == target {
+			if c.State != nil && dockerIDRE.MatchString(c.ID) && strings.TrimPrefix(c.Name, "/") == target {
 				match = i
 				break
 			}

@@ -50,6 +50,9 @@ func Decode(data []byte) ([]Container, error) {
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode container inspect output: %w", err)
 	}
+	if containers == nil {
+		return nil, fmt.Errorf("decode container inspect output: expected a JSON array, got null")
+	}
 	return containers, nil
 }
 

@@ -230,6 +230,9 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	}
 	r.closeStdin()
 	waitForLogLines(t, logPath, "rm --force "+uid)
+	if data, _ := os.ReadFile(logPath); !strings.Contains(string(data), "inspect --type=container ctr") {
+		t.Errorf("reaper inspect args = %q, want --type=container", data)
+	}
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
 	}

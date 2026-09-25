@@ -216,10 +216,10 @@ Docker は検証済み immutable ID でのみ削除し、名前ロックを取�
 新しい実装は、親リビジョンの `TMPDIR` ロック、UserCacheDir を使う初版ハードニングのロック、namespace maintenance ロック、アカウント情報から導いた固定 state ディレクトリのロックを、この順で取得する。
 `XDG_STATE_HOME` や `HOME` で同じアカウントの lock namespace を分けたりはしない。
 移行用ロックの解決または取得に失敗した場合は、臨界領域へ入らず互換性エラーを返す。
-古い実装が異なる `TMPDIR` を使う場合、旧実装と新しい実装の historical path は一致しないため、mixed-revision の保証はその組み合わせには適用されない。rollout は段階的に行う。watchdog の 4-barrier プロトコルは同じ revision 間の契約であり、barrier を取得しない旧リーパーとは協調できない。mixed-version のリーパー安全性は保証せず、アップグレード前に旧リーパーを終了させる。
+古い実装が異なる `TMPDIR` を使う場合、旧実装と新しい実装の historical path は一致しないため、mixed-revision の保証はその組み合わせには適用されない。rollout は段階的に行う。watchdog の 4-barrier プロトコルは同じ revision 間の契約であり、barrier を取得しない旧リーパーとは協調できない。mixed-version のリーパー安全性は保証せず、アップグレード前に旧リーパーを終了させる。Docker の full-ID prune 契約も same-revision のものである。mutable name を一覧してその name で削除する旧 `Prune` / `PruneReuseGroup` caller は、この revision が prune する前に必ず drain し、並行稼働させてはならない。
 state のファイル名は名前の SHA-256 ダイジェストであり、`TMPDIR` や cache が異なっても新しい実装彼此は同じ state inode を使う。
 すべてのロックファイルは `O_NOFOLLOW` で開き、ファイル種別、所有者、`0600`、path と open fd の inode 一致を `flock` の前後で確認する。
-reaper 登録時には 4 つの barrier すべてに fixed hard-link lease と entry ごとの ownership hold を作る。fixed lease を通常 caller と shell が共有し、hold によって複数 reaper の参照を数える。正常な Terminate、登録失敗、reaper child の exit では entry の hold を回収し、shell 自体も EOF 後の cleanup で parent が kill された場合まで回収する。maintenance sweep は古い orphan lease を bounded に GC し、古い lease を観測した sweep では raw inode を保護する。busy inode は削除せず、壊れた lease は fail closed とする。
+reaper 登録時には 4 つの barrier すべてに fixed hard-link lease と entry ごとの ownership hold を作る。fixed lease を通常 caller と shell が共有し、hold によって複数 reaper の参照を数える。parent は process-level の active-state marker を flock 保持し、child にもその descriptor を継承させる。marker は対象 state lock を記録するため、lease link が retention より古くなっても登録中の entry だけを保護し、別の orphan link は回収できる。正常な Terminate、登録失敗、reaper child の exit では entry の hold を回収し、shell 自体も EOF 後の cleanup で parent が kill された場合まで回収する。maintenance sweep は古い orphan lease を bounded に GC し、古い lease を観測した sweep では raw inode を保護する。busy inode は削除せず、壊れた lease は fail closed とする。
 state ディレクトリは所有者と置換可能性を検索し、sticky bit を持つ標準の temporary root は sticky 規則で保護されるため受け入れる。
 
 最近使用した state ロックファイルは保持し、他の協力プロセスが保持する inode は unlink しない。
@@ -227,7 +227,7 @@ namespace の maintenance `flock` は cleanup の sweep が終わるまで保持
 cleanup は 1 回の取得ごとに最大 258 件（name-lock 256 件と maintenance 1 件）を調べ、最大 32 件だけを削除する。
 7 日より古いファイルは削除対象であり、256 件の上限を超えた場合は他のプロセスが使用していないファイルなら早く削除できる。
 lease GC も同じ bounded budget を使い、古い orphan の hold/fixed link を回収する。ただし最近の ownership hold を cap だけで削除하지는 않으며、lease を観測した sweep では raw path を残す。lease が壊れていれば安全側 fail closed とする。
-非 blocking exclusive `flock` を取得できない候補は skip するため、保持中の inode は cleanup 対象にならない。
+非 blocking exclusive `flock` を取得できない候補は skip するため、保持中の inode は cleanup 対象にならない。bounded directory scan が上限に達した場合は、scan 外の active marker を見落とす危険を避けて lease reclaim を延期する。
 旧実装と併存できるあいだは、移行用ロックファイルを cleanup しない。
 
 外部の `container delete` と再作成は、この lock を使わず、名前だけでは検出できない。

@@ -328,9 +328,14 @@ Every historical and state file is opened with `O_NOFOLLOW`; its type, owner,
 `flock`. A registered reaper entry creates a fixed hard-link lease for each
 barrier plus per-entry ownership holds. Normal lock callers use the fixed
 lease inode, while independent reapers can be reference-counted safely. A
-successful termination, failed registration, or reaper-child exit removes the
-entry's holds; the shell also performs cleanup after EOF, including when the
-parent was killed. The bounded maintenance sweep removes old orphan lease
+separate process-level active-state marker is flock-held by the parent and
+inherited by the child. The marker records the covered state-lock names, so
+lease GC preserves a live registration even when all of its lease hard links
+are older than the retention window while unrelated orphan links remain
+collectable. A successful termination, failed registration, or
+reaper-child exit removes the entry's holds; the shell also performs
+cleanup after EOF, including when the parent was killed. The bounded
+maintenance sweep removes old orphan lease
 links, keeps a raw inode protected for the sweep in which a lease is
 observed, and never evicts a recent ownership hold solely because the lease
 cap was exceeded. A malformed or replaced lease fails closed. The state
@@ -353,7 +358,9 @@ if a lease is observed, its raw path is retained for that sweep. A malformed
 or replaced lease causes cleanup to fail closed rather than unlink the
 original. Cleanup uses nonblocking exclusive `flock` and skips a busy
 candidate, so it never unlinks an inode held by another cooperating process.
-The historical files are not swept while old binaries can coexist.
+If the bounded directory scan is full, lease reclamation defers rather than
+risk missing a live active marker outside the scan window. The historical
+files are not swept while old binaries can coexist.
 
 These guarantees cover cooperating processes on the same host and the same
 account-derived state namespace. A direct `container delete` plus re-create
@@ -365,8 +372,12 @@ new state-only barrier; mixed-revision safety is therefore limited to
 matching historical paths and requires staged rollout. The reaper's
 four-barrier protocol has a stricter same-revision contract: an older
 reaper that does not acquire those barriers is not a participant, so
-mixed-version reaper safety is explicitly not claimed. Drain old reapers
-before upgrading. The reaper follows the same four-barrier order and fails
+mixed-version reaper safety is explicitly not claimed. The full-ID Docker
+prune contract is also same-revision: an older `Prune` or
+`PruneReuseGroup` caller that lists mutable names and deletes those names
+must be drained before this revision is allowed to prune, and must not run
+concurrently with it. Drain old reapers before upgrading. The reaper
+follows the same four-barrier order and fails
 closed if any historical path, lease, or `lockf` invocation is unavailable.
 An inspect failure other than not-found aborts the delete (fail closed).
 Lock and directory failures from failed-create cleanup are joined to

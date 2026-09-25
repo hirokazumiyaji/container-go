@@ -416,6 +416,70 @@ func TestCleanupNameLockFilesHonorsRetentionCap(t *testing.T) {
 	}
 }
 
+func TestCleanupRetainsAgedLiveReaperEntry(t *testing.T) {
+	requireReaperLockf(t)
+	bin, _ := writeReaperStub(t)
+	name := "aged-live-lease-" + newContainerName()
+	creation := "0123456789abcdef"
+	r := newReaper(bin, "delete")
+	if err := r.register(name, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	entry := leaseEntrySnapshot(r)
+	r.activeMu.Lock()
+	activePath := r.activeHold.path
+	r.activeMu.Unlock()
+	old := time.Now().Add(-2 * nameLockRetention)
+	if err := os.Chtimes(activePath, old, old); err != nil {
+		t.Fatal(err)
+	}
+	for _, group := range [][]string{entry.lockPaths, entry.leaseHolds} {
+		for _, path := range group {
+			if err := os.Chtimes(path, old, old); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	orphanName := "aged-orphan-lease-" + newContainerName()
+	orphanPaths, _, err := reaperNameLockSet(orphanName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orphanRaw, err := rawNameLockPath(orphanName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(orphanRaw); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(orphanPaths[3], old, old); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Dir(entry.lockPaths[3])
+	if err := cleanupNameLockFilesAt(context.Background(), stateDir, "", time.Now(), 1000, 1000); err != nil {
+		t.Fatalf("cleanup: %v", err)
+	}
+	for _, group := range [][]string{entry.lockPaths, entry.leaseHolds} {
+		for _, path := range group {
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("aged live reaper path %s was reclaimed: %v", path, err)
+			}
+		}
+	}
+	if _, err := os.Lstat(activePath); err != nil {
+		t.Fatalf("active marker was reclaimed while reaper was live: %v", err)
+	}
+	if _, err := os.Lstat(orphanPaths[3]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("aged orphan lease was retained by a different live registration: %v", err)
+	}
+	r.closeStdin()
+	waitReaperExitForTest(t, r)
+	if _, err := os.Lstat(activePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("active marker remains after reaper exit: %v", err)
+	}
+	assertLeasePathsAbsent(t, entry.lockPaths, entry.leaseHolds)
+}
+
 func TestCleanupReclaimsOrphanedReaperLeasesWithCap(t *testing.T) {
 	dir := t.TempDir()
 	old := time.Now().Add(-2 * nameLockRetention)

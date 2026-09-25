@@ -141,8 +141,10 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    削除します。Apple では legacy、transitional、maintenance、durable の
    4 つの name-lock barrier を順番に保持します。登録済み lock inode は
    entry ごとの ownership hold を持つ durable hard-link lease を使い、
-   active entry を保護しながら古い orphan link を GC します。lease、
-   identity、lockf のいずれかが欠ければ fail closed してスキップします。
+   active entry を保護しながら古い orphan link を GC します。lease link が
+   retention より古くなっても、親と child が保持する別ファイルの marker が
+   対応する state lock を記録して登録中の entry を保護します。identity、lockf
+   のいずれかが欠ければ fail closed してスキップします。
    これは同じ revision のリーパープロトコルです。古い、barrier を取得
    しないリーパーとは協調できず、mixed-version のリーパー安全性は保証
    しません。アップグレード前に古いリーパーを終了してください。リーパーは
@@ -159,7 +161,11 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
   一覧し、64 hex 以外を拒否して、置換可能な名前ではなく検証済み ID を
   削除します。rolling upgrade 中は、異なる historical `TMPDIR` を使う旧
   binary を新しい state-only barrier で協調できないため、段階的に更新します。
-  watchdog についても同じ制約があり、旧 barrier 非使用リーパーは現在の
+  現行 Docker prune の契約は旧 caller を安全にするものではありません。mutable
+  name を一覧してその name で削除する旧 `Prune` / `PruneReuseGroup` caller は、
+  この revision が prune する前に必ず drain してください。旧 name-based Docker
+  prune caller とこの revision を並行稼働させないでください。watchdog についても
+  同じ制約があり、旧 barrier 非使用リーパーは現在の
   4-barrier プロトコルには参加しません。旧 binary と新 binary のリーパーを
   同じ Apple name に対して並行稼働させないでください。
 

@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"os"
 )
 
 const (
@@ -13,6 +14,28 @@ const (
 // nameLockStateRootOverride is defined on Windows so the shared test
 // harness can compile; Windows never uses a name-addressed reaper.
 var nameLockStateRootOverride string
+
+// Windows never instantiates the name-addressed active marker, but the
+// shared reaper code still needs the type and helper to compile.
+type reaperActiveHold struct {
+	path     string
+	identity string
+	file     *os.File
+}
+
+func nameLockDir() (string, error) {
+	return "", fmt.Errorf("name-addressed locks are unavailable on Windows")
+}
+
+func newReaperActiveHold(string) (*reaperActiveHold, error) {
+	return nil, fmt.Errorf("name-addressed reaper is unavailable on Windows")
+}
+
+func (h *reaperActiveHold) addRaw(string) error { return nil }
+
+func (h *reaperActiveHold) removeRaw(string, bool) error { return nil }
+
+func (h *reaperActiveHold) release(bool) error { return nil }
 
 // Apple Container does not exist on Windows and Docker deletes by
 // immutable ID, so no cross-process name lock is needed here.

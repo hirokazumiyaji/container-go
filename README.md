@@ -171,11 +171,14 @@ Three layers make sure containers do not outlive your tests:
    transitional, maintenance, and durable name-lock barriers in order
    across generation inspection and deletion. Registered lock inodes
    use durable hard-link leases with per-entry ownership holds; active
-   entries are protected while old orphan links are collected, and an
-   entry is skipped if any lease, identity check, or `lockf` invocation
-   is unavailable. This is a same-revision reaper protocol: it does not
-   coordinate with an older reaper that does not take these barriers, so
-   mixed-version reaper safety is not claimed. Drain old reapers before
+   entries are protected while old orphan links are collected, and a
+   separate flock-held active marker, inherited by the child, records the
+   covered state locks and preserves a live registration even when its
+   lease links are older than the retention window. An entry is skipped
+   if any lease, identity check, or `lockf` invocation is unavailable.
+   This is a same-revision reaper protocol: it does not coordinate with
+   an older reaper that does not take these barriers, so mixed-version
+   reaper safety is not claimed. Drain old reapers before
    upgrading. The reaper needs `/bin/sh`, so it is unavailable on
    Windows — there, cleanup relies on the first two layers only.
 
@@ -191,10 +194,14 @@ Extras:
   the validated ID rather than a replaceable name. During a rolling
   upgrade, an old binary using a different historical `TMPDIR` cannot
   participate in the new state-only barrier; stage the upgrade rather
-  than assuming mixed-`TMPDIR` coordination. The same restriction
-  applies to the watchdog: an older unlocked reaper is not a participant
-  in the current four-barrier protocol, so do not run old and new
-  reapers against the same Apple names concurrently.
+  than assuming mixed-`TMPDIR` coordination. The current Docker prune
+  contract does not make old callers safe: drain any older `Prune` or
+  `PruneReuseGroup` caller that lists mutable names and deletes those
+  names before this revision is allowed to prune. Do not run old
+  name-based Docker prune callers concurrently with this revision. The
+  same restriction applies to the watchdog: an older unlocked reaper is
+  not a participant in the current four-barrier protocol, so do not run
+  old and new reapers against the same Apple names concurrently.
 
 ## Reuse (shared containers across tests/processes)
 

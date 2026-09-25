@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"os/user"
@@ -16,6 +17,7 @@ import (
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -34,6 +36,7 @@ const (
 	nameLockMaintenanceFile = ".maintenance.lock"
 	nameLockLeaseSuffix     = ".reaper-lease"
 	nameLockLeaseHoldSuffix = nameLockLeaseSuffix + "."
+	nameLockActiveSuffix    = ".reaper-active"
 )
 
 type nameLockStage string
@@ -166,6 +169,209 @@ func reaperNameLockSet(name string) ([]string, []string, error) {
 
 func reaperNameLockSetForReaper(name string) ([]string, []string, []string, error) {
 	return reaperNameLockSetWithOwnership(name, true)
+}
+
+// reaperActiveMarkerPath is a process-level liveness hold in the durable
+// lock directory. Its contents list the state-lock names currently covered
+// by the reaper; it is separate from the hard-link leases so holding it
+// never blocks ordinary name-lock callers.
+func reaperActiveMarkerPath(dir, token string) string {
+	return filepath.Join(dir, nameLockActiveSuffix+"."+token)
+}
+
+type reaperActiveHold struct {
+	path     string
+	identity string
+	file     *os.File
+	raws     map[string]int
+}
+
+func newReaperActiveHoldLocked(dir, token string) (*reaperActiveHold, error) {
+	if !validReaperLeaseToken(token) {
+		return nil, fmt.Errorf("invalid reaper active marker token")
+	}
+	path := reaperActiveMarkerPath(dir, token)
+	f, err := openLockFile(path, true, stateNameLockStage, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create reaper active marker: %w", err)
+	}
+	closeAndUnlock := func() {
+		_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+		_ = f.Close()
+	}
+	if err := checkOpenedLockFile(f, path); err != nil {
+		closeAndUnlock()
+		return nil, fmt.Errorf("validate reaper active marker: %w", err)
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		closeAndUnlock()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			return nil, fmt.Errorf("reaper active marker %s is busy", path)
+		}
+		return nil, fmt.Errorf("lock reaper active marker: %w", err)
+	}
+	if err := checkOpenedLockFile(f, path); err != nil {
+		closeAndUnlock()
+		return nil, fmt.Errorf("revalidate reaper active marker: %w", err)
+	}
+	info, err := f.Stat()
+	if err != nil {
+		closeAndUnlock()
+		return nil, err
+	}
+	identity, err := lockFileIdentity(info)
+	if err != nil {
+		closeAndUnlock()
+		return nil, err
+	}
+	return &reaperActiveHold{path: path, identity: identity, file: f, raws: make(map[string]int)}, nil
+}
+
+func acquireActiveMaintenance(dir string) (func(), error) {
+	var last error
+	for attempt := 0; attempt < nameLockLeaseRetryLimit; attempt++ {
+		maintenancePath, err := maintenanceNameLockPath(dir)
+		if err != nil {
+			last = err
+			if !errors.Is(err, errNameLockPathChanged) {
+				return nil, err
+			}
+			time.Sleep(nameLockPoll)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		unlock, err := acquireLockFile(ctx, maintenanceNameLockStage, maintenancePath, false, nil)
+		cancel()
+		if err == nil {
+			return unlock, nil
+		}
+		last = err
+		if !errors.Is(err, errNameLockPathChanged) {
+			return nil, err
+		}
+		time.Sleep(nameLockPoll)
+	}
+	return nil, last
+}
+
+func newReaperActiveHold(dir string) (*reaperActiveHold, error) {
+	token, err := newReaperLeaseToken()
+	if err != nil {
+		return nil, err
+	}
+	maintenanceUnlock, err := acquireActiveMaintenance(dir)
+	if err != nil {
+		return nil, err
+	}
+	hold, err := newReaperActiveHoldLocked(dir, token)
+	maintenanceUnlock()
+	return hold, err
+}
+
+func (h *reaperActiveHold) writeRawsLocked() error {
+	if err := checkOpenedLockFile(h.file, h.path); err != nil {
+		return err
+	}
+	names := make([]string, 0, len(h.raws))
+	for raw := range h.raws {
+		names = append(names, raw)
+	}
+	sort.Strings(names)
+	body := strings.Join(names, "\n")
+	checksum := sha256.Sum256([]byte(body))
+	contents := fmt.Sprintf("v1 %d %s\n%s", len(names), hex.EncodeToString(checksum[:]), body)
+	if err := h.file.Truncate(0); err != nil {
+		return fmt.Errorf("truncate reaper active marker: %w", err)
+	}
+	if _, err := h.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind reaper active marker: %w", err)
+	}
+	if _, err := io.WriteString(h.file, contents); err != nil {
+		return fmt.Errorf("write reaper active marker: %w", err)
+	}
+	if err := h.file.Sync(); err != nil {
+		return fmt.Errorf("sync reaper active marker: %w", err)
+	}
+	return checkOpenedLockFile(h.file, h.path)
+}
+
+func (h *reaperActiveHold) updateRaw(raw string, add, barriersHeld bool) error {
+	if h == nil || h.file == nil {
+		return fmt.Errorf("reaper active marker is not open")
+	}
+	raw = filepath.Base(raw)
+	if !isNameLockFile(raw) {
+		return fmt.Errorf("invalid reaper active raw lock %q", raw)
+	}
+	if !barriersHeld {
+		maintenanceUnlock, err := acquireActiveMaintenance(filepath.Dir(h.path))
+		if err != nil {
+			return err
+		}
+		defer maintenanceUnlock()
+	}
+	if h.raws == nil {
+		h.raws = make(map[string]int)
+	}
+	oldCount := h.raws[raw]
+	newCount := oldCount
+	if add {
+		newCount++
+	} else if oldCount > 1 {
+		newCount--
+	} else {
+		newCount = 0
+	}
+	if newCount == 0 {
+		delete(h.raws, raw)
+	} else {
+		h.raws[raw] = newCount
+	}
+	if err := h.writeRawsLocked(); err != nil {
+		if oldCount == 0 {
+			delete(h.raws, raw)
+		} else {
+			h.raws[raw] = oldCount
+		}
+		return err
+	}
+	return nil
+}
+
+func (h *reaperActiveHold) addRaw(raw string) error {
+	return h.updateRaw(raw, true, false)
+}
+
+func (h *reaperActiveHold) removeRaw(raw string, barriersHeld bool) error {
+	return h.updateRaw(raw, false, barriersHeld)
+}
+
+func (h *reaperActiveHold) release(barriersHeld bool) error {
+	if h == nil || h.file == nil {
+		return nil
+	}
+	if !barriersHeld {
+		maintenanceUnlock, err := acquireActiveMaintenance(filepath.Dir(h.path))
+		if err != nil {
+			_ = syscall.Flock(int(h.file.Fd()), syscall.LOCK_UN)
+			closeErr := h.file.Close()
+			h.file = nil
+			return errors.Join(err, closeErr)
+		}
+		defer maintenanceUnlock()
+	}
+	removeErr := removeReaperLeaseFile(h.path, h.identity, true)
+	_ = syscall.Flock(int(h.file.Fd()), syscall.LOCK_UN)
+	closeErr := h.file.Close()
+	h.file = nil
+	return errors.Join(removeErr, closeErr)
 }
 
 func newReaperLeaseToken() (string, error) {
@@ -1193,6 +1399,10 @@ func closeFileLock(f *os.File) func() {
 	}
 }
 
+// Active-state markers are flock-held independently of lease mtimes. A live
+// marker protects the recorded state-lock names for the lifetime of its
+// owning reaper; the child inherits the same descriptor.
+
 // cleanupNameLockFiles performs a bounded opportunistic sweep. It never
 // waits for a name lock: a busy candidate is live and is skipped. The
 // namespace maintenance lock excludes the open-then-flock window used by
@@ -1236,6 +1446,9 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 	validNames := 0
 	leaseProtected := make(map[string]bool)
 	leaseCount := 0
+	activeEntries := make([]string, 0)
+	activeProtectedRaws := make(map[string]bool)
+	activeProtectedAll := false
 	for _, entry := range entries {
 		if isNameLockFile(entry.Name()) {
 			validNames++
@@ -1244,26 +1457,81 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 			leaseCount++
 			leaseProtected[raw] = true
 		}
+		if _, valid, candidate := reaperActiveMarkerName(entry.Name()); candidate {
+			if !valid {
+				activeProtectedAll = true
+				continue
+			}
+			path := filepath.Join(dir, entry.Name())
+			activeEntries = append(activeEntries, path)
+			state, stateErr := reaperActiveMarkerStateAt(path)
+			if stateErr != nil {
+				activeProtectedAll = true
+				continue
+			}
+			if state.failClosed {
+				activeProtectedAll = true
+				continue
+			}
+			if state.live {
+				for raw := range state.raws {
+					activeProtectedRaws[raw] = true
+				}
+			}
+		}
 	}
 	overLimit := len(entries) >= scanLimit || validNames > nameLockMaxFiles
-	leaseOverLimit := leaseCount > nameLockMaxLeases
-
-	// Collect lease names before removing any of them. The original raw
-	// path remains protected for this whole sweep even if its stale lease
-	// is reclaimed; otherwise a reaper could still be holding the old
-	// inode while a new caller creates a replacement raw path.
+	leaseOverLimit := leaseCount+len(activeEntries) > nameLockMaxLeases
+	// ReadDir(n) does not report whether more entries remain. If the scan
+	// may be truncated, postpone all lease reclamation: an active marker
+	// outside the window must still protect its aged lease links.
+	scanTruncated := len(entries) >= scanLimit
 	leaseEntries := make([]string, 0, leaseCount)
-	for _, entry := range entries {
-		if _, _, ok := reaperLeaseRawName(entry.Name()); ok {
-			leaseEntries = append(leaseEntries, filepath.Join(dir, entry.Name()))
+	if !scanTruncated {
+		for _, entry := range entries {
+			if _, _, ok := reaperLeaseRawName(entry.Name()); ok {
+				leaseEntries = append(leaseEntries, filepath.Join(dir, entry.Name()))
+			}
 		}
 	}
 	removed := 0
-	leaseRemoved, err := cleanupReaperLeaseFilesLocked(ctx, dir, keep, leaseEntries, now, leaseOverLimit, deleteLimit)
-	if err != nil {
-		return err
+	if !scanTruncated {
+		var leaseRemoved int
+		var err error
+		if activeProtectedAll {
+			leaseRemoved, err = cleanupReaperLeaseFilesLockedWithActive(ctx, dir, keep, leaseEntries, now, leaseOverLimit, deleteLimit, true)
+		} else if len(activeProtectedRaws) == 0 {
+			leaseRemoved, err = cleanupReaperLeaseFilesLocked(ctx, dir, keep, leaseEntries, now, leaseOverLimit, deleteLimit)
+		} else {
+			leaseRemoved, err = cleanupReaperLeaseFilesLockedWithRaws(ctx, dir, keep, leaseEntries, now, leaseOverLimit, deleteLimit, activeProtectedRaws, false)
+		}
+		if err != nil {
+			return err
+		}
+		removed += leaseRemoved
+		for _, path := range activeEntries {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if removed >= deleteLimit {
+				break
+			}
+			info, statErr := os.Lstat(path)
+			if statErr != nil {
+				continue
+			}
+			if !overLimit && now.Sub(info.ModTime()) < nameLockRetention {
+				continue
+			}
+			live, liveErr := reaperActiveMarkerLiveAt(path)
+			if liveErr != nil || live {
+				continue
+			}
+			if err := removeReaperLeaseFile(path, "", false); err == nil {
+				removed++
+			}
+		}
 	}
-	removed += leaseRemoved
 
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
@@ -1345,7 +1613,145 @@ func reaperLeaseRawName(name string) (raw string, fixed bool, ok bool) {
 	return "", false, false
 }
 
+// reaperActiveMarkerName recognizes the process-level marker names. A
+// marker-shaped name with an invalid token is still a candidate so GC can
+// fail closed for the whole directory.
+func reaperActiveMarkerName(name string) (token string, valid bool, candidate bool) {
+	prefix := nameLockActiveSuffix + "."
+	if !strings.HasPrefix(name, prefix) {
+		return "", false, false
+	}
+	token = strings.TrimPrefix(name, prefix)
+	return token, validReaperLeaseToken(token), true
+}
+
+type reaperActiveMarkerState struct {
+	raws       map[string]bool
+	failClosed bool
+	live       bool
+}
+
+// reaperActiveMarkerStateAt validates the marker's checksummed registration
+// set before reporting its liveness; a partial or malformed marker fails
+// closed rather than authorizing lease reclamation.
+func reaperActiveMarkerStateAt(path string) (reaperActiveMarkerState, error) {
+	state := reaperActiveMarkerState{raws: make(map[string]bool)}
+	info, err := os.Lstat(path)
+	if err != nil {
+		state.failClosed = true
+		return state, err
+	}
+	if err := checkLockFile(info, path); err != nil {
+		state.failClosed = true
+		return state, err
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		state.failClosed = true
+		return state, err
+	}
+	opened, statErr := f.Stat()
+	if statErr == nil {
+		statErr = checkOpenedLockFile(f, path)
+	}
+	if statErr == nil && !os.SameFile(info, opened) {
+		statErr = fmt.Errorf("reaper active marker %s changed while opening", path)
+	}
+	if statErr != nil {
+		_ = f.Close()
+		state.failClosed = true
+		return state, statErr
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		_ = f.Close()
+		state.failClosed = true
+		return state, err
+	}
+	contents, err := io.ReadAll(f)
+	if err != nil {
+		_ = f.Close()
+		state.failClosed = true
+		return state, err
+	}
+	markerContents := string(contents)
+	headerEnd := strings.IndexByte(markerContents, '\n')
+	if headerEnd <= 0 {
+		state.failClosed = true
+	} else {
+		header := strings.Fields(markerContents[:headerEnd])
+		body := markerContents[headerEnd+1:]
+		if len(header) != 3 || header[0] != "v1" {
+			state.failClosed = true
+		} else if count, parseErr := strconv.Atoi(header[1]); parseErr != nil || count < 0 {
+			state.failClosed = true
+		} else {
+			checksum := sha256.Sum256([]byte(body))
+			if header[2] != hex.EncodeToString(checksum[:]) {
+				state.failClosed = true
+			} else {
+				lines := []string{}
+				if body != "" {
+					lines = strings.Split(body, "\n")
+				}
+				if len(lines) != count {
+					state.failClosed = true
+				} else {
+					for _, raw := range lines {
+						if !isNameLockFile(raw) {
+							state.failClosed = true
+							break
+						}
+						if state.raws[raw] {
+							state.failClosed = true
+							break
+						}
+						state.raws[raw] = true
+					}
+				}
+			}
+		}
+	}
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+			_ = f.Close()
+			return state, nil
+		}
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		_ = f.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
+			state.live = true
+			return state, nil
+		}
+		state.failClosed = true
+		return state, fmt.Errorf("probe reaper active marker %s: %w", path, err)
+	}
+}
+
+func reaperActiveMarkerLiveAt(path string) (bool, error) {
+	state, err := reaperActiveMarkerStateAt(path)
+	if err != nil {
+		return false, err
+	}
+	return state.live, nil
+}
+
+// cleanupReaperLeaseFilesLocked preserves the package-local helper shape;
+// the wrapper also performs a complete active-marker probe for callers that
+// do not have the bounded sweep's active-state result.
 func cleanupReaperLeaseFilesLocked(ctx context.Context, dir, keep string, paths []string, now time.Time, overLimit bool, deleteLimit int) (int, error) {
+	raws, all := reaperActiveMarkerProtection(dir)
+	return cleanupReaperLeaseFilesLockedWithRaws(ctx, dir, keep, paths, now, overLimit, deleteLimit, raws, all)
+}
+
+func cleanupReaperLeaseFilesLockedWithActive(ctx context.Context, dir, keep string, paths []string, now time.Time, overLimit bool, deleteLimit int, activeProtected bool) (int, error) {
+	return cleanupReaperLeaseFilesLockedWithRaws(ctx, dir, keep, paths, now, overLimit, deleteLimit, nil, activeProtected)
+}
+
+func cleanupReaperLeaseFilesLockedWithRaws(ctx context.Context, dir, keep string, paths []string, now time.Time, overLimit bool, deleteLimit int, activeRaws map[string]bool, activeAll bool) (int, error) {
 	removed := 0
 	ownedRaws := make(map[string]bool)
 	for _, path := range paths {
@@ -1364,7 +1770,7 @@ func cleanupReaperLeaseFilesLocked(ctx context.Context, dir, keep string, paths 
 				return removed, nil
 			}
 			raw, fixed, ok := reaperLeaseRawName(filepath.Base(path))
-			if !ok || fixed != pass {
+			if !ok || fixed != pass || activeAll || activeRaws[raw] {
 				continue
 			}
 			if path == keep || filepath.Base(path) == filepath.Base(keep) {
@@ -1424,9 +1830,52 @@ func cleanupReaperLeaseFilesLocked(ctx context.Context, dir, keep string, paths 
 	return removed, nil
 }
 
+func reaperActiveMarkerProtection(dir string) (map[string]bool, bool) {
+	raws := make(map[string]bool)
+	all := false
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return raws, true
+	}
+	for _, entry := range entries {
+		_, valid, candidate := reaperActiveMarkerName(entry.Name())
+		if !candidate {
+			continue
+		}
+		if !valid {
+			all = true
+			continue
+		}
+		state, stateErr := reaperActiveMarkerStateAt(filepath.Join(dir, entry.Name()))
+		if stateErr != nil {
+			all = true
+			continue
+		}
+		if state.failClosed {
+			all = true
+			continue
+		}
+		if !state.live {
+			continue
+		}
+		for raw := range state.raws {
+			raws[raw] = true
+		}
+	}
+	return raws, all
+}
+
+func reaperActiveMarkerProtectsRaw(dir, raw string) bool {
+	raws, all := reaperActiveMarkerProtection(dir)
+	return all || raws[raw]
+}
+
 func reaperLeaseExists(path string) bool {
 	leases, err := reaperLeasePaths(path)
-	return err != nil || len(leases) != 0
+	if err != nil || len(leases) != 0 {
+		return true
+	}
+	return reaperActiveMarkerProtectsRaw(filepath.Dir(path), filepath.Base(path))
 }
 
 func isNameLockFile(name string) bool {

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
@@ -25,8 +26,10 @@ import (
 // validated at registration. The shell uses lockf(1) to hold every path,
 // checks the registered device/inode identity, and only then inspects and
 // deletes. If any lock, lease, identity, or helper is unavailable, the
-// entry is skipped rather than deleted without coordination. This is a
-// same-revision protocol: it does not coordinate with an older reaper
+// entry is skipped rather than deleted without coordination. A process-level
+// active marker is flock-held by the parent and inherited by the child, so
+// lease GC cannot reclaim an aged entry while either side is alive. This is
+// a same-revision protocol: it does not coordinate with an older reaper
 // that does not take these barriers. Mixed-version reaper safety is not
 // claimed; drain old reapers before upgrading. Docker's immutable-ID
 // entries remain lock-free.
@@ -291,7 +294,11 @@ type reaper struct {
 	// (Docker); both take --force.
 	subcommand string
 
-	mu            sync.Mutex
+	mu         sync.Mutex
+	registerMu sync.Mutex
+	activeMu   sync.Mutex
+	// activeHold is inherited by every child spawned for this reaper.
+	activeHold    *reaperActiveHold
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
 	exited        chan struct{}
@@ -303,6 +310,69 @@ type reaper struct {
 
 func newReaper(binary, subcommand string) *reaper {
 	return &reaper{binary: binary, subcommand: subcommand}
+}
+
+// ensureActiveHold creates one durable marker for this reaper process. The
+// marker records the state-lock names covered by its registrations and is
+// independent of the per-entry hard links, so a long-lived parent cannot
+// lose a live registration to mtime-based lease GC.
+func (r *reaper) ensureActiveHold() error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	if r.activeHold != nil && r.activeHold.file != nil {
+		return nil
+	}
+	dir, err := nameLockDir()
+	if err != nil {
+		return err
+	}
+	hold, err := newReaperActiveHold(dir)
+	if err != nil {
+		return err
+	}
+	r.activeHold = hold
+	return nil
+}
+
+func (r *reaper) addActiveRaw(raw string) error {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	if r.activeHold == nil {
+		return errors.New("reaper: missing process active lease")
+	}
+	return r.activeHold.addRaw(raw)
+}
+
+func (r *reaper) removeActiveRaw(raw string, barriersHeld bool) error {
+	r.activeMu.Lock()
+	defer r.activeMu.Unlock()
+	if r.activeHold == nil {
+		return nil
+	}
+	return r.activeHold.removeRaw(raw, barriersHeld)
+}
+
+func (r *reaper) releaseActiveIfUnused(barriersHeld bool) error {
+	r.registerMu.Lock()
+	defer r.registerMu.Unlock()
+	return r.releaseActiveIfUnusedLocked(barriersHeld)
+}
+
+func (r *reaper) releaseActiveIfUnusedLocked(barriersHeld bool) error {
+	r.mu.Lock()
+	unused := len(r.entries) == 0 && r.cmd == nil
+	r.mu.Unlock()
+	if !unused {
+		return nil
+	}
+	r.activeMu.Lock()
+	hold := r.activeHold
+	r.activeHold = nil
+	r.activeMu.Unlock()
+	return hold.release(barriersHeld)
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
@@ -330,10 +400,39 @@ func (r *reaper) register(id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
+	r.registerMu.Lock()
+	defer r.registerMu.Unlock()
+	keepActive := false
+	activeRaw := ""
+	activeRawAdded := false
+	defer func() {
+		if activeRawAdded {
+			if err := r.removeActiveRaw(activeRaw, false); err != nil {
+				log.Printf("container-go: reaper active registration cleanup %s: %v", activeRaw, err)
+			}
+		}
+		if keepActive {
+			return
+		}
+		if err := r.releaseActiveIfUnusedLocked(false); err != nil {
+			log.Printf("container-go: reaper active lease cleanup after registration failure: %v", err)
+		}
+	}()
 
 	var lockPaths, lockIdentities, leaseHolds []string
 	if r.subcommand == "delete" {
-		var err error
+		if err := r.ensureActiveHold(); err != nil {
+			return fmt.Errorf("reaper: prepare active lease: %w", err)
+		}
+		rawState, err := rawNameLockPath(id)
+		if err != nil {
+			return fmt.Errorf("reaper: resolve active lease for %q: %w", id, err)
+		}
+		activeRaw = filepath.Base(rawState)
+		if err := r.addActiveRaw(activeRaw); err != nil {
+			return fmt.Errorf("reaper: register active lease for %q: %w", id, err)
+		}
+		activeRawAdded = true
 		lockPaths, lockIdentities, leaseHolds, err = reaperNameLockSetForReaper(id)
 		if err != nil {
 			return fmt.Errorf("reaper: prepare name locks for %q: %w", id, err)
@@ -362,12 +461,14 @@ func (r *reaper) register(id, creation string) error {
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		_ = releaseReaperLeaseFiles(lockPaths, lockIdentities, leaseHolds, false)
-		return errors.New("reaper: closed")
+		leaseErr := releaseReaperLeaseFiles(lockPaths, lockIdentities, leaseHolds, false)
+		return errors.Join(errors.New("reaper: closed"), leaseErr)
 	}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
+			keepActive = true
+			activeRawAdded = false
 			r.mu.Unlock()
 			return nil
 		}
@@ -380,6 +481,9 @@ func (r *reaper) register(id, creation string) error {
 				break
 			}
 		}
+	} else {
+		keepActive = true
+		activeRawAdded = false
 	}
 	r.mu.Unlock()
 	if err != nil {
@@ -487,6 +591,15 @@ func (r *reaper) prepareEntriesLocked() error {
 
 func (r *reaper) spawnLocked() error {
 	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	if r.subcommand == "delete" {
+		r.activeMu.Lock()
+		active := r.activeHold
+		r.activeMu.Unlock()
+		if active == nil || active.file == nil {
+			return errors.New("reaper: missing process active lease")
+		}
+		cmd.ExtraFiles = []*os.File{active.file}
+	}
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -514,6 +627,13 @@ func (r *reaper) handleProcessExit(cmd *exec.Cmd) {
 	closed := r.closed
 	entries := append([]reaperEntry(nil), r.entries...)
 	r.cmd, r.stdin = nil, nil
+	var active *reaperActiveHold
+	r.activeMu.Lock()
+	if closed {
+		active = r.activeHold
+		r.activeHold = nil
+	}
+	r.activeMu.Unlock()
 	if closed {
 		r.entries = nil
 	} else {
@@ -531,6 +651,11 @@ func (r *reaper) handleProcessExit(cmd *exec.Cmd) {
 			log.Printf("container-go: reaper lease cleanup on exit %s: %v", entry.id, err)
 		}
 	}
+	if active != nil {
+		if err := active.release(false); err != nil {
+			log.Printf("container-go: reaper active lease cleanup on exit: %v", err)
+		}
+	}
 }
 
 // closeStdin hands the reaper the same EOF it would see on parent
@@ -546,7 +671,12 @@ func (r *reaper) closeStdin() {
 	stdin := r.stdin
 	entries := append([]reaperEntry(nil), r.entries...)
 	noChild := r.cmd == nil
+	var active *reaperActiveHold
 	if noChild {
+		r.activeMu.Lock()
+		active = r.activeHold
+		r.activeHold = nil
+		r.activeMu.Unlock()
 		r.entries = nil
 	}
 	r.mu.Unlock()
@@ -557,6 +687,11 @@ func (r *reaper) closeStdin() {
 		for _, entry := range entries {
 			if err := releaseReaperLeaseFiles(entry.lockPaths, entry.lockIdentities, entry.leaseHolds, false); err != nil {
 				log.Printf("container-go: reaper lease cleanup on close %s: %v", entry.id, err)
+			}
+		}
+		if active != nil {
+			if err := active.release(false); err != nil {
+				log.Printf("container-go: reaper active lease cleanup on close: %v", err)
 			}
 		}
 	}
@@ -603,10 +738,22 @@ func (r *reaper) unregister(id, creation string, barriersHeld bool) error {
 	entry := r.entries[index]
 	r.entries = append(r.entries[:index], r.entries[index+1:]...)
 	r.mu.Unlock()
-	if err := releaseReaperLeaseFiles(entry.lockPaths, entry.lockIdentities, entry.leaseHolds, barriersHeld); err != nil {
-		return err
+	leaseErr := releaseReaperLeaseFiles(entry.lockPaths, entry.lockIdentities, entry.leaseHolds, barriersHeld)
+	var activeRaw string
+	if base := filepath.Base(entry.stateLockPath); base != "." && strings.HasSuffix(base, nameLockLeaseSuffix) {
+		activeRaw = strings.TrimSuffix(base, nameLockLeaseSuffix)
 	}
-	return nil
+	if activeRaw == "" && r.subcommand == "delete" {
+		if rawState, rawErr := rawNameLockPath(entry.id); rawErr == nil {
+			activeRaw = filepath.Base(rawState)
+		}
+	}
+	var activeStateErr error
+	if activeRaw != "" {
+		activeStateErr = r.removeActiveRaw(activeRaw, barriersHeld)
+	}
+	activeErr := r.releaseActiveIfUnused(barriersHeld)
+	return errors.Join(leaseErr, activeStateErr, activeErr)
 }
 
 var (

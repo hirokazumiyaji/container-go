@@ -63,7 +63,7 @@ const logTailLimit = 1024 * 1024
 func (c *Container) logTail(ctx context.Context) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.operationTarget())...)
 	if err != nil {
 		return ""
 	}

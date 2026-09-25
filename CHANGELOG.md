@@ -9,6 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add bounded and streaming CLI output paths: `LogsOptions.MaxBytes`,
+  `WithExecMaxBytes`, `ExecTo`, `LogsTo`, `OutputStats`, and the
+  `ErrOutputTruncated` / `Truncated` observability contract. The CLI
+  runner now exposes direct `RunTo` writers; wait exec probes discard
+  output and log-tail diagnostics use a fixed-size ring.
+- Document the compatibility policy: legacy full-output calls remain
+  available, while callers handling untrusted output should opt into a
+  positive limit or streaming sink.
 - Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture

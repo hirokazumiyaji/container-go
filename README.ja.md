@@ -74,6 +74,24 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 リリースノートは [CHANGELOG.md](CHANGELOG.md) を参照してください。
 
+## 出力の契約
+
+CLI の出力は bounded または caller 所有の sink へ流します。
+`LogsWithOptions{MaxBytes: n}` と `WithExecMaxBytes(n)` は stdout と
+stderr の合計を `n` byte に制限します。`ExecTo` と `LogsTo` は
+`io.Writer` へ直接ストリームし、`OutputStats` が破棄前の総観測量と
+truncation を返します。bounded reader は `Truncated() bool` を提供し、
+保持したデータを返した後の terminal read error が
+`ErrOutputTruncated` になります。`FollowLogs` は長期ストリームなので
+自動 byte 上限はありません。`wait.ForExec` は各 poll の出力を
+`io.Discard` へ送り、失敗診断のログは固定長 1MiB の末尾リングに
+保持します。
+
+`Logs`、`WithExecMaxBytes` を指定しない `Exec`、`MaxBytes == 0` は
+ソース互換性のため従来の全量保持を維持します。これは信頼できない
+出力には deprecated であり、新コードでは正の制限値または
+`ExecTo` / `LogsTo` を選んでください。
+
 ## 接続エンドポイント
 
 **Apple Container バックエンド**: 各コンテナは vmnet の `default`

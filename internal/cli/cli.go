@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"strings"
 	"time"
@@ -30,6 +31,87 @@ type Probe struct {
 // Runner executes one backend CLI invocation.
 type Runner interface {
 	Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+// OutputStats describes bytes observed by RunTo. The counts include
+// bytes that a caller-supplied writer subsequently discarded.
+type OutputStats struct {
+	StdoutBytes     int64
+	StderrBytes     int64
+	StdoutTruncated bool
+	StderrTruncated bool
+}
+
+// Truncated reports whether either output stream was truncated by a
+// writer passed to RunTo.
+func (s OutputStats) Truncated() bool {
+	return s.StdoutTruncated || s.StderrTruncated
+}
+
+// WriterRunner is the streaming form of Runner. Implementations write
+// directly to the supplied sinks, so a sink can keep a fixed-size view
+// without first allocating the complete CLI output. Runner remains
+// separate for compatibility with existing test and embedding runners.
+type WriterRunner interface {
+	Runner
+	RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error)
+}
+
+// RunTo executes a CLI invocation through WriterRunner when available.
+// Runners that only implement the historical Runner interface are
+// adapted for compatibility; that fallback necessarily has already
+// materialized their returned byte slices.
+func RunTo(r Runner, ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
+	if wr, ok := r.(WriterRunner); ok {
+		return wr.RunTo(ctx, stdout, stderr, args...)
+	}
+
+	dataOut, dataErr, runErr := r.Run(ctx, args...)
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	stats := OutputStats{
+		StdoutBytes:     int64(len(dataOut)),
+		StderrBytes:     int64(len(dataErr)),
+		StdoutTruncated: writerTruncated(stdout),
+		StderrTruncated: writerTruncated(stderr),
+	}
+	if err := writeOutput(stdout, dataOut); err != nil {
+		return stats, fmt.Errorf("write CLI stdout: %w", err)
+	}
+	if err := writeOutput(stderr, dataErr); err != nil {
+		return stats, fmt.Errorf("write CLI stderr: %w", err)
+	}
+	stats.StdoutTruncated = writerTruncated(stdout)
+	stats.StderrTruncated = writerTruncated(stderr)
+	return stats, runErr
+}
+
+func writeOutput(dst io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := dst.Write(data)
+		if n > 0 {
+			data = data[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+	}
+	return nil
+}
+
+func writerTruncated(w io.Writer) bool {
+	type truncationReporter interface {
+		Truncated() bool
+	}
+	tr, ok := w.(truncationReporter)
+	return ok && tr.Truncated()
 }
 
 // ExternalRunner identifies runners that execute the CLI as real child
@@ -92,36 +174,95 @@ func (r *ExecRunner) binary() string {
 }
 
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	var stdout, stderr bytes.Buffer
+	_, err := r.RunTo(ctx, &stdout, &stderr, args...)
+	// The historical Runner contract returns the complete output. The
+	// bounded/streaming contract is available through RunTo and does
+	// not change this compatibility path.
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+// RunTo runs the CLI while sending stdout and stderr directly to the
+// supplied writers. The process is still fully drained after a sink
+// reaches its own limit, so a bounded sink cannot deadlock the child.
+func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	stdoutCount := &countingWriter{dst: stdout}
+	stderrCount := &countingWriter{dst: stderr}
+	diagnostic := &headWriter{max: maxStderr}
+	cmd.Stdout = stdoutCount
+	cmd.Stderr = io.MultiWriter(stderrCount, diagnostic)
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
-	// Output buffers are returned whole: success output and non-zero
-	// exec/log results must not be silently truncated. Only the
-	// diagnostic copy inside CLIError is bounded.
-	if err != nil {
+	runErr := cmd.Run()
+	stats := OutputStats{
+		StdoutBytes:     stdoutCount.bytes,
+		StderrBytes:     stderrCount.bytes,
+		StdoutTruncated: writerTruncated(stdout),
+		StderrTruncated: writerTruncated(stderr),
+	}
+	// Output sinks are intentionally not allowed to hide the command's
+	// terminal status. The diagnostic stderr copy is bounded separately
+	// from the caller's sink.
+	if runErr != nil {
 		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+			return stats, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
+		if errors.As(runErr, &exitErr) {
+			return stats, &CLIError{
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
+				Stderr:   truncateStderr(diagnostic.String()),
 			}
 		}
-		return stdout.Bytes(), stderr.Bytes(), err
+		return stats, runErr
 	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	return stats, nil
 }
+
+type countingWriter struct {
+	dst   io.Writer
+	bytes int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.dst.Write(p)
+	w.bytes += int64(len(p))
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+// headWriter retains only the first max bytes for CLIError diagnostics.
+type headWriter struct {
+	buf bytes.Buffer
+	max int
+}
+
+func (w *headWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			_, _ = w.buf.Write(p[:room])
+		} else {
+			_, _ = w.buf.Write(p)
+		}
+	}
+	return len(p), nil
+}
+
+func (w *headWriter) String() string { return w.buf.String() }
 
 // truncateStderr bounds the diagnostic copy kept in CLIError.
 func truncateStderr(s string) string {

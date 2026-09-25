@@ -1,11 +1,12 @@
 package container
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"sync"
 
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -47,7 +48,10 @@ func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) {
-	code, _, err := t.c.Exec(ctx, cmd)
+	// Readiness probes discard application output. ExecTo drains the
+	// CLI streams into io.Discard instead of materializing a byte slice
+	// for every polling attempt.
+	code, _, err := t.c.ExecTo(ctx, cmd, io.Discard)
 	return code, err
 }
 
@@ -57,17 +61,18 @@ const logTailLimit = 1024 * 1024
 
 // logTail fetches up to logTailLimit trailing bytes of the container's
 // logs for diagnostics. It asks the backend for a bounded tail
-// (logsTailArgs) and keeps only the last bytes in a fixed-size ring,
-// so neither the CLI output nor the Go buffer grows with total log
-// size. Failures yield an empty tail.
+// (logsTailArgs) and streams both CLI streams through a fixed-size
+// ring, so neither the CLI output nor the Go buffer grows with total
+// log size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
+	tail := newTailWriter(logTailLimit)
+	_, err := cli.RunTo(c.runner, qCtx, tail, tail, c.eng.logsTailArgs(c.id)...)
 	if err != nil {
 		return ""
 	}
-	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	return tail.String()
 }
 
 // lastNBytes keeps only the trailing n bytes of r using a fixed-size
@@ -77,36 +82,52 @@ func lastNBytes(r io.Reader, n int) string {
 		_, _ = io.Copy(io.Discard, r)
 		return ""
 	}
-	buf := make([]byte, n)
-	pos := 0
-	full := false
-	tmp := make([]byte, 32*1024)
-	for {
-		m, err := r.Read(tmp)
-		if m > 0 {
-			chunk := tmp[:m]
-			for len(chunk) > 0 {
-				space := n - pos
-				if len(chunk) < space {
-					copy(buf[pos:], chunk)
-					pos += len(chunk)
-					break
-				}
-				copy(buf[pos:], chunk[:space])
-				chunk = chunk[space:]
-				pos = 0
-				full = true
-			}
-		}
-		if err != nil {
+	tail := newTailWriter(n)
+	_, _ = io.Copy(tail, r)
+	return tail.String()
+}
+
+type tailWriter struct {
+	mu   sync.Mutex
+	buf  []byte
+	pos  int
+	full bool
+}
+
+func newTailWriter(n int) *tailWriter {
+	return &tailWriter{buf: make([]byte, n)}
+}
+
+func (w *tailWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	original := len(p)
+	if len(w.buf) == 0 {
+		return original, nil
+	}
+	for len(p) > 0 {
+		space := len(w.buf) - w.pos
+		if len(p) < space {
+			copy(w.buf[w.pos:], p)
+			w.pos += len(p)
 			break
 		}
+		copy(w.buf[w.pos:], p[:space])
+		p = p[space:]
+		w.pos = 0
+		w.full = true
 	}
-	if !full {
-		return string(buf[:pos])
+	return original, nil
+}
+
+func (w *tailWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if !w.full {
+		return string(w.buf[:w.pos])
 	}
-	out := make([]byte, n)
-	copy(out, buf[pos:])
-	copy(out[n-pos:], buf[:pos])
+	out := make([]byte, len(w.buf))
+	copy(out, w.buf[w.pos:])
+	copy(out[len(w.buf)-w.pos:], w.buf[:w.pos])
 	return string(out)
 }

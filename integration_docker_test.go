@@ -3,6 +3,7 @@
 package container_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -509,6 +510,43 @@ func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 	}
 	if n, _ := io.ReadAll(out); len(n) != 131072 {
 		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}
+
+// TestIntegrationDockerExecStreamsLargeOutputBounded exercises the
+// direct RunTo path with more than 256 MiB of CLI output. The host
+// retains only the configured prefix while the child is fully drained.
+func TestIntegrationDockerExecStreamsLargeOutputBounded(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithCmd("sleep", "60"),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	defer func() {
+		_ = ctr.Terminate(context.Background())
+	}()
+
+	var output bytes.Buffer
+	const maxBytes = 1024
+	code, stats, err := ctr.ExecTo(ctx,
+		[]string{"sh", "-c", "head -c 268435456 /dev/zero"},
+		&output,
+		container.WithExecMaxBytes(maxBytes),
+	)
+	if err != nil {
+		t.Fatalf("ExecTo: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if output.Len() != maxBytes {
+		t.Fatalf("retained bytes = %d, want %d", output.Len(), maxBytes)
+	}
+	if stats.Bytes < 256*1024*1024 || !stats.Truncated {
+		t.Fatalf("stats = %+v, want >=256MiB observed and truncation", stats)
 	}
 }
 

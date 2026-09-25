@@ -74,6 +74,35 @@ possible.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
+## Output contract
+
+New CLI output paths capture through bounded or caller-owned sinks so a
+container cannot make the host allocate an unbounded response:
+
+- `LogsWithOptions{MaxBytes: n}` retains at most `n` combined bytes and
+  returns a reader implementing `Truncated() bool`. A positive
+  `WithExecMaxBytes(n)` applies the same policy to `Exec`.
+- `ExecTo` and `LogsTo` stream directly to an `io.Writer`; use
+  `WithExecMaxBytes` or `LogsOptions.MaxBytes` to drain and discard
+  bytes beyond a caller-selected limit. `OutputStats.Bytes` is the
+  total observed, including discarded bytes. These streaming methods
+  merge stdout and stderr in arrival order.
+- A bounded reader returns `ErrOutputTruncated` as its terminal read
+  error, while still returning all retained bytes. Check
+  `errors.Is(readErr, container.ErrOutputTruncated)` or the
+  `Truncated()` method; truncation is never silent.
+- `FollowLogs` is intentionally a long-lived stream and has no
+  automatic byte limit. The caller owns its lifetime and backpressure.
+- `wait.ForExec` discards command output for every poll, and wait-failure
+  diagnostics use a fixed 1 MiB trailing log buffer.
+
+`Logs`, `Exec` without `WithExecMaxBytes`, and `MaxBytes == 0` retain
+the historical full-output behavior for source compatibility. That
+compatibility path is deprecated for untrusted or long-lived output;
+new code should select a positive limit or use a streaming method.
+The legacy path will be reconsidered in a future minor release, but
+this change does not silently discard existing output.
+
 ## Connection endpoints
 
 **Apple Container backend**: every container gets a real IP on the

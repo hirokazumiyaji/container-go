@@ -201,9 +201,12 @@ later verification inspect that consumes the deadline does not by itself
 produce `ExecTerminationError`.
 Cancellation is owned by the local command lifecycle. On Unix targets with a
 stable process identity, process-group termination is attempted only while the
-direct child handle still owns the process; the direct child is also
-killed after the group signal because it may have changed process groups. Unix
-targets without that identity use the direct child handle conservatively. After
+direct child handle still owns the process. On Linux, the numeric group signal
+also requires `waitid(WSTOPPED|WNOWAIT)` to confirm the stopped state; if that
+ownership proof is lost, the pidfd is used directly and the former PGID is
+never signaled. The direct child is also killed after a successful group signal
+because it may have changed process groups. Unix targets without that identity
+use the direct child handle conservatively. After
 the child is reaped, no former numeric group ID is used. Windows uses a
 lifecycle-owned Job Object handle, with direct-child fallback when assignment
 is unavailable. Assignment occurs after `Start`; descendants created during

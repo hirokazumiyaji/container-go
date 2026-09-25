@@ -18,12 +18,14 @@ func configureProcessTree(cmd *exec.Cmd) {
 }
 
 // processIdentity is an OS-owned reference to the direct child. It remains
-// valid across a concurrent cmd.Wait, so a group signal cannot be aimed at a
-// recycled numeric PGID. Platforms without such a reference fail closed to
-// direct-handle termination.
+// valid across a concurrent cmd.Wait; on Linux, waitid WSTOPPED/WNOWAIT must
+// confirm the stopped state before any numeric group signal is attempted.
+// Platforms without that proof fail closed to pidfd/direct termination.
 type stableProcessIdentity interface {
 	active() (bool, error)
 	stop() error
+	stopped() (bool, error)
+	kill() error
 	groupID() (int, bool)
 	close()
 }
@@ -49,24 +51,36 @@ func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 	}
 	active, err := t.identity.active()
 	if err != nil || !active {
-		return terminateDirectProcess(cmd)
+		return terminateProcessIdentity(t.identity, false)
 	}
 	if err := t.identity.stop(); err != nil {
 		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
 			return terminationResult{err: os.ErrProcessDone}
 		}
-		// The stable identity could not stop the child. The direct handle
-		// remains safe, but cannot provide group-wide active evidence.
-		return terminateDirectProcess(cmd)
+		// The stable identity could not stop the child. The pidfd-directed
+		// kill remains safe, but cannot provide group-wide active evidence.
+		return terminateProcessIdentity(t.identity, false)
 	}
 	active, err = t.identity.active()
 	if err != nil || !active {
-		return terminateDirectProcess(cmd)
+		return terminateProcessIdentity(t.identity, false)
 	}
 
-	// Always call the direct handle after the group signal. A child that
-	// changed process groups gets direct termination without touching its
-	// former numeric group.
+	// A numeric group signal is allowed only after waitid confirms the
+	// stopped state without reaping it. If that ownership proof is lost,
+	// terminate only through the pidfd and never reuse the numeric PGID.
+	stopped, err := t.identity.stopped()
+	if err != nil || !stopped {
+		return terminateProcessIdentity(t.identity, false)
+	}
+	active, err = t.identity.active()
+	if err != nil || !active {
+		return terminateProcessIdentity(t.identity, false)
+	}
+
+	// The child is stopped, so its current process group cannot change while
+	// the lifecycle decision is serialized. Always call the direct handle
+	// after a group signal because the child may have escaped its group.
 	var groupErr error
 	groupSignaled := false
 	if pgid, ok := t.identity.groupID(); ok && pgid == cmd.Process.Pid {
@@ -87,6 +101,17 @@ func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		return terminationResult{active: true, err: errors.Join(groupErr, killErr)}
 	}
 	return terminationResult{active: true, err: killErr}
+}
+
+func terminateProcessIdentity(identity stableProcessIdentity, activeEvidence bool) terminationResult {
+	err := identity.kill()
+	if err == nil {
+		return terminationResult{active: activeEvidence}
+	}
+	if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		return terminationResult{err: os.ErrProcessDone}
+	}
+	return terminationResult{err: err}
 }
 
 func (t *unixProcessTree) close() {

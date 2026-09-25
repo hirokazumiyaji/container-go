@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+const processStoppedObservationWindow = 20 * time.Millisecond
 
 type processIdentity struct {
 	pid   int
@@ -47,6 +50,42 @@ func (p processIdentity) stop() error {
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGSTOP, nil, 0)
 }
 
+func (p processIdentity) stopped() (bool, error) {
+	deadline := time.Now().Add(processStoppedObservationWindow)
+	for {
+		var info unix.Siginfo
+		err := unix.Waitid(
+			unix.P_PIDFD,
+			p.pidfd,
+			&info,
+			unix.WSTOPPED|unix.WNOWAIT|unix.WNOHANG,
+			nil,
+		)
+		if errors.Is(err, unix.EINTR) {
+			continue
+		}
+		if errors.Is(err, unix.ECHILD) {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		// CLD_TRAPPED and CLD_STOPPED are the two stopped states. WNOWAIT
+		// leaves either state available to the lifecycle's sole Wait call.
+		if info.Code == 4 || info.Code == 5 {
+			return true, nil
+		}
+		if time.Now().After(deadline) {
+			return false, nil
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func (p processIdentity) kill() error {
+	return unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0)
+}
+
 func (p processIdentity) groupID() (int, bool) {
 	pgid, err := unix.Getpgid(p.pid)
 	if err != nil {
@@ -64,5 +103,16 @@ func processGroupTerminationSupported() bool {
 	}
 	defer identity.close()
 	active, err := identity.active()
-	return err == nil && active
+	if err != nil || !active {
+		return false
+	}
+	var info unix.Siginfo
+	err = unix.Waitid(
+		unix.P_PIDFD,
+		identity.pidfd,
+		&info,
+		unix.WSTOPPED|unix.WNOWAIT|unix.WNOHANG,
+		nil,
+	)
+	return err == nil || errors.Is(err, unix.ECHILD)
 }

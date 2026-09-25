@@ -162,10 +162,13 @@ and stderr produced before the failure.
 Cancellation is owned by the local command lifecycle. On Unix-like systems a
 best-effort process-group termination is attempted only on targets with a
 stable process identity and while the direct child handle still owns the
-process; the direct child is also killed after the group signal because it may
-have changed process groups. Other Unix targets conservatively use the direct
-child handle. Once that child is reaped, no former numeric process-group ID is
-used. On Windows, a lifecycle-owned Job Object handle provides the descendant
+process. On Linux, a numeric group signal additionally requires a
+`waitid(WSTOPPED|WNOWAIT)` stopped-state check; if that ownership proof is lost,
+termination uses the pidfd directly and never signals the former PGID. The
+direct child is also killed after a successful group signal because it may have
+changed process groups. Other Unix targets conservatively use the direct child
+handle. Once that child is reaped, no former numeric process-group ID is used.
+On Windows, a lifecycle-owned Job Object handle provides the descendant
 boundary, with direct-child fallback when assignment is unavailable. Job
 assignment happens after `Start`; descendants created during that short
 post-Start attachment window are outside the job boundary. Neither boundary

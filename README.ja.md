@@ -145,7 +145,7 @@ command の非ゼロ終了は結果であり、backend、timeout、cancellation 
 CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
 いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
 
-context error によって local CLI が終了した場合、stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ process group をベストエフォートで停止します。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。他の Unix target は直接の子 handle だけを使います。直接の子を回収した後は、古い process group ID には signal を送りません。
+context error によって local CLI が終了した場合、stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ process group をベストエフォートで停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確かめられない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。他の Unix target は直接の子 handle だけを使います。直接の子を回収した後は、古い process group ID には signal を送りません。
 Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
 Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
 Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。

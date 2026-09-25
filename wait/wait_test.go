@@ -209,6 +209,113 @@ func TestForLogSettlesTerminalErrorAfterMatch(t *testing.T) {
 	}
 }
 
+type delayedTerminalErrorStream struct {
+	reader        io.Reader
+	done          chan struct{}
+	terminalReady chan struct{}
+	terminal      error
+}
+
+func (s *delayedTerminalErrorStream) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+func (s *delayedTerminalErrorStream) Close() error          { return nil }
+func (s *delayedTerminalErrorStream) Done() <-chan struct{} { return s.done }
+func (s *delayedTerminalErrorStream) TerminalError() error {
+	select {
+	case <-s.terminalReady:
+		return s.terminal
+	default:
+		return nil
+	}
+}
+
+func TestForLogPreservesDelayedTerminalErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("terminal CLI failure arrived after settle")
+	stream := &delayedTerminalErrorStream{
+		reader:        strings.NewReader("ready\n"),
+		done:          make(chan struct{}),
+		terminalReady: make(chan struct{}),
+		terminal:      terminal,
+	}
+	time.AfterFunc(time.Millisecond, func() { close(stream.done) })
+	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
+	target := newFakeTarget()
+	target.logs = stream
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want delayed terminal error", err)
+	}
+}
+
+type cancelDelayedTerminalStream struct {
+	data          []byte
+	dataRead      chan struct{}
+	closed        chan struct{}
+	closeOnce     sync.Once
+	done          chan struct{}
+	terminalReady chan struct{}
+	readErr       error
+	terminal      error
+}
+
+func (s *cancelDelayedTerminalStream) Read(p []byte) (int, error) {
+	if len(s.data) > 0 {
+		n := copy(p, s.data)
+		s.data = s.data[n:]
+		close(s.dataRead)
+		return n, nil
+	}
+	<-s.closed
+	return 0, s.readErr
+}
+func (s *cancelDelayedTerminalStream) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		close(s.done)
+	})
+	return nil
+}
+func (s *cancelDelayedTerminalStream) Done() <-chan struct{} { return s.done }
+func (s *cancelDelayedTerminalStream) TerminalError() error {
+	select {
+	case <-s.terminalReady:
+		return s.terminal
+	default:
+		return nil
+	}
+}
+
+func TestForLogJoinsCancellationWithDelayedReaderAndTerminalErrors(t *testing.T) {
+	readErr := errors.New("reader failed after cancellation")
+	terminal := errors.New("terminal failed after cancellation")
+	stream := &cancelDelayedTerminalStream{
+		data:          []byte("ready\n"),
+		dataRead:      make(chan struct{}),
+		closed:        make(chan struct{}),
+		done:          make(chan struct{}),
+		terminalReady: make(chan struct{}),
+		readErr:       readErr,
+		terminal:      terminal,
+	}
+	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
+	target := newFakeTarget()
+	target.logs = stream
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	}()
+	<-stream.dataRead
+	cancel()
+
+	err := <-result
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, readErr) || !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want context, reader, and terminal errors", err)
+	}
+}
+
 func TestForLogPreservesTerminalAndContextErrors(t *testing.T) {
 	terminal := errors.New("terminal CLI failure")
 	done := make(chan struct{})
@@ -250,6 +357,43 @@ func TestForLogPreservesReaderErrorAfterMatch(t *testing.T) {
 	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
 	if !errors.Is(err, readErr) {
 		t.Fatalf("ForLog error = %v, want reader error", err)
+	}
+}
+
+type delayedReaderErrorStream struct {
+	data      []byte
+	closeOnce sync.Once
+	closed    chan struct{}
+	err       error
+}
+
+func (s *delayedReaderErrorStream) Read(p []byte) (int, error) {
+	if len(s.data) > 0 {
+		n := copy(p, s.data)
+		s.data = s.data[n:]
+		return n, nil
+	}
+	<-s.closed
+	return 0, s.err
+}
+
+func (s *delayedReaderErrorStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestForLogPreservesDelayedReaderErrorAfterMatch(t *testing.T) {
+	readErr := errors.New("log reader failed after delayed close")
+	target := newFakeTarget()
+	target.logs = &delayedReaderErrorStream{
+		data:   []byte("ready\n"),
+		closed: make(chan struct{}),
+		err:    readErr,
+	}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want delayed reader error", err)
 	}
 }
 

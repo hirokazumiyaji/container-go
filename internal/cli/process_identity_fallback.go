@@ -15,7 +15,11 @@ func openProcessIdentity(int) (processIdentity, error) {
 func (processIdentity) active() (bool, error) {
 	return false, errStableProcessIdentityUnavailable
 }
-func (processIdentity) stop() error          { return errStableProcessIdentityUnavailable }
+func (processIdentity) stop() error { return errStableProcessIdentityUnavailable }
+func (processIdentity) stopped() (bool, error) {
+	return false, errStableProcessIdentityUnavailable
+}
+func (processIdentity) kill() error          { return errStableProcessIdentityUnavailable }
 func (processIdentity) groupID() (int, bool) { return 0, false }
 func (processIdentity) close()               {}
 func processGroupTerminationSupported() bool { return false }

@@ -19,7 +19,8 @@ import (
 // the stream terminates the direct CLI child. On platforms with process
 // groups it also makes a best-effort attempt to terminate descendants
 // while that child is owned and the platform can prove a stable process
-// identity; this package does not reap those descendants.
+// identity (including Linux's non-reaping stopped-state check); this package
+// does not reap those descendants.
 // Once the direct child is reaped, Close does not signal its former group.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)

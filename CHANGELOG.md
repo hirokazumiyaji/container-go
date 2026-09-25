@@ -26,7 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bound log-stream endpoint draining, settle terminal errors before accepting
   ForLog matches, and use structured timeout evidence instead of workload
   stderr text.
-- Require a stable Unix process identity before group signaling, use Windows
+- Require a stable Unix process identity before group signaling, synchronize
+  Linux group termination with `waitid(WSTOPPED|WNOWAIT)`, use Windows
   WaitForSingleObject for active-child detection, and keep Solaris and illumos
   builds on platform-specific locking with conservative direct-handle
   termination.

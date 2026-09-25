@@ -145,32 +145,65 @@ func finalLifecycleError(
 	callerCtx, waitCtx context.Context,
 	target Target,
 	what string,
-	timeout time.Duration,
+	timeout, interval time.Duration,
 	lastErr error,
 ) error {
-	probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
-	if err := probeCtx.Err(); err != nil {
+	// A successful endpoint/exec/log check can race a short-lived daemon
+	// hiccup. The lifecycle check is still a fail-fast guard for a stopped
+	// container, but transient probe failures get another attempt while the
+	// original wait budget remains. Retries reuse the strategy's poll
+	// interval so a transient daemon failure cannot turn into a faster
+	// probe loop than the check it follows, and only the latest probe cause
+	// is retained so retries cannot grow an error tree.
+	var lastProbeErr error
+	for {
+		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+		if err := probeCtx.Err(); err != nil {
+			probeCancel()
+			return waitContextTerminationError(
+				callerCtx,
+				waitCtx,
+				what,
+				timeout,
+				joinNonNil(lastErr, lastProbeErr, err),
+			)
+		}
+		running, probeErr := target.Running(probeCtx)
+		probeCtxErr := probeCtx.Err()
 		probeCancel()
-		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, err))
+		if probeCtxErr != nil {
+			probeErr = joinNonNil(probeErr, probeCtxErr)
+		}
+		if terminalErr := waitContextTerminationError(
+			callerCtx,
+			waitCtx,
+			what,
+			timeout,
+			joinNonNil(lastErr, lastProbeErr, probeErr),
+		); terminalErr != nil {
+			return terminalErr
+		}
+		if probeErr != nil {
+			lastProbeErr = probeErr
+			if isPermanentCheckError(probeErr) {
+				return wrapWaitCause(what, permanentCause(probeErr), joinNonNil(lastErr, lastProbeErr))
+			}
+			if err := waitForReconnect(waitCtx, interval); err != nil {
+				return waitContextTerminationError(
+					callerCtx,
+					waitCtx,
+					what,
+					timeout,
+					joinNonNil(lastErr, lastProbeErr),
+				)
+			}
+			continue
+		}
+		if !running {
+			return waitStoppedError(what, joinNonNil(lastErr, lastProbeErr))
+		}
+		return nil
 	}
-	running, probeErr := target.Running(probeCtx)
-	probeCancel()
-	if terminalErr := waitContextTerminationError(
-		callerCtx,
-		waitCtx,
-		what,
-		timeout,
-		joinNonNil(lastErr, probeErr),
-	); terminalErr != nil {
-		return terminalErr
-	}
-	if probeErr != nil {
-		return wrapWaitCause(what, probeErr, lastErr)
-	}
-	if !running {
-		return waitStoppedError(what, lastErr)
-	}
-	return nil
 }
 
 func joinNonNil(errs ...error) error {
@@ -242,7 +275,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				return terminalErr
 			}
 			causes := joinNonNil(lastErr, lastProbeErr)
-			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, causes); err != nil {
+			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, causes); err != nil {
 				return err
 			}
 			return terminationErr()

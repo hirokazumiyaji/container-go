@@ -100,14 +100,19 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	startDone := make(chan struct{})
 	var treeMu sync.Mutex
 	var tree processTree
+	var cancelCalled bool
+	var cancelResult terminationResult
 	cmd.Cancel = func() error {
 		<-startDone
 		treeMu.Lock()
 		defer treeMu.Unlock()
+		cancelCalled = true
 		if tree == nil {
-			return os.ErrProcessDone
+			cancelResult = terminationResult{err: os.ErrProcessDone}
+			return cancelResult.err
 		}
-		return tree.terminate(cmd).err
+		cancelResult = tree.terminate(cmd)
+		return cancelResult.err
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -134,12 +139,17 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	if tree != nil {
 		tree.close()
 	}
+	called := cancelCalled
+	result := cancelResult
 	treeMu.Unlock()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
-		if ctx.Err() != nil {
+		// A cancellation callback is not proof that the child was
+		// signaled. Preserve a settled process/CLI error unless the
+		// termination result contains positive delivery evidence.
+		if ctx.Err() != nil && (!called || result.active) {
 			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError
@@ -152,6 +162,9 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 			}
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	if ctx.Err() != nil && called && result.active {
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
 }

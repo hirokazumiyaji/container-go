@@ -6,11 +6,10 @@ import (
 	"errors"
 	"os"
 	"os/exec"
+	"sync"
 
 	"golang.org/x/sys/windows"
 )
-
-const windowsStillActive = 259
 
 // configureProcessTree is intentionally a no-op on Windows. The standard
 // library does not expose a Job Object handle, so this package retains the
@@ -19,6 +18,7 @@ const windowsStillActive = 259
 func configureProcessTree(*exec.Cmd) {}
 
 type windowsProcessTree struct {
+	mu      sync.Mutex
 	process windows.Handle
 }
 
@@ -41,7 +41,12 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 }
 
 func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
-	if t == nil || t.process == 0 {
+	if t == nil {
+		return terminationResult{err: os.ErrProcessDone}
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.process == 0 {
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	active, activeErr := windowsProcessActive(t.process)
@@ -49,8 +54,9 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	terminateErr := windows.TerminateProcess(t.process, 1)
+	activeEvidence := activeErr == nil && active
 	if terminateErr == nil {
-		return terminationResult{active: true, syntheticExit: true}
+		return terminationResult{active: activeEvidence, syntheticExit: activeEvidence}
 	}
 	if cmd == nil || cmd.Process == nil {
 		return terminationResult{err: terminateErr}
@@ -59,7 +65,7 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		if activeErr != nil {
 			terminateErr = errors.Join(terminateErr, activeErr)
 		}
-		return terminationResult{active: true, syntheticExit: true, err: terminateErr}
+		return terminationResult{active: activeEvidence, syntheticExit: activeEvidence, err: terminateErr}
 	} else if errors.Is(killErr, os.ErrProcessDone) {
 		return terminationResult{err: errors.Join(terminateErr, killErr)}
 	} else {
@@ -68,18 +74,23 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 }
 
 func (t *windowsProcessTree) close() {
-	if t != nil && t.process != 0 {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.process != 0 {
 		_ = windows.CloseHandle(t.process)
 		t.process = 0
 	}
 }
 
 func windowsProcessActive(process windows.Handle) (bool, error) {
-	var exitCode uint32
-	if err := windows.GetExitCodeProcess(process, &exitCode); err != nil {
+	event, err := windows.WaitForSingleObject(process, 0)
+	if err != nil {
 		return false, err
 	}
-	return exitCode == windowsStillActive, nil
+	return event == uint32(windows.WAIT_TIMEOUT), nil
 }
 
 func terminateDirectProcessResult(cmd *exec.Cmd) terminationResult {

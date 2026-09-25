@@ -496,6 +496,91 @@ func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
 	assertStreamDirectChildReaped(t, pid)
 }
 
+func TestTerminalErrorRetainsSettledProcessErrorWithoutPositiveTermination(t *testing.T) {
+	exitErr := terminalErrorExitError(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:                 ctx,
+		binary:              "docker",
+		args:                []string{"logs", "--follow", "x"},
+		stderr:              &tailBuffer{},
+		cancelled:           true,
+		terminationSignaled: false,
+	}
+	ps.drainCompleted.Store(true)
+	err := ps.terminalError(exitErr)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != exitErr.ExitCode() {
+		t.Fatalf("terminal error = %v, want settled exit %d CLIError", err, exitErr.ExitCode())
+	}
+
+	processErr := errors.New("wait failed after cancellation callback")
+	ps.waitErr = processErr
+	err = ps.terminalError(processErr)
+	if !errors.Is(err, processErr) {
+		t.Fatalf("terminal error = %v, want settled process error", err)
+	}
+}
+
+func TestTerminalErrorReturnsContextOnlyAfterPositiveTermination(t *testing.T) {
+	exitErr := terminalErrorExitError(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:                 ctx,
+		binary:              "docker",
+		args:                []string{"logs", "--follow", "x"},
+		stderr:              &tailBuffer{},
+		cancelled:           true,
+		terminationSignaled: true,
+	}
+	ps.drainCompleted.Store(true)
+	err := ps.terminalError(exitErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("terminal error = %v, want context cancellation", err)
+	}
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		t.Fatalf("terminal error = %v, unexpectedly retained CLIError", err)
+	}
+}
+
+func TestTerminalErrorDoesNotTurnSuccessfulSettledProcessIntoCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:       ctx,
+		binary:    "docker",
+		args:      []string{"logs", "--follow", "x"},
+		stderr:    &tailBuffer{},
+		cancelled: true,
+	}
+	ps.drainCompleted.Store(true)
+	if err := ps.terminalError(nil); err != nil {
+		t.Fatalf("terminal error = %v, want successful settled process", err)
+	}
+}
+
+func TestStreamPreservesChildStdoutStderrChronology(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell ordering fixture requires a POSIX shell")
+	}
+	binary := writeStub(t, `printf 'first\\n'; sleep 0.02; printf 'second\\n' >&2; printf 'third\\n'; sleep 0.02; printf 'fourth\\n' >&2`)
+	stream, err := (&ExecRunner{Binary: binary}).Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+	data, err := io.ReadAll(stream)
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if got, want := string(data), "first\\nsecond\\nthird\\nfourth\\n"; got != want {
+		t.Fatalf("stream chronology = %q, want %q", got, want)
+	}
+}
+
 func assertStreamDirectChildReaped(t *testing.T, pid int) {
 	t.Helper()
 	if runtime.GOOS == "windows" {

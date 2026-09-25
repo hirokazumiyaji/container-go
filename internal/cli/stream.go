@@ -42,18 +42,15 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	cmd.WaitDelay = 3 * time.Second
 	configureProcessTree(cmd)
 
-	// Keep OS pipes as the command's stdout/stderr. os/exec does not join
-	// a caller-owned *os.File with a copy goroutine, so Wait can reap the
-	// direct child even when the public stream is not being read. Our two
-	// pumps merge those pipes into the public stream asynchronously.
-	stdoutRead, stdoutWrite, err := os.Pipe()
+	// Give the child one ordered OS endpoint for both stdout and stderr.
+	// Separate pipes would be drained by independent goroutines, which can
+	// publish stderr before earlier stdout even when the child wrote in the
+	// opposite order. os/exec recognizes the identical *os.File and passes
+	// the same open file description for fd 1 and fd 2, preserving the
+	// kernel's write order. The single pump keeps a bounded diagnostic tail
+	// while forwarding the merged child output.
+	childRead, childWrite, err := os.Pipe()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
-	}
-	stderrRead, stderrWrite, err := os.Pipe()
-	if err != nil {
-		_ = stdoutRead.Close()
-		_ = stdoutWrite.Close()
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 	pr, pw := io.Pipe()
@@ -65,14 +62,17 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		args:       append([]string(nil), args...),
 		output:     pw,
 		stderr:     &tailBuffer{},
-		stdoutRead: stdoutRead,
-		stderrRead: stderrRead,
+		// Keep both names as aliases for package-local compatibility;
+		// they intentionally refer to the same ordered endpoint.
+		stdoutRead: childRead,
+		stderrRead: childRead,
 		startDone:  make(chan struct{}),
 		waitDone:   make(chan struct{}),
 		pumpsDone:  make(chan struct{}),
 	}
-	cmd.Stdout = stdoutWrite
-	cmd.Stderr = stderrWrite
+	stream.ordered = newStreamOutput(pw, stream.stderr, &stream.terminalDrain)
+	cmd.Stdout = childWrite
+	cmd.Stderr = childWrite
 	// Cancel closes the reader as well as killing the process tree. This
 	// is the callback used by exec.CommandContext's context watcher.
 	cmd.Cancel = stream.cancel
@@ -80,20 +80,17 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		// Start does not return a usable process on failure. Close the
 		// ownership barrier anyway so no lifecycle caller can wait forever.
 		close(stream.startDone)
-		_ = stdoutWrite.Close()
-		_ = stderrWrite.Close()
+		_ = childWrite.Close()
 		_ = pr.Close()
 		_ = pw.Close()
 		stream.closeSourceFiles()
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 
-	// The child owns inherited copies of the write ends. Close the
-	// parent copies explicitly; they remain local to this function and are
-	// deliberately not stored in processStream, so cancellation can never
-	// race ownership of them.
-	_ = stdoutWrite.Close()
-	_ = stderrWrite.Close()
+	// The child owns the inherited write end. Close the parent's copy
+	// explicitly; it remains local to this function and is deliberately not
+	// stored in processStream, so cancellation cannot race its ownership.
+	_ = childWrite.Close()
 
 	var tree processTree
 	if hooks.terminate != nil {
@@ -123,8 +120,11 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	}
 
 	stream.pumpWG.Add(2)
-	go stream.pump(stdoutRead, false)
-	go stream.pump(stderrRead, true)
+	go stream.pump(childRead, true)
+	go func() {
+		stream.ordered.run()
+		stream.pumpWG.Done()
+	}()
 	go func() {
 		stream.pumpWG.Wait()
 		stream.outputCloseOnce.Do(func() { _ = stream.output.Close() })
@@ -140,16 +140,17 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 
 type processStream struct {
 	io.ReadCloser
-	cmd    *exec.Cmd
-	ctx    context.Context
-	binary string
-	args   []string
-	output *io.PipeWriter
-	stderr *tailBuffer
+	cmd     *exec.Cmd
+	ctx     context.Context
+	binary  string
+	args    []string
+	output  *io.PipeWriter
+	stderr  *tailBuffer
+	ordered *streamOutput
 
-	// stdoutRead and stderrRead belong to the stream after construction.
-	// The matching write ends are local to Stream and are never stored
-	// here; this keeps endpoint ownership immutable across cancellation.
+	// stdoutRead and stderrRead are aliases for the single ordered child
+	// endpoint. The matching write end is local to Stream and is never
+	// stored here, keeping endpoint ownership immutable across cancellation.
 	stdoutRead *os.File
 	stderrRead *os.File
 
@@ -176,10 +177,19 @@ type processStream struct {
 	terminalDrain   atomic.Bool
 	drainCompleted  atomic.Bool
 
-	terminateOnce        sync.Once
-	terminateErr         error
-	terminateTree        func(*exec.Cmd) terminationResult
-	closeTree            func()
+	terminateOnce sync.Once
+	terminateErr  error
+	terminateTree func(*exec.Cmd) terminationResult
+	closeTree     func()
+	// terminationSignaled records positive evidence that the cancellation
+	// callback actually signaled the child. A callback can run after the
+	// child has already settled, so cancellation alone is not enough to
+	// replace its process result with a context error.
+	terminationSignaled bool
+	// syntheticTermination is retained for platform-specific callers and
+	// older package tests. It is a positive signal marker for APIs such as
+	// Windows TerminateProcess, but is not required for the general
+	// cancellation decision.
 	syntheticTermination bool
 
 	closeOnce sync.Once
@@ -191,28 +201,78 @@ type processStream struct {
 	ctxErr    error
 }
 
-// streamOutput retains a rolling stderr diagnostic while forwarding the
-// bytes to the public stream. Once terminalDrain is set, a closed public
-// writer is an intentional signal to stop forwarding and continue reading
-// stderr so the diagnostic tail can be completed.
+// streamOutput retains a bounded diagnostic tail while forwarding the
+// ordered child stream. The child-facing pipe merges stdout and stderr so
+// chronology is preserved; the tail is intentionally retained for the
+// terminal CLI diagnostic even though its source is the merged stream. A
+// bounded queue decouples child draining from public-reader backpressure, so
+// a terminal child can exit and release its stderr even when nobody is
+// currently reading the public stream.
 type streamOutput struct {
 	output        io.Writer
 	stderr        *tailBuffer
 	terminalDrain *atomic.Bool
+	chunks        chan []byte
+	workerDone    chan struct{}
+	closeInput    sync.Once
+}
+
+const orderedOutputQueue = 32
+
+func newStreamOutput(
+	output io.Writer,
+	stderr *tailBuffer,
+	terminalDrain *atomic.Bool,
+) *streamOutput {
+	return &streamOutput{
+		output:        output,
+		stderr:        stderr,
+		terminalDrain: terminalDrain,
+		chunks:        make(chan []byte, orderedOutputQueue),
+		workerDone:    make(chan struct{}),
+	}
 }
 
 func (w *streamOutput) Write(p []byte) (int, error) {
 	if _, err := w.stderr.Write(p); err != nil {
 		return 0, err
 	}
-	n, err := w.output.Write(p)
-	if err != nil && w.terminalDrain.Load() {
+	if w.terminalDrain.Load() {
 		// The terminal process has already exited. The public reader is
-		// no longer part of the diagnostic path, so a closed io.Pipe must
-		// not make io.Copy stop before the remaining stderr is captured.
+		// no longer part of the diagnostic path, so keep consuming the
+		// child endpoint without adding more queued output.
 		return len(p), nil
 	}
-	return n, err
+	chunk := append([]byte(nil), p...)
+	select {
+	case <-w.workerDone:
+		// The public side has been closed. The tail above remains useful
+		// for TerminalError, and the child must not be held hostage by a
+		// blocked public reader.
+		return len(p), nil
+	case w.chunks <- chunk:
+		return len(p), nil
+	default:
+		// Preserve the bounded-memory guarantee for a caller that never
+		// reads. The diagnostic tail still receives every subsequent byte.
+		// A live consumer normally drains this queue immediately.
+		return len(p), nil
+	}
+}
+
+func (w *streamOutput) run() {
+	defer close(w.workerDone)
+	for chunk := range w.chunks {
+		if _, err := w.output.Write(chunk); err != nil {
+			// Drain/Close deliberately close the public pipe. The child
+			// reader will continue filling the bounded diagnostic tail.
+			return
+		}
+	}
+}
+
+func (w *streamOutput) close() {
+	w.closeInput.Do(func() { close(w.chunks) })
 }
 
 func (s *processStream) pump(r *os.File, stderr bool) {
@@ -220,13 +280,20 @@ func (s *processStream) pump(r *os.File, stderr bool) {
 	defer func() { _ = r.Close() }()
 	var output io.Writer = s.output
 	if stderr {
-		output = &streamOutput{
-			output:        s.output,
-			stderr:        s.stderr,
-			terminalDrain: &s.terminalDrain,
+		if s.ordered == nil {
+			output = &streamOutput{
+				output:        s.output,
+				stderr:        s.stderr,
+				terminalDrain: &s.terminalDrain,
+			}
+		} else {
+			output = s.ordered
 		}
 	}
 	_, _ = io.Copy(output, r)
+	if s.ordered != nil {
+		s.ordered.close()
+	}
 }
 
 func (s *processStream) wait() {
@@ -283,7 +350,10 @@ func (s *processStream) requestTermination(cancelled bool) error {
 			result = s.terminateTree(s.cmd)
 		}
 		s.terminateErr = result.err
-		if cancelled && result.active && result.syntheticExit {
+		if result.active {
+			s.terminationSignaled = true
+		}
+		if cancelled && result.syntheticExit {
 			s.syntheticTermination = true
 		}
 	})
@@ -300,10 +370,13 @@ func (s *processStream) requestTermination(cancelled bool) error {
 
 func (s *processStream) closeSourceFiles() {
 	s.sourceCloseOnce.Do(func() {
+		var previous *os.File
 		for _, f := range []*os.File{s.stdoutRead, s.stderrRead} {
-			if f != nil {
-				_ = f.Close()
+			if f == nil || f == previous {
+				continue
 			}
+			_ = f.Close()
+			previous = f
 		}
 	})
 }
@@ -375,7 +448,7 @@ func (s *processStream) terminalError(waitErr error) error {
 	s.stateMu.Lock()
 	closed := s.closed
 	cancelled := s.cancelled
-	syntheticTermination := s.syntheticTermination
+	terminationSignaled := s.terminationSignaled || s.syntheticTermination
 	ctxErr := s.ctxErr
 	s.stateMu.Unlock()
 	if closed {
@@ -383,13 +456,22 @@ func (s *processStream) terminalError(waitErr error) error {
 	}
 	var exitErr *exec.ExitError
 	hasExit := errors.As(waitErr, &exitErr)
-	if cancelled && syntheticTermination {
+	// A context callback is not itself evidence that the child was
+	// terminated. Only a positive signal result may replace an already
+	// settled process/CLI failure (or a successful exit) with the context
+	// cause. This matters when cancellation races a process that has
+	// already exited, or when the platform kill operation reports
+	// os.ErrProcessDone.
+	if cancelled && terminationSignaled {
 		return s.contextError()
 	}
-	if cancelled && (!hasExit || exitErr.ExitCode() < 0) {
-		return s.contextError()
-	}
+
 	if waitErr == nil {
+		if cancelled {
+			// The process settled successfully after the callback ran but
+			// before it could signal the child. Preserve that result.
+			return nil
+		}
 		if ctxErr != nil || s.ctx.Err() != nil {
 			return s.contextError()
 		}
@@ -411,7 +493,10 @@ func (s *processStream) terminalError(waitErr error) error {
 		terminalErr = fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), waitErr)
 	}
 	if ctxErr != nil || s.ctx.Err() != nil {
-		return errors.Join(s.contextError(), terminalErr)
+		// Keep the settled process error matchable (especially *CLIError)
+		// while still exposing the caller's cancellation cause. The
+		// cancellation callback alone never discards terminalErr.
+		return errors.Join(terminalErr, s.contextError())
 	}
 	if drainErr != nil {
 		return errors.Join(terminalErr, fmt.Errorf("%s %s: stream drain: %w", s.binary, strings.Join(s.args, " "), drainErr))
@@ -445,9 +530,10 @@ func (s *processStream) readError(readErr error) error {
 	s.stateMu.Lock()
 	closed := s.closed
 	cancelled := s.cancelled
+	terminationSignaled := s.terminationSignaled || s.syntheticTermination
 	ctxErr := s.ctxErr
 	s.stateMu.Unlock()
-	if cancelled || ctxErr != nil || s.ctx.Err() != nil {
+	if (cancelled && terminationSignaled) || (!cancelled && (ctxErr != nil || s.ctx.Err() != nil)) {
 		return s.contextError()
 	}
 	if closed {

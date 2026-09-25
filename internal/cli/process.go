@@ -2,10 +2,12 @@ package cli
 
 import "os/exec"
 
-// terminationResult records whether termination was actually signaled to
-// the direct child. syntheticExit is reserved for platforms whose kill API
-// reports a synthetic positive exit status, such as Windows
-// TerminateProcess; it must not suppress a genuine positive Unix exit.
+// terminationResult records positive ownership/termination evidence for the
+// direct child. active is deliberately conservative: a direct kill fallback
+// that could not prove the child was active does not set it. syntheticExit is
+// reserved for platforms whose kill API reports a synthetic positive exit
+// status, such as Windows TerminateProcess; it must not suppress a genuine
+// positive Unix exit.
 type terminationResult struct {
 	active        bool
 	syntheticExit bool

@@ -34,6 +34,21 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrCopySourceUnsupported reports a host source that is not a regular
+// file or directory. CopyToContainer rejects source symlinks and symlink
+// entries in source directories rather than copying devices, sockets, or
+// FIFOs.
+var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or directory")
+
+// ErrCopySourceTooLarge reports a source whose regular-file bytes exceed
+// MaxCopyToContainerSize. The limit applies to a directory's total
+// snapshot size as well as to a single file.
+var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
+
+// ErrCopySourceChanged reports that the host path changed between the
+// type/identity check and opening it for the private snapshot.
+var ErrCopySourceChanged = errors.New("copy source changed while staging")
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {

@@ -189,6 +189,10 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   stdin データとしてのみ渡ります。
 - 環境変数はパーミッション 0600 の一時 env ファイル経由で渡すため、秘密が
   プロセス一覧(`ps`)に現れません。
+- `CopyToContainer` は通常ファイルとディレクトリを専用のステージングパスへ
+  スナップショットしてから backend を呼び出します。ソースのシンボリックリンクや
+  特殊ファイルは拒否し、通常ファイルの合計サイズは `MaxCopyToContainerSize`
+  （64 MiB）以下に制限します。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry
   login`(macOS Keychain 保存)を使ってください。
 

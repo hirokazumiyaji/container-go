@@ -225,6 +225,10 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   only as validated stdin data.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
+- `CopyToContainer` snapshots regular files and directories into a
+  private staging path before invoking the backend. Source symlinks and
+  special files are rejected, and the aggregate regular-file payload is
+  limited to `MaxCopyToContainerSize` (64 MiB).
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
 

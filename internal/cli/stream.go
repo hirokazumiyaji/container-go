@@ -2,9 +2,9 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -12,46 +12,150 @@ import (
 )
 
 // Streamer starts a long-lived CLI invocation (e.g. `logs --follow`)
-// and exposes its stdout as a stream. Closing the stream terminates the
-// child process.
+// and exposes its combined stdout/stderr as a stream. A terminal
+// non-zero process status is returned by Read after Stream returns.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
 
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
-	cmd := exec.CommandContext(ctx, r.binary(), args...)
+	bin := r.binary()
+	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = 3 * time.Second
-	// One pipe carries both output streams: `docker logs` splits the
-	// container's stdout/stderr across the CLI's two streams.
-	pr, pw, err := os.Pipe()
-	if err != nil {
-		return nil, err
+	pr, pw := io.Pipe()
+	stream := &processStream{
+		ReadCloser: pr,
+		cmd:        cmd,
+		ctx:        ctx,
+		binary:     bin,
+		args:       append([]string(nil), args...),
+		pipeWriter: pw,
+		waitDone:   make(chan struct{}),
 	}
+	// Keep the two streams in the same public stream while retaining a
+	// bounded stderr diagnostic for a terminal CLIError.
 	cmd.Stdout = pw
-	cmd.Stderr = pw
+	cmd.Stderr = io.MultiWriter(&stream.stderr, pw)
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
-		return nil, fmt.Errorf("container %s: %w", strings.Join(args, " "), err)
+		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
-	// The child holds its own copy of the write end; releasing ours
-	// lets the reader see EOF when the child exits.
-	_ = pw.Close()
-	return &processStream{ReadCloser: pr, cmd: cmd}, nil
+	go stream.wait()
+	return stream, nil
 }
 
 type processStream struct {
 	io.ReadCloser
-	cmd  *exec.Cmd
-	once sync.Once
+	cmd        *exec.Cmd
+	ctx        context.Context
+	binary     string
+	args       []string
+	pipeWriter *io.PipeWriter
+	waitDone   chan struct{}
+
+	waitOnce  sync.Once
+	closeOnce sync.Once
+	mu        sync.Mutex
+	waitErr   error
+	closed    bool
+	stderr    tailBuffer
 }
 
+func (s *processStream) wait() {
+	s.waitOnce.Do(func() {
+		err := s.cmd.Wait()
+		s.mu.Lock()
+		s.waitErr = err
+		s.mu.Unlock()
+		_ = s.pipeWriter.Close()
+		close(s.waitDone)
+	})
+	<-s.waitDone
+}
+
+func (s *processStream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := s.ReadCloser.Read(p)
+	if err == nil {
+		return n, nil
+	}
+	if terminal := s.TerminalError(); terminal != nil {
+		return n, terminal
+	}
+	return n, err
+}
+
+// TerminalError returns a terminal CLI error, if the process has ended
+// with one. It deliberately returns nil for a clean EOF and for an
+// intentional Close/context cancellation.
+func (s *processStream) TerminalError() error {
+	s.wait()
+	s.mu.Lock()
+	waitErr := s.waitErr
+	closed := s.closed
+	s.mu.Unlock()
+	if closed || s.ctx.Err() != nil {
+		if s.ctx.Err() != nil && !closed {
+			return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), s.ctx.Err())
+		}
+		return nil
+	}
+	if waitErr == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(waitErr, &exitErr) {
+		return &CLIError{
+			Binary:   s.binary,
+			Args:     s.args,
+			ExitCode: exitErr.ExitCode(),
+			Stderr:   s.stderr.String(),
+		}
+	}
+	return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), waitErr)
+}
+
+func (s *processStream) Done() <-chan struct{} { return s.waitDone }
+
 func (s *processStream) Close() error {
-	s.once.Do(func() {
-		_ = s.cmd.Process.Kill()
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		s.closed = true
+		s.mu.Unlock()
+		if s.cmd.Process != nil {
+			_ = s.cmd.Process.Kill()
+		}
 		_ = s.ReadCloser.Close()
-		// Reap the child; the error is the expected kill signal.
-		_ = s.cmd.Wait()
+		s.wait()
 	})
 	return nil
+}
+
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= maxStderr {
+		b.data = append(b.data[:0], p[len(p)-maxStderr:]...)
+		return len(p), nil
+	}
+	if overflow := len(b.data) + len(p) - maxStderr; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.data...))
 }

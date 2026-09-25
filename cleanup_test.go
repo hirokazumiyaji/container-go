@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
 	"strings"
@@ -117,12 +118,35 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
+	if args[0] == "inspect" {
+		var containers []struct {
+			ID     string `json:"id"`
+			Config struct {
+				Labels map[string]string `json:"labels"`
+			} `json:"configuration"`
+			Status struct {
+				State string `json:"state"`
+			} `json:"status"`
+		}
+		if err := json.Unmarshal([]byte(l.lsJSON), &containers); err != nil {
+			return nil, nil, err
+		}
+		for _, container := range containers {
+			if container.ID == args[len(args)-1] {
+				data, err := json.Marshal([]any{container})
+				if err != nil {
+					return nil, nil, err
+				}
+				return data, nil, nil
+			}
+		}
+	}
 	return l.fakeRunner.Run(ctx, args...)
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"bbbbbbbbbbbbbbbb"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 

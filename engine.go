@@ -24,6 +24,22 @@ type engineInfo struct {
 	bound []boundPort
 }
 
+// pruneCandidate retains the identity observed during a list operation.
+// Apple deletes are name-addressed, so a later inspect must prove that the
+// same generation, ownership marker, and lifecycle state is still present.
+type pruneCandidate struct {
+	id         string
+	creation   string
+	state      State
+	managed    bool
+	reuseGroup string
+}
+
+func usesNameAddressedDeletes(eng engine) bool {
+	capability, ok := eng.(interface{ nameAddressedDeletes() bool })
+	return ok && capability.nameAddressedDeletes()
+}
+
 type boundPort struct {
 	containerPort int
 	proto         string
@@ -57,15 +73,15 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the IDs of
-	// stopped containers this library created.
-	parseStoppedManaged(data []byte) ([]string, error)
+	// parseStoppedManaged extracts stopped managed containers and retains
+	// the list-time identity needed by a guarded name delete.
+	parseStoppedManaged(data []byte) ([]pruneCandidate, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
-	// output that carry the given reuse group.
-	parseReuseGroupIDs(data []byte, group string) ([]string, error)
+	// parseReuseGroupIDs extracts containers carrying the requested group,
+	// with the identity metadata needed for a guarded delete.
+	parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error)
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool

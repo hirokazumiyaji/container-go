@@ -2,6 +2,7 @@ package container
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -79,6 +80,25 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestReaperRejectsDockerNameFallback(t *testing.T) {
+	r := newReaper("unused", "rm")
+	if err := r.register("mutable-name", "0123456789abcdef"); err == nil {
+		t.Fatal("Docker reaper accepted a mutable name fallback")
+	}
+}
+
+func TestReaperRejectsOwnedEntryWithoutSession(t *testing.T) {
+	r := newReaper("unused", "delete")
+	err := r.registerEntry(reaperEntry{
+		id:           "owned-review",
+		creation:     "0123456789abcdef",
+		requireOwner: true,
+	})
+	if err == nil {
+		t.Fatal("owned reaper entry was accepted without a session")
+	}
+}
+
 func TestReaperAcceptsFullDockerID(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "rm")
@@ -124,14 +144,49 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
+	if !strings.Contains(reaperScript, "-k -n -t 30 -w") {
+		t.Error("reaper lockf calls must request a writable descriptor")
+	}
+	if !strings.Contains(reaperScript, `[ -n "$REAPER_SESSION" ] || exit 0`) {
+		t.Error("owned reaper entries must fail closed without a session")
+	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
 	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
 		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || exit 0`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
+}
+
+func TestReaperScriptRejectsDockerNameWithoutImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "docker")
+	logPath := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(record string) {
+		t.Helper()
+		cmd := exec.Command(
+			"/bin/sh", "-c", reaperScript, "containergo-reaper",
+			bin, "rm", breQuote(creationLabel), breQuote(managedLabel), breQuote(sessionLabel), "1", "1",
+		)
+		cmd.Stdin = strings.NewReader(record)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("reaper protocol: %v (%s)", err, output)
+		}
+	}
+	run("+\tmutable-name\t\n")
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "rm --force mutable-name") {
+		t.Fatalf("reaper deleted a mutable Docker name: %q", data)
+	}
+	uid := strings.Repeat("a", 64)
+	run("+\t" + uid + "\t\n")
+	waitForLogLines(t, logPath, "rm --force "+uid)
 }
 
 func TestBreQuoteEscapesLabelKey(t *testing.T) {
@@ -250,8 +305,11 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "rm")
-	if err := r.register("ctr", creation); err != nil {
-		t.Fatalf("register: %v", err)
+	if err := r.registerPending("ctr", creation); err != nil {
+		t.Fatalf("pending register: %v", err)
+	}
+	if err := r.promotePendingToDockerID("ctr", creation, uid); err != nil {
+		t.Fatalf("promote: %v", err)
 	}
 	r.closeStdin()
 	waitForLogLines(t, logPath, "rm --force "+uid)

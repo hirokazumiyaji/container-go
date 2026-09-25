@@ -145,17 +145,44 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 }
 
+func TestDockerPruneListsRequestFullIDs(t *testing.T) {
+	e := dockerEngine{}
+	for _, args := range [][]string{e.listArgs(), e.listReuseGroupArgs("group")} {
+		if !slices.Contains(args, "--no-trunc") {
+			t.Fatalf("list args = %v, want --no-trunc", args)
+		}
+		if !slices.Contains(args, "--format") || !slices.Contains(args, "{{.ID}}") {
+			t.Fatalf("list args = %v, want ID format", args)
+		}
+	}
+}
+
+func TestDockerParseStoppedManagedRejectsShortID(t *testing.T) {
+	if _, err := (dockerEngine{}).parseStoppedManaged([]byte("one\n")); err == nil {
+		t.Fatal("short Docker ID was accepted as a prune target")
+	}
+	if _, err := (dockerEngine{}).parseReuseGroupIDs([]byte("one\n"), "group"); err == nil {
+		t.Fatal("short Docker ID was accepted as a reuse-group prune target")
+	}
+}
+
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {
 		t.Errorf("listArgs = %v, want daemon-side filters", got)
 	}
-	ids, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	one := strings.Repeat("1", 64)
+	two := strings.Repeat("2", 64)
+	candidates, err := e.parseStoppedManaged([]byte(one + "\n" + two + "\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []string{"one", "two"}) {
-		t.Errorf("ids = %v", ids)
+	got := make([]string, 0, len(candidates))
+	for _, candidate := range candidates {
+		got = append(got, candidate.id)
+	}
+	if !slices.Equal(got, []string{one, two}) {
+		t.Errorf("ids = %v", got)
 	}
 }
 

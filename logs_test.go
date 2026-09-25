@@ -2,11 +2,14 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // streamRunner adds a canned Stream implementation to fakeRunner.
@@ -89,6 +92,64 @@ func TestFollowLogsStreamsAndPropagatesClose(t *testing.T) {
 	if !f.closed {
 		t.Error("Close not propagated to the underlying stream")
 	}
+}
+
+type reviewTerminalStream struct {
+	err error
+}
+
+func (s *reviewTerminalStream) Read([]byte) (int, error) { return 0, s.err }
+func (s *reviewTerminalStream) Close() error             { return nil }
+
+func (s *reviewTerminalStream) TerminalError() error { return s.err }
+
+type reviewTerminalStreamRunner struct {
+	*fakeRunner
+	args []string
+}
+
+func (r *reviewTerminalStreamRunner) Stream(_ context.Context, args ...string) (io.ReadCloser, error) {
+	r.args = append([]string(nil), args...)
+	return &reviewTerminalStream{err: &cli.CLIError{Binary: "container", Args: args, ExitCode: 7, Stderr: "logs failed"}}, nil
+}
+
+func TestReviewFollowLogsPropagatesTerminalCLIError(t *testing.T) {
+	base := newTestRunner()
+	runner := &reviewTerminalStreamRunner{fakeRunner: base}
+	ctr := runTestContainer(t, runner)
+	stream, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = stream.Read(make([]byte, 1))
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("FollowLogs read error = %v, want terminal CLIError", err)
+	}
+	_ = stream.Close()
+}
+
+func TestFollowLogsContextCancellationReleasesNameLock(t *testing.T) {
+	old := nameLockStateRootOverride
+	nameLockStateRootOverride = t.TempDir()
+	t.Cleanup(func() { nameLockStateRootOverride = old })
+
+	f := &streamRunner{fakeRunner: newTestRunner(), streamData: "streamed"}
+	ctr := runTestContainer(t, f)
+	ctx, cancel := context.WithCancel(context.Background())
+	stream, err := ctr.FollowLogs(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), time.Second)
+	defer lockCancel()
+	unlock, err := lockName(lockCtx, ctr.id)
+	if err != nil {
+		t.Fatalf("name lock was not released after context cancellation: %v", err)
+	}
+	unlock()
+	_ = stream.Close()
 }
 
 func TestFollowLogsRequiresStreamingRunner(t *testing.T) {

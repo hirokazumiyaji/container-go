@@ -45,8 +45,10 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return c.withVerifiedOperationTarget(qCtx, true, func(target string, _ *engineInfo) error {
+		_, _, err := c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
+		return c.classify(ctx, err)
+	})
 }
 
 // CopyFileFromContainer copies one file out of the running container
@@ -62,12 +64,20 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err != nil {
 		return nil, err
 	}
-	dst := filepath.Join(dir, filepath.Base(containerPath))
+	base := filepath.Base(filepath.Clean(containerPath))
+	if base == "." || base == ".." || base == string(filepath.Separator) {
+		_ = os.RemoveAll(dir)
+		return nil, fmt.Errorf("copy file from container %q: invalid file name", containerPath)
+	}
+	dst := filepath.Join(dir, base)
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
+	if err := c.withVerifiedOperationTarget(qCtx, true, func(target string, _ *engineInfo) error {
+		_, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...)
+		return c.classify(ctx, err)
+	}); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, c.classify(ctx, err)
+		return nil, err
 	}
 	info, err := os.Stat(dst)
 	if err != nil {

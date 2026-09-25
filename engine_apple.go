@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -26,7 +27,40 @@ func (appleEngine) checkConfig(*config) error { return nil }
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {
-	return cli.Probe{Args: []string{"system", "status"}, Hint: "run `container system start`"}
+	return cli.Probe{
+		Args:          []string{"system", "status"},
+		Hint:          "run `container system start`",
+		IsUnavailable: appleProbeUnavailable,
+	}
+}
+
+func appleProbeUnavailable(err error) bool {
+	if cli.IsNonLivenessError(err) {
+		return false
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	if len(cliErr.Args) < 2 || strings.ToLower(cliErr.Args[0]) != "system" || strings.ToLower(cliErr.Args[1]) != "status" {
+		return false
+	}
+	stdout, stderr, ok := cli.DiagnosticText(err)
+	if !ok {
+		return false
+	}
+	text := strings.ToLower(stdout + "\n" + stderr)
+	for _, fragment := range []string{
+		"xpc connection", "container-apiserver", "plugins are unavailable",
+		"start the container system services", "system is not running",
+		"system service is not running", "apiserver is not running",
+		"not registered with launchd", "connection refused", "backend down", "daemon unavailable",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
@@ -35,6 +69,8 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 }
 
 func (appleEngine) parseRunID([]byte) string { return "" }
+
+func (appleEngine) nameAddressedDeletes() bool { return true }
 
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
@@ -121,19 +157,28 @@ func (appleEngine) listArgs() []string {
 }
 
 // parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter.
-func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
+// label or status filter. It retains the list-time generation and state
+// so a later name-addressed delete can be revalidated under the name lock.
+func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[managedLabel] == "true" && c.Status.State == string(StateStopped) {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[managedLabel] != "true" || c.Status.State != string(StateStopped) {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    true,
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
 
 func (appleEngine) imageInspectArgs(image, _ string) []string {
@@ -211,18 +256,26 @@ func (appleEngine) listReuseGroupArgs(string) []string {
 	return []string{"ls", "--all", "--format", "json"}
 }
 
-func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
+func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var ids []string
+	var candidates []pruneCandidate
 	for _, c := range containers {
-		if c.Configuration.Labels[reuseGroupLabel] == group {
-			ids = append(ids, c.ID)
+		labels := c.Configuration.Labels
+		if labels[reuseGroupLabel] != group {
+			continue
 		}
+		candidates = append(candidates, pruneCandidate{
+			id:         c.ID,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			managed:    labels[managedLabel] == "true",
+			reuseGroup: labels[reuseGroupLabel],
+		})
 	}
-	return ids, nil
+	return candidates, nil
 }
 
 // nameConflict matches Apple Container's duplicate-name wording.

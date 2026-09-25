@@ -126,16 +126,20 @@ func TestRunForLogSkipsInitialInspect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + logs stream; no container inspect.
-	if got := r.count(); got != 3 {
-		t.Fatalf("after ForLog Run: calls = %d, want 3", got)
+	// image inspect + run + generation-verifying inspect + logs stream.
+	if got := r.count(); got != 4 {
+		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	inspectCount := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			t.Fatalf("unexpected container inspect during ForLog Run: %v", r.args)
+			inspectCount++
 		}
+	}
+	if inspectCount != 1 {
+		t.Fatalf("container inspect calls = %d, want one generation check: %v", inspectCount, r.args)
 	}
 }
 

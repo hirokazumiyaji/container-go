@@ -4,7 +4,9 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -80,6 +82,18 @@ const (
 	StateUnknown  State = "unknown"
 )
 
+// knownStableState is the allow-list for name-addressed operations. A
+// backend that grows a new state must be reviewed before destructive or
+// name-locked work is allowed to act on it.
+func knownStableState(state State) bool {
+	switch state {
+	case StateRunning, StateStopped, StateCreated:
+		return true
+	default:
+		return false
+	}
+}
+
 // Container is a handle to a container created by Run.
 type Container struct {
 	id        string
@@ -100,6 +114,15 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// reapers contains the pending/active watchdog registrations for this
+	// handle. A Docker handle normally has one immutable registration;
+	// keeping the slice makes the create-to-registration transition
+	// explicit and lets failed or replaced lifecycles remove every entry.
+	reapers []*reaperRegistration
+	// reaper is retained as a package-local compatibility alias for tests
+	// and older in-package helpers. New code should use reapers.
+	reaper   *reaperRegistration
+	reaperMu sync.Mutex
 
 	mu        sync.Mutex
 	info      *engineInfo // cached first inspect; immutable fields only
@@ -113,7 +136,9 @@ type Container struct {
 func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
 	unlock := func() {}
 	if cfg.eng.name() == "apple" {
-		unlock, err = lockName(ctx, cfg.name)
+		lockCtx, lockCancel := context.WithTimeout(ctx, queryTimeout)
+		unlock, err = lockName(lockCtx, cfg.name)
+		lockCancel()
 		if err != nil {
 			return nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, err)
 		}
@@ -121,6 +146,55 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 	defer unlock()
 	stdout, _, err = cfg.runner.Run(ctx, args...)
 	return stdout, true, err
+}
+
+// preRegisterContainer records the name and generation before the backend
+// can acknowledge a create. Registration is best-effort insurance, but a
+// successful registration is retained on the handle so a later termination
+// can cancel it atomically with the successful delete.
+func preRegisterContainer(cfg *config) (*reaperRegistration, string) {
+	if keepContainers() || !validCreationID(cfg.creation) {
+		return nil, ""
+	}
+	er, ok := cfg.runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return nil, ""
+	}
+	binary := er.ExternalBinary()
+	if binary == "" {
+		binary = cfg.eng.binary()
+	}
+	reg, err := preRegisterWithGlobalReaperRegistration(binary, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, sessionID())
+	if err != nil {
+		log.Printf("container-go: reaper pre-registration failed (binary=%q): %v", binary, err)
+		return nil, binary
+	}
+	return reg, binary
+}
+
+func completeContainerReaperRegistration(cfg *config, reg *reaperRegistration, binary string, uid string) {
+	if reg == nil || binary == "" {
+		return
+	}
+	if cfg.eng.name() == "docker" && validImmutableContainerID(cfg.eng, uid) {
+		uidEntry := reaperEntry{id: uid}
+		// Promotion can fail after the in-memory name record has been
+		// replaced by the immutable one. Retain the alternate until the
+		// handoff succeeds so reuse cancellation removes either form.
+		reg.alternate = uidEntry
+		if err := promotePendingDockerIDWithGlobalReaper(binary, cfg.name, cfg.creation, uid); err != nil {
+			log.Printf("container-go: reaper immutable-ID promotion failed (binary=%q): %v", binary, err)
+			return
+		}
+		reg.entry = uidEntry
+		reg.alternate = reaperEntry{}
+		return
+	}
+	if err := completePendingWithGlobalReaperFor(binary, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation); err != nil {
+		log.Printf("container-go: reaper create-completion update failed (binary=%q): %v", binary, err)
+		return
+	}
+	reg.entry.pending = false
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -180,14 +254,37 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+	// Register before the backend create. If this process dies after the
+	// CLI has created the object but before Run receives stdout, the
+	// pending entry still gives the external reaper a bounded chance to
+	// observe and remove this exact generation.
+	reaperRegistration, reaperBinary := preRegisterContainer(cfg)
 	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		if !attempted {
+			if reaperRegistration != nil {
+				unregisterWithGlobalReaper(reaperRegistration)
+			}
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr == nil && reaperRegistration != nil {
+			// A name conflict, an already-gone object, or a verified
+			// cleanup leaves no owned generation for the watchdog.
+			unregisterWithGlobalReaper(reaperRegistration)
+		}
 		return nil, withCleanupError(classified, cleanupErr)
+	}
+
+	uid := cfg.eng.parseRunID(stdout)
+	if cfg.eng.name() == "docker" && !validImmutableContainerID(cfg.eng, uid) {
+		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
+		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
+		if cleanupErr == nil && reaperRegistration != nil {
+			unregisterWithGlobalReaper(reaperRegistration)
+		}
+		return nil, withCleanupError(identityErr, cleanupErr)
 	}
 
 	c := &Container{
@@ -197,21 +294,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
 	}
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
-		}
-		if c.uid != "" {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
-		} else {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
-		}
+	if reaperRegistration != nil {
+		c.addReaperRegistration(reaperRegistration)
+		completeContainerReaperRegistration(cfg, reaperRegistration, reaperBinary, c.uid)
 	}
 
 	for _, f := range cfg.files {
@@ -238,6 +325,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	if keepContainers() {
+		return cause
+	}
 	if c.reused {
 		cleanupErr := fmt.Errorf("container %s is a shared reuse generation; refusing automatic deletion", c.id)
 		return withCleanupError(cause, cleanupErr)
@@ -259,14 +349,21 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // clean and returns nil; any other failure to inspect or remove it is
 // returned to Run so the container left behind is visible to the caller.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
-	if err != nil {
-		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
+	unlock := func() {}
+	if cfg.eng.name() == "apple" {
+		locked, err := lockName(cleanupCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
+		}
+		unlock = locked
 	}
 	defer unlock()
 	ctr := namedContainer(cfg, cfg.name)
@@ -286,6 +383,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if cfg.reuse && info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("cleanup container %s: reuse marker is missing", cfg.name)
 	}
+	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("cleanup container %s: reuse group label does not match", cfg.name)
+	}
 	if !validCreationID(cfg.creation) {
 		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
 	}
@@ -303,6 +403,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if info.state == StateRunning {
 		return fmt.Errorf("cleanup container %s: running generation may already be adopted; refusing automatic deletion", cfg.name)
 	}
+	if info.state != StateCreated && info.state != StateStopped {
+		return fmt.Errorf("cleanup container %s: state %q is unsafe for automatic deletion; refusing", cfg.name, info.state)
+	}
 	if err := ctr.delete(cleanupCtx, target); err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
@@ -312,6 +415,36 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 // verifiedDeleteTarget returns the only safe target for a fresh inspect.
 // Docker must provide its immutable ID; Apple is name-addressed and must not
 // report an unexpected backend ID.
+func verifyDestructiveInfo(eng engine, info *engineInfo, requireSession bool) error {
+	if info == nil {
+		return fmt.Errorf("inspect returned no container identity")
+	}
+	if info.labels[managedLabel] != "true" {
+		return fmt.Errorf("container is not managed by container-go")
+	}
+	if requireSession {
+		session, ok := info.labels[sessionLabel]
+		if !ok || session != sessionID() {
+			return fmt.Errorf("container ownership session does not match this process")
+		}
+	}
+	if eng.name() == "apple" {
+		if !validCreationID(info.labels[creationLabel]) {
+			return fmt.Errorf("container has no valid creation generation")
+		}
+		if !knownStableState(info.state) {
+			return fmt.Errorf("apple container has unsafe state %q", info.state)
+		}
+		if info.uid != "" {
+			return fmt.Errorf("apple backend returned an unexpected immutable ID")
+		}
+	}
+	if eng.name() == "docker" && !validImmutableContainerID(eng, info.uid) {
+		return fmt.Errorf("docker inspect returned no valid immutable ID")
+	}
+	return nil
+}
+
 func verifiedDeleteTarget(eng engine, info *engineInfo, name string) (string, error) {
 	if info == nil {
 		return "", fmt.Errorf("inspect returned no container identity")
@@ -393,6 +526,67 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 // ID returns the container ID (identical to its name).
 func (c *Container) ID() string { return c.id }
 
+func (c *Container) addReaperRegistration(reg *reaperRegistration) {
+	if reg == nil {
+		return
+	}
+	c.reaperMu.Lock()
+	defer c.reaperMu.Unlock()
+	for _, existing := range c.reapers {
+		if existing == reg {
+			return
+		}
+	}
+	c.reapers = append(c.reapers, reg)
+	if c.reaper == nil {
+		c.reaper = reg
+	}
+}
+
+//nolint:unused // retained for package-local compatibility helpers.
+func (c *Container) updateReaperEntry(reg *reaperRegistration, entry reaperEntry) {
+	if reg == nil {
+		return
+	}
+	c.reaperMu.Lock()
+	defer c.reaperMu.Unlock()
+	reg.entry = entry
+	if c.reaper == reg {
+		c.reaper = reg
+	}
+}
+
+func (c *Container) reaperRegistrations() []*reaperRegistration {
+	c.reaperMu.Lock()
+	defer c.reaperMu.Unlock()
+	regs := make([]*reaperRegistration, 0, len(c.reapers)+1)
+	seen := make(map[*reaperRegistration]struct{}, len(c.reapers)+1)
+	for _, reg := range c.reapers {
+		if reg != nil {
+			if _, ok := seen[reg]; !ok {
+				seen[reg] = struct{}{}
+				regs = append(regs, reg)
+			}
+		}
+	}
+	if c.reaper != nil {
+		if _, ok := seen[c.reaper]; !ok {
+			regs = append(regs, c.reaper)
+		}
+	}
+	return regs
+}
+
+func (c *Container) unregisterReapers() {
+	for _, reg := range c.reaperRegistrations() {
+		unregisterWithGlobalReaper(reg)
+	}
+	c.reaperMu.Lock()
+	c.reapers = nil
+	c.reaper = nil
+	c.reaperMu.Unlock()
+}
+
 func (c *Container) classify(ctx context.Context, err error) error {
 	return cli.Classify(ctx, c.runner, err, c.eng.probe())
 }
@@ -407,12 +601,16 @@ func (c *Container) State(ctx context.Context) (State, error) {
 }
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
-// period before the process is killed.
+// period before the process is killed. The operation is addressed by a
+// freshly verified identity: Docker uses its immutable ID, while Apple
+// holds the stable name lock across verification and stop.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
-	return c.classify(ctx, err)
+	return c.withVerifiedOperationTarget(stopCtx, false, func(target string, _ *engineInfo) error {
+		_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
+		return c.classify(ctx, err)
+	})
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -435,22 +633,82 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if !validImmutableContainerID(c.eng, uid) {
 			return fmt.Errorf("terminate %s: invalid immutable container ID: %w", c.id, ErrGenerationReplaced)
 		}
-		return c.delete(ctx, uid)
+		err := c.delete(ctx, uid)
+		if err == nil {
+			c.unregisterReapers()
+		}
+		return err
+	}
+	if requiresImmutableID(c.eng) {
+		return fmt.Errorf("terminate %s: missing valid immutable container ID: %w", c.id, ErrGenerationReplaced)
 	}
 	if !validCreationID(c.creation) {
 		return fmt.Errorf("terminate %s: missing valid creation generation: %w", c.id, ErrGenerationReplaced)
 	}
 	_, err := c.terminateByName(ctx, nil, false, nil)
+	if err == nil || errors.Is(err, ErrGenerationReplaced) || errors.Is(err, ErrContainerNotFound) {
+		// A replaced or already-absent generation is no longer ours to
+		// reap. Remove the old registration even though no delete ran.
+		c.unregisterReapers()
+	}
 	return err
 }
 
-// terminateByName performs the locked inspect/delete critical section for
-// a name-addressed operation. expected, when non-nil, is the generation or
-// immutable identity observed before the fresh inspect. stoppedOnly makes a
-// stopped-generation delete fail closed if the object became running.
+// terminateImmutable revalidates a Docker target without taking the Apple
+// name-lock path. Once inspect returns a full immutable ID, a replacement
+// cannot inherit that ID; the lock is only needed for name-addressed
+// backends.
+func (c *Container) terminateImmutable(ctx context.Context, expected *engineInfo, stoppedOnly bool, verify func(*engineInfo) error) (bool, error) {
+	c.inspectMu.Lock()
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if !validImmutableContainerID(c.eng, uid) {
+		return false, fmt.Errorf("terminate %s: missing valid immutable container ID: %w", c.id, ErrGenerationReplaced)
+	}
+	fresh, err := c.inspectFresh(ctx)
+	if isNotFoundFor(c.eng, err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+	}
+	if expected != nil {
+		if err := sameContainerIdentity(c.eng, expected, fresh); err != nil {
+			return false, err
+		}
+	} else if !validCreationID(c.creation) || fresh.labels[creationLabel] != c.creation {
+		return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused); err != nil {
+		return false, fmt.Errorf("terminate %s: %w", c.id, err)
+	}
+	if verify != nil {
+		if err := verify(fresh); err != nil {
+			return false, err
+		}
+	}
+	if stoppedOnly && fresh.state != StateStopped {
+		return false, nil
+	}
+	target, err := verifiedDeleteTarget(c.eng, fresh, c.id)
+	if err != nil {
+		return false, err
+	}
+	return true, c.delete(ctx, target)
+}
+
+// terminateByName performs the generation-checked inspect/delete operation.
+// Apple holds the name lock for the critical section; Docker binds the
+// fresh inspect to an immutable ID. expected, when non-nil, is the
+// generation or immutable identity observed before the fresh inspect.
+// stoppedOnly makes a stopped-generation delete fail closed if the object
+// became running.
 func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, stoppedOnly bool, verify func(*engineInfo) error) (bool, error) {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
+	if requiresImmutableID(c.eng) {
+		return c.terminateImmutable(ctx, expected, stoppedOnly, verify)
+	}
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
 		return false, fmt.Errorf("terminate %s: lock name: %w", c.id, err)
@@ -470,6 +728,12 @@ func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, s
 		}
 	} else if !validCreationID(c.creation) || fresh.labels[creationLabel] != c.creation {
 		return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused); err != nil {
+		return false, fmt.Errorf("terminate %s: %w", c.id, err)
+	}
+	if !knownStableState(fresh.state) {
+		return false, fmt.Errorf("terminate %s: unsafe or unknown state %q", c.id, fresh.state)
 	}
 	if verify != nil {
 		if err := verify(fresh); err != nil {
@@ -635,6 +899,82 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 		c.uid = info.uid
 	}
 	return info, nil
+}
+
+// acquireVerifiedOperationTarget verifies the target immediately before an
+// operation. For Apple it also returns a release function that keeps all
+// name-lock barriers held until the caller is finished; this is used by
+// FollowLogs so a long-lived stream cannot outlive its generation check.
+func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireRunning bool) (target string, info *engineInfo, release func(), err error) {
+	opCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	if requiresImmutableID(c.eng) {
+		c.inspectMu.Lock()
+		uid := c.uid
+		c.inspectMu.Unlock()
+		if !validImmutableContainerID(c.eng, uid) {
+			cancel()
+			return "", nil, func() {}, fmt.Errorf("container %s: missing valid immutable container ID: %w", c.id, ErrGenerationReplaced)
+		}
+		info, err = c.inspectFresh(opCtx)
+		if err != nil {
+			cancel()
+			return "", nil, func() {}, err
+		}
+		if !validImmutableContainerID(c.eng, info.uid) {
+			cancel()
+			return "", nil, func() {}, fmt.Errorf("container %s: operation target has no valid immutable ID", c.id)
+		}
+		if err := verifyDestructiveInfo(c.eng, info, false); err != nil {
+			cancel()
+			return "", nil, func() {}, fmt.Errorf("container %s: %w", c.id, err)
+		}
+		if requireRunning && info.state != StateRunning {
+			cancel()
+			return "", nil, func() {}, fmt.Errorf("container %s is not running (state %s)", c.id, info.state)
+		}
+		return info.uid, info, cancel, nil
+	}
+
+	unlock, err := lockName(opCtx, c.id)
+	if err != nil {
+		cancel()
+		return "", nil, func() {}, fmt.Errorf("operation %s: lock name: %w", c.id, err)
+	}
+	release = func() {
+		unlock()
+		cancel()
+	}
+	info, err = c.inspectFresh(opCtx)
+	if err != nil {
+		release()
+		return "", nil, func() {}, err
+	}
+	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
+		release()
+		return "", nil, func() {}, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if err := verifyDestructiveInfo(c.eng, info, !c.reused); err != nil {
+		release()
+		return "", nil, func() {}, fmt.Errorf("operation %s: %w", c.id, err)
+	}
+	if !knownStableState(info.state) {
+		release()
+		return "", nil, func() {}, fmt.Errorf("container %s has unsafe or unknown state %q", c.id, info.state)
+	}
+	if requireRunning && info.state != StateRunning {
+		release()
+		return "", nil, func() {}, fmt.Errorf("container %s is not running (state %s)", c.id, info.state)
+	}
+	return c.id, info, release, nil
+}
+
+func (c *Container) withVerifiedOperationTarget(ctx context.Context, requireRunning bool, fn func(string, *engineInfo) error) error {
+	target, info, release, err := c.acquireVerifiedOperationTarget(ctx, requireRunning)
+	if err != nil {
+		return err
+	}
+	defer release()
+	return fn(target, info)
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

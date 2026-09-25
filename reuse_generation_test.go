@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -30,7 +32,7 @@ type generationRunner struct {
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":
@@ -111,6 +113,35 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	// so a same-name replacement created after the check is not found.
 	if len(r.deleted) != 1 || r.deleted[0] != r.uid {
 		t.Errorf("deleted = %v, want [%s]", r.deleted, r.uid)
+	}
+}
+
+func TestDeleteStoppedDockerReuseDoesNotDependOnNameLock(t *testing.T) {
+	old := nameLockStateRootOverride
+	invalidRoot := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(invalidRoot, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nameLockStateRootOverride = invalidRoot
+	t.Cleanup(func() { nameLockStateRootOverride = old })
+
+	uid := strings.Repeat("0f", 32)
+	info := &engineInfo{
+		state: StateStopped,
+		uid:   uid,
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+	}
+	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("Docker reuse cleanup depended on the name-lock namespace: %v", err)
+	}
+	if len(r.deleted) != 1 || r.deleted[0] != uid {
+		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
 	}
 }
 

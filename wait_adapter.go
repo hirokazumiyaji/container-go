@@ -63,11 +63,16 @@ const logTailLimit = 1024 * 1024
 func (c *Container) logTail(ctx context.Context) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
-	if err != nil {
-		return ""
-	}
-	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	var tail string
+	_ = c.withVerifiedOperationTarget(qCtx, false, func(target string, _ *engineInfo) error {
+		stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
+		if err != nil {
+			return err
+		}
+		tail = lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+		return nil
+	})
+	return tail
 }
 
 // lastNBytes keeps only the trailing n bytes of r using a fixed-size

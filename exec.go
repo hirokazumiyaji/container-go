@@ -80,26 +80,45 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
-	if err == nil {
-		return 0, output, nil
+	verifyCtx, verifyCancel := withDefaultTimeout(ctx, queryTimeout)
+	defer verifyCancel()
+	var (
+		exitCode int
+		output   io.Reader
+		execErr  error
+	)
+	err := c.withVerifiedOperationTarget(verifyCtx, true, func(target string, _ *engineInfo) error {
+		stdout, stderr, runErr := c.runner.Run(verifyCtx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+		if runErr == nil {
+			return nil
+		}
+		if !cli.IsCommandExit(runErr) {
+			execErr = wrapNotFoundFor(c.eng, c.classify(verifyCtx, runErr))
+			return execErr
+		}
+		var cliErr *cli.CLIError
+		errors.As(runErr, &cliErr)
+		exitCode = cliErr.ExitCode
+		// App stderr alone must not decide infrastructure state. Only
+		// ambiguous failures pay for a verification inspect; clear app
+		// results return immediately with no extra CLI call.
+		if !isNotFoundFor(c.eng, runErr) && !maybeInfraExecErr(runErr) {
+			return nil
+		}
+		if c.execContainerRunningTarget(verifyCtx, target) {
+			return nil
+		}
+		execErr = wrapNotFoundFor(c.eng, c.classify(verifyCtx, runErr))
+		return execErr
+	})
+	if err != nil {
+		if execErr != nil {
+			return exitCode, output, execErr
+		}
+		return 0, output, err
 	}
-	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
-	}
-	var cliErr *cli.CLIError
-	errors.As(err, &cliErr)
-	// App stderr alone must not decide infrastructure state. Only
-	// ambiguous failures pay for a verification inspect; clear app
-	// results return immediately with no extra CLI call.
-	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, output, nil
-	}
-	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, output, nil
-	}
-	return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	return exitCode, output, execErr
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
@@ -127,20 +146,24 @@ func execCLIStderr(err error) (string, bool) {
 	if !errors.As(err, &cliErr) {
 		return "", false
 	}
-	return strings.ToLower(cliErr.Stderr), true
+	stdout, stderr, ok := cli.DiagnosticText(err)
+	if !ok {
+		return "", false
+	}
+	return strings.ToLower(stdout + "\n" + stderr), true
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context) bool {
+// execContainerRunningTarget verifies the already-bound operation target.
+// It is called while the Apple name lock is held, so it does not acquire a
+// second lock.
+func (c *Container) execContainerRunningTarget(ctx context.Context, target string) bool {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return false
 	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
 		return false
 	}

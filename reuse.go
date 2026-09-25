@@ -232,9 +232,13 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+	reaperRegistration, reaperBinary := preRegisterContainer(cfg)
 	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		if !attempted {
+			if reaperRegistration != nil {
+				unregisterWithGlobalReaper(reaperRegistration)
+			}
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -242,10 +246,26 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			createRaceMissing(err) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
+			if reaperRegistration != nil {
+				unregisterWithGlobalReaper(reaperRegistration)
+			}
 			return nil, err
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr == nil && reaperRegistration != nil {
+			unregisterWithGlobalReaper(reaperRegistration)
+		}
 		return nil, withCleanupError(classified, cleanupErr)
+	}
+
+	uid := cfg.eng.parseRunID(stdout)
+	if cfg.eng.name() == "docker" && !validImmutableContainerID(cfg.eng, uid) {
+		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
+		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
+		if cleanupErr == nil && reaperRegistration != nil {
+			unregisterWithGlobalReaper(reaperRegistration)
+		}
+		return nil, withCleanupError(identityErr, cleanupErr)
 	}
 
 	ctr := &Container{
@@ -256,7 +276,15 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
+	}
+	if reaperRegistration != nil {
+		ctr.addReaperRegistration(reaperRegistration)
+		completeContainerReaperRegistration(cfg, reaperRegistration, reaperBinary, ctr.uid)
+		// Reuse containers are shared and intentionally outlive the
+		// creating process. The pending registration only closes the
+		// create acknowledgement race, so retire it after success.
+		ctr.unregisterReapers()
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		return nil, ctr.rollback(ctx, err)
@@ -270,16 +298,23 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation, so Terminate re-checks the
-// generation and deletes by immutable ID. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// handle bound to its inspected generation, so the termination path
+// re-checks the generation and deletes by immutable ID. A replaced
+// generation means another process already recreated the name; the
+// caller loops and attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	if err := checkReuseLabels(info, cfg); err != nil {
 		return err
 	}
 	ctr := namedContainer(cfg, cfg.name)
+	ctr.reused = true
 	ctr.creation = info.labels[creationLabel]
+	if requiresImmutableID(cfg.eng) {
+		if !validImmutableContainerID(cfg.eng, info.uid) {
+			return fmt.Errorf("reuse %s: stopped generation has no valid immutable ID", cfg.name)
+		}
+		ctr.uid = info.uid
+	}
 	_, err := ctr.terminateByName(ctx, info, true, func(fresh *engineInfo) error {
 		if err := checkReuseLabels(fresh, cfg); err != nil {
 			return err
@@ -353,6 +388,7 @@ func namedContainer(cfg *config, id string) *Container {
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		reused:    cfg.reuse,
 	}
 }
 
@@ -381,6 +417,9 @@ func createRaceMissing(err error) bool {
 		}
 		for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
 			line := stripCLIErrorPrefix(rawLine)
+			if appleTypedContainerIDNotFoundLine(line, target) {
+				return true
+			}
 			for range 3 {
 				if exactAppleIDNotFound(line, target) {
 					return true
@@ -581,7 +620,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]pruneCandidate, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group)
+	}, "prune reuse group "+group, group)
 }

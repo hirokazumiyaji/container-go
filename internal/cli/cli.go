@@ -7,13 +7,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 )
 
 // maxStderr bounds the stderr captured into a CLIError.
 const maxStderr = 64 * 1024
+
+var endpointURI = regexp.MustCompile(`(?i)\b(unix|tcp|ssh|npipe|http|https)://[^\s"'<>]+`)
 
 // ErrSystemNotRunning reports that the container backend (Apple
 // Container system service or Docker daemon) is not running.
@@ -25,6 +29,10 @@ var ErrSystemNotRunning = errors.New("container backend is not running")
 type Probe struct {
 	Args []string
 	Hint string
+	// IsUnavailable recognizes a backend-specific liveness failure. A
+	// failed probe with no proven liveness signal is not enough to add
+	// ErrSystemNotRunning.
+	IsUnavailable func(error) bool
 }
 
 // Runner executes one backend CLI invocation.
@@ -76,6 +84,62 @@ func (e *CLIError) Error() string {
 	return msg
 }
 
+// diagnosticError keeps stdout available to classifiers without changing
+// the historical four-field CLIError layout. Unwrap preserves errors.As
+// and errors.Is behavior for the original CLIError.
+type diagnosticError struct {
+	cause  error
+	cliErr *CLIError
+	stdout string
+}
+
+func (e *diagnosticError) Error() string {
+	msg := e.cliErr.Error()
+	if e.stdout == "" {
+		return msg
+	}
+	if e.cliErr.Stderr != "" {
+		msg += "; stdout: "
+	} else {
+		msg += ": "
+	}
+	return msg + strings.TrimSpace(e.stdout)
+}
+
+func (e *diagnosticError) Unwrap() error { return e.cause }
+
+func withStdout(err error, stdout string) error {
+	if err == nil || stdout == "" {
+		return err
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return err
+	}
+	var existing *diagnosticError
+	if errors.As(err, &existing) && existing.cliErr == cliErr && existing.stdout != "" {
+		return err
+	}
+	return &diagnosticError{cause: err, cliErr: cliErr, stdout: truncateOutput(stdout)}
+}
+
+// DiagnosticText returns the bounded diagnostic streams carried by a CLI
+// failure. The bool reports whether err contains a CLIError.
+func DiagnosticText(err error) (stdout, stderr string, ok bool) {
+	if err == nil {
+		return "", "", false
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return "", "", false
+	}
+	var diagnostic *diagnosticError
+	if errors.As(err, &diagnostic) && diagnostic.cliErr == cliErr {
+		stdout = diagnostic.stdout
+	}
+	return stdout, cliErr.Stderr, true
+}
+
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
 // argv vector; no shell is involved.
 type ExecRunner struct {
@@ -106,30 +170,38 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
-		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
-		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
+			cliErr := &CLIError{
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
 				Stderr:   truncateStderr(stderr.String()),
 			}
+			commandErr := withStdout(cliErr, stdout.String())
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return stdout.Bytes(), stderr.Bytes(), errors.Join(commandErr, ctxErr)
+			}
+			return stdout.Bytes(), stderr.Bytes(), commandErr
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return stdout.Bytes(), stderr.Bytes(), errors.Join(
+				fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr), err)
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
-func truncateStderr(s string) string {
+// truncateOutput bounds a diagnostic copy kept in CLIError.
+func truncateOutput(s string) string {
 	if len(s) > maxStderr {
 		return s[:maxStderr]
 	}
 	return s
 }
+
+func truncateStderr(s string) string { return truncateOutput(s) }
 
 // IsCommandExit reports whether err is a CLIError from a child process
 // that started and returned an exit status. Launch failures (missing
@@ -139,34 +211,275 @@ func IsCommandExit(err error) bool {
 	return errors.As(err, &e)
 }
 
+func collectCLIErrors(err error) []*CLIError {
+	if err == nil {
+		return nil
+	}
+	if cliErr, ok := err.(*CLIError); ok {
+		return []*CLIError{cliErr}
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		var out []*CLIError
+		for _, child := range joined.Unwrap() {
+			out = append(out, collectCLIErrors(child)...)
+		}
+		return out
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return collectCLIErrors(wrapped.Unwrap())
+	}
+	return nil
+}
+
 // probeTimeout bounds the diagnostic liveness check so a hung backend
 // cannot stall error handling forever. Caller cancellation still
 // aborts the probe via context propagation.
 const probeTimeout = 5 * time.Second
 
-// Classify augments a failed CLI call: if the backend does not answer
-// the probe, the failure is reported as ErrSystemNotRunning while the
-// original error remains in the chain.
+// Classify augments a failed CLI call only when a probe proves that the
+// backend is unavailable. Both the original and probe errors remain in the
+// returned chain; a generic probe failure is never promoted to
+// ErrSystemNotRunning.
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
 	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, ctxErr)
+	}
 	var cliErr *CLIError
-	if !errors.As(err, &cliErr) {
+	if !errors.As(err, &cliErr) || IsOperationTimeoutError(err) {
 		return err
 	}
-	if ctx.Err() != nil {
-		// Caller already gave up; preserve the original failure
-		// instead of masking it with a probe cancellation.
-		return err
-	}
+
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
-		if ctx.Err() != nil {
-			return err
-		}
-		return fmt.Errorf("%w: %s (underlying error: %w)", ErrSystemNotRunning, probe.Hint, err)
+	probeStdout, _, probeErr := r.Run(probeCtx, probe.Args...)
+	if probeErr != nil {
+		probeErr = withStdout(probeErr, string(probeStdout))
 	}
-	return err
+	if probeErr == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.Join(err, ctxErr)
+		}
+		return err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return errors.Join(err, probeErr, ctxErr)
+	}
+	// A precise client-side failure in the original command is not made
+	// into daemon-down by an unrelated failed probe.
+	if IsDefinitiveNonLivenessError(err) {
+		return errors.Join(err, probeErr)
+	}
+	// A pure bounded-probe timeout is liveness evidence. A joined
+	// permission/configuration/cancellation cause vetoes it.
+	if isProbeTimeoutError(probeCtx, probeErr) && !probeVetoError(probeErr) {
+		return classifySystemNotRunning(err, probeErr, probe.Hint)
+	}
+	if isProbeCancellationOrConfiguration(probeErr) {
+		return errors.Join(err, probeErr)
+	}
+	if operationLivenessText(err) || probeUnavailable(probe, probeErr) {
+		return classifySystemNotRunning(err, probeErr, probe.Hint)
+	}
+	return errors.Join(err, probeErr)
+}
+
+func classifySystemNotRunning(original, probeErr error, hint string) error {
+	return errors.Join(
+		fmt.Errorf("%w: %s", ErrSystemNotRunning, hint),
+		original,
+		probeErr,
+	)
+}
+
+func isProbeTimeoutError(probeCtx context.Context, err error) bool {
+	return probeCtx.Err() == context.DeadlineExceeded &&
+		(errors.Is(err, context.DeadlineExceeded) || probeCtx.Err() != nil)
+}
+
+func probeVetoError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, os.ErrPermission) ||
+		errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	for _, cliErr := range collectCLIErrors(err) {
+		if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+			return true
+		}
+	}
+	return containsNonLivenessText(strings.ToLower(diagnosticText(err)))
+}
+
+func isProbeCancellationOrConfiguration(err error) bool {
+	return probeVetoError(err) || errors.Is(err, context.DeadlineExceeded) && !isProbeTimeoutError(context.Background(), err)
+}
+
+func operationLivenessText(err error) bool {
+	if err == nil {
+		return false
+	}
+	if IsDefinitiveNonLivenessError(err) {
+		return false
+	}
+	s := strings.ToLower(diagnosticText(err))
+	for _, fragment := range []string{
+		"xpc connection", "cannot connect", "connection refused",
+		"system is not running", "daemon is not running", "backend down",
+		"apiserver is not running", "not registered with launchd",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func probeUnavailable(probe Probe, err error) bool {
+	if IsDefinitiveNonLivenessError(err) {
+		return false
+	}
+	if probe.IsUnavailable != nil {
+		return probe.IsUnavailable(err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	s := strings.ToLower(diagnosticText(err))
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"cannot connect to the container backend",
+		"connection refused",
+		"xpc connection",
+		"system is not running",
+		"system service is not running",
+		"apiserver is not running",
+		"not registered with launchd",
+		"daemon is not running",
+		"is the docker daemon running",
+		"failed to connect to the docker daemon", "backend down", "daemon unavailable",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func diagnosticText(err error) string {
+	if err == nil {
+		return ""
+	}
+	var parts []string
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil {
+			return
+		}
+		if diagnostic, ok := cur.(*diagnosticError); ok {
+			if diagnostic.stdout != "" {
+				parts = append(parts, diagnostic.stdout)
+			}
+			walk(diagnostic.cause)
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+			return
+		}
+		var cliErr *CLIError
+		if errors.As(cur, &cliErr) {
+			if stdout, stderr, ok := DiagnosticText(cur); ok {
+				if stdout != "" {
+					parts = append(parts, stdout)
+				}
+				if stderr != "" {
+					parts = append(parts, stderr)
+				}
+			}
+			return
+		}
+		if text := cur.Error(); text != "" {
+			parts = append(parts, text)
+		}
+	}
+	walk(err)
+	return endpointURI.ReplaceAllString(strings.Join(parts, "\n"), " ")
+}
+
+func containsNonLivenessText(s string) bool {
+	for _, fragment := range []string{
+		"permission denied", "operation not permitted", "access denied",
+		"eacces", "eperm", "unauthorized", "forbidden",
+		"authentication required", "credential helper", "credentials",
+		"invalid config", "invalid configuration", "config error",
+		"configuration file", "configuration directory", "failed to load config",
+		"invalid context", "unknown context", "no such context",
+		"tls handshake", "x509:", "certificate signed by unknown authority",
+		"unknown flag", "unknown option", "invalid option", "invalid argument",
+		"operation canceled", "operation cancelled", "context canceled",
+		"context cancelled", "command canceled", "request canceled",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsDefinitiveNonLivenessError reports a client-side failure that vetoes
+// backend liveness and absence classification.
+func IsDefinitiveNonLivenessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	for _, cliErr := range collectCLIErrors(err) {
+		if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+			return true
+		}
+	}
+	return containsNonLivenessText(strings.ToLower(diagnosticText(err)))
+}
+
+// IsNonLivenessError is the broader predicate used by backend probes.
+func IsNonLivenessError(err error) bool { return IsDefinitiveNonLivenessError(err) }
+
+// IsOperationTimeoutError reports structured timeout/cancellation evidence
+// without treating arbitrary application stderr as an operation timeout.
+func IsOperationTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	for _, cliErr := range collectCLIErrors(err) {
+		if cliErr.ExitCode < 0 {
+			return true
+		}
+	}
+	return false
 }

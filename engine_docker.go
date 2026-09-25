@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -47,9 +48,37 @@ func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
 	return cli.Probe{
-		Args: []string{"version", "--format", "{{.Server.Version}}"},
-		Hint: "start the Docker daemon",
+		Args:          []string{"version", "--format", "{{.Server.Version}}"},
+		Hint:          "start the Docker daemon",
+		IsUnavailable: dockerProbeUnavailable,
 	}
+}
+
+func dockerProbeUnavailable(err error) bool {
+	if cli.IsNonLivenessError(err) {
+		return false
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	if len(cliErr.Args) == 0 || strings.ToLower(cliErr.Args[0]) != "version" {
+		return false
+	}
+	stdout, stderr, ok := cli.DiagnosticText(err)
+	if !ok {
+		return false
+	}
+	text := strings.ToLower(stdout + "\n" + stderr)
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon", "failed to connect to the docker daemon",
+		"is the docker daemon running", "daemon is not running", "connection refused", "backend down", "daemon unavailable",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
@@ -144,6 +173,8 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
+func (dockerEngine) nameAddressedDeletes() bool { return false }
+
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 // dockerInspect mirrors the fields of `docker inspect` output this
@@ -171,6 +202,12 @@ type dockerInspect struct {
 }
 
 func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+	// A 64-character target is intended to be Docker's immutable ID. Do
+	// not let a malformed ID fall through to name matching, where a
+	// same-name replacement could satisfy the operation.
+	if len(id) == len(strings.Repeat("a", 64)) && !dockerIDRE.MatchString(id) {
+		return nil, fmt.Errorf("invalid immutable container id %q", id)
+	}
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
@@ -303,15 +340,23 @@ func (dockerEngine) logsTailArgs(id string) []string {
 // status filters directly.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 
-func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+	ids := splitNonEmptyLines(data)
+	candidates := make([]pruneCandidate, 0, len(ids))
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("invalid immutable container id %q", id)
+		}
+		candidates = append(candidates, pruneCandidate{id: id})
+	}
+	return candidates, nil
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -343,14 +388,22 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 
-func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
+	ids := splitNonEmptyLines(data)
+	candidates := make([]pruneCandidate, 0, len(ids))
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("invalid immutable container id %q", id)
+		}
+		candidates = append(candidates, pruneCandidate{id: id})
+	}
+	return candidates, nil
 }
 
 // nameConflict matches Docker's duplicate container name error.

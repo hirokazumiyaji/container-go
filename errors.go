@@ -1,8 +1,10 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -233,6 +235,206 @@ func exactAppleExecNotFound(line, target string) bool {
 	return exactNotFoundValue(line[len(prefix):len(line)-len(" not found")], target)
 }
 
+// appleTypedNotFoundLine recognizes the structured Apple Container 1.3
+// error vocabulary. It accepts only a typed notFound value and the
+// operation-specific message underneath internalError/cause wrappers.
+func appleTypedNotFoundLine(line, target, operation string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleContainerNotFoundMessage(message, target, operation)
+}
+
+// appleTypedContainerIDNotFoundLine is used by the concurrent-create
+// classifier. A run failure with the typed ID form is a lost-create
+// race; an arbitrary application line is not.
+func appleTypedContainerIDNotFoundLine(line, target string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleIDMessageMatches(message, target)
+}
+
+// appleTypedNotFoundMessage unwraps only the typed wrapper grammar. Swift's
+// rendered descriptions occur in both escaped and older unescaped nested
+// forms, so each quoted cause is decoded before the next wrapper is read.
+func appleTypedNotFoundMessage(line string) (string, bool) {
+	current := strings.TrimSpace(line)
+	for range 16 {
+		current = strings.TrimSpace(current)
+		current = strings.TrimSpace(strings.Trim(current, "()"))
+		lower := strings.ToLower(current)
+		if strings.HasPrefix(lower, "error:") {
+			current = strings.TrimSpace(current[len("error:"):])
+			continue
+		}
+		switch {
+		case strings.HasPrefix(lower, "notfound:"):
+			value := decodeAppleQuotedValue(strings.TrimSpace(current[len("notfound:"):]))
+			value = strings.TrimSpace(value)
+			return value, value != ""
+		case strings.HasPrefix(lower, "internalerror:"), strings.HasPrefix(lower, "cause:"):
+			index := strings.Index(lower, "cause:")
+			if index < 0 {
+				value := decodeAppleQuotedValue(strings.TrimSpace(current[strings.Index(current, ":")+1:]))
+				if value == "" {
+					return "", false
+				}
+				if notFound := strings.Index(strings.ToLower(value), "notfound:"); notFound >= 0 {
+					current = value[notFound:]
+					continue
+				}
+				return "", false
+			}
+			current = decodeAppleQuotedValue(strings.TrimSpace(current[index+len("cause:"):]))
+			if current == "" {
+				return "", false
+			}
+		case strings.HasPrefix(lower, "invalidargument:"):
+			value := decodeAppleQuotedValue(strings.TrimSpace(current[len("invalidargument:"):]))
+			if value == "" {
+				return "", false
+			}
+			// The logs client wraps its typed absence in invalidArgument
+			// rather than internalError. Peel only the known typed value.
+			if index := strings.Index(strings.ToLower(value), "notfound:"); index >= 0 {
+				current = value[index:]
+			} else {
+				current = value
+			}
+		default:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// appleTypedExistsMessage unwraps Apple's typed exists errors. Run uses
+// this form for a concurrent name conflict, so it must be recognized as
+// precisely as the older untyped "already exists" wording.
+func appleTypedExistsMessage(line string) (string, bool) {
+	current := strings.TrimSpace(line)
+	for range 16 {
+		current = strings.TrimSpace(strings.Trim(current, "()"))
+		lower := strings.ToLower(current)
+		if strings.HasPrefix(lower, "error:") {
+			current = strings.TrimSpace(current[len("error:"):])
+			continue
+		}
+		switch {
+		case strings.HasPrefix(lower, "exists:"):
+			value := strings.TrimSpace(decodeAppleQuotedValue(strings.TrimSpace(current[len("exists:"):])))
+			return value, value != ""
+		case strings.HasPrefix(lower, "internalerror:"), strings.HasPrefix(lower, "cause:"):
+			index := strings.Index(lower, "cause:")
+			if index < 0 {
+				value := strings.TrimSpace(decodeAppleQuotedValue(strings.TrimSpace(current[strings.Index(current, ":")+1:])))
+				if value == "" {
+					return "", false
+				}
+				if exists := strings.Index(strings.ToLower(value), "exists:"); exists >= 0 {
+					current = value[exists:]
+					continue
+				}
+				return "", false
+			}
+			current = strings.TrimSpace(decodeAppleQuotedValue(strings.TrimSpace(current[index+len("cause:"):])))
+			if current == "" {
+				return "", false
+			}
+		case strings.HasPrefix(lower, "invalidargument:"):
+			value := strings.TrimSpace(decodeAppleQuotedValue(strings.TrimSpace(current[len("invalidargument:"):])))
+			if value == "" {
+				return "", false
+			}
+			current = value
+		default:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+func appleContainerExistsMessage(message, target string) bool {
+	message = strings.TrimSpace(strings.Trim(message, `"'`))
+	lower := strings.ToLower(message)
+	const idPrefix = "container with id "
+	if strings.HasPrefix(lower, idPrefix) && strings.HasSuffix(lower, " already exists") {
+		return exactNotFoundValue(message[len(idPrefix):len(message)-len(" already exists")], target)
+	}
+	const existsPrefix = "container already exists:"
+	if strings.HasPrefix(lower, existsPrefix) {
+		return exactNotFoundValue(message[len(existsPrefix):], target)
+	}
+	return false
+}
+
+// decodeAppleQuotedValue removes one outer quoted value and decodes the
+// escaping used by Swift's diagnostic descriptions. When the CLI emits
+// nested unescaped quotes, the outer quote is removed first and the inner
+// typed value remains available to the next loop iteration.
+func decodeAppleQuotedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 0 && (value[0] == '"' || value[0] == '\'') {
+		quote := value[0]
+		if len(value) < 2 || value[len(value)-1] != quote {
+			return ""
+		}
+		value = value[1 : len(value)-1]
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	escaped := false
+	for _, r := range value {
+		if escaped {
+			switch r {
+			case 'n':
+				b.WriteByte('\n')
+			case 'r':
+				b.WriteByte('\r')
+			case 't':
+				b.WriteByte('\t')
+			case '"', '\\':
+				b.WriteRune(r)
+			default:
+				b.WriteByte('\\')
+				b.WriteRune(r)
+			}
+			escaped = false
+			continue
+		}
+		if r == '\\' {
+			escaped = true
+			continue
+		}
+		b.WriteRune(r)
+	}
+	if escaped {
+		b.WriteByte('\\')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func appleContainerNotFoundMessage(message, target, operation string) bool {
+	message = strings.TrimSpace(strings.Trim(message, `"'`))
+	lower := strings.ToLower(message)
+	if strings.HasPrefix(lower, "container not found:") {
+		return exactNotFoundValue(message[len("container not found:"):], target)
+	}
+	switch operation {
+	case "exec":
+		return exactAppleExecNotFound(message, target)
+	case "stop", "delete", "rm":
+		return exactAppleIDNotFound(message, target)
+	case "logs":
+		return exactAppleIDNotFound(message, target) || exactAppleExecNotFound(message, target)
+	case "run":
+		return exactAppleIDNotFound(message, target)
+	default:
+		return false
+	}
+}
+
+func appleIDMessageMatches(message, target string) bool {
+	return exactAppleIDNotFound(strings.TrimSpace(strings.Trim(message, `"'`)), target)
+}
+
 func exactContainerNotFoundFor(err error, backend string) bool {
 	cliErr, ok := backendCLIError(err, backend)
 	if !ok || len(cliErr.Args) == 0 {
@@ -248,6 +450,9 @@ func exactContainerNotFoundFor(err error, backend string) bool {
 			continue
 		}
 		lower := strings.ToLower(line)
+		if backend == "apple" && appleTypedNotFoundLine(line, target, op) {
+			return true
+		}
 		// The generic form is retained for older CLI versions and the
 		// repository's fake runners, but it still requires an exact
 		// operation and target. Permission/configuration text does not
@@ -353,6 +558,11 @@ func exactNameConflictFor(err error, backend string) bool {
 		for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
 			line := stripCLIErrorPrefix(rawLine)
 			lower := strings.ToLower(line)
+			if backend == "apple" {
+				if message, ok := appleTypedExistsMessage(line); ok && appleContainerExistsMessage(message, target) {
+					return true
+				}
+			}
 			switch backend {
 			case "apple":
 				const idPrefix = "container with id "
@@ -448,11 +658,32 @@ func exactContainerNotFound(err error) bool {
 }
 
 func isNotFound(err error) bool {
+	if hasDefinitiveErrorBranch(err) {
+		return false
+	}
 	return errors.Is(err, ErrContainerNotFound) || exactContainerNotFound(err)
 }
 
-func isNotFoundFor(eng engine, err error) bool {
+func hasDefinitiveErrorBranch(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var cliErrs []*cli.CLIError
+	collectCLIErrors(err, &cliErrs)
+	for _, cliErr := range cliErrs {
+		if cli.IsDefinitiveNonLivenessError(cliErr) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNotFoundFor(eng engine, err error) bool {
+	if err == nil || hasDefinitiveErrorBranch(err) {
 		return false
 	}
 	if errors.Is(err, ErrContainerNotFound) {

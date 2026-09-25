@@ -105,7 +105,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		// Docker's detached run prints a full immutable ID. Apple
+		// ignores stdout, so one stable fixture keeps both fake
+		// backends useful without weakening Docker identity checks.
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {

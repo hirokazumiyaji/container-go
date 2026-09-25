@@ -72,37 +72,118 @@ func Prune(ctx context.Context) ([]string, error) {
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
+	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", "")
 }
 
-// pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. errKind prefixes per-ID delete failures ("prune", …).
-func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
+// pruneListed lists candidates and removes them. Name-addressed engines
+// revalidate the list-time generation, ownership, and state while holding
+// the stable name lock across inspect and delete.
+func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]pruneCandidate, error), errKind, reuseGroup string) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
+		return nil, cli.Classify(qCtx, r, err, eng.probe())
 	}
-	ids, err := parse(stdout)
+	candidates, err := parse(stdout)
 	if err != nil {
 		return nil, err
 	}
 
 	var removed []string
 	var errs []error
-	for _, id := range ids {
-		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
-		dCancel()
-		if err != nil {
-			classified := wrapNotFoundFor(eng, err)
-			if !isNotFoundFor(eng, classified) {
-				errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, classified))
-				continue
-			}
+	for _, candidate := range candidates {
+		if err := qCtx.Err(); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", errKind, err))
+			break
 		}
-		removed = append(removed, id)
+		var didRemove bool
+		if usesNameAddressedDeletes(eng) {
+			didRemove, err = pruneNamedCandidate(qCtx, r, eng, candidate, errKind, reuseGroup)
+		} else {
+			didRemove, err = deletePruneCandidate(qCtx, r, eng, candidate.id, errKind)
+		}
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if didRemove {
+			removed = append(removed, candidate.id)
+		}
 	}
 	return removed, errors.Join(errs...)
+}
+
+func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if requiresImmutableID(eng) && !dockerIDRE.MatchString(id) {
+		return false, fmt.Errorf("%s %s: Docker prune target is not a full immutable ID", errKind, id)
+	}
+	if !requiresImmutableID(eng) && !usesNameAddressedDeletes(eng) {
+		return false, fmt.Errorf("%s %s: backend has no safe prune target", errKind, id)
+	}
+	if !requiresImmutableID(eng) && !nameRE.MatchString(id) {
+		return false, fmt.Errorf("%s %s: invalid container name", errKind, id)
+	}
+	_, _, err := r.Run(ctx, eng.deleteArgs(id)...)
+	if err != nil {
+		classified := wrapNotFoundFor(eng, cli.Classify(ctx, r, err, eng.probe()))
+		if !isNotFoundFor(eng, classified) {
+			return false, fmt.Errorf("%s %s: %w", errKind, id, classified)
+		}
+	}
+	return true, nil
+}
+
+func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+	if candidate.id == "" || !nameRE.MatchString(candidate.id) {
+		return false, nil
+	}
+	guardCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	unlock, err := lockName(guardCtx, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: lock name: %w", errKind, candidate.id, err)
+	}
+	defer unlock()
+
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(guardCtx)
+	if isNotFoundFor(eng, err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
+		return false, nil
+	}
+	if err := verifyDestructiveInfo(eng, fresh, false); err != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
+	}
+	target, err := verifiedDeleteTarget(eng, fresh, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
+	}
+	return deletePruneCandidate(guardCtx, r, eng, target, errKind)
+}
+
+func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
+	if fresh == nil || !candidate.managed || !validCreationID(candidate.creation) || !knownPruneState(candidate.state) {
+		return false
+	}
+	if fresh.labels[managedLabel] != "true" || !validCreationID(fresh.labels[creationLabel]) ||
+		fresh.labels[creationLabel] != candidate.creation || fresh.state != candidate.state ||
+		fresh.labels[reuseGroupLabel] != candidate.reuseGroup {
+		return false
+	}
+	if reuseGroup != "" {
+		return candidate.reuseGroup == reuseGroup && fresh.labels[reuseGroupLabel] == reuseGroup && knownPruneState(fresh.state)
+	}
+	return fresh.state == StateStopped
+}
+
+func knownPruneState(state State) bool {
+	return knownStableState(state)
 }

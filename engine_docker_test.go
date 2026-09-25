@@ -2,12 +2,15 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"encoding/json"
+	"errors"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -101,6 +104,112 @@ func TestDockerParseInspect(t *testing.T) {
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)
+	}
+}
+
+func TestParseInspectTargetErrors(t *testing.T) {
+	engines := []struct {
+		name       string
+		eng        engine
+		absentData string
+	}{
+		{name: "apple", eng: appleEngine{}, absentData: `[{"id":"other"}]`},
+		{name: "docker", eng: dockerEngine{}, absentData: `[{"Id":"other"}]`},
+	}
+	cases := []struct {
+		name            string
+		data            string
+		backendData     bool
+		wantNotFound    bool
+		wantSyntaxError bool
+	}{
+		{name: "empty", data: `[]`, wantNotFound: true},
+		{name: "target absent", backendData: true, wantNotFound: true},
+		{name: "ID missing", data: `[{}]`, wantNotFound: true},
+		{name: "malformed JSON", data: `{not json`, wantSyntaxError: true},
+	}
+	for _, backend := range engines {
+		for _, tc := range cases {
+			t.Run(backend.name+"/"+tc.name, func(t *testing.T) {
+				data := tc.data
+				if tc.backendData {
+					data = backend.absentData
+				}
+				_, err := backend.eng.parseInspect([]byte(data), "requested")
+				if err == nil {
+					t.Fatal("parseInspect: want error, got nil")
+				}
+				if got := errors.Is(err, ErrContainerNotFound); got != tc.wantNotFound {
+					t.Errorf("errors.Is(ErrContainerNotFound) = %t, want %t: %v", got, tc.wantNotFound, err)
+				}
+				var syntaxErr *json.SyntaxError
+				if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
+					t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
+				}
+			})
+		}
+	}
+}
+
+func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
+	otherID := strings.Repeat("a", 64)
+	cases := []struct {
+		name    string
+		target  string
+		data    string
+		wantUID string
+	}{
+		{
+			name:    "exact ID",
+			target:  dockerFixtureID,
+			data:    `[{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:    "name",
+			target:  "myctr",
+			data:    `[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:   "multiple objects",
+			target: dockerFixtureID,
+			data: `[{"Id":"` + otherID + `","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := (dockerEngine{}).parseInspect([]byte(tc.data), tc.target)
+			if err != nil {
+				t.Fatalf("parseInspect: %v", err)
+			}
+			if info.uid != tc.wantUID {
+				t.Errorf("uid = %q, want %q", info.uid, tc.wantUID)
+			}
+			if info.state != StateRunning {
+				t.Errorf("state = %q, want %q", info.state, StateRunning)
+			}
+		})
+	}
+}
+
+func TestDockerInspectUsesRunIDAndRejectsMismatch(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d)
+	d.inspectJSON = []byte(`[{"Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Name":"/myctr","State":{"Status":"running"}}]`)
+
+	_, err := ctr.State(context.Background())
+	inspectCall := d.callWith("inspect")
+	if inspectCall == nil {
+		t.Fatal("inspect was not called")
+	}
+	if got := inspectCall[len(inspectCall)-1]; got != dockerFixtureID {
+		t.Errorf("inspect target = %q, want Docker run ID %q", got, dockerFixtureID)
+	}
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
 	}
 }
 

@@ -462,11 +462,21 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.inspectTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	return c.eng.parseInspect(stdout, target)
+}
+
+// inspectTarget prefers an immutable ID so a same-name replacement cannot
+// satisfy a Docker inspect.
+func (c *Container) inspectTarget() string {
+	if c.uid != "" {
+		return c.uid
+	}
+	return c.id
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

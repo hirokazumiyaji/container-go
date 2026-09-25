@@ -185,15 +185,25 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
-func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	match := -1
+	for i, c := range containers {
+		if c.ID == "" {
+			continue
+		}
+		if c.ID == target || strings.TrimPrefix(c.Name, "/") == target {
+			match = i
+			break
+		}
 	}
-	c := containers[0]
+	if match < 0 {
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
+	}
+	c := containers[match]
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),

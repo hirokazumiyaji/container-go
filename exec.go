@@ -136,11 +136,12 @@ func execCLIStderr(err error) (string, bool) {
 func (c *Container) execContainerRunning(ctx context.Context) bool {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.inspectTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return false
 	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
 		return false
 	}

@@ -131,6 +131,10 @@ daemon の platform デフォルトに委譲します
 `NetworkSettings.Networks` を使います。
 既存のコンテナが Docker の特別な `default` mode を返す場合も、実際の
 network 名に正規化して再利用します。
+互換性判定では daemon の server platform も取得し、authoritative な
+default を確定します。そのため user-defined な `bridge` や `nat` を
+default と誤認しません。identity を取得できない場合や曖昧な場合は
+`ErrNetworkMismatch` で失敗します。
 `WithReuse` は一致する daemon default を受け付けますが、省略指定を
 `host`、`none`、任意の名前付き network の wildcard にはしません。
 Docker の handle は `run` が返した immutable な container ID を保持し、
@@ -138,7 +142,9 @@ endpoint、Host、lifecycle、reuse の inspect はその ID を対象にしま�
 network、IP、binding などの dynamic データは毎回更新され、古い snapshot
 は再利用されません。
 
-`docker context` 経由のリモート指定は検知しません。
+`DOCKER_HOST` のみを host reachability の判定に使用します。
+`docker context` 経由のリモート daemon は endpoint host の書き換えには
+使用しません。
 割り当てはデーモンが起動時に原子的に行うため、並列テストがポートを奪い合う
 こともありません。
 

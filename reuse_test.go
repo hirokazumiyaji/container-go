@@ -484,13 +484,17 @@ type staticDockerReuseRunner struct {
 }
 
 func (r *staticDockerReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "inspect" {
+	switch args[0] {
+	case "version":
+		return []byte("linux"), nil, nil
+	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		r.mu.Unlock()
 		return []byte(dockerReuseInspectJSON(dockerNetworkDefault)), nil, nil
+	default:
+		return r.fakeRunner.Run(ctx, args...)
 	}
-	return r.fakeRunner.Run(ctx, args...)
 }
 
 func TestDockerReuseRechecksNetworkAfterEnsure(t *testing.T) {

@@ -87,6 +87,10 @@ type Container struct {
 	// value means the backend's daemon-selected default.
 	network         string
 	networkExplicit bool
+	// defaultNetwork is Docker's authoritative daemon default identity
+	// (bridge on Linux, nat on Windows), learned lazily for implicit
+	// compatibility checks.
+	defaultNetwork string
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
 	// process exit. Explicit Terminate still removes them.
@@ -392,6 +396,9 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if err := c.attachDefaultNetwork(ctx, info); err != nil {
+		return "", err
+	}
 	if err := c.validateNetworkInfo(info); err != nil {
 		return "", err
 	}
@@ -470,6 +477,9 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
+	if err := c.attachDefaultNetwork(ctx, info); err != nil {
+		return "", 0, err
+	}
 	if err := c.validateNetworkInfo(info); err != nil {
 		return "", 0, err
 	}
@@ -508,7 +518,7 @@ func (c *Container) validateNetworkInfo(info *engineInfo) error {
 	if !c.networkExplicit {
 		requested = ""
 	}
-	return dockerNetworkModeError(requested, info.networkMode, info.networkNames)
+	return dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork)
 }
 
 // cachedInfo returns the immutable identity snapshot. Dynamic fields are
@@ -541,6 +551,7 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
+	c.applyCachedDefaultNetwork(info)
 	if err := c.rememberIdentity(info); err != nil {
 		return nil, err
 	}
@@ -639,6 +650,48 @@ func (c *Container) operationTarget() string {
 	c.inspectMu.Lock()
 	defer c.inspectMu.Unlock()
 	return c.inspectTargetLocked()
+}
+
+func (c *Container) needsDefaultNetwork() bool {
+	return c.eng.name() == "docker" &&
+		(!c.networkExplicit || c.network == dockerNetworkDefault)
+}
+
+func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
+	if !c.needsDefaultNetwork() {
+		return "", nil
+	}
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+	if c.defaultNetwork != "" {
+		return c.defaultNetwork, nil
+	}
+	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
+	if err != nil {
+		return "", err
+	}
+	c.defaultNetwork = name
+	return name, nil
+}
+
+func (c *Container) attachDefaultNetwork(ctx context.Context, info *engineInfo) error {
+	if !c.needsDefaultNetwork() {
+		return nil
+	}
+	name, err := c.ensureDefaultNetwork(ctx)
+	if err != nil {
+		return err
+	}
+	info.defaultNetwork = name
+	return nil
+}
+
+func (c *Container) applyCachedDefaultNetwork(info *engineInfo) {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+	if c.defaultNetwork != "" {
+		info.defaultNetwork = c.defaultNetwork
+	}
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

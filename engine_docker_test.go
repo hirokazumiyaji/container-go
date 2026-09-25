@@ -195,6 +195,7 @@ const dockerFixtureID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b
 
 type dockerRunner struct {
 	*fakeRunner
+	serverOS           string
 	inspectJSON        []byte
 	inspectResponses   [][]byte
 	inspectIndex       int
@@ -206,6 +207,11 @@ type dockerRunner struct {
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	d.calls = append(d.calls, args)
 	switch args[0] {
+	case "version":
+		if d.serverOS != "" {
+			return []byte(d.serverOS), nil, nil
+		}
+		return []byte("linux"), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "network":
@@ -335,13 +341,20 @@ func TestDockerEndpointRefreshesDynamicBinding(t *testing.T) {
 		t.Fatalf("Endpoint values = %q then %q", first, second)
 	}
 	inspectCalls := 0
+	versionCalls := 0
 	for _, call := range d.calls {
+		if len(call) > 0 && call[0] == "version" {
+			versionCalls++
+		}
 		if len(call) > 0 && call[0] == "inspect" {
 			inspectCalls++
 			if call[len(call)-1] != dockerFixtureID {
 				t.Errorf("inspect target = %q, want immutable Docker ID", call[len(call)-1])
 			}
 		}
+	}
+	if versionCalls != 1 {
+		t.Fatalf("server platform calls = %d, want one cached default lookup", versionCalls)
 	}
 	if inspectCalls != 2 {
 		t.Fatalf("inspect calls = %d, want 2", inspectCalls)
@@ -969,11 +982,23 @@ func TestDockerOmittedDefaultEndpointRejectsHostFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, mode := range []string{dockerNetworkHost, dockerNetworkNone} {
-		t.Run(mode, func(t *testing.T) {
-			inspect := []byte(strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+mode+`"`, 1))
+	for _, tc := range []struct {
+		name     string
+		mode     string
+		network  string
+		serverOS string
+	}{
+		{name: "host", mode: dockerNetworkHost, network: dockerNetworkBridge, serverOS: "linux"},
+		{name: "none", mode: dockerNetworkNone, network: dockerNetworkBridge, serverOS: "linux"},
+		{name: "linux user-defined nat", mode: dockerNetworkNAT, network: dockerNetworkNAT, serverOS: "linux"},
+		{name: "windows user-defined bridge", mode: dockerNetworkBridge, network: dockerNetworkBridge, serverOS: "windows"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			inspect := []byte(strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1))
+			inspect = []byte(strings.Replace(string(inspect), `"bridge": {`, `"`+tc.network+`": {`, 1))
 			d := &dockerRunner{
 				fakeRunner:       newTestRunner(),
+				serverOS:         tc.serverOS,
 				inspectResponses: [][]byte{inspect},
 			}
 			ctr, err := Run(context.Background(), "redis:7-alpine",
@@ -998,6 +1023,7 @@ func TestDockerDefaultNATEndpointUsesActualNetworkName(t *testing.T) {
 	data = bytes.Replace(data, []byte(`"bridge": {`), []byte(`"nat": {`), 1)
 	d := &dockerRunner{
 		fakeRunner:       newTestRunner(),
+		serverOS:         "windows",
 		inspectResponses: [][]byte{data},
 	}
 	ctr := runDockerTestContainer(t, d, WithExposedPorts("6379/tcp"))
@@ -1042,25 +1068,53 @@ func TestDockerReuseRejectsOmittedNetworkWildcard(t *testing.T) {
 
 func TestDockerReuseCanonicalizesDaemonDefaultNetwork(t *testing.T) {
 	for _, tc := range []struct {
-		name   string
-		actual string
-		names  []string
+		name           string
+		actual         string
+		names          []string
+		defaultNetwork string
 	}{
-		{name: "linux bridge", actual: dockerNetworkDefault, names: []string{dockerNetworkBridge}},
-		{name: "windows nat", actual: dockerNetworkDefault, names: []string{dockerNetworkNAT}},
-		{name: "reported bridge", actual: dockerNetworkBridge, names: []string{dockerNetworkBridge}},
-		{name: "reported nat", actual: dockerNetworkNAT, names: []string{dockerNetworkNAT}},
+		{name: "linux bridge", actual: dockerNetworkDefault, names: []string{dockerNetworkBridge}, defaultNetwork: dockerNetworkBridge},
+		{name: "windows nat", actual: dockerNetworkDefault, names: []string{dockerNetworkNAT}, defaultNetwork: dockerNetworkNAT},
+		{name: "reported bridge", actual: dockerNetworkBridge, names: []string{dockerNetworkBridge}, defaultNetwork: dockerNetworkBridge},
+		{name: "reported nat", actual: dockerNetworkNAT, names: []string{dockerNetworkNAT}, defaultNetwork: dockerNetworkNAT},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
 			info := &engineInfo{
-				labels:       map[string]string{reuseLabel: "true"},
-				image:        "redis:7-alpine",
-				networkMode:  tc.actual,
-				networkNames: tc.names,
+				labels:         map[string]string{reuseLabel: "true"},
+				image:          "redis:7-alpine",
+				networkMode:    tc.actual,
+				networkNames:   tc.names,
+				defaultNetwork: tc.defaultNetwork,
 			}
 			if err := checkReuseCompat(info, "redis:7-alpine", cfg); err != nil {
 				t.Fatalf("checkReuseCompat: %v", err)
+			}
+		})
+	}
+}
+
+func TestDockerOmittedNetworkRejectsUserDefinedPlatformName(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		actual         string
+		names          []string
+		defaultNetwork string
+	}{
+		{name: "linux user-defined nat", actual: dockerNetworkNAT, names: []string{dockerNetworkNAT}, defaultNetwork: dockerNetworkBridge},
+		{name: "windows user-defined bridge", actual: dockerNetworkBridge, names: []string{dockerNetworkBridge}, defaultNetwork: dockerNetworkNAT},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := dockerTestConfig(t, WithName("myctr"), WithReuse())
+			info := &engineInfo{
+				labels:         map[string]string{reuseLabel: "true"},
+				image:          "redis:7-alpine",
+				networkMode:    tc.actual,
+				networkNames:   tc.names,
+				defaultNetwork: tc.defaultNetwork,
+			}
+			if err := checkReuseCompat(info, "redis:7-alpine", cfg); !errors.Is(err, ErrNetworkMismatch) {
+				t.Fatalf("checkReuseCompat error = %v, want ErrNetworkMismatch", err)
 			}
 		})
 	}

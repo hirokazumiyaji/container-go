@@ -75,6 +75,27 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestReaperAcceptsDockerImmutableID(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	uid := strings.Repeat("ab", 32)
+
+	dockerReaper := newReaper(bin, "rm")
+	if err := dockerReaper.register(uid, ""); err != nil {
+		t.Fatalf("register Docker UID: %v", err)
+	}
+	dockerReaper.closeStdin()
+
+	if err := dockerReaper.register(strings.ToUpper(uid), ""); err == nil {
+		t.Error("uppercase Docker UID accepted; want lowercase-only validation")
+	}
+
+	nameReaper := newReaper(bin, "delete")
+	if err := nameReaper.register(uid, ""); err != nil {
+		t.Errorf("full Docker UID rejected by generic reaper validator: %v", err)
+	}
+	nameReaper.closeStdin()
+}
+
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")

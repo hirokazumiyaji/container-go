@@ -239,7 +239,10 @@ When `WithNetwork` is omitted, Docker receives no synthesized
 `HostConfig.NetworkMode == "default"` is matched against the concrete
 names in `NetworkSettings.Networks`, so a pre-existing default container
 can be reused without treating omission as a wildcard for `host`, `none`,
-or arbitrary named networks.
+or arbitrary named networks. The daemon server OS is also queried for the
+authoritative platform default; a user-defined `bridge` on Windows or
+`nat` on Linux is rejected, and an unavailable identity fails closed with
+`ErrNetworkMismatch`.
 
 Docker handles retain the immutable ID printed by `docker run --detach`.
 Inspect for Host, Endpoint, lifecycle operations, and reuse targets that

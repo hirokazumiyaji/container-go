@@ -37,6 +37,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err != nil {
 		return nil, err
 	}
+	if err := base.attachDefaultNetwork(ctx, info); err != nil {
+		return nil, err
+	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
 		return nil, err
 	}
@@ -49,6 +52,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published:       cfg.published,
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
+		defaultNetwork:  info.defaultNetwork,
 		reused:          true,
 		info:            immutableInfo(info),
 		creation:        info.labels[creationLabel],
@@ -307,7 +311,7 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 		if !cfg.networkExplicit {
 			requested = ""
 		}
-		if err := dockerNetworkModeError(requested, info.networkMode, info.networkNames); err != nil {
+		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
 			return fmt.Errorf("reuse %s: %w", cfg.name, err)
 		}
 		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {

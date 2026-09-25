@@ -177,6 +177,10 @@ inspect の特別な `HostConfig.NetworkMode == "default"` は
 `NetworkSettings.Networks` の具体的な network 名と照合するため、既存の
 default コンテナを再利用できても、省略指定を `host`、`none`、任意の名前付き
 network の wildcard にはしません。
+daemon の server OS から authoritative な platform default も取得するため、
+Linux の user-defined `nat` や Windows の user-defined `bridge` を default と
+誤認しません。identity を取得できない場合は `ErrNetworkMismatch` で fail closed
+します。
 
 Docker の handle は `docker run --detach` が返した immutable な container ID
 を保持します。Host、endpoint、lifecycle、reuse の inspect はその ID を対象

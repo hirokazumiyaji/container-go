@@ -22,10 +22,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Reject Docker host, none, internal, and isolated networks before
   published endpoint creation; leave omitted `WithNetwork` to the
   daemon default and resolve Docker's `default` mode from actual
-  `NetworkSettings.Networks`. Refresh dynamic inspect data through the
-  immutable Docker UID for endpoint, Host, lifecycle, and reuse operations.
+  `NetworkSettings.Networks` and the daemon's authoritative platform
+  default; user-defined `bridge`/`nat` names no longer impersonate an
+  omitted default. Refresh dynamic inspect data through the immutable
+  Docker UID for endpoint, Host, lifecycle, and reuse operations.
 - Canonicalize IPv6 bindings and preserve address family in endpoint
   resolution, including fail-closed remote-daemon loopback handling.
+- Accept full lowercase Docker UIDs in the reaper while retaining strict
+  logical-name validation.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

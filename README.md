@@ -129,16 +129,20 @@ When `WithNetwork` is omitted, the Docker CLI is left without a
 on Linux, `nat` on native Windows). Endpoint and Host resolution uses the
 actual mode and `NetworkSettings.Networks` from inspect; a pre-existing
 container reporting Docker's special `default` mode is canonicalized
-against that actual network. `WithReuse` is therefore compatible with a
-matching daemon default, but never treats an omitted option as a wildcard
-for `host`, `none`, or an arbitrary named network. Docker handles retain
+against that actual network. Compatibility also uses the daemon's
+reported server platform to identify its authoritative default, so a
+user-defined `bridge` or `nat` is not mistaken for that default. If the
+identity is unavailable or ambiguous, the operation fails with
+`ErrNetworkMismatch`. `WithReuse` is therefore compatible with a matching
+daemon default, but never treats an omitted option as a wildcard for
+`host`, `none`, or an arbitrary named network. Docker handles retain
 the immutable container ID returned by `run`, and endpoint, Host, lifecycle,
 and reuse operations inspect that ID; dynamic network, IP, and binding
 data are refreshed on every operation rather than served from a stale
 snapshot.
 
-Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected.
+Only `DOCKER_HOST` is honored for host reachability; a `docker context`
+pointing at a remote daemon is not used to rewrite endpoint hosts.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:

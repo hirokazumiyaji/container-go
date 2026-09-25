@@ -17,6 +17,12 @@ const (
 )
 
 func issue115ReviewAppleImageJSON(variants []map[string]any) []byte {
+	if len(variants) == 1 {
+		variants = append(variants, map[string]any{
+			"platform": map[string]any{"os": "linux", "architecture": "amd64"},
+			"digest":   "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+		})
+	}
 	return issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, variants)
 }
 
@@ -45,6 +51,7 @@ type issue115ReviewRunner struct {
 	inspectCalls     int
 	pullCalls        int
 	runImage         string
+	platform         string
 	calls            [][]string
 }
 
@@ -67,7 +74,22 @@ func (r *issue115ReviewRunner) Run(_ context.Context, args ...string) ([]byte, [
 		return nil, nil, nil
 	case args[0] == "run":
 		r.runImage = args[len(args)-1]
+		for i, arg := range args {
+			if arg == "--platform" && i+1 < len(args) {
+				r.platform = args[i+1]
+			}
+		}
 		return []byte("myctr\n"), nil, nil
+	case args[0] == "inspect":
+		image := stripImageDigest(r.runImage)
+		if image == "" {
+			image = "redis:7-alpine"
+		}
+		platform := r.platform
+		if platform == "" {
+			platform = "linux/amd64"
+		}
+		return issue115ReviewContainerJSON(image, issue115ReviewRoot, platform), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -79,6 +101,33 @@ func (r *issue115ReviewRunner) state() (runImage string, inspectCalls, pullCalls
 	return r.runImage, r.inspectCalls, r.pullCalls
 }
 
+func issue115ReviewContainerJSON(image, digest, platform string) []byte {
+	parts := strings.Split(platform, "/")
+	platformJSON := map[string]string{}
+	if len(parts) > 0 {
+		platformJSON["os"] = parts[0]
+	}
+	if len(parts) > 1 {
+		platformJSON["architecture"] = parts[1]
+	}
+	if len(parts) > 2 {
+		platformJSON["variant"] = parts[2]
+	}
+	data, _ := json.Marshal([]any{map[string]any{
+		"id": "myctr",
+		"configuration": map[string]any{
+			"id": "myctr",
+			"image": map[string]any{
+				"reference":  image,
+				"descriptor": map[string]string{"digest": digest},
+			},
+			"platform": platformJSON,
+		},
+		"status": map[string]any{"state": "running", "networks": []any{}},
+	}})
+	return data
+}
+
 func issue115ReviewCallHasPlatform(call []string, platform string) bool {
 	for i, arg := range call {
 		if arg == "--platform" && i+1 < len(call) && call[i+1] == platform {
@@ -88,24 +137,27 @@ func issue115ReviewCallHasPlatform(call []string, platform string) bool {
 	return false
 }
 
-func TestIssue115AppleNameDigestAliasFailsClosed(t *testing.T) {
+func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	input := "redis:7-alpine@" + issue115ReviewRoot
 	r := &issue115ReviewRunner{inspectJSON: issue115ReviewAppleImageJSON(nil)}
 	identity, exists := (appleEngine{}).parseImageIdentity(issue115ReviewAppleImageJSON(nil), input, "")
-	if !exists || !identity.mutableAlias || !identity.pinned {
-		t.Fatalf("parsed alias identity = %+v, exists = %v, want explicit mutable-alias state", identity, exists)
+	if !exists || !identity.pinned || identity.mutableAlias {
+		t.Fatalf("parsed name@digest identity = %+v, exists = %v, want pinned identity", identity, exists)
 	}
-	_, err := Run(context.Background(), input,
+	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
-	if !errors.Is(err, ErrImageIdentityUnavailable) {
-		t.Fatalf("error = %v, want ErrImageIdentityUnavailable for mutable Apple alias", err)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if runImage, _, pulls := r.state(); runImage != "" || pulls != 0 {
-		t.Fatalf("alias reached run=%q pulls=%d", runImage, pulls)
+	if !ctr.image.pinned || ctr.image.digest != issue115ReviewRoot {
+		t.Fatalf("run identity = %+v, want pinned root digest", ctr.image)
+	}
+	if got, _, pulls := r.state(); got != input || pulls != 0 {
+		t.Fatalf("run image = %q pulls = %d, want pinned name@digest", got, pulls)
 	}
 }
 
-func TestIssue115AppleNameDigestAliasRequiresExplicitMutablePolicy(t *testing.T) {
+func TestIssue115AppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
 	input := "redis:7-alpine@" + issue115ReviewRoot
 	r := &issue115ReviewRunner{inspectJSON: issue115ReviewAppleImageJSON(nil)}
 	ctr, err := Run(context.Background(), input,
@@ -113,11 +165,11 @@ func TestIssue115AppleNameDigestAliasRequiresExplicitMutablePolicy(t *testing.T)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if ctr.image.pinned || ctr.image.digest != issue115ReviewRoot {
-		t.Fatalf("mutable alias identity = %+v, want unpinned reference with retained content digest", ctr.image)
+	if !ctr.image.pinned || ctr.image.mutableAlias || ctr.image.digest != issue115ReviewRoot {
+		t.Fatalf("identity = %+v, want name@digest to remain pinned", ctr.image)
 	}
 	if got, _, _ := r.state(); got != input {
-		t.Fatalf("run image = %q, want original mutable alias %q", got, input)
+		t.Fatalf("run image = %q, want original pinned reference", got)
 	}
 }
 
@@ -370,8 +422,10 @@ func TestIssue115ApplePlatformUsesRootIndexDigestForRunAndReuse(t *testing.T) {
 	}
 
 	actual := imageFromInfo(&engineInfo{
-		image:       "redis:7-alpine",
-		imageDigest: issue115ReviewRoot,
+		image:              "redis:7-alpine",
+		imageDigest:        issue115ReviewRoot,
+		imageVariantDigest: issue115ReviewVariant,
+		platform:           "linux/arm64",
 	})
 	if actual.reference != wantReference {
 		t.Fatalf("synthesized container reference = %q, want %q", actual.reference, wantReference)
@@ -408,6 +462,19 @@ func TestIssue115AppleMalformedDescriptorDoesNotFallbackToID(t *testing.T) {
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists || identity.pinned {
 		t.Fatalf("identity = %+v, exists = %v, want fail-closed malformed descriptor", identity, exists)
+	}
+}
+
+func TestIssue115DockerUnprefixedInspectIDCanonicalizes(t *testing.T) {
+	raw := strings.Repeat("a", 64)
+	identity, exists := (dockerEngine{}).parseImageIdentity(
+		[]byte(`[{"Id":"`+raw+`"}]`), "redis:7-alpine", "")
+	if !exists || !identity.pinned || identity.reference != "sha256:"+raw {
+		t.Fatalf("identity = %+v exists = %v, want canonical local ID", identity, exists)
+	}
+	actual := imageFromInfo(&engineInfo{imageID: raw})
+	if !actual.pinned || actual.reference != "sha256:"+raw {
+		t.Fatalf("container identity = %+v, want canonical local ID", actual)
 	}
 }
 

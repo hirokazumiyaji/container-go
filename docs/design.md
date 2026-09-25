@@ -124,8 +124,8 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-`Run` fetches the image (the CLI auto-pulls when missing), creates and
-starts the container, and completes the wait strategy; on failure it
+`Run` resolves the image according to the selected pull policy, creates
+and starts the container, and completes the wait strategy; on failure it
 rolls back whatever it created before returning the error.
 
 Options use the functional options pattern. The initial release
@@ -372,16 +372,18 @@ env-file contents.
 passes the reported immutable identity to the backend. Docker prefers a
 matching registry digest and falls back to the inspected local image ID;
 a local alias with a foreign `RepoDigests` entry also uses that ID, while
-an explicit pinned repository/digest conflict is an error. Apple Container uses the root image descriptor as the run/reuse identity
-and validates the selected platform variant separately. An ID-only image
-record is normalized to a digest reference when a repository and
-descriptor prove that identity. This prevents a later local tag
+an explicit pinned repository/digest conflict is an error. Apple Container
+uses the root image descriptor as the run and reuse identity and keeps the
+selected platform variant as separate validation metadata. When Apple
+resolves an unqualified input to a custom default registry, the reported
+canonical repository is retained in the run reference and identity
+comparison. An ID-only image record is normalized to a digest reference
+when a repository and descriptor prove that identity. This prevents a later local tag
 reassignment from changing that create, but it does not make a mutable
-tag's pull-to-inspect operation atomic. A caller-supplied Apple
-`name@digest` is also an alias rather than an atomic run address, so it
-is rejected unless `WithAllowMutableImageTag` explicitly accepts the
-mutable fallback. If a backend
-version reports no usable identity, the default policy fails closed with
+tag's pull-to-inspect operation atomic. Caller-supplied Apple
+`name@digest` and `name:tag@digest` references remain pinned, including
+when `WithAllowMutableImageTag` is set. If a backend version reports no
+usable identity, the default policy fails closed with
 `ErrImageIdentityUnavailable`. A digest without repository provenance is
 not identity proof; a bare Docker image ID is accepted only when the
 backend inspect verifies that exact local ID.
@@ -399,12 +401,19 @@ errors from the addressability check remain operational errors and never
 authorize the mutable fallback. `WithAllowMutableImageTag` is an
 explicit compatibility escape hatch for a mutable input whose identity
 is unavailable or whose resolved reference is not locally addressable;
-it carries no identity guarantee. It is also required for a caller-
-supplied Apple `name@digest`, which the backend exposes as a mutable
-alias rather than an atomic run address. It never downgrades a bare
-digest or Docker image-ID-shaped value. Locally built Apple images may
-therefore require the explicit mutable-tag fallback when no local digest
-reference is available.
+it carries no identity guarantee and never downgrades a caller-supplied
+repository digest, a bare digest, or a Docker image-ID-shaped value.
+Locally built Apple images may therefore require the explicit
+mutable-tag fallback when no local digest reference is available.
+
+Apple can synthesize a local index around a single manifest. That index
+root is content-addressed in the local store but is not necessarily
+registry-addressable by `name@digest`. The resolver therefore does not
+blindly exact-pull a synthetic root. It requires a locally addressable
+tag or alias, or the explicit mutable-tag fallback. A newly-created Apple
+container is inspected again after `container run`; a root, platform, or
+selected-variant mismatch rolls the container back before `Run` or reuse
+returns it.
 
 ## Performance design
 

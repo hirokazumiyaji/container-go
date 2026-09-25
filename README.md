@@ -157,9 +157,12 @@ repository or digest conflicts is rejected as
 `ErrImageIdentityMismatch`. Apple Container uses the root image
 descriptor as the run/reuse identity, validates the selected platform
 variant separately, and normalizes an ID-only record to a digest
-reference when the descriptor is available. Reuse compares the resolved
-digest/ID identity, not the original tag, and removes a newly-created
-reused container if its post-create identity or port validation fails.
+reference when the descriptor is available. When Apple resolves an
+unqualified input to a custom default registry, `Run` preserves that
+canonical repository in the pinned reference and reuse comparison.
+Reuse compares the resolved digest/ID identity, not the original tag,
+and removes a newly-created reused container if its post-create identity
+or port validation fails.
 
 Apple has no runtime `--pull=never` switch. Before `Run` passes any
 pinned Apple reference to `container run`, it verifies that exact
@@ -183,10 +186,10 @@ container.Run(ctx, "redis:7-alpine",
 
 With that option, a mutable input may run the original tag; this
 deliberately retains the tag-replacement window and is not an identity
-guarantee. Apple also treats a caller-supplied `image@sha256:...` as
-a mutable alias, so that spelling is rejected by default and requires
-this explicit option. The option never downgrades a bare digest or a
-Docker image-ID-shaped value. Pinning cannot make a mutable registry
+guarantee. Apple `image@sha256:...` (including `image:tag@sha256:...`)
+is a pinned address and is never downgraded by this option. The option
+never downgrades a bare digest or a Docker image-ID-shaped value.
+Pinning cannot make a mutable registry
 tag's pull-to-inspect resolution atomic when another actor can modify
 the shared backend. Prefer a caller-supplied `image@sha256:...` when
 the backend provides an atomic address and treat its identity metadata
@@ -280,9 +283,11 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - `Run` passes the verified identity returned by image inspect (or a
   Docker image ID) to the backend, so a later local tag reassignment
   does not change that create. Apple descriptor-backed references are
-  checked for local addressability before create; caller-supplied
-  `name@digest` aliases are rejected unless `WithAllowMutableImageTag`
-  explicitly accepts their mutable semantics. `container run` is never
+  checked for local addressability before create and the resulting
+  container identity is verified before return. Caller-supplied
+  `name@digest` references remain pinned; `WithAllowMutableImageTag`
+  applies only to mutable tags and explicitly authorized compatibility
+  fallbacks. `container run` is never
   used as an implicit fetch. This is a backend/API guarantee, not a
   claim that every tag-to-registry operation is atomic: a mutable tag
   can still be replaced before the post-pull inspect, and an

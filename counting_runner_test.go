@@ -85,23 +85,24 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	ctr := runTestContainer(t, r, WithExposedPorts("6379/tcp"))
 
 	// Expected calls: image inspect (present, no pull), a second
-	// addressability inspect for Apple's pinned reference, and run. The
-	// first container inspect is deferred until connection info is needed.
-	if got := r.count(); got != 3 {
-		t.Fatalf("after Run: calls = %d, want 3", got)
+	// addressability inspect for Apple's pinned reference, run, and the
+	// post-create container identity verification. The first connection
+	// info request then reuses that verified inspect cache.
+	if got := r.count(); got != 4 {
+		t.Fatalf("after Run: calls = %d, want 4", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
 	// Endpoint triggers the deferred container inspect once; later reads reuse it.
-	if got := r.count(); got != 4 {
-		t.Fatalf("after Endpoint: calls = %d, want 4", got)
+	if got := r.count(); got != 5 {
+		t.Fatalf("after Endpoint: calls = %d, want 5", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 4 {
-		t.Fatalf("after cached Endpoint: calls = %d, want 4", got)
+	if got := r.count(); got != 5 {
+		t.Fatalf("after cached Endpoint: calls = %d, want 5", got)
 	}
 
 	// The wrapper forwards results unchanged.
@@ -127,17 +128,21 @@ func TestRunForLogSkipsInitialInspect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + pinned-reference inspect + run + logs stream; no
-	// container inspect.
-	if got := r.count(); got != 4 {
-		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
+	// image inspect + pinned-reference inspect + run + post-create
+	// verification inspect + logs stream.
+	if got := r.count(); got != 5 {
+		t.Fatalf("after ForLog Run: calls = %d, want 5", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	inspectCalls := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			t.Fatalf("unexpected container inspect during ForLog Run: %v", r.args)
+			inspectCalls++
 		}
+	}
+	if inspectCalls != 1 {
+		t.Fatalf("container inspect calls = %d, want one post-create verification: %v", inspectCalls, r.args)
 	}
 }
 

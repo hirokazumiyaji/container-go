@@ -24,6 +24,19 @@
           "os": "linux",
           "config": {}
         }
+      },
+      {
+        "platform": {
+          "os": "linux",
+          "architecture": "amd64"
+        },
+        "digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "size": 6789,
+        "config": {
+          "architecture": "amd64",
+          "os": "linux",
+          "config": {}
+        }
       }
     ]
   }

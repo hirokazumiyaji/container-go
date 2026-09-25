@@ -109,6 +109,7 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 		{name: "aarch64 to arm64", actual: "linux/aarch64", requested: "linux/arm64"},
 		{name: "arm64 nil to v8", actual: "linux/arm64", requested: "linux/arm64/v8"},
 		{name: "armhf default to arm v7", actual: "linux/arm/v7", requested: "linux/armhf"},
+		{name: "armel default to v6", actual: "linux/armel/v6", requested: "linux/armel"},
 		{name: "amd64 v1 to amd64", actual: "linux/x86_64/v1", requested: "linux/amd64"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

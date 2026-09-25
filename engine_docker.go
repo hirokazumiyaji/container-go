@@ -337,9 +337,35 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 	return []string{"pull", image}
 }
 
-// imageMissing matches the daemon's response for an absent image.
+// imageMissing matches the daemon's image-absence reason, rather than a
+// broad "not found" substring that could be part of the requested name.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
+	cliErr, ok := imageCLIErrorForBackend(err, "docker")
+	if !ok {
+		return false
+	}
+	for _, raw := range strings.Split(strings.ToLower(cliErr.Stderr), "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.Trim(line, "()[]{} \t:,")
+		for range 3 {
+			line = strings.Trim(line, " \t\"'")
+			matchedPrefix := false
+			for _, prefix := range []string{"error response from daemon:", "error:", "failed:"} {
+				if strings.HasPrefix(line, prefix) {
+					line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+					matchedPrefix = true
+					break
+				}
+			}
+			if !matchedPrefix {
+				break
+			}
+		}
+		if strings.HasPrefix(line, "no such image:") || strings.HasPrefix(line, "manifest unknown:") || strings.HasPrefix(line, "image not found:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
@@ -374,15 +400,21 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 	}
 	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
 	sawExplicitConflict := false
+	sawDifferentID := false
 	fallbackID := ""
 	for _, img := range images {
+		inspectedID, inspectedIDOK := canonicalDockerImageID(img.ID)
 		// An ID-shaped request is only accepted when inspect reports that
-		// exact verified local ID. A registry digest from a different
-		// record must not turn an unverified caller token into a pin.
+		// exact verified local ID. A different, well-formed Docker ID is a
+		// known mismatch rather than an unavailable identity.
 		if requestedIsID {
-			inspectedID, ok := canonicalDockerImageID(img.ID)
-			if ok && strings.EqualFold(inspectedID, requestedID) {
-				return imageReferenceWithDigest(requestedID, "", "", inspectedID), true
+			if inspectedIDOK && strings.EqualFold(inspectedID, requestedID) {
+				identity := imageReferenceWithDigest(requestedID, "", "", inspectedID)
+				identity.rootDigest = ""
+				return identity, true
+			}
+			if inspectedIDOK {
+				sawDifferentID = true
 			}
 			continue
 		}
@@ -408,30 +440,40 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 					continue
 				}
 			}
-			return imageReferenceWithDigest(image, repoDigest, digest, img.ID), true
+			identityID := ""
+			if inspectedIDOK {
+				identityID = inspectedID
+			}
+			identity := imageReferenceWithDigest(image, repoDigest, digest, identityID)
+			identity.repository = imageRepository(repoDigest)
+			return identity, true
 		}
-		if img.ID != "" {
+		if inspectedIDOK {
 			// A tag can be a local alias whose RepoDigests came from a
 			// different registry. The inspected local ID is still the
 			// safe immutable target for that alias. An explicit pinned
 			// request remains a conflict when a RepoDigest contradicted
 			// it, even if the local content ID is available.
 			if !explicitPinned {
-				return imageReferenceWithDigest(image, "", "", img.ID), true
+				identity := imageReferenceWithDigest(image, "", "", inspectedID)
+				identity.repository = imageRepository(image)
+				return identity, true
 			}
 			if fallbackID == "" {
-				fallbackID = img.ID
+				fallbackID = inspectedID
 			}
 		}
 		// A non-empty Docker inspect array proves existence even when
 		// this old/versioned response has no usable identity fields.
 	}
 	if explicitPinned {
-		if sawExplicitConflict {
+		if sawExplicitConflict || sawDifferentID {
 			return imageIdentity{mismatch: true}, true
 		}
 		if fallbackID != "" {
-			return imageReferenceWithDigest(image, "", "", fallbackID), true
+			identity := imageReferenceWithDigest(image, "", "", fallbackID)
+			identity.repository = imageRepository(image)
+			return identity, true
 		}
 	}
 	return imageIdentity{}, true
@@ -461,13 +503,9 @@ func (dockerEngine) nameConflict(err error) bool {
 
 // containerMissing matches a CLI failure for an absent container.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
+	return dockerStderrContains(err, dockerStderrNotFound) ||
+		dockerStderrContains(err, dockerStderrNoSuchObj) ||
+		dockerStderrContains(err, dockerStderrNoSuchCtr)
 }
 
 func dockerCLIStderr(err error) (string, bool) {

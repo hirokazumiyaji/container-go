@@ -129,43 +129,30 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 
 ## イメージの解決と固定
 
-`Run` は `PullMissing` と `PullAlways` の両方で、image inspect の後に
-解決した image identity を backend の `run` に渡します。
-Docker は repository が一致する `RepoDigests` を優先し、取得できない
-場合は inspect した local image `Id` にフォールバックします。別の
-repository の `RepoDigests` を持つ local tag は alias として扱い、
-その immutable `Id` で安全に実行します。明示的な
-`image@digest` の repository または digest が一致しない場合だけ
-`ErrImageIdentityMismatch` になります。
-Apple Container は root image descriptor を run / reuse の identity と
-して使い、指定した platform の variant は別途検証します。
+`Run` は `PullMissing` と `PullAlways` の両方で、image inspect の後に解決した image identity を backend の `run` に渡します。
+Docker は repository が一致する `RepoDigests` を優先し、取得できない場合は inspect した local image `Id` にフォールバックします。
+別の repository の `RepoDigests` を持つ local tag は alias として扱い、その immutable `Id` で安全に実行します。
+明示的な `image@digest` の repository または digest が一致しない場合は `ErrImageIdentityMismatch` になります。
+Apple Container は root image descriptor を run / reuse の identity として使い、指定した platform の variant は別の検証情報として保持します。
 descriptor が利用可能な ID だけの record は digest 参照に正規化します。
-Reuse は元の mutable tag ではなく、解決済み digest / image ID で互換性を
-判定します。作成後の検証に失敗した新規 reuse container は削除します。
+Apple が未指定の入力を custom default registry へ解決した場合、`Run` は pinned 参照と reuse 比較に backend が報告した canonical repository を保持します。
+Reuse は元の mutable tag ではなく、解決済み digest / image ID で互換性を判定します。
+作成後の検証に失敗した新規 reuse container は削除します。
 
-Apple Container には実行時の `--pull=never` がないため、`Run` は
-`PullMissing`、`PullAlways`、`PullNever` のいずれでも、pinned された
-Apple reference を `container run` に渡す前に local store にあるかを
-確認します。存在せず選択した policy が fetch を許可する場合は、
-exact digest を明示的に pull してから再確認します。`container run` に
-暗黙の fetch をさせません。identity を取得できない inspect の成功は
-`ErrImageIdentityUnavailable`、local に存在しないことが確認された
-場合は `ErrImageIdentityNotLocal` です。addressability check の
-transport、permission、context cancellation エラーは元の operational
-error として返し、mutable fallback では隠しません。
-identity を取得できない、または resolved reference が local にない
-mutable input では、互換 fallback として `WithAllowMutableImageTag()`
-を明示指定できます。Apple では呼び出し側の `image@sha256:...` も
-mutable alias として扱い、atomic な run address として immutable に
-扱いません。そのため、この綴りを実行するには option の明示指定が必要です。
-この fallback は tag や alias の置き換えを防ぐ保証ではなく、bare digest
-や Docker image ID を降格することもありません。
-pull 完了から inspect の間に発生する mutable tag の変更や、共有 daemon に
-対する別 process の変更を、CLI API だけで原子的に排除できるとは仮定しません。
-再現性が重要な場合は、backend が atomic address を提供する場合の
-`image@sha256:...` を呼び出し側から渡してください。
-local build の Apple image に利用可能な local digest 参照がない場合は
-`WithAllowMutableImageTag` が必要になることがあります。
+Apple Container には実行時の `--pull=never` がないため、`Run` は `PullMissing`、`PullAlways`、`PullNever` のいずれでも、pinned された Apple reference を `container run` に渡す前に local store にあるかを確認します。
+存在せず選択した policy が fetch を許可する場合は exact digest を明示的に pull してから再確認します。
+`container run` に暗黙の fetch をさせません。
+identity を取得できない inspect の成功は `ErrImageIdentityUnavailable`、local に存在しないことが確認された場合は `ErrImageIdentityNotLocal` です。
+addressability check の transport、permission、context cancellation エラーは元の operational error として返し、mutable fallback では隠しません。
+identity を取得できない、または resolved reference が local にない mutable input では、互換 fallback として `WithAllowMutableImageTag()` を明示指定できます。
+Apple の `name@digest` と `name:tag@digest` は pinned として扱い、この option を指定しても mutable へ降格させません。
+この fallback は tag の置き換えを防ぐ保証ではなく、bare digest や Docker image ID も降格しません。
+pull 完了から inspect の間に発生する mutable tag の変更や、共有 daemon に対する別 process の変更を、CLI API だけで原子的に排除できるとは仮定しません。
+再現性が重要な場合は、backend が atomic address を提供する場合の `image@sha256:...` を呼び出し側から渡してください。
+Apple が単一 manifest の周囲に合成した local index の root は registry から取得できるとは限らないため、無条件に exact pull しません。
+local に addressable な tag または alias を使うか、明示的な mutable-tag fallback を要求します。
+新規作成直後の container は再 inspect し、root、platform、選択された variant が異なる場合は `Run` が返す前にロールバックします。
+local build の Apple image に利用可能な local digest 参照がない場合は `WithAllowMutableImageTag` が必要になることがあります。
 
 ```go
 container.Run(ctx, "redis:7-alpine",
@@ -246,15 +233,12 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   プロセス一覧(`ps`)に現れません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry
   login`(macOS Keychain 保存)を使ってください。
-- `Run` は image inspect が返した検証済み identity、または Docker の
-  image ID を backend に渡すため、inspect 後の local tag 変更で create
-  対象が変わりません。Apple の descriptor-backed reference は create 前に
-  local addressability を確認します。呼び出し側の `name@digest` alias は
-  mutable な意味を明示的に受け入れる `WithAllowMutableImageTag` がない限り
-  拒否します。`container run` を暗黙の fetch として使いません。これは
-  backend API の範囲での保証です。mutable tag の pull から inspect までの
-  操作を原子化するものではありません。identity を取得できない backend
-  では `WithAllowMutableImageTag` による明示的な fallback が必要です。
+- `Run` は image inspect が返した検証済み identity、または Docker の image ID を backend に渡すため、inspect 後の local tag 変更で create 対象が変わりません。
+  Apple の descriptor-backed reference は create 前に local addressability を確認します。
+  呼び出し側の `name@digest` と `name:tag@digest` は pinned のまま残り、`WithAllowMutableImageTag` は mutable tag と明示的に許可された互換 fallback にだけ適用されます。
+  `container run` を暗黙の fetch として使いません。
+  これは backend API の範囲での保証であり、mutable tag の pull から inspect までの操作を原子化するものではありません。
+  identity を取得できない backend では `WithAllowMutableImageTag` による明示的な fallback が必要です。
 
 ## testcontainers-go との違い
 

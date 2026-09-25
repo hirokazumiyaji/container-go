@@ -33,6 +33,7 @@ type issue115AppleAddressRunner struct {
 	exactPullErr      error
 	originalPullErr   error
 	runImage          string
+	platform          string
 	inspectTargets    []string
 	pullTargets       []string
 }
@@ -71,7 +72,22 @@ func (r *issue115AppleAddressRunner) Run(_ context.Context, args ...string) ([]b
 		return nil, nil, nil
 	case args[0] == "run":
 		r.runImage = args[len(args)-1]
+		for i, arg := range args {
+			if arg == "--platform" && i+1 < len(args) {
+				r.platform = args[i+1]
+			}
+		}
 		return []byte("myctr\n"), nil, nil
+	case args[0] == "inspect":
+		image := stripImageDigest(r.runImage)
+		if image == "" {
+			image = "redis:7-alpine"
+		}
+		platform := r.platform
+		if platform == "" {
+			platform = "linux/arm64/v8"
+		}
+		return issue115ReviewContainerJSON(image, "sha256:1111111111111111111111111111111111111111111111111111111111111111", platform), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -110,7 +126,7 @@ func TestIssue115AppleDescriptorReferenceIsLocallyCheckedForAllPullPolicies(t *t
 			r := &issue115AppleAddressRunner{
 				fixture:      issue115AppleImageFixture(t),
 				localMissing: true,
-				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found"},
+				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
 			}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(policy), withRunner(r), withEngine(appleEngine{}))
@@ -169,7 +185,7 @@ func TestIssue115AppleDescriptorReferenceUsesExplicitMutableFallback(t *testing.
 			r := &issue115AppleAddressRunner{
 				fixture:      issue115AppleImageFixture(t),
 				localMissing: true,
-				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found"},
+				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
 			}
 			ctr, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(policy), WithAllowMutableImageTag(),

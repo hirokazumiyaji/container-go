@@ -1,6 +1,7 @@
 package container
 
 import (
+	"errors"
 	"strings"
 	"time"
 
@@ -19,20 +20,34 @@ import (
 // ID ABI, and a bare digest has no repository provenance.
 type imageIdentity struct {
 	reference string
-	digest    string
-	id        string
-	pinned    bool
+	// digest is the root/index identity used for the run reference. When
+	// Apple selected a platform variant, variantDigest records the selected
+	// manifest separately rather than replacing the root identity.
+	digest string
+	// rootDigest is kept separately from digest for callers that need to
+	// distinguish a backend-selected manifest from the root index. Parsers
+	// set both to the same value when no variant is selected.
+	rootDigest string
+	// repository is the backend-canonical repository identity. It preserves
+	// a custom default registry reported by Apple without rewriting it to
+	// Docker Hub during comparison.
+	repository string
+	id         string
+	pinned     bool
 	// platform and variantDigest describe an explicitly selected image
-	// variant. digest remains the root/index descriptor used as the run
-	// identity; the variant is validation metadata, not the reference
-	// passed to run.
+	// variant. digest/rootDigest remain the root/index descriptor used as
+	// the content identity; the variant is validation metadata.
 	platform      string
 	variantDigest string
-	// mutableAlias marks a caller-supplied Apple name@digest. Its digest
-	// is useful for comparison, but the Apple backend does not expose an
-	// atomic address for that spelling, so Run must not treat the
-	// synthesized reference as immutable unless the caller explicitly
-	// accepts the compatibility fallback.
+	// appleSynthetic marks a root descriptor synthesized by Apple around a
+	// single manifest. That root is an implementation detail, not a
+	// registry-addressable pull target; the resolver must try its local tag
+	// only as an explicit mutable fallback.
+	appleSynthetic bool
+	// mutableAlias is retained for source compatibility with the internal
+	// identity model. Apple name@digest references are immutable addresses,
+	// so parsers no longer set it; it is reserved for an explicitly
+	// authorized compatibility state.
 	mutableAlias bool
 	// notLocal means the backend returned an image record but could not
 	// prove that the requested platform variant is locally addressable.
@@ -59,8 +74,16 @@ type engineInfo struct {
 	image string
 	// imageID is Docker's immutable local image ID when reported.
 	imageID string
-	// imageDigest is the OCI digest reported for the container image.
+	// imageDigest is the OCI root/index digest reported for the container
+	// image.
 	imageDigest string
+	// imageVariantDigest is populated when the backend reports the selected
+	// platform manifest separately from the root index.
+	imageVariantDigest string
+	// platform is the platform selected when the container was created.
+	// Empty means the backend did not report it; it must not be inferred
+	// from a root index digest.
+	platform string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
@@ -146,6 +169,9 @@ type engine interface {
 func imageReferenceWithDigest(requested, reported, digest, id string) imageIdentity {
 	digest = strings.TrimSpace(digest)
 	id = strings.TrimSpace(id)
+	if canonicalID, ok := canonicalDockerImageID(id); ok {
+		id = canonicalID
+	}
 	if digest != "" {
 		base := imageReferenceBase(requested)
 		if base == "" {
@@ -155,20 +181,20 @@ func imageReferenceWithDigest(requested, reported, digest, id string) imageIdent
 			// A verified backend ID may stand alone. This is the only
 			// exception to the repository-provenance rule.
 			if isImageID(id) && ((isImageID(requested) && strings.EqualFold(requested, id)) || strings.EqualFold(id, digest)) {
-				return imageIdentity{reference: id, id: id, pinned: true}
+				return imageIdentity{reference: id, id: id, pinned: true, rootDigest: digest}
 			}
 			return imageIdentity{}
 		}
 		if !validImageDigest(digest) || !imageRE.MatchString(base+"@"+digest) {
 			return imageIdentity{}
 		}
-		return imageIdentity{reference: base + "@" + digest, digest: digest, id: id, pinned: true}
+		return imageIdentity{reference: base + "@" + digest, digest: digest, rootDigest: digest, id: id, pinned: true}
 	}
 	if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) {
 		if imageReferenceBase(requested) == "" {
 			return imageIdentity{}
 		}
-		return imageIdentity{reference: requested, digest: requestedDigest, id: id, pinned: true}
+		return imageIdentity{reference: requested, digest: requestedDigest, rootDigest: requestedDigest, id: id, pinned: true}
 	}
 	if isImageID(id) {
 		return imageIdentity{reference: id, id: id, pinned: true}
@@ -185,16 +211,39 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 	if !a.pinned || !b.pinned {
 		return false
 	}
-	if a.platform != "" && b.platform != "" && a.platform != b.platform {
+
+	// A Docker local ID is a stronger identity than a registry digest. If
+	// either side reports one, a missing or different ID is not compatible;
+	// equal content digests must not hide a known-different local image.
+	aID, aHasID := canonicalDockerImageID(a.id)
+	bID, bHasID := canonicalDockerImageID(b.id)
+	if aHasID || bHasID {
+		return aHasID && bHasID && strings.EqualFold(aID, bID)
+	}
+
+	if !applePlatformMetadataCompatible(a.platform, b.platform) {
 		return false
 	}
-	if a.variantDigest != "" && b.variantDigest != "" && !strings.EqualFold(a.variantDigest, b.variantDigest) {
+	if a.variantDigest != "" && !validImageDigest(a.variantDigest) {
 		return false
 	}
-	if isImageID(a.id) && isImageID(b.id) && strings.EqualFold(a.id, b.id) {
-		return true
+	if b.variantDigest != "" && !validImageDigest(b.variantDigest) {
+		return false
 	}
-	if !validImageDigest(a.digest) || !validImageDigest(b.digest) || !strings.EqualFold(a.digest, b.digest) {
+	if a.variantDigest != "" || b.variantDigest != "" {
+		if a.variantDigest == "" || b.variantDigest == "" || !strings.EqualFold(a.variantDigest, b.variantDigest) {
+			return false
+		}
+	}
+
+	aroot, broot := a.rootDigest, b.rootDigest
+	if aroot == "" {
+		aroot = a.digest
+	}
+	if broot == "" {
+		broot = b.digest
+	}
+	if !validImageDigest(aroot) || !validImageDigest(broot) || !strings.EqualFold(aroot, broot) {
 		return false
 	}
 	// A digest is content-addressed, but a reference also names the
@@ -206,7 +255,82 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 	if abase == "" || bbase == "" {
 		return false
 	}
-	return imageRepository(abase) == imageRepository(bbase)
+	if a.repository != "" && b.repository != "" {
+		return imageRepositoriesCompatible(a.repository, b.repository)
+	}
+	if a.repository != "" || b.repository != "" {
+		// One side may be a caller spelling while the other carries the
+		// backend's canonical registry. Compare the repository paths and
+		// tags without accepting a bare digest as a wildcard.
+		return imageRepositoryPathsCompatible(abase, bbase)
+	}
+	return imageRepositoriesCompatible(imageRepository(abase), imageRepository(bbase))
+}
+
+// requestedImageIdentitiesCompatible compares a resolved request with an
+// inspected result. The request may omit platform metadata when the caller
+// did not select a platform; metadata reported only by the inspected
+// container is then additional information. Conversely, an explicit request
+// must not be accepted when the actual result omits that metadata.
+func requestedImageIdentitiesCompatible(requested, actual imageIdentity) bool {
+	actualForComparison := actual
+	if requested.platform == "" {
+		actualForComparison.platform = ""
+	}
+	if requested.variantDigest == "" {
+		actualForComparison.variantDigest = ""
+	}
+	return imageIdentitiesCompatible(requested, actualForComparison)
+}
+
+func applePlatformMetadataCompatible(a, b string) bool {
+	if a == "" && b == "" {
+		return true
+	}
+	if a == "" || b == "" {
+		// A requested platform is not verifiable from metadata that omits
+		// the selected platform. Fail closed rather than attaching an
+		// unknown variant under a known root index.
+		return false
+	}
+	ap, aok := parseApplePlatformSelector(a)
+	bp, bok := parseApplePlatformSelector(b)
+	return aok && bok && applePlatformsEqual(ap, bp)
+}
+
+// imageCLIErrorForBackend returns a CLI error only when it came from the
+// requested backend image operation. The binary and command checks keep an
+// error from one backend from being classified as another backend's absence.
+func imageCLIErrorForBackend(err error, backend string) (*cli.CLIError, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return nil, false
+	}
+	backend = strings.ToLower(strings.TrimSpace(backend))
+	if binary := strings.ToLower(strings.TrimSpace(cliErr.Binary)); binary != "" && binary != backend {
+		return nil, false
+	}
+	if len(cliErr.Args) == 0 {
+		return cliErr, true
+	}
+	if len(cliErr.Args) < 2 {
+		return nil, false
+	}
+	switch strings.ToLower(cliErr.Args[0]) {
+	case "image":
+		if len(cliErr.Args) < 3 {
+			return nil, false
+		}
+		switch strings.ToLower(cliErr.Args[1]) {
+		case "inspect", "pull":
+		default:
+			return nil, false
+		}
+	case "pull":
+	default:
+		return nil, false
+	}
+	return cliErr, true
 }
 
 // isImageID recognizes Docker's content-addressed local image ID. The

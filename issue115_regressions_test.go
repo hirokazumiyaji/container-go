@@ -282,7 +282,7 @@ func (r *issue115AppleIDRunner) Run(_ context.Context, args ...string) ([]byte, 
 		if args[len(args)-1] == "redis:7-alpine" {
 			return []byte(`[{"id":"` + issue115ReuseImageID[7:] + `","configuration":{"name":"redis:7-alpine"},"variants":[]}]`), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found"}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: " + args[len(args)-1]}
 	}
 	if args[0] == "run" {
 		r.runImage = args[len(args)-1]

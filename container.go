@@ -195,6 +195,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
 	}
+	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
+		return nil, c.rollback(ctx, err)
+	}
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {

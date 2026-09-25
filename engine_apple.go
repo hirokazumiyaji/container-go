@@ -105,8 +105,10 @@ func parseApplePlatformSelector(platform string) (applePlatform, bool) {
 		variant = parts[2]
 	} else {
 		switch parts[1] {
-		case "arm", "armhf", "armel":
+		case "arm", "armhf":
 			variant = "v7"
+		case "armel":
+			variant = "v6"
 		case "aarch64", "arm64":
 			variant = "v8"
 		}
@@ -139,6 +141,17 @@ func applePlatformsEqual(want, have applePlatform) bool {
 		want.variant == have.variant
 }
 
+func formatApplePlatform(platform applePlatform) string {
+	if platform.os == "" || platform.architecture == "" {
+		return ""
+	}
+	value := platform.os + "/" + platform.architecture
+	if platform.variant != "" {
+		value += "/" + platform.variant
+	}
+	return value
+}
+
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {
@@ -168,11 +181,25 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if image != "" && validImageDigest(imageDigest) {
 			image = stripImageDigest(image) + "@" + imageDigest
 		}
+		platform := ""
+		if p := c.Configuration.Platform; p.OS != "" || p.Architecture != "" || p.Variant != "" {
+			candidate := p.OS + "/" + p.Architecture
+			if p.Variant != "" {
+				candidate += "/" + p.Variant
+			}
+			parsed, ok := parseApplePlatformSelector(candidate)
+			if !ok {
+				return nil, fmt.Errorf("container %s has invalid platform %q", id, candidate)
+			}
+			platform = formatApplePlatform(parsed)
+		}
 		info := &engineInfo{
-			state:       State(c.Status.State),
-			labels:      c.Configuration.Labels,
-			image:       image,
-			imageDigest: imageDigest,
+			state:              State(c.Status.State),
+			labels:             c.Configuration.Labels,
+			image:              image,
+			imageDigest:        imageDigest,
+			imageVariantDigest: c.Configuration.Image.VariantDigest,
+			platform:           platform,
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -259,7 +286,9 @@ func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
 }
 
 type appleImageDescriptor struct {
-	Digest string `json:"digest"`
+	Digest      string            `json:"digest"`
+	MediaType   string            `json:"mediaType"`
+	Annotations map[string]string `json:"annotations"`
 }
 
 type appleImageVariant struct {
@@ -280,7 +309,12 @@ type appleImageInspectRecord struct {
 		Name       string               `json:"name"`
 		Reference  string               `json:"reference"`
 		Descriptor appleImageDescriptor `json:"descriptor"`
-		Image      struct {
+		Platform   struct {
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
+			Variant      string `json:"variant"`
+		} `json:"platform"`
+		Image struct {
 			Reference  string               `json:"reference"`
 			Descriptor appleImageDescriptor `json:"descriptor"`
 		} `json:"image"`
@@ -299,9 +333,37 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 	return []string{"image", "pull", image}
 }
 
-// imageMissing matches the CLI's error for an absent image.
+// imageMissing matches the backend's image-absence reason, not an
+// arbitrary occurrence of "not found" in an image name or application
+// message. Apple reports the reason as `image not found: <name>`.
 func (appleEngine) imageMissing(err error) bool {
-	return appleStderrContains(err, appleStderrNotFound)
+	cliErr, ok := imageCLIErrorForBackend(err, "container")
+	return ok && appleImageMissingStderr(cliErr.Stderr)
+}
+
+func appleImageMissingStderr(stderr string) bool {
+	for _, raw := range strings.Split(strings.ToLower(stderr), "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.Trim(line, "()[]{} \t:,")
+		for range 3 {
+			line = strings.Trim(line, " \t\"'")
+			matchedPrefix := false
+			for _, prefix := range []string{"notfound:", "error:", "failed:"} {
+				if strings.HasPrefix(line, prefix) {
+					line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+					matchedPrefix = true
+					break
+				}
+			}
+			if !matchedPrefix {
+				break
+			}
+		}
+		if strings.HasPrefix(line, "image not found:") {
+			return true
+		}
+	}
+	return false
 }
 
 func (appleEngine) imageIdentityNeedsLocalCheck() bool { return true }
@@ -328,9 +390,22 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		return imageIdentity{}, false
 	}
 	record := records[0]
+	if platform == "" && (record.Configuration.Platform.OS != "" || record.Configuration.Platform.Architecture != "" || record.Configuration.Platform.Variant != "") {
+		candidate := record.Configuration.Platform.OS + "/" + record.Configuration.Platform.Architecture
+		if record.Configuration.Platform.Variant != "" {
+			candidate += "/" + record.Configuration.Platform.Variant
+		}
+		parsed, ok := parseApplePlatformSelector(candidate)
+		if !ok {
+			return imageIdentity{}, true
+		}
+		platform = formatApplePlatform(parsed)
+	}
 	rootDigest, rootOK := appleRootDescriptorDigest(record)
+	variantDigest := ""
 	if platform != "" {
-		variantDigest, variantOK := applePlatformVariantDigest(record, platform)
+		var variantOK bool
+		variantDigest, variantOK = applePlatformVariantDigest(record, platform)
 		if !variantOK {
 			return imageIdentity{
 				notLocal:       true,
@@ -343,7 +418,6 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 			// index identity used by run and reuse.
 			return imageIdentity{}, true
 		}
-		return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest), true
 	}
 	if !rootOK && appleDescriptorPresent(record) {
 		// A malformed descriptor is not equivalent to an older
@@ -351,7 +425,7 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		// backend supplied an unusable descriptor field.
 		return imageIdentity{}, true
 	}
-	return finishAppleImageIdentity(image, record, rootDigest, "", ""), true
+	return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest), true
 }
 
 // appleRootDescriptorDigest returns the index/root descriptor digest,
@@ -401,8 +475,10 @@ func applePlatformVariantDigest(record appleImageInspectRecord, platform string)
 		}
 		have := canonicalApplePlatform(variant.Platform.OS, variant.Platform.Architecture, variant.Platform.Variant)
 		if applePlatformsEqual(want, have) {
+			if selected != "" && !strings.EqualFold(selected, variant.Digest) {
+				return "", false
+			}
 			selected = variant.Digest
-			break
 		}
 	}
 	return selected, selected != ""
@@ -434,20 +510,30 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
 			return imageIdentity{mismatch: true}
 		}
-	} else if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
-		requestedDigest := imageDigest(requested)
-		if requestedDigest == "" || imageDigest(reference) != "" || imageRepository(requested) != imageRepository(reference) {
-			return imageIdentity{mismatch: true}
-		}
-		// A caller-supplied digest with an older response that only
-		// repeats the name is still safe: the successful inspect proves
-		// the requested reference exists, and pinImage will retain the
-		// caller's digest.
+	} else if requested != "" && reference != "" && !appleImageReferencesCompatible(requested, reference) {
+		return imageIdentity{mismatch: true}
 	}
+
 	if validImageDigest(digest) {
 		// The descriptor is authoritative. Do not copy an ID-shaped field
 		// into imageIdentity.id: that field is a Docker-only local-ID ABI.
-		return appleIdentityWithAlias(appleIdentityWithVariant(imageReferenceWithDigest(requested, reference, digest, ""), platform, variantDigest), requested)
+		runReference := appleRunReferenceBase(requested, reference)
+		identity := imageReferenceWithDigest(runReference, reference, digest, "")
+		identity.rootDigest = digest
+		identity.platform = platform
+		identity.variantDigest = variantDigest
+		identity.repository = imageRepository(runReference)
+		identity.appleSynthetic = appleSyntheticIndex(record, digest, variantDigest)
+		// A caller may pin the actual manifest of a single-manifest image.
+		// That digest is registry-addressable even though Apple's synthetic
+		// root index digest is not, so retain the caller's tag plus digest.
+		if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) && validImageDigest(variantDigest) && strings.EqualFold(requestedDigest, variantDigest) {
+			if base := imageReferenceBase(requested); base != "" {
+				identity.reference = base + "@" + variantDigest
+				identity.appleSynthetic = false
+			}
+		}
+		return identity
 	}
 	if isImageID(record.ID) {
 		// Apple must not treat a Docker-style ID field as an immutable
@@ -459,24 +545,85 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		// without a descriptor. Keep the compatibility fallback, but do
 		// not classify it as a Docker image ID.
 		digest := "sha256:" + record.ID
-		return appleIdentityWithAlias(appleIdentityWithVariant(imageReferenceWithDigest(requested, reference, digest, ""), platform, variantDigest), requested)
+		identity := imageReferenceWithDigest(appleRunReferenceBase(requested, reference), reference, digest, "")
+		identity.rootDigest = digest
+		identity.platform = platform
+		identity.variantDigest = variantDigest
+		identity.repository = imageRepository(identity.reference)
+		return identity
 	}
 	return imageIdentity{}
 }
 
-func appleIdentityWithVariant(identity imageIdentity, platform, variantDigest string) imageIdentity {
-	identity.platform = platform
-	identity.variantDigest = variantDigest
-	return identity
+// appleSyntheticIndex identifies Apple's local index wrapper around one
+// manifest. Such a digest is present in the content store but is not a
+// registry reference that can safely be pulled by name@digest.
+func appleSyntheticIndex(record appleImageInspectRecord, rootDigest, variantDigest string) bool {
+	if len(record.Variants) != 1 {
+		return false
+	}
+	if variantDigest == "" {
+		variantDigest = record.Variants[0].Digest
+	}
+	if !validImageDigest(rootDigest) {
+		return false
+	}
+	if !validImageDigest(variantDigest) {
+		// A single-variant record with an unusable manifest digest is not
+		// evidence that the generated root is registry-addressable.
+		return true
+	}
+	if strings.EqualFold(rootDigest, variantDigest) {
+		return false
+	}
+	descriptor := record.Configuration.Descriptor
+	if descriptor.MediaType != "" {
+		mediaType := strings.ToLower(descriptor.MediaType)
+		if !strings.Contains(mediaType, "index") && !strings.Contains(mediaType, "manifest.list") {
+			return false
+		}
+	}
+	if descriptor.Annotations != nil {
+		if value, ok := descriptor.Annotations["com.apple.containerization.index.indirect"]; ok {
+			return strings.EqualFold(value, "true") || value == "1"
+		}
+	}
+	// Current Apple releases omit the indirect annotation from the
+	// serialized descriptor. A one-variant root whose digest differs from
+	// that variant is therefore the observable synthetic-index shape.
+	return true
 }
 
-// appleIdentityWithAlias records whether the caller supplied the
-// name@digest spelling. A reference synthesized from a mutable tag has
-// already been resolved through the inspected root descriptor and keeps
-// the normal descriptor-backed run path; the caller's spelling does not.
-func appleIdentityWithAlias(identity imageIdentity, requested string) imageIdentity {
-	identity.mutableAlias = isRepositoryDigestReference(requested)
-	return identity
+// appleRunReferenceBase preserves a backend's canonical custom-registry
+// name when the caller used an unqualified reference. Docker Hub's familiar
+// short form remains unchanged for compatibility.
+func appleRunReferenceBase(requested, reported string) string {
+	requestedBase := imageReferenceBase(requested)
+	reportedBase := imageReferenceBase(reported)
+	if requestedBase == "" {
+		return reportedBase
+	}
+	if isUnqualifiedImageReference(requestedBase) && reportedBase != "" && !isDockerRegistryReference(reportedBase) {
+		return reportedBase
+	}
+	return requestedBase
+}
+
+func appleImageReferencesCompatible(requested, actual string) bool {
+	if imagesCompatible(requested, actual) {
+		return true
+	}
+	// A custom default registry is reported canonically by Apple, while the
+	// caller may have supplied an unqualified name. Accept that backend
+	// spelling only when the repository path and tag agree. If both sides
+	// carry digests, their digest claims must also agree; a descriptor-backed
+	// identity is checked separately against the selected root/variant.
+	requestedDigest := imageDigest(requested)
+	actualDigest := imageDigest(actual)
+	if requestedDigest != "" && actualDigest != "" && !strings.EqualFold(requestedDigest, actualDigest) {
+		return false
+	}
+	return imageRepositoryPathsCompatible(requested, actual)
 }
 
 // appleImageIDMatchesDescriptor verifies the only safe interpretation of
@@ -531,13 +678,9 @@ func (appleEngine) nameConflict(err error) bool {
 
 // containerMissing matches a CLI failure for an absent container.
 func (appleEngine) containerMissing(err error) bool {
-	s, ok := appleCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, appleStderrNotFound) ||
-		strings.Contains(s, appleStderrNoSuchObj) ||
-		strings.Contains(s, appleStderrNoSuchCtr)
+	return appleStderrContains(err, appleStderrNotFound) ||
+		appleStderrContains(err, appleStderrNoSuchObj) ||
+		appleStderrContains(err, appleStderrNoSuchCtr)
 }
 
 func appleCLIStderr(err error) (string, bool) {

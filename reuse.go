@@ -46,6 +46,16 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
 		return nil, err
 	}
+	if cfg.eng.name() == "apple" && resolvedImage.pinned {
+		// Re-inspect immediately before returning an attached Apple
+		// container. This closes the same final addressability window for
+		// reuse adoption that verifyAppleCreatedImage closes for create.
+		probe := namedContainer(cfg, cfg.name)
+		probe.image = resolvedImage
+		if err := verifyAppleCreatedImage(ctx, probe, resolvedImage); err != nil {
+			return nil, err
+		}
+	}
 
 	containerImage := imageFromInfo(info)
 	if resolvedImage.pinned {
@@ -231,6 +241,9 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
 		return nil, cleanupReuseCreate(ctx, ctr, err)
 	}
+	if err := verifyAppleCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
+		return nil, cleanupReuseCreate(ctx, ctr, err)
+	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			return nil, cleanupReuseCreate(ctx, ctr, err)
@@ -310,13 +323,28 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	if info == nil {
 		return imageIdentity{}
 	}
+	platform := info.platform
+	variantDigest := info.imageVariantDigest
+	imageID := info.imageID
+	if canonicalID, ok := canonicalDockerImageID(imageID); ok {
+		imageID = canonicalID
+	}
 	if validImageDigest(info.imageDigest) {
 		reference := info.image
 		if imageReferenceBase(reference) == "" {
-			reference = info.imageID
+			reference = imageID
 		}
-		if imageReferenceBase(reference) == "" && isImageID(info.imageID) {
-			return imageIdentity{reference: info.imageID, digest: info.imageDigest, id: info.imageID, pinned: true}
+		if imageReferenceBase(reference) == "" && isImageID(imageID) {
+			return imageIdentity{
+				reference:     imageID,
+				digest:        info.imageDigest,
+				rootDigest:    info.imageDigest,
+				repository:    "",
+				id:            imageID,
+				pinned:        true,
+				platform:      platform,
+				variantDigest: variantDigest,
+			}
 		}
 		if base := imageReferenceBase(reference); base != "" {
 			// Container inspect may report a tag plus a separate
@@ -327,22 +355,31 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 			if !imageRE.MatchString(synthesized) {
 				return imageIdentity{}
 			}
-			return imageIdentity{reference: synthesized, digest: info.imageDigest, id: info.imageID, pinned: true}
+			return imageIdentity{
+				reference:     synthesized,
+				digest:        info.imageDigest,
+				rootDigest:    info.imageDigest,
+				repository:    imageRepository(base),
+				id:            imageID,
+				pinned:        true,
+				platform:      platform,
+				variantDigest: variantDigest,
+			}
 		}
 		// A digest without repository provenance is not a safe identity.
 		return imageIdentity{}
 	}
-	if isImageID(info.imageID) {
-		return imageIdentity{reference: info.imageID, id: info.imageID, pinned: true}
+	if isImageID(imageID) {
+		return imageIdentity{reference: imageID, id: imageID, pinned: true, platform: platform, variantDigest: variantDigest}
 	}
 	if digest := imageDigest(info.image); validImageDigest(digest) && imageReferenceBase(info.image) != "" {
-		return imageIdentity{reference: info.image, digest: digest, pinned: true}
+		return imageIdentity{reference: info.image, digest: digest, rootDigest: digest, repository: imageRepository(info.image), pinned: true, platform: platform, variantDigest: variantDigest}
 	}
 	// A bare sha256:... in a container's image field is not enough to
 	// establish a Docker local ID. Only info.imageID above is verified
 	// backend identity data.
 	if info.image != "" && !isBareImageReference(info.image) {
-		return imageIdentity{reference: info.image}
+		return imageIdentity{reference: info.image, repository: imageRepository(info.image), platform: platform, variantDigest: variantDigest}
 	}
 	return imageIdentity{}
 }
@@ -357,12 +394,16 @@ func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original
 	}
 	if requested.pinned {
 		actual := imageFromInfo(info)
-		if !imageIdentitiesCompatible(requested, actual) {
+		if !requestedImageIdentitiesCompatible(requested, actual) {
 			return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
 		}
 		return nil
 	}
-	if !imagesCompatible(original, info.image) {
+	compatible := imagesCompatible(original, info.image)
+	if cfg.eng.name() == "apple" {
+		compatible = appleImageReferencesCompatible(original, info.image)
+	}
+	if !compatible {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
 	}
 	return nil
@@ -507,6 +548,133 @@ func normalizeImageRef(ref string) string {
 
 func isRegistry(s string) bool {
 	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
+}
+
+func isUnqualifiedImageReference(ref string) bool {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return false
+	}
+	base = imageRepositoryBaseWithoutTag(base)
+	first, _, _ := strings.Cut(base, "/")
+	return !isRegistry(first)
+}
+
+func isDockerRegistryReference(ref string) bool {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return false
+	}
+	base = imageRepositoryBaseWithoutTag(base)
+	first, _, _ := strings.Cut(base, "/")
+	switch strings.ToLower(first) {
+	case "docker.io", "registry-1.docker.io", "index.docker.io":
+		return true
+	default:
+		return false
+	}
+}
+
+func imageRepositoryBaseWithoutTag(base string) string {
+	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
+		return base[:i]
+	}
+	return base
+}
+
+// imageRepositoryPathsCompatible compares the repository path and tag
+// while allowing one side to be an unqualified backend-default name. It is
+// intentionally separate from imagesCompatible: the latter retains the
+// historical Docker-Hub-only policy for arbitrary public comparisons, while
+// Apple inspect responses may legitimately contain a custom default
+// registry.
+func imageRepositoryPathsCompatible(a, b string) bool {
+	aName, aTag, aExplicit := imageRepositoryParts(a)
+	bName, bTag, bExplicit := imageRepositoryParts(b)
+	if aName == "" || bName == "" {
+		return false
+	}
+	if aExplicit && bExplicit {
+		ra, rb := imageRegistryOf(a), imageRegistryOf(b)
+		if ra == "" || rb == "" || !strings.EqualFold(ra, rb) {
+			return false
+		}
+	}
+	if !tagsCompatible(aTag, bTag) {
+		return false
+	}
+	if aExplicit && bExplicit {
+		return aName == bName
+	}
+	if aExplicit {
+		return repositoryNameMatches(bName, aName)
+	}
+	if bExplicit {
+		return repositoryNameMatches(aName, bName)
+	}
+	return normalizeImageRef(stripImageDigest(a)) == normalizeImageRef(stripImageDigest(b))
+}
+
+func imageRegistryOf(ref string) string {
+	base := imageRepositoryBaseWithoutTag(imageReferenceBase(ref))
+	if base == "" {
+		return ""
+	}
+	first, _, _ := strings.Cut(base, "/")
+	if !isRegistry(first) {
+		return ""
+	}
+	return first
+}
+
+func imageRepositoryParts(ref string) (name, tag string, explicit bool) {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return "", "", false
+	}
+	name = base
+	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
+		tag = name[i+1:]
+		name = name[:i]
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) > 0 && isRegistry(parts[0]) {
+		explicit = true
+		name = strings.Join(parts[1:], "/")
+		if strings.EqualFold(parts[0], "docker.io") && !strings.Contains(name, "/") {
+			name = "library/" + name
+		}
+	}
+	return name, tag, explicit
+}
+
+func tagsCompatible(a, b string) bool {
+	if a == "" {
+		a = "latest"
+	}
+	if b == "" {
+		b = "latest"
+	}
+	return a == b
+}
+
+func repositoryNameMatches(unqualified, qualified string) bool {
+	if unqualified == qualified {
+		return true
+	}
+	parts := strings.Split(unqualified, "/")
+	if len(parts) == 1 {
+		return qualified == unqualified || qualified == "library/"+unqualified
+	}
+	return false
+}
+
+// imageRepositoriesCompatible compares canonical repository keys captured
+// from backend inspect responses. Unlike path compatibility it is strict:
+// once a backend has supplied a registry-qualified identity, another
+// registry is never interchangeable.
+func imageRepositoriesCompatible(a, b string) bool {
+	return a != "" && b != "" && strings.EqualFold(a, b)
 }
 
 func imageDigest(ref string) string {

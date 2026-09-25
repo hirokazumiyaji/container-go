@@ -132,6 +132,16 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 	case args[0] == "run":
 		r.runImage = args[len(args)-1]
 		return []byte("myctr\n"), nil, nil
+	case args[0] == "inspect":
+		image := stripImageDigest(r.runImage)
+		if image == "" {
+			image = "redis:7-alpine"
+		}
+		digest := r.resolvedDigest
+		if digest == "" {
+			digest = issue115ImageIdentityOld
+		}
+		return issue115ReviewContainerJSON(image, digest, "linux/arm64/v8"), nil, nil
 	default:
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "unexpected command"}
 	}
@@ -209,7 +219,7 @@ func (r *issue115AppleNoDigestAliasRunner) Run(_ context.Context, args ...string
 		if args[len(args)-1] == "redis:7-alpine" {
 			return []byte(`[{"id":"` + issue115ImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue115ImageIdentityNew + `"}}}]`), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found"}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: " + args[len(args)-1]}
 	}
 	if args[0] == "run" {
 		r.runCalls++

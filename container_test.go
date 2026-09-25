@@ -18,17 +18,20 @@ func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
 	// another backend; tests opting in use t.Setenv.
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv(defaultPlatformEnv)
 	os.Exit(m.Run())
 }
 
 // fakeRunner records CLI calls and replays canned results.
 type fakeRunner struct {
-	mu          sync.Mutex
-	calls       [][]string
-	envFiles    []string // contents of --env-file captured at call time
-	inspectJSON string
-	failPrefix  string // fail calls whose first arg matches
-	systemUp    bool
+	mu                    sync.Mutex
+	calls                 [][]string
+	envFiles              []string // contents of --env-file captured at call time
+	inspectJSON           string
+	failPrefix            string // fail calls whose first arg matches
+	failInspectAfter      int    // allow this many matching calls before failing (0 fails all)
+	containerInspectCalls int
+	systemUp              bool
 
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
@@ -68,7 +71,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
-			return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}]`), nil, nil
+			return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
@@ -82,8 +85,12 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		f.pullCalls++
 		return nil, nil, nil
 	}
-	if f.failPrefix != "" && args[0] == f.failPrefix {
+	if f.failPrefix != "" && args[0] == f.failPrefix &&
+		(args[0] != "inspect" || f.failInspectAfter == 0 || f.containerInspectCalls >= f.failInspectAfter) {
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+	}
+	if args[0] == "inspect" {
+		f.containerInspectCalls++
 	}
 	switch args[0] {
 	case "run":
@@ -118,7 +125,8 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "docker.io/library/redis:7-alpine"},
+      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
+      "platform": {"os": "linux", "architecture": "amd64"},
       "publishedPorts": [],
       "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
     },
@@ -344,13 +352,14 @@ func TestRunRejectsMountWithComma(t *testing.T) {
 func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
+	f.failInspectAfter = 1
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if f.callWith("inspect") != nil {
-		t.Errorf("inspect issued during Run: %v", f.calls)
+	if f.containerInspectCalls != 1 {
+		t.Errorf("container inspect calls during Run = %d, want one post-create verification: %v", f.containerInspectCalls, f.calls)
 	}
 	if f.callWith("delete") != nil {
 		t.Errorf("unexpected delete during Run: %v", f.calls)

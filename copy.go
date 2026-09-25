@@ -56,7 +56,12 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, newValidationErrorWithField("CopyFileFromContainer", "containerPath", containerPath, err)
 	}
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
+		return nil, newValidationErrorWithField(
+			"CopyFileFromContainer",
+			"containerPath",
+			containerPath,
+			fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath),
+		)
 	}
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {

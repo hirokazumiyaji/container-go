@@ -81,6 +81,26 @@ func TestCopyMethodsRejectInvalidContainerPathAsValidationError(t *testing.T) {
 	}
 }
 
+func TestCopyFileFromContainerRejectsRootAndTrailingSlashAsValidationError(t *testing.T) {
+	for _, path := range []string{"/", "/foo/", "/foo/bar/"} {
+		t.Run(path, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := runTestContainer(t, f)
+			f.calls = nil
+
+			rc, err := ctr.CopyFileFromContainer(context.Background(), path)
+			if rc != nil {
+				_ = rc.Close()
+			}
+			want := fmt.Sprintf("copy file from container %q: cannot copy directory or root as a single file", path)
+			assertPublicValidationError(t, err, "CopyFileFromContainer", "containerPath", path, want)
+			if len(f.calls) != 0 {
+				t.Fatalf("backend was called despite invalid copy path: %v", f.calls)
+			}
+		})
+	}
+}
+
 func TestCopyToContainerFilesystemErrorIsNotValidationError(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

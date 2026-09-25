@@ -14,6 +14,8 @@ type BaselineScenario struct {
 	Scenario            string   `json:"scenario"`
 	Image               string   `json:"image"`
 	ImageDigest         string   `json:"image_digest"`
+	RyukImage           string   `json:"ryuk_image,omitempty"`
+	RyukImageDigest     string   `json:"ryuk_image_digest,omitempty"`
 	WorkloadCacheStates []string `json:"workload_cache_states"`
 	RyukCacheStates     []string `json:"ryuk_cache_states,omitempty"`
 	Iterations          int      `json:"iterations"`
@@ -23,12 +25,14 @@ type BaselineScenario struct {
 // benchmark baseline. It is intentionally separate from measured durations:
 // the table may contain pending or historical values, while this record fixes
 // the source, environment, and scenario inputs those values were allowed to
-// represent.
+// represent. The checked-in record is explicitly synthetic policy provenance,
+// not a fabricated measurement result.
 type BaselineProvenance struct {
 	SchemaVersion int                `json:"schema_version"`
 	Commit        string             `json:"commit"`
 	Tree          string             `json:"tree"`
 	Dirty         bool               `json:"dirty"`
+	Synthetic     bool               `json:"synthetic"`
 	Env           Env                `json:"env"`
 	Scenarios     []BaselineScenario `json:"scenarios"`
 
@@ -48,6 +52,9 @@ func (b *BaselineProvenance) UnmarshalJSON(data []byte) error {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
+	}
+	if err := validateJSONBoolField(fields, "dirty"); err != nil {
+		return fmt.Errorf("baseline.%w", err)
 	}
 	*b = BaselineProvenance(decoded)
 	b.metadataPresent = true
@@ -74,6 +81,8 @@ func GenerateBaselineProvenance(env Env) BaselineProvenance {
 			Scenario:            key.Scenario,
 			Image:               policy.Image,
 			ImageDigest:         policy.ImageDigest,
+			RyukImage:           policy.RyukImage,
+			RyukImageDigest:     policy.RyukImageDigest,
 			WorkloadCacheStates: append([]string(nil), policy.WorkloadCacheStates...),
 			RyukCacheStates:     append([]string(nil), policy.CacheStates...),
 			Iterations:          policy.Iterations,
@@ -84,6 +93,7 @@ func GenerateBaselineProvenance(env Env) BaselineProvenance {
 		Commit:        env.Commit,
 		Tree:          env.Tree,
 		Dirty:         env.Dirty,
+		Synthetic:     true,
 		Env:           env,
 		Scenarios:     scenarios,
 
@@ -97,6 +107,9 @@ func GenerateBaselineProvenance(env Env) BaselineProvenance {
 func ValidateBaselineProvenance(baseline BaselineProvenance) error {
 	if baseline.SchemaVersion != CurrentSchemaVersion {
 		return fmt.Errorf("baseline schema_version = %d, want %d", baseline.SchemaVersion, CurrentSchemaVersion)
+	}
+	if !baseline.Synthetic {
+		return fmt.Errorf("baseline provenance must be explicitly marked synthetic")
 	}
 	if baseline.metadataPresent && !baseline.dirtyPresent {
 		return fmt.Errorf("baseline dirty is required")
@@ -134,6 +147,9 @@ func ValidateBaselineProvenance(baseline BaselineProvenance) error {
 		}
 		if scenario.Image != policy.Image || scenario.ImageDigest != policy.ImageDigest {
 			return fmt.Errorf("baseline %s/%s/%s image provenance does not match policy", key.Backend, key.Library, key.Scenario)
+		}
+		if scenario.RyukImage != policy.RyukImage || scenario.RyukImageDigest != policy.RyukImageDigest {
+			return fmt.Errorf("baseline %s/%s/%s Ryuk image provenance does not match policy", key.Backend, key.Library, key.Scenario)
 		}
 		if scenario.Iterations != policy.Iterations {
 			return fmt.Errorf("baseline %s/%s/%s iterations = %d, want %d", key.Backend, key.Library, key.Scenario, scenario.Iterations, policy.Iterations)

@@ -129,6 +129,28 @@ func TestTestcontainersPropertiesPathsIncludeConfigOverride(t *testing.T) {
 	}
 }
 
+func TestValidateTestcontainersDockerEndpoint(t *testing.T) {
+	for _, endpoint := range []string{
+		"unix:///var/run/docker.sock",
+		"tcp://127.0.0.1:2375",
+		"npipe:////./pipe/docker_engine",
+	} {
+		if err := validateTestcontainersDockerEndpoint(endpoint); err != nil {
+			t.Errorf("canonical endpoint %q rejected: %v", endpoint, err)
+		}
+	}
+	for _, endpoint := range []string{
+		"ssh://user@example.invalid/run/docker.sock",
+		"http://127.0.0.1:2375",
+		"tcp://",
+		"unix://",
+	} {
+		if err := validateTestcontainersDockerEndpoint(endpoint); err == nil {
+			t.Errorf("unsupported endpoint %q was accepted", endpoint)
+		}
+	}
+}
+
 func TestValidateTestcontainersConfigurationRejectsEffectiveFixedIdentity(t *testing.T) {
 	home := t.TempDir()
 	custom := filepath.Join(t.TempDir(), "testcontainers.properties")

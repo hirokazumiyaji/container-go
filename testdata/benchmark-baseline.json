@@ -216,7 +216,9 @@
         "cold",
         "warm"
       ],
-      "iterations": 1
+      "iterations": 1,
+      "ryuk_image": "testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0",
+      "ryuk_image_digest": "sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0"
     },
     {
       "backend": "docker",
@@ -227,7 +229,9 @@
       "workload_cache_states": [
         "warm"
       ],
-      "iterations": 5
+      "iterations": 5,
+      "ryuk_image": "testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0",
+      "ryuk_image_digest": "sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0"
     },
     {
       "backend": "docker",
@@ -238,7 +242,10 @@
       "workload_cache_states": [
         "warm"
       ],
-      "iterations": 5
+      "iterations": 5,
+      "ryuk_image": "testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0",
+      "ryuk_image_digest": "sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0"
     }
-  ]
+  ],
+  "synthetic": true
 }

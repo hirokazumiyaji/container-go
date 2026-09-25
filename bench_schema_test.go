@@ -34,7 +34,11 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 		if row.iterations != policy.Iterations {
 			t.Errorf("baseline %s/%s/%s iterations = %d, want %d", key.Backend, key.Library, key.Scenario, row.iterations, policy.Iterations)
 		}
-		if row.image != policy.Image || row.imageDigest != policy.ImageDigest || row.workloadCache != policy.WorkloadCacheStates[0] {
+		ryukImage, ryukDigest := row.ryukImage, row.ryukDigest
+		if policy.RyukImage == "" && ryukImage == "-" && ryukDigest == "-" {
+			ryukImage, ryukDigest = "", ""
+		}
+		if row.image != policy.Image || row.imageDigest != policy.ImageDigest || ryukImage != policy.RyukImage || ryukDigest != policy.RyukImageDigest || row.workloadCache != policy.WorkloadCacheStates[0] {
 			t.Errorf("baseline %s/%s/%s image/cache provenance does not match policy: row=%+v", key.Backend, key.Library, key.Scenario, row)
 		}
 		if scenarioCacheState(row.ryukCache, policy.CacheStates) == "" {
@@ -62,11 +66,15 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 		"apple.client",
 		"apple.service",
 		"ryuk_image",
+		"ryuk_image_digest",
+		"synthetic",
 		"cache_state",
 		"reaper_session_id",
 		"TESTCONTAINERS_CONFIG",
 		"ryuk.container.image",
 		"Java-properties",
+		"does not traverse",
+		"CI workflows",
 	} {
 		if !bytes.Contains(data, []byte(required)) {
 			t.Errorf("benchmark documentation does not describe %q", required)
@@ -128,6 +136,8 @@ type benchmarkRow struct {
 	iterations    int
 	image         string
 	imageDigest   string
+	ryukImage     string
+	ryukDigest    string
 	workloadCache string
 	ryukCache     string
 }
@@ -152,7 +162,7 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchma
 			break
 		}
 		cells := strings.Split(strings.Trim(line, "|"), "|")
-		if len(cells) < 8 {
+		if len(cells) < 10 {
 			t.Fatalf("malformed baseline row: %q", line)
 		}
 		key := bench.ScenarioKey{
@@ -171,8 +181,10 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchma
 			iterations:    iterations,
 			image:         strings.TrimSpace(cells[4]),
 			imageDigest:   strings.TrimSpace(cells[5]),
-			workloadCache: strings.TrimSpace(cells[6]),
-			ryukCache:     strings.TrimSpace(cells[7]),
+			ryukImage:     strings.TrimSpace(cells[6]),
+			ryukDigest:    strings.TrimSpace(cells[7]),
+			workloadCache: strings.TrimSpace(cells[8]),
+			ryukCache:     strings.TrimSpace(cells[9]),
 		}
 	}
 	return rows

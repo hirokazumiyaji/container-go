@@ -92,8 +92,11 @@ Every result entry has the following reproducibility fields:
 - Docker results record `docker_endpoint`, `docker_context`,
   `docker_daemon_id`, `docker_daemon_os`, and `docker_daemon_arch`. The
   endpoint is the effective context endpoint, and a conflicting
-  `DOCKER_HOST`/`DOCKER_CONTEXT` selection fails before measurement. These
-  fields are compared along with the other environment provenance.
+  `DOCKER_HOST`/`DOCKER_CONTEXT` selection fails before measurement. The
+  Testcontainers run sets canonical `DOCKER_HOST`/`DOCKER_CONTEXT` values
+  from that captured pair (or rejects an unsupported endpoint) before its
+  first Testcontainers operation. These fields are compared along with the
+  other environment provenance.
 
 Scenario policies are keyed by backend and library: all `run/*` policies
 belong to `container-go` on both `docker` and `apple`, while all `tc/*`
@@ -114,10 +117,13 @@ policy, expected/observed image identity, or stable environment metadata
 commit and tree may differ: that is how before/after comparisons are made.
 The actual testcontainers session ID is diagnostic and is intentionally not
 part of environment equality. The complete baseline provenance record is
-`testdata/benchmark-baseline.json`; it contains the environment and every
-backend/library/scenario image and cache input, not just table row shape.
-Testcontainers properties are parsed with its Java-properties grammar before
-any identity setting is accepted.
+`testdata/benchmark-baseline.json`; it is explicitly marked `synthetic:
+true` because it is a policy/format fixture, not a fabricated measurement.
+It contains the environment, every backend/library/scenario workload and
+Ryuk image/digest, and every cache input, not just table row shape. The
+human-readable baseline table carries the same workload and Ryuk image and
+digest columns. Testcontainers properties are parsed with its Java-properties
+grammar before any identity setting is accepted.
 
 The environment object uses the stable fields `env.os`, `env.arch`,
 `env.cpus`, `env.go`, `env.host`, `env.commit`, `env.tree`, and
@@ -237,27 +243,27 @@ and explicit workload and Ryuk cache states.
 `run/warm-nginx` and `run/multi-5` are listed for schema completeness but
 were not recorded in this historical run.
 
-| Backend | Library            | Scenario       | Iterations | Image | Image digest | Workload cache | Ryuk cache | Median | Spawn |
-| ------- | ------------------ | -------------- | ---------- | ----- | ------------ | -------------- | ---------- | ------ | ----- |
-| docker | container-go | run/cold | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | cold | - | 3.5s (pull) | 4 |
-| docker | container-go | run/warm | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 149ms | 3 |
-| docker | container-go | run/warm-nginx | 5 | public.ecr.aws/docker/library/nginx@sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | warm | - | pending | pending |
-| docker | container-go | run/no-wait | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 145ms | 3 |
-| docker | container-go | run/forlog | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 165ms | 4 |
-| docker | container-go | run/forexec | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 188ms | 4 |
-| docker | container-go | run/parallel-8 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 420ms | 17 |
-| docker | container-go | run/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/cold | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | cold | - | pending | pending |
-| apple | container-go | run/warm | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/warm-nginx | 5 | public.ecr.aws/docker/library/nginx@sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | warm | - | pending | pending |
-| apple | container-go | run/no-wait | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/forlog | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/forexec | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/parallel-8 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| apple | container-go | run/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | pending | pending |
-| docker | testcontainers-go | tc/session-init | 1 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | cold/warm | 0.5s warm / 14.7s cold | 0 |
-| docker | testcontainers-go | tc/single | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 335ms | 0 |
-| docker | testcontainers-go | tc/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | warm | - | 1.69s (5 ctrs) | 0 |
+| Backend | Library            | Scenario       | Iterations | Image | Image digest | Ryuk image | Ryuk digest | Workload cache | Ryuk cache | Median | Spawn |
+| ------- | ------------------ | -------------- | ---------- | ----- | ------------ | ---------- | ----------- | -------------- | ---------- | ------ | ----- |
+| docker | container-go | run/cold | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | cold | - | 3.5s (pull) | 4 |
+| docker | container-go | run/warm | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | 149ms | 3 |
+| docker | container-go | run/warm-nginx | 5 | public.ecr.aws/docker/library/nginx@sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | - | - | warm | - | pending | pending |
+| docker | container-go | run/no-wait | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | 145ms | 3 |
+| docker | container-go | run/forlog | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | 165ms | 4 |
+| docker | container-go | run/forexec | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | 188ms | 4 |
+| docker | container-go | run/parallel-8 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | 420ms | 17 |
+| docker | container-go | run/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/cold | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | cold | - | pending | pending |
+| apple | container-go | run/warm | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/warm-nginx | 5 | public.ecr.aws/docker/library/nginx@sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f | - | - | warm | - | pending | pending |
+| apple | container-go | run/no-wait | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/forlog | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/forexec | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/parallel-8 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| apple | container-go | run/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | - | - | warm | - | pending | pending |
+| docker | testcontainers-go | tc/session-init | 1 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | warm | cold/warm | 0.5s warm / 14.7s cold | 0 |
+| docker | testcontainers-go | tc/single | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | warm | - | 335ms | 0 |
+| docker | testcontainers-go | tc/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | warm | - | 1.69s (5 ctrs) | 0 |
 
 Changes observed when the pull singleflight landed (#18), against the
 pre-#18 numbers from PR #23:

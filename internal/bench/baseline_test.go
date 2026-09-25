@@ -26,6 +26,9 @@ func TestBaselineProvenanceRoundTripAndValidation(t *testing.T) {
 	if err := ValidateBaselineProvenance(parsed); err != nil {
 		t.Fatalf("generated baseline is invalid: %v", err)
 	}
+	if !parsed.Synthetic {
+		t.Fatal("generated baseline is not marked synthetic")
+	}
 	if len(parsed.Scenarios) != len(ScenarioPolicyKeys()) {
 		t.Fatalf("scenarios = %d, want %d", len(parsed.Scenarios), len(ScenarioPolicyKeys()))
 	}
@@ -36,6 +39,66 @@ func TestBaselineProvenanceRoundTripAndValidation(t *testing.T) {
 	parsed.Scenarios[0].ImageDigest = NginxImageDigest
 	if err := ValidateBaselineProvenance(parsed); err == nil || !strings.Contains(err.Error(), "image provenance") {
 		t.Fatalf("mutated baseline error = %v, want image provenance error", err)
+	}
+
+	parsed = baseline
+	parsed.Scenarios[0].RyukImage = "evil/ryuk:latest"
+	if err := ValidateBaselineProvenance(parsed); err == nil || !strings.Contains(err.Error(), "Ryuk image provenance") {
+		t.Fatalf("mutated Ryuk baseline error = %v, want Ryuk image provenance error", err)
+	}
+}
+
+func TestBaselineProvenanceRejectsNullDirtyFields(t *testing.T) {
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	data, err := json.Marshal(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	raw["dirty"] = json.RawMessage("null")
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parsed BaselineProvenance
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		t.Fatal("null top-level baseline dirty was accepted")
+	}
+
+	data, err = json.Marshal(baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		t.Fatal(err)
+	}
+	var env map[string]json.RawMessage
+	if err := json.Unmarshal(raw["env"], &env); err != nil {
+		t.Fatal(err)
+	}
+	env["dirty"] = json.RawMessage(`"false"`)
+	envData, marshalErr := json.Marshal(env)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	raw["env"] = envData
+	data, err = json.Marshal(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &parsed); err == nil {
+		t.Fatal("non-boolean baseline env dirty was accepted")
+	}
+}
+
+func TestValidateBaselineProvenanceRequiresSyntheticMarker(t *testing.T) {
+	baseline := GenerateBaselineProvenance(completeBaselineTestEnv(testCommit))
+	baseline.Synthetic = false
+	if err := ValidateBaselineProvenance(baseline); err == nil || !strings.Contains(err.Error(), "synthetic") {
+		t.Fatalf("unmarked baseline error = %v, want synthetic marker error", err)
 	}
 }
 

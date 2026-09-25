@@ -237,6 +237,37 @@ func TestValidateDocRequiresExplicitDirtyField(t *testing.T) {
 	}
 }
 
+func TestJSONDirtyRejectsNullAndNonBooleanValues(t *testing.T) {
+	doc := completeDoc(testCommit)
+	var encoded bytes.Buffer
+	if err := doc.WriteJSON(&encoded); err != nil {
+		t.Fatal(err)
+	}
+	for _, dirty := range []string{"null", `"false"`, "1"} {
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(encoded.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		var env map[string]json.RawMessage
+		if err := json.Unmarshal(raw["env"], &env); err != nil {
+			t.Fatal(err)
+		}
+		env["dirty"] = json.RawMessage(dirty)
+		envData, marshalErr := json.Marshal(env)
+		if marshalErr != nil {
+			t.Fatal(marshalErr)
+		}
+		raw["env"] = envData
+		data, err := json.Marshal(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := ParseDoc(data); err == nil {
+			t.Errorf("Env dirty=%s was accepted", dirty)
+		}
+	}
+}
+
 func TestNormalizeEnvCanonicalizesMetadata(t *testing.T) {
 	env := testEnv(testCommit)
 	env.OS = " darwin "

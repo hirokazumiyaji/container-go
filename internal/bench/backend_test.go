@@ -25,13 +25,36 @@ func TestDockerIdentityParsesContentAndContainerProvenance(t *testing.T) {
 	}
 }
 
-func TestAppleImageIdentityUsesNestedDescriptor(t *testing.T) {
-	identity, err := parseAppleImageIdentity([]byte(`[{"configuration":{"image":{"reference":"docker.io/library/redis:7-alpine","descriptor":{"digest":"sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"}}}}]`), "redis:7-alpine")
+func TestAppleImageIdentityUsesConfigurationDescriptor(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "apple-image-inspect.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if identity.Digest != RedisImageDigest || identity.Reference != "docker.io/library/redis:7-alpine" {
+	identity, err := parseAppleImageIdentity(data, "redis:7-alpine")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if identity.Digest != RedisImageDigest || identity.Reference != "public.ecr.aws/docker/library/redis:7-alpine" || identity.ContentID != "858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499" {
 		t.Fatalf("identity = %+v", identity)
+	}
+}
+
+func TestAppleImageIdentityRejectsIncompleteConfiguration(t *testing.T) {
+	for name, data := range map[string]string{
+		"missing name":       `[{"configuration":{"descriptor":{"digest":"sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"}}}]`,
+		"missing descriptor": `[{"configuration":{"name":"redis:7-alpine"}}]`,
+		"invalid digest":     `[{"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"sha256:bad"}}}]`,
+	} {
+		if _, err := parseAppleImageIdentity([]byte(data), "redis:7-alpine"); err == nil {
+			t.Errorf("%s Apple image provenance was accepted", name)
+		}
+	}
+}
+
+func TestAppleImageIdentityRejectsLegacyNestedSchema(t *testing.T) {
+	legacy := []byte(`[{"configuration":{"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"}}}}]`)
+	if _, err := parseAppleImageIdentity(legacy, "redis:7-alpine"); err == nil {
+		t.Fatal("legacy nested Apple image schema was accepted")
 	}
 }
 

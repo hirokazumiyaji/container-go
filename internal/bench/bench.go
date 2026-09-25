@@ -6,6 +6,7 @@
 package bench
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -118,9 +119,24 @@ func (e *Env) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		return err
 	}
+	if err := validateJSONBoolField(fields, "dirty"); err != nil {
+		return fmt.Errorf("env.%w", err)
+	}
 	*e = Env(decoded)
 	e.metadataPresent = true
 	_, e.dirtyPresent = fields["dirty"]
+	return nil
+}
+
+func validateJSONBoolField(fields map[string]json.RawMessage, name string) error {
+	raw, ok := fields[name]
+	if !ok {
+		return nil
+	}
+	value := bytes.TrimSpace(raw)
+	if !bytes.Equal(value, []byte("true")) && !bytes.Equal(value, []byte("false")) {
+		return fmt.Errorf("%s must be a JSON boolean, got %s", name, string(value))
+	}
 	return nil
 }
 

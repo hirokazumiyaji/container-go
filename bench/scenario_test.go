@@ -162,6 +162,15 @@ func terminateCleanup(t *testing.T, containers ...*container.Container) func() {
 
 func benchEnv(t *testing.T, b ibench.Backend) Env {
 	t.Helper()
+	provenance, err := b.CaptureProvenance()
+	if err != nil {
+		t.Fatalf("record backend provenance: %v", err)
+	}
+	return benchEnvWithProvenance(t, b, provenance)
+}
+
+func benchEnvWithProvenance(t *testing.T, b ibench.Backend, provenance ibench.BackendProvenance) Env {
+	t.Helper()
 	source, err := ibench.RequireCleanSource()
 	if err != nil {
 		t.Fatalf("resolve clean benchmark source: %v", err)
@@ -173,10 +182,6 @@ func benchEnv(t *testing.T, b ibench.Backend) Env {
 	versions, err := b.Versions()
 	if err != nil {
 		t.Fatalf("record backend versions: %v", err)
-	}
-	provenance, err := b.CaptureProvenance()
-	if err != nil {
-		t.Fatalf("record backend provenance: %v", err)
 	}
 	return Env{
 		OS:               runtime.GOOS,
@@ -478,9 +483,10 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	requireDocker(t)
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 	dockerBackend := ibench.DockerBackend()
+	dockerProvenance := configureTestcontainersDockerEndpoint(t, dockerBackend)
 	sessionID := requireCanonicalTestcontainersConfig(t)
 	requireFreshTestcontainersSession(t, dockerBackend, sessionID)
-	env := benchEnv(t, dockerBackend)
+	env := benchEnvWithProvenance(t, dockerBackend, dockerProvenance)
 	env.ReaperSessionID = sessionID
 	doc := Doc{SchemaVersion: ibench.CurrentSchemaVersion, Env: env}
 	cacheState := prepareTestcontainersRyuk(t, dockerBackend)

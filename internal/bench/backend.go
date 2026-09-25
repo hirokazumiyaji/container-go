@@ -193,18 +193,13 @@ func parseDockerImageIdentity(data []byte, image string) (ImageIdentity, error) 
 
 func parseAppleImageIdentity(data []byte, image string) (ImageIdentity, error) {
 	var records []struct {
-		ID         string `json:"id"`
-		Reference  string `json:"reference"`
-		Descriptor struct {
-			Digest string `json:"digest"`
-		} `json:"descriptor"`
+		ID            string `json:"id"`
 		Configuration struct {
-			Image struct {
-				Reference  string `json:"reference"`
-				Descriptor struct {
-					Digest string `json:"digest"`
-				} `json:"descriptor"`
-			} `json:"image"`
+			Name       string `json:"name"`
+			Descriptor struct {
+				Digest string `json:"digest"`
+				Name   string `json:"name"`
+			} `json:"descriptor"`
 		} `json:"configuration"`
 	}
 	if err := json.Unmarshal(data, &records); err != nil {
@@ -214,19 +209,22 @@ func parseAppleImageIdentity(data []byte, image string) (ImageIdentity, error) {
 		return ImageIdentity{}, fmt.Errorf("apple image identity for %s returned %d records", image, len(records))
 	}
 	record := records[0]
-	identity := ImageIdentity{Reference: image, ContentID: record.ID, Digest: record.Descriptor.Digest}
-	if identity.Digest == "" {
-		identity.Digest = record.Configuration.Image.Descriptor.Digest
+	name := strings.TrimSpace(record.Configuration.Name)
+	if name == "" {
+		name = strings.TrimSpace(record.Configuration.Descriptor.Name)
 	}
-	if record.Reference != "" {
-		identity.Reference = record.Reference
-	} else if record.Configuration.Image.Reference != "" {
-		identity.Reference = record.Configuration.Image.Reference
+	digest := strings.TrimSpace(record.Configuration.Descriptor.Digest)
+	if name == "" {
+		return ImageIdentity{}, fmt.Errorf("apple image identity for %s has no configuration name", image)
 	}
-	if identity.ContentID == "" && identity.Digest == "" {
-		return ImageIdentity{}, fmt.Errorf("apple image identity for %s has no content ID or descriptor digest", image)
+	if !validSHA256Digest(digest) {
+		return ImageIdentity{}, fmt.Errorf("apple image identity for %s has invalid configuration.descriptor.digest %q", image, digest)
 	}
-	return identity, nil
+	return ImageIdentity{
+		Reference: name,
+		ContentID: strings.TrimSpace(record.ID),
+		Digest:    digest,
+	}, nil
 }
 
 func parseDockerContainerIdentity(data []byte, requested string) (ContainerIdentity, error) {

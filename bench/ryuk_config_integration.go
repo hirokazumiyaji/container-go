@@ -12,6 +12,23 @@ import (
 	tc "github.com/testcontainers/testcontainers-go"
 )
 
+func configureTestcontainersDockerEndpoint(tb testing.TB, backend ibench.Backend) ibench.BackendProvenance {
+	tb.Helper()
+	provenance, err := backend.CaptureProvenance()
+	if err != nil {
+		tb.Fatalf("capture Docker endpoint for Testcontainers: %v", err)
+	}
+	if err := validateTestcontainersDockerEndpoint(provenance.Endpoint); err != nil {
+		tb.Fatal(err)
+	}
+	// DOCKER_HOST is the transport understood by the Docker SDK used by
+	// testcontainers-go. DOCKER_CONTEXT is set to the same captured context
+	// for clients that honor it; neither value is allowed to drift afterward.
+	tb.Setenv("DOCKER_HOST", provenance.Endpoint)
+	tb.Setenv("DOCKER_CONTEXT", provenance.Context)
+	return provenance
+}
+
 // requireCanonicalTestcontainersConfig makes the benchmark fail closed
 // before testcontainers reads its process-wide configuration. A benchmark
 // that accepted a disabled or rewritten reaper would not measure the pinned

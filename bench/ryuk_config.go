@@ -2,6 +2,7 @@ package bench
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -92,6 +93,33 @@ func validateTestcontainersConfiguration() error {
 		if !os.IsNotExist(err) {
 			return fmt.Errorf("read testcontainers properties %s: %w", path, err)
 		}
+	}
+	return nil
+}
+
+// validateTestcontainersDockerEndpoint limits the canonical DOCKER_HOST
+// forms to transports that testcontainers-go can consume without additional
+// context-specific material. The Docker CLI context remains recorded and is
+// set alongside DOCKER_HOST so both clients select the same daemon.
+func validateTestcontainersDockerEndpoint(endpoint string) error {
+	parsed, err := url.Parse(strings.TrimSpace(endpoint))
+	if err != nil || parsed.Scheme == "" {
+		return fmt.Errorf("unsupported Docker endpoint %q", endpoint)
+	}
+	if parsed.User != nil || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("unsupported Docker endpoint %q", endpoint)
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "unix", "npipe":
+		if parsed.Path == "" {
+			return fmt.Errorf("unsupported Docker endpoint %q", endpoint)
+		}
+	case "tcp":
+		if parsed.Host == "" {
+			return fmt.Errorf("unsupported Docker endpoint %q", endpoint)
+		}
+	default:
+		return fmt.Errorf("unsupported Docker endpoint scheme %q", parsed.Scheme)
 	}
 	return nil
 }

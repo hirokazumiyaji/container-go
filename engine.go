@@ -16,6 +16,9 @@ type engineInfo struct {
 	uid string
 	// image is the image reference the container was created from.
 	image string
+	// platform is the platform reported by inspect, normalized when
+	// possible. An empty value means the backend did not report one.
+	platform string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string

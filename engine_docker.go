@@ -164,9 +164,10 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID       string `json:"Id"`
+	Name     string `json:"Name"`
+	Platform string `json:"Platform"`
+	State    struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -196,11 +197,12 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[0]
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:    dockerState(c.State.Status),
+		labels:   c.Config.Labels,
+		uid:      c.ID,
+		image:    c.Config.Image,
+		platform: c.Platform,
+		ip:       c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

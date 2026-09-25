@@ -135,7 +135,8 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    defer 派には `container.TerminateContainer(ctr)` があります。どちらも
    nil 安全なので、`Run` のエラーチェックより前に呼べます。
 2. `Run` が途中で失敗した場合は、`Run` 自身が作成済みリソースを削除して
-   から返ります。
+   から返ります。削除にも失敗した場合は、返された `*CleanupError` から
+   元の error と cleanup error の両方を取得できます。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
@@ -172,15 +173,22 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
 - image / port が既存と不一致なら分かりやすいエラーを返す。
+  既存の reuse container には managed、reuse、有効な creation generation label が必要で、欠ける場合は fail closed する。
   `PullAlways` は reuse を解決する前にローカル image を更新し、container が既に running でも pull failure を隠さない。
   pull 後に running container の image が一致しなければ、共有 container を再作成せずエラーにする。digest を指定している場合は digest 不一致も含む。
   mutable tag はローカル store を更新するが、既に running の共有 container は置き換えない。厳密な image identity が必要なら digest を固定する。
   `PullMissing` と `PullNever` は attach 専用に image を fetch しない。
+  attach 解決中に stopped generation を確認した場合は stopped-reuse の delete / recreate policy に従う。
+  readiness 後に stopped へ変化した場合は stopped handle を返さずエラーにする。
 - `WithFiles` は attach する caller も含めて reuse の全 caller で copy する。
+  Docker は inspect した immutable UID を copy target に使い、Apple は per-name lock 内で generation を確認する。
+  identity 確認から copy の間に replacement があれば fail closed にする。
   attach 中の copy failure は shared container を削除せずにエラーを返す。
+  reuse leader も post-start の copy / inspect failure では新規 generation を残す。peer が既にそれを使っている可能性があるためである。
   同じ path への copy は shared state の変更なので、並行 caller は競合する target を避ける。
-  `WithEnv` / `WithCmd` / `WithEntrypoint` / `WithLabels` / `WithMounts` / `WithCPUs` / `WithMemory` / `WithUser` / `WithWorkingDir` / `WithNetwork` / `WithPlatform` は作成専用 option として attach 時に意図的に無視する。
+  `WithEnv` / `WithCmd` / `WithEntrypoint` / `WithLabels` / `WithMounts` / `WithCPUs` / `WithMemory` / `WithUser` / `WithWorkingDir` / `WithNetwork` は作成専用 option として attach 時に意図的に無視する。
   必要な場合は別 name を使う。
+  `WithPlatform` は既存 container の platform と一致することを要求し、`PullAlways` は指定 platform の image variant を fetch する。
   `WithReuseGroup` は新規作成・再作成時の tag 付けのみで、reuse の compatibility key には含めない。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを

@@ -19,8 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Apply `WithFiles` and `WithPullPolicy(PullAlways)` for every
   `WithReuse` caller, including attach callers. Pull failures and
   post-pull image mismatches are returned without replacing a running
-  shared container; creation-only options remain intentionally ignored
-  on attach.
+  shared container. Attach copies use immutable/generation-bound targets,
+  reuse post-start failures do not delete shared generations, and cleanup
+  failures remain in `CleanupError` chains. Other creation-only options
+  remain intentionally ignored on attach, while `WithPlatform` is checked
+  and used by pulls.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

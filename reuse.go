@@ -28,57 +28,123 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		cfg.imagePrepared = true
 	}
 
+	resolveCtx, cancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer cancel()
+	stoppedRecreated := false
+	for {
+		if err := resolveCtx.Err(); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
+			}
+			return nil, err
+		}
+
+		base, err := reuseEnsureFlight(resolveCtx, image, cfg)
+		if err != nil {
+			return nil, err
+		}
+		info, err := inspectNamed(resolveCtx, cfg, cfg.name)
+		if err != nil {
+			if isNotFound(err) {
+				cfg.clearReuseCreated()
+				continue
+			}
+			return nil, err
+		}
+		if !cfg.reuseCreatedMatches(info) {
+			cfg.clearReuseCreated()
+		}
+
+		switch info.state {
+		case StateStopped:
+			if stoppedRecreated {
+				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
+			}
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
+			if err := deleteStoppedReuse(resolveCtx, cfg, info); err != nil {
+				return nil, err
+			}
+			stoppedRecreated = true
+			cfg.clearReuseCreated()
+			continue
+		case StateCreated, StateStopping, StateUnknown:
+			time.Sleep(reusePollInterval)
+			continue
+		case StateRunning:
+			// Continue below with a freshly inspected, running identity.
+		default:
+			time.Sleep(reusePollInterval)
+			continue
+		}
+
+		if err := checkReuseCompat(info, image, cfg); err != nil {
+			return nil, err
+		}
+		ctr := &Container{
+			id:        base.id,
+			runner:    base.runner,
+			eng:       base.eng,
+			exposed:   cfg.exposed,
+			published: cfg.published,
+			reused:    true,
+			info:      info,
+			creation:  info.labels[creationLabel],
+			uid:       info.uid,
+		}
+		// The leader's files are copied in reuseCreate. Every attaching
+		// caller applies its own files after the shared generation is
+		// known and its identity has been checked under the backend's
+		// safe target path.
+		if !cfg.reusedCreated {
+			if err := copyReuseFiles(resolveCtx, ctr, cfg.files); err != nil {
+				return nil, err
+			}
+		}
+		if err := reuseWait(ctx, cfg, ctr); err != nil {
+			return nil, err
+		}
+
+		// A wait strategy or a concurrent replacement can outlive the
+		// inspect above. Never return a handle for a different, stopped,
+		// or otherwise changed generation.
+		fresh, err := ctr.inspectFresh(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+		}
+		if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
+			return nil, err
+		}
+		return ctr, nil
+	}
+}
+
+func reuseEnsureFlight(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
-	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
+	return reuseFlights.do(ctx, key, func() (*Container, error) {
 		// Shared ensure must not die with the first caller's cancel;
 		// waiters keep waiting on their own contexts.
 		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reuseAttachTimeout)
 		defer cancel()
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
-	if err != nil {
-		return nil, err
-	}
+}
 
-	info := base.info
-	// A PullAlways caller may have joined an ensure started before its
-	// pull completed. Re-inspect in that case so the compatibility check
-	// observes the post-pull container identity, and never replace a
-	// running shared container on a mismatch.
-	if info == nil || cfg.pullPolicy == PullAlways {
-		info, err = inspectNamed(ctx, cfg, cfg.name)
-		if err != nil {
-			return nil, err
-		}
+func (c *config) reuseCreatedMatches(info *engineInfo) bool {
+	if !c.reusedCreated {
+		return false
 	}
-	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, err
+	if c.reusedCreatedUID != "" || info.uid != "" {
+		return c.reusedCreatedUID != "" && c.reusedCreatedUID == info.uid
 	}
+	return c.reusedCreatedGeneration != "" && c.reusedCreatedGeneration == info.labels[creationLabel]
+}
 
-	ctr := &Container{
-		id:        base.id,
-		runner:    base.runner,
-		eng:       base.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		info:      info,
-		creation:  info.labels[creationLabel],
-		uid:       info.uid,
-	}
-	// The leader's files are copied in reuseCreate. Every attaching
-	// caller applies its own files after the shared generation is known.
-	// A failed attach copy is reported without deleting the shared
-	// container, which may be serving other callers.
-	if !cfg.reusedCreated {
-		if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
-			return nil, err
-		}
-	}
-	if err := reuseWait(ctx, cfg, ctr); err != nil {
-		return nil, err
-	}
-	return ctr, nil
+func (c *config) clearReuseCreated() {
+	c.reusedCreated = false
+	c.reusedCreatedUID = ""
+	c.reusedCreatedGeneration = ""
 }
 
 // reuseEnsureContainer creates or attaches to the named container
@@ -107,6 +173,8 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
 				cfg.reusedCreated = true
+				cfg.reusedCreatedUID = ctr.uid
+				cfg.reusedCreatedGeneration = ctr.creation
 				return ctr, nil
 			}
 			// nameConflict: another process won create. createRaceMissing
@@ -139,6 +207,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -188,8 +259,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, classified
+		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		return nil, withCleanupError(classified, cleanupErr)
 	}
 
 	ctr := &Container{
@@ -202,22 +273,95 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
+	if _, err := ctr.cachedInfo(runCtx); err != nil {
+		// A reuse container is shared as soon as its name is published;
+		// do not let this caller remove a generation a peer may be using.
 		return nil, err
 	}
-	if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
+	if err := copyReuseFiles(runCtx, ctr, cfg.files); err != nil {
+		// A copy failure leaves the shared generation intact. The next
+		// caller can attach and retry, while explicit cleanup remains the
+		// caller's responsibility.
 		return nil, err
 	}
 	return ctr, nil
 }
 
+type reuseCopyIdentity struct {
+	uid      string
+	creation string
+}
+
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	identity, target, unlock, err := ctr.beginReuseCopy(ctx)
+	if err != nil {
+		return fmt.Errorf("reuse %s: WithFiles identity check: %w", ctr.id, err)
+	}
+	defer unlock()
 	for _, f := range files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyToContainerTarget(ctx, target, f.HostPath, f.ContainerPath); err != nil {
 			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
 		}
+	}
+	if err := ctr.verifyReuseCopyIdentity(ctx, identity); err != nil {
+		return fmt.Errorf("reuse %s: WithFiles identity changed: %w", ctr.id, err)
+	}
+	return nil
+}
+
+func (c *Container) beginReuseCopy(ctx context.Context) (reuseCopyIdentity, string, func(), error) {
+	if c.uid != "" {
+		info, err := c.inspectFresh(ctx)
+		if err != nil {
+			return reuseCopyIdentity{}, "", nil, err
+		}
+		if info.uid == "" || info.uid != c.uid {
+			return reuseCopyIdentity{}, "", nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		if info.state != StateRunning {
+			return reuseCopyIdentity{}, "", nil, fmt.Errorf("container state is %s before copy", info.state)
+		}
+		return reuseCopyIdentity{uid: c.uid}, c.uid, func() {}, nil
+	}
+	if !creationRE.MatchString(c.creation) {
+		return reuseCopyIdentity{}, "", nil, fmt.Errorf("container has no valid creation generation")
+	}
+	unlock, err := lockName(ctx, c.id)
+	if err != nil {
+		return reuseCopyIdentity{}, "", nil, fmt.Errorf("lock name: %w", err)
+	}
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		unlock()
+		return reuseCopyIdentity{}, "", nil, err
+	}
+	if info.state != StateRunning {
+		unlock()
+		return reuseCopyIdentity{}, "", nil, fmt.Errorf("container state is %s before copy", info.state)
+	}
+	if info.labels[creationLabel] != c.creation {
+		unlock()
+		return reuseCopyIdentity{}, "", nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	return reuseCopyIdentity{creation: c.creation}, c.id, unlock, nil
+}
+
+func (c *Container) verifyReuseCopyIdentity(ctx context.Context, identity reuseCopyIdentity) error {
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		return err
+	}
+	if identity.uid != "" {
+		if info.uid == "" || info.uid != identity.uid {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		return nil
+	}
+	if info.labels[creationLabel] == "" || info.labels[creationLabel] != identity.creation {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	return nil
 }
@@ -228,6 +372,9 @@ func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
 	err := ctr.Terminate(ctx)
@@ -249,6 +396,52 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
 	}
 	return nil
+}
+
+func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) error {
+	if !sameReuseGeneration(before, fresh) {
+		return fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+	}
+	if fresh.state != StateRunning {
+		return fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
+	}
+	if before.state != fresh.state {
+		return fmt.Errorf("reuse %s: state changed from %s to %s before return", cfg.name, before.state, fresh.state)
+	}
+	if fresh.image != before.image {
+		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
+	}
+	if fresh.platform != before.platform {
+		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
+	}
+	if !sameReusePorts(before.bound, fresh.bound) {
+		return fmt.Errorf("reuse %s: published ports changed before return", cfg.name)
+	}
+	return checkReuseCompat(fresh, image, cfg)
+}
+
+func sameReuseGeneration(before, fresh *engineInfo) bool {
+	if before.uid != "" || fresh.uid != "" {
+		return before.uid != "" && before.uid == fresh.uid
+	}
+	return before.labels[creationLabel] != "" && before.labels[creationLabel] == fresh.labels[creationLabel]
+}
+
+func sameReusePorts(before, fresh []boundPort) bool {
+	if len(before) != len(fresh) {
+		return false
+	}
+	counts := make(map[boundPort]int, len(before))
+	for _, port := range before {
+		counts[port]++
+	}
+	for _, port := range fresh {
+		if counts[port] == 0 {
+			return false
+		}
+		counts[port]--
+	}
+	return true
 }
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
@@ -280,14 +473,37 @@ func createRaceMissing(err error) bool {
 	return strings.Contains(s, "container not found")
 }
 
-// checkReuseOwned reports whether a stopped container may be deleted
-// and recreated for this reuse request.
+// checkReuseOwned reports whether an existing container may be adopted
+// or deleted for this reuse request. All three labels are required: a
+// reuse marker alone can be present on a foreign container, and a
+// generation is what makes a later name-based delete safe.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	}
+	if cfg.platform != "" {
+		if info.platform == "" {
+			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
+		}
+		if !strings.EqualFold(cfg.platform, info.platform) {
+			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
+		}
+	}
+	return nil
+}
+
+func checkReuseLabels(info *engineInfo, cfg *config) error {
+	if info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if info.labels[managedLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: existing container has no valid creation generation", cfg.name)
 	}
 	return nil
 }

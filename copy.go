@@ -19,8 +19,9 @@ type File struct {
 // WithFiles copies files into the container after it starts. Copy
 // failures fail Run; an ordinary newly created container is rolled
 // back. WithReuse applies the copy to every caller, including callers
-// that attach to an existing shared container; an attach copy failure
-// returns an error without deleting that shared container.
+// that attach to an existing shared container. A reuse copy failure
+// returns an error without deleting the shared generation, because a
+// peer may already be using it.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		for _, f := range files {
@@ -36,6 +37,10 @@ func WithFiles(files ...File) Option {
 // CopyToContainer copies a host file or directory into the running
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
+	return c.copyToContainerTarget(ctx, c.id, hostPath, containerPath)
+}
+
+func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
 		return err
 	}
@@ -48,7 +53,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
+	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
 	return c.classify(ctx, err)
 }
 

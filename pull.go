@@ -32,7 +32,7 @@ const (
 
 // WithPullPolicy sets when Run fetches the image. The default is
 // PullMissing. PullAlways is honored for every WithReuse caller,
-// including attach callers.
+// including attach callers; WithPlatform selects the fetched variant.
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {

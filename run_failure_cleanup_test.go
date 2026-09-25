@@ -15,6 +15,7 @@ type failRunRunner struct {
 	*fakeRunner
 	runErr      error
 	inspectJSON string
+	creation    string
 	deleted     []string
 }
 
@@ -23,13 +24,21 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for i := 0; i+1 < len(args); i++ {
+			if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+				r.creation = value
+				break
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		inspectJSON := r.inspectJSON
+		creation := r.creation
 		r.mu.Unlock()
-		return []byte(r.inspectJSON), nil, nil
+		return []byte(strings.ReplaceAll(inspectJSON, "__CONTAINER_CREATION__", creation)), nil, nil
 	case "delete", "rm":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
@@ -42,6 +51,19 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 }
 
 func ownedInspectJSON(name string) string {
+	return ownedInspectJSONWithReuse(name, false)
+}
+
+func ownedReuseInspectJSON(name string) string {
+	return ownedInspectJSONWithReuse(name, true)
+}
+
+func ownedInspectJSONWithReuse(name string, withReuse bool) string {
+	reuse := ""
+	if withReuse {
+		reuse = `,
+        "com.github.hirokazumiyaji.container-go.reuse": "true"`
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -51,12 +73,13 @@ func ownedInspectJSON(name string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q%s,
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
       }
     },
     "status": {"state": "created", "networks": []}
   }
-]`, name, name, sessionID())
+]`, name, name, sessionID(), reuse)
 }
 
 func foreignInspectJSON(name string) string {
@@ -143,6 +166,8 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.runner = r
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
+	cfg.creation = "0123456789abcdef"
+	r.creation = cfg.creation
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	cleanupFailedCreate(ctx, cfg, runErr, runErr)
 	if len(r.deleted) != 1 {
@@ -158,7 +183,7 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	inner := &failRunRunner{
 		fakeRunner:  base,
 		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
-		inspectJSON: ownedInspectJSON("myctr"),
+		inspectJSON: ownedReuseInspectJSON("myctr"),
 	}
 	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
 	_, err := Run(context.Background(), "redis:7-alpine",

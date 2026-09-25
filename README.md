@@ -164,7 +164,8 @@ Three layers make sure containers do not outlive your tests:
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
 2. If `Run` fails partway, it removes whatever it created before
-   returning.
+   returning. If removal also fails, the returned `*CleanupError`
+   preserves both the original operation error and the cleanup error.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
@@ -202,24 +203,35 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  `PullAlways` refreshes the local image before reuse is resolved, and
+  Existing reuse containers must carry the managed, reuse, and valid
+  creation-generation labels; otherwise reuse fails closed. `PullAlways`
+  refreshes the local image before reuse is resolved, and
   its pull failure is returned even when the container is already
   running. A running reused container is never recreated after a
   post-pull mismatch; the call fails instead, including when a requested
   digest differs from the container image. Mutable tag requests refresh
   the local store but do not replace an already-running shared container;
   pin a digest when the exact image identity matters. `PullMissing` and
-  `PullNever` do not add an attach-only fetch.
+  `PullNever` do not add an attach-only fetch. A stopped generation seen
+  during attach resolution follows the stopped-reuse delete/recreate
+  policy; a generation that becomes stopped after readiness returns an
+  error rather than a stopped handle.
 - `WithFiles` is copied for every reuse caller, including attach callers.
-  A failed attach copy returns an error without deleting the shared
-  container. Copies to the same path are shared-state mutations, so
-  concurrent callers should avoid conflicting targets. Creation-only
-  options — `WithEnv`, `WithCmd`,
+  Docker copies target the inspected immutable UID; Apple copies verify the
+  generation under the per-name lock. A replacement between identity
+  verification and copy fails closed. A failed reuse copy returns an error
+  without deleting the shared generation. Copies to the same path are
+  shared-state mutations, so concurrent callers should avoid conflicting
+  targets. A reuse leader also leaves a newly created generation in place
+  after a post-start copy or inspect failure, because a peer may already
+  be using it. Creation-only options — `WithEnv`, `WithCmd`,
   `WithEntrypoint`, `WithLabels`, `WithMounts`, `WithCPUs`, `WithMemory`,
-  `WithUser`, `WithWorkingDir`, `WithNetwork`, and `WithPlatform` — are
-  intentionally ignored on attach; use distinct names when they matter.
-  `WithReuseGroup` only tags a newly created/recreated generation and
-  is not part of the reuse compatibility key.
+  `WithUser`, `WithWorkingDir`, and `WithNetwork` — are intentionally
+  ignored on attach; use distinct names when they matter. `WithPlatform`
+  is checked against the existing container, and `PullAlways` uses it
+  when fetching the requested platform variant. `WithReuseGroup` only
+  tags a newly created/recreated generation and is not part of the reuse
+  compatibility key.
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

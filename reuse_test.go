@@ -32,11 +32,15 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		created := r.created.Load()
+		creation := r.creations[args[len(args)-1]]
 		r.mu.Unlock()
 		if !created {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		if creation == "" {
+			creation = "0123456789abcdef"
+		}
+		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -161,6 +165,10 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONWithCreation(id, state, image, "0123456789abcdef")
+}
+
+func reuseInspectJSONWithCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -170,7 +178,8 @@ func reuseInspectJSON(id, state, image string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
     "status": {
@@ -178,7 +187,7 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {

@@ -105,6 +105,65 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	}
 }
 
+type dockerListRunner struct {
+	*fakeRunner
+	output string
+}
+
+func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ps" {
+		d.calls = append(d.calls, args)
+		return []byte(d.output), nil, nil
+	}
+	return d.fakeRunner.Run(ctx, args...)
+}
+
+func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *dockerListRunner) ([]string, error)
+	}{
+		{
+			name: "prune",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneWith(ctx, r, dockerEngine{})
+			},
+		},
+		{
+			name: "reuse group",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneReuseGroupWith(ctx, r, dockerEngine{}, "integration")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &dockerListRunner{fakeRunner: newTestRunner(), output: "managed-one\nmanaged-two\n"}
+			removed, err := tc.run(context.Background(), r)
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+			if !slices.Equal(removed, []string{"managed-one", "managed-two"}) {
+				t.Fatalf("removed = %v", removed)
+			}
+
+			var deletes [][]string
+			for _, call := range r.calls {
+				if call[0] == "rm" {
+					deletes = append(deletes, call)
+				}
+			}
+			if len(deletes) != 2 {
+				t.Fatalf("rm calls = %v, want 2", deletes)
+			}
+			for _, call := range deletes {
+				if len(call) < 3 || !slices.Equal(call[:3], []string{"rm", "--force", "--volumes"}) {
+					t.Errorf("rm call = %v, want volume cleanup flag", call)
+				}
+			}
+		})
+	}
+}
+
 func TestSessionLabelValueIsValid(t *testing.T) {
 	id := sessionID()
 	if len(id) != 16 || strings.ToLower(id) != id {

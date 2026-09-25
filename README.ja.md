@@ -148,6 +148,14 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。
 
+Docker では `Terminate`、`Prune`、`PruneReuseGroup`、watchdog リーパーが
+すべて `docker rm --force --volumes` で削除する。
+image の `VOLUME` 宣言などによって作られた匿名ボリュームは削除される。
+名前付きボリューム（カスタムストレージ driver の明示マウントを含む）は Docker が保持する。
+名前付きボリュームのライフサイクルは呼び出し側が管理する。
+このポリシーは container-go が管理するコンテナに付与されたボリュームだけを対象とする。
+ライブラリはグローバルな匿名ボリュームの回収処理を実行しない。
+
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 
 `WithReuse` は安定した `WithName` に対する get-or-create です。同一

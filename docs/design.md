@@ -185,8 +185,9 @@ exit is a result, not an error); this is kept for v1 compatibility.
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
 
-`Terminate` maps to `container delete --force` and is idempotent
-(deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
+`Terminate` maps to `container delete --force` on Apple Container and
+`docker rm --force --volumes` on Docker, and is idempotent (deleting an
+already-absent container succeeds). `Cleanup(t, ctr)` and
 `TerminateContainer(ctr)` are nil-safe helpers preserving the
 testcontainers-go idiom of deferring cleanup before the error check.
 
@@ -272,11 +273,13 @@ containers.
 `t.Cleanup` run, so an external **watchdog reaper** takes over. At
 library initialization one `/bin/sh` child is spawned; container IDs
 are registered by writing them down a pipe. However the parent dies,
-the pipe reaches EOF, and the reaper runs `container delete --force`
-for every registered ID and exits. While the parent lives the reaper
-does nothing (deletion belongs to the normal path; the reaper is
-insurance). This mirrors container-rs's watchdog and covers SIGKILL,
-which no signal handler can.
+the pipe reaches EOF, and the reaper runs the backend's force-delete
+command (`container delete --force` on Apple Container or
+`docker rm --force --volumes` on Docker) for every registered ID and
+exits. While the parent lives the reaper does nothing (deletion belongs
+to the normal path; the reaper is insurance). This mirrors
+container-rs's watchdog and covers SIGKILL, which no signal handler
+can.
 
 **Session labels**: every created container carries
 
@@ -292,8 +295,14 @@ session.
 Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
 reaper (for debugging).
 
-Anonymous volumes survive `--rm`, so the library never creates one;
-volumes must be named, and their lifecycle belongs to the caller.
+Every managed Docker delete path (`Terminate`, `Prune`,
+`PruneReuseGroup`, rollback, and the watchdog reaper) uses
+`docker rm --force --volumes`. Docker removes anonymous volumes attached
+to that container, including volumes created by image `VOLUME`
+directives, but preserves named volumes, including explicitly mounted
+volumes backed by a custom storage driver. Named volume lifecycle
+therefore belongs to the caller. This policy does not scan or prune
+volumes that are no longer attached to a managed container.
 
 ## Reuse
 
@@ -495,8 +504,8 @@ so the free-port race avoided on Apple Container does not reappear.
 The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
-subcommand per backend (`delete --force` for Apple, `rm --force` for
-Docker). The reaper depends on `/bin/sh` and thus does not run on
+command per backend (`delete --force` for Apple, `rm --force --volumes`
+for Docker). The reaper depends on `/bin/sh` and thus does not run on
 Windows; v0.2 documents that Windows relies on the normal cleanup
 paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
 on Docker (`--filter label=... --filter status=exited`).

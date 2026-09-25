@@ -17,10 +17,13 @@ import (
 // pipe reaches EOF, and the reaper force-deletes every registered
 // container. While this process lives, the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
+// Backend-specific delete flags (such as Docker's --volumes) are
+// passed through so abnormal cleanup has the same volume policy.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated against Apple Container's name rule or Docker's 64-hex
+// ID format, and the script itself disables globbing and quotes every
+// expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -37,6 +40,7 @@ const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
+shift 3
 ids=""
 while IFS= read -r line; do
   ids="$ids
@@ -66,7 +70,7 @@ echo "$ids" | while IFS= read -r line; do
     [ "$got" = "$creation" ] || continue
     [ -n "$uid" ] && target="$uid"
   fi
-  run_with_timeout "$bin" "$sub" --force "$target" || true
+  run_with_timeout "$bin" "$sub" --force "$@" "$target" || true
 done
 `
 
@@ -88,6 +92,11 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+// reaperIDRE accepts Apple Container names and Docker's immutable 64-hex
+// container IDs. Docker IDs are longer than Apple's maximum name length,
+// so they must be validated separately before reaching the shell script.
+var reaperIDRE = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}|[0-9a-f]{64})$`)
+
 type reaperEntry struct {
 	id       string
 	creation string
@@ -96,8 +105,10 @@ type reaperEntry struct {
 type reaper struct {
 	binary string
 	// subcommand deletes a container: "delete" (Apple) or "rm"
-	// (Docker); both take --force.
-	subcommand string
+	// (Docker); both take --force. deleteFlags carries backend-specific
+	// options between --force and the target.
+	subcommand  string
+	deleteFlags []string
 
 	mu            sync.Mutex
 	cmd           *exec.Cmd
@@ -108,8 +119,12 @@ type reaper struct {
 	gaveUp        bool
 }
 
-func newReaper(binary, subcommand string) *reaper {
-	return &reaper{binary: binary, subcommand: subcommand}
+func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
+	return &reaper{
+		binary:      binary,
+		subcommand:  subcommand,
+		deleteFlags: append([]string(nil), deleteFlags...),
+	}
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
@@ -117,7 +132,7 @@ func newReaper(binary, subcommand string) *reaper {
 // ID from creationLabel; empty skips the generation check for
 // backward compatibility.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !reaperIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
@@ -174,7 +189,9 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel)}
+	args = append(args, r.deleteFlags...)
+	cmd := exec.Command("/bin/sh", args...)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -221,14 +238,14 @@ var (
 // process-wide reaper for its backend binary. Reaper trouble never
 // fails container startup. The reaper needs /bin/sh, so on Windows
 // this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+func registerWithGlobalReaper(binary, subcommand string, deleteFlags []string, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
 	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[binary]
 	if !ok {
-		r = newReaper(binary, subcommand)
+		r = newReaper(binary, subcommand, deleteFlags...)
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()

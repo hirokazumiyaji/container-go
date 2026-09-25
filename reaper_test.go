@@ -60,6 +60,19 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperAcceptsDockerIDAndVolumeFlag(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	uid := strings.Repeat("ab", 32)
+	r := newReaper(bin, "rm", "--volumes")
+
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("register Docker ID: %v", err)
+	}
+	r.closeStdin()
+
+	waitForLogLines(t, logPath, "rm --force --volumes "+uid)
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
@@ -72,6 +85,9 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
+	}
+	if err := r.register(strings.Repeat("g", 64), ""); err == nil {
+		t.Error("register non-hex Docker ID: want error")
 	}
 }
 
@@ -224,13 +240,13 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	r := newReaper(binPath, "rm")
+	r := newReaper(binPath, "rm", "--volumes")
 	if err := r.register("ctr", creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
-	waitForLogLines(t, logPath, "rm --force "+uid)
-	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
+	waitForLogLines(t, logPath, "rm --force --volumes "+uid)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force --volumes ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
 	}
 }

@@ -25,6 +25,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Endpoint` when publish host-IPs differ.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
+- Remove anonymous Docker volumes from every managed deletion path while
+  preserving named volumes.
 
 ## [0.2.0] - 2026-09-02
 

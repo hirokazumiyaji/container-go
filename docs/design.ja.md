@@ -134,7 +134,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
+`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force --volumes` に対応する。
+冪等であり、既に存在しないコンテナを削除した場合も成功として扱う。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
 ## 接続エンドポイントの設計
@@ -189,7 +190,8 @@ type Strategy interface {
 
 **異常終了経路(SIGKILL、パニック、`os.Exit`)**：Go の defer も t.Cleanup も走らないため、外部プロセスによる**watchdog リーパー**を用意する。
 ライブラリ初期化時に `/bin/sh` の子プロセスを一つ起動し、標準入力のパイプ越しにコンテナ ID を登録する。
-親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へ `container delete --force` を実行して自身も終了する。
+親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へバックエンドの強制削除コマンドを実行して自身も終了する。
+Apple Container では `container delete --force`、Docker では `docker rm --force --volumes` を使う。
 テストプロセス生存中はリーパーは何もしない(削除は通常経路が担い、リーパーは保険である)。
 この方式は container-rs の watchdog と同じで、シグナルハンドラでは捕捉できない SIGKILL にも対応できる。
 
@@ -203,8 +205,12 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 
 環境変数 `CONTAINERGO_KEEP=1` を設定した場合、`Cleanup` とリーパーは削除を行わない(デバッグ用)。
 
-匿名ボリュームは `--rm` でも残る仕様のため、本ライブラリは匿名ボリュームを作らない。
-ボリュームが必要な場合は名前付きで作らせ、ライフサイクルは利用者に委ねる。
+Docker の managed 削除経路（`Terminate`、`Prune`、`PruneReuseGroup`、ロールバック、watchdog リーパー）はすべて `docker rm --force --volumes` を使う。
+Docker は対象コンテナに付与された匿名ボリュームを削除する。
+名前付きボリューム（カスタムストレージ driver の明示マウントを含む）は保持する。
+そのため、名前付きボリュームのライフサイクルは利用者が管理する。
+このポリシーは managed コンテナに付与されたボリュームだけを対象とする。
+コンテナから切り離されたボリュームを走査・削除する処理は用意しない。
 
 ## セキュリティ設計
 
@@ -327,7 +333,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 
-**クリーンアップの違い**:watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
+**クリーンアップの違い**:watchdog リーパーは削除コマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force --volumes`)。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
 `Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。

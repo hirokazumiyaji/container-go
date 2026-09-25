@@ -127,11 +127,14 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	if got := e.stopArgs("myctr", &d); !slices.Equal(got, []string{"stop", "--time", "10", "myctr"}) {
 		t.Errorf("stopArgs = %v", got)
 	}
-	if got := e.deleteArgs("myctr"); !slices.Equal(got, []string{"rm", "--force", "myctr"}) {
+	if got := e.deleteArgs("myctr"); !slices.Equal(got, []string{"rm", "--force", "--volumes", "myctr"}) {
 		t.Errorf("deleteArgs = %v", got)
 	}
 	if e.reaperSubcommand() != "rm" {
 		t.Errorf("reaperSubcommand = %q", e.reaperSubcommand())
+	}
+	if got := e.reaperDeleteFlags(); !slices.Equal(got, []string{"--volumes"}) {
+		t.Errorf("reaperDeleteFlags = %v", got)
 	}
 	if got := e.logsArgs("myctr", true); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
 		t.Errorf("logsArgs = %v", got)
@@ -201,8 +204,8 @@ func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
 	if extra := d.calls[inspects:]; len(extra) != 1 || extra[0][0] != "rm" {
 		t.Errorf("Terminate issued %v, want a single rm", extra)
 	}
-	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
-		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	if rm := d.callWith("rm"); !slices.Equal(rm, []string{"rm", "--force", "--volumes", dockerFixtureID}) {
+		t.Errorf("rm = %v, want volume cleanup by %s", rm, dockerFixtureID)
 	}
 }
 

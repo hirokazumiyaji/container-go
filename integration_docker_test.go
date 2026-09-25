@@ -37,6 +37,32 @@ func requireDocker(t *testing.T) {
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 }
 
+func dockerMountVolumeName(t *testing.T, containerName, destination string) string {
+	t.Helper()
+	out, err := exec.Command("docker", "inspect", "--format",
+		fmt.Sprintf(`{{range .Mounts}}{{if eq .Destination %q}}{{.Name}}{{end}}{{end}}`, destination),
+		containerName,
+	).Output()
+	if err != nil {
+		t.Fatalf("inspect mounts for %s: %v", containerName, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+func waitForDockerVolume(t *testing.T, name string, wantExists bool) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		exists := exec.Command("docker", "volume", "inspect", name).Run() == nil
+		if exists == wantExists {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	out, err := exec.Command("docker", "volume", "inspect", name).CombinedOutput()
+	t.Fatalf("volume %s existence = %v, want %v: %v: %s", name, err == nil, wantExists, err, out)
+}
+
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -115,6 +141,71 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	}
 }
 
+// The Redis image declares VOLUME /data, so this exercises a volume
+// created by the image rather than an explicit anonymous mount.
+func TestIntegrationDockerCleanupVolumePolicy(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-volume-%d", os.Getpid())
+
+	ctr, err := container.Run(ctx, integrationRedis,
+		container.WithName(name),
+		container.WithEntrypoint("/bin/sh"),
+		container.WithCmd("-c", "sleep 60"),
+	)
+	if err != nil {
+		t.Fatalf("Run with image-defined volume: %v", err)
+	}
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+	}()
+
+	anonymous := dockerMountVolumeName(t, name, "/data")
+	if anonymous == "" {
+		t.Fatal("image-defined /data volume not found")
+	}
+	waitForDockerVolume(t, anonymous, true)
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	waitForDockerVolume(t, anonymous, false)
+
+	named := name + "-named"
+	if out, err := exec.Command("docker", "volume", "create", named).CombinedOutput(); err != nil {
+		t.Fatalf("create named volume: %v: %s", err, out)
+	}
+	defer func() {
+		_ = exec.Command("docker", "volume", "rm", named).Run()
+	}()
+
+	namedContainer := name + "-named-ctr"
+	namedCtr, err := container.Run(ctx, integrationRedis,
+		container.WithName(namedContainer),
+		container.WithEntrypoint("/bin/sh"),
+		container.WithCmd("-c", "sleep 60"),
+		container.WithMounts(container.Mount{
+			Type:   container.MountVolume,
+			Source: named,
+			Target: "/data",
+		}),
+	)
+	if err != nil {
+		_ = exec.Command("docker", "rm", "--force", "--volumes", namedContainer).Run()
+		t.Fatalf("Run with named volume: %v", err)
+	}
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", "--volumes", namedContainer).Run()
+	}()
+
+	if mounted := dockerMountVolumeName(t, namedContainer, "/data"); mounted != named {
+		t.Fatalf("mounted volume = %q, want %q", mounted, named)
+	}
+	if err := namedCtr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate with named volume: %v", err)
+	}
+	waitForDockerVolume(t, named, true)
+}
+
 func TestIntegrationDockerParallelStarts(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -148,9 +239,10 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		// env-passed selection never reaches Run; pin it here.
 		os.Setenv("CONTAINERGO_BACKEND", "docker")
 		ctx := context.Background()
-		ctr, err := container.Run(ctx, integrationAlpine,
+		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REAPER_NAME")),
-			container.WithCmd("sleep", "120"))
+			container.WithEntrypoint("/bin/sh"),
+			container.WithCmd("-c", "sleep 120"))
 		if err != nil {
 			fmt.Println("CHILD-ERROR:", err)
 			os.Exit(1)
@@ -161,6 +253,13 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 
 	requireDocker(t)
 	name := fmt.Sprintf("containergo-dockerreap-%d", os.Getpid())
+	var anonymousVolume string
+	defer func() {
+		_ = exec.Command("docker", "rm", "--force", "--volumes", name).Run()
+		if anonymousVolume != "" {
+			_ = exec.Command("docker", "volume", "rm", anonymousVolume).Run()
+		}
+	}()
 
 	cmd := exec.Command(os.Args[0], "-test.run", "TestIntegrationDockerReaperSurvivesSIGKILL")
 	cmd.Env = append(os.Environ(),
@@ -175,7 +274,10 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() {
-		_ = exec.Command("docker", "rm", "--force", name).Run()
+		if cmd.ProcessState == nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
 	}()
 
 	ready := make(chan string, 1)
@@ -201,6 +303,12 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		t.Fatal("child never became ready")
 	}
 
+	anonymousVolume = dockerMountVolumeName(t, name, "/data")
+	if anonymousVolume == "" {
+		t.Fatal("image-defined /data volume not found")
+	}
+	waitForDockerVolume(t, anonymousVolume, true)
+
 	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
 		t.Fatal(err)
 	}
@@ -210,6 +318,7 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("docker", "ps", "--all", "--format", "{{.Names}}").Output()
 		if err == nil && !strings.Contains(string(out), name) {
+			waitForDockerVolume(t, anonymousVolume, false)
 			return
 		}
 		time.Sleep(time.Second)

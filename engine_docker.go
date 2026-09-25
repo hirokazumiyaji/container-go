@@ -29,6 +29,7 @@ type dockerEngine struct{}
 //   - container missing: "error: no such object: …" (also historically
 //     "No such container" / "not found")
 const (
+	dockerDeleteVolumesFlag  = "--volumes"
 	dockerStderrConflict     = "conflict"
 	dockerStderrAlreadyInUse = "already in use"
 	dockerStderrName         = "name"
@@ -256,7 +257,7 @@ func (dockerEngine) stopArgs(id string, timeout *time.Duration) []string {
 }
 
 func (dockerEngine) deleteArgs(id string) []string {
-	return []string{"rm", "--force", id}
+	return []string{"rm", "--force", dockerDeleteVolumesFlag, id}
 }
 
 func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
@@ -268,6 +269,8 @@ func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 }
 
 func (dockerEngine) reaperSubcommand() string { return "rm" }
+
+func (dockerEngine) reaperDeleteFlags() []string { return []string{dockerDeleteVolumesFlag} }
 
 func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}

@@ -105,6 +105,8 @@ func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 
 func (appleEngine) reaperSubcommand() string { return "delete" }
 
+func (appleEngine) reaperDeleteFlags() []string { return nil }
+
 func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}
 	if envFile != "" {

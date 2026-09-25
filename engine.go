@@ -70,8 +70,11 @@ type engine interface {
 	// name is already taken by another create.
 	nameConflict(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
-	// runs as `<binary> <subcommand> --force <id>`.
+	// runs as `<binary> <subcommand> --force [backend flags] <id>`.
 	reaperSubcommand() string
+	// reaperDeleteFlags returns backend-specific delete options passed
+	// after --force and before the container ID.
+	reaperDeleteFlags() []string
 	// directIP reports whether clients connect straight to the
 	// container IP (Apple Container) instead of published host ports
 	// (Docker).

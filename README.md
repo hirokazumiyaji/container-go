@@ -178,6 +178,14 @@ Extras:
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label).
 
+On Docker, `Terminate`, `Prune`, `PruneReuseGroup`, and the watchdog
+reaper all delete with `docker rm --force --volumes`. This removes
+anonymous volumes created by image `VOLUME` directives, while Docker
+preserves named volumes, including explicitly mounted volumes backed by
+a custom storage driver. Named volume lifecycle remains the caller's
+responsibility. The policy only covers volumes attached to a managed
+container; the library does not run a global anonymous-volume janitor.
+
 ## Reuse (shared containers across tests/processes)
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`.

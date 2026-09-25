@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -14,15 +16,17 @@ import (
 )
 
 const (
-	maxReaperDescendantPasses = 8
-	maxReaperDescendantPIDs   = 1024
-	maxReaperDescendantDepth  = 64
-	reaperPgrepWaitDelay      = 100 * time.Millisecond
+	maxReaperDescendantPasses  = 8
+	maxReaperDescendantPIDs    = 1024
+	maxReaperDescendantDepth   = 64
+	maxReaperDescendantLookups = 4096
+	reaperPgrepWaitDelay       = 100 * time.Millisecond
 )
 
 var errReaperDescendantLimit = errors.New("reaper descendant traversal limit exceeded")
 
 type reaperDescendantLookup func(context.Context, int) ([]int, error)
+type reaperDescendantIdentity func(int) (int, bool)
 
 func prepareReaperCommand(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -91,10 +95,19 @@ func killReaperProcess(pid int) error {
 }
 
 func reaperDescendants(ctx context.Context, root int, visit func(int) error) error {
-	return reaperDescendantsWithLookup(ctx, root, visit, reaperPgrepChildren)
+	return reaperDescendantsWithLookupAndIdentity(ctx, root, visit, reaperPgrepChildren, reaperProcessIdentity)
 }
 
 func reaperDescendantsWithLookup(ctx context.Context, root int, visit func(int) error, lookup reaperDescendantLookup) error {
+	return reaperDescendantsWithLookupAndIdentity(ctx, root, visit, lookup, func(int) (int, bool) { return 0, false })
+}
+
+func reaperProcessIdentity(pid int) (int, bool) {
+	pgid, err := reaperProcessGroupID(pid)
+	return pgid, err == nil
+}
+
+func reaperDescendantsWithLookupAndIdentity(ctx context.Context, root int, visit func(int) error, lookup reaperDescendantLookup, identify reaperDescendantIdentity) error {
 	boundedCtx, cancel := context.WithTimeout(ctx, reaperCleanupTimeout)
 	defer cancel()
 	ctx = boundedCtx
@@ -103,17 +116,89 @@ func reaperDescendantsWithLookup(ctx context.Context, root int, visit func(int) 
 		return fmt.Errorf("reaper: invalid root pid %d", root)
 	}
 
-	// Keep the PID for the whole bounded cleanup. A PID is signaled at
-	// most once: retaining this set prevents a later traversal from
-	// signaling a recycled PID after the original process has exited.
-	seen := map[int]struct{}{root: {}}
+	type descendantState struct {
+		signalErr  error
+		pgid       int
+		identified bool
+	}
+	states := map[int]*descendantState{root: {}}
+	parentOrder := []int{root}
 	visited := 0
-	var visitErrors []error
-	var walk func(int, int, []int) error
-	walk = func(parent, depth int, children []int) error {
+	lookups := 0
+	lookupErrors := make(map[int]error)
+	signalErrors := make(map[int]error)
+	retryNeeded := false
+	var errorOrder []int
+	rememberError := func(kind string, pid int, err error) {
+		if err == nil {
+			return
+		}
+		if kind == "lookup" {
+			if _, ok := lookupErrors[pid]; !ok {
+				errorOrder = append(errorOrder, pid)
+			}
+			lookupErrors[pid] = err
+			return
+		}
+		if _, ok := signalErrors[pid]; !ok {
+			errorOrder = append(errorOrder, pid)
+		}
+		signalErrors[pid] = err
+	}
+	clearError := func(kind string, pid int) {
+		if kind == "lookup" {
+			delete(lookupErrors, pid)
+			return
+		}
+		delete(signalErrors, pid)
+	}
+	remainingErrors := func() error {
+		var errs []error
+		for _, pid := range errorOrder {
+			if err := lookupErrors[pid]; err != nil {
+				errs = append(errs, fmt.Errorf("reaper: lookup pid %d: %w", pid, err))
+			}
+			if err := signalErrors[pid]; err != nil {
+				errs = append(errs, fmt.Errorf("reaper: signal descendant %d: %w", pid, err))
+			}
+		}
+		return errors.Join(errs...)
+	}
+
+	lookupBounded := func(parent int) ([]int, error) {
+		if lookups >= maxReaperDescendantLookups {
+			return nil, fmt.Errorf("%w: more than %d process-tree lookups", errReaperDescendantLimit, maxReaperDescendantLookups)
+		}
+		lookups++
+		children, err := lookup(ctx, parent)
+		if err != nil {
+			retryNeeded = true
+			rememberError("lookup", parent, err)
+		} else {
+			clearError("lookup", parent)
+		}
+		return children, err
+	}
+
+	// A branch is re-expanded on every pass. This catches a child that is
+	// created after its parent was first scanned and retries a branch whose
+	// first pgrep failed. The state maps still ensure that a successfully
+	// signaled numeric PID is not signaled again, while a failed signal can
+	// be retried. When a process identity is available, an expanded branch
+	// is queried only while its process group still has the same identity.
+	active := make(map[int]struct{})
+	var walk func(int, int) error
+	var walkChildren func(int, int, []int) error
+	walkChildren = func(parent, depth int, children []int) error {
 		if depth > maxReaperDescendantDepth {
 			return fmt.Errorf("%w: depth exceeds %d", errReaperDescendantLimit, maxReaperDescendantDepth)
 		}
+		if _, ok := active[parent]; ok {
+			return nil
+		}
+		active[parent] = struct{}{}
+		defer delete(active, parent)
+
 		for _, child := range children {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -121,64 +206,128 @@ func reaperDescendantsWithLookup(ctx context.Context, root int, visit func(int) 
 			if child <= 0 {
 				return fmt.Errorf("reaper: pgrep returned invalid descendant pid %d for %d", child, parent)
 			}
-			if _, ok := seen[child]; ok {
+			state, exists := states[child]
+			if !exists {
+				if visited >= maxReaperDescendantPIDs {
+					return fmt.Errorf("%w: more than %d descendants", errReaperDescendantLimit, maxReaperDescendantPIDs)
+				}
+				// Capture one branch before stopping its leader so a child
+				// reparented during the hand-off is still available below it.
+				childChildren, childErr := lookupBounded(child)
+				pgid, identified := identify(child)
+				state = &descendantState{pgid: pgid, identified: identified}
+				states[child] = state
+				parentOrder = append(parentOrder, child)
+				visited++
+				if err := visit(child); err != nil {
+					state.signalErr = err
+					retryNeeded = true
+					rememberError("signal", child, err)
+				}
+				if childErr != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					continue
+				}
+				if err := walkChildren(child, depth+1, childChildren); err != nil {
+					if ctxErr := ctx.Err(); ctxErr != nil {
+						return ctxErr
+					}
+					retryNeeded = true
+					rememberError("lookup", child, err)
+				}
 				continue
-			}
-			if visited >= maxReaperDescendantPIDs {
-				return fmt.Errorf("%w: more than %d descendants", errReaperDescendantLimit, maxReaperDescendantPIDs)
 			}
 
-			// Capture one branch before stopping its leader. Without this
-			// small hand-off window, a child that is reparented while the
-			// leader is being killed can escape the next lookup. We never
-			// look up this PID again after signaling it, so a recycled
-			// numeric PID cannot be mistaken for the original process.
-			childChildren, childErr := lookup(ctx, child)
-			seen[child] = struct{}{}
-			visited++
-			// Signal before descending so a running branch cannot create
-			// another child while an earlier subtree is being enumerated.
-			if err := visit(child); err != nil {
-				visitErrors = append(visitErrors, fmt.Errorf("reaper: signal descendant %d: %w", child, err))
-			}
-			if childErr != nil {
-				if ctxErr := ctx.Err(); ctxErr != nil {
-					return ctxErr
+			// Retry a failed signal, but do not signal a successful PID a
+			// second time after it could have been recycled.
+			if state.signalErr != nil {
+				if err := visit(child); err != nil {
+					state.signalErr = err
+					retryNeeded = true
+					rememberError("signal", child, err)
+				} else {
+					state.signalErr = nil
+					clearError("signal", child)
 				}
-				visitErrors = append(visitErrors, childErr)
-				continue
 			}
-			if err := walk(child, depth+1, childChildren); err != nil {
-				return err
-			}
+			// The parentOrder frontier re-expands this branch on the next
+			// pass, even if the root no longer reports it as a child.
 		}
 		return nil
+	}
+	walk = func(parent, depth int) error {
+		if parent != root {
+			if state, ok := states[parent]; ok && state.identified {
+				pgid, identified := identify(parent)
+				if !identified || pgid != state.pgid {
+					return nil
+				}
+			}
+		}
+		if depth > maxReaperDescendantDepth {
+			return fmt.Errorf("%w: depth exceeds %d", errReaperDescendantLimit, maxReaperDescendantDepth)
+		}
+		if _, ok := active[parent]; ok {
+			return nil
+		}
+		children, err := lookupBounded(parent)
+		if err != nil {
+			return err
+		}
+		return walkChildren(parent, depth, children)
 	}
 
 	for pass := 0; pass < maxReaperDescendantPasses; pass++ {
 		before := visited
+		retryNeeded = false
 		if err := ctx.Err(); err != nil {
-			visitErrors = append(visitErrors, err)
-			return errors.Join(visitErrors...)
+			return errors.Join(remainingErrors(), err)
 		}
-		children, err := lookup(ctx, root)
-		if err != nil {
-			visitErrors = append(visitErrors, err)
-			return errors.Join(visitErrors...)
+		for _, parent := range parentOrder {
+			if err := ctx.Err(); err != nil {
+				return errors.Join(remainingErrors(), err)
+			}
+			if err := walk(parent, 0); err != nil {
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return errors.Join(remainingErrors(), ctxErr)
+				}
+				retryNeeded = true
+				rememberError("lookup", parent, err)
+			}
 		}
-		if err := walk(root, 0, children); err != nil {
-			visitErrors = append(visitErrors, err)
-			return errors.Join(visitErrors...)
-		}
-		if visited == before {
-			return errors.Join(visitErrors...)
+		if visited == before && !retryNeeded {
+			return remainingErrors()
 		}
 	}
-	return errors.Join(append(visitErrors, errReaperDescendantLimit)...)
+	return errors.Join(remainingErrors(), errReaperDescendantLimit)
+}
+
+func trustedReaperPgrepPath() (string, error) {
+	path, err := exec.LookPath("pgrep")
+	if err != nil {
+		return "", err
+	}
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("reaper: pgrep path %q is not absolute", path)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return "", err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return "", fmt.Errorf("reaper: pgrep path %q is not executable", path)
+	}
+	return path, nil
 }
 
 func reaperPgrepChildren(ctx context.Context, parent int) ([]int, error) {
-	cmd := exec.CommandContext(ctx, "pgrep", "-P", strconv.Itoa(parent))
+	pgrepPath, err := trustedReaperPgrepPath()
+	if err != nil {
+		return nil, fmt.Errorf("reaper: locate pgrep: %w", err)
+	}
+	cmd := exec.CommandContext(ctx, pgrepPath, "-P", strconv.Itoa(parent))
 	// A pgrep replacement should not be able to keep the cleanup stuck
 	// by retaining stdout after its context is canceled.
 	cmd.WaitDelay = reaperPgrepWaitDelay

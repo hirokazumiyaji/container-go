@@ -51,7 +51,7 @@ func TestReaperDescendantsSignalsBranchesAndRepeats(t *testing.T) {
 	if got, want := fmt.Sprint(signaled), "[101 103 102]"; got != want {
 		t.Fatalf("signaled PIDs = %s, want %s", got, want)
 	}
-	if got, want := fmt.Sprint(events), "[lookup:100 lookup:101 signal:101 lookup:103 signal:103 lookup:100 lookup:102 signal:102 lookup:100]"; got != want {
+	if got, want := fmt.Sprint(events), "[lookup:100 lookup:101 signal:101 lookup:103 signal:103 lookup:100 lookup:102 signal:102 lookup:101 lookup:103 lookup:100 lookup:101 lookup:103 lookup:102]"; got != want {
 		t.Fatalf("events = %s, want %s", got, want)
 	}
 }
@@ -99,6 +99,181 @@ func TestReaperDescendantsReportsSignalError(t *testing.T) {
 	)
 	if !errors.Is(err, signalErr) {
 		t.Fatalf("error = %v, want signal failure", err)
+	}
+}
+
+func TestReaperDescendantsReportsLookupError(t *testing.T) {
+	lookupErr := errors.New("pgrep failed")
+	err := reaperDescendantsWithLookup(
+		context.Background(),
+		100,
+		func(int) error { return nil },
+		func(context.Context, int) ([]int, error) { return nil, lookupErr },
+	)
+	if !errors.Is(err, lookupErr) {
+		t.Fatalf("error = %v, want lookup failure", err)
+	}
+}
+
+func TestReaperDescendantsRetriesFailedBranch(t *testing.T) {
+	rootCalls := 0
+	childCalls := 0
+	lookup := func(_ context.Context, parent int) ([]int, error) {
+		switch parent {
+		case 100:
+			rootCalls++
+			if rootCalls == 1 {
+				return []int{101}, nil
+			}
+			return nil, nil
+		case 101:
+			childCalls++
+			if childCalls == 1 {
+				return nil, errors.New("temporary pgrep failure")
+			}
+			return nil, nil
+		default:
+			return nil, nil
+		}
+	}
+	var signaled []int
+	err := reaperDescendantsWithLookup(context.Background(), 100, func(pid int) error {
+		signaled = append(signaled, pid)
+		return nil
+	}, lookup)
+	if err != nil {
+		t.Fatalf("reaperDescendantsWithLookup: %v", err)
+	}
+	if got, want := fmt.Sprint(signaled), "[101]"; got != want {
+		t.Fatalf("signaled PIDs = %s, want %s", got, want)
+	}
+}
+
+func TestReaperDescendantsFindsLateChildOnExpandedBranch(t *testing.T) {
+	rootCalls := 0
+	childCalls := 0
+	lookup := func(_ context.Context, parent int) ([]int, error) {
+		switch parent {
+		case 100:
+			rootCalls++
+			if rootCalls == 1 {
+				return []int{101}, nil
+			}
+			return nil, nil
+		case 101:
+			childCalls++
+			if childCalls == 1 {
+				return nil, nil
+			}
+			return []int{102}, nil
+		default:
+			return nil, nil
+		}
+	}
+	var signaled []int
+	err := reaperDescendantsWithLookup(context.Background(), 100, func(pid int) error {
+		signaled = append(signaled, pid)
+		return nil
+	}, lookup)
+	if err != nil {
+		t.Fatalf("reaperDescendantsWithLookup: %v", err)
+	}
+	if got, want := fmt.Sprint(signaled), "[101 102]"; got != want {
+		t.Fatalf("signaled PIDs = %s, want %s", got, want)
+	}
+}
+
+func TestReaperDescendantsDoesNotReexpandReusedPID(t *testing.T) {
+	rootCalls := 0
+	childCalls := 0
+	identityCalls := 0
+	lookup := func(_ context.Context, parent int) ([]int, error) {
+		switch parent {
+		case 100:
+			rootCalls++
+			if rootCalls == 1 {
+				return []int{101}, nil
+			}
+			return nil, nil
+		case 101:
+			childCalls++
+			if childCalls == 1 {
+				return nil, nil
+			}
+			return []int{102}, nil
+		default:
+			return nil, nil
+		}
+	}
+	identify := func(pid int) (int, bool) {
+		if pid != 101 {
+			return 0, false
+		}
+		identityCalls++
+		if identityCalls == 1 {
+			return 101, true
+		}
+		return 999, true
+	}
+	var signaled []int
+	err := reaperDescendantsWithLookupAndIdentity(
+		context.Background(),
+		100,
+		func(pid int) error {
+			signaled = append(signaled, pid)
+			return nil
+		},
+		lookup,
+		identify,
+	)
+	if err != nil {
+		t.Fatalf("reaperDescendantsWithLookupAndIdentity: %v", err)
+	}
+	if got, want := fmt.Sprint(signaled), "[101]"; got != want {
+		t.Fatalf("signaled PIDs = %s, want %s", got, want)
+	}
+}
+
+func TestReaperDescendantsRetriesFailedSignal(t *testing.T) {
+	signalErr := errors.New("temporary signal failure")
+	calls := 0
+	err := reaperDescendantsWithLookup(
+		context.Background(),
+		100,
+		func(int) error {
+			calls++
+			if calls == 1 {
+				return signalErr
+			}
+			return nil
+		},
+		func(context.Context, int) ([]int, error) { return []int{101}, nil },
+	)
+	if err != nil {
+		t.Fatalf("reaperDescendantsWithLookup: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("signal calls = %d, want retry", calls)
+	}
+}
+
+func TestReaperDescendantsHandlesCycles(t *testing.T) {
+	lookup := func(_ context.Context, parent int) ([]int, error) {
+		if parent == 100 {
+			return []int{101}, nil
+		}
+		return []int{100}, nil
+	}
+	var signaled []int
+	err := reaperDescendantsWithLookup(context.Background(), 100, func(pid int) error {
+		signaled = append(signaled, pid)
+		return nil
+	}, lookup)
+	if err != nil {
+		t.Fatalf("reaperDescendantsWithLookup: %v", err)
+	}
+	if got, want := fmt.Sprint(signaled), "[101]"; got != want {
+		t.Fatalf("signaled PIDs = %s, want %s", got, want)
 	}
 }
 

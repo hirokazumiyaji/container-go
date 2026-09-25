@@ -2,8 +2,10 @@ package container
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,11 +14,29 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func reaperShellQuote(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
 }
+
+type reaperExternalRunner struct {
+	inner  cli.Runner
+	binary string
+	id     string
+}
+
+func (r *reaperExternalRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "run" {
+		return []byte(r.id + "\n"), nil, nil
+	}
+	return r.inner.Run(ctx, args...)
+}
+
+func (r *reaperExternalRunner) External() bool         { return true }
+func (r *reaperExternalRunner) ExternalBinary() string { return r.binary }
 
 // writeReaperStub creates a fake `container` binary that logs its argv.
 func writeReaperStub(t *testing.T) (binPath, logPath string) {
@@ -80,13 +100,117 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	r := newReaper(bin, "delete")
 	defer closeReaperForTest(t, r)
 
-	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
+	for _, id := range []string{
+		"",
+		"bad id",
+		"a;b",
+		"x\ny",
+		"-leading",
+		strings.Repeat("a", 65),
+		strings.Repeat("A", 64),
+		strings.Repeat("g", 64),
+	} {
 		if err := r.register(id, ""); err == nil {
 			t.Errorf("register(%q): want error", id)
 		}
 	}
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
+	}
+}
+
+func TestReaperAcceptsFullDockerID(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+
+	id := strings.Repeat("ab", 32)
+	if err := r.register(id, ""); err != nil {
+		t.Fatalf("register full Docker ID: %v", err)
+	}
+	closeReaperForTest(t, r)
+	waitForLogLines(t, logPath, "rm --force "+id)
+}
+
+func TestRegisterWithGlobalReaperRecordsError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	binary := filepath.Join(t.TempDir(), "docker")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previous) })
+
+	if err := registerWithGlobalReaper(binary, "rm", "bad id", ""); err == nil {
+		t.Fatal("registration unexpectedly succeeded")
+	}
+	if got := logs.String(); !strings.Contains(got, "reaper registration failed") || !strings.Contains(got, "invalid container id") {
+		t.Fatalf("registration log = %q, want validation error", got)
+	}
+}
+
+func TestRunRegistersFullDockerIDThroughExternalPath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	bin, _ := writeReaperStub(t)
+	inner := newTestRunner()
+	inner.imagePresent = true
+	runner := &reaperExternalRunner{
+		inner:  inner,
+		binary: bin,
+		id:     strings.Repeat("cd", 32),
+	}
+
+	globalReapersMu.Lock()
+	delete(globalReapers, bin)
+	globalReapersMu.Unlock()
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		r := globalReapers[bin]
+		delete(globalReapers, bin)
+		globalReapersMu.Unlock()
+		if r == nil {
+			return
+		}
+		r.closeStdin()
+		r.mu.Lock()
+		exited := r.exited
+		r.mu.Unlock()
+		if exited != nil {
+			select {
+			case <-exited:
+			case <-time.After(5 * time.Second):
+				t.Error("external-path reaper did not exit")
+			}
+		}
+	})
+
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("external-ctr"),
+		WithPullPolicy(PullNever),
+		withRunner(runner),
+		withEngine(dockerEngine{}),
+	); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	globalReapersMu.Lock()
+	r := globalReapers[bin]
+	globalReapersMu.Unlock()
+	if r == nil {
+		t.Fatal("external Run did not create a reaper")
+	}
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].id != runner.id || entries[0].creation != "" {
+		t.Fatalf("registered entries = %+v, want full Docker ID without generation", entries)
 	}
 }
 
@@ -315,6 +439,111 @@ func TestReaperHungInspectDoesNotBlockLaterEntries(t *testing.T) {
 	}
 }
 
+func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the watchdog reaper requires a POSIX shell")
+	}
+	realSleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	sleepLog := filepath.Join(dir, "sleep-pids")
+	sleepPath := filepath.Join(dir, "sleep")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$$\" >> " + reaperShellQuote(sleepLog) + "\nexec " + reaperShellQuote(realSleep) + " \"$@\"\n"
+	if err := os.WriteFile(sleepPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bin, _ := writeReaperStub(t)
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nsleep 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "delete")
+	if err := r.register("timer-ctr", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	closeReaperForTest(t, r)
+
+	data, err := os.ReadFile(sleepLog)
+	if err != nil {
+		t.Fatalf("read sleep PID log: %v", err)
+	}
+	pids := strings.Fields(string(data))
+	if len(pids) == 0 {
+		t.Fatal("timer did not start a sleep descendant")
+	}
+	for _, field := range pids {
+		pid, err := strconv.Atoi(field)
+		if err != nil || pid <= 0 {
+			t.Fatalf("sleep PID log = %q", data)
+		}
+		waitForReaperProcessGone(t, pid)
+	}
+}
+
+func TestReaperShellBoundsPgrepLookup(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the watchdog reaper requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	pgrepPath := filepath.Join(dir, "pgrep")
+	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nsleep 5\nexit 2\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bin, logPath := writeReaperStub(t)
+	const first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then sleep 5; fi\n"
+	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "rm")
+	r.timeoutSeconds = 1
+	if err := r.register(first, ""); err != nil {
+		t.Fatalf("register first: %v", err)
+	}
+	if err := r.register(second, ""); err != nil {
+		t.Fatalf("register second: %v", err)
+	}
+	started := time.Now()
+	closeReaperForTest(t, r)
+	if elapsed := time.Since(started); elapsed > 4*time.Second {
+		t.Fatalf("reaper shell cleanup took %s, want bounded pgrep lookup", elapsed)
+	}
+	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
+}
+
+func TestReaperShellRejectsInvalidPgrepPID(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the watchdog reaper requires a POSIX shell")
+	}
+	dir := t.TempDir()
+	pgrepPath := filepath.Join(dir, "pgrep")
+	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\necho not-a-pid\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bin, logPath := writeReaperStub(t)
+	const first = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	const second = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then sleep 5; fi\n"
+	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "rm")
+	r.timeoutSeconds = 1
+	if err := r.register(first, ""); err != nil {
+		t.Fatalf("register first: %v", err)
+	}
+	if err := r.register(second, ""); err != nil {
+		t.Fatalf("register second: %v", err)
+	}
+	closeReaperForTest(t, r)
+	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
+}
+
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `timeout="${4:-30}"`) ||
 		!strings.Contains(reaperScript, `sleep "$timeout"`) ||
@@ -323,6 +552,16 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	}
 	if !strings.Contains(reaperScript, "run_with_timeout process_entry") {
 		t.Error("reaper must put the complete entry pipeline behind its timeout")
+	}
+	for _, required := range []string{
+		"valid_docker_id \"$uid\"",
+		"\"$pgrep_bin\" -P \"$parent\"",
+		"max_descendant_lookups",
+		"kill -KILL \"$sleeper\"",
+	} {
+		if !strings.Contains(reaperScript, required) {
+			t.Errorf("reaper script missing bounded cleanup fragment %q", required)
+		}
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
@@ -457,5 +696,34 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	waitForLogLines(t, logPath, "rm --force "+uid)
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
+	}
+}
+
+func TestReaperDockerGenerationRequiresImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "docker")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then\n" +
+		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "rm")
+	if err := r.register("ctr", creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	closeReaperForTest(t, r)
+	waitForLogLines(t, logPath, "inspect ctr")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "rm --force") {
+			t.Fatalf("Docker generation-guarded entry fell back to name: %q", data)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

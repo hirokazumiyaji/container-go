@@ -22,8 +22,9 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated as an Apple Container name or a full Docker ID, and
+// the script itself disables globbing and quotes every expansion the
+// IDs reach.
 // Every backend entry runs behind a bounded timeout. The timeout covers
 // the complete inspect, status-marker, filter, and delete pipeline; it
 // kills the whole local process group when the shell supports one and
@@ -39,8 +40,8 @@ import (
 // and status are held in memory; it is never staged in a host file, so
 // a killed reaper cannot leave an environment-bearing inspect dump behind.
 // When inspect also reports an immutable "Id" (Docker), the delete
-// targets that ID instead of the name, so a same-name replacement
-// created after the check is simply not found.
+// targets that validated ID instead of the name; a Docker entry with a
+// generation but no valid ID is skipped.
 // Apple Container has no such ID; there the delete necessarily goes by
 // name.
 const reaperScript = `set -f
@@ -53,34 +54,191 @@ while IFS= read -r line; do
   ids="$ids
 $line"
 done
-kill_descendants() {
-  children=$(pgrep -P "$1" 2>/dev/null)
+descendant_timeout=1
+max_descendant_pids=256
+max_descendant_depth=32
+max_descendant_passes=4
+max_descendant_lookups=8
+# Resolve pgrep once to an absolute executable; never invoke a shell
+# function, alias, or bare PATH lookup from the cleanup recursion.
+pgrep_bin=$(command -v pgrep 2>/dev/null) || pgrep_bin=
+case "$pgrep_bin" in
+  /*) [ -x "$pgrep_bin" ] || pgrep_bin= ;;
+  *) pgrep_bin= ;;
+esac
+mktemp_bin=$(command -v mktemp 2>/dev/null) || mktemp_bin=
+case "$mktemp_bin" in
+  /*) [ -x "$mktemp_bin" ] || mktemp_bin= ;;
+  *) mktemp_bin= ;;
+esac
+reaper_warn() {
+  printf 'containergo: %s\n' "$*" >&2
+}
+bounded_pgrep() {
+  parent="$1"
+  [ -n "$pgrep_bin" ] && [ -n "$mktemp_bin" ] || return 127
+  lookup_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/containergo-pgrep.XXXXXX") || return 127
+  lookup_error_file=$("$mktemp_bin" "${TMPDIR:-/tmp}/containergo-pgrep-error.XXXXXX") || {
+    rm -f "$lookup_file"
+    return 127
+  }
+  trap 'rm -f "$lookup_file" "$lookup_error_file" 2>/dev/null || true' 0
+  trap 'rm -f "$lookup_file" "$lookup_error_file" 2>/dev/null || true; exit 1' HUP INT TERM
+  "$pgrep_bin" -P "$parent" >"$lookup_file" 2>"$lookup_error_file" &
+  lookup="$!"
+  (
+    sleeper=
+    trap 'if [ -n "$sleeper" ]; then kill -KILL "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+    sleep "$descendant_timeout" &
+    sleeper="$!"
+    wait "$sleeper"
+    if [ "$process_groups" = 1 ]; then
+      kill -KILL -"$lookup" 2>/dev/null || true
+    fi
+    kill -KILL "$lookup" 2>/dev/null || true
+    wait "$lookup" 2>/dev/null || true
+  ) &
+  lookup_timer="$!"
+  wait "$lookup"
+  status="$?"
+  kill -TERM "$lookup_timer" 2>/dev/null || true
+  wait "$lookup_timer" 2>/dev/null || true
+  if [ "$status" -eq 1 ] && [ -s "$lookup_error_file" ]; then
+    status=125
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    printf '%s\n' "$line"
+  done < "$lookup_file"
+  rm -f "$lookup_file" "$lookup_error_file"
+  if [ "$status" -ge 128 ] 2>/dev/null; then
+    return 124
+  fi
+  return "$status"
+}
+list_children() {
+  parent="$1"
+  descendant_lookups=$((descendant_lookups + 1))
+  if [ "$descendant_lookups" -gt "$max_descendant_lookups" ]; then
+    reaper_warn "descendant lookup limit reached"
+    return 1
+  fi
+  children=$(bounded_pgrep "$parent")
+  status="$?"
+  case "$status" in
+    0) ;;
+    1) children=; return 0 ;;
+    *) reaper_warn "pgrep lookup failed for pid $parent (status $status)"; return 1 ;;
+  esac
+  validated=
   for child in $children; do
-    kill_descendants "$child"
+    case "$child" in
+      ""|*[!0-9]*) reaper_warn "pgrep returned an invalid child pid for $parent"; return 1 ;;
+    esac
+    [ "$child" -gt 0 ] 2>/dev/null || {
+      reaper_warn "pgrep returned an invalid child pid for $parent"
+      return 1
+    }
+    validated="$validated $child"
   done
-  kill -9 "$1" 2>/dev/null || true
+  children="${validated# }"
+  return 0
+}
+clear_failed_pid() {
+  target="$1"
+  remaining_failed=
+  for failed in $failed_pids; do
+    [ "$failed" = "$target" ] || remaining_failed="$remaining_failed $failed"
+  done
+  failed_pids="$remaining_failed"
+}
+kill_descendants() {
+  pid="$1"
+  depth="$2"
+  if [ "$depth" -gt "$max_descendant_depth" ]; then
+    reaper_warn "descendant depth limit reached at pid $pid"
+    kill -9 "$pid" 2>/dev/null || true
+    return 1
+  fi
+  # Stop a newly discovered process group before asking pgrep about its
+  # children. A previously successful PID is only re-expanded, never
+  # signaled again, so a recycled numeric PID cannot be killed.
+  already=0
+  case " $seen_pids " in
+    *" $pid "*) already=1 ;;
+    *) seen_pids="$seen_pids $pid" ;;
+  esac
+  resignal=0
+  case " $failed_pids " in
+    *" $pid "*) resignal=1 ;;
+  esac
+  if { [ "$already" -eq 0 ] || [ "$resignal" -eq 1 ]; } && [ "$process_groups" = 1 ] && kill -0 -"$pid" 2>/dev/null; then
+    kill -9 -"$pid" 2>/dev/null || reaper_warn "failed to signal process group $pid"
+  fi
+  if ! list_children "$pid"; then
+    failed_pids="$failed_pids $pid"
+    if [ "$already" -eq 0 ] || [ "$resignal" -eq 1 ]; then
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    return 1
+  fi
+  clear_failed_pid "$pid"
+  if [ "$already" -eq 0 ] || [ "$resignal" -eq 1 ]; then
+    kill -9 "$pid" 2>/dev/null || true
+  fi
+  branch="$children"
+  for child in $branch; do
+    case " $seen_pids " in
+      *" $child "*) ;;
+      *) descendant_count=$((descendant_count + 1)) ;;
+    esac
+    if [ "$descendant_count" -gt "$max_descendant_pids" ]; then
+      reaper_warn "descendant pid limit reached"
+      descendant_error=1
+      break
+    fi
+    kill_descendants "$child" "$((depth + 1))" || descendant_error=1
+  done
+  return 0
 }
 kill_pipeline() {
   pid="$1"
-  group=0
-  if [ "$process_groups" = 1 ] && kill -0 -"$pid" 2>/dev/null; then
-    group=1
-  fi
-  # Kill descendants first so a nested monitor-mode group cannot escape;
-  # the group signal below also catches descendants not seen by pgrep.
-  kill_descendants "$pid"
-  if [ "$group" = 1 ]; then
-    kill -9 -"$pid" 2>/dev/null || true
-  fi
+  descendant_error=0
+  descendant_count=0
+  descendant_lookups=0
+  seen_pids=
+  failed_pids=
+  pass=1
+  while [ "$pass" -le "$max_descendant_passes" ]; do
+    before="$descendant_count"
+    kill_descendants "$pid" 0 || descendant_error=1
+    if [ "$descendant_error" -eq 0 ] && [ "$descendant_count" -eq "$before" ]; then
+      break
+    fi
+    pass=$((pass + 1))
+  done
+  [ "$descendant_error" -eq 0 ]
 }
 run_with_timeout() {
   "$@" & pid=$!
-  (sleep "$timeout"; kill_pipeline "$pid") & killer=$!
+  (
+    sleeper=
+    trap 'if [ -n "$sleeper" ]; then kill -KILL "$sleeper" 2>/dev/null || true; wait "$sleeper" 2>/dev/null || true; fi; exit 0' HUP INT TERM
+    sleep "$timeout" &
+    sleeper="$!"
+    wait "$sleeper"
+    kill_pipeline "$pid"
+  ) & killer=$!
   wait "$pid" 2>/dev/null
-  rc=$?
-  kill "$killer" 2>/dev/null
-  wait "$killer" 2>/dev/null
+  rc="$?"
+  kill -TERM "$killer" 2>/dev/null || true
+  wait "$killer" 2>/dev/null || true
   return "$rc"
+}
+valid_docker_id() {
+  case "$1" in
+    *[!0-9a-f]*) return 1 ;;
+  esac
+  [ "${#1}" -eq 64 ] 2>/dev/null
 }
 process_entry() {
   bin="$1"
@@ -89,6 +247,13 @@ process_entry() {
   creation="$4"
   key="$5"
   target="$id"
+  case "$sub" in
+    delete|rm) ;;
+    *) return 0 ;;
+  esac
+  if [ "$sub" = "rm" ] && [ -z "$creation" ]; then
+    valid_docker_id "$id" || return 0
+  fi
   if [ -n "$creation" ]; then
     # Apple has no inspect format; filter on the pipe before command
     # substitution can materialize output. This whole pipeline runs in
@@ -108,7 +273,10 @@ process_entry() {
     unset inspect_fields
     [ "$inspect_rc" = 0 ] || return 0
     [ "$got" = "$creation" ] || return 0
-    [ -n "$uid" ] && target="$uid"
+    if [ "$sub" = "rm" ]; then
+      valid_docker_id "$uid" || return 0
+      target="$uid"
+    fi
   fi
   run_with_timeout "$bin" "$sub" --force "$target" >/dev/null 2>&1 || true
 }
@@ -158,6 +326,10 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+func validReaperID(subcommand, id string) bool {
+	return nameRE.MatchString(id) || (subcommand == "rm" && dockerIDRE.MatchString(id))
+}
+
 type reaperEntry struct {
 	id       string
 	creation string
@@ -191,14 +363,20 @@ func newReaper(binary, subcommand string) *reaper {
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// ID from creationLabel; a full immutable Docker ID is normalized to an
+// ungenerated entry.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	immutableID := r.subcommand == "rm" && dockerIDRE.MatchString(id)
+	if !validReaperID(r.subcommand, id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
+	if immutableID {
+		// A full Docker ID is already immutable; it must not be sent
+		// through the name/generation fallback path.
+		creation = ""
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -320,12 +498,12 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+// process-wide reaper for its backend binary. Reaper trouble is logged
+// but never fails container startup. The reaper needs /bin/sh, so on
+// Windows this is a no-op and cleanup relies on the normal paths.
+func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
 	if runtime.GOOS == "windows" {
-		return
+		return nil
 	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[binary]
@@ -334,5 +512,9 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
 }

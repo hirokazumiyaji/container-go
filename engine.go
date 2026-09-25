@@ -51,6 +51,9 @@ type engine interface {
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
+	// checkCopyFileFromContainer rejects backends whose copy-out cannot
+	// preserve file types and reject links/special files before host open.
+	checkCopyFileFromContainer() error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	logsArgs(id string, follow bool) []string
 	// logsTailArgs fetches a bounded tail for diagnostics without

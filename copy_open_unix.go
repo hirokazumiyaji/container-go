@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+func checkCopyFileOpenCapability() error { return nil }
+
 // openCopyFile refuses links and avoids a blocking open if the target
 // changes to a FIFO after the Lstat check.
 func openCopyFile(name string) (*os.File, error) {

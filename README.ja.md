@@ -54,6 +54,18 @@ inspect JSON 形状):
 `engine_apple.go` / `engine_docker.go` 先頭の stderr マッチャと、
 `internal/inspect/testdata/`・`testdata/` のフィクスチャを参照してください。
 
+## ファイル取り出しのバックエンド制限
+
+`CopyFileFromContainer` は Docker バックエンドでのみサポートされます。
+Docker の `cp` はコピーするオブジェクトの型を保持し、このライブラリは
+開く前に regular file であることを検証します。Apple Container の
+`container cp` には型を保持し symlink を追跡しない copy-out モードが
+なく、host 側の検証前に link や special file を dereference/consume する
+ことがあります。そのため Apple Container では CLI を起動せず
+`ErrCopyFileFromContainerUnsupported` を返します。no-follow と nonblocking
+な file open を持たない host でも同じ fail-closed error を返します。macOS で
+安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` を使ってください。
+
 ## インストール
 
 ```

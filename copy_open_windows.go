@@ -7,6 +7,8 @@ import (
 	"syscall"
 )
 
+func checkCopyFileOpenCapability() error { return nil }
+
 // openCopyFile opens the reparse point itself and uses overlapped I/O
 // so a named-pipe target cannot turn the read into an unbounded wait.
 func openCopyFile(name string) (*os.File, error) {

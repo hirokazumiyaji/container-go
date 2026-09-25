@@ -18,6 +18,15 @@ type cpRunner struct {
 	*fakeRunner
 	fileContent string
 	materialize func(dst string) error
+	containerID string
+}
+
+func (c *cpRunner) isContainerSpec(arg string) bool {
+	id := c.containerID
+	if id == "" {
+		id = "myctr"
+	}
+	return strings.HasPrefix(arg, id+":/")
 }
 
 func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -26,8 +35,11 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		if c.failPrefix == "cp" {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
-		dst := args[2]
-		if !strings.Contains(dst, ":") {
+		// A container spec (id:/path) is not a host path. Match the
+		// known container ID rather than looking for a colon, since a
+		// Windows host path can also contain a drive-letter colon.
+		if c.isContainerSpec(args[1]) {
+			dst := args[2]
 			if c.materialize != nil {
 				if err := c.materialize(dst); err != nil {
 					return nil, nil, err
@@ -39,6 +51,43 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		return nil, nil, nil
 	}
 	return c.fakeRunner.Run(ctx, args...)
+}
+
+func runCopyDockerTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
+	t.Helper()
+	return runTestContainer(t, f, append([]Option{withEngine(dockerEngine{})}, opts...)...)
+}
+
+func TestCopyFileFromContainerRejectsAppleBackendBeforeCLI(t *testing.T) {
+	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "must not be copied"}
+	ctr := runTestContainer(t, f)
+
+	_, err := ctr.CopyFileFromContainer(context.Background(), "/out/result.txt")
+	if !errors.Is(err, ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("error = %v, want ErrCopyFileFromContainerUnsupported", err)
+	}
+	if call := f.callWith("cp"); call != nil {
+		t.Fatalf("Apple copy-out invoked CLI: %v", call)
+	}
+}
+
+func TestCpRunnerRecognizesDriveLikeContainerID(t *testing.T) {
+	f := &cpRunner{
+		fakeRunner:  newTestRunner(),
+		containerID: "C",
+		fileContent: "copied",
+	}
+	dst := filepath.Join(t.TempDir(), "payload")
+	if _, _, err := f.Run(context.Background(), "cp", "C:/out/file", dst); err != nil {
+		t.Fatalf("cp: %v", err)
+	}
+	data, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "copied" {
+		t.Errorf("copied content = %q", data)
+	}
 }
 
 func TestCopyToContainerBuildsCpArgs(t *testing.T) {
@@ -85,7 +134,7 @@ func TestCopyToContainerRejectsMissingHostPath(t *testing.T) {
 
 func TestCopyFileFromContainerReadsAndCleansUp(t *testing.T) {
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "result data"}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/result.txt")
 	if err != nil {
@@ -145,7 +194,7 @@ func TestWithFilesFailureRollsBack(t *testing.T) {
 
 func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
 	f := &cpRunner{fakeRunner: newTestRunner()}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	for _, path := range []string{"/", "/etc/", "/foo/bar/"} {
 		if _, err := ctr.CopyFileFromContainer(context.Background(), path); err == nil {
@@ -161,7 +210,7 @@ func TestCopyFileFromContainerUsesCleanPOSIXPathAndFixedDestination(t *testing.T
 	t.Setenv("TEMP", root)
 
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "safe"}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	rc, err := ctr.CopyFileFromContainer(context.Background(), "/a/b/..")
 	if err != nil {
@@ -207,7 +256,7 @@ func TestCopyFileFromContainerRejectsSymlinkWithoutReadingTarget(t *testing.T) {
 			return linkErr
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	rc, err := ctr.CopyFileFromContainer(context.Background(), "/container/link")
 	if linkErr != nil {
@@ -235,7 +284,7 @@ func TestCopyFileFromContainerRejectsCopiedDirectory(t *testing.T) {
 			return os.Mkdir(dst, 0o700)
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	_, err := ctr.CopyFileFromContainer(context.Background(), "/container/dir")
 	if err == nil {

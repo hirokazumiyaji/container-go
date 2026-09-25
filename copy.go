@@ -50,8 +50,11 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	return c.classify(ctx, err)
 }
 
-// CopyFileFromContainer copies one file out of the running container
-// and returns its content. Close releases the temporary copy.
+// CopyFileFromContainer copies one regular file out of the running
+// container and returns its content. It is supported by the Docker
+// backend; Apple Container returns ErrCopyFileFromContainerUnsupported
+// before invoking its CLI because it cannot preserve and validate all
+// source file types safely. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err
@@ -63,6 +66,12 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", requestedPath)
 	}
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.eng.checkCopyFileFromContainer(); err != nil {
+		return nil, err
+	}
+	if err := checkCopyFileOpenCapability(); err != nil {
 		return nil, err
 	}
 

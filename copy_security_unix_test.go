@@ -1,4 +1,4 @@
-//go:build darwin || linux
+//go:build darwin || freebsd || linux || netbsd || openbsd
 
 package container
 
@@ -25,7 +25,7 @@ func TestCopyFileFromContainerRejectsFIFOWithoutOpeningIt(t *testing.T) {
 			return syscall.Mkfifo(dst, 0o600)
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	result := make(chan error, 1)
 	go func() {
@@ -53,7 +53,7 @@ func TestCopyFileFromContainerHonorsCanceledContextBeforeOpen(t *testing.T) {
 			return syscall.Mkfifo(dst, 0o600)
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -86,7 +86,7 @@ func TestCopyFileFromContainerRejectsUnixSocket(t *testing.T) {
 			return socketErr
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
 	rc, err := ctr.CopyFileFromContainer(context.Background(), "/container/socket")
 	if listener != nil {
@@ -120,15 +120,96 @@ func TestCopyFileFromContainerRemovesPrivateDirectoryAfterRejectedTarget(t *test
 			return syscall.Mkfifo(path, 0o600)
 		},
 	}
-	ctr := runTestContainer(t, f)
+	ctr := runCopyDockerTestContainer(t, f)
 
-	if _, err := ctr.CopyFileFromContainer(context.Background(), "/container/fifo"); err == nil {
+	_, err := ctr.CopyFileFromContainer(context.Background(), "/container/fifo")
+	if err == nil {
 		t.Fatal("FIFO was accepted")
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Errorf("FIFO cleanup error = %v, want ErrCopyFileNotRegular", err)
 	}
 	if dst == "" {
 		t.Fatal("copy destination was not recorded")
 	}
 	if _, err := os.Stat(filepath.Dir(dst)); !os.IsNotExist(err) {
 		t.Errorf("private copy directory %q remains after rejection", filepath.Dir(dst))
+	}
+}
+
+func TestOpenCopyFileRejectsSymlinkReplacementAfterLstat(t *testing.T) {
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "payload")
+	target := filepath.Join(dir, "host-secret")
+	if err := os.WriteFile(payload, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, payload); err != nil {
+		t.Skipf("symlink creation unavailable: %v", err)
+	}
+
+	f, err := openCopyFile(payload)
+	if f != nil {
+		_ = f.Close()
+		t.Fatal("open followed a symlink replaced after Lstat")
+	}
+	if err == nil {
+		t.Fatal("open unexpectedly accepted a symlink")
+	}
+}
+
+func TestOpenCopyFileDoesNotBlockOnFIFOReplacementAfterLstat(t *testing.T) {
+	dir := t.TempDir()
+	payload := filepath.Join(dir, "payload")
+	if err := os.WriteFile(payload, []byte("safe"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		file *os.File
+		err  error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		f, err := openCopyFile(payload)
+		resultCh <- result{file: f, err: err}
+	}()
+
+	select {
+	case got := <-resultCh:
+		if got.err != nil {
+			t.Fatalf("open FIFO: %v", got.err)
+		}
+		if got.file == nil {
+			t.Fatal("open FIFO returned a nil file")
+		}
+		info, err := got.file.Stat()
+		_ = got.file.Close()
+		if err != nil {
+			t.Fatalf("stat FIFO: %v", err)
+		}
+		if info.Mode().IsRegular() {
+			t.Fatal("FIFO descriptor was reported as a regular file")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("openCopyFile blocked on a FIFO replacement")
 	}
 }

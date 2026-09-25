@@ -74,6 +74,19 @@ possible.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
+## Copy-out backend capability
+
+`CopyFileFromContainer` is supported only by the Docker backend. Docker's
+`cp` preserves the copied object type, and this library additionally
+requires a regular file before opening it. Apple Container's `container cp`
+has no type-preserving/no-follow copy-out mode; it can dereference or
+consume links and special files before host-side validation. On Apple
+Container, `CopyFileFromContainer` therefore returns
+`ErrCopyFileFromContainerUnsupported` without invoking the CLI. The same
+fail-closed error is returned on host platforms without no-follow and
+nonblocking file-open support. Use `CONTAINERGO_BACKEND=docker` on macOS
+when a safe copy-out is required.
+
 ## Connection endpoints
 
 **Apple Container backend**: every container gets a real IP on the

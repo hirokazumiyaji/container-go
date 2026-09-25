@@ -50,7 +50,12 @@ The design decisions below rest on these properties of Apple Container
 - `--label` exists, but filtering by label means filtering the JSON
   output client-side. Label keys are restricted to lowercase
   Docker/OCI-style keys.
-- `container cp` only works on running containers.
+- `container cp` only works on running containers. Its copy-out operation
+  has no type-preserving/no-follow mode: observed versions can dereference
+  or consume symlinks, FIFOs, and device nodes before the host can inspect
+  the result. `CopyFileFromContainer` therefore fails closed on Apple
+  Container with `ErrCopyFileFromContainerUnsupported`; Docker retains the
+  host-side Lstat/open checks.
 - `--rm` removal leaves anonymous volumes behind.
 - Error classification depends on CLI stderr substrings owned by
   `engine_apple.go` (name conflict, image/container missing). Those
@@ -189,6 +194,13 @@ name recycled by another process (see Reuse below).
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
 `TerminateContainer(ctr)` are nil-safe helpers preserving the
 testcontainers-go idiom of deferring cleanup before the error check.
+
+`CopyFileFromContainer` is a Docker-only safe copy-out operation. Apple
+Container's CLI cannot preserve/reject all source file types before the
+host opens the result, so the method returns
+`ErrCopyFileFromContainerUnsupported` without invoking `container cp`.
+Hosts without no-follow/nonblocking file-open support fail closed with the
+same error. `CopyToContainer` remains available on both backends.
 
 ## Connection endpoints
 
@@ -398,6 +410,11 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
+- `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
+  file
+- `ErrCopyFileFromContainerUnsupported`: the selected backend or host
+  cannot perform a type-safe copy-out (currently Apple Container and
+  hosts without the required open flags)
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
 

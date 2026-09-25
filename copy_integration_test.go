@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -11,6 +12,8 @@ import (
 	container "github.com/hirokazumiyaji/container-go"
 )
 
+// assertIntegrationCopyOutRejectsSpecialFiles exercises the Docker-only
+// copy-out safety contract; Apple is tested separately for fail-closed behavior.
 func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Context, ctr *container.Container) {
 	t.Helper()
 
@@ -59,6 +62,9 @@ func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Conte
 				}
 				if got.err == nil {
 					t.Fatalf("CopyFileFromContainer accepted %s", tc.name)
+				}
+				if !errors.Is(got.err, container.ErrCopyFileNotRegular) {
+					t.Errorf("%s error = %v, want ErrCopyFileNotRegular", tc.name, got.err)
 				}
 			case <-time.After(5 * time.Second):
 				t.Fatalf("CopyFileFromContainer blocked on %s", tc.name)

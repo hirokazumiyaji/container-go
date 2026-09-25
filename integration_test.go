@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -74,7 +75,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 		t.Errorf("redis-cli ping: code=%d out=%q", code, data)
 	}
 
-	// Copy a file in and read it back.
+	// Copy a file in; Apple Container copy-out is intentionally fail-closed.
 	src := filepath.Join(t.TempDir(), "hello.txt")
 	if err := os.WriteFile(src, []byte("hello from host"), 0o600); err != nil {
 		t.Fatal(err)
@@ -82,16 +83,9 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if err := ctr.CopyToContainer(ctx, src, "/tmp/hello.txt"); err != nil {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
-	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
+	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt"); !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("CopyFileFromContainer error = %v, want ErrCopyFileFromContainerUnsupported", err)
 	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello from host" {
-		t.Errorf("round-tripped content = %q", round)
-	}
-	assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 
 	// Logs snapshot.
 	logs, err := ctr.Logs(ctx)

@@ -267,6 +267,8 @@ func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
 }
 
+func (dockerEngine) checkCopyFileFromContainer() error { return nil }
+
 func (dockerEngine) reaperSubcommand() string { return "rm" }
 
 func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {

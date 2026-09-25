@@ -136,6 +136,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(cfg); err != nil {
 		return nil, err
 	}
+	materializeAppleRunPlatform(cfg)
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}

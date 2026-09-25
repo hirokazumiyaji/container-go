@@ -121,7 +121,7 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		} else if r.resolvedDigest != "" {
 			digest = r.resolvedDigest
 		}
-		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":%q}},"variants":[]}]`, digest, digest)), nil, nil
+		return issue115FreshAppleImageJSON(digest, digest), nil, nil
 	case args[0] == "image" && len(args) > 1 && args[1] == "pull":
 		digest := r.pullDigest
 		if digest == "" {
@@ -141,7 +141,7 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		if digest == "" {
 			digest = issue115ImageIdentityOld
 		}
-		return issue115ReviewContainerJSON(image, digest, "linux/arm64/v8"), nil, nil
+		return issue115ReviewContainerJSON(image, digest, issue115FreshHostPlatform()), nil, nil
 	default:
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "unexpected command"}
 	}
@@ -217,7 +217,7 @@ type issue115AppleNoDigestAliasRunner struct {
 func (r *issue115AppleNoDigestAliasRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
 		if args[len(args)-1] == "redis:7-alpine" {
-			return []byte(`[{"id":"` + issue115ImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue115ImageIdentityNew + `"}}}]`), nil, nil
+			return issue115FreshAppleImageJSON(issue115ImageIdentityNew, issue115ImageIdentityNew), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: " + args[len(args)-1]}
 	}

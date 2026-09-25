@@ -408,15 +408,18 @@ func imageMissingError(eng engine, err error) bool {
 }
 
 func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, error) {
+	if identity.mismatch {
+		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageIdentityMismatch, image)
+	}
 	if identity.notLocal {
+		if !identity.pinned && c.canUseMutableFallback(image) {
+			return mutableImageReference(image, identity), nil
+		}
 		reason := identity.notLocalReason
 		if reason == "" {
 			reason = "the requested platform variant is not locally addressable"
 		}
 		return imageIdentity{}, fmt.Errorf("%w: %s (%s)", ErrImageIdentityNotLocal, image, reason)
-	}
-	if identity.mismatch {
-		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageIdentityMismatch, image)
 	}
 	requestedDigest := imageDigest(image)
 	if identity.pinned {
@@ -486,6 +489,8 @@ func mutableImageReference(image string, identity imageIdentity) imageIdentity {
 	identity.pinned = false
 	identity.mutableAlias = false
 	identity.appleSynthetic = false
+	identity.notLocal = false
+	identity.notLocalReason = ""
 	return identity
 }
 

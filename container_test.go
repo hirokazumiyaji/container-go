@@ -35,6 +35,7 @@ type fakeRunner struct {
 
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
+	runPlatform  string
 	creations    map[string]string // container name -> creation generation from run args
 }
 
@@ -94,7 +95,11 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	switch args[0] {
 	case "run":
+		f.runPlatform = ""
 		for i, a := range args {
+			if a == "--platform" && i+1 < len(args) {
+				f.runPlatform = args[i+1]
+			}
 			if a == "--label" && i+1 < len(args) {
 				if v, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
 					name := ""
@@ -120,13 +125,26 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			// creation generation captured at run time so
 			// generation-verified deletes succeed.
 			name := args[len(args)-1]
+			platform := f.runPlatform
+			if platform == "" {
+				platform = appleHostPlatform()
+			}
+			platformParts := strings.Split(platform, "/")
+			platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+			variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+			if strings.Contains(platformParts[1], "arm") {
+				variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+			}
+			if len(platformParts) == 3 {
+				platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+			}
 			json = fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
-      "platform": {"os": "linux", "architecture": "amd64"},
+      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "variantDigest": %q},
+      "platform": %s,
       "publishedPorts": [],
       "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
     },
@@ -135,7 +153,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, name, name, sessionID(), f.creations[name])
+]`, name, name, variantDigest, platformJSON, sessionID(), f.creations[name])
 		}
 		return []byte(json), nil, nil
 	default:

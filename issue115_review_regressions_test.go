@@ -139,7 +139,7 @@ func issue115ReviewCallHasPlatform(call []string, platform string) bool {
 
 func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	input := "redis:7-alpine@" + issue115ReviewRoot
-	r := &issue115ReviewRunner{inspectJSON: issue115ReviewAppleImageJSON(nil)}
+	r := &issue115ReviewRunner{inspectJSON: issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant)}
 	identity, exists := (appleEngine{}).parseImageIdentity(issue115ReviewAppleImageJSON(nil), input, "")
 	if !exists || !identity.pinned || identity.mutableAlias {
 		t.Fatalf("parsed name@digest identity = %+v, exists = %v, want pinned identity", identity, exists)
@@ -159,7 +159,7 @@ func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 
 func TestIssue115AppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
 	input := "redis:7-alpine@" + issue115ReviewRoot
-	r := &issue115ReviewRunner{inspectJSON: issue115ReviewAppleImageJSON(nil)}
+	r := &issue115ReviewRunner{inspectJSON: issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant)}
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), WithAllowMutableImageTag(), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -179,7 +179,7 @@ func TestIssue115AppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testin
 	for _, allow := range []bool{false, true} {
 		t.Run(fmt.Sprintf("allow=%v", allow), func(t *testing.T) {
 			r := &issue115ReviewRunner{
-				inspectJSON: issue115ReviewAppleImageJSONForRoot(replacement, nil),
+				inspectJSON: issue115FreshAppleImageJSON(replacement, replacement),
 			}
 			opts := []Option{WithName("myctr"), withRunner(r), withEngine(appleEngine{})}
 			if allow {
@@ -199,8 +199,8 @@ func TestIssue115AppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testin
 func TestIssue115AppleTagReplacementBeforeRunFailsIdentityCheck(t *testing.T) {
 	const replacement = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
 	r := &issue115ReviewRunner{
-		inspectJSON:      issue115ReviewAppleImageJSON(nil),
-		replacementJSON:  issue115ReviewAppleImageJSONForRoot(replacement, nil),
+		inspectJSON:      issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant),
+		replacementJSON:  issue115FreshAppleImageJSON(replacement, replacement),
 		mutateAfterFirst: true,
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",

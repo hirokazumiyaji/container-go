@@ -46,7 +46,7 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 				"name":       r.containerImage,
 				"descriptor": map[string]string{"digest": r.imageDigest},
 			},
-			"variants": []any{},
+			"variants": []any{issue115FreshVariant(issue115FreshHostPlatform(), r.imageDigest)},
 		}}), nil, nil
 	case args[0] == "run":
 		r.created = true
@@ -84,9 +84,11 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 			"configuration": map[string]any{
 				"id": "myctr",
 				"image": map[string]any{
-					"reference":  r.containerImage,
-					"descriptor": map[string]string{"digest": r.containerDigest},
+					"reference":     r.containerImage,
+					"descriptor":    map[string]string{"digest": r.containerDigest},
+					"variantDigest": r.containerDigest,
 				},
+				"platform": issue115FreshPlatformMap(),
 				"labels": map[string]string{
 					managedLabel:  "true",
 					reuseLabel:    "true",

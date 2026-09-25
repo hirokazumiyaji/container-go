@@ -167,12 +167,22 @@ func reuseInspectJSON(id, state, image string) string {
 }
 
 func reuseInspectJSONWithDigest(id, state, image, digest string) string {
+	platformParts := strings.Split(issue115FreshHostPlatform(), "/")
+	platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if strings.Contains(platformParts[1], "arm") {
+		variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	}
+	if len(platformParts) == 3 {
+		platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": %q, "descriptor": {"digest": %q}},
+      "image": {"reference": %q, "descriptor": {"digest": %q}, "variantDigest": %q},
+      "platform": %s,
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
@@ -184,7 +194,7 @@ func reuseInspectJSONWithDigest(id, state, image, digest string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, digest, state)
+]`, id, id, image, digest, variantDigest, platformJSON, state)
 }
 
 type attachRunner struct {

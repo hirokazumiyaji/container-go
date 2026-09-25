@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -41,9 +42,46 @@ func (appleEngine) checkConfig(cfg *config) error {
 		return err
 	}
 	if cfg.platform != "" {
-		return validateApplePlatform(cfg.platform)
+		if err := validateApplePlatform(cfg.platform); err != nil {
+			return err
+		}
+		cfg.platform = canonicalizeApplePlatformSelector(cfg.platform)
 	}
 	return nil
+}
+
+// canonicalizeApplePlatformSelector makes the default variant explicit
+// where Apple requires a stable selector for image operations. In
+// particular, linux/armel is v6 rather than the generic ARM default.
+func canonicalizeApplePlatformSelector(platform string) string {
+	if platform == "linux/armel" {
+		return platform + "/v6"
+	}
+	return platform
+}
+
+// materializeAppleRunPlatform records the platform Apple will use for a
+// Run with no explicit selector. Pull alone intentionally remains
+// platform-agnostic, so it must not call this helper.
+func materializeAppleRunPlatform(cfg *config) {
+	if cfg == nil || cfg.eng == nil || cfg.eng.name() != "apple" || cfg.platform != "" {
+		return
+	}
+	cfg.platform = appleHostPlatform()
+}
+
+// appleHostPlatform is the Linux platform selected by Apple's default
+// linux/<host-architecture> run settings. The variant is left implicit for
+// arm64, matching Apple's CLI while the platform matcher treats it as v8.
+func appleHostPlatform() string {
+	architecture := runtime.GOARCH
+	switch architecture {
+	case "aarch64":
+		architecture = "arm64"
+	case "x86_64":
+		architecture = "amd64"
+	}
+	return "linux/" + architecture
 }
 
 // validateApplePlatform mirrors the platform grammar accepted by Apple
@@ -404,6 +442,22 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 	rootDigest, rootOK := appleRootDescriptorDigest(record)
 	variantDigest := ""
 	if platform != "" {
+		if len(record.Variants) == 0 && !rootOK {
+			if len(record.ID) == 64 && isHex(record.ID) {
+				// An old ID-only record proves that some local content
+				// exists, but it cannot prove that the host variant is
+				// addressable by a digest reference.
+				return imageIdentity{
+					notLocal:       true,
+					notLocalReason: "Apple image inspect has no platform variant metadata",
+					platform:       platform,
+				}, true
+			}
+			// Without a usable root descriptor or a local ID, the record
+			// is identity-unavailable rather than evidence that a requested
+			// platform is absent from the local store.
+			return imageIdentity{}, true
+		}
 		var variantOK bool
 		variantDigest, variantOK = applePlatformVariantDigest(record, platform)
 		if !variantOK {
@@ -610,20 +664,36 @@ func appleRunReferenceBase(requested, reported string) string {
 }
 
 func appleImageReferencesCompatible(requested, actual string) bool {
+	requestedDigest := imageDigest(requested)
+	actualDigest := imageDigest(actual)
+	if requestedDigest != "" && !validImageDigest(requestedDigest) {
+		return false
+	}
+	if actualDigest != "" && !validImageDigest(actualDigest) {
+		return false
+	}
 	if imagesCompatible(requested, actual) {
 		return true
 	}
 	// A custom default registry is reported canonically by Apple, while the
-	// caller may have supplied an unqualified name. Accept that backend
-	// spelling only when the repository path and tag agree. If both sides
-	// carry digests, their digest claims must also agree; a descriptor-backed
+	// caller may have supplied an unqualified name. When a digest is
+	// present, the tag is only a mutable alias spelling: content and
+	// repository provenance, not the tag, determine compatibility. If both
+	// sides carry digests, their claims must agree; a descriptor-backed
 	// identity is checked separately against the selected root/variant.
-	requestedDigest := imageDigest(requested)
-	actualDigest := imageDigest(actual)
 	if requestedDigest != "" && actualDigest != "" && !strings.EqualFold(requestedDigest, actualDigest) {
 		return false
 	}
+	if requestedDigest != "" || actualDigest != "" {
+		return imageRepositoryPathsCompatibleIgnoringTags(requested, actual)
+	}
 	return imageRepositoryPathsCompatible(requested, actual)
+}
+
+func imageRepositoryPathsCompatibleIgnoringTags(a, b string) bool {
+	abase := imageRepositoryBaseWithoutTag(imageReferenceBase(a))
+	bbase := imageRepositoryBaseWithoutTag(imageReferenceBase(b))
+	return imageRepositoryPathsCompatible(abase, bbase)
 }
 
 // appleImageIDMatchesDescriptor verifies the only safe interpretation of

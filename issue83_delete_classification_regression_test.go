@@ -16,6 +16,14 @@ func TestDeleteNotFoundIsBackendCommandAndTargetScoped(t *testing.T) {
 	if !isDeleteNotFound(appleEngine{}, "myctr", appleErr) {
 		t.Fatal("matching Apple delete was not idempotent")
 	}
+	upperErr := &cli.CLIError{
+		Binary: "container",
+		Args:   []string{"delete", "--force", "MyCtr"},
+		Stderr: "Container Not Found: MYCTR",
+	}
+	if !isNotFound(upperErr) || !isDeleteNotFound(appleEngine{}, "MyCtr", upperErr) {
+		t.Fatal("uppercase Apple name was not classified case-insensitively")
+	}
 	for _, tc := range []struct {
 		name string
 		eng  engine

@@ -229,7 +229,7 @@ func deleteIDNotFoundMatches(rest, want string) bool {
 
 func deleteTargetTokenMatches(rest, want string) bool {
 	rest = strings.TrimSpace(strings.Trim(strings.TrimSpace(rest), "\"'"))
-	return rest == want
+	return strings.EqualFold(rest, want)
 }
 
 // wrapNotFound converts a classified CLI not-found failure into

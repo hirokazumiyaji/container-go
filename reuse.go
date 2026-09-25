@@ -155,13 +155,8 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	for {
 		fresh, err = ctr.inspectFreshLocked(finalCtx)
 		if err != nil {
-			// A Docker handle with a resolved immutable ID that disappears
-			// from its final inspect is necessarily no longer the generation
-			// observed before readiness. Report that replacement explicitly;
-			// never fall back to inspecting the logical name.
-			if ctr.uid != "" && isNotFound(err) {
-				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
-			}
+			// inspectFreshLocked preserves the replacement and backend
+			// not-found causes for a reused handle.
 			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
 		}
 		if err := sameContainerIdentity(cfg.eng, info, fresh); err != nil {
@@ -379,7 +374,7 @@ func reusePostCreateWithImage(ctx context.Context, cfg *config, ctr *Container, 
 	// generations. Docker is already bound to its immutable UID.
 	target := ready.uid
 	if cfg.eng.name() == "apple" {
-		unlock, err := lockName(postCtx, cfg.name)
+		unlock, err := lockNameShared(postCtx, cfg.name)
 		if err != nil {
 			return fmt.Errorf("reuse %s: lock post-create generation: %w", cfg.name, err)
 		}
@@ -433,6 +428,9 @@ func verifyReusePostCreateInfo(cfg *config, ctr *Container, info *engineInfo) er
 		(cfg.reuse && info.labels[reuseLabel] != "true") ||
 		!validCreationID(cfg.creation) || info.labels[creationLabel] != cfg.creation {
 		return fmt.Errorf("reuse %s: %w: post-create generation could not be verified", cfg.name, ErrGenerationReplaced)
+	}
+	if err := verifyExactReuseGroup(info, cfg); err != nil {
+		return fmt.Errorf("reuse %s: %w: %v", cfg.name, ErrGenerationReplaced, err)
 	}
 	if requiresImmutableID(cfg.eng) && (!validImmutableID(cfg.eng, info.uid) || info.uid != ctr.uid) {
 		return fmt.Errorf("reuse %s: %w: post-create Docker ID changed", cfg.name, ErrGenerationReplaced)
@@ -740,6 +738,9 @@ func checkReuseLabels(info *engineInfo, cfg *config) error {
 	}
 	if !creationRE.MatchString(info.labels[creationLabel]) {
 		return fmt.Errorf("reuse %s: existing container has no valid creation generation: %w", cfg.name, ErrGenerationReplaced)
+	}
+	if err := verifyExactReuseGroup(info, cfg); err != nil {
+		return fmt.Errorf("reuse %s: %w", cfg.name, err)
 	}
 	return nil
 }

@@ -74,14 +74,18 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-shared-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
-func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
+func TestPruneRemovesOnlyManagedNonReuseStoppedContainers(t *testing.T) {
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
-	f.inspectJSON = reuseInspectJSONWithCreation("managed-stopped", "stopped", "redis:7-alpine", "0123456789abcdef")
+	f.inspectJSON = inspectJSONWithStateAndLabels("managed-stopped", "stopped", "redis:7-alpine", map[string]string{
+		managedLabel:  "true",
+		creationLabel: "0123456789abcdef",
+	})
 
 	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {

@@ -18,7 +18,8 @@ import (
 // run, then serves a reused-container inspect payload.
 type reuseCreateRunner struct {
 	*fakeRunner
-	created atomic.Bool
+	created    atomic.Bool
+	reuseGroup string
 }
 
 func newReuseCreateRunner() *reuseCreateRunner {
@@ -32,6 +33,7 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		created := r.created.Load()
+		group := r.reuseGroup
 		r.mu.Unlock()
 		if !created {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
@@ -40,7 +42,7 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		if creation == "" {
 			creation = "0123456789abcdef"
 		}
-		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
+		return []byte(reuseInspectJSONWithCreationAndGroup(args[len(args)-1], "running", "redis:7-alpine", creation, group)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -65,6 +67,7 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 
 func TestReuseAddsLabels(t *testing.T) {
 	f := newReuseCreateRunner()
+	f.reuseGroup = "integration"
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithReuseGroup("integration"),
 		withRunner(f), withEngine(appleEngine{}))
@@ -169,6 +172,15 @@ func reuseInspectJSON(id, state, image string) string {
 }
 
 func reuseInspectJSONWithCreation(id, state, image, creation string) string {
+	return reuseInspectJSONWithCreationAndGroup(id, state, image, creation, "")
+}
+
+func reuseInspectJSONWithCreationAndGroup(id, state, image, creation, group string) string {
+	groupLabel := ""
+	if group != "" {
+		groupLabel = fmt.Sprintf(`,
+        %q: %q`, reuseGroupLabel, group)
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -179,7 +191,7 @@ func reuseInspectJSONWithCreation(id, state, image, creation string) string {
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
         "com.github.hirokazumiyaji.container-go.reuse": "true",
-        "com.github.hirokazumiyaji.container-go.creation": %q
+        "com.github.hirokazumiyaji.container-go.creation": %q%s
       }
     },
     "status": {
@@ -187,7 +199,7 @@ func reuseInspectJSONWithCreation(id, state, image, creation string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, creation, state)
+]`, id, id, image, creation, groupLabel, state)
 }
 
 type attachRunner struct {

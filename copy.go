@@ -36,7 +36,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	if err := validateContainerPath(containerPath); err != nil {
 		return err
 	}
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		return err
 	}
@@ -75,7 +75,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 	dst := filepath.Join(dir, filepath.Base(containerPath))
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err

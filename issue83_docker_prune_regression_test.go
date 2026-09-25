@@ -76,10 +76,10 @@ func dockerPruneInspectJSON(entry dockerPruneEntry) []byte {
 
 func TestDockerPruneUsesFullIDsAndDeadStoppedState(t *testing.T) {
 	creation := "aaaaaaaaaaaaaaaa"
-	exited := dockerPruneEntry{uid: strings.Repeat("a", 64), state: "exited", managed: true, reuse: true, creation: creation}
-	dead := dockerPruneEntry{uid: strings.Repeat("b", 64), state: "dead", managed: true, reuse: true, creation: creation}
-	running := dockerPruneEntry{uid: strings.Repeat("c", 64), state: "running", managed: true, reuse: true, creation: creation}
-	created := dockerPruneEntry{uid: strings.Repeat("d", 64), state: "created", managed: true, reuse: true, creation: creation}
+	exited := dockerPruneEntry{uid: strings.Repeat("a", 64), state: "exited", managed: true, creation: creation}
+	dead := dockerPruneEntry{uid: strings.Repeat("b", 64), state: "dead", managed: true, creation: creation}
+	running := dockerPruneEntry{uid: strings.Repeat("c", 64), state: "running", managed: true, creation: creation}
+	created := dockerPruneEntry{uid: strings.Repeat("d", 64), state: "created", managed: true, creation: creation}
 	foreign := dockerPruneEntry{uid: strings.Repeat("e", 64), state: "exited", creation: creation}
 	runner := &dockerPruneFreshRunner{
 		entries: []dockerPruneEntry{exited, dead, running, created, foreign},
@@ -103,8 +103,8 @@ func TestDockerPruneUsesFullIDsAndDeadStoppedState(t *testing.T) {
 func TestDockerPruneSkipsFreshRunningReplacement(t *testing.T) {
 	creation := "aaaaaaaaaaaaaaaa"
 	uid := strings.Repeat("f", 64)
-	listed := dockerPruneEntry{uid: uid, state: "exited", managed: true, reuse: true, creation: creation}
-	fresh := dockerPruneEntry{uid: uid, state: "running", managed: true, reuse: true, creation: creation}
+	listed := dockerPruneEntry{uid: uid, state: "exited", managed: true, creation: creation}
+	fresh := dockerPruneEntry{uid: uid, state: "running", managed: true, creation: creation}
 	runner := &dockerPruneFreshRunner{
 		entries:   []dockerPruneEntry{listed},
 		responses: map[string][]dockerPruneEntry{uid: {listed, fresh}},

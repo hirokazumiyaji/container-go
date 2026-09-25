@@ -276,6 +276,34 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	return cause
 }
 
+// unexpectedReuseMarker identifies ownership labels that would make a
+// non-reuse generation eligible for shared lifecycle handling. Presence is
+// enough to fail closed: even a false or empty value is not produced by the
+// non-reuse create path and may indicate backend rewriting.
+func unexpectedReuseMarker(labels map[string]string) string {
+	if _, ok := labels[reuseLabel]; ok {
+		return "reuse marker"
+	}
+	if _, ok := labels[reuseGroupLabel]; ok {
+		return "reuse group marker"
+	}
+	return ""
+}
+
+func verifyExactReuseGroup(info *engineInfo, cfg *config) error {
+	actual, present := info.labels[reuseGroupLabel]
+	if cfg.reuseGroup == "" {
+		if present {
+			return fmt.Errorf("unexpected reuse group label %q", actual)
+		}
+		return nil
+	}
+	if !present || actual != cfg.reuseGroup {
+		return fmt.Errorf("reuse group label = %q, want %q", actual, cfg.reuseGroup)
+	}
+	return nil
+}
+
 // verifyCreatedOwnership checks the exact labels and backend identity of a
 // just-created container before it is registered with the external reaper.
 // It is intentionally separate from the normal lazy inspect path: test
@@ -307,11 +335,15 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
 		return fmt.Errorf("verify created container %s: creation generation does not match", c.id)
 	}
-	if cfg.reuse && info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("verify created container %s: reuse ownership label is missing", c.id)
+	if cfg.reuse {
+		if info.labels[reuseLabel] != "true" {
+			return fmt.Errorf("verify created container %s: reuse ownership label is missing", c.id)
+		}
+	} else if marker := unexpectedReuseMarker(info.labels); marker != "" {
+		return fmt.Errorf("verify created container %s: unexpected %s", c.id, marker)
 	}
-	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
-		return fmt.Errorf("verify created container %s: reuse group label does not match", c.id)
+	if err := verifyExactReuseGroup(info, cfg); err != nil {
+		return fmt.Errorf("verify created container %s: %w", c.id, err)
 	}
 	if requiresImmutableID(cfg.eng) {
 		if !validImmutableID(cfg.eng, c.uid) || info.uid != c.uid {
@@ -372,11 +404,15 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return nil
 	}
-	if cfg.reuse && info.labels[reuseLabel] != "true" {
-		return nil
+	if cfg.reuse {
+		if info.labels[reuseLabel] != "true" {
+			return nil
+		}
+	} else if marker := unexpectedReuseMarker(info.labels); marker != "" {
+		return fmt.Errorf("cleanup container %s: refusing automatic deletion with unexpected %s", cfg.name, marker)
 	}
-	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
-		return nil
+	if err := verifyExactReuseGroup(info, cfg); err != nil {
+		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
 	if !validCreationID(cfg.creation) {
 		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
@@ -598,6 +634,11 @@ func (c *Container) terminateByNameWithImage(ctx context.Context, expected *engi
 	if err != nil {
 		return false, fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 	}
+	if expected == nil && !c.reused {
+		if marker := unexpectedReuseMarker(fresh.labels); marker != "" {
+			return false, fmt.Errorf("terminate %s: refusing automatic deletion with unexpected %s", c.id, marker)
+		}
+	}
 	if expected != nil {
 		if err := sameContainerIdentity(c.eng, expected, fresh); err != nil {
 			return false, err
@@ -659,19 +700,16 @@ func (c *Container) ipFromInfo(info *engineInfo) (string, error) {
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
-	info, err := c.cachedInfo(ctx)
-	if err != nil {
-		return "", err
-	}
 	if len(c.published) > 0 {
-		if !hasPublishedBinding(info.bound, c.published[0]) {
-			return "", fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, c.published[0].raw)
-		}
 		addr := c.published[0].connectAddr()
 		if !c.eng.directIP() {
 			addr = dockerConnectHost(addr, c.eng)
 		}
 		return addr, nil
+	}
+	info, err := c.cachedInfo(ctx)
+	if err != nil {
+		return "", err
 	}
 	if c.eng.directIP() {
 		return c.ipFromInfo(info)

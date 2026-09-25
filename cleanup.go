@@ -40,8 +40,10 @@ func Cleanup(tb testing.TB, ctr *Container) {
 	})
 }
 
-// Prune removes stopped containers created by this library, from any
-// session. It returns the IDs it removed.
+// Prune removes stopped non-reuse containers created by this library,
+// from any session. Shared reuse generations are left untouched; use
+// PruneReuseGroup to remove an explicitly selected group. It returns the
+// IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
@@ -229,7 +231,7 @@ func dockerPruneCandidateEligible(candidate dockerPruneCandidate, reuseGroup str
 		return false
 	}
 	if reuseGroup == "" {
-		return candidate.state == StateStopped
+		return candidate.state == StateStopped && unexpectedReuseMarker(candidate.labels) == ""
 	}
 	return candidate.reuse &&
 		(candidate.state == StateRunning || candidate.state == StateStopped) &&
@@ -279,7 +281,7 @@ func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
 		return false
 	}
 	if reuseGroup == "" {
-		return candidate.state == StateStopped
+		return candidate.state == StateStopped && unexpectedReuseMarker(candidate.labels) == ""
 	}
 	// Group prune is deliberately narrower than the old label-only query:
 	// a group label alone does not prove that the object is a reusable

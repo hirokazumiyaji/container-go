@@ -38,6 +38,10 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -314,6 +318,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
+	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
+	defer cancel()
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
 	}

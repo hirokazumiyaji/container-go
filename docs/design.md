@@ -311,17 +311,21 @@ returned by inspect) and deletes by it, so no generation check is
 needed: a replacement never shares the ID. Apple Container addresses
 containers by name only, so there the delete is name-based: the
 generation must match a fresh inspect, and inspect plus delete run
-under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
-limited to cooperating processes using this library on the same host:
-a direct `container delete` plus re-create by an external tool inside
-that window is indistinguishable by name, and closing it would need an
-immutable ID or an atomic conditional delete that Apple Container does
-not provide. An inspect
-failure other than not-found aborts the delete (fail closed); `Run`'s
-rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Docker containers by
-`Id`; for Apple it stores the generation, reads the label as a
+under a per-name `flock` in a private, user-scoped cache directory
+(the filename is a SHA-256 digest of the name) that every such delete
+in this library takes. The path does not depend on `TMPDIR`; existing
+lock files are retained because the kernel releases `flock` when a holder
+exits, while unlinking a live file could create a second inode. The
+lock file is opened with `O_NOFOLLOW` and its owner and `0600`
+permissions are checked. That guarantee is limited to cooperating
+processes using this library on the same host: a direct `container
+delete` plus re-create by an external tool inside that window is
+indistinguishable by name, and closing it would need an immutable ID or
+an atomic conditional delete that Apple Container does not provide. An
+inspect failure other than not-found aborts the delete (fail closed);
+`Run`'s rollback reports a container left behind that way in its error
+rather than hiding it. The watchdog reaper registers Docker containers
+by `Id`; for Apple it stores the generation, reads the label as a
 line-anchored JSON field (`"key": "value"`, never a substring), and
 skips deletion on mismatch. Each backend call carries a 10-30s timeout
 via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung

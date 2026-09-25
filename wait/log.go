@@ -47,6 +47,7 @@ func (s *LogStrategy) AsRegexp() *LogStrategy {
 
 // WithOccurrence requires the pattern to appear n times. Occurrences
 // are counted across reconnects after replayed history is de-duplicated.
+// A final unterminated line at clean EOF is treated as a complete line.
 func (s *LogStrategy) WithOccurrence(n int) *LogStrategy {
 	s.occurrences = n
 	return s
@@ -84,6 +85,7 @@ func (s *LogStrategy) validate() error {
 
 type logScanResult struct {
 	found       bool
+	committed   bool
 	err         error
 	terminalErr error
 	count       int
@@ -125,9 +127,9 @@ func appendReplayLine(lines [][sha256.Size]byte, start *int, line [sha256.Size]b
 	return lines
 }
 
-// scanLogStream reads complete logical lines unless the requested number of
-// occurrences is found. A trailing unterminated line remains a partial and
-// is neither matched nor fingerprinted until a later connection completes it.
+// scanLogStream reads Scanner-like logical lines unless the requested number
+// of occurrences is found. Only a clean EOF commits replay, count, and
+// partial state; a non-EOF transport error rolls the scan back.
 func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
 	results := make(chan logScanResult, 1)
 	go func() {
@@ -139,9 +141,10 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 		lineCount := replay.previousLines
 		count := replay.count
 		replaying := true
-		result := func(found bool, scanErr, terminalErr error) logScanResult {
-			return logScanResult{
+		result := func(found, committed bool, scanErr, terminalErr error) logScanResult {
+			res := logScanResult{
 				found:       found,
+				committed:   committed,
 				err:         scanErr,
 				terminalErr: terminalErr,
 				count:       count,
@@ -150,20 +153,27 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 				lineCount:   lineCount,
 				partial:     partial,
 			}
+			if !committed && !found {
+				res.count = replay.count
+				res.lines = replay.previous
+				res.lineStart = replay.previousStart
+				res.lineCount = replay.previousLines
+				res.partial = replay.partial
+			}
+			return res
 		}
 		for {
 			line, complete, err := readLogLine(reader)
 			if complete {
-				observed := []byte(line)
-				hash := sha256.Sum256(observed)
+				hash := sha256.Sum256(line)
 				if replaying && !replay.matchesPrevious(observedLines, hash) {
 					replaying = false
 					lineCount = observedLines
 				}
 				if !replaying {
-					logical, reconcileErr := reconcileLogLine(partial, observed)
+					logical, reconcileErr := reconcileLogLine(partial, line)
 					if reconcileErr != nil {
-						results <- result(false, reconcileErr, nil)
+						results <- result(false, false, reconcileErr, nil)
 						return
 					}
 					partial = nil
@@ -173,34 +183,34 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 				}
 				lines = appendReplayLine(lines, &lineStart, hash)
 				observedLines++
-			} else if len(line) > 0 {
+			} else if line != nil {
 				var reconcileErr error
-				partial, reconcileErr = reconcileLogLine(partial, []byte(line))
+				partial, reconcileErr = reconcileLogLine(partial, line)
 				if reconcileErr != nil {
-					results <- result(false, reconcileErr, nil)
+					results <- result(false, false, reconcileErr, nil)
 					return
 				}
 			}
 			if err != nil {
 				if isPermanentCheckError(err) || isTerminalStreamError(err) {
-					results <- result(false, err, nil)
+					results <- result(false, false, err, nil)
 					return
 				}
 				if errors.Is(err, io.EOF) {
 					if count >= occurrences {
 						terminalErr := settleLogMatch(ctx, stream, reader)
-						results <- result(true, nil, terminalErr)
+						results <- result(true, true, nil, terminalErr)
 					} else {
-						results <- result(false, nil, nil)
+						results <- result(false, true, nil, nil)
 					}
 					return
 				}
-				results <- result(false, err, nil)
+				results <- result(false, false, err, nil)
 				return
 			}
 			if count >= occurrences {
 				terminalErr := settleLogMatch(ctx, stream, reader)
-				results <- result(true, nil, terminalErr)
+				results <- result(true, false, nil, terminalErr)
 				return
 			}
 		}
@@ -209,7 +219,31 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 	if result, ok := receiveLogScanResult(results, ctx.Done()); ok {
 		return result
 	}
-	return logScanResult{err: ctx.Err()}
+	terminalErr := settledTerminalError(stream)
+	return logScanResult{
+		err:         joinNonNil(ctx.Err(), terminalErr),
+		terminalErr: terminalErr,
+	}
+}
+
+func settledTerminalError(stream io.ReadCloser) error {
+	status, ok := stream.(interface {
+		Done() <-chan struct{}
+		TerminalError() error
+	})
+	if !ok {
+		return nil
+	}
+	done := status.Done()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return status.TerminalError()
+	default:
+		return nil
+	}
 }
 
 func receiveLogScanResult(results <-chan logScanResult, done <-chan struct{}) (logScanResult, bool) {
@@ -233,31 +267,44 @@ func receiveLogScanResult(results <-chan logScanResult, done <-chan struct{}) (l
 	return logScanResult{}, false
 }
 
-func readLogLine(reader *bufio.Reader) (string, bool, error) {
+// readLogLine returns bufio.ScanLines-compatible text: a line terminator is
+// removed, CRLF drops its carriage return, and data before a clean EOF is a
+// final token. A nil line with a non-EOF error is an incomplete transport
+// fragment and is not a logical line.
+func readLogLine(reader *bufio.Reader) ([]byte, bool, error) {
 	var line []byte
 	for {
 		fragment, err := reader.ReadSlice('\n')
 		if len(line)+len(fragment) > maxLogLineSize {
-			return "", false, errLogLineTooLong
+			return nil, false, errLogLineTooLong
 		}
 		line = append(line, fragment...)
 		if err == nil {
-			return string(line), true, nil
+			return dropLogLineTerminator(line), true, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue
 		}
-		return string(line), false, err
+		if errors.Is(err, io.EOF) {
+			if line == nil {
+				return nil, false, err
+			}
+			return dropLogLineTerminator(line), true, err
+		}
+		return line, false, err
 	}
 }
 
-// reconcileLogLine carries a partial prefix into the next connection. A
-// replayed line already starts with that prefix, so it replaces the carried
-// bytes rather than duplicating them.
+func dropLogLineTerminator(line []byte) []byte {
+	line = bytes.TrimSuffix(line, []byte{'\n'})
+	line = bytes.TrimSuffix(line, []byte{'\r'})
+	return line
+}
+
+// reconcileLogLine carries an incomplete transport prefix into a completed
+// logical line. A replayed line already starts with that prefix, so it
+// replaces the carried bytes rather than duplicating them.
 func reconcileLogLine(partial, observed []byte) ([]byte, error) {
-	if len(observed) == 0 {
-		return partial, nil
-	}
 	if len(partial) > 0 && bytes.HasPrefix(observed, partial) {
 		return observed, nil
 	}
@@ -349,12 +396,11 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 	startRead()
 
 	settleTerminal := func() error {
+		var drainErr error
 		if drainer, ok := stream.(interface{ Drain(context.Context) error }); ok {
-			if err := drainer.Drain(ctx); err != nil {
-				return err
-			}
+			drainErr = drainer.Drain(ctx)
 		}
-		return status.TerminalError()
+		return joinNonNil(status.TerminalError(), drainErr)
 	}
 
 	handleRead := func(read logSettleRead) (bool, error) {
@@ -418,6 +464,17 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 		case <-maxTimer.C:
 			maxExpired = true
 		case <-ctx.Done():
+			// Stream completion and caller cancellation can become ready in
+			// the same scheduling turn. Recheck settled evidence once so a
+			// terminal exit remains visible beside the context cause.
+			if read, hasRead, doneReady := nextReadyLogSettle(readResults, done); hasRead {
+				terminal, err := handleRead(read)
+				if terminal {
+					return joinNonNil(err, ctx.Err())
+				}
+			} else if doneReady {
+				return joinNonNil(settleTerminal(), ctx.Err())
+			}
 			return ctx.Err()
 		}
 	}
@@ -477,15 +534,20 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			if terminalStreamErr != nil {
 				return wrapWaitCause(what, terminalStreamErr, lastErr)
 			}
+			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, lastErr); err != nil {
+				return err
+			}
 			return nil
 		}
 
-		replay = logReplay{
-			previous:      result.lines,
-			previousStart: result.lineStart,
-			previousLines: result.lineCount,
-			count:         result.count,
-			partial:       result.partial,
+		if result.committed {
+			replay = logReplay{
+				previous:      result.lines,
+				previousStart: result.lineStart,
+				previousLines: result.lineCount,
+				count:         result.count,
+				partial:       result.partial,
+			}
 		}
 		if result.err != nil {
 			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, result.err)); terminalErr != nil {
@@ -503,7 +565,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		// A clean EOF (and a transient stream read error) may be
 		// reconnectable. The probe is bounded by the existing wait context;
 		// it never detaches from or extends the caller's budget.
-		probeCtx, probeCancel := boundedProbeContext(waitCtx, 5*time.Second)
+		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
 		if err := probeCtx.Err(); err != nil {
 			probeCancel()
 			return waitContextError(what, err, lastErr)

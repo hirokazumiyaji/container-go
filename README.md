@@ -148,6 +148,9 @@ after a clean EOF; a non-zero `logs --follow` CLI exit is terminal and
 is returned without reconnecting or accepting a matching line.
 `WithOccurrence(n)` requires a positive `n`, counts matches per line,
 and counts across reconnects after the replayed prefix is de-duplicated.
+Line terminators follow `bufio.ScanLines` semantics, and a final
+unterminated line at clean EOF counts as a complete line.
+Only clean EOF scans commit replay and occurrence state.
 This prefix contract assumes `FollowLogs` replays the append-only history
 on each reconnect; repeated identical lines at different positions remain
 separate events. Replay bookkeeping keeps the prefix length plus a bounded
@@ -166,8 +169,9 @@ undeclared ports and missing containers are reported as
 configuration errors fail fast. Transient probe causes remain in the
 returned error chain together with `context.Canceled` or
 `context.DeadlineExceeded`; EOF and final state probes never extend the
-caller or startup budget. A failed wait rolls the container back with a
-tail of its logs attached to the error.
+caller or startup budget. Each leaf strategy performs one final bounded
+lifecycle probe before reporting success. A failed wait rolls the container
+back with a tail of its logs attached to the error.
 
 ### Streaming logs
 

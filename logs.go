@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -73,17 +74,30 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
-	return &classifyingStream{
+	classified := &classifyingStream{
 		ReadCloser: stream,
 		ctx:        ctx,
 		container:  c,
+	}
+	status, ok := stream.(interface {
+		Done() <-chan struct{}
+		TerminalError() error
+	})
+	if !ok || status.Done() == nil {
+		return classified, nil
+	}
+	return &classifyingStatusStream{
+		classifyingStream: classified,
+		status:            status,
 	}, nil
 }
 
 type classifyingStream struct {
 	io.ReadCloser
-	ctx       context.Context
-	container *Container
+	ctx          context.Context
+	container    *Container
+	terminalOnce sync.Once
+	terminalErr  error
 }
 
 func (s *classifyingStream) Read(p []byte) (int, error) {
@@ -91,29 +105,39 @@ func (s *classifyingStream) Read(p []byte) (int, error) {
 	if err == nil || errors.Is(err, io.EOF) {
 		return n, err
 	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return n, s.classifyTerminal(err)
+	}
 	return n, wrapNotFound(s.container.classify(s.ctx, err))
 }
 
-// Done and TerminalError forward the optional process status exposed by
-// the stream implementation. They let wait.ForLog distinguish a live
-// follow stream from one that has already terminated with an error.
-func (s *classifyingStream) Done() <-chan struct{} {
-	if status, ok := s.ReadCloser.(interface{ Done() <-chan struct{} }); ok {
-		return status.Done()
-	}
-	return nil
+func (s *classifyingStream) classifyTerminal(err error) error {
+	s.terminalOnce.Do(func() {
+		s.terminalErr = s.wrap(err)
+	})
+	return s.terminalErr
 }
 
-func (s *classifyingStream) TerminalError() error {
-	if status, ok := s.ReadCloser.(interface{ TerminalError() error }); ok {
-		return s.wrap(status.TerminalError())
+type classifyingStatusStream struct {
+	*classifyingStream
+	status interface {
+		Done() <-chan struct{}
+		TerminalError() error
 	}
-	return nil
+}
+
+func (s *classifyingStatusStream) Done() <-chan struct{} {
+	return s.status.Done()
+}
+
+func (s *classifyingStatusStream) TerminalError() error {
+	return s.classifyTerminal(s.status.TerminalError())
 }
 
 // Drain forwards the optional process-stream drain operation so wait.ForLog
 // can finish stderr capture before classifying a terminal CLI error.
-func (s *classifyingStream) Drain(ctx context.Context) error {
+func (s *classifyingStatusStream) Drain(ctx context.Context) error {
 	if drainer, ok := s.ReadCloser.(interface{ Drain(context.Context) error }); ok {
 		return drainer.Drain(ctx)
 	}

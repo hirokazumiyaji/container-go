@@ -18,6 +18,7 @@ type issue90Target struct {
 	endpointCalls atomic.Int32
 	runningCalls  atomic.Int32
 	runningErrs   []error
+	runningStates []bool
 	followCalls   atomic.Int32
 	execCalls     atomic.Int32
 	execErr       error
@@ -33,6 +34,9 @@ func (t *issue90Target) Running(context.Context) (bool, error) {
 	call := int(t.runningCalls.Add(1)) - 1
 	if call < len(t.runningErrs) && t.runningErrs[call] != nil {
 		return false, t.runningErrs[call]
+	}
+	if call < len(t.runningStates) {
+		return t.runningStates[call], nil
 	}
 	return true, nil
 }
@@ -320,8 +324,8 @@ func TestForLogPollIntervalReconnects(t *testing.T) {
 	if got := target.followCalls.Load(); got != 2 {
 		t.Fatalf("FollowLogs calls = %d, want 2", got)
 	}
-	if got := target.runningCalls.Load(); got != 1 {
-		t.Fatalf("Running calls = %d, want 1 before reconnect", got)
+	if got := target.runningCalls.Load(); got != 2 {
+		t.Fatalf("Running calls = %d, want reconnect and final lifecycle checks", got)
 	}
 }
 
@@ -416,30 +420,107 @@ func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
 	}
 }
 
-func TestScanLogStreamDefersAndCarriesPartialLine(t *testing.T) {
-	match := func(line string) int { return strings.Count(line, "ready") }
-	first := scanLogStream(
+type issue90FragmentErrorReader struct {
+	fragment string
+	err      error
+	sent     bool
+}
+
+func (r *issue90FragmentErrorReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, r.err
+	}
+	r.sent = true
+	return copy(p, r.fragment), nil
+}
+
+func (*issue90FragmentErrorReader) Close() error { return nil }
+
+func TestScanLogStreamRollsBackTransientState(t *testing.T) {
+	baseline := scanLogStream(
 		context.Background(),
-		io.NopCloser(strings.NewReader("ready")),
-		match,
+		io.NopCloser(strings.NewReader("one\ntwo\n")),
+		func(string) int { return 0 },
 		1,
 		logReplay{},
 	)
-	if first.err != nil {
-		t.Fatalf("first scan: %v", first.err)
+	if baseline.err != nil {
+		t.Fatalf("baseline scan: %v", baseline.err)
 	}
-	if first.count != 0 || first.lineCount != 0 || len(first.lines) != 0 {
+	replay := logReplay{
+		previous:      baseline.lines,
+		previousStart: baseline.lineStart,
+		previousLines: baseline.lineCount,
+		count:         baseline.count,
+		partial:       baseline.partial,
+	}
+	transient := errors.New("transport interrupted")
+	result := scanLogStream(
+		context.Background(),
+		&issue90FragmentErrorReader{fragment: "ready", err: transient},
+		func(line string) int { return strings.Count(line, "ready") },
+		1,
+		replay,
+	)
+	if !errors.Is(result.err, transient) {
+		t.Fatalf("scan error = %v, want transient transport error", result.err)
+	}
+	if result.count != replay.count || result.lineCount != replay.previousLines || len(result.lines) != len(replay.previous) {
 		t.Fatalf(
-			"partial line was observed: count=%d lines=%d fingerprints=%d",
-			first.count,
-			first.lineCount,
-			len(first.lines),
+			"transient scan advanced committed state: count=%d lines=%d fingerprints=%d",
+			result.count,
+			result.lineCount,
+			len(result.lines),
 		)
 	}
-	if got := string(first.partial); got != "ready" {
-		t.Fatalf("partial = %q, want %q", got, "ready")
+	if string(result.partial) != string(replay.partial) {
+		t.Fatalf("transient partial = %q, want committed %q", result.partial, replay.partial)
 	}
+}
 
+func TestScanLogStreamUsesScannerLineSemantics(t *testing.T) {
+	tests := map[string]string{
+		"final unterminated": "ready",
+		"LF":                 "ready\n",
+		"CRLF":               "ready\r\n",
+	}
+	for name, input := range tests {
+		t.Run(name, func(t *testing.T) {
+			var matched string
+			result := scanLogStream(
+				context.Background(),
+				io.NopCloser(strings.NewReader(input)),
+				func(line string) int {
+					matched = line
+					return strings.Count(line, "ready")
+				},
+				1,
+				logReplay{},
+			)
+			if result.err != nil {
+				t.Fatalf("scan: %v", result.err)
+			}
+			if !result.found || result.count != 1 {
+				t.Fatalf("scan = found:%v count:%d, want final logical line", result.found, result.count)
+			}
+			if matched != "ready" {
+				t.Fatalf("matched line = %q, want Scanner text without terminator", matched)
+			}
+		})
+	}
+}
+
+func TestScanLogStreamTreatsFinalAndTerminatedReadyAsSameFingerprint(t *testing.T) {
+	first := scanLogStream(
+		context.Background(),
+		io.NopCloser(strings.NewReader("ready")),
+		func(line string) int { return strings.Count(line, "ready") },
+		1,
+		logReplay{},
+	)
+	if first.err != nil || first.count != 1 || first.lineCount != 1 {
+		t.Fatalf("first scan = err:%v count:%d lines:%d, want one final line", first.err, first.count, first.lineCount)
+	}
 	replay := logReplay{
 		previous:      first.lines,
 		previousStart: first.lineStart,
@@ -447,27 +528,22 @@ func TestScanLogStreamDefersAndCarriesPartialLine(t *testing.T) {
 		count:         first.count,
 		partial:       first.partial,
 	}
+	matches := 0
 	second := scanLogStream(
 		context.Background(),
-		io.NopCloser(strings.NewReader("ready\n")),
-		match,
-		1,
+		io.NopCloser(strings.NewReader("ready\nready\n")),
+		func(line string) int {
+			matches += strings.Count(line, "ready")
+			return strings.Count(line, "ready")
+		},
+		2,
 		replay,
 	)
-	if second.err != nil {
-		t.Fatalf("second scan: %v", second.err)
+	if second.err != nil || !second.found {
+		t.Fatalf("second scan = err:%v found:%v, want one new occurrence", second.err, second.found)
 	}
-	if !second.found || second.count != 1 || second.lineCount != 1 || len(second.lines) != 1 {
-		t.Fatalf(
-			"completed replayed line = found:%v count:%d lines:%d fingerprints:%d, want one logical line",
-			second.found,
-			second.count,
-			second.lineCount,
-			len(second.lines),
-		)
-	}
-	if len(second.partial) != 0 {
-		t.Fatalf("partial after completed line = %q, want empty", second.partial)
+	if matches != 1 {
+		t.Fatalf("new ready matches = %d, want replayed final line excluded", matches)
 	}
 }
 
@@ -549,23 +625,22 @@ func TestForLogDeduplicatesReplayedHistoryAcrossReconnect(t *testing.T) {
 	}
 }
 
-func TestForLogWaitsForPartialLineCompletionAcrossReconnect(t *testing.T) {
+func TestForLogDoesNotCommitTransientOccurrence(t *testing.T) {
+	transient := errors.New("transport interrupted")
 	target := &issue90Target{logs: []io.ReadCloser{
-		io.NopCloser(strings.NewReader("starting\nread")),
-		io.NopCloser(strings.NewReader("y\n")),
+		&issue90FragmentErrorReader{fragment: "ready", err: transient},
+		io.NopCloser(strings.NewReader("")),
 	}}
-	if err := ForLog("ready").
-		WithStartupTimeout(time.Second).
+	err := ForLog("ready").
+		WithStartupTimeout(30*time.Millisecond).
 		WithPollInterval(time.Millisecond).
-		WaitUntilReady(context.Background(), target); err != nil {
-		t.Fatalf("WaitUntilReady: %v", err)
-	}
-	if got := target.followCalls.Load(); got != 2 {
-		t.Fatalf("FollowLogs calls = %d, want 2 after partial line completion", got)
+		WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want timeout without committed transient occurrence", err)
 	}
 }
 
-func TestForLogReconcilesPartialReadyWithReplayedLine(t *testing.T) {
+func TestForLogDeduplicatesFinalReadyWithReplayedTerminatedLine(t *testing.T) {
 	target := &issue90Target{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader("ready")),
 		io.NopCloser(strings.NewReader("ready\n")),

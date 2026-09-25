@@ -255,7 +255,9 @@ EOF. A non-zero `logs --follow` CLI exit is terminal: it is returned
 without reconnecting and cannot be satisfied by a matching line.
 `WithOccurrence(n)` requires a positive count, matches per line, and
 counts across reconnects after de-duplicating the replayed log prefix.
-The prefix contract assumes `FollowLogs` replays append-only history;
+`bufio.ScanLines` framing excludes line terminators and accepts a final
+unterminated line at clean EOF. Only clean scans commit replay and count
+state. The prefix contract assumes `FollowLogs` replays append-only history;
 identical lines at different positions remain separate events. Replay state
 stores the prefix length and a fixed-size rolling tail of line fingerprints,
 so memory use is independent of total log volume.
@@ -269,8 +271,9 @@ and permanent target errors fail fast. Transient probe errors,
 `context.Canceled`, and `context.DeadlineExceeded` remain in the
 returned error chain. EOF and final state probes use the caller's
 existing budget and do not detach
-with `WithoutCancel`; if the container transitions to stopped while
-waiting, the wait also fails without burning the remaining timeout and
+with `WithoutCancel`. Every leaf strategy performs one final bounded
+lifecycle probe before success; if the container transitions to stopped
+while waiting, the wait also fails without burning the remaining timeout and
 the error carries a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:

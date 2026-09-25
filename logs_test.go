@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // streamRunner adds a canned Stream implementation to fakeRunner.
@@ -37,6 +38,50 @@ func (s *streamRunner) Stream(_ context.Context, args ...string) (io.ReadCloser,
 	s.streamArgs = args
 	return &recordingCloser{Reader: strings.NewReader(s.streamData), closed: &s.closed}, nil
 }
+
+type singleStreamRunner struct {
+	*fakeRunner
+	stream io.ReadCloser
+}
+
+func (r *singleStreamRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	return r.stream, nil
+}
+
+type stagedTerminalReader struct {
+	terminalErr error
+	stage       int
+}
+
+func (r *stagedTerminalReader) Read(p []byte) (int, error) {
+	if r.stage > 0 {
+		return 0, r.terminalErr
+	}
+	r.stage++
+	return copy(p, "ready\n"), nil
+}
+
+func (*stagedTerminalReader) Close() error { return nil }
+
+type terminalStatusReader struct {
+	io.Reader
+	done        chan struct{}
+	terminalErr error
+}
+
+func newTerminalStatusReader(terminalErr error) *terminalStatusReader {
+	done := make(chan struct{})
+	close(done)
+	return &terminalStatusReader{
+		Reader:      strings.NewReader(""),
+		done:        done,
+		terminalErr: terminalErr,
+	}
+}
+
+func (*terminalStatusReader) Close() error            { return nil }
+func (r *terminalStatusReader) Done() <-chan struct{} { return r.done }
+func (r *terminalStatusReader) TerminalError() error  { return r.terminalErr }
 
 func TestLogsReturnsSnapshot(t *testing.T) {
 	f := newTestRunner()
@@ -103,6 +148,67 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 
 	if _, err := ctr.FollowLogs(context.Background()); err == nil {
 		t.Fatal("want error when runner cannot stream")
+	}
+}
+
+func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 17,
+		Stderr:   "logs stream failed",
+	}
+	runner := &singleStreamRunner{
+		fakeRunner: newTestRunner(),
+		stream:     &stagedTerminalReader{terminalErr: terminal},
+	}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+
+	err := wait.ForLog("ready").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if err == nil {
+		t.Fatal("status-less stream terminal error was hidden by readiness")
+	}
+	var got *CLIError
+	if !errors.As(err, &got) || got != terminal {
+		t.Fatalf("error = %v, want read CLIError %v", err, terminal)
+	}
+}
+
+func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 1,
+		Stderr:   "Error response from daemon: No such container: myctr",
+	}
+	runner := &singleStreamRunner{
+		fakeRunner: &fakeRunner{systemUp: false},
+		stream:     newTerminalStatusReader(terminal),
+	}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	stream, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatalf("FollowLogs: %v", err)
+	}
+	defer stream.Close()
+
+	status, ok := stream.(interface{ TerminalError() error })
+	if !ok {
+		t.Fatalf("stream type %T does not expose terminal status", stream)
+	}
+	terminalErr := status.TerminalError()
+	if !errors.Is(terminalErr, ErrContainerNotFound) {
+		t.Fatalf("terminal error = %v, want ErrContainerNotFound", terminalErr)
+	}
+	if !errors.Is(terminalErr, cli.ErrSystemNotRunning) {
+		t.Fatalf("terminal error = %v, want failed classification probe", terminalErr)
+	}
+	var got *CLIError
+	if !errors.As(terminalErr, &got) || got != terminal {
+		t.Fatalf("terminal error = %v, want original CLIError %v", terminalErr, terminal)
 	}
 }
 

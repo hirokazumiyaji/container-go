@@ -4,6 +4,7 @@ package cli
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -11,7 +12,45 @@ import (
 	"time"
 )
 
-const terminateProcessTreeHelperEnv = "CONTAINER_GO_TERMINATE_PROCESS_TREE_HELPER"
+const (
+	terminateProcessTreeHelperEnv = "CONTAINER_GO_TERMINATE_PROCESS_TREE_HELPER"
+	processHelperTimeout          = 2 * time.Second
+)
+
+func waitProcessHelper(done <-chan struct{}) error {
+	timer := time.NewTimer(processHelperTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return nil
+	case <-timer.C:
+		return errors.New("process helper wait timed out")
+	}
+}
+
+func stopProcessHelper(cmd *exec.Cmd, waitDone <-chan struct{}) error {
+	select {
+	case <-waitDone:
+		return nil
+	default:
+	}
+
+	killResult := make(chan error, 1)
+	go func() { killResult <- cmd.Process.Kill() }()
+	var cleanupErr error
+	select {
+	case err := <-killResult:
+		if err != nil && !errors.Is(err, os.ErrProcessDone) {
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("kill helper: %w", err))
+		}
+	case <-time.After(processHelperTimeout):
+		cleanupErr = errors.Join(cleanupErr, errors.New("kill helper timed out"))
+	}
+	if err := waitProcessHelper(waitDone); err != nil {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
+}
 
 func TestTerminateProcessTreeUsesRetainedProcessHandle(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "-test.run=^TestTerminateProcessTreeHelper$")
@@ -23,12 +62,16 @@ func TestTerminateProcessTreeUsesRetainedProcessHandle(t *testing.T) {
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
-	waitDone := make(chan error, 1)
-	go func() { waitDone <- cmd.Wait() }()
-	stop := func() {
-		_ = cmd.Process.Kill()
-		<-waitDone
-	}
+	waitDone := make(chan struct{})
+	go func() {
+		_ = cmd.Wait()
+		close(waitDone)
+	}()
+	t.Cleanup(func() {
+		if err := stopProcessHelper(cmd, waitDone); err != nil {
+			t.Errorf("helper cleanup: %v", err)
+		}
+	})
 
 	ready := make([]byte, 1)
 	readyResult := make(chan error, 1)
@@ -39,23 +82,24 @@ func TestTerminateProcessTreeUsesRetainedProcessHandle(t *testing.T) {
 	select {
 	case err := <-readyResult:
 		if err != nil {
-			stop()
-			t.Fatalf("wait for helper readiness: %v", err)
+			t.Fatalf("wait for helper readiness: %v (cleanup: %v)", err, stopProcessHelper(cmd, waitDone))
 		}
-	case <-time.After(5 * time.Second):
-		stop()
-		<-readyResult
-		t.Fatal("helper did not become ready")
+	case <-time.After(processHelperTimeout):
+		cleanupErr := stopProcessHelper(cmd, waitDone)
+		_ = stdout.Close()
+		var readyErr error
+		select {
+		case readyErr = <-readyResult:
+		case <-time.After(processHelperTimeout):
+			readyErr = errors.New("readiness wait timed out")
+		}
+		t.Fatalf("helper did not become ready (cleanup: %v, readiness: %v)", cleanupErr, readyErr)
 	}
 	if err := terminateProcessTree(cmd); err != nil {
-		stop()
-		t.Fatalf("terminateProcessTree on live process = %v", err)
+		t.Fatalf("terminateProcessTree on live process = %v (cleanup: %v)", err, stopProcessHelper(cmd, waitDone))
 	}
-	select {
-	case <-waitDone:
-	case <-time.After(5 * time.Second):
-		stop()
-		t.Fatal("live process was not terminated")
+	if err := waitProcessHelper(waitDone); err != nil {
+		t.Fatalf("%v (cleanup: %v)", err, stopProcessHelper(cmd, waitDone))
 	}
 }
 

@@ -1,6 +1,7 @@
 package wait
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"io"
@@ -110,6 +111,52 @@ func (s *review90CloseTerminalLogStream) TerminalError() error {
 	return s.terminalErr
 }
 
+type review90DrainTerminalLogStream struct {
+	*strings.Reader
+	done        chan struct{}
+	cancel      context.CancelFunc
+	terminalErr error
+}
+
+func TestSettleLogMatchRetainsTerminalErrorWhenDrainIsCancelled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 17,
+		Stderr:   "logs stream failed",
+	}
+	done := make(chan struct{})
+	close(done)
+	stream := &review90DrainTerminalLogStream{
+		Reader:      strings.NewReader(""),
+		done:        done,
+		cancel:      cancel,
+		terminalErr: terminal,
+	}
+	err := settleLogMatch(ctx, stream, bufio.NewReader(strings.NewReader("")))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("settle error = %v, want context.Canceled", err)
+	}
+	var got *cli.CLIError
+	if !errors.As(err, &got) || got != terminal {
+		t.Fatalf("settle error = %v, want terminal CLIError %v", err, terminal)
+	}
+}
+
+func (*review90DrainTerminalLogStream) Close() error { return nil }
+func (s *review90DrainTerminalLogStream) Done() <-chan struct{} {
+	return s.done
+}
+func (s *review90DrainTerminalLogStream) Drain(context.Context) error {
+	s.cancel()
+	return context.Canceled
+}
+func (s *review90DrainTerminalLogStream) TerminalError() error {
+	return s.terminalErr
+}
+
 func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T) {
 	tests := map[string]struct {
 		newContext func() (context.Context, func())
@@ -153,6 +200,116 @@ func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T)
 				t.Fatalf("CLIError = %p, want original terminal error %p", got, terminal)
 			}
 		})
+	}
+}
+
+type review90BlockingStatusStream struct {
+	reader        *io.PipeReader
+	done          chan struct{}
+	terminalErr   error
+	terminalCalls atomic.Int32
+}
+
+func newReview90BlockingStatusStream(terminalErr error) *review90BlockingStatusStream {
+	done := make(chan struct{})
+	close(done)
+	return &review90BlockingStatusStream{
+		reader:      newBlockingPipeReader(),
+		done:        done,
+		terminalErr: terminalErr,
+	}
+}
+
+func newBlockingPipeReader() *io.PipeReader {
+	reader, _ := io.Pipe()
+	return reader
+}
+
+func (s *review90BlockingStatusStream) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+func (s *review90BlockingStatusStream) Close() error { return s.reader.Close() }
+func (s *review90BlockingStatusStream) Done() <-chan struct{} {
+	return s.done
+}
+func (s *review90BlockingStatusStream) TerminalError() error {
+	s.terminalCalls.Add(1)
+	return s.terminalErr
+}
+
+func TestScanLogStreamJoinsContextWithSettledTerminalExit(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 17,
+		Stderr:   "logs stream failed",
+	}
+	stream := newReview90BlockingStatusStream(terminal)
+	t.Cleanup(func() { _ = stream.Close() })
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	result := scanLogStream(ctx, stream, func(string) int { return 0 }, 1, logReplay{})
+	if !errors.Is(result.err, context.Canceled) {
+		t.Fatalf("scan error = %v, want context.Canceled", result.err)
+	}
+	var got *cli.CLIError
+	if !errors.As(result.err, &got) || got != terminal {
+		t.Fatalf("scan error = %v, want settled terminal %v", result.err, terminal)
+	}
+	if calls := stream.terminalCalls.Load(); calls != 1 {
+		t.Fatalf("TerminalError calls = %d, want one cached terminal result", calls)
+	}
+}
+
+func TestPollRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
+	target := &issue90Target{runningStates: []bool{false}}
+	err := poll(
+		context.Background(),
+		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error { return nil },
+		true,
+	)
+	if err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("error = %v, want final stopped lifecycle error", err)
+	}
+	if got := target.runningCalls.Load(); got != 1 {
+		t.Fatalf("Running calls = %d, want one final lifecycle check", got)
+	}
+}
+
+func TestForLogRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
+	target := &issue90Target{
+		runningStates: []bool{false},
+		logs:          []io.ReadCloser{io.NopCloser(strings.NewReader("ready\n"))},
+	}
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("error = %v, want final stopped lifecycle error", err)
+	}
+	if got := target.runningCalls.Load(); got != 1 {
+		t.Fatalf("Running calls = %d, want one final lifecycle check", got)
+	}
+}
+
+func TestFinalLifecycleProbeHonorsWaitBudget(t *testing.T) {
+	target := &slowRunningTarget{fakeTarget: newFakeTarget(), block: time.Hour}
+	started := time.Now()
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 20 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error { return nil },
+		true,
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want bounded final probe deadline", err)
+	}
+	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
+		t.Fatalf("final lifecycle probe took %v, want wait budget bound", elapsed)
 	}
 }
 

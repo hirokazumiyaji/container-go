@@ -18,7 +18,8 @@ const (
 	// spawns a CLI process during polling. A final probe is also attempted
 	// while the remaining wait budget is at most this long; it never
 	// creates a new budget after the caller or startup deadline.
-	stateCheckInterval = time.Second
+	stateCheckInterval    = time.Second
+	lifecycleProbeTimeout = 5 * time.Second
 )
 
 // Target is the container surface strategies probe. *container.Container
@@ -140,6 +141,38 @@ func waitContextTerminationError(callerCtx, waitCtx context.Context, what string
 	return nil
 }
 
+func finalLifecycleError(
+	callerCtx, waitCtx context.Context,
+	target Target,
+	what string,
+	timeout time.Duration,
+	lastErr error,
+) error {
+	probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+	if err := probeCtx.Err(); err != nil {
+		probeCancel()
+		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, err))
+	}
+	running, probeErr := target.Running(probeCtx)
+	probeCancel()
+	if terminalErr := waitContextTerminationError(
+		callerCtx,
+		waitCtx,
+		what,
+		timeout,
+		joinNonNil(lastErr, probeErr),
+	); terminalErr != nil {
+		return terminalErr
+	}
+	if probeErr != nil {
+		return wrapWaitCause(what, probeErr, lastErr)
+	}
+	if !running {
+		return waitStoppedError(what, lastErr)
+	}
+	return nil
+}
+
 func joinNonNil(errs ...error) error {
 	filtered := make([]error, 0, len(errs))
 	for _, err := range errs {
@@ -208,7 +241,11 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
 			}
-			return nil
+			causes := joinNonNil(lastErr, lastProbeErr)
+			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, causes); err != nil {
+				return err
+			}
+			return terminationErr()
 		}
 
 		if err := terminationErr(); err != nil {

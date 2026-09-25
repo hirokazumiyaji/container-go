@@ -150,6 +150,49 @@ func TestStreamRetainsTerminalStderrTail(t *testing.T) {
 	}
 }
 
+const terminalErrorExitHelperEnv = "CONTAINER_GO_TERMINAL_ERROR_EXIT_HELPER"
+
+func terminalErrorExitError(t *testing.T) *exec.ExitError {
+	t.Helper()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestTerminalErrorExitHelper$")
+	cmd.Env = append(os.Environ(), terminalErrorExitHelperEnv+"=1")
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("helper exit error = %v, want *exec.ExitError", err)
+	}
+	return exitErr
+}
+
+func TestTerminalErrorExitHelper(t *testing.T) {
+	if os.Getenv(terminalErrorExitHelperEnv) == "1" {
+		os.Exit(17)
+	}
+}
+
+func TestTerminalErrorResultJoinsContextAndExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:    ctx,
+		binary: "docker",
+		args:   []string{"logs", "--follow", "x"},
+		stderr: &tailBuffer{},
+	}
+	ps.drainCompleted.Store(true)
+	ps.stateMu.Lock()
+	ps.cancelled = true
+	ps.stateMu.Unlock()
+	err := ps.terminalError(terminalErrorExitError(t))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("TerminalError = %v, want context.Canceled", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("TerminalError = %v, want settled exit CLIError", err)
+	}
+}
+
 func TestTerminalErrorDrainsStderrWhenPublicReaderIsBlocked(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `printf 'ready\n'; head -c 70000 /dev/zero >&2; printf 'TERMINAL_STDERR_MARKER\n' >&2; exit 17`)}
 
@@ -340,7 +383,7 @@ func TestStreamDelayedCloseAndCancelDoNotSignalAfterReap(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	signaled := make(chan struct{}, 1)
-	r := &ExecRunner{Binary: writeStub(t, `exit 0`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'terminal failure\n' >&2; exit 17`)}
 	hooks := streamHooks{
 		terminate: func(*exec.Cmd) error {
 			signaled <- struct{}{}
@@ -357,12 +400,20 @@ func TestStreamDelayedCloseAndCancelDoNotSignalAfterReap(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("child was not reaped")
 	}
+	terminal := ps.TerminalError()
+	var cliErr *CLIError
+	if !errors.As(terminal, &cliErr) || cliErr.ExitCode != 17 {
+		t.Fatalf("TerminalError = %v, want settled exit 17", terminal)
+	}
 
 	// Simulate a context callback and a caller Close arriving after the
 	// direct child has been waited. Neither may signal the old PID/PGID.
 	cancel()
 	if err := ps.requestTermination(true); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("late cancellation error = %v, want os.ErrProcessDone", err)
+	}
+	if got := ps.TerminalError(); got != terminal {
+		t.Fatalf("TerminalError after cancellation = %v, want cached %v", got, terminal)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close: %v", err)

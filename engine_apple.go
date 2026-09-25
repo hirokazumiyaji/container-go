@@ -289,11 +289,20 @@ func appleContainerMissingLine(line, target, command string) bool {
 	case "exec":
 		return appleExecMissingLine(line, target)
 	case "stop":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
 		return appleStateMissingLine(line, target, "failed to stop container:")
 	case "delete", "rm":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
 		return appleStateMissingLine(line, target, "failed to delete container:")
 	case "logs":
-		return appleLogsMissingLine(line, target)
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
+		return appleLogsMissingLine(line, target) || appleExecMissingLine(line, target)
 	default:
 		return false
 	}
@@ -315,52 +324,112 @@ func appleTypedContainerIDNotFoundLine(line, target string) bool {
 	return ok && appleIDMessageMatches(message, target)
 }
 
+// appleTypedNotFoundMessage unwraps only the typed wrapper grammar. The
+// cause value is treated as a quoted string at each level, then escapes are
+// decoded before the next wrapper is examined. This handles both escaped
+// forms emitted by the CLI and the older unescaped nested spelling without
+// searching arbitrary stderr for the words "not found".
 func appleTypedNotFoundMessage(line string) (string, bool) {
 	current := strings.ToLower(strings.TrimSpace(line))
-	for range 6 {
+	if strings.HasPrefix(current, "error:") {
+		current = strings.TrimSpace(strings.TrimPrefix(current, "error:"))
+	}
+	for range 16 {
 		current = strings.TrimSpace(current)
-		current = strings.Trim(current, "()")
-		current = strings.TrimSpace(current)
-		if strings.HasPrefix(current, "notfound:") {
-			message := strings.TrimSpace(strings.TrimPrefix(current, "notfound:"))
-			message = strings.TrimSpace(strings.Trim(message, `"'`))
-			message = strings.ReplaceAll(message, `\"`, `"`)
+		current = strings.TrimSpace(strings.Trim(current, "()"))
+		switch {
+		case strings.HasPrefix(current, "notfound:"):
+			message := decodeAppleQuotedValue(strings.TrimSpace(strings.TrimPrefix(current, "notfound:")))
 			return message, message != ""
-		}
-		if strings.HasPrefix(current, "internalerror:") || strings.HasPrefix(current, "cause:") {
+		case strings.HasPrefix(current, "internalerror:"), strings.HasPrefix(current, "cause:"):
 			index := strings.Index(current, "cause:")
 			if index < 0 {
 				return "", false
 			}
-			current = strings.TrimSpace(current[index+len("cause:"):])
-			if len(current) >= 2 && current[0] == '"' && current[len(current)-1] == '"' {
-				current = current[1 : len(current)-1]
+			current = decodeAppleQuotedValue(strings.TrimSpace(current[index+len("cause:"):]))
+			if current == "" {
+				return "", false
 			}
-			current = strings.ReplaceAll(current, `\"`, `"`)
-			continue
+		default:
+			return "", false
 		}
-		return "", false
 	}
 	return "", false
 }
 
-func appleContainerNotFoundMessage(message, target, command string) bool {
-	message = strings.TrimSpace(strings.Trim(message, `"'`))
-	if rest, ok := strings.CutPrefix(message, "container not found:"); ok {
-		return cliTargetListMatches(rest, target)
-	}
-	if rest, ok := strings.CutPrefix(message, "get failed:"); ok {
-		return command == "exec" && appleExecMissingLine("get failed:"+rest, target)
-	}
-	if appleIDMessageMatches(message, target) {
-		switch command {
-		case "inspect", "exec", "stop", "delete", "rm", "logs":
-			return true
-		default:
-			return false
+// decodeAppleQuotedValue removes one outer quoted value and decodes the
+// escaping used when Swift's diagnostic description is rendered. The
+// fallback is intentionally permissive for the CLI's older unescaped nested
+// form, but it still requires the value to be bounded by a quote.
+func decodeAppleQuotedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') {
+		quote := value[0]
+		value = value[1:]
+		if value[len(value)-1] == quote {
+			value = value[:len(value)-1]
 		}
 	}
-	return false
+	var b strings.Builder
+	b.Grow(len(value))
+	escaped := false
+	for _, r := range value {
+		if !escaped {
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			b.WriteRune(r)
+			continue
+		}
+		switch r {
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case '"', '\\':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		}
+		escaped = false
+	}
+	if escaped {
+		b.WriteByte('\\')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func appleContainerNotFoundMessage(message, target, command string) bool {
+	message = strings.TrimSpace(strings.Trim(message, `"'`))
+	generic, hasGeneric := strings.CutPrefix(message, "container not found:")
+	switch command {
+	case "inspect":
+		// Inspect emits the generic list/inspect spelling. A lifecycle
+		// ID error or an exec-specific get failure is not an inspect
+		// absence result.
+		return hasGeneric && cliTargetListMatches(generic, target)
+	case "exec":
+		// Exec reports its failure after the get operation. Do not
+		// classify an application/container-not-found line as a backend
+		// result merely because it contains the target.
+		return appleExecMissingLine(message, target)
+	case "stop", "delete", "rm":
+		if hasGeneric && cliTargetListMatches(generic, target) {
+			return true
+		}
+		return appleIDMessageMatches(message, target)
+	case "logs":
+		if hasGeneric && cliTargetListMatches(generic, target) {
+			return true
+		}
+		return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
+	default:
+		return false
+	}
 }
 
 func appleIDMessageMatches(message, target string) bool {

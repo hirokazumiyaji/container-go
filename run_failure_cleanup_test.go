@@ -22,6 +22,7 @@ type failRunRunner struct {
 	inspectErr  error
 	deleteErr   error
 	deleted     []string
+	creation    string
 }
 
 func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -29,6 +30,13 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = value
+				}
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
@@ -38,7 +46,7 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 		if r.inspectErr != nil {
 			return nil, nil, r.inspectErr
 		}
-		return []byte(r.inspectJSON), nil, nil
+		return []byte(strings.ReplaceAll(r.inspectJSON, "__CONTAINER_CREATION__", r.creation)), nil, nil
 	case "delete", "rm":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
@@ -63,7 +71,28 @@ func ownedInspectJSON(name string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
+      }
+    },
+    "status": {"state": "created", "networks": []}
+  }
+]`, name, name, sessionID())
+}
+
+func ownedReuseInspectJSON(name string) string {
+	return fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
       }
     },
     "status": {"state": "created", "networks": []}
@@ -96,7 +125,8 @@ func ownedDockerInspectJSON(name, id string) string {
       "Image": "redis:7-alpine",
       "Labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINER_CREATION__"
       }
     }
   }
@@ -352,6 +382,8 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cfg.runner = r
 	cfg.eng = appleEngine{}
 	cfg.name = "myctr"
+	cfg.creation = "0123456789abcdef"
+	r.creation = cfg.creation
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
 		t.Fatalf("cleanupFailedCreate: %v", err)
@@ -369,7 +401,7 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	inner := &failRunRunner{
 		fakeRunner:  base,
 		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
-		inspectJSON: ownedInspectJSON("myctr"),
+		inspectJSON: ownedReuseInspectJSON("myctr"),
 	}
 	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
 	_, err := Run(context.Background(), "redis:7-alpine",

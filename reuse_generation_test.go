@@ -86,6 +86,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state:  StateStopped,
 		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		uid:    strings.Repeat("0f", 32),
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}

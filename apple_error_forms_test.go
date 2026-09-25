@@ -77,10 +77,14 @@ func typedAppleMissing(operation string) *cli.CLIError {
 	if operation == "exec" {
 		args = append(args, "true")
 	}
+	message := `container not found: myctr`
+	if operation == "exec" {
+		message = `get failed: container myctr not found`
+	}
 	return &cli.CLIError{
 		Binary: "container",
 		Args:   args,
-		Stderr: `Error: internalError: "operation failed" (cause: "notFound: \"container not found: myctr\"")`,
+		Stderr: `Error: internalError: "operation failed" (cause: "notFound: \"` + message + `\"")`,
 	}
 }
 

@@ -189,7 +189,7 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
+	if !strings.Contains(reaperScript, `sleep "$seconds"`) || !strings.Contains(reaperScript, "kill -9") {
 		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
 	}
 	// The creation label must be read as a structural JSON field, anchored
@@ -197,7 +197,7 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
 		t.Error("reaper script must anchor the creation label match on the quoted key")
 	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
+	if !strings.Contains(reaperScript, `[ "$got" = "$entry_creation" ] || return 0`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
 	if strings.Contains(reaperScript, "mktemp") {
@@ -328,5 +328,115 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	waitForLogLines(t, logPath, "rm --force --volumes "+uid)
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force --volumes ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
+	}
+}
+
+func TestReaperPendingRegistrationRetriesSettlingCreate(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	countPath := filepath.Join(dir, "inspect-count")
+	binPath := filepath.Join(dir, "container")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  count=0\n" +
+		"  [ -f " + countPath + " ] && count=$(cat " + countPath + ")\n" +
+		"  count=$((count + 1))\n" +
+		"  echo \"$count\" > " + countPath + "\n" +
+		"  [ \"$count\" -ge 2 ] || exit 1\n" +
+		"  echo '  \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	r.pendingAttempts = 4
+	if err := r.registerPending("settling", creation); err != nil {
+		t.Fatalf("registerPending: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force settling")
+}
+
+func TestReaperRestartsAndReplaysAfterUnexpectedChildExit(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\"'; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("replayed", creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.mu.Lock()
+	old := r.cmd
+	r.mu.Unlock()
+	if old == nil || old.Process == nil {
+		t.Fatal("reaper did not start a child")
+	}
+	if err := old.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		current := r.cmd
+		r.mu.Unlock()
+		if current != nil && current != old {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect replayed", "delete --force replayed")
+}
+
+func TestReaperCompletionRetainsActiveEntry(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	creation := "0123456789abcdef"
+	if err := r.registerPending("completed", creation); err != nil {
+		t.Fatalf("registerPending: %v", err)
+	}
+	if err := r.completePending("completed", creation); err != nil {
+		t.Fatalf("completePending: %v", err)
+	}
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].pending || entries[0].shared {
+		t.Fatalf("entries = %+v, want one active entry", entries)
+	}
+	r.closeStdin()
+}
+
+func TestReaperSharedEntryIsNotDeletedOnEOF(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\"'; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.registerPending("shared", creation); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.markShared("shared", creation); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	time.Sleep(250 * time.Millisecond)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force shared") {
+		t.Fatalf("shared entry was deleted: %q", data)
 	}
 }

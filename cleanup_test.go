@@ -10,6 +10,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+const (
+	cleanupDockerIDOne = "1111111111111111111111111111111111111111111111111111111111111111"
+	cleanupDockerIDTwo = "2222222222222222222222222222222222222222222222222222222222222222"
+)
+
 func TestTerminateContainerIsNilSafe(t *testing.T) {
 	if err := TerminateContainer(nil); err != nil {
 		t.Fatalf("TerminateContainer(nil) = %v, want nil", err)
@@ -73,12 +78,16 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
+	if args[0] == "inspect" && l.lsJSON != "" {
+		l.calls = append(l.calls, args)
+		return []byte(l.lsJSON), nil, nil
+	}
 	return l.fakeRunner.Run(ctx, args...)
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
@@ -145,12 +154,12 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &dockerListRunner{fakeRunner: newTestRunner(), output: "managed-one\nmanaged-two\n"}
+			r := &dockerListRunner{fakeRunner: newTestRunner(), output: cleanupDockerIDOne + "\n" + cleanupDockerIDTwo + "\n"}
 			removed, err := tc.run(context.Background(), r)
 			if err != nil {
 				t.Fatalf("prune: %v", err)
 			}
-			if !slices.Equal(removed, []string{"managed-one", "managed-two"}) {
+			if !slices.Equal(removed, []string{cleanupDockerIDOne, cleanupDockerIDTwo}) {
 				t.Fatalf("removed = %v", removed)
 			}
 
@@ -176,10 +185,10 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 func TestDockerPruneReportsVolumeDeleteFailure(t *testing.T) {
 	r := &dockerListRunner{
 		fakeRunner: newTestRunner(),
-		output:     "managed-one\n",
+		output:     cleanupDockerIDOne + "\n",
 		deleteErr: &cli.CLIError{
 			Binary: "docker",
-			Args:   []string{"rm", "--force", "--volumes", "managed-one"},
+			Args:   []string{"rm", "--force", "--volumes", cleanupDockerIDOne},
 			Stderr: "error removing volume: volume driver plugin not found",
 		},
 	}
@@ -190,13 +199,13 @@ func TestDockerPruneReportsVolumeDeleteFailure(t *testing.T) {
 	if len(removed) != 0 {
 		t.Fatalf("removed = %v, want no falsely successful deletions", removed)
 	}
-	if !strings.Contains(err.Error(), "prune managed-one") {
+	if !strings.Contains(err.Error(), "prune "+cleanupDockerIDOne) {
 		t.Fatalf("error = %v, want prune target context", err)
 	}
 }
 
 func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
-	id := "managed-one"
+	id := cleanupDockerIDOne
 	r := &dockerListRunner{
 		fakeRunner: newTestRunner(),
 		output:     id + "\n",

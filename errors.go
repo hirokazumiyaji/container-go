@@ -98,27 +98,61 @@ func cliCommandTarget(command string, args []string) string {
 				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(arg, "--name=")), `"'`)
 			}
 		}
-	case "rm", "delete", "stop":
+	case "rm", "delete":
 		for i := len(args) - 1; i >= 0; i-- {
 			if strings.HasPrefix(args[i], "-") {
 				continue
 			}
 			return strings.Trim(strings.TrimSpace(args[i]), `"'`)
 		}
+	case "stop":
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			if !strings.HasPrefix(arg, "-") {
+				return strings.Trim(strings.TrimSpace(arg), `"'`)
+			}
+			option := arg
+			if equal := strings.IndexByte(option, '='); equal >= 0 {
+				option = option[:equal]
+			}
+			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
+				i++
+			}
+		}
 	case "inspect", "exec", "logs":
 		for i := 0; i < len(args); i++ {
 			arg := args[i]
-			if strings.HasPrefix(arg, "-") {
-				switch arg {
-				case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--platform", "--format", "--size", "--type", "--filter":
-					i++
-				}
-				continue
+			if !strings.HasPrefix(arg, "-") {
+				return strings.Trim(strings.TrimSpace(arg), `"'`)
 			}
-			return strings.Trim(strings.TrimSpace(arg), `"'`)
+
+			// Options that take a separate value must consume that value
+			// before the target scan. In particular, Apple logs uses
+			// `-n 1000 <id>`; returning "1000" would make a target-qualified
+			// not-found error look like a backend/container identity error.
+			option := arg
+			if equal := strings.IndexByte(option, '='); equal >= 0 {
+				option = option[:equal]
+			}
+			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
+				if i+1 >= len(args) {
+					return ""
+				}
+				i++
+			}
 		}
 	}
 	return ""
+}
+
+func cliOptionTakesValue(option string) bool {
+	switch option {
+	case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--until",
+		"--platform", "--format", "--size", "--type", "--filter", "-n":
+		return true
+	default:
+		return false
+	}
 }
 
 func cliErrorLines(err error) ([]string, bool) {

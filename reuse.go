@@ -151,8 +151,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	// A reuse leader has the same parent-death window as a normal create.
+	// The pending record is removed as soon as the shared generation is
+	// established, so the watchdog never deletes a container that other
+	// callers are entitled to share.
+	preRegisterRunWithGlobalReaper(cfg)
+	stdout, _, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			if target, ok := runReaperTarget(cfg); ok {
+				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+			}
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
@@ -174,6 +185,20 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
+	if target, ok := runReaperTarget(cfg); ok {
+		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
+			_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
+			return nil, withCleanupError(err, cleanupErr)
+		}
+		if err := markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation); err != nil {
+			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, cfg.name, cfg.creation)
+		}
+		// Shared containers are intentionally excluded from the orphan
+		// watchdog after the create has completed. Marking the entry
+		// shared first also closes the small completion/unregister window.
+		unregisterReuseFromGlobalReaper(cfg)
+	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		return nil, ctr.rollback(ctx, err)
 	}
@@ -185,19 +210,122 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	return ctr, nil
 }
 
-// deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation, so Terminate re-checks the
-// generation and deletes by immutable ID. A replaced generation means
+// deleteStoppedReuse removes a stopped reuse container only after
+// revalidating its ownership and generation. A replaced generation means
 // another process already recreated the name; the caller loops and
 // attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
-	ctr := namedContainer(cfg, cfg.name)
-	ctr.creation = info.labels[creationLabel]
-	err := ctr.Terminate(ctx)
-	if errors.Is(err, ErrGenerationReplaced) {
-		return nil
-	}
+	_, err := deleteStoppedReuseResult(ctx, cfg, info)
 	return err
+}
+
+// deleteStoppedReuseResult reports whether the original generation was
+// actually deleted. A false result with a nil error means the candidate
+// changed underneath us and was deliberately retained.
+func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo) (bool, error) {
+	if info == nil {
+		return false, fmt.Errorf("reuse %s: missing inspected container", cfg.name)
+	}
+	labels := info.labels
+	// Older callers used a partial generation-only fixture. Treat an
+	// object that never claims reuse as ineligible, but fail closed when
+	// it claims reuse and omits another ownership label. In either case
+	// no delete is issued. Docker retains a narrow compatibility path for
+	// callers that supplied only an immutable ID and generation: that
+	// identity is already safe to delete, while Apple name deletes must
+	// carry the complete ownership set.
+	dockerLegacy := cfg.eng.name() == "docker" && labels[managedLabel] == "" && labels[reuseLabel] == ""
+	if labels[reuseLabel] != "true" && !dockerLegacy {
+		return false, nil
+	}
+	if labels[reuseLabel] == "true" && labels[managedLabel] != "true" {
+		return false, fmt.Errorf("reuse %s: managed ownership label is missing", cfg.name)
+	}
+	creation := labels[creationLabel]
+	if !creationRE.MatchString(creation) {
+		return false, fmt.Errorf("reuse %s: creation ownership label is missing or invalid", cfg.name)
+	}
+	if info.state != StateStopped {
+		return false, nil
+	}
+	if cfg.eng.name() == "docker" && !dockerIDRE.MatchString(info.uid) {
+		return false, fmt.Errorf("reuse %s: stopped container has no verified immutable ID", cfg.name)
+	}
+
+	guardCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	unlock := func() {}
+	if cfg.eng.name() == "apple" {
+		var err error
+		unlock, err = lockName(guardCtx, cfg.name)
+		if err != nil {
+			return false, fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
+		}
+	}
+	defer unlock()
+
+	freshContainer := namedContainer(cfg, cfg.name)
+	fresh, err := freshContainer.inspectFresh(guardCtx)
+	if isNotFoundFor(cfg.eng, err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+	}
+	if !sameStoppedReuseGeneration(info, fresh) || fresh.state != StateStopped {
+		return false, nil
+	}
+	target := cfg.name
+	if cfg.eng.name() == "docker" {
+		if !dockerIDRE.MatchString(fresh.uid) || fresh.uid != info.uid {
+			return false, nil
+		}
+		// Delete the immutable identity from the original inspect, not a
+		// name that may have been replaced after that inspect.
+		target = info.uid
+	} else if fresh.uid != "" {
+		return false, fmt.Errorf("reuse %s: Apple inspect returned an unexpected immutable ID", cfg.name)
+	}
+	_, _, err = cfg.runner.Run(guardCtx, cfg.eng.deleteArgs(target)...)
+	if err != nil && !isNotFoundFor(cfg.eng, err) {
+		return false, fmt.Errorf("reuse %s: delete stopped generation: %w", cfg.name, err)
+	}
+	return true, nil
+}
+
+func sameStoppedReuseGeneration(before, after *engineInfo) bool {
+	if before == nil || after == nil {
+		return false
+	}
+	if before.labels[managedLabel] != after.labels[managedLabel] ||
+		before.labels[reuseLabel] != after.labels[reuseLabel] ||
+		before.labels[reuseGroupLabel] != after.labels[reuseGroupLabel] ||
+		before.labels[sessionLabel] != after.labels[sessionLabel] ||
+		before.labels[creationLabel] != after.labels[creationLabel] {
+		return false
+	}
+	return after.state == StateStopped
+}
+
+// rollbackReuse refuses automatic deletion of a running or unverified
+// shared generation. It is intentionally separate from normal rollback:
+// a reuse handle may be visible to another process before the leader's
+// file copy or readiness step fails.
+func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, error) {
+	if ctr == nil || ctr.info == nil {
+		return false, fmt.Errorf("reuse %s: missing inspected generation for rollback", ctr.id)
+	}
+	if ctr.info.state != StateStopped {
+		return false, fmt.Errorf("reuse %s: %s generation may be shared; refusing automatic deletion", cfg.name, ctr.info.state)
+	}
+	deleted, err := deleteStoppedReuseResult(ctx, cfg, ctr.info)
+	if err != nil {
+		return false, err
+	}
+	if !deleted {
+		return false, fmt.Errorf("reuse %s: stopped generation changed; refusing automatic deletion", cfg.name)
+	}
+	return true, nil
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -251,8 +379,11 @@ func createRaceMissing(err error) bool {
 			"failed to run container:",
 		} {
 			rest, found := strings.CutPrefix(line, wrapper)
-			if found && appleIDMissingLine(strings.TrimSpace(rest), target) {
-				return true
+			if found {
+				rest = strings.TrimSpace(rest)
+				if appleIDMissingLine(rest, target) || appleTypedContainerIDNotFoundLine(rest, target) {
+					return true
+				}
 			}
 		}
 		return false
@@ -262,8 +393,14 @@ func createRaceMissing(err error) bool {
 // checkReuseOwned reports whether a stopped container may be deleted
 // and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+	if info == nil || info.labels[managedLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container is missing managed ownership", cfg.name)
+	}
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: existing container is missing a valid creation generation", cfg.name)
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
@@ -416,7 +553,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+	return pruneListedWithGroup(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group)
+	}, "prune reuse group "+group, group)
 }

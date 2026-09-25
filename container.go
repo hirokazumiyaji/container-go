@@ -158,8 +158,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	// Register the exact logical name and generation before the backend
+	// create starts. If the process is killed while `run` is in flight,
+	// the reaper can wait for the pending generation instead of missing
+	// the container entirely.
+	preRegisterRunWithGlobalReaper(cfg)
+	stdout, _, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			if target, ok := runReaperTarget(cfg); ok {
+				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+			}
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, withCleanupError(classified, cleanupErr)
@@ -174,18 +185,28 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
-	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
-		bin := er.ExternalBinary()
-		if bin == "" {
-			bin = cfg.eng.binary()
+	// The reaper only backs real CLI containers. Complete the pending
+	// name/generation record, then retain Docker's immutable-ID record as
+	// an additional deletion target. Both operations are best effort: a
+	// reaper problem must not turn a successful backend create into a
+	// failed Run call.
+	if target, ok := runReaperTarget(cfg); ok {
+		if err := verifyCreatedOwnership(ctx, c, cfg); err != nil {
+			// Do not leave a foreign or unverified generation registered
+			// with the watchdog. cleanupFailedCreate performs its own
+			// ownership check and will therefore fail closed as well.
+			_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
+			return nil, withCleanupError(err, cleanupErr)
+		}
+		if err := completePreRegistrationWithGlobalReaper(target.binary, cfg.name, cfg.creation); err != nil {
+			// If the pre-registration could not be updated (for example,
+			// its child exited between commands), retry as a completed
+			// registration so the exact generation remains protected.
+			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, cfg.name, cfg.creation)
 		}
 		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.eng.reaperDeleteFlags(), c.uid, "")
-		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.eng.reaperDeleteFlags(), cfg.name, cfg.creation)
+			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, c.uid, "")
 		}
 	}
 
@@ -208,12 +229,167 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
+type runReaperTargetInfo struct {
+	binary      string
+	subcommand  string
+	deleteFlags []string
+}
+
+func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
+	if keepContainers() {
+		return runReaperTargetInfo{}, false
+	}
+	er, ok := cfg.runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return runReaperTargetInfo{}, false
+	}
+	binary := er.ExternalBinary()
+	if binary == "" {
+		binary = cfg.eng.binary()
+	}
+	return runReaperTargetInfo{
+		binary:      binary,
+		subcommand:  cfg.eng.reaperSubcommand(),
+		deleteFlags: append([]string(nil), cfg.eng.reaperDeleteFlags()...),
+	}, true
+}
+
+func preRegisterRunWithGlobalReaper(cfg *config) {
+	target, ok := runReaperTarget(cfg)
+	if !ok {
+		return
+	}
+	_ = preRegisterWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, cfg.name, cfg.creation)
+}
+
+func unregisterReuseFromGlobalReaper(cfg *config) {
+	target, ok := runReaperTarget(cfg)
+	if !ok {
+		return
+	}
+	_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+}
+
+// runCreateLocked serializes an Apple name-addressed create with the
+// generation-checked prune/delete paths. attempted is false when the
+// lock could not be acquired, so callers must not run failed-create
+// cleanup for a command that was never issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, stderr []byte, attempted bool, err error) {
+	if cfg.eng.name() != "apple" {
+		stdout, stderr, err = cfg.runner.Run(ctx, args...)
+		return stdout, stderr, true, err
+	}
+	unlock, err := lockName(ctx, cfg.name)
+	if err != nil {
+		return nil, nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, err)
+	}
+	defer unlock()
+	stdout, stderr, err = cfg.runner.Run(ctx, args...)
+	return stdout, stderr, true, err
+}
+
+func waitForReusePoll(ctx context.Context) error {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// verifyCreatedOwnership validates the labels and backend identity before
+// an external reaper is allowed to retain a newly created container. A
+// successful `run` command alone is not proof that the library's ownership
+// labels were attached.
+func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) error {
+	if c == nil || cfg == nil || !creationRE.MatchString(c.creation) {
+		return fmt.Errorf("verify created container: invalid creation generation")
+	}
+	verifyCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	var info *engineInfo
+	for {
+		var err error
+		inspectContainer := c
+		if cfg.eng.name() == "docker" {
+			if !dockerIDRE.MatchString(c.uid) {
+				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, c.uid)
+			}
+			inspectContainer = &Container{id: c.uid, uid: c.uid, runner: c.runner, eng: c.eng}
+		}
+		unlock := func() {}
+		if cfg.eng.name() == "apple" {
+			unlock, err = lockName(verifyCtx, c.id)
+			if err != nil {
+				return fmt.Errorf("verify created container %s: lock name: %w", c.id, err)
+			}
+		}
+		info, err = inspectContainer.inspectFresh(verifyCtx)
+		if unlock != nil {
+			unlock()
+		}
+		if err == nil {
+			break
+		}
+		if !isNotFoundFor(cfg.eng, err) {
+			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		}
+		if err := waitForReusePoll(verifyCtx); err != nil {
+			return fmt.Errorf("verify created container %s: %w", c.id, err)
+		}
+	}
+	if info == nil || info.labels[managedLabel] != "true" {
+		return fmt.Errorf("verify created container %s: managed ownership label is missing", c.id)
+	}
+	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
+		return fmt.Errorf("verify created container %s: session ownership label does not match", c.id)
+	}
+	if info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("verify created container %s: creation generation does not match", c.id)
+	}
+	if cfg.reuse && info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("verify created container %s: reuse ownership label is missing", c.id)
+	}
+	if cfg.reuseGroup != "" && info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("verify created container %s: reuse group label does not match", c.id)
+	}
+	if cfg.eng.name() == "docker" {
+		if info.uid != c.uid {
+			return fmt.Errorf("verify created container %s: immutable ID does not match", c.id)
+		}
+	} else if info.uid != "" {
+		return fmt.Errorf("verify created container %s: unexpected immutable ID", c.id)
+	}
+	c.mu.Lock()
+	c.info = info
+	c.mu.Unlock()
+	return nil
+}
+
 // rollback removes a container Run created but cannot return. A failed
 // removal is not hidden: without an immutable ID, Terminate refuses to
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
-	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
+	if keepContainers() {
+		return cause
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
+	if c.reused {
+		cfg := &config{runner: c.runner, eng: c.eng, name: c.id, reuse: true}
+		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
+		if err != nil {
+			return withCleanupError(cause, fmt.Errorf("container %s left behind: %w", c.id, err))
+		}
+		if !deleted {
+			return withCleanupError(cause, fmt.Errorf("container %s left behind: stopped generation was not deleted", c.id))
+		}
+		return cause
+	}
+	if err := c.Terminate(cleanupCtx); err != nil {
 		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
 		return withCleanupError(cause, cleanupErr)
 	}
@@ -226,8 +402,14 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // managed+session labels is removed. A cleanup failure is returned so Run
 // can preserve it alongside the original operation error.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
+	}
+	if !creationRE.MatchString(cfg.creation) {
+		return fmt.Errorf("cleanup container %s: creation generation is missing or invalid", cfg.name)
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
@@ -250,14 +432,33 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
 		return nil
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
+	if cfg.reuse {
+		if info.labels[reuseLabel] != "true" {
+			return nil
+		}
+		actual, ok := info.labels[creationLabel]
+		if !ok || !creationRE.MatchString(actual) || actual != cfg.creation {
+			return nil
+		}
+		// A running generation may already have been adopted by another
+		// caller. Automatic failed-create cleanup must leave it alone.
+		if info.state == StateRunning {
+			return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
+		}
+	} else {
+		actual, ok := info.labels[creationLabel]
+		if !ok || !creationRE.MatchString(actual) || actual != cfg.creation {
 			return nil
 		}
 	}
 	target := cfg.name
-	if info.uid != "" {
+	if cfg.eng.name() == "docker" {
+		if !dockerIDRE.MatchString(info.uid) {
+			return fmt.Errorf("cleanup container %s: inspect returned no verified immutable ID", cfg.name)
+		}
 		target = info.uid
+	} else if info.uid != "" {
+		return fmt.Errorf("cleanup container %s: unexpected immutable ID", cfg.name)
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()

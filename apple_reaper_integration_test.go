@@ -34,12 +34,16 @@ func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
 	}
 
 	requireSystem(t)
+	// Keep mode disables the watchdog; clear it in both the parent and
+	// child so an inherited CI/debug setting cannot mask reaper behavior.
+	t.Setenv("CONTAINERGO_KEEP", "")
 	name := fmt.Sprintf("containergo-reapertest-%d", os.Getpid())
 
 	cmd := exec.Command(os.Args[0], "-test.run", "TestIntegrationReaperSurvivesSIGKILL")
 	cmd.Env = append(os.Environ(),
 		"CONTAINERGO_REAPER_CHILD=1",
-		"CONTAINERGO_REAPER_NAME="+name)
+		"CONTAINERGO_REAPER_NAME="+name,
+		"CONTAINERGO_KEEP=")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)

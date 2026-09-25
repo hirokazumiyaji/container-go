@@ -305,16 +305,25 @@ func (dockerEngine) logsTailArgs(id string) []string {
 // created and running containers remain out of scope.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
 		"--filter", "status=dead",
-		"--format", "{{.Names}}",
 	}
 }
 
+func parseDockerPruneIDs(data []byte) ([]string, error) {
+	ids := splitNonEmptyLines(data)
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker ps returned invalid container ID %q", id)
+		}
+	}
+	return ids, nil
+}
+
 func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerPruneIDs(data)
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -346,14 +355,13 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerPruneIDs(data)
 }
 
 // nameConflict matches Docker's duplicate container name error.

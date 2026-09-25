@@ -113,10 +113,6 @@ type appleVersionEntry struct {
 	Version string `json:"version"`
 }
 
-type appleStatusVersion struct {
-	APIServerVersion string `json:"apiServerVersion"`
-}
-
 // requireAppleCapabilityVersion keeps the live matrix tied to the Apple
 // releases whose source/help was used to derive the Go validator. It also
 // records the API-server version separately: a CLI-only response is not
@@ -156,7 +152,8 @@ func requireAppleCapabilityVersion(t *testing.T, r *cli.ExecRunner) string {
 	}
 
 	// Older service combinations can omit the server component from
-	// `system version`; status JSON exposes the same API-server fields.
+	// `system version`; status JSON exposes the API-server version in either
+	// the legacy top-level or nested server.version shape.
 	if apiVersion == "" {
 		statusCtx, statusCancel := context.WithTimeout(context.Background(), 30*time.Second)
 		statusOut, statusErr, statusRunErr := r.Run(statusCtx, "system", "status", "--format", "json")
@@ -164,11 +161,11 @@ func requireAppleCapabilityVersion(t *testing.T, r *cli.ExecRunner) string {
 		if statusRunErr != nil {
 			t.Skipf("Apple Container API server version is unavailable from system status: %v (%s)", statusRunErr, statusErr)
 		}
-		var status appleStatusVersion
-		if err := json.Unmarshal(statusOut, &status); err != nil {
-			t.Skipf("cannot decode Apple Container system status %q: %v", statusOut, err)
+		decodedVersion, decodeErr := decodeAppleStatusVersion(statusOut)
+		if decodeErr != nil {
+			t.Skipf("cannot decode Apple Container system status %q: %v", statusOut, decodeErr)
 		}
-		apiVersion = normalizeAppleVersion(status.APIServerVersion)
+		apiVersion = decodedVersion
 	}
 	if apiVersion == "" {
 		t.Skipf("Apple Container CLI %s is available, but the API server version is unavailable; skipping the live matrix", cliVersion)

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -126,6 +127,28 @@ func TestStreamReturnsTerminalExitErrorAndStderr(t *testing.T) {
 	}
 }
 
+func TestStreamRetainsTerminalStderrTail(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `head -c 70000 /dev/zero >&2; printf 'Error response from daemon: No such container: terminal\n' >&2; exit 1`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	defer stream.Close()
+
+	_, readErr := io.ReadAll(stream)
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("read error = %v, want *CLIError", readErr)
+	}
+	if len(cliErr.Stderr) > maxStderr {
+		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
+		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
+	}
+}
+
 func TestStreamReturnsTerminalSignalError(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `printf 'signal stderr\n' >&2; kill -TERM $$`)}
 
@@ -148,7 +171,7 @@ func TestStreamReturnsTerminalSignalError(t *testing.T) {
 	}
 }
 
-func TestStreamReapsChildAfterEOFWithoutClose(t *testing.T) {
+func TestStreamReapsChildAfterExitWithoutReadOrClose(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `printf 'line\n'`)}
 	stream, err := r.Stream(context.Background(), "logs", "x")
 	if err != nil {
@@ -158,8 +181,13 @@ func TestStreamReapsChildAfterEOFWithoutClose(t *testing.T) {
 	pid := ps.cmd.Process.Pid
 	t.Cleanup(func() { _ = stream.Close() })
 
-	if _, err := io.ReadAll(stream); err != nil {
-		t.Fatalf("ReadAll: %v", err)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped without a Read or Close")
+	}
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
 	}
 	assertStreamProcessReaped(t, pid)
 }
@@ -177,11 +205,16 @@ func TestStreamReapsChildAfterCancellationWithoutClose(t *testing.T) {
 	t.Cleanup(func() { _ = stream.Close() })
 
 	cancel()
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped after cancellation without a Read or Close")
+	}
+	assertStreamProcessReaped(t, pid)
 	_, readErr := io.ReadAll(stream)
 	if !errors.Is(readErr, context.Canceled) {
 		t.Fatalf("ReadAll error = %v, want context.Canceled", readErr)
 	}
-	assertStreamProcessReaped(t, pid)
 }
 
 func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
@@ -231,11 +264,17 @@ func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
 	if ps.cmd.ProcessState == nil {
 		t.Fatal("child was not waited")
 	}
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
+	}
 	assertStreamProcessReaped(t, pid)
 }
 
 func assertStreamProcessReaped(t *testing.T, pid int) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("the process-state probe uses Unix ps; Windows termination is guarded by taskkill")
+	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()

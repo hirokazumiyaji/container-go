@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -94,6 +95,8 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	configureProcessTree(cmd)
+	cmd.Cancel = func() error { return terminateProcessTree(cmd) }
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -123,12 +126,46 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
+// truncateStderr returns at most maxStderr bytes from the end of the
+// diagnostic. Keeping the tail, rather than the first bytes, preserves
+// the final daemon error after a large amount of preceding output.
 func truncateStderr(s string) string {
-	if len(s) > maxStderr {
-		return s[:maxStderr]
+	return tailString(s)
+}
+
+func tailString(s string) string {
+	if len(s) <= maxStderr {
+		return s
 	}
-	return s
+	return string([]byte(s[len(s)-maxStderr:]))
+}
+
+// tailBuffer is a bounded rolling diagnostic buffer. It always reports
+// complete writes, even when older bytes are discarded.
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= maxStderr {
+		b.data = append(b.data[:0], p[len(p)-maxStderr:]...)
+		return len(p), nil
+	}
+	if overflow := len(b.data) + len(p) - maxStderr; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.data...))
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process

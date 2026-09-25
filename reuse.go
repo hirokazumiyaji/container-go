@@ -312,24 +312,28 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 	}
 	if validImageDigest(info.imageDigest) {
 		reference := info.image
-		if reference == "" {
+		if imageReferenceBase(reference) == "" {
 			reference = info.imageID
 		}
-		if reference == "" {
-			reference = info.imageDigest
+		if imageReferenceBase(reference) == "" && isImageID(info.imageID) {
+			return imageIdentity{reference: info.imageID, digest: info.imageDigest, id: info.imageID, pinned: true}
 		}
-		return imageIdentity{reference: reference, digest: info.imageDigest, id: info.imageID, pinned: true}
+		if imageReferenceBase(reference) != "" {
+			return imageIdentity{reference: reference, digest: info.imageDigest, id: info.imageID, pinned: true}
+		}
+		// A digest without repository provenance is not a safe identity.
+		return imageIdentity{}
 	}
 	if isImageID(info.imageID) {
 		return imageIdentity{reference: info.imageID, id: info.imageID, pinned: true}
 	}
-	if digest := imageDigest(info.image); validImageDigest(digest) {
+	if digest := imageDigest(info.image); validImageDigest(digest) && imageReferenceBase(info.image) != "" {
 		return imageIdentity{reference: info.image, digest: digest, pinned: true}
 	}
-	if isImageID(info.image) {
-		return imageIdentity{reference: info.image, id: info.image, pinned: true}
-	}
-	if info.image != "" {
+	// A bare sha256:... in a container's image field is not enough to
+	// establish a Docker local ID. Only info.imageID above is verified
+	// backend identity data.
+	if info.image != "" && !isBareImageReference(info.image) {
 		return imageIdentity{reference: info.image}
 	}
 	return imageIdentity{}
@@ -414,6 +418,11 @@ func imagesCompatible(requested, actual string) bool {
 	if requested == "" || actual == "" {
 		return requested == actual
 	}
+	// A bare digest/ID has no repository namespace. Comparing it by its
+	// digest alone would make unrelated registries interchangeable.
+	if isBareImageReference(requested) || isBareImageReference(actual) {
+		return false
+	}
 	if requested == actual {
 		return true
 	}
@@ -423,23 +432,30 @@ func imagesCompatible(requested, actual string) bool {
 		if reqDigest != actDigest {
 			return false
 		}
-		return normalizeImageRef(stripImageDigest(requested)) == normalizeImageRef(stripImageDigest(actual))
+		reqBase := imageReferenceBase(requested)
+		actBase := imageReferenceBase(actual)
+		return reqBase != "" && actBase != "" &&
+			normalizeImageRef(reqBase) == normalizeImageRef(actBase)
 	}
-	req := normalizeImageRef(stripImageDigest(requested))
-	act := normalizeImageRef(stripImageDigest(actual))
-	return req == act
+	req := imageReferenceBase(requested)
+	act := imageReferenceBase(actual)
+	return req != "" && act != "" && normalizeImageRef(req) == normalizeImageRef(act)
 }
 
 // imageRepository returns the canonical repository portion of an image
 // reference, discarding any tag or digest. It is used for a digest
 // response that has no tag but still must not cross a registry or
-// namespace boundary.
+// namespace boundary. A bare ID/digest has no repository and returns
+// the empty string.
 func imageRepository(ref string) string {
-	ref = stripImageDigest(ref)
-	if i := strings.LastIndex(ref, ":"); i >= 0 && !strings.Contains(ref[i+1:], "/") {
-		ref = ref[:i]
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return ""
 	}
-	return strings.TrimSuffix(normalizeImageRef(ref), ":latest")
+	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
+		base = base[:i]
+	}
+	return strings.TrimSuffix(normalizeImageRef(base), ":latest")
 }
 
 // normalizeImageRef expands Docker Hub short names to a canonical

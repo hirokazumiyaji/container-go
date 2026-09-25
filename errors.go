@@ -25,12 +25,14 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
-// ErrImageIdentityUnavailable reports that the backend inspected an
-// image successfully but did not provide a digest or an immutable local
-// ID. Run fails closed by default; WithAllowMutableImageTag opts into
-// passing the original mutable tag to the backend. PullNever also
-// rejects an identity-less Apple inspect even when the caller supplied a
-// digest, because the backend has not confirmed the local identity.
+// ErrImageIdentityUnavailable reports that an image inspect completed
+// successfully but did not provide a usable immutable identity (a
+// repository-bearing digest or a verified local image ID). It is not
+// used for transport, permission, or cancellation failures. Run fails
+// closed by default; WithAllowMutableImageTag opts into passing the
+// original mutable tag to the backend. PullNever also rejects an
+// identity-less Apple inspect even when the caller supplied a digest,
+// because the backend has not confirmed the local identity.
 var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
 
 // ErrImageIdentityMismatch reports that image inspect returned an
@@ -39,12 +41,12 @@ var ErrImageIdentityUnavailable = errors.New("backend did not report an immutabl
 var ErrImageIdentityMismatch = errors.New("backend reported a different image identity")
 
 // ErrImageIdentityNotLocal reports that a resolved immutable identity
-// cannot be addressed from the backend's local image store under the
-// selected policy. Apple Container has no run-time --pull=never switch;
-// running the digest could otherwise fetch it, so PullNever fails
-// before create instead. The same wrapped error is used when an Apple
-// ID-derived digest cannot be made addressable by another policy.
-var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally for PullNever")
+// was successfully checked but is not available from the backend's local
+// image store under the selected policy. Apple Container has no run-time
+// --pull=never switch; running an unaddressable pinned reference could
+// otherwise fetch it, so Run fails before create unless the caller opted
+// into the mutable-tag compatibility fallback.
+var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally under the selected pull policy")
 
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, and Logs wrap it with %w so callers can use

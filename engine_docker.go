@@ -356,19 +356,40 @@ func (dockerEngine) parseImageExists(data []byte, platform string) bool {
 // target.
 func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
 	var images []dockerImageInspect
-	if err := json.Unmarshal(data, &images); err != nil || len(images) == 0 {
+	if err := json.Unmarshal(data, &images); err != nil {
+		// A successful CLI invocation with malformed JSON is not proof
+		// that the image is absent. Treat it as identity-unavailable so
+		// PullMissing cannot turn a parser failure into a fetch.
+		return imageIdentity{}, true
+	}
+	if len(images) == 0 {
 		return imageIdentity{}, false
 	}
-	explicitPinned := image != "" && validImageDigest(imageDigest(image))
+	requestedID := isImageID(image)
+	if image != "" && isBareImageReference(image) && !requestedID {
+		// A malformed or unprefixed digest/ID-shaped value is not a
+		// Docker image-ID request that inspect can verify.
+		return imageIdentity{}, true
+	}
+	explicitPinned := requestedID || (image != "" && validImageDigest(imageDigest(image)))
 	sawExplicitConflict := false
 	fallbackID := ""
 	for _, img := range images {
+		// An ID-shaped request is only accepted when inspect reports that
+		// exact verified local ID. A registry digest from a different
+		// record must not turn an unverified caller token into a pin.
+		if requestedID {
+			if isImageID(img.ID) && strings.EqualFold(img.ID, image) {
+				return imageReferenceWithDigest(image, "", "", img.ID), true
+			}
+			continue
+		}
 		for _, repoDigest := range img.RepoDigests {
 			digest := imageDigest(repoDigest)
-			if !validImageDigest(digest) || stripImageDigest(repoDigest) == "" {
+			if !validImageDigest(digest) || imageReferenceBase(repoDigest) == "" {
 				continue
 			}
-			if image != "" && !isImageID(image) {
+			if image != "" {
 				requestedDigest := imageDigest(image)
 				if requestedDigest != "" {
 					// An explicit digest is a claim about both the

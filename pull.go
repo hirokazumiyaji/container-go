@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -45,12 +46,12 @@ func WithPullPolicy(policy PullPolicy) Option {
 
 // WithAllowMutableImageTag permits Run to execute the caller's original
 // mutable tag when the backend's image-inspect response contains no
-// digest or immutable local ID, or when an Apple ID-derived digest
-// cannot be addressed locally. This is an explicit compatibility
-// escape hatch: it does not prevent a tag from being replaced after
-// inspection, so it is not an identity guarantee. It never downgrades a
-// caller-supplied digest. Without this option Run fails closed with
-// ErrImageIdentityUnavailable.
+// usable immutable identity, or when a resolved Apple reference cannot
+// be addressed locally. This is an explicit compatibility escape hatch:
+// it does not prevent a tag from being replaced after inspection, so it
+// is not an identity guarantee. It never downgrades a caller-supplied
+// digest or Docker image-ID-shaped value. Without this option Run fails
+// closed with ErrImageIdentityUnavailable or ErrImageIdentityNotLocal.
 func WithAllowMutableImageTag() Option {
 	return func(c *config) error {
 		c.allowMutableImageTag = true
@@ -117,16 +118,19 @@ func imageIdentityNeedsLocalCheck(eng engine) bool {
 	return ok && checker.imageIdentityNeedsLocalCheck()
 }
 
-// imageIdentityNeedsLocalAddressCheck identifies the pinned references
-// that must be proven addressable before they are passed to a backend
-// without a runtime pull-never switch. PullNever always checks. Apple's
-// ID-derived digest is also checked for other policies because it names
-// local content rather than a registry manifest that can be fetched.
+// imageIdentityNeedsLocalAddressCheck identifies pinned references that
+// must be proven addressable before they are passed to a backend without
+// a runtime pull-never switch. PullNever always checks. Apple has no
+// run-time no-fetch switch, so every pinned Apple reference—not only an
+// ID-derived one—is checked for PullMissing and PullAlways as well.
 func imageIdentityNeedsLocalAddressCheck(eng engine, identity imageIdentity, policy PullPolicy) bool {
-	if !imageIdentityNeedsLocalCheck(eng) || !identity.pinned {
+	if !identity.pinned || eng == nil {
 		return false
 	}
-	return policy == PullNever || (eng.name() == "apple" && identity.id != "")
+	if eng.name() == "apple" || imageIdentityNeedsLocalCheck(eng) {
+		return true
+	}
+	return policy == PullNever
 }
 
 // ensureImage brings the image into the backend's local store according
@@ -208,36 +212,52 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	if err != nil {
 		return imageIdentity{}, err
 	}
-	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) || pinned.reference == image {
+	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) ||
+		(pinned.reference == image && identity.pinned) {
 		return pinned, nil
 	}
 
 	// Apple Container resolves a missing reference during `container run`
 	// because it has no --pull=never switch. Check the pinned reference
 	// first, and explicitly pull it when the current policy permits a
-	// fetch. This keeps an ID-derived local reference from silently
-	// becoming a registry lookup.
+	// fetch. This keeps a descriptor- or ID-derived reference from
+	// silently becoming a registry lookup during create. Even when the
+	// caller's reference already contains a digest, an identity-less
+	// inspect must not be treated as proof of the descriptor identity.
 	checked, pinnedExists, err := inspectImage(ctx, c.runner, c.eng, pinned.reference, platform)
 	if err != nil {
-		return imageIdentity{}, fmt.Errorf("%w: %w: could not inspect locally addressable image %s: %w", ErrImageIdentityUnavailable, ErrImageIdentityNotLocal, pinned.reference, err)
+		// A transport, permission, or cancellation failure is an
+		// operational error, not evidence that identity is unavailable.
+		// Preserve it for errors.Is/errors.As and never fall back to a
+		// mutable tag on this path.
+		return imageIdentity{}, fmt.Errorf("inspect locally addressable image %s: %w", pinned.reference, err)
 	}
 	if !pinnedExists && c.pullPolicy != PullNever {
-		if pullErr := pullImage(ctx, c.runner, c.eng, pinned.reference, platform); pullErr == nil {
-			checked, pinnedExists, err = inspectImage(ctx, c.runner, c.eng, pinned.reference, platform)
-			if err != nil {
-				return imageIdentity{}, fmt.Errorf("%w: %w: could not verify locally addressable image %s: %w", ErrImageIdentityUnavailable, ErrImageIdentityNotLocal, pinned.reference, err)
+		pullErr := pullImage(ctx, c.runner, c.eng, pinned.reference, platform)
+		if pullErr != nil {
+			// A known not-found result means the exact reference is not
+			// locally addressable and may use the explicit compatibility
+			// escape hatch. Other failures (transport, permission, or
+			// cancellation) must be returned unchanged and must not be
+			// hidden by a mutable fallback.
+			if c.canUseMutableFallback(image) && imageAddressMissing(c.eng, pullErr) {
+				return imageIdentity{reference: image}, nil
 			}
-		} else if c.canUseMutableFallback(image) {
-			return imageIdentity{reference: image}, nil
-		} else {
-			return imageIdentity{}, fmt.Errorf("%w: %w: %s could not be made locally addressable: %w", ErrImageIdentityUnavailable, ErrImageIdentityNotLocal, pinned.reference, pullErr)
+			if imageAddressMissing(c.eng, pullErr) {
+				return imageIdentity{}, fmt.Errorf("%w: %s could not be made locally addressable: %w", ErrImageIdentityNotLocal, pinned.reference, pullErr)
+			}
+			return imageIdentity{}, fmt.Errorf("pull locally addressable image %s: %w", pinned.reference, pullErr)
+		}
+		checked, pinnedExists, err = inspectImage(ctx, c.runner, c.eng, pinned.reference, platform)
+		if err != nil {
+			return imageIdentity{}, fmt.Errorf("verify locally addressable image %s: %w", pinned.reference, err)
 		}
 	}
 	if !pinnedExists {
 		if c.canUseMutableFallback(image) {
 			return imageIdentity{reference: image}, nil
 		}
-		return imageIdentity{}, fmt.Errorf("%w: %w: %s cannot run %s without fetching it", ErrImageIdentityUnavailable, ErrImageIdentityNotLocal, c.eng.name(), pinned.reference)
+		return imageIdentity{}, fmt.Errorf("%w: %s cannot run %s without fetching it", ErrImageIdentityNotLocal, c.eng.name(), pinned.reference)
 	}
 	if checked.mismatch {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s resolves to another image", ErrImageIdentityMismatch, pinned.reference)
@@ -254,11 +274,45 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	return pinned, nil
 }
 
+// imageAddressMissing reports only a backend-confirmed absence. Other
+// failures must remain visible to the caller and must never authorize a
+// mutable-tag fallback.
+func imageAddressMissing(eng engine, err error) bool {
+	return imageMissingError(eng, err)
+}
+
+// imageMissingError applies the backend's not-found matcher without
+// allowing a broad "not found" substring to hide permission, transport,
+// or cancellation failures.
+func imageMissingError(eng engine, err error) bool {
+	if eng == nil || err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		stderr := strings.ToLower(cliErr.Stderr)
+		for _, marker := range []string{"permission", "denied", "unauthorized", "not authorized", "forbidden", "transport", "connection", "xpc", "refused", "reset", "timeout", "deadline", "cancel"} {
+			if strings.Contains(stderr, marker) {
+				return false
+			}
+		}
+		for _, marker := range []string{"manifest unknown", "image not found", "no such image"} {
+			if strings.Contains(stderr, marker) {
+				return true
+			}
+		}
+	}
+	return eng.imageMissing(err) || errors.Is(err, ErrImageNotFound)
+}
+
 func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, error) {
 	if identity.mismatch {
 		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageIdentityMismatch, image)
 	}
 	if identity.pinned {
+		if !imageIdentityIsVerified(identity) {
+			return imageIdentity{}, fmt.Errorf("%w: %s (%s returned an identity without repository provenance or a verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
+		}
 		if requestedDigest := imageDigest(image); validImageDigest(requestedDigest) &&
 			identity.digest != "" && requestedDigest != identity.digest {
 			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected %s", ErrImageIdentityMismatch, image, requestedDigest, identity.digest)
@@ -266,30 +320,40 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 		return identity, nil
 	}
 	// A successful identity-less Apple inspect cannot establish that a
-	// caller-pinned digest is the local image, and PullNever must not
-	// let run perform an implicit fetch. Mutable tags remain available
-	// through the explicit compatibility option below.
-	immutableRequest := isImageID(image) || strings.Contains(image, "@")
+	// caller-pinned digest is the local image. Mutable tags remain
+	// available through the explicit compatibility option below; pinned
+	// inputs are verified by resolveInspectedImage before they can run.
+	immutableRequest := isBareImageReference(image) || strings.Contains(image, "@")
 	if c.pullPolicy == PullNever && c.eng.name() == "apple" && immutableRequest {
 		return imageIdentity{}, fmt.Errorf("%w: %s (Apple image inspect did not confirm the pinned identity)", ErrImageIdentityUnavailable, image)
 	}
-	// A caller-supplied digest or local image ID is already immutable,
-	// even if an older backend cannot repeat that identity in its
-	// inspect JSON.
-	if isImageID(image) {
-		return imageIdentity{reference: image, digest: image, id: image, pinned: true}, nil
-	}
-	if requestedDigest := imageDigest(image); validImageDigest(requestedDigest) {
+	// A caller-supplied digest is usable only with repository provenance.
+	// A bare sha256:... is Docker's image-ID syntax, not proof that the
+	// requested image exists; only a parser that inspected a matching
+	// verified local ID may use that form (handled above).
+	if requestedDigest := imageDigest(image); validImageDigest(requestedDigest) && imageReferenceBase(image) != "" {
 		return imageIdentity{reference: image, digest: requestedDigest, pinned: true}, nil
 	}
 	if c.canUseMutableFallback(image) {
 		return imageIdentity{reference: image}, nil
 	}
-	return imageIdentity{}, fmt.Errorf("%w: %s (%s image inspect did not report a usable digest or immutable ID)", ErrImageIdentityUnavailable, image, c.eng.name())
+	return imageIdentity{}, fmt.Errorf("%w: %s (%s image inspect did not report a usable digest or verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
+}
+
+// imageIdentityIsVerified rejects a digest-shaped identity that has no
+// repository provenance and no verified backend image ID.
+func imageIdentityIsVerified(identity imageIdentity) bool {
+	if !identity.pinned || !imageRE.MatchString(identity.reference) {
+		return false
+	}
+	if isImageID(identity.id) {
+		return strings.EqualFold(identity.reference, identity.id) || imageReferenceBase(identity.reference) != ""
+	}
+	return validImageDigest(identity.digest) && imageReferenceBase(identity.reference) != ""
 }
 
 func (c *config) canUseMutableFallback(image string) bool {
-	return c.allowMutableImageTag && !isImageID(image) && !strings.Contains(image, "@")
+	return c.allowMutableImageTag && !isBareImageReference(image) && !strings.Contains(image, "@")
 }
 
 // inspectImage returns both existence and the identity reported by the
@@ -300,7 +364,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if err != nil {
-		if eng.imageMissing(err) {
+		if imageMissingError(eng, err) {
 			return imageIdentity{}, false, nil
 		}
 		return imageIdentity{}, false, cli.Classify(ctx, r, err, eng.probe())

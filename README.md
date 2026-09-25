@@ -160,36 +160,35 @@ record to a digest reference. Reuse compares the resolved digest/ID
 identity, not the original tag, and removes a newly-created reused
 container if its post-create identity or port validation fails.
 
-If a backend/version reports no usable identity, `Run` fails closed with
-`errors.Is(err, container.ErrImageIdentityUnavailable)`. For an
-Apple-only ID-derived reference that is not locally addressable, the
-library first tries an explicit exact-digest pull when the policy allows
-one; otherwise it fails closed. `WithAllowMutableImageTag` is the
-explicit escape hatch for a mutable input:
+Apple has no runtime `--pull=never` switch. Before `Run` passes any
+pinned Apple reference to `container run`, it verifies that exact
+reference in the local store for `PullMissing`, `PullAlways`, and
+`PullNever`. If it is missing and the selected policy permits a fetch,
+the library performs an explicit exact-digest pull and verifies it again;
+`container run` is never allowed to perform that implicit fetch. A
+successful inspect that cannot provide a repository-bearing digest or a
+verified local image ID returns `ErrImageIdentityUnavailable`; a
+confirmed local absence returns `ErrImageIdentityNotLocal`. Transport,
+permission, and cancellation failures from the addressability check are
+returned as operational errors and do not trigger the mutable fallback.
+`WithAllowMutableImageTag` is the explicit escape hatch for a mutable
+input when identity is unavailable or the resolved reference is not
+locally addressable:
 
 ```go
 container.Run(ctx, "redis:7-alpine",
     container.WithAllowMutableImageTag())
 ```
 
-With that option, an Apple image that cannot be addressed by its
-resolved digest runs the original mutable tag; this deliberately
-retains the tag-replacement window and is not an identity guarantee. It
-does not downgrade a caller-supplied digest. Under `PullNever`, a
-resolved Apple digest must already be locally addressable: an absent
-reference returns `ErrImageIdentityNotLocal` (and an identity-less
-successful Apple inspect returns `ErrImageIdentityUnavailable`) before
-`container run`, so Apple cannot silently fetch during create. The
-mutable-tag option is the one exception: with it, a mutable input may
-run the original tag even when its resolved digest is not local. Apple has
-no runtime `--pull=never` flag, so a normal Apple `PullMissing` or
-`PullAlways` run may still need an exact-digest fetch for a registry
-image. Pinning cannot make a mutable registry tag's pull-to-inspect
-resolution atomic when another actor can modify the shared backend.
-Prefer a caller-supplied `image@sha256:...` and treat the backend's
-identity metadata as the compatibility boundary. Locally built Apple
-images may require `WithAllowMutableImageTag` when no locally
-addressable digest reference exists.
+With that option, a mutable input may run the original tag; this
+deliberately retains the tag-replacement window and is not an identity
+guarantee. It never downgrades a caller-supplied digest or a Docker
+image-ID-shaped value. Pinning cannot make a mutable registry tag's
+pull-to-inspect resolution atomic when another actor can modify the
+shared backend. Prefer a caller-supplied `image@sha256:...` and treat
+the backend's identity metadata as the compatibility boundary. Locally
+built Apple images may require `WithAllowMutableImageTag` when no
+locally addressable digest reference exists.
 
 ```go
 container.Run(ctx, "redis:7-alpine",
@@ -276,7 +275,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   `container registry login`, which stores them in the macOS Keychain.
 - `Run` passes the identity returned by image inspect (or a Docker image
   ID) to the backend, so a later local tag reassignment does not change
-  that create. This is a backend/API guarantee, not a claim that every
+  that create. Apple pinned references are checked for local
+  addressability before create; `container run` is never used as an
+  implicit fetch. This is a backend/API guarantee, not a claim that every
   tag-to-registry operation is atomic: a mutable tag can still be
   replaced before the post-pull inspect, and an identity-less backend
   requires the explicit `WithAllowMutableImageTag` compatibility

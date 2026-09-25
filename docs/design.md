@@ -377,22 +377,28 @@ Container uses the descriptor or selected platform-variant digest and
 normalizes an ID-only image record to a digest reference. This prevents
 a later local tag reassignment from changing that create, but it does not
 make a mutable tag's pull-to-inspect operation atomic. If a backend
-version reports no identity, the default policy fails closed with
-`ErrImageIdentityUnavailable`. `WithAllowMutableImageTag` is an explicit
-compatibility escape hatch for an identity-less or not-locally-addressable
-backend and carries no identity guarantee; it never downgrades a
-caller-supplied digest. Apple Container has no `--pull=never` run flag.
-For an Apple ID-derived reference, a pull-allowed policy first tries an
-explicit exact-digest pull; if that reference still cannot be addressed,
-the default fails closed and only the explicit mutable-tag option can
-run the original tag. Under `PullNever`, the pinned Apple reference must
-already be local: an absent reference returns
-`ErrImageIdentityNotLocal`, and an identity-less successful inspect
-returns `ErrImageIdentityUnavailable`, before `container run` can fetch
-anything. With ordinary Apple `PullMissing` or `PullAlways`, a registry
-image may still require an exact-digest fetch. Locally built Apple
-images may therefore require the explicit mutable-tag fallback when no
-local digest reference is available.
+version reports no usable identity, the default policy fails closed with
+`ErrImageIdentityUnavailable`. A digest without repository provenance is
+not identity proof; a bare Docker image ID is accepted only when the
+backend inspect verifies that exact local ID.
+
+Apple Container has no `--pull=never` run flag. Before a pinned Apple
+reference is passed to `container run`, the library verifies that exact
+reference locally for every pull policy. If it is absent and the policy
+allows fetching, the library performs an explicit exact-digest pull and
+inspects it again; `container run` is never allowed to perform an
+implicit fetch. A confirmed local absence returns
+`ErrImageIdentityNotLocal`; a successful inspect that cannot report a
+repository-bearing digest or verified local ID returns
+`ErrImageIdentityUnavailable`. Transport, permission, and cancellation
+errors from the addressability check remain operational errors and never
+authorize the mutable fallback. `WithAllowMutableImageTag` is an
+explicit compatibility escape hatch for a mutable input whose identity
+is unavailable or whose resolved reference is not locally addressable;
+it carries no identity guarantee and never downgrades a caller-supplied
+digest or Docker image-ID-shaped value. Locally built Apple images may
+therefore require the explicit mutable-tag fallback when no local digest
+reference is available.
 
 ## Performance design
 
@@ -427,10 +433,12 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
-- `ErrImageIdentityUnavailable`: inspect returned no immutable image identity
-  and the caller did not opt into the mutable-tag fallback
-- `ErrImageIdentityNotLocal`: PullNever resolved a pinned reference that
-  the backend cannot address without an implicit fetch
+- `ErrImageIdentityUnavailable`: a successful image inspect returned no
+  repository-bearing digest or verified local image ID, and the caller
+  did not opt into the mutable-tag fallback
+- `ErrImageIdentityNotLocal`: a pinned reference was confirmed absent
+  from the backend's local store under the selected policy; Apple does
+  not let `container run` perform an implicit fetch
 - `ErrImageIdentityMismatch`: inspect returned an identity for a
   different image; the mutable-tag fallback is not used
 - `ErrPortNotExposed`: querying a port not declared via

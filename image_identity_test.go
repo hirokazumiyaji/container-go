@@ -93,11 +93,12 @@ func TestIssue115RunPinsDockerIdentityAfterPullAlways(t *testing.T) {
 }
 
 type issue115AppleTagSwapRunner struct {
-	mu            sync.Mutex
-	pullDigest    string
-	inspectDigest string
-	swapOnInspect bool
-	runImage      string
+	mu             sync.Mutex
+	pullDigest     string
+	inspectDigest  string
+	resolvedDigest string
+	swapOnInspect  bool
+	runImage       string
 }
 
 func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -109,8 +110,16 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		if digest == "" {
 			digest = issue115ImageIdentityOld
 		}
-		if r.swapOnInspect {
-			r.inspectDigest = issue115ImageIdentityNew
+		if args[len(args)-1] == "redis:7-alpine" {
+			// The mutable tag may be replaced after the initial resolution,
+			// but the addressability check for the already-pinned reference
+			// must continue to observe that exact old digest.
+			r.resolvedDigest = digest
+			if r.swapOnInspect {
+				r.inspectDigest = issue115ImageIdentityNew
+			}
+		} else if r.resolvedDigest != "" {
+			digest = r.resolvedDigest
 		}
 		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":%q}},"variants":[]}]`, digest, digest)), nil, nil
 	case args[0] == "image" && len(args) > 1 && args[1] == "pull":

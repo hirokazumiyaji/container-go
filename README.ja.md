@@ -143,27 +143,26 @@ Reuse は元の mutable tag ではなく、解決済み digest / image ID で
 互換性を判定します。作成後の検証に失敗した新規 reuse container は
 削除します。
 
-identity を取得できない backend では、既定で
-`errors.Is(err, container.ErrImageIdentityUnavailable)` として失敗します。
-Apple の ID 由来 digest が local から直接指定できない場合、pull が
-許可される policy では exact digest の pull を一度試します。それでも
-失敗する場合は fail closed します。mutable tag を実行する互換 fallback
-を利用するには `WithAllowMutableImageTag()` を明示指定してください。
-この fallback は tag の置き換えを防ぐ保証ではなく、呼び出し側が
-digest を指定した場合はその digest に降格しません。
-Apple Container には実行時の `--pull=never` がないため、`PullNever`
-では pinned reference がすでに local に存在することを確認します。
-存在しなければ `ErrImageIdentityNotLocal`、identity がない inspect が
-成功した場合は `ErrImageIdentityUnavailable` を返してから
-`container run` を実行しません。mutable tag option を指定し、入力が
-mutable tag の場合だけが例外で、resolved digest が local にない場合も
-元の tag を実行できます。通常の `PullMissing` / `PullAlways`
-では、registry image の exact digest を実行時に fetch することがあります。
-pull 完了から inspect の間に発生する mutable tag の変更や、共有 daemon
-に対する別 process の変更を、CLI API だけで原子的に排除できるとは
-仮定しません。再現性が重要な場合は `image@sha256:...` を呼び出し側から
-渡してください。local build の Apple image に利用可能な local digest
-参照がない場合は `WithAllowMutableImageTag` が必要になることがあります。
+Apple Container には実行時の `--pull=never` がないため、`Run` は
+`PullMissing`、`PullAlways`、`PullNever` のいずれでも、pinned された
+Apple reference を `container run` に渡す前に local store にあるかを
+確認します。存在せず選択した policy が fetch を許可する場合は、
+exact digest を明示的に pull してから再確認します。`container run` に
+暗黙の fetch をさせません。identity を取得できない inspect の成功は
+`ErrImageIdentityUnavailable`、local に存在しないことが確認された
+場合は `ErrImageIdentityNotLocal` です。addressability check の
+transport、permission、context cancellation エラーは元の operational
+error として返し、mutable fallback では隠しません。
+identity を取得できない、または resolved reference が local にない
+mutable input では、互換 fallback として `WithAllowMutableImageTag()`
+を明示指定できます。この fallback は tag の置き換えを防ぐ保証ではなく、
+呼び出し側が digest または Docker image ID を指定した場合は、その値を
+降格しません。pull 完了から inspect の間に発生する mutable tag の変更
+や、共有 daemon に対する別 process の変更を、CLI API だけで原子的に
+排除できるとは仮定しません。再現性が重要な場合は
+`image@sha256:...` を呼び出し側から渡してください。local build の
+Apple image に利用可能な local digest 参照がない場合は
+`WithAllowMutableImageTag` が必要になることがあります。
 
 ```go
 container.Run(ctx, "redis:7-alpine",
@@ -246,9 +245,10 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   login`(macOS Keychain 保存)を使ってください。
 - `Run` は image inspect が返した identity、または Docker の image ID を
   backend に渡すため、inspect 後の local tag 変更で create 対象が変わり
-  ません。これは backend API の範囲での保証です。mutable tag の pull から
-  inspect までの操作を原子化するものではありません。
-  identity を取得できない backend では
+  ません。Apple の pinned reference は create 前に local addressability を
+  確認し、`container run` を暗黙の fetch として使いません。これは backend
+  API の範囲での保証です。mutable tag の pull から inspect までの操作を
+  原子化するものではありません。identity を取得できない backend では
   `WithAllowMutableImageTag` による明示的な fallback が必要です。
 
 ## testcontainers-go との違い

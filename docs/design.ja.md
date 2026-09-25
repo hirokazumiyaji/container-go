@@ -242,23 +242,25 @@ Apple Container は descriptor または指定 platform の variant digest を�
 ID だけの record は digest 参照に正規化する。
 この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
 ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
-identity を返さない backend version では既定で
-`ErrImageIdentityUnavailable` を返して fail closed する。
-`WithAllowMutableImageTag` は identity が取得できない、または local から
-直接指定できない backend の明示的な互換 fallback であり、identity の
-保証ではない。呼び出し側が digest を指定した場合を mutable tag に
-降格させることもない。
-Apple Container の `run` に `--pull=never` はないため、ID 由来 digest が
-local にない場合は、pull 可能な policy で exact digest の pull を一度試す。
-それでも address できない場合は既定で fail closed し、明示的な mutable
-tag option だけが元の tag を実行する。
-`PullNever` では pinned Apple reference がすでに local に存在する必要が
-ある。存在しなければ `ErrImageIdentityNotLocal`、identity がない inspect が
-成功した場合は `ErrImageIdentityUnavailable` を返し、`container run` の
-暗黙の fetch を許さない。
-通常の Apple `PullMissing` / `PullAlways` では registry image の exact digest
-fetch が必要になることがある。local build の Apple image で local digest
-参照がない場合は、明示的な mutable tag fallback が必要になることがある。
+利用可能な identity を返さない backend version では既定で
+`ErrImageIdentityUnavailable` を返して fail closed する。repository の
+provenance がない bare digest は identity として扱わず、bare Docker image
+ID は inspect がその local ID を検証した場合だけ受け入れる。
+
+Apple Container の `run` に `--pull=never` はないため、pinned Apple reference
+を `container run` に渡す前に、すべての pull policy で local store にあるか
+を確認する。存在せず選択した policy が fetch を許可する場合は exact digest
+を明示的に pull して再検査し、`container run` の暗黙の fetch は許さない。
+local に存在しないことが確認された場合は `ErrImageIdentityNotLocal`、
+成功した inspect が repository-bearing digest または検証済み local ID を
+返さない場合は `ErrImageIdentityUnavailable` を返す。addressability check の
+transport、permission、cancellation エラーは operational error として返し、
+mutable fallback の根拠にしない。`WithAllowMutableImageTag` は identity が
+取得できない、または resolved reference が local にない mutable input の
+明示的な互換 fallback であり、identity の保証ではない。呼び出し側の digest
+や Docker image ID を mutable tag に降格させることもない。local build の
+Apple image で local digest 参照がない場合は、この明示 fallback が必要に
+なることがある。
 
 ## パフォーマンス設計
 
@@ -288,10 +290,12 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
-- `ErrImageIdentityUnavailable`：inspect が immutable な image identity を
-  返さず、mutable tag fallback も指定されていない
-- `ErrImageIdentityNotLocal`：`PullNever` で、暗黙の fetch なしには
-  実行できない pinned reference が解決された
+- `ErrImageIdentityUnavailable`：成功した image inspect が repository-bearing
+  digest または検証済み local image ID を返さず、mutable tag fallback も
+  指定されていない
+- `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local
+  image store に存在しないことが確認された。Apple の `container run` に暗黙の
+  fetch を許さない
 - `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。
   mutable tag fallback は使わない
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会

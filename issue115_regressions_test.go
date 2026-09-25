@@ -253,8 +253,11 @@ func TestIssue115AppleLocalIDDigestFailsClosedWithoutFallback(t *testing.T) {
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullMissing),
 		withRunner(r), withEngine(appleEngine{}))
-	if !errors.Is(err, ErrImageIdentityUnavailable) {
-		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
+	if !errors.Is(err, ErrImageIdentityNotLocal) {
+		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
+	}
+	if errors.Is(err, ErrImageIdentityUnavailable) {
+		t.Fatalf("known local-address absence was reported as identity-unavailable: %v", err)
 	}
 	if r.image() != "" {
 		t.Fatalf("run image = %q, want no run", r.image())

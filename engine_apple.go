@@ -214,10 +214,17 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 // Container releases and also accepts the older flat ImageDescription
 // shape. A platform-specific variant digest is preferred when the
 // caller selected a platform; otherwise the index digest pins the
-// complete image.
+// complete image. Apple image-resource IDs are treated as local
+// identifiers, not Docker's sha256:<hex> image-ID syntax.
 func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool) {
 	var records []appleImageInspectRecord
-	if err := json.Unmarshal(data, &records); err != nil || len(records) == 0 {
+	if err := json.Unmarshal(data, &records); err != nil {
+		// A successful CLI invocation with malformed JSON is not proof
+		// that the image is absent. Treat it as an identity-unavailable
+		// result so PullMissing cannot turn a parser failure into a fetch.
+		return imageIdentity{}, true
+	}
+	if len(records) == 0 {
 		return imageIdentity{}, false
 	}
 	for _, record := range records {
@@ -275,7 +282,19 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	if reference == "" {
 		reference = record.Name
 	}
-	if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
+
+	// A bare sha256:... is Docker's image-ID syntax, not an Apple
+	// repository reference. It is safe to handle only when the inspected
+	// Apple record proves the same identity through its descriptor and
+	// gives us a repository base for the normalized run reference.
+	if isImageID(requested) || isBareImageID(requested) {
+		if imageReferenceBase(reference) == "" || !validImageDigest(digest) {
+			return imageIdentity{}
+		}
+		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
+			return imageIdentity{mismatch: true}
+		}
+	} else if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
 		requestedDigest := imageDigest(requested)
 		if requestedDigest == "" || imageDigest(reference) != "" || imageRepository(requested) != imageRepository(reference) {
 			return imageIdentity{mismatch: true}
@@ -286,16 +305,43 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		// caller's digest.
 	}
 	if validImageDigest(digest) {
+		// The descriptor is authoritative. Do not copy an ID-shaped field
+		// into imageIdentity.id: that field is a Docker-only local-ID ABI.
 		return imageReferenceWithDigest(requested, reference, digest, "")
 	}
 	if isImageID(record.ID) {
-		return imageReferenceWithDigest(requested, reference, record.ID, record.ID)
+		// Apple must not treat a Docker-style ID field as an immutable
+		// run target without a descriptor proving what that ID names.
+		return imageIdentity{}
 	}
 	if len(record.ID) == 64 && isHex(record.ID) {
+		// Older Apple image-inspect responses exposed the local content ID
+		// without a descriptor. Keep the compatibility fallback, but do
+		// not classify it as a Docker image ID.
 		digest := "sha256:" + record.ID
-		return imageReferenceWithDigest(requested, reference, digest, digest)
+		return imageReferenceWithDigest(requested, reference, digest, "")
 	}
 	return imageIdentity{}
+}
+
+// appleImageIDMatchesDescriptor verifies the only safe interpretation of
+// an ID-shaped value supplied to Apple: the descriptor must independently
+// report the same digest, and any non-empty Apple ID field must agree.
+func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
+	requestedDigest := requested
+	if isBareImageID(requested) {
+		requestedDigest = "sha256:" + requested
+	}
+	if (!isImageID(requested) && !isBareImageID(requested)) || !validImageDigest(digest) || !strings.EqualFold(digest, requestedDigest) {
+		return false
+	}
+	if recordID == "" {
+		return true
+	}
+	if strings.HasPrefix(recordID, "sha256:") {
+		return isImageID(recordID) && strings.EqualFold(recordID, digest)
+	}
+	return len(recordID) == 64 && isHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
 }
 
 func splitPlatform(p string) (os, arch, variant string) {

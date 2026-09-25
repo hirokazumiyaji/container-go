@@ -178,6 +178,9 @@ func TestTerminalErrorDrainsStderrWhenPublicReaderIsBlocked(t *testing.T) {
 	if !strings.Contains(cliErr.Stderr, "TERMINAL_STDERR_MARKER") {
 		t.Fatalf("Stderr = %q, want final terminal marker", cliErr.Stderr)
 	}
+	if !ps.drainCompleted.Load() {
+		t.Fatal("TerminalError returned before drain completion")
+	}
 	select {
 	case <-ps.pumpsDone:
 	case <-time.After(2 * time.Second):
@@ -185,6 +188,45 @@ func TestTerminalErrorDrainsStderrWhenPublicReaderIsBlocked(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
+	}
+}
+
+func TestDrainTimeoutWaitsForPumpsBeforeReturning(t *testing.T) {
+	sourceRead, sourceWrite, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicRead, publicWrite := io.Pipe()
+	defer func() {
+		_ = sourceWrite.Close()
+		_ = publicRead.Close()
+		_ = publicWrite.Close()
+	}()
+
+	ps := &processStream{
+		ReadCloser: publicRead,
+		output:     publicWrite,
+		stderrRead: sourceRead,
+		pumpsDone:  make(chan struct{}),
+	}
+	go func() {
+		_, _ = io.Copy(io.Discard, sourceRead)
+		time.Sleep(25 * time.Millisecond)
+		close(ps.pumpsDone)
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	if err := ps.Drain(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Drain error = %v, want caller deadline", err)
+	}
+	select {
+	case <-ps.pumpsDone:
+	case <-time.After(10 * time.Millisecond):
+		t.Fatal("Drain returned before pumpsDone after closing sources")
+	}
+	if !ps.drainCompleted.Load() {
+		t.Fatal("Drain returned without recording completion")
 	}
 }
 
@@ -388,7 +430,7 @@ func TestStreamLifecyclePathsDoNotDoubleWait(t *testing.T) {
 func assertStreamDirectChildReaped(t *testing.T, pid int) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
-		t.Skip("the process-state probe uses Unix ps; Windows termination is guarded by taskkill")
+		t.Skip("the process-state probe uses Unix ps; Windows tests use the retained process handle")
 	}
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {

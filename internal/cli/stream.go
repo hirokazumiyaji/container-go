@@ -162,7 +162,10 @@ type processStream struct {
 	outputCloseOnce sync.Once
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
+	drainStartOnce  sync.Once
+	drainDoneOnce   sync.Once
 	terminalDrain   atomic.Bool
+	drainCompleted  atomic.Bool
 
 	terminateOnce sync.Once
 	terminateErr  error
@@ -301,21 +304,29 @@ const terminalDrainTimeout = 100 * time.Millisecond
 // Drain completes the output pumps after the child has exited. It closes
 // the public pipe to release a pump blocked on backpressure, then lets the
 // stderr pump consume the remaining child output for its diagnostic tail.
-// The wait is bounded by both ctx and a short safety limit; source files
-// are closed on the safety timeout so a descendant holding an inherited
-// descriptor cannot deadlock the caller. A caller cancellation is returned;
-// the safety timeout is a best-effort diagnostic fallback.
+// If the caller or the short safety deadline expires, source files are
+// closed and Drain still waits for pumpsDone before returning. That wait is
+// what makes a later TerminalError snapshot complete rather than a partial
+// stderr tail.
 func (s *processStream) Drain(ctx context.Context) error {
 	drainCtx, cancel := context.WithTimeout(ctx, terminalDrainTimeout)
 	defer cancel()
 
-	s.terminalDrain.Store(true)
-	s.outputCloseOnce.Do(func() { _ = s.output.Close() })
+	s.drainStartOnce.Do(func() {
+		s.terminalDrain.Store(true)
+		s.outputCloseOnce.Do(func() { _ = s.output.Close() })
+	})
+	complete := func() {
+		s.drainDoneOnce.Do(func() { s.drainCompleted.Store(true) })
+	}
 	select {
 	case <-s.pumpsDone:
+		complete()
 		return nil
 	case <-drainCtx.Done():
 		s.closeSourceFiles()
+		<-s.pumpsDone
+		complete()
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -352,12 +363,15 @@ func (s *processStream) TerminalError() error {
 	}
 	// cmd.Wait only proves that the direct child was reaped. A pump can
 	// still be blocked trying to hand a chunk to the public reader, so
-	// drain it before constructing the diagnostic error. The stream
-	// context bounds this work and Drain also has a short safety limit for
-	// an inherited descriptor held by a descendant. wait/log may already
-	// have started the drain; in that case do not extend its budget here.
-	if !s.terminalDrain.Load() {
-		_ = s.Drain(s.ctx)
+	// wait for the drain to complete before constructing the diagnostic
+	// error. Never expose a CLIError backed by an incomplete stderr tail.
+	if !s.drainCompleted.Load() {
+		if err := s.Drain(s.ctx); err != nil {
+			if s.ctx.Err() != nil {
+				return s.contextError()
+			}
+			return fmt.Errorf("%s %s: stream drain: %w", s.binary, strings.Join(s.args, " "), err)
+		}
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
@@ -392,6 +406,14 @@ func (s *processStream) readError(readErr error) error {
 	s.stateMu.Unlock()
 
 	if waitErr != nil {
+		if !cancelled && !closed && ctxErr == nil && !s.drainCompleted.Load() {
+			if err := s.Drain(s.ctx); err != nil {
+				if s.ctx.Err() != nil {
+					return s.contextError()
+				}
+				return fmt.Errorf("%s %s: stream drain: %w", s.binary, strings.Join(s.args, " "), err)
+			}
+		}
 		var exitErr *exec.ExitError
 		if errors.As(waitErr, &exitErr) {
 			// Cancellation and Close are intentional terminal paths. A

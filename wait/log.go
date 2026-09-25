@@ -13,9 +13,13 @@ import (
 )
 
 const (
-	maxLogLineSize       = 1024 * 1024
-	maxLogReplayLines    = 4096
-	terminalSettleWindow = 5 * time.Millisecond
+	maxLogLineSize    = 1024 * 1024
+	maxLogReplayLines = 4096
+	// terminalSettleWindow is the idle grace period after the scanner has
+	// consumed pending output. maxLogSettleWindow bounds a continuously
+	// active live --follow stream so readiness cannot wait forever.
+	terminalSettleWindow = 100 * time.Millisecond
+	maxLogSettleWindow   = time.Second
 )
 
 var errLogLineTooLong = errors.New("log line exceeds 1 MiB")
@@ -164,14 +168,19 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 					return
 				}
 				if errors.Is(err, io.EOF) {
-					results <- result(count >= occurrences, nil, nil)
+					if count >= occurrences {
+						terminalErr := settleLogMatch(ctx, stream, reader)
+						results <- result(true, nil, terminalErr)
+					} else {
+						results <- result(false, nil, nil)
+					}
 					return
 				}
 				results <- result(false, err, nil)
 				return
 			}
 			if count >= occurrences {
-				terminalErr := settleLogReader(ctx, reader)
+				terminalErr := settleLogMatch(ctx, stream, reader)
 				results <- result(true, nil, terminalErr)
 				return
 			}
@@ -223,38 +232,131 @@ func readLogLine(reader *bufio.Reader) (string, error) {
 	}
 }
 
-func settleLogReader(ctx context.Context, reader *bufio.Reader) error {
-	window := terminalSettleWindow
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+type logSettleRead struct {
+	n   int
+	err error
+}
+
+// settleLogMatch actively consumes merged output after a readiness match.
+// A single delayed read leaves a public io.Pipe blocked, which can prevent
+// the follow process from exiting and hide its terminal diagnostic. The
+// scanner therefore keeps reading until the process reports Done, the
+// stream returns a terminal error, the caller ends, or the bounded live-
+// stream grace period expires.
+func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Reader) error {
+	status, hasStatus := stream.(interface {
+		Done() <-chan struct{}
+		TerminalError() error
+	})
+	var done <-chan struct{}
+	if hasStatus {
+		done = status.Done()
+	}
+
+	boundedWindow := func(max time.Duration) time.Duration {
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return 0
+			}
+			if remaining < max {
+				return remaining
+			}
+		}
+		return max
+	}
+	idleWindow := boundedWindow(terminalSettleWindow)
+	maxWindow := boundedWindow(maxLogSettleWindow)
+	if idleWindow <= 0 {
+		return ctx.Err()
+	}
+	if maxWindow < idleWindow {
+		maxWindow = idleWindow
+	}
+	idleTimer := time.NewTimer(idleWindow)
+	maxTimer := time.NewTimer(maxWindow)
+	defer idleTimer.Stop()
+	defer maxTimer.Stop()
+	resetIdle := func() {
+		if !idleTimer.Stop() {
+			select {
+			case <-idleTimer.C:
+			default:
+			}
+		}
+		idleTimer.Reset(idleWindow)
+	}
+
+	readResults := make(chan logSettleRead, 1)
+	buf := make([]byte, 32*1024)
+	startRead := func() {
+		go func() {
+			n, err := reader.Read(buf)
+			readResults <- logSettleRead{n: n, err: err}
+		}()
+	}
+	startRead()
+
+	settleTerminal := func() error {
+		if drainer, ok := stream.(interface{ Drain(context.Context) error }); ok {
+			if err := drainer.Drain(ctx); err != nil {
+				return err
+			}
+		}
+		return status.TerminalError()
+	}
+
+	for {
+		select {
+		case read := <-readResults:
+			if read.err != nil {
+				if isTerminalStreamError(read.err) && hasStatus {
+					return settleTerminal()
+				}
+				if isPermanentCheckError(read.err) || isTerminalStreamError(read.err) {
+					return read.err
+				}
+				if errors.Is(read.err, io.EOF) {
+					if hasStatus {
+						select {
+						case <-done:
+							return settleTerminal()
+						default:
+						}
+					}
+					return nil
+				}
+				return read.err
+			}
+			if read.n == 0 {
+				startRead()
+				continue
+			}
+			resetIdle()
+			startRead()
+		case <-done:
+			return settleTerminal()
+		case <-idleTimer.C:
+			// No output arrived during the idle grace period. Recheck Done
+			// once before accepting a live follow stream as ready.
+			select {
+			case <-done:
+				return settleTerminal()
+			default:
+			}
+			return nil
+		case <-maxTimer.C:
+			// A continuously active live stream must not postpone readiness
+			// forever. Recheck Done before accepting the bounded result.
+			select {
+			case <-done:
+				return settleTerminal()
+			default:
+			}
+			return nil
+		case <-ctx.Done():
 			return ctx.Err()
 		}
-		if remaining < window {
-			window = remaining
-		}
-	}
-	readErr := make(chan error, 1)
-	go func() {
-		_, err := reader.ReadByte()
-		readErr <- err
-	}()
-	timer := time.NewTimer(window)
-	defer timer.Stop()
-	select {
-	case err := <-readErr:
-		if err == nil {
-			return nil
-		}
-		if isPermanentCheckError(err) || isTerminalStreamError(err) {
-			return err
-		}
-		if errors.Is(err, io.EOF) {
-			return nil
-		}
-		return err
-	case <-timer.C:
-		return nil
 	}
 }
 
@@ -305,9 +407,6 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		var terminalStreamErr error
 		if result.found {
 			terminalStreamErr = result.terminalErr
-			if terminalStreamErr == nil {
-				terminalStreamErr = terminalErrorIfSettled(waitCtx, stream)
-			}
 		}
 		_ = stream.Close()
 		if result.found {
@@ -382,49 +481,6 @@ func boundedProbeContext(ctx context.Context, max time.Duration) (context.Contex
 		}
 	}
 	return context.WithTimeout(ctx, max)
-}
-
-func terminalErrorIfSettled(ctx context.Context, stream io.ReadCloser) error {
-	status, hasStatus := stream.(interface {
-		Done() <-chan struct{}
-		TerminalError() error
-	})
-	if !hasStatus || status.Done() == nil {
-		// Generic readers are settled by settleLogReader while the
-		// scanner still owns its bufio.Reader. Starting another Read here
-		// would race with a timed-out read-ahead goroutine.
-		return nil
-	}
-
-	window := terminalSettleWindow
-	if deadline, ok := ctx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
-			return ctx.Err()
-		}
-		if remaining < window {
-			window = remaining
-		}
-	}
-	timer := time.NewTimer(window)
-	defer timer.Stop()
-	select {
-	case <-status.Done():
-		// A process stream can report the child exit before its output
-		// pumps have finished. Drain within the same wait budget before
-		// asking for TerminalError, otherwise the stderr tail can be a
-		// snapshot taken before the final diagnostic was read.
-		if drainer, ok := stream.(interface{ Drain(context.Context) error }); ok {
-			if err := drainer.Drain(ctx); err != nil {
-				return err
-			}
-		}
-		return status.TerminalError()
-	case <-timer.C:
-		// A live follow stream is expected to remain open. The caller
-		// closes it after this bounded settling check.
-		return nil
-	}
 }
 
 func waitForReconnect(ctx context.Context, interval time.Duration) error {

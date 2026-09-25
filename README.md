@@ -184,9 +184,9 @@ that becomes a zombie is the platform init/subreaper's responsibility.
 If the direct child has already exited and been reaped, Close does not
 signal its former process group, so descendants may outlive it. Detached
 or reparented descendants are outside the group guarantee. On Windows,
-`taskkill /T` is the best-effort descendant boundary; on other platforms
-only the direct child is covered. Do not rely on descendant cleanup when
-a CLI deliberately detaches helpers.
+termination uses the retained process handle for the direct child; there
+is no descendant boundary. Do not rely on descendant cleanup when a CLI
+deliberately detaches helpers.
 
 ## Image pulls
 

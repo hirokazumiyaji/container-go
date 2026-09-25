@@ -414,9 +414,9 @@ reap descendants. A descendant that becomes a zombie is the platform
 init/subreaper's responsibility. If the direct child has already been
 reaped, Close does not signal its former process group, so descendants
 may outlive it. Detached or reparented descendants are outside the group
-boundary. On Windows, `taskkill /T` is a best-effort descendant boundary
-rather than a Job Object guarantee. Other supported platforms cover only
-the direct child. ForLog's diagnostic buffer caps at 1MiB.
+boundary. On Windows, the retained process handle terminates only the
+direct child; there is no descendant boundary. Other supported platforms
+cover only the direct child. ForLog's diagnostic buffer caps at 1MiB.
 
 A stream has two error phases. `Stream` (and the public `FollowLogs`
 wrapper) returns startup errors. Once a stream has been returned, a
@@ -426,9 +426,10 @@ intentional terminal paths and may instead produce EOF or a context error.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the direct CLI child is killed and reaped. Process-group or
-`taskkill` termination of descendants is best effort; this package does
-not claim descendant reaping.
+cancellation the direct CLI child is killed and reaped. Process-group
+termination of descendants is best effort; Windows uses the retained
+process handle for the direct child and does not claim descendant cleanup
+or reaping.
 
 ## Error handling
 

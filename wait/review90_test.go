@@ -92,6 +92,50 @@ func (s *review90ContextStrategy) WaitUntilReady(ctx context.Context, _ Target) 
 	return s.cause
 }
 
+type review90NonCooperativeStrategy struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *review90NonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
+	close(s.started)
+	<-s.release
+	return nil
+}
+
+func TestForAnyCancellationDoesNotWaitForNonCooperativeChild(t *testing.T) {
+	child := &review90NonCooperativeStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(child.release) })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- ForAny(child).WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &issue90Target{})
+	}()
+
+	select {
+	case <-child.started:
+	case <-time.After(time.Second):
+		t.Fatal("non-cooperative child did not start")
+	}
+	started := time.Now()
+	cancel()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled", err)
+		}
+		if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+			t.Fatalf("ForAny took %v after cancellation", elapsed)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("ForAny waited for a non-cooperative child indefinitely")
+	}
+}
+
 func TestCompositeContextErrorsRetainChildCauses(t *testing.T) {
 	cause := &review90Cause{message: "child failed at deadline"}
 	tests := []struct {

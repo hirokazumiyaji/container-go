@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// compositeDrainTimeout bounds collection of child results after a
+// composite context ends; non-cooperative children cannot hold the caller.
+const compositeDrainTimeout = 100 * time.Millisecond
+
 // AllStrategy waits for every strategy, in order.
 type AllStrategy struct {
 	strategies     []Strategy
@@ -164,20 +168,7 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 
 	var errs []error
 	remaining := len(s.strategies)
-	var terminalErr error
 	for remaining > 0 {
-		if terminalErr != nil {
-			// Built-in strategies honor the derived context. Drain their
-			// final errors so cancellation does not erase the causes that
-			// explain why readiness was not established.
-			err := <-results
-			remaining--
-			if err != nil {
-				errs = append(errs, err)
-			}
-			continue
-		}
-
 		select {
 		case err := <-results:
 			remaining--
@@ -185,22 +176,45 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				errs = append(errs, err)
 			}
 			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
-				terminalErr = terminal
-			} else if err == nil {
+				cancel()
+				childErrs := drainCompositeResults(results, remaining)
+				return errors.Join(append([]error{terminal}, append(errs, childErrs...)...)...)
+			}
+			if err == nil {
 				return nil
 			}
 		case <-waitCtx.Done():
-			terminalErr = anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline)
+			terminalErr := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline)
 			if terminalErr == nil {
 				// A custom Context may close Done without exposing Err.
 				terminalErr = context.Canceled
 			}
+			cancel()
+			childErrs := drainCompositeResults(results, remaining)
+			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
-	if terminalErr != nil {
-		errs = append([]error{terminalErr}, errs...)
-	}
 	return errors.Join(errs...)
+}
+
+func drainCompositeResults(results <-chan error, count int) []error {
+	if count <= 0 {
+		return nil
+	}
+	childErrs := make([]error, 0, count)
+	timer := time.NewTimer(compositeDrainTimeout)
+	defer timer.Stop()
+	for received := 0; received < count; received++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				childErrs = append(childErrs, err)
+			}
+		case <-timer.C:
+			return childErrs
+		}
+	}
+	return childErrs
 }
 
 func anyContextError(callerCtx, waitCtx context.Context, startupTimeout time.Duration, startupDeadline, callerDeadline time.Time, callerHasDeadline bool) error {

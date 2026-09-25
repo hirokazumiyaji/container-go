@@ -59,10 +59,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // or the context is cancelled. Close terminates the underlying CLI
 // process. A startup failure is returned by FollowLogs; after the stream
 // is returned, a terminal CLI failure is delivered by Read. The direct
-// CLI child is reaped; Unix process groups and Windows taskkill provide
-// only best-effort descendant termination while that child is owned, and
-// descendants are not reaped by this package. Once the child is reaped,
-// Close does not signal its former process group.
+// CLI child is reaped; Unix process groups provide best-effort descendant
+// termination while that child is owned. Windows uses the retained process
+// handle for direct-child termination; descendants are not reaped by this
+// package. Once the child is reaped, Close does not signal its former
+// process group.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {

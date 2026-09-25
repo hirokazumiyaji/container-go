@@ -58,6 +58,13 @@ func runCopyDockerTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Con
 	return runTestContainer(t, f, append([]Option{withEngine(dockerEngine{})}, opts...)...)
 }
 
+func skipIfCopyFileOpenUnsupported(t *testing.T) {
+	t.Helper()
+	if err := checkCopyFileOpenCapability(); err != nil {
+		t.Skipf("copy-out is not supported on this host: %v", err)
+	}
+}
+
 func TestCopyFileFromContainerRejectsAppleBackendBeforeCLI(t *testing.T) {
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "must not be copied"}
 	ctr := runTestContainer(t, f)
@@ -133,6 +140,7 @@ func TestCopyToContainerRejectsMissingHostPath(t *testing.T) {
 }
 
 func TestCopyFileFromContainerReadsAndCleansUp(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "result data"}
 	ctr := runCopyDockerTestContainer(t, f)
 
@@ -204,6 +212,7 @@ func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
 }
 
 func TestCopyFileFromContainerUsesCleanPOSIXPathAndFixedDestination(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
 	root := t.TempDir()
 	t.Setenv("TMPDIR", root)
 	t.Setenv("TMP", root)
@@ -242,6 +251,7 @@ func TestCopyFileFromContainerUsesCleanPOSIXPathAndFixedDestination(t *testing.T
 }
 
 func TestCopyFileFromContainerRejectsSymlinkWithoutReadingTarget(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
 	secretDir := t.TempDir()
 	secret := filepath.Join(secretDir, "host-secret")
 	if err := os.WriteFile(secret, []byte("host secret"), 0o600); err != nil {
@@ -278,6 +288,7 @@ func TestCopyFileFromContainerRejectsSymlinkWithoutReadingTarget(t *testing.T) {
 }
 
 func TestCopyFileFromContainerRejectsCopiedDirectory(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
 	f := &cpRunner{
 		fakeRunner: newTestRunner(),
 		materialize: func(dst string) error {

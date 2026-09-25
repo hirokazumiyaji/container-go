@@ -52,9 +52,10 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 
 // CopyFileFromContainer copies one regular file out of the running
 // container and returns its content. It is supported by the Docker
-// backend; Apple Container returns ErrCopyFileFromContainerUnsupported
-// before invoking its CLI because it cannot preserve and validate all
-// source file types safely. Close releases the temporary copy.
+// backend when the host can open copied files without following links or
+// blocking on special files. Apple Container, unsupported hosts, and
+// Windows Go 1.23 through 1.25 return ErrCopyFileFromContainerUnsupported
+// before invoking the copy-out CLI. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err

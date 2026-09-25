@@ -56,15 +56,19 @@ inspect JSON 形状):
 
 ## ファイル取り出しのバックエンド制限
 
-`CopyFileFromContainer` は Docker バックエンドでのみサポートされます。
-Docker の `cp` はコピーするオブジェクトの型を保持し、このライブラリは
-開く前に regular file であることを検証します。Apple Container の
+`CopyFileFromContainer` は、安全な file-open semantics を持つ host でのみ
+Docker バックエンド経由で利用できます。本ライブラリは materialize された
+結果を regular file として検証しますが、すべての Docker host がすべての
+container file type を表現できるとは主張しません。Apple Container の
 `container cp` には型を保持し symlink を追跡しない copy-out モードが
 なく、host 側の検証前に link や special file を dereference/consume する
 ことがあります。そのため Apple Container では CLI を起動せず
 `ErrCopyFileFromContainerUnsupported` を返します。no-follow と nonblocking
-な file open を持たない host でも同じ fail-closed error を返します。macOS で
-安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` を使ってください。
+な file open を持たない host でも同じ fail-closed error を返します。Windows
+では必要な Windows file flag を `os.OpenFile` が伝播しない Go 1.23 から
+1.25 が該当するため、Docker の copy-out には Go 1.26 以降を使ってください。
+macOS で安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` を
+使ってください。
 
 ## インストール
 

@@ -26,9 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
 - Make `CopyFileFromContainer` fail closed on Apple Container, whose CLI
-  has no type-preserving/no-follow copy-out mode; Docker retains the
-  host-side regular-file and no-follow checks, while unsupported host
-  open APIs also fail closed.
+  has no type-preserving/no-follow copy-out mode, and on Windows Go
+  1.23 through 1.25, whose `os.OpenFile` silently ignores the required
+  Windows file flags. On supported hosts, Docker retains the host-side
+  regular-file and no-follow checks; unsupported host open APIs also
+  fail closed.
 
 ## [0.2.0] - 2026-09-02
 

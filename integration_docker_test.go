@@ -4,12 +4,14 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -88,13 +90,22 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
 	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
-	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello docker" {
-		t.Errorf("round-tripped content = %q", round)
+	if runtime.GOOS == "windows" && errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		// Go 1.23-1.25 on Windows cannot pass no-follow/overlapped flags
+		// through os.OpenFile, so the method intentionally fails closed.
+		t.Logf("CopyFileFromContainer is unsupported on this Windows toolchain: %v", err)
+	} else {
+		if err != nil {
+			t.Fatalf("CopyFileFromContainer: %v", err)
+		}
+		defer rc.Close()
+		round, readErr := io.ReadAll(rc)
+		if readErr != nil {
+			t.Fatalf("read round-tripped content: %v", readErr)
+		}
+		if string(round) != "hello docker" {
+			t.Errorf("round-tripped content = %q", round)
+		}
 	}
 	assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 

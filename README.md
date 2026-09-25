@@ -76,16 +76,19 @@ See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Copy-out backend capability
 
-`CopyFileFromContainer` is supported only by the Docker backend. Docker's
-`cp` preserves the copied object type, and this library additionally
-requires a regular file before opening it. Apple Container's `container cp`
-has no type-preserving/no-follow copy-out mode; it can dereference or
-consume links and special files before host-side validation. On Apple
-Container, `CopyFileFromContainer` therefore returns
-`ErrCopyFileFromContainerUnsupported` without invoking the CLI. The same
-fail-closed error is returned on host platforms without no-follow and
-nonblocking file-open support. Use `CONTAINERGO_BACKEND=docker` on macOS
-when a safe copy-out is required.
+`CopyFileFromContainer` is supported only by the Docker backend when the
+host provides safe file-open semantics. This library verifies that the
+materialized result is a regular file and does not claim that every Docker
+host can represent every container file type. Apple Container's
+`container cp` has no type-preserving/no-follow copy-out mode; it can
+dereference or consume links and special files before host-side validation.
+On Apple Container, `CopyFileFromContainer` therefore returns
+`ErrCopyFileFromContainerUnsupported` without invoking the CLI. Hosts
+without no-follow and nonblocking file-open support fail closed with the
+same error. On Windows, this includes Go 1.23 through 1.25, whose
+`os.OpenFile` does not propagate the required Windows file flags; use Go
+1.26 or newer for Docker copy-out there. Use
+`CONTAINERGO_BACKEND=docker` on macOS when a safe copy-out is required.
 
 ## Connection endpoints
 

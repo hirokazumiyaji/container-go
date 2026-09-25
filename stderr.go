@@ -7,15 +7,14 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// cliErrorLinePrefixes are wrappers emitted by the supported CLIs around
-// their structured error messages. Removing only these prefixes lets the
-// backend matchers require an error kind to start a stderr line, rather
-// than finding the same words in an application or configuration message.
+// cliErrorLinePrefixes are backend-specific wrappers emitted by the
+// supported CLIs around their structured error messages. A generic
+// "Error: " prefix is intentionally absent: exec stderr may come from the
+// workload, so it is admitted only for operations known to emit it.
 var cliErrorLinePrefixes = []string{
 	"docker: ",
 	"container: ",
 	"error response from daemon: ",
-	"error: ",
 }
 
 // cliErrorContext is the small, structured part of a CLI failure that a
@@ -88,18 +87,22 @@ func commandTarget(args []string, operation string) string {
 			}
 		}
 	case "image inspect":
-		return firstPositional(args, 2)
-	case "inspect", "exec", "logs":
+		return firstPositional(args, 2, "--platform")
+	case "inspect":
 		return firstPositional(args, 1)
-	case "stop", "delete", "rm":
-		if len(args) > 1 {
-			return args[len(args)-1]
-		}
+	case "exec":
+		return firstPositional(args, 1, "--env-file", "--user", "--workdir")
+	case "logs":
+		return firstPositional(args, 1, "--tail", "--since", "-n")
+	case "stop":
+		return firstPositional(args, 1, "--time")
+	case "delete", "rm":
+		return firstPositional(args, 1)
 	}
 	return ""
 }
 
-func firstPositional(args []string, start int) string {
+func firstPositional(args []string, start int, valueOptions ...string) string {
 	for i := start; i < len(args); i++ {
 		arg := args[i]
 		if arg == "--" {
@@ -109,11 +112,14 @@ func firstPositional(args []string, start int) string {
 			return ""
 		}
 		if strings.HasPrefix(arg, "-") {
-			// These options carry a value in the argv forms emitted by
-			// this package.  Do not mistake that value for the target.
-			switch arg {
-			case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--platform":
-				i++
+			// Only options in this operation's emitted argv schema carry
+			// values. Do not mistake a value for an unrelated flag as the
+			// backend target.
+			for _, option := range valueOptions {
+				if arg == option {
+					i++
+					break
+				}
 			}
 			continue
 		}
@@ -122,18 +128,21 @@ func firstPositional(args []string, start int) string {
 	return ""
 }
 
-// cliErrorLines returns normalized, non-empty stderr lines.  Only known CLI
-// wrappers are removed; arbitrary application/configuration prefixes remain
-// visible and consequently cannot satisfy an anchored backend matcher.
+// cliErrorLines returns normalized, non-empty stderr lines. Only wrappers
+// verified for the selected binary and operation are removed. In
+// particular, Docker exec never treats a workload's generic "Error: " line
+// as backend evidence; arbitrary application/configuration prefixes remain
+// visible and cannot satisfy an anchored backend matcher.
 func cliErrorLines(err error) ([]string, bool) {
 	var cliErr *cli.CLIError
 	if !errors.As(err, &cliErr) {
 		return nil, false
 	}
 
+	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {
-		line = normalizeCLIErrorLine(line)
+		line = normalizeCLIErrorLine(line, allowGenericError)
 		if line != "" {
 			lines = append(lines, line)
 		}
@@ -141,7 +150,23 @@ func cliErrorLines(err error) ([]string, bool) {
 	return lines, true
 }
 
-func normalizeCLIErrorLine(line string) string {
+func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
+	operation := commandOperation(cliErr.Args)
+	if cliBinaryMatches(cliErr.Binary, "container") {
+		return true
+	}
+	if !cliBinaryMatches(cliErr.Binary, "docker") {
+		return false
+	}
+	switch operation {
+	case "inspect", "image inspect", "logs":
+		return true
+	default:
+		return false
+	}
+}
+
+func normalizeCLIErrorLine(line string, allowGenericError bool) string {
 	line = strings.ToLower(strings.TrimSpace(line))
 	for {
 		changed := false
@@ -151,6 +176,10 @@ func normalizeCLIErrorLine(line string) string {
 				changed = true
 				break
 			}
+		}
+		if allowGenericError && strings.HasPrefix(line, "error: ") {
+			line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+			changed = true
 		}
 		if !changed {
 			return line

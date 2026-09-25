@@ -72,6 +72,12 @@ func dockerProbeUnavailable(err error) bool {
 	if !ok || ctx.operation != "version" {
 		return false
 	}
+	// A reachable daemon can fail the client for TLS, certificate, SSH,
+	// proxy, authentication, or endpoint-configuration reasons. None of
+	// those failures prove that the daemon is stopped.
+	if cli.IsProbeConfigurationError(err) {
+		return false
+	}
 	lines, ok := cliErrorLines(err)
 	if !ok {
 		return false
@@ -80,7 +86,6 @@ func dockerProbeUnavailable(err error) bool {
 		for _, fragment := range []string{
 			"cannot connect to the docker daemon",
 			"is the docker daemon running",
-			"error during connect",
 			"connection refused",
 		} {
 			if strings.Contains(line, fragment) {

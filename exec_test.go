@@ -122,6 +122,43 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 }
 
+type operationSpecificExecStderrRunner struct {
+	inspectCalls int
+}
+
+func (r *operationSpecificExecStderrRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "exec":
+		return nil, nil, &cli.CLIError{
+			Binary: "docker", Args: args, ExitCode: 7,
+			Stderr: "Error: no such container: myctr",
+		}
+	case "inspect":
+		r.inspectCalls++
+		return nil, nil, errors.New("inspect endpoint is temporarily unavailable")
+	case "version":
+		return []byte("29.7"), nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestExecGenericErrorStderrIsNotDockerBackendEvidence(t *testing.T) {
+	runner := &operationSpecificExecStderrRunner{}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+
+	code, _, err := ctr.Exec(context.Background(), []string{"query"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want application result", err)
+	}
+	if code != 7 {
+		t.Errorf("code = %d, want 7", code)
+	}
+	if runner.inspectCalls != 0 {
+		t.Errorf("inspect calls = %d, want no classification probe for application stderr", runner.inspectCalls)
+	}
+}
+
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)

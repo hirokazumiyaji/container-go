@@ -496,6 +496,122 @@ func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
 	}
 }
 
+func TestCommandTargetUsesOperationSpecificArgvSchemas(t *testing.T) {
+	cases := []struct {
+		name      string
+		operation string
+		args      []string
+		want      string
+	}{
+		{
+			name:      "apple bounded logs short option value",
+			operation: "logs",
+			args:      []string{"logs", "-n", "1000", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "public logs option values",
+			operation: "logs",
+			args:      []string{"logs", "--tail", "50", "--since", "2026-09-25T00:00:00Z", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "exec option values",
+			operation: "exec",
+			args:      []string{"exec", "--env-file", "/tmp/env", "--user", "nobody", "--workdir", "/work", "myctr", "true"},
+			want:      "myctr",
+		},
+		{
+			name:      "image inspect option value",
+			operation: "image inspect",
+			args:      []string{"image", "inspect", "--platform", "linux/amd64", "redis:7-alpine"},
+			want:      "redis:7-alpine",
+		},
+		{
+			name:      "stop option value",
+			operation: "stop",
+			args:      []string{"stop", "--time", "10", "myctr"},
+			want:      "myctr",
+		},
+		{
+			name:      "run name equals value",
+			operation: "run",
+			args:      []string{"run", "--name=myctr", "redis:7-alpine"},
+			want:      "myctr",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := commandTarget(tc.args, tc.operation); got != tc.want {
+				t.Fatalf("commandTarget(%q) = %q, want %q", tc.args, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAppleLogsMissingAcceptsKnownBoundedWrapperVariants(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{
+			name:   "get failed leaf",
+			stderr: "Error: failed to get logs for container myctr: get failed: container myctr not found",
+			want:   true,
+		},
+		{
+			name:   "single open wrapper",
+			stderr: "Error: failed to get logs for container myctr: failed to open container logs: container with ID myctr not found",
+			want:   true,
+		},
+		{
+			name:   "open wrapping get failed",
+			stderr: "Error: failed to open container logs: get failed: container myctr not found",
+			want:   true,
+		},
+		{
+			name:   "bounded wrapper depth",
+			stderr: "Error: failed to get logs for container myctr: failed to open container logs: failed to open container logs: failed to open container logs: failed to open container logs: container with ID myctr not found",
+			want:   false,
+		},
+		{
+			name:   "wrong target",
+			stderr: "Error: failed to get logs for container myctr: get failed: container other not found",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &cli.CLIError{
+				Binary: "container", Args: []string{"logs", "-n", "1000", "myctr"},
+				ExitCode: 1, Stderr: tc.stderr,
+			}
+			if got := (appleEngine{}).containerMissing(err); got != tc.want {
+				t.Fatalf("containerMissing(%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestGenericErrorWrapperIsNotDockerExecEvidence(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker", Args: []string{"exec", "myctr", "true"},
+		ExitCode: 7, Stderr: "Error: no such container: myctr",
+	}
+	if (dockerEngine{}).containerMissing(err) {
+		t.Fatal("generic application Error: stderr was treated as Docker exec evidence")
+	}
+
+	inspectErr := &cli.CLIError{
+		Binary: "docker", Args: []string{"inspect", "myctr"},
+		ExitCode: 1, Stderr: "Error: no such object: myctr",
+	}
+	if !(dockerEngine{}).containerMissing(inspectErr) {
+		t.Fatal("Docker inspect's known Error: wrapper was not recognized")
+	}
+}
+
 type ambiguousOriginalRunner struct {
 	*fakeRunner
 	original     *cli.CLIError

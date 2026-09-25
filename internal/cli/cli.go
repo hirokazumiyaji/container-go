@@ -176,15 +176,25 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 			return errors.Join(err, probeErr)
 		}
 		// A permission/configuration failure in the original command is
-		// not evidence that the backend is down, even if the probe also
-		// fails. Preserve both diagnostics without adding the sentinel.
-		if isNonLivenessError(err) {
+		// not evidence that the backend is down when only the conservative
+		// default matcher is available. An explicit backend predicate is
+		// authoritative for broad original text, but definite permission,
+		// cancellation, launch, and endpoint-configuration failures still
+		// veto the sentinel.
+		if isNonLivenessError(err) &&
+			(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err)) {
 			return errors.Join(err, probeErr)
 		}
-		// A probe timeout is a bounded liveness-check timeout, not the
-		// caller's cancellation. Preserve the established sentinel while
-		// retaining both underlying errors.
-		if probeCtx.Err() == context.DeadlineExceeded {
+		// Probe-side transport configuration failures are not daemon-down
+		// evidence, even if a backend predicate would otherwise accept a
+		// broad connect fragment.
+		if IsProbeConfigurationError(probeErr) {
+			return errors.Join(err, probeErr)
+		}
+		// A returned timeout cause, while the caller remains active, is a
+		// bounded liveness-check timeout. probeCtx.Err alone races a
+		// definite error returned as the deadline fires.
+		if errors.Is(probeErr, context.DeadlineExceeded) && ctx.Err() == nil {
 			return errors.Join(
 				fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint),
 				err,
@@ -223,7 +233,13 @@ func defaultProbeUnavailable(err error) bool {
 	if !errors.As(err, &cliErr) {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
+	// Error includes wrapper and joined-branch text outside the first
+	// CLIError.Stderr. Requiring a reachable CLIError keeps arbitrary
+	// application errors from becoming liveness evidence on their own.
+	return defaultProbeUnavailableText(strings.ToLower(err.Error()))
+}
+
+func defaultProbeUnavailableText(s string) bool {
 	for _, fragment := range []string{
 		"cannot connect",
 		"connection refused",
@@ -231,7 +247,95 @@ func defaultProbeUnavailable(err error) bool {
 		"system is not running",
 		"daemon is not running",
 		"is the docker daemon running",
-		"error during connect",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsProbeConfigurationError reports concrete transport, authentication,
+// and endpoint-configuration diagnostics that must not be classified as a
+// stopped backend. The complete wrapped/joined error text is inspected so
+// instrumentation cannot hide a configuration failure in another branch.
+func IsProbeConfigurationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"tls",
+		"x509",
+		"certificate",
+		"ssh",
+		"proxy",
+		"config",
+		"authentication required",
+		"authentication failed",
+		"unauthorized",
+		"forbidden",
+		"credential",
+		"invalid context",
+		"unknown context",
+		"no such context",
+		"context not found",
+		"context does not exist",
+		"unknown flag",
+		"unknown option",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// isDefinitiveNonLivenessError identifies original failures that remain a
+// veto even when an explicit backend liveness predicate is available. Broad
+// words such as "configuration" are intentionally absent.
+func isDefinitiveNonLivenessError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
+		return true
+	}
+	s := strings.ToLower(err.Error())
+	for _, fragment := range []string{
+		"permission denied",
+		"operation not permitted",
+		"operation canceled",
+		"operation cancelled",
+		"eacces",
+		"eperm",
+		"access denied",
+		"not permitted",
+		"invalid config",
+		"config error",
+		"invalid configuration",
+		"invalid context",
+		"unknown context",
+		"no such context",
+		"context not found",
+		"context does not exist",
+		"unknown flag",
+		"unknown option",
+		"tls",
+		"x509",
+		"certificate",
+		"ssh",
+		"proxy",
+		"authentication required",
+		"authentication failed",
+		"unauthorized",
+		"forbidden",
+		"credential",
 	} {
 		if strings.Contains(s, fragment) {
 			return true
@@ -250,6 +354,9 @@ func isNonLivenessError(err error) bool {
 		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
 		return true
 	}
+	if IsProbeConfigurationError(err) {
+		return true
+	}
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
 		return containsNonLivenessText(strings.ToLower(err.Error()))
@@ -257,7 +364,9 @@ func isNonLivenessError(err error) bool {
 	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
 		return true
 	}
-	return containsNonLivenessText(strings.ToLower(cliErr.Stderr))
+	// Wrappers and errors.Join branches can carry additional diagnostics
+	// outside the first CLIError.Stderr.
+	return containsNonLivenessText(strings.ToLower(err.Error()))
 }
 
 // containsNonLivenessText also treats object/image absence diagnostics as

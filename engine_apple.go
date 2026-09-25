@@ -346,8 +346,11 @@ func appleExecMissingLine(line, target string) bool {
 	if !ok {
 		return false
 	}
-	rest = strings.TrimSpace(rest)
-	rest, ok = strings.CutPrefix(rest, "container ")
+	return appleContainerMissingLine(strings.TrimSpace(rest), target)
+}
+
+func appleContainerMissingLine(line, target string) bool {
+	rest, ok := strings.CutPrefix(line, "container ")
 	if !ok || !strings.HasSuffix(rest, " not found") {
 		return false
 	}
@@ -382,33 +385,44 @@ func appleStateMissingLine(line, target, wrapper string) bool {
 }
 
 func appleLogsMissingLine(line, target string) bool {
-	const prefix = "failed to get logs for container "
-	rest, ok := strings.CutPrefix(line, prefix)
-	if !ok {
-		return appleIDMissingLine(line, target)
-	}
-	rest = strings.TrimSpace(rest)
-	separator := strings.Index(rest, ":")
-	if separator < 0 {
-		return false
-	}
-	logID := strings.TrimSpace(rest[:separator])
-	if logID == "" || (target != "" && !sameCLITarget(logID, target)) {
-		return false
-	}
-	nested := strings.TrimSpace(rest[separator+1:])
-	// The 1.2/1.3 client wraps the API service's open failure once more
-	// before the CLI renders it. Accept only this known wrapper chain.
-	const openPrefix = "failed to open container logs: "
-	for range 3 {
-		if appleIDMissingLine(nested, target) || appleExecMissingLine(nested, target) {
-			return true
-		}
-		openRest, ok := strings.CutPrefix(nested, openPrefix)
-		if !ok {
+	const logsPrefix = "failed to get logs for container "
+	current := line
+	if rest, ok := strings.CutPrefix(current, logsPrefix); ok {
+		rest = strings.TrimSpace(rest)
+		separator := strings.Index(rest, ":")
+		if separator < 0 {
 			return false
 		}
-		nested = strings.TrimSpace(openRest)
+		logID := strings.TrimSpace(rest[:separator])
+		if logID == "" || (target != "" && !sameCLITarget(logID, target)) {
+			return false
+		}
+		current = strings.TrimSpace(rest[separator+1:])
+	}
+
+	const (
+		openPrefix = "failed to open container logs: "
+		getPrefix  = "get failed:"
+	)
+	// Client and API versions wrap the same absence in a small, known set
+	// of prefixes. Bound the depth so arbitrary nested diagnostics cannot
+	// grow the classifier without limit.
+	for range 3 {
+		if appleIDMissingLine(current, target) || appleExecMissingLine(current, target) {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(current, openPrefix); ok {
+			current = strings.TrimSpace(rest)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(current, getPrefix); ok {
+			current = strings.TrimSpace(rest)
+			if appleContainerMissingLine(current, target) {
+				return true
+			}
+			continue
+		}
+		return false
 	}
 	return false
 }

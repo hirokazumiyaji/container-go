@@ -193,6 +193,137 @@ func TestReaperUnregisterCancellationIsContextBounded(t *testing.T) {
 	}
 }
 
+func TestReaperOperationCancellationWhileWaitingDoesNotEnterLifecycle(t *testing.T) {
+	r := newReaper("unused", "delete")
+	r.entries = []reaperEntry{{id: "active"}}
+	if err := r.lockOperation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.unlockOperation()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- r.lockOperation(ctx) }()
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("waiting operation error = %v, want context cancellation", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("operation lock did not honor cancellation")
+	}
+	r.mu.Lock()
+	entries := len(r.entries)
+	r.mu.Unlock()
+	if entries != 1 {
+		t.Fatalf("entries after canceled wait = %d, want unchanged 1", entries)
+	}
+}
+
+func TestReaperCanceledRecoveryReplacesProcess(t *testing.T) {
+	oldRecoveryTimeout := reaperRecoveryTimeout
+	reaperRecoveryTimeout = time.Second
+	t.Cleanup(func() { reaperRecoveryTimeout = oldRecoveryTimeout })
+
+	spawns := 0
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd {
+		spawns++
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	if err := r.register("active", ""); err != nil {
+		t.Fatalf("initial register: %v", err)
+	}
+	r.mu.Lock()
+	old := r.process
+	r.mu.Unlock()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.recoverAndReplay(canceled, old); err != nil {
+		t.Fatalf("canceled recovery: %v", err)
+	}
+	if spawns != 2 {
+		t.Fatalf("reaper spawns = %d, want replacement after canceled recovery", spawns)
+	}
+	r.mu.Lock()
+	replaced := r.process != old
+	r.mu.Unlock()
+	if !replaced {
+		t.Fatal("canceled recovery retained the detached process")
+	}
+}
+
+func TestReaperCanceledReplayStillRespawns(t *testing.T) {
+	oldRecoveryTimeout := reaperRecoveryTimeout
+	reaperRecoveryTimeout = 2 * time.Second
+	t.Cleanup(func() { reaperRecoveryTimeout = oldRecoveryTimeout })
+
+	spawns := 0
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd {
+		spawns++
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	r.entries = []reaperEntry{{id: "active"}}
+	r.mu.Lock()
+	if err := r.spawnLocked(); err != nil {
+		r.mu.Unlock()
+		t.Fatalf("initial spawn: %v", err)
+	}
+	old := r.process
+	r.mu.Unlock()
+
+	killed := make(chan struct{})
+	var killOnce sync.Once
+	r.killProcess = func(process *reaperProcess) {
+		killOnce.Do(func() { close(killed) })
+		killReaperProcess(process)
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	// Keep the lifecycle owner busy while cancellation arrives after the
+	// old child has been detached. Recovery must still get a fresh budget.
+	if err := r.lockOperation(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer r.unlockOperation()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() { result <- r.recoverAndReplay(ctx, old) }()
+	select {
+	case <-killed:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("recovery did not begin shutting down the old process")
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("canceled replay recovery: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("canceled replay recovery did not finish")
+	}
+	if spawns != 2 {
+		t.Fatalf("reaper spawns = %d, want replacement after canceled replay", spawns)
+	}
+	r.mu.Lock()
+	replaced := r.process != old
+	r.mu.Unlock()
+	if !replaced {
+		t.Fatal("canceled replay did not replace the detached process")
+	}
+}
+
 func TestReaperDelayedRegistrationAndUnregisterDoNotSignalReapedProcess(t *testing.T) {
 	r := newReaper("unused", "delete")
 	t.Cleanup(func() {
@@ -255,8 +386,10 @@ func TestReaperDelayedRegistrationAndUnregisterDoNotSignalReapedProcess(t *testi
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, "sleep 30") || !strings.Contains(reaperScript, "kill -9") {
-		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
+	if !strings.Contains(reaperScript, `sleep "$killer_delay"`) ||
+		!strings.Contains(reaperScript, `kill -9 "$killer_target"`) ||
+		!strings.Contains(reaperScript, "stop_killer") {
+		t.Error("reaper script must bound each backend call with a cancellable sleep/kill helper")
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
@@ -277,6 +410,7 @@ func TestReaperDisablesMonitorMode(t *testing.T) {
 	logPath := filepath.Join(dir, "shellopts.log")
 	binPath := filepath.Join(dir, "container")
 	script := "#!/bin/sh\n" +
+		"/bin/sleep 0.05\n" +
 		"printf 'called:%s\\n' \"$SHELLOPTS\" >> " + logPath + "\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)

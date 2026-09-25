@@ -52,14 +52,69 @@ set +m
 bin="$1"
 sub="$2"
 key="$3"
+start_killer() {
+  killer_target="$1"
+  killer_delay="$2"
+  killer_ready=$(mktemp "${TMPDIR:-/tmp}/containergo-reaper.XXXXXX") || return 1
+  (
+    killer_sleeper=""
+    cleanup_killer() {
+      if [ -n "$killer_sleeper" ]; then
+        kill -9 "$killer_sleeper" 2>/dev/null || true
+        wait "$killer_sleeper" 2>/dev/null || true
+      fi
+      killer_sleeper=""
+      rm -f "$killer_ready" 2>/dev/null || true
+    }
+    trap 'cleanup_killer; exit 0' 0 1 2 15
+    sleep "$killer_delay" &
+    killer_sleeper="$!"
+    printf '%s\n' "$killer_sleeper" >"$killer_ready" || exit 1
+    wait "$killer_sleeper"
+    killer_sleeper=""
+    kill -9 "$killer_target" 2>/dev/null || true
+  ) &
+  killer="$!"
+  killer_attempts=0
+  while [ ! -s "$killer_ready" ]; do
+    killer_attempts=$((killer_attempts + 1))
+    if ! kill -0 "$killer" 2>/dev/null; then
+      wait "$killer" 2>/dev/null || true
+      rm -f "$killer_ready"
+      return 1
+    fi
+    if [ "$killer_attempts" -ge 1000 ]; then
+      kill "$killer" 2>/dev/null || true
+      wait "$killer" 2>/dev/null || true
+      rm -f "$killer_ready"
+      return 1
+    fi
+    /bin/sleep 0.001
+  done
+  if ! IFS= read -r killer_sleeper <"$killer_ready"; then
+    kill "$killer" 2>/dev/null || true
+    wait "$killer" 2>/dev/null || true
+    rm -f "$killer_ready"
+    return 1
+  fi
+  rm -f "$killer_ready"
+}
+stop_killer() {
+  [ -n "${1:-}" ] || return 0
+  kill "$1" 2>/dev/null || true
+  wait "$1" 2>/dev/null || true
+}
 run_with_timeout() {
   "$@" >/dev/null 2>&1 & pid=$!
-  (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
+  if ! start_killer "$pid" 30; then
+    kill -9 "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+  fi
   wait "$pid" 2>/dev/null
   rc=$?
-  kill "$killer" 2>/dev/null
-  wait "$killer" 2>/dev/null
-  return $rc
+  stop_killer "$killer"
+  return "$rc"
 }
 awk '
   substr($0, 1, 2) == "+ " {
@@ -81,7 +136,7 @@ awk '
   target="$id"
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
+    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; if ! start_killer "$pid" 10; then kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1; fi; wait "$pid" 2>/dev/null; rc=$?; stop_killer "$killer"; exit "$rc") || { rm -f "$tmp"; continue; }
     got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
@@ -103,11 +158,15 @@ const (
 
 // Reaper writes are deliberately short-lived operations. A reaper reader
 // can stop draining its stdin while a backend call is stalled; the parent
-// must not turn that condition into a process-wide lock convoy.
+// must not turn that condition into a process-wide lock convoy. Waiting for
+// the operation gate has its own budget so queued lifecycle work does not
+// consume the budget for the actual write or replay.
 var (
-	reaperWriteTimeout       = 500 * time.Millisecond
-	reaperProcessStopTimeout = time.Second
-	reaperOperationTimeout   = 5 * time.Second
+	reaperWriteTimeout         = 500 * time.Millisecond
+	reaperProcessStopTimeout   = time.Second
+	reaperOperationLockTimeout = 30 * time.Second
+	reaperOperationTimeout     = 5 * time.Second
+	reaperRecoveryTimeout      = 5 * time.Second
 )
 
 var (
@@ -115,6 +174,51 @@ var (
 	errReaperSpawnFailed   = errors.New("reaper: giving up after repeated spawn failures")
 	errReaperWriteTimeout  = errors.New("reaper: pipe write timed out")
 )
+
+type reaperOperationLock struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (l *reaperOperationLock) init() {
+	l.once.Do(func() { l.gate = make(chan struct{}, 1) })
+}
+
+// Lock preserves the package-test helper shape while using the same
+// context-aware gate as lifecycle operations.
+func (l *reaperOperationLock) Lock() {
+	l.init()
+	l.gate <- struct{}{}
+}
+
+func (l *reaperOperationLock) Unlock() {
+	<-l.gate
+}
+
+func (l *reaperOperationLock) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.init()
+	select {
+	case l.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-l.gate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (r *reaper) lockOperation(ctx context.Context) error {
+	return r.opMu.LockContext(ctx)
+}
+
+func (r *reaper) unlockOperation() {
+	r.opMu.Unlock()
+}
 
 // breQuote escapes a literal for use inside the reaper's sed basic
 // regular expression, so the label key's dots match only dots.
@@ -185,10 +289,9 @@ type reaper struct {
 	subcommand string
 
 	// opMu serializes lifecycle transitions while mu protects the
-	// in-memory state. Pipe writes and child shutdown happen with opMu
-	// held but never with mu held, so a stalled reader cannot block
-	// unrelated state inspection or state-mutex users indefinitely.
-	opMu sync.Mutex
+	// in-memory state. Acquisition is context-aware; pipe writes and child
+	// shutdown happen with the gate held but never with mu held.
+	opMu reaperOperationLock
 	mu   sync.Mutex
 
 	// process is the current child. The cmd/stdin/exited aliases are kept
@@ -238,10 +341,14 @@ func (r *reaper) register(id, creation string) error {
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer lockCancel()
+	if err := r.lockOperation(lockCtx); err != nil {
+		return err
+	}
+	defer r.unlockOperation()
 	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
 	defer cancel()
-	r.opMu.Lock()
-	defer r.opMu.Unlock()
 	return r.registerContext(ctx, reaperEntry{id: id, creation: creation})
 }
 
@@ -395,10 +502,14 @@ func (r *reaper) unregister(id, creation string) error {
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer lockCancel()
+	if err := r.lockOperation(lockCtx); err != nil {
+		return err
+	}
+	defer r.unlockOperation()
 	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
 	defer cancel()
-	r.opMu.Lock()
-	defer r.opMu.Unlock()
 	return r.unregisterContext(ctx, reaperEntry{id: id, creation: creation})
 }
 
@@ -471,8 +582,13 @@ func (r *reaper) removeCompletedLocked(entry reaperEntry) {
 
 // recoverAndReplay detaches the failed process before doing any signal
 // work. Once detached, a later lifecycle operation cannot accidentally
-// signal the old PID/PGID, even if shutdown itself takes time.
-func (r *reaper) recoverAndReplay(ctx context.Context, process *reaperProcess) error {
+// signal the old PID/PGID, even if shutdown itself takes time. Recovery
+// gets a fresh budget: a caller cancellation (including expiry while
+// waiting for the operation gate) must not leave active entries without a
+// watchdog.
+func (r *reaper) recoverAndReplay(_ context.Context, process *reaperProcess) error {
+	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+	defer cancel()
 	if detached := r.detachProcess(process); detached != nil {
 		if err := r.stopProcess(detached, ctx); err != nil {
 			return err
@@ -797,8 +913,8 @@ func (r *reaper) closeStdin() {
 // is reaped, so the next write deterministically fails. It uses the same
 // detach-before-signal path as production recovery.
 func (r *reaper) killForTest() {
-	r.opMu.Lock()
-	defer r.opMu.Unlock()
+	_ = r.lockOperation(context.Background())
+	defer r.unlockOperation()
 	process := r.detachProcess(nil)
 	if process == nil {
 		return

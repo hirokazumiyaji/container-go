@@ -61,6 +61,37 @@ func wrapInspectTargetNotFound(err error) error {
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
 }
 
+func isBareContainerNotFound(err error) bool {
+	if err == nil || !errors.Is(err, ErrContainerNotFound) {
+		return false
+	}
+	found := false
+	conflict := false
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil || conflict {
+			return
+		}
+		if cur == ErrContainerNotFound {
+			found = true
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+			return
+		}
+		conflict = true
+	}
+	walk(err)
+	return found && !conflict
+}
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. It is retained for callers that do not have an engine context;
 // the concrete backend and command still have to pass their own matcher.
@@ -68,16 +99,7 @@ func isNotFound(err error) bool {
 	if err == nil {
 		return false
 	}
-	if errors.Is(err, ErrContainerNotFound) {
-		branches := backendCLIErrorBranches(err, "")
-		if hasNonCLIDefinitiveErrorText(err) {
-			return false
-		}
-		for _, branch := range branches {
-			if cli.IsDefinitiveNonLivenessError(branch.cause) {
-				return false
-			}
-		}
+	if isBareContainerNotFound(err) {
 		return true
 	}
 	branches := backendCLIErrorBranches(err, "")
@@ -110,16 +132,7 @@ func isNotFoundFor(eng engine, err error) bool {
 	if eng == nil {
 		return isNotFound(err)
 	}
-	if errors.Is(err, ErrContainerNotFound) {
-		branches := backendCLIErrorBranches(err, eng.binary())
-		if hasNonCLIDefinitiveErrorText(err) {
-			return false
-		}
-		for _, branch := range branches {
-			if cli.IsDefinitiveNonLivenessError(branch.cause) {
-				return false
-			}
-		}
+	if isBareContainerNotFound(err) {
 		return true
 	}
 	branches := backendCLIErrorBranches(err, eng.binary())
@@ -142,21 +155,10 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 	if eng == nil {
 		return isNotFound(err)
 	}
-	selected := matchingCLIErrorBranches(err, eng.binary(), operation, targets...)
-	if errors.Is(err, ErrContainerNotFound) {
-		if len(selected) == 0 {
-			return true
-		}
-		if hasNonCLIDefinitiveErrorText(err) {
-			return false
-		}
-		for _, branch := range selected {
-			if cli.IsDefinitiveNonLivenessError(branch.cause) {
-				return false
-			}
-		}
+	if isBareContainerNotFound(err) {
 		return true
 	}
+	selected := matchingCLIErrorBranches(err, eng.binary(), operation, targets...)
 	if len(selected) == 0 {
 		return false
 	}

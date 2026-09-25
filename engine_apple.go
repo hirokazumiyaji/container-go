@@ -16,16 +16,17 @@ import (
 type appleEngine struct{}
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Matchers are both command- and binary-aware. Apple uses different
-// ContainerizationError messages for the client-side inspect path and
-// for the API-client paths used by exec/stop/delete/logs:
+// Matchers are both command- and binary-aware. Apple 1.3 renders typed
+// ContainerizationError values (notFound/internalError with nested causes),
+// while older releases used the plain forms below:
 //   - inspect: "container not found: …"
 //   - exec: "get failed: container <id> not found"
 //   - stop/delete: "container with ID <id> not found" (often wrapped by
 //     "failed to stop/delete container: …")
 //   - logs: "failed to get logs for container <id>: …"
 //
-// Generic application output containing "not found" is not a backend match.
+// Generic application output containing "not found" is not a backend match;
+// an application-prefixed typed message is rejected as well.
 const (
 	appleStderrNameConflict  = "container with id"
 	appleStderrAlreadyExists = "already exists"
@@ -270,11 +271,22 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 // imageMissing matches only Apple's image-inspect error. A pull failure
 // with similar text is not evidence that the local image check was missing.
 func (appleEngine) imageMissing(err error) bool {
-	for _, branch := range backendCLIErrorBranches(err, "container") {
-		if branch.ctx.operation != "image inspect" {
+	return (appleEngine{}).imageMissingForTarget(err, "")
+}
+
+func (appleEngine) imageMissingForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "container")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "image inspect" || !exactImageTarget(branch, target) {
 			continue
 		}
 		if hasBranchImageLine(branch, appleStderrImageNotFound, branch.ctx.target, true) {
+			return true
+		}
+		if hasAppleTypedImageLine(branch, branch.ctx.target) {
 			return true
 		}
 	}
@@ -358,12 +370,25 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 // create/run command. Other commands may legitimately contain the words
 // "already" or "exists" in application/configuration diagnostics.
 func (appleEngine) nameConflict(err error) bool {
-	for _, branch := range backendCLIErrorBranches(err, "container") {
-		if branch.ctx.operation != "run" {
+	return (appleEngine{}).nameConflictForTarget(err, "")
+}
+
+func (appleEngine) nameConflictForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "container")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "run" || !exactBranchTarget(branch, target) {
 			continue
 		}
 		if hasBranchLine(branch, func(line string) bool {
 			return appleNameConflictLine(line, branch.ctx.target)
+		}) {
+			return true
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			return appleTypedNameConflictLine(line, branch.ctx.target)
 		}) {
 			return true
 		}
@@ -391,6 +416,11 @@ func appleNameConflictLine(line, target string) bool {
 // prints "container not found" cannot be mistaken for a backend result.
 func (appleEngine) containerMissing(err error) bool {
 	for _, branch := range backendCLIErrorBranches(err, "container") {
+		if hasBranchLine(branch, func(line string) bool {
+			return appleTypedContainerMissingLine(line, branch.ctx.target, branch.ctx.operation)
+		}) {
+			return true
+		}
 		switch branch.ctx.operation {
 		case "inspect":
 			if hasBranchLine(branch, func(line string) bool {

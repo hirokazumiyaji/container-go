@@ -60,12 +60,27 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperAcceptsDockerIDAndCleansUpOnEOF(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	uid := strings.Repeat("ab", 32)
+	r := newReaper(bin, "rm")
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("register Docker ID: %v", err)
+	}
+	apple := newReaper(bin, "delete")
+	if err := apple.register(uid, ""); err == nil {
+		t.Fatal("Apple reaper accepted a Docker-only ID")
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
 
-	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
+	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading", strings.Repeat("A", 64)} {
 		if err := r.register(id, ""); err == nil {
 			t.Errorf("register(%q): want error", id)
 		}

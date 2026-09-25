@@ -185,9 +185,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			bin = cfg.eng.binary()
 		}
 		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
 		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
 	}
 
@@ -227,7 +227,7 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // carrying this process's managed+session labels is removed. When the
 // creation generation is known it must also match.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
-	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
+	if cfg.eng.nameConflictForTarget(runErr, cfg.name) || cfg.eng.nameConflictForTarget(classified, cfg.name) {
 		return
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)

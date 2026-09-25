@@ -88,6 +88,10 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+func validReaperID(subcommand, id string) bool {
+	return nameRE.MatchString(id) || (subcommand == "rm" && dockerIDRE.MatchString(id))
+}
+
 type reaperEntry struct {
 	id       string
 	creation string
@@ -117,7 +121,7 @@ func newReaper(binary, subcommand string) *reaper {
 // ID from creationLabel; empty skips the generation check for
 // backward compatibility.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !validReaperID(r.subcommand, id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
@@ -218,12 +222,13 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+// process-wide reaper for its backend binary. Reaper trouble never fails
+// container startup, but is logged and returned for diagnostics. The reaper
+// needs /bin/sh, so on Windows this is a no-op and cleanup relies on the
+// normal paths.
+func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
 	if runtime.GOOS == "windows" {
-		return
+		return nil
 	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[binary]
@@ -232,5 +237,9 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed for %q: %v", id, err)
+		return err
+	}
+	return nil
 }

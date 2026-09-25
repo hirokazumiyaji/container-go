@@ -87,7 +87,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+			if cfg.eng.nameConflictForTarget(createErr, cfg.name) || createRaceMissingForTarget(createErr, cfg.name) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -154,8 +154,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := classifyErrorFor(ctx, cfg.runner, err, cfg.eng, "run", cfg.name)
-		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
-			createRaceMissing(err) || createRaceMissing(classified) {
+		if cfg.eng.nameConflictForTarget(err, cfg.name) || cfg.eng.nameConflictForTarget(classified, cfg.name) ||
+			createRaceMissingForTarget(err, cfg.name) || createRaceMissingForTarget(classified, cfg.name) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
 			return nil, err
@@ -236,12 +236,20 @@ func namedContainer(cfg *config, id string) *Container {
 // it is commonly emitted by the application process and must remain an
 // ordinary original error.
 func createRaceMissing(err error) bool {
-	for _, branch := range backendCLIErrorBranches(err, "container") {
-		if branch.ctx.operation != "run" {
+	return createRaceMissingForTarget(err, "")
+}
+
+func createRaceMissingForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "container")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "run" || !exactBranchTarget(branch, target) {
 			continue
 		}
 		if hasBranchLine(branch, func(line string) bool {
-			if appleIDMissingLine(line, branch.ctx.target) {
+			if appleTypedCreateRaceMissingLine(line, branch.ctx.target) || appleIDMissingLine(line, branch.ctx.target) {
 				return true
 			}
 			for _, wrapper := range []string{

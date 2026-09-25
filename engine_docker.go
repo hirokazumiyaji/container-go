@@ -462,8 +462,16 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 // imageMissing matches only Docker's image-inspect response. Pull errors
 // and arbitrary application output are not local-store absence evidence.
 func (dockerEngine) imageMissing(err error) bool {
-	for _, branch := range backendCLIErrorBranches(err, "docker") {
-		if branch.ctx.operation != "image inspect" {
+	return (dockerEngine{}).imageMissingForTarget(err, "")
+}
+
+func (dockerEngine) imageMissingForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "docker")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "image inspect" || !exactImageTarget(branch, target) {
 			continue
 		}
 		if hasBranchImageLine(branch, dockerStderrNoSuchImage, branch.ctx.target, true) {
@@ -497,8 +505,16 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 // create/run command. A delete or application command containing the same
 // words is not evidence that this library lost a name race.
 func (dockerEngine) nameConflict(err error) bool {
-	for _, branch := range backendCLIErrorBranches(err, "docker") {
-		if branch.ctx.operation != "run" {
+	return (dockerEngine{}).nameConflictForTarget(err, "")
+}
+
+func (dockerEngine) nameConflictForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "docker")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "run" || !exactBranchTarget(branch, target) {
 			continue
 		}
 		if hasBranchLine(branch, func(line string) bool {

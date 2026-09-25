@@ -143,6 +143,22 @@ func matchingCLIErrorBranches(err error, backend, operation string, targets ...s
 	return targetless
 }
 
+func exactBranchTarget(branch cliErrorBranch, target string) bool {
+	return target == "" || (strings.TrimSpace(branch.ctx.target) != "" && sameCLITarget(branch.ctx.target, target))
+}
+
+func exactImageTarget(branch cliErrorBranch, target string) bool {
+	return target == "" || (strings.TrimSpace(branch.ctx.target) != "" && strings.TrimSpace(branch.ctx.target) == strings.TrimSpace(target))
+}
+
+func ambiguousBranchTargets(branches []cliErrorBranch) bool {
+	seen := make(map[string]struct{}, len(branches))
+	for _, branch := range branches {
+		seen[strings.ToLower(strings.TrimSpace(branch.ctx.target))] = struct{}{}
+	}
+	return len(seen) > 1
+}
+
 func matchingCLIErrorBranch(err error, backend, operation string, targets ...string) (cliErrorBranch, bool) {
 	branches := matchingCLIErrorBranches(err, backend, operation, targets...)
 	if len(branches) == 0 {

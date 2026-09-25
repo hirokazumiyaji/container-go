@@ -69,6 +69,7 @@ type engine interface {
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
+	nameConflictForTarget(err error, target string) bool
 	// containerMissing reports whether a backend command's diagnostic
 	// proves that the addressed container is absent.
 	containerMissing(err error) bool
@@ -91,6 +92,7 @@ type engine interface {
 	// imageMissing reports whether a failed image inspect means the
 	// image is not in the local store.
 	imageMissing(err error) bool
+	imageMissingForTarget(err error, target string) bool
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool

@@ -36,6 +36,28 @@ func (r *issue104FollowupPruneRunner) Run(_ context.Context, args ...string) ([]
 	return nil, nil, nil
 }
 
+func TestExec126ShortcutUsesSelectedCurrentBranch(t *testing.T) {
+	unrelatedStatus := &cli.CLIError{
+		Binary: "container", Args: []string{"exec", "other", "app"}, ExitCode: 126,
+		Stderr: "permission denied: unrelated workload",
+	}
+	selected := &cli.CLIError{
+		Binary: "container", Args: []string{"exec", "myctr", "app"}, ExitCode: 23,
+		Stderr: "permission denied: current workload",
+	}
+	f := &issue104JoinedExecRunner{
+		fakeRunner: newTestRunner(),
+		err:        errors.Join(unrelatedStatus, selected),
+		stderr:     selected.Stderr,
+	}
+	ctr := runTestContainer(t, f)
+	ctr.runner = f
+	code, _, err := ctr.Exec(context.Background(), []string{"app"})
+	if err != nil || code != 23 {
+		t.Fatalf("Exec = %d/%v, want selected current workload result", code, err)
+	}
+}
+
 func TestPruneDeleteNotFoundIsOperationAndTargetSpecific(t *testing.T) {
 	permission := &cli.CLIError{
 		Binary: "docker", Args: []string{"rm", "--force", "target"}, ExitCode: 1,
@@ -125,6 +147,28 @@ func TestOperationSpecificAbsenceHonorsSentinelWithoutCLIError(t *testing.T) {
 	err := fmt.Errorf("wrapped: %w", ErrContainerNotFound)
 	if !isNotFoundForOperation(dockerEngine{}, err, "rm", "target") {
 		t.Fatal("operation-specific absence ignored ErrContainerNotFound sentinel")
+	}
+}
+
+func TestContainerNotFoundSentinelDoesNotOverrideConflictingBranches(t *testing.T) {
+	conflicting := errors.Join(ErrContainerNotFound, errors.New("application failed"))
+	if isNotFoundForOperation(dockerEngine{}, conflicting, "rm", "target") ||
+		isNotFoundFor(dockerEngine{}, conflicting) {
+		t.Fatal("bare sentinel fast path overrode a conflicting joined failure")
+	}
+	unrelatedAbsence := errors.Join(ErrContainerNotFound, &cli.CLIError{
+		Binary: "docker", Args: []string{"inspect", "other"}, ExitCode: 1,
+		Stderr: "Error: no such object: other",
+	})
+	if isNotFoundForOperation(dockerEngine{}, unrelatedAbsence, "rm", "target") {
+		t.Fatal("sentinel plus unrelated inspect absence was treated as rm absence")
+	}
+	matchingAbsence := errors.Join(ErrContainerNotFound, &cli.CLIError{
+		Binary: "docker", Args: []string{"rm", "--force", "target"}, ExitCode: 1,
+		Stderr: "Error response from daemon: No such container: target",
+	})
+	if !isNotFoundForOperation(dockerEngine{}, matchingAbsence, "rm", "target") {
+		t.Fatal("matching rm absence evidence was not honored with sentinel")
 	}
 }
 

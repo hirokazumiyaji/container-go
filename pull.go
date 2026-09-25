@@ -123,7 +123,7 @@ func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform 
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if err != nil {
-		if eng.imageMissing(err) {
+		if eng.imageMissingForTarget(err, image) {
 			return false, nil
 		}
 		return false, classifyErrorFor(ctx, r, err, eng, commandOperation(eng.imageInspectArgs(image, platform)), image)

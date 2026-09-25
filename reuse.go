@@ -13,10 +13,21 @@ import (
 
 // reuseFlights collapses concurrent WithReuse get-or-create calls that
 // share a name into one ensure operation. Each caller still applies its
-// own compatibility check and wait strategy afterward.
+// own image pull, file copy, compatibility check, and wait strategy.
 var reuseFlights flightGroup[*Container]
 
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
+	// PullAlways is a per-caller side effect, even when the container is
+	// already running. Do it before joining the shared ensure flight so
+	// concurrent callers aggregate the pull instead of silently inheriting
+	// the leader's result.
+	if cfg.pullPolicy == PullAlways {
+		if err := cfg.ensureImage(ctx, image); err != nil {
+			return nil, err
+		}
+		cfg.imagePrepared = true
+	}
+
 	key := cfg.eng.name() + "\x00" + cfg.name
 	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
 		// Shared ensure must not die with the first caller's cancel;
@@ -30,7 +41,11 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 
 	info := base.info
-	if info == nil {
+	// A PullAlways caller may have joined an ensure started before its
+	// pull completed. Re-inspect in that case so the compatibility check
+	// observes the post-pull container identity, and never replace a
+	// running shared container on a mismatch.
+	if info == nil || cfg.pullPolicy == PullAlways {
 		info, err = inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			return nil, err
@@ -51,6 +66,15 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
 	}
+	// The leader's files are copied in reuseCreate. Every attaching
+	// caller applies its own files after the shared generation is known.
+	// A failed attach copy is reported without deleting the shared
+	// container, which may be serving other callers.
+	if !cfg.reusedCreated {
+		if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
+			return nil, err
+		}
+	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
@@ -58,8 +82,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 }
 
 // reuseEnsureContainer creates or attaches to the named container
-// without per-caller wait or port compatibility checks. Those run in
-// reuseRun so every concurrent caller applies its own configuration.
+// without per-caller pull, file copy, wait, or port compatibility
+// checks. Those run in reuseRun so every concurrent caller applies its
+// own configuration.
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	recreated := false
 
@@ -81,6 +106,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// not be cut off after reuseAttachTimeout.
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
+				cfg.reusedCreated = true
 				return ctr, nil
 			}
 			// nameConflict: another process won create. createRaceMissing
@@ -148,8 +174,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	// even when the caller's context carries a tighter attach deadline.
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
-	if err := cfg.ensureImage(runCtx, image); err != nil {
-		return nil, err
+	if !cfg.imagePrepared {
+		if err := cfg.ensureImage(runCtx, image); err != nil {
+			return nil, err
+		}
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
@@ -178,13 +206,20 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
 		return nil, err
 	}
-	for _, f := range cfg.files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
-		}
+	if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
+		_ = ctr.Terminate(context.WithoutCancel(ctx))
+		return nil, err
 	}
 	return ctr, nil
+}
+
+func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
+	for _, f := range files {
+		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
+		}
+	}
+	return nil
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a

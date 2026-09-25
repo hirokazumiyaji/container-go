@@ -299,10 +299,27 @@ volumes must be named, and their lifecycle belongs to the caller.
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. `env`,
-`cmd`, and `mounts` differences attach silently to the existing
-container by design; callers needing isolation should use distinct
-names or reset state via `Exec`.
+narrow: image reference and declared/published ports only. `PullAlways`
+is a per-caller operation: it fetches before the shared ensure flight,
+including for an attach, and a pull failure is returned. The image is
+re-inspected after that fetch. A running reused container is never
+recreated on a post-pull mismatch; the caller gets the existing
+mismatch error instead (digest-pinned requests must match exactly).
+Mutable tags refresh the local store but do not replace an already-running
+shared container; callers that need exact image identity should pin a
+digest. `PullMissing` and `PullNever` do not add an attach-only fetch.
+
+`WithFiles` is also per-caller. The creation leader copies its files
+before the shared handle is published, and every waiter/attach caller
+copies its own files before its wait strategy runs. A failed attach copy
+returns an error but leaves the shared container intact because other
+callers may own it. Copies to the same path are shared-state mutations;
+concurrent callers should avoid conflicting targets. Creation-only options
+(`env`, `cmd`, `entrypoint`,
+`labels`, `mounts`, resource/user/workdir/network/platform settings)
+and `reuseGroup` are intentionally not applied to an existing
+container; callers needing isolation should use distinct names or reset
+state via `Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On

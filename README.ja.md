@@ -171,7 +171,17 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
-- image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
+- image / port が既存と不一致なら分かりやすいエラーを返す。
+  `PullAlways` は reuse を解決する前にローカル image を更新し、container が既に running でも pull failure を隠さない。
+  pull 後に running container の image が一致しなければ、共有 container を再作成せずエラーにする。digest を指定している場合は digest 不一致も含む。
+  mutable tag はローカル store を更新するが、既に running の共有 container は置き換えない。厳密な image identity が必要なら digest を固定する。
+  `PullMissing` と `PullNever` は attach 専用に image を fetch しない。
+- `WithFiles` は attach する caller も含めて reuse の全 caller で copy する。
+  attach 中の copy failure は shared container を削除せずにエラーを返す。
+  同じ path への copy は shared state の変更なので、並行 caller は競合する target を避ける。
+  `WithEnv` / `WithCmd` / `WithEntrypoint` / `WithLabels` / `WithMounts` / `WithCPUs` / `WithMemory` / `WithUser` / `WithWorkingDir` / `WithNetwork` / `WithPlatform` は作成専用 option として attach 時に意図的に無視する。
+  必要な場合は別 name を使う。
+  `WithReuseGroup` は新規作成・再作成時の tag 付けのみで、reuse の compatibility key には含めない。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。

@@ -202,9 +202,24 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Only image and ports are compared; `env` / `cmd` / `mounts`
-  differences attach silently by design (use distinct names when they
-  matter).
+  `PullAlways` refreshes the local image before reuse is resolved, and
+  its pull failure is returned even when the container is already
+  running. A running reused container is never recreated after a
+  post-pull mismatch; the call fails instead, including when a requested
+  digest differs from the container image. Mutable tag requests refresh
+  the local store but do not replace an already-running shared container;
+  pin a digest when the exact image identity matters. `PullMissing` and
+  `PullNever` do not add an attach-only fetch.
+- `WithFiles` is copied for every reuse caller, including attach callers.
+  A failed attach copy returns an error without deleting the shared
+  container. Copies to the same path are shared-state mutations, so
+  concurrent callers should avoid conflicting targets. Creation-only
+  options — `WithEnv`, `WithCmd`,
+  `WithEntrypoint`, `WithLabels`, `WithMounts`, `WithCPUs`, `WithMemory`,
+  `WithUser`, `WithWorkingDir`, `WithNetwork`, and `WithPlatform` — are
+  intentionally ignored on attach; use distinct names when they matter.
+  `WithReuseGroup` only tags a newly created/recreated generation and
+  is not part of the reuse compatibility key.
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

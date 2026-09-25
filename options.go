@@ -37,6 +37,14 @@ type config struct {
 	reuse        bool
 	reuseGroup   string
 	creation     string
+
+	// imagePrepared is set when a reuse caller has completed its own
+	// PullAlways fetch before entering the shared ensure flight.
+	imagePrepared bool
+	// reusedCreated is set only on the caller whose flight callback
+	// created the container. Other callers still apply their own files
+	// after attaching to the shared generation.
+	reusedCreated bool
 }
 
 func newConfig() *config {
@@ -121,10 +129,13 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 
 // WithReuse enables process- and cross-process get-or-create for a
 // stable WithName. Concurrent Run calls with the same name share one
-// container; readiness strategies always re-run against it. Returned
-// handles are shared: Cleanup, TerminateContainer, and the watchdog
-// reaper do not remove them. Explicit Terminate still does — only use
-// it when no other process still needs the container.
+// container; readiness strategies always re-run against it. WithFiles
+// is copied for every caller, and PullAlways is fetched for every
+// caller before attach. Creation-only options are intentionally
+// ignored when attaching; use distinct names when those differences
+// matter. Returned handles are shared: Cleanup, TerminateContainer,
+// and the watchdog reaper do not remove them. Explicit Terminate still
+// does — only use it when no other process still needs the container.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

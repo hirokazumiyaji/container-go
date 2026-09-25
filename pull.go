@@ -15,7 +15,8 @@ const (
 	// backend's local store. This is the default and mirrors the
 	// implicit pull Run always did before.
 	PullMissing PullPolicy = iota
-	// PullAlways fetches the image on every Run.
+	// PullAlways fetches the image on every Run, including a
+	// WithReuse attach before the shared container is returned.
 	PullAlways
 	// PullNever never fetches; Run fails before starting when the
 	// image is absent.
@@ -30,7 +31,8 @@ const (
 )
 
 // WithPullPolicy sets when Run fetches the image. The default is
-// PullMissing.
+// PullMissing. PullAlways is honored for every WithReuse caller,
+// including attach callers.
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {

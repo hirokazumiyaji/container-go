@@ -193,14 +193,18 @@ holding an Exec call open.
 On backend, timeout, or cancellation errors, Exec retains partial
 stdout+stderr in its reader and returns the classified error; a
 CLI-reported exit status, when available, remains in the first return
-value. A context error that terminates the local CLI is classified
-independently of that status. This matters on Windows, where
+value. A context error that actually races with a launched command is
+classified independently of that status. This matters on Windows, where
 `Process.Kill` can report the killed process with exit code `1`; the
-status remains observable but does not suppress the typed error.
-Cancellation stops only the local CLI
-process group on Unix (on Windows the local process is stopped, while
-child cleanup is platform-dependent). The supported backend CLIs do not
-expose a common exec-instance kill operation, so Exec returns
+status remains observable but does not suppress the typed error. A
+later verification inspect that consumes the deadline does not by itself
+produce `ExecTerminationError`.
+Cancellation is owned by the local command lifecycle. Unix process-group
+termination is attempted only while the direct child handle still owns
+the process; after the child is reaped, no former numeric group ID is
+used. Windows uses a lifecycle-owned Job Object handle, with direct-child
+fallback when assignment is unavailable. The supported backend CLIs do
+not expose a common exec-instance kill operation, so Exec returns
 `*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
 rather than claiming that the daemon-side process stopped. Callers must
 terminate the container or use backend-specific cleanup. Callers must
@@ -404,9 +408,19 @@ lock (reaper ID registration takes a mutex for a one-line write).
 Because the default design consumes no host ports, parallelism is
 bounded only by host resources.
 
-**Keep streams finite**. `Logs` returns the `container logs --follow`
-child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+**Keep streams finite**. `FollowLogs` returns the `container logs --follow`
+child as an `io.ReadCloser`; `Close` or context cancellation terminates
+and reaps the direct CLI child. Unix process-group termination is gated
+by the direct process handle, while Windows uses a lifecycle-owned Job
+Object handle with direct-child fallback. The library does not reap
+detached descendants, and detached/reparented helpers are outside the
+boundary. ForLog's diagnostic buffer caps at 1MiB.
+
+A stream has two error phases. `Stream` (and the public `FollowLogs`
+wrapper) returns startup errors. Once a stream has been returned, a
+terminal CLI failure is delivered by `Read`; callers must read the stream
+to observe `CLIError` details. `Close` and context cancellation are
+intentional terminal paths and may instead produce EOF or a context error.
 
 **Deadline every finite CLI call**. Every call honors `context` and
 carries a default timeout (30s for queries and public Exec, 10min for
@@ -414,11 +428,8 @@ pull-bearing runs). `Exec` is finite and buffered by design;
 `WithExecTimeout(0)` is the explicit escape hatch for an intentional
 long-running command, which should still use a cancellable context.
 A positive `WithExecTimeout` uses the earlier of its value and the
-caller's deadline. `FollowLogs` is the separate streaming API for long-lived
-output. On cancellation the local CLI process group is SIGKILLed and
-reaped on Unix; Windows stops the local process, with child cleanup
-platform-dependent. This does not imply that a remote exec process was
-killed.
+caller's deadline. This local process-tree ownership does not imply that
+a remote exec process was killed.
 
 ## Error handling
 

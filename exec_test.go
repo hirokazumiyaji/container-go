@@ -440,6 +440,41 @@ func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
 	}
 }
 
+type issue116InspectDeadlineRunner struct {
+	*fakeRunner
+}
+
+func (r *issue116InspectDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		return []byte("command output"), []byte("daemon unavailable"), &cli.CLIError{Args: args, ExitCode: 125, Stderr: "daemon unavailable"}
+	}
+	if len(args) > 0 && args[0] == "inspect" {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecInspectDeadlineDoesNotClaimRemoteTermination(t *testing.T) {
+	f := &issue116InspectDeadlineRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
+	if code != 125 || out == nil {
+		t.Fatalf("code/output = %d/%v, want status 125 and output", code, out)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want inspect deadline", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 125 {
+		t.Fatalf("error = %v, want original CLIError", err)
+	}
+	if errors.As(err, new(*ExecTerminationError)) {
+		t.Fatalf("error = %v, inspect deadline must not claim remote termination", err)
+	}
+}
+
 type issue116ConcurrentExitRunner struct {
 	*fakeRunner
 }
@@ -703,5 +738,29 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 				t.Fatalf("timeout/signal triggered a verification probe: %v", f.calls)
 			}
 		})
+	}
+}
+
+func TestExecDoesNotClassifyTimeoutTextFromArgs(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "application output",
+		execErr: &cli.CLIError{
+			Args:     []string{"exec", "myctr", "command timed out"},
+			ExitCode: 7,
+			Stderr:   "application failed",
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"query"})
+	if err != nil {
+		t.Fatalf("Exec returned infrastructure error for application argv: %v", err)
+	}
+	if code != 7 || out == nil {
+		t.Fatalf("code/output = %d/%v, want application status 7 and output", code, out)
+	}
+	if f.callWith("inspect") != nil {
+		t.Fatalf("application argv triggered a verification probe: %v", f.calls)
 	}
 }

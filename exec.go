@@ -146,15 +146,25 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	// A runner call is considered a launch for legacy/custom runners that
-	// do not report process-start metadata. ExecRunner annotates failures
-	// with the authoritative local Start result below.
+	// do not report lifecycle metadata. ExecRunner annotates failures with
+	// the authoritative local Start/reap/cancellation result below.
 	launched := true
-	if reported, ok := cli.StartedStatus(err); ok {
-		launched = reported
+	commandStatus, statusReported := cli.RunStatusOf(err)
+	if statusReported {
+		launched = commandStatus.Started
 	}
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
+	}
+
+	// Capture whether cancellation was already present when the command
+	// returned. A later deadline consumed by the verification inspect must
+	// not be mistaken for a cancellation race with the command itself.
+	commandContextErr := isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil
+	terminationUnknown := launched && commandContextErr
+	if statusReported {
+		terminationUnknown = commandStatus.Reaped && commandStatus.TerminatedByCancellation
 	}
 
 	// A custom runner may return a plain CLIError when cancellation races
@@ -164,7 +174,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		err = errors.Join(err, ctxErr)
 	}
 	finish := func(code int, classified error) (int, io.Reader, error) {
-		if contextErr, ok := execContextualError(ctx, execCtx, classified, launched); ok {
+		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
 			return code, output, contextErr
 		}
 		return code, output, classified
@@ -221,7 +231,7 @@ func effectiveExecContextErr(ctx, execCtx context.Context) error {
 	return execCtx.Err()
 }
 
-func execContextualError(ctx, execCtx context.Context, err error, launched bool) (error, bool) {
+func execContextualError(ctx, execCtx context.Context, err error, terminationUnknown bool) (error, bool) {
 	ctxErr := effectiveExecContextErr(ctx, execCtx)
 	if ctxErr == nil && !isExecContextError(err) {
 		return nil, false
@@ -230,7 +240,10 @@ func execContextualError(ctx, execCtx context.Context, err error, launched bool)
 		err = errors.Join(err, ctxErr)
 	}
 	err = wrapNotFound(err)
-	if launched {
+	// The command may have completed before a later diagnostic inspect
+	// consumed the deadline. Only a cancellation observed at runner return
+	// leaves the remote exec termination unknown.
+	if terminationUnknown {
 		err = &ExecTerminationError{Err: err}
 	}
 	return err, true

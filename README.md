@@ -159,18 +159,28 @@ exit status, when available, is retained in `exitCode` even alongside
 that error. In either error case, read `output` to retain partial stdout
 and stderr produced before the failure.
 
-Cancellation stops the local CLI process group on Unix (on Windows,
-the local process is stopped but child cleanup is platform-dependent).
-Neither supported backend CLI exposes a common kill operation for an
-exec instance. When a context error terminates the local CLI, Exec
+Cancellation is owned by the local command lifecycle. On Unix-like systems a
+best-effort process-group termination is attempted only while the direct child
+handle still owns the process; once that child is reaped, no former numeric
+process-group ID is used. On Windows, a lifecycle-owned Job Object handle
+provides the descendant boundary, with direct-child fallback when assignment
+is unavailable. Neither boundary claims remote container-process termination.
+Neither supported backend CLI exposes a common kill operation for an exec
+instance. When a context error actually races with a launched command, Exec
 returns an `*ExecTerminationError` (`errors.Is(err,
 ErrExecTerminationUnsupported)`) instead of claiming that the
 container-side process stopped. Classification does not depend on the
 local exit status: in particular, Windows `Process.Kill` may report the
 killed process as exit code `1`, and that status remains visible without
-suppressing the typed error. The backend-side process may still be
-running; callers must terminate the container or use a backend-specific
-cleanup path.
+suppressing the typed error. A deadline consumed later by a verification
+inspect does not by itself produce `ExecTerminationError`. The backend-side
+process may still be running; callers must terminate the container or use a
+backend-specific cleanup path.
+
+`FollowLogs` returns startup failures directly. After a stream is returned,
+read it to EOF: terminal CLI failures (including a CLI status racing context
+cancellation) are reported by `Read`. `Close` and context cancellation are
+intentional termination paths and may instead produce EOF or a context error.
 
 ## Image pulls
 

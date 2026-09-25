@@ -144,9 +144,10 @@ deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadlin
 `FollowLogs` で取得する(Long-open な Exec は避ける)。
 backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
 CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。
-context error によって local CLI が終了した場合、その分類は終了コードに依存しません。
+command の起動中 실제로 context error が競合した場合だけ、その分類は終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
-context 取消時は Unix の local CLI process group を停止します(Windows では local process のみを停止し、child cleanup は platform に依存します)。
+後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
+context 取消時は直接の command lifecycle が所有する間だけ Unix の local CLI process group を停止します。直接の子を回収した後は古い process group ID に signal を送りません。Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。
 backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
 process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。
 したがって error が non-nil でも reader を読む。
@@ -270,11 +271,13 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 `Exec` は有限・バッファリング操作であり、`WithExecTimeout(0)` は意図的な
 長時間実行 command のための明示的な escape hatch とする(その場合でも
 cancellable な context を併用する)。正の `WithExecTimeout` は指定値と
-caller の deadline の早い方を用いる。長寿命の出力には別の streaming API
-`FollowLogs` を使う。
-コンテキスト取消時は Unix の local CLI process group へ SIGKILL を送って
-回収する(Windows では local process のみを停止し、child cleanup は
-platform に依存する)。これは remote exec process の kill を意味しない。
+caller の deadline の早い方を用いる。
+ストリームは `FollowLogs` が `io.ReadCloser` を返した後に `Read` される。
+`Close` または context cancel は直接の CLI 子プロセスを終了して回収する。
+Unix の process group 終了は直接の process handle を所有している間だけ
+ゲートされ、Windows は lifecycle-owned Job Object handle を使い、割り当て
+できない場合は直接の子だけを対象にする。デタッチされた子孫は回収も保証も
+しない。
 
 ## エラー処理
 

@@ -485,6 +485,51 @@ func TestForAnyDrainsCanceledLosersBeforeSuccess(t *testing.T) {
 	}
 }
 
+type issue116NonCooperativeStrategy struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *issue116NonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
+	close(s.started)
+	<-s.release
+	return nil
+}
+
+func TestForAnyBoundsNonCooperativeLoserDrain(t *testing.T) {
+	loser := &issue116NonCooperativeStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(loser.release) })
+
+	winner := &issue116ForAnyWinner{loserStarted: loser.started}
+	started := time.Now()
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
+		t.Fatalf("ForAny success = %v, want nil", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForAny success took %v with non-cooperative loser", elapsed)
+	}
+}
+
+func TestForAnyBoundsNonCooperativeDrainAfterTimeout(t *testing.T) {
+	strategy := &issue116NonCooperativeStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(strategy.release) })
+
+	started := time.Now()
+	err := ForAny(strategy).WithStartupTimeout(20*time.Millisecond).WaitUntilReady(context.Background(), newFakeTarget())
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForAny error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForAny timeout took %v with non-cooperative strategy", elapsed)
+	}
+}
+
 func TestForAllWithStartupTimeout(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // dead port

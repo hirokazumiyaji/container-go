@@ -78,8 +78,9 @@ func (e *CLIError) Error() string {
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
-// argv vector; no shell is involved. Cancellation kills the local process
-// group on Unix; it does not claim to terminate a process inside a backend.
+// argv vector; no shell is involved. Cancellation terminates the lifecycle-
+// owned local process tree; it does not claim to terminate a process inside
+// a backend.
 type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
@@ -96,11 +97,9 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
-	configureProcessGroup(cmd)
-	// CommandContext's default cancellation kills only the CLI process.
-	// Kill the local process group so a shell wrapper cannot leave a child
-	// (for example, sleep) behind while the caller is being cancelled.
-	cmd.Cancel = func() error { return killProcessGroup(cmd) }
+	configureProcessTree(cmd)
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	cmd.Cancel = lifecycle.cancel
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -108,53 +107,27 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		lifecycle.failStart()
+		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
+	}
+	tree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		// A platform tree is an enhancement. The direct process handle
+		// remains a safe cancellation path when attachment is unavailable.
+		tree = directProcessTree{}
+	}
+	lifecycle.publishStart(tree)
+
+	// Run owns the sole Wait call through the same lifecycle used by Stream.
+	// This keeps context cancellation and the eventual reap from racing a
+	// stale numeric process-group signal.
+	err := lifecycle.result()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	commandErr := commandError(ctx, bin, args, stderr.Bytes(), err)
-	if commandErr != nil {
-		// ProcessState is non-nil only after os/exec has successfully
-		// started and waited for the child. Preserve that fact across the
-		// error chain so callers do not mistake a pre-canceled launch
-		// failure for a process that needs remote termination cleanup.
-		commandErr = markStarted(commandErr, cmd.ProcessState != nil)
-	}
-	return stdout.Bytes(), stderr.Bytes(), commandErr
-}
-
-// startedError carries the local process-start fact alongside the
-// original command error. It is intentionally transparent to errors.Is
-// and errors.As callers.
-type startedError struct {
-	err     error
-	started bool
-}
-
-func (e *startedError) Error() string { return e.err.Error() }
-
-func (e *startedError) Unwrap() error { return e.err }
-
-// Started reports whether the local CLI process reached Start before the
-// error was returned.
-func (e *startedError) Started() bool { return e.started }
-
-func markStarted(err error, started bool) error {
-	if err == nil {
-		return nil
-	}
-	return &startedError{err: err, started: started}
-}
-
-// StartedStatus returns the local process-start fact attached by ExecRunner,
-// when available. The bool result reports whether the error carried the
-// fact; runners that return ordinary errors do not need to implement it.
-func StartedStatus(err error) (started, reported bool) {
-	var status interface{ Started() bool }
-	if !errors.As(err, &status) {
-		return false, false
-	}
-	return status.Started(), true
+	return stdout.Bytes(), stderr.Bytes(), markRunStatus(commandErr, lifecycle.status())
 }
 
 func commandError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
@@ -166,8 +139,8 @@ func commandError(ctx context.Context, bin string, args []string, stderr []byte,
 		exitCode := exitErr.ExitCode()
 		if ctxErr := ctx.Err(); ctxErr != nil && exitCode < 0 {
 			// A Unix signal has no usable application status. Preserve the
-			// context contract while StartedStatus above records that the
-			// local process did launch.
+			// context contract while the lifecycle status records whether
+			// local cancellation actually terminated the process.
 			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
 		cliErr := &CLIError{
@@ -208,14 +181,19 @@ func IsOperationTimeoutError(err error) bool {
 
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
-		return hasOperationTimeoutText(err.Error())
+		// A non-CLI error has no structured timeout evidence. Do not infer
+		// one from its free-form Error text.
+		return false
 	}
 	// A negative status is the standard-library representation of a
 	// signal. It is not an application exit result.
 	if cliErr.ExitCode < 0 {
 		return true
 	}
-	return hasOperationTimeoutText(cliErr.Stderr + "\n" + err.Error())
+	// Only backend stderr is diagnostic evidence. CLIError.Error/Args may
+	// contain arbitrary application text or command arguments and must not
+	// turn an ordinary exit into an infrastructure timeout.
+	return hasOperationTimeoutText(cliErr.Stderr)
 }
 
 func hasOperationTimeoutText(value string) bool {

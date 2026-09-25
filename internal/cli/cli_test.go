@@ -180,6 +180,16 @@ func TestExecRunnerReportsWhetherLocalProcessStarted(t *testing.T) {
 	}
 }
 
+func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
+	status, reported := RunStatusOf(err)
+	if !reported || !status.Started || !status.Reaped || !status.TerminatedByCancellation {
+		t.Fatalf("run status = %+v, reported=%t; want started/reaped/cancel-terminated", status, reported)
+	}
+}
+
 func TestCLIErrorIncludesBinaryName(t *testing.T) {
 	err := &CLIError{Binary: "docker", Args: []string{"run", "--detach"}, ExitCode: 125, Stderr: "conflict"}
 	got := err.Error()
@@ -352,23 +362,26 @@ func (r *cliTimeoutProbeRunner) Run(context.Context, ...string) ([]byte, []byte,
 	return nil, nil, &CLIError{ExitCode: 1, Stderr: "probe failed"}
 }
 
-func TestIsOperationTimeoutErrorRecognizesStructuredAndDiagnosticForms(t *testing.T) {
+func TestIsOperationTimeoutErrorUsesStructuredAndStderrEvidence(t *testing.T) {
 	cases := []struct {
 		name string
 		err  error
+		want bool
 	}{
-		{name: "context", err: context.DeadlineExceeded},
-		{name: "timeout interface", err: timeoutInterfaceError{}},
-		{name: "negative status", err: &CLIError{ExitCode: -1}},
-		{name: "i/o timeout", err: &CLIError{ExitCode: 7, Stderr: "client: i/o timeout"}},
-		{name: "command timed out", err: &CLIError{ExitCode: 7, Stderr: "command timed out"}},
-		{name: "operation timed out", err: &CLIError{ExitCode: 7, Stderr: "operation timed out"}},
-		{name: "plain diagnostic", err: errors.New("operation timed out")},
+		{name: "context", err: context.DeadlineExceeded, want: true},
+		{name: "timeout interface", err: timeoutInterfaceError{}, want: true},
+		{name: "negative status", err: &CLIError{ExitCode: -1}, want: true},
+		{name: "i/o timeout", err: &CLIError{ExitCode: 7, Stderr: "client: i/o timeout"}, want: true},
+		{name: "command timed out", err: &CLIError{ExitCode: 7, Stderr: "command timed out"}, want: true},
+		{name: "operation timed out", err: &CLIError{ExitCode: 7, Stderr: "operation timed out"}, want: true},
+		{name: "plain diagnostic", err: errors.New("operation timed out"), want: false},
+		{name: "application argv", err: &CLIError{Args: []string{"exec", "command timed out"}, ExitCode: 7, Stderr: "application failed"}, want: false},
+		{name: "application stderr", err: &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "i/o timeout"}, want: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if !IsOperationTimeoutError(tc.err) {
-				t.Fatalf("IsOperationTimeoutError(%v) = false", tc.err)
+			if got := IsOperationTimeoutError(tc.err); got != tc.want {
+				t.Fatalf("IsOperationTimeoutError(%v) = %t, want %t", tc.err, got, tc.want)
 			}
 		})
 	}

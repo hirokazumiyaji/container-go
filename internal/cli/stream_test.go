@@ -118,6 +118,45 @@ func TestStreamReapsChildAfterExitWithoutReadOrClose(t *testing.T) {
 	}
 }
 
+func TestStreamReadPreservesCLIErrorWhenCancellationRacesExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ExecRunner{Binary: writeStub(t, `printf 'terminal stderr\\n' >&2; exit 17`)}
+	stream, err := r.Stream(ctx, "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	// Model the context callback winning the publication boundary just as
+	// Wait returns a real positive CLI status. The stream must retain both
+	// facts rather than replacing CLIError with a bare context error.
+	ps.stateMu.Lock()
+	ps.cancelled = true
+	ps.stateMu.Unlock()
+	ps.lifecycle.mu.Lock()
+	ps.lifecycle.ctxErr = context.Canceled
+	ps.lifecycle.mu.Unlock()
+
+	data, readErr := io.ReadAll(stream)
+	if !strings.Contains(string(data), "terminal stderr") {
+		t.Fatalf("stream data = %q, want terminal output", data)
+	}
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) || cliErr.ExitCode != 17 {
+		t.Fatalf("read error = %v, want CLIError status 17", readErr)
+	}
+	if !errors.Is(readErr, context.Canceled) {
+		t.Fatalf("read error = %v, want context.Canceled", readErr)
+	}
+}
+
 func TestStreamCancellationReapsAndClosesWithoutClose(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

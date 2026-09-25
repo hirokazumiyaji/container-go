@@ -145,11 +145,17 @@ command の非ゼロ終了は結果であり、backend、timeout、cancellation 
 CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
 いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
 
-context error によって local CLI が終了した場合、Unix では process group を停止します(Windows では local process のみを停止し、child cleanup は platform に依存します)。
-backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
+context error によって local CLI が終了した場合、直接の command lifecycle が所有する間だけ Unix の process group をベストエフォートで停止します。直接の子を回収した後は、古い process group ID には signal を送りません。Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
+backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、command の起動中に context error が実際に競合した場合だけ `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
 この分類は local の終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
+後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 backend 側 process が残っている可能性があるため、caller は container を terminate するか backend 固有の cleanup を実行してください。
+
+`FollowLogs` は起動エラーを直接返します。ストリームを返した後は EOF まで
+`Read` してください。CLI の終端エラー(CLI status と context cancel が競合した
+場合も含む)は `Read` から返ります。`Close` と context cancel は意図的な終了
+経路なので、EOF または context error になることがあります。
 
 ## クリーンアップの契約
 

@@ -33,8 +33,16 @@ const (
 	nginxImage = "public.ecr.aws/docker/library/nginx:alpine"
 )
 
+func isolateBenchmarkEnv(t *testing.T) {
+	t.Helper()
+	// Benchmarks own teardown; do not inherit a developer's diagnostic
+	// retention setting from the parent integration process.
+	t.Setenv("CONTAINERGO_KEEP", "0")
+}
+
 func requireDocker(t *testing.T) {
 	t.Helper()
+	isolateBenchmarkEnv(t)
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -143,6 +151,7 @@ func writeDoc(t *testing.T, name string, doc Doc) string {
 // wall-clock for cold, warm, multi, and parallel scenarios on both
 // backends.
 func TestIntegrationBenchContainerGo(t *testing.T) {
+	isolateBenchmarkEnv(t)
 	for _, b := range []ibench.Backend{ibench.DockerBackend(), ibench.AppleBackend()} {
 		t.Run(b.Name, func(t *testing.T) {
 			b.Available(t)
@@ -176,10 +185,12 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 					var containers []*container.Container
 					for range 5 {
 						ctr, err := containerGoStart(t, redisImage, "6379/tcp")
+						if ctr != nil {
+							containers = append(containers, ctr)
+						}
 						if err != nil {
 							return terminateCleanup(t, containers...), err
 						}
-						containers = append(containers, ctr)
 					}
 					return terminateCleanup(t, containers...), nil
 				})
@@ -204,28 +215,27 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 							container.WithExposedPorts("6379/tcp"),
 							container.WithWaitStrategy(wait.ForListeningPort("6379/tcp")),
 						)
+						if ctr != nil {
+							mu.Lock()
+							containers = append(containers, ctr)
+							mu.Unlock()
+						}
 						if err != nil {
 							errs[idx] = err
-							return
 						}
-						mu.Lock()
-						containers = append(containers, ctr)
-						mu.Unlock()
 					}()
 				}
 				ready.Wait()
 				elapsed := time.Since(start)
+				// Clean up successful and partial handles before reporting
+				// any failed iteration.
+				terminateCleanup(t, containers...)()
 				for _, err := range errs {
 					if err != nil {
 						t.Fatalf("run/parallel-8 iteration %d: %v", i, err)
 					}
 				}
 				record(&doc, b.Name, LibraryContainerGo, redisImage, "run/parallel-8", i, elapsed)
-				for _, ctr := range containers {
-					if err := ctr.Terminate(context.Background()); err != nil {
-						t.Logf("run/parallel-8 iteration %d: terminate: %v", i, err)
-					}
-				}
 			}
 
 			path := writeDoc(t, b.Name, doc)
@@ -276,6 +286,11 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	ctr, err := tc.GenericContainer(context.Background(), tcRequest())
 	elapsed := time.Since(start)
 	if err != nil {
+		if ctr != nil {
+			if termErr := ctr.Terminate(context.Background()); termErr != nil {
+				t.Logf("terminate session-init container: %v", termErr)
+			}
+		}
 		t.Fatalf("session-init container: %v", err)
 	}
 	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, elapsed)

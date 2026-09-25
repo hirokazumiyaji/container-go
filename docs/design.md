@@ -125,11 +125,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
 `Run` fetches the image (the CLI auto-pulls when missing), creates and
-starts the container, and completes the wait strategy; by default, on
-failure it rolls back whatever it created before returning the error.
-With `CONTAINERGO_KEEP=1`, a verified retained container is returned as
-a non-nil partial handle alongside the error; see the cleanup contract
-below.
+starts the container, and completes the wait strategy. For a non-reuse
+run, a failure after creation rolls back whatever it created before
+returning the error. With `CONTAINERGO_KEEP=1`, a verified retained
+container is returned as a non-nil partial handle alongside the error.
+`WithReuse` uses get-or-create and never rolls back a shared container
+on wait failure; see the cleanup contract below.
 
 Options use the functional options pattern. The initial release
 provides:
@@ -248,7 +249,10 @@ provides:
 Every strategy carries `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms). If the container transitions to
 stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+and the error carries a log tail capped at 1MiB for diagnosis. For a
+non-reuse `Run`, a wait failure rolls the container back by default;
+`CONTAINERGO_KEEP=1` retains it instead. A `WithReuse` `Run` never rolls
+back the shared container on wait failure.
 
 The strategy interface:
 
@@ -268,8 +272,11 @@ reader, exec, state query) implemented by adapting
 Every way a test process can exit has an automatic deletion path.
 
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
-`t.Cleanup`. By default, mid-`Run` failures are rolled back by `Run`
-itself, including failed-create cleanup and copy/wait rollback.
+`t.Cleanup`. For a non-reuse `Run`, mid-`Run` failures are rolled back
+by `Run` itself, including failed-create cleanup and copy/wait rollback.
+A `WithReuse` `Run` leaves an existing shared container in place on wait
+failure; newly created reuse setup follows the rollback policy until the
+shared container is established.
 
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
 `t.Cleanup` run, so an external **watchdog reaper** takes over. At
@@ -294,19 +301,26 @@ session.
 
 Setting `CONTAINERGO_KEEP=1` makes this diagnostic switch retain
 containers instead of deleting them automatically: `Cleanup` /
-`TerminateContainer`, failed-create cleanup, copy/wait and reuse-create
-rollback, and watchdog registration are all skipped. When the container
-was created and its ownership labels verify, `Run` returns a non-nil
-partial `*Container` together with the failure. This includes generated
-names and copy failures that happen before the CLI copy call, so the
-caller can inspect, execute in, copy to, or explicitly terminate the
-retained container. If the container is absent or ownership cannot be
-verified, the returned handle is nil. The operation error is still
-returned; a rollback that is attempted and cannot delete reports the
-left-behind container in that error. Explicit `Container.Terminate`,
-`Prune`, and `PruneReuseGroup` remain deletion operations. The reuse
-get-or-create rules, including stopped-container replacement, are
-unchanged.
+`TerminateContainer`, failed-create cleanup, and copy/wait rollback are
+skipped, as is watchdog registration. A `WithReuse` `Run` never rolls
+back a shared container on wait failure, regardless of this setting.
+For a non-reuse `Run`, when the container was created and its ownership
+labels verify, `Run` returns a non-nil partial `*Container` together
+with the failure. This includes generated names and copy failures that
+happen before the CLI copy call, so the caller can inspect, execute in,
+copy to, or explicitly terminate the retained container. For `WithReuse`,
+a failed create returns a retained handle only after that ownership
+check; a wait failure under `CONTAINERGO_KEEP=1` returns the shared
+handle as well. That handle refers to the shared container: callers in
+one process may receive the same handle, and callers in other processes
+refer to the same container. It is not a private ownership handle. If
+the container is absent or ownership cannot be verified, the returned
+handle is nil. The operation error is still returned; a rollback that is
+attempted and cannot delete reports the left-behind container in that
+error. Explicit
+`Container.Terminate`, `Prune`, and `PruneReuseGroup` remain deletion
+operations. The reuse get-or-create rules, including stopped-container
+replacement, are unchanged.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -420,10 +434,12 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   container verification also failed; `errors.As` exposes both `Err` and
   `CleanupErr`
 
-When `Run` fails on a wait timeout, the returned error includes the
-container's log tail. By default the rollback delete follows; with
-`CONTAINERGO_KEEP=1` the container is retained, a verified partial handle
-is returned with the error, and no rollback delete is issued.
+When a non-reuse `Run` fails on a wait timeout, the returned error
+includes the container's log tail. By default the rollback delete
+follows; with `CONTAINERGO_KEEP=1` the container is retained and a
+verified partial handle is returned with the error. A `WithReuse` `Run`
+returns the wait error while leaving the shared container in place;
+under `CONTAINERGO_KEEP=1`, its verified handle is also shared.
 
 The library never runs `container system start` itself: the command
 can prompt interactively for a kernel install, which a test library

@@ -124,8 +124,10 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`
-(既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
-待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
+(既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。
+待機中にコンテナが停止すると即座に失敗し、待機に失敗した場合はログ末尾をエラーに添付します。
+非 reuse の `Run` では既定でコンテナをロールバック削除しますが、`CONTAINERGO_KEEP=1` の場合は残します。
+`WithReuse` の `Run` は、待機に失敗しても共有コンテナをロールバックしません。
 
 ## クリーンアップの契約
 
@@ -136,27 +138,31 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    テスト失敗として報告します。defer 派には
    `container.TerminateContainer(ctr)` があります。いずれも nil 安全なので、
    `Run` のエラーチェックより前に呼べます。
-2. 通常、`Run` が途中で失敗した場合は `Run` 自身が作成済みリソースを
-   削除してから返ります。削除にも失敗した場合は、返された
-   `*CleanupError` から元の error とクリーンアップ error の両方を取得
-   できます。これは作成失敗、コピー、待機、reuse の作成後ロールバック
-   に適用されます。
+2. 非 reuse の `Run` では、既定で途中まで作成したリソースを削除してから返ります。
+   削除にも失敗した場合は、返された `*CleanupError` から元の error とクリーンアップ error の両方を取得できます。
+   これは作成失敗、コピー、待機のロールバック経路に適用されます。
+   `WithReuse` の `Run` は、既存の共有コンテナの待機に失敗してもロールバックしません。
+   新規に共有コンテナを作成している間は、同じロールバック方針を適用します。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
    Windows では前 2 層のみでクリーンアップします。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用スイッチです。
-`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピー・
-待機・reuse のロールバックを自動的に行わず、watchdog の登録も無効に
-します。Run がコンテナを作成し、所有ラベルを検証できた場合は、失敗
-エラーとともに非 nil の部分的な `*Container` を返します。自動生成した
-名前や、copy CLI を呼ぶ前の失敗でも同じです。返した handle は
-`State`、`Logs`、`Exec`、`CopyToContainer`、明示的な `Terminate` に
-利用できます。コンテナが存在しない場合、または所有権を検証できない
-場合は nil を返します。明示的な `Container.Terminate`、`Prune`、
-`PruneReuseGroup` は引き続き削除を行います。reuse の停止済みコンテナ
-置き換え規則は変わりません。
+`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピーや待機のロールバックを自動的に行わず、watchdog の登録も無効にします。
+`WithReuse` の `Run` は、待機に失敗しても共有コンテナをロールバックしません。
+非 reuse の `Run` がコンテナを作成し、所有ラベルを検証できた場合は、失敗エラーとともに非 nil の部分的な `*Container` を返します。
+自動生成した名前や copy CLI を呼ぶ前の失敗でも同じです。
+`WithReuse` の create 失敗では同じ所有権検証に成功した場合だけ保持 handle を返します。
+`CONTAINERGO_KEEP=1` の待機失敗では、共有 handle も返します。
+この handle は共有コンテナを参照します。
+同一プロセスの呼び出しは同じ handle を受け取る可能性があり、別プロセスの呼び出しも同じコンテナを参照します。
+この handle は呼び出し元だけが所有する handle ではありません。
+返した handle は `State`、`Logs`、`Exec`、`CopyToContainer`、明示的な `Terminate` に利用できます。
+共有コンテナの明示的な終了は、そのコンテナを使うすべての呼び出し元に影響します。
+コンテナが存在しない場合、または所有権を検証できない場合は nil を返します。
+明示的な `Container.Terminate`、`Prune`、`PruneReuseGroup` は引き続き削除を行います。
+reuse の停止済みコンテナ置き換え規則は変わりません。
 
 補助 API:
 
@@ -184,15 +190,16 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 契約:
 
 - `WithName` 必須。待機戦略は attach 時も必ず再実行する。
-- 競合する create の名前衝突は成功として扱い、既存へ attach する。
-- stopped の残骸は削除して再作成する。running のまま ready にならない
-  場合は削除せずエラーを返す。
+- 名前競合や Apple の create race は通常、attach または再試行へ進む。
+  `CONTAINERGO_KEEP=1` の場合で、この `Run` が名前付きコンテナを自分が作成した所有ラベルから検証できるときは、元のエラーと保持した共有 handle を返す。
+  所有性を検証できない peer は取得しない。
+- stopped の残骸は削除して再作成する。running のまま ready にならない場合は削除せずエラーを返す。
 - image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
-- `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
-  削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
-- `container.PruneReuseGroup(ctx, "integration")` はそのグループの
-  コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
+- `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを削除しない。
+  保持された失敗 handle を含め、すべての handle が同じ共有コンテナを参照する。
+  明示的な `ctr.Terminate` はすべての利用者に影響するため、他の利用者が不要と確認できる場合だけ実行する。
+- `container.PruneReuseGroup(ctx, "integration")` はそのグループのコンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って

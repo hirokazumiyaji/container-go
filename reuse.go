@@ -26,8 +26,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
 	if err != nil {
-		// The flight preserves a partial handle when a create fails
-		// under CONTAINERGO_KEEP; do not discard it at this boundary.
+		// The flight preserves a verified partial handle when a create
+		// fails under CONTAINERGO_KEEP; callers that receive this shared
+		// flight result use that same handle, so do not discard it here.
 		return base, err
 	}
 
@@ -88,6 +89,23 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if createErr == nil {
 				return ctr, nil
 			}
+			if ctr != nil {
+				// A retained partial handle is deliberately returned
+				// with the create error so callers can inspect or
+				// explicitly terminate the shared container. Check this
+				// before retry classification: a verified owned create
+				// must not be mistaken for a peer race.
+				return ctr, createErr
+			}
+			if keepContainers() {
+				// A failed ownership lookup is not a peer race. Do not
+				// retry it: without verification, returning or attaching
+				// to a same-name container would be fail-open.
+				var retainedErr *CleanupError
+				if errors.As(createErr, &retainedErr) {
+					return nil, createErr
+				}
+			}
 			// nameConflict: another process won create. createRaceMissing
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
@@ -95,12 +113,6 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
 				time.Sleep(reusePollInterval)
 				continue
-			}
-			if ctr != nil {
-				// A retained partial handle is deliberately returned
-				// with the create error so callers can inspect or
-				// explicitly terminate the failed shared container.
-				return ctr, createErr
 			}
 			return nil, createErr
 		}
@@ -170,15 +182,21 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		if keepContainers() {
+			// A conflict or Apple create-race can happen after this
+			// process created the container. Verify ownership before
+			// retrying so KEEP returns an owned partial handle, while
+			// leaving an unverified peer available for attach.
+			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
+			if retained != nil || retainedErr != nil {
+				return retained, withCleanupError(classified, retainedErr)
+			}
+		}
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
 			return nil, err
-		}
-		if keepContainers() {
-			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
-			return retained, withCleanupError(classified, retainedErr)
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, withCleanupError(classified, cleanupErr)

@@ -123,10 +123,13 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // stable WithName. Concurrent Run calls with the same name share one
 // container; readiness strategies always re-run against it. Returned
 // handles are shared: Cleanup, TerminateContainer, and the watchdog
-// reaper do not remove them. Explicit Terminate still does — only use
-// it when no other process still needs the container. If a new shared
-// container fails after creation under CONTAINERGO_KEEP=1, Run returns
-// its partial handle with the error for explicit diagnostics.
+// reaper do not remove them. Explicit Terminate still does, and affects
+// the shared container for every user, so use it only when no other
+// process still needs the container. If this Run creates a new shared
+// container and then fails after creation under CONTAINERGO_KEEP=1, it
+// returns a verified retained handle with the error. That handle is
+// shared too: callers in one process may receive the same pointer, and
+// callers in other processes refer to the same container.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

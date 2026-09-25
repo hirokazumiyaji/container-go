@@ -29,12 +29,10 @@ func failedCreateOwned(cfg *config, info *engineInfo) bool {
 // retainedFailedCreate looks up a container left by a failed create when
 // diagnostic retention is enabled. It returns a usable handle only after
 // the same ownership checks used by automatic cleanup succeed. A missing
-// or foreign container is not claimed by this Run.
-func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified error) (*Container, error) {
-	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return nil, nil
-	}
-
+// or foreign container is not claimed by this Run. This lookup is also
+// used for name-conflict and create-race errors, because the container
+// may have been created before the CLI reported one of those failures.
+func retainedFailedCreate(ctx context.Context, cfg *config, _ error, _ error) (*Container, error) {
 	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(lookupCtx, cfg.name)

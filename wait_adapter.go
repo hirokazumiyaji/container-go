@@ -10,8 +10,11 @@ import (
 )
 
 // WithWaitStrategy blocks Run until the strategy reports the container
-// ready. On failure the container is removed by default and the error
-// carries a tail of its logs; CONTAINERGO_KEEP=1 retains it instead.
+// ready. A wait failure carries a tail of the container's logs. For a
+// non-reuse Run, the container is rolled back and removed by default;
+// CONTAINERGO_KEEP=1 retains it instead. A WithReuse Run never rolls
+// back its shared container on wait failure; under KEEP it returns the
+// verified shared handle with the error.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
 		c.waitStrategy = s

@@ -79,7 +79,9 @@ const (
 // Container is a handle to a container created by Run. When Run
 // returns a non-nil handle together with an error under
 // CONTAINERGO_KEEP=1, it is a partial handle for a retained failed
-// container; its normal lifecycle methods remain usable.
+// container; its normal lifecycle methods remain usable. WithReuse
+// handles refer to a shared container, including retained failure
+// handles, so they are not private ownership.
 type Container struct {
 	id        string
 	runner    cli.Runner
@@ -105,12 +107,15 @@ type Container struct {
 }
 
 // Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, the container is
-// normally removed before returning. With CONTAINERGO_KEEP=1, a
-// container that this Run can prove it created is retained and returned
-// alongside the error; that partial handle remains usable for explicit
-// inspection, execution, copying, and Terminate. WithReuse switches to
-// get-or-create; see WithReuse for the shared-handle lifecycle.
+// returns a handle to it. On a non-reuse failure after creation, the
+// container is rolled back and removed by default before returning. With
+// CONTAINERGO_KEEP=1, a non-reuse container that this Run can prove it
+// created is retained and returned alongside the error; that partial
+// handle remains usable for explicit inspection, execution, copying, and
+// Terminate. WithReuse switches to get-or-create and never rolls back a
+// shared container on wait failure; under KEEP it may return a verified
+// shared retained handle with the error. See WithReuse for the
+// shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -218,11 +223,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. It honors
-// CONTAINERGO_KEEP=1 by leaving the container in place. A failed removal
-// is not hidden: without an immutable ID, Terminate refuses to delete
-// when it cannot verify the generation, and the caller must know the
-// container was left behind.
+// rollback removes a container created by a non-reuse Run when Run
+// cannot return it. It honors CONTAINERGO_KEEP=1 by leaving the container
+// in place. A failed removal is not hidden: without an immutable ID,
+// Terminate refuses to delete when it cannot verify the generation, and
+// the caller must know the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if keepContainers() {
 		return cause

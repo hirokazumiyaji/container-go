@@ -136,8 +136,10 @@ wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back with a tail of its
-logs attached to the error.
+stops, and a failed wait attaches a tail of its logs to the error. For a
+non-reuse `Run`, the container is rolled back by default; with
+`CONTAINERGO_KEEP=1` it is retained instead. A `WithReuse` `Run` never
+rolls back the shared container on wait failure.
 
 ## Image pulls
 
@@ -165,11 +167,13 @@ Three layers make sure containers do not outlive your tests:
    failure as a test failure. `container.TerminateContainer(ctr)` is the
    deferred-style variant. All are nil-safe, so call them before checking
    `Run`'s error.
-2. By default, if `Run` fails partway, it removes whatever it created
+2. For a non-reuse `Run`, the default policy removes whatever it created
    before returning. If that removal also fails, the returned
-   `*CleanupError` exposes both the original and cleanup errors. The
-   same rule covers failed-create, copy, wait, and reuse-create rollback
-   paths.
+   `*CleanupError` exposes both the original and cleanup errors. This
+   covers failed-create, copy, and wait rollback paths. A `WithReuse`
+   `Run` does not roll back an existing shared container on wait failure;
+   newly created reuse setup follows the same rollback policy until the
+   shared container is established.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
@@ -177,14 +181,22 @@ Three layers make sure containers do not outlive your tests:
    layers only.
 
 `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It skips
-`Cleanup` / `TerminateContainer`, failed-create cleanup, copy/wait and
-reuse rollback, and watchdog registration. When a container was created
-and this Run can verify its ownership labels, `Run` returns a non-nil
-partial `*Container` together with the failure, including for generated
-names and failures that happen before the copy CLI call. The handle can
-be used for `State`, `Logs`, `Exec`, `CopyToContainer`, and explicit
-`Terminate`. If no container exists, or ownership cannot be verified,
-the handle is nil. Explicit `Container.Terminate`, `Prune`, and
+`Cleanup` / `TerminateContainer`, failed-create cleanup, and copy/wait
+rollback, and skips watchdog registration. A `WithReuse` `Run` does not
+roll back a shared container on wait failure regardless of this setting.
+For a non-reuse `Run`, when a container was created and this `Run`
+can verify its ownership labels, `Run` returns a non-nil partial
+`*Container` together with the failure, including for generated names
+and failures that happen before the copy CLI call. For `WithReuse`, a
+failed create returns a retained handle only after that ownership check;
+a wait failure under `CONTAINERGO_KEEP=1` returns the shared handle as
+well. That handle refers to the shared container: callers in one process
+may receive the same handle, and callers in other processes refer to the
+same container. It is not a private ownership handle. The handle can be
+used for `State`, `Logs`, `Exec`, `CopyToContainer`, and explicit
+`Terminate`; explicit termination affects every user of a shared
+container. If no container exists, or ownership cannot be verified, the
+handle is nil. Explicit `Container.Terminate`, `Prune`, and
 `PruneReuseGroup` remain deletion operations. The reuse stopped-container
 replacement rule is unchanged.
 
@@ -214,7 +226,10 @@ container.Cleanup(t, ctr) // no-op for reused handles
 Contract:
 
 - `WithName` is required; readiness strategies always re-run.
-- Name conflicts from a racing create are treated as success and attach.
+- Name conflicts and Apple create races normally trigger attach/retry.
+  Under `CONTAINERGO_KEEP=1`, if this `Run` can verify that it created the
+  named container, it returns the original error with a retained shared
+  handle instead; an unverified peer is never claimed.
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
@@ -225,8 +240,10 @@ Contract:
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
-  handles so other packages keep working. Explicit `ctr.Terminate` still
-  removes the shared container — only do that when nothing else needs it.
+  handles so other packages keep working. All handles, including a
+  retained failure handle, refer to the shared container; explicit
+  `ctr.Terminate` affects every user, so only do that when nothing else
+  needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). Ordinary `Prune` still
   only deletes stopped managed containers.

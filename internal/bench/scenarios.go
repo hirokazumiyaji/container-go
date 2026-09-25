@@ -227,7 +227,7 @@ func ScenarioPolicyForKey(backend, library, name string) (ScenarioPolicy, bool) 
 // documentation order. It is the complete key set that strict docs and
 // scenario-set validation must cover.
 func ScenarioPolicyKeys() []ScenarioKey {
-	var keys []ScenarioKey
+	keys := make([]ScenarioKey, 0, len(scenarioPolicyRows))
 	for _, row := range scenarioPolicyRows {
 		keys = append(keys, row.Identities...)
 	}

@@ -49,10 +49,31 @@ func requireDocker(t *testing.T) {
 	}
 }
 
+type workloadObservation struct {
+	digest string
+	id     string
+}
+
+func observeWorkloadImage(t *testing.T, backend ibench.Backend, image string) workloadObservation {
+	t.Helper()
+	identity, err := backend.ObserveImage(image)
+	if err != nil {
+		t.Fatalf("observe workload image %s: %v", image, err)
+	}
+	expected := ibench.ImageDigest(image)
+	if identity.Digest == "" || identity.Digest != expected {
+		t.Fatalf("observed workload image %s digest = %q, want %q", image, identity.Digest, expected)
+	}
+	if backend.Name == "docker" && identity.ContentID == "" {
+		t.Fatalf("observed Docker workload image %s has no content ID", image)
+	}
+	return workloadObservation{digest: identity.Digest, id: identity.ContentID}
+}
+
 // record appends one timed iteration to the doc. cacheState is used only by
 // tc/session-init; the other testcontainers scenarios inherit the same
 // pinned Ryuk image but have no separate cache-state dimension.
-func record(doc *Doc, backend, library, image, name string, iteration int, elapsed time.Duration, cacheState string) {
+func record(doc *Doc, backend, library, image, name string, iteration int, elapsed time.Duration, cacheState string, observation workloadObservation) {
 	policy, ok := ibench.ScenarioPolicyForKey(backend, library, name)
 	if !ok {
 		panic("unknown benchmark scenario key: " + backend + "/" + library + "/" + name)
@@ -61,19 +82,22 @@ func record(doc *Doc, backend, library, image, name string, iteration int, elaps
 		panic("benchmark policy has no workload cache state: " + name)
 	}
 	doc.Results = append(doc.Results, Result{
-		Backend:            backend,
-		Library:            library,
-		Image:              image,
-		ImageDigest:        policy.ImageDigest,
-		WorkloadCacheState: policy.WorkloadCacheStates[0],
-		RyukImage:          policy.RyukImage,
-		RyukImageDigest:    policy.RyukImageDigest,
-		CacheState:         cacheState,
-		Scenario:           name,
-		Iteration:          iteration,
-		Iterations:         policy.Iterations,
-		Commit:             doc.Env.Commit,
-		DurationNS:         int64(elapsed),
+		Backend:             backend,
+		Library:             library,
+		Image:               image,
+		ImageDigest:         policy.ImageDigest,
+		ExpectedImageDigest: policy.ImageDigest,
+		ObservedImageDigest: observation.digest,
+		ObservedImageID:     observation.id,
+		WorkloadCacheState:  policy.WorkloadCacheStates[0],
+		RyukImage:           policy.RyukImage,
+		RyukImageDigest:     policy.RyukImageDigest,
+		CacheState:          cacheState,
+		Scenario:            name,
+		Iteration:           iteration,
+		Iterations:          policy.Iterations,
+		Commit:              doc.Env.Commit,
+		DurationNS:          int64(elapsed),
 	})
 }
 
@@ -81,9 +105,10 @@ func record(doc *Doc, backend, library, image, name string, iteration int, elaps
 // duration. prep and ensureImage run before the timer; cleanup runs after
 // it, so image setup/teardown and container termination stay out of the
 // measurement.
-func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, prep, ensureImage func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
+func runScenario(t *testing.T, doc *Doc, backend ibench.Backend, library, image, name string, prep, ensureImage func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
 	t.Helper()
-	policy, ok := ibench.ScenarioPolicyForKey(backend, library, name)
+	backendName := backend.Name
+	policy, ok := ibench.ScenarioPolicyForKey(backendName, library, name)
 	if !ok {
 		t.Fatalf("no benchmark policy for scenario %q", name)
 	}
@@ -103,7 +128,8 @@ func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, p
 			}
 			t.Fatalf("%s iteration %d: %v", name, i, err)
 		}
-		record(doc, backend, library, image, name, i, elapsed, "")
+		observation := observeWorkloadImage(t, backend, image)
+		record(doc, backendName, library, image, name, i, elapsed, "", observation)
 		if cleanup != nil {
 			cleanup()
 		}
@@ -148,17 +174,26 @@ func benchEnv(t *testing.T, b ibench.Backend) Env {
 	if err != nil {
 		t.Fatalf("record backend versions: %v", err)
 	}
+	provenance, err := b.CaptureProvenance()
+	if err != nil {
+		t.Fatalf("record backend provenance: %v", err)
+	}
 	return Env{
-		OS:         runtime.GOOS,
-		Arch:       runtime.GOARCH,
-		CPUs:       runtime.NumCPU(),
-		Go:         runtime.Version(),
-		Host:       host,
-		Commit:     source.Commit,
-		Tree:       source.Tree,
-		Dirty:      source.Dirty,
-		CLIs:       versions,
-		RecordedAt: time.Now().UTC(),
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		CPUs:             runtime.NumCPU(),
+		Go:               runtime.Version(),
+		Host:             host,
+		Commit:           source.Commit,
+		Tree:             source.Tree,
+		Dirty:            source.Dirty,
+		CLIs:             versions,
+		DockerEndpoint:   provenance.Endpoint,
+		DockerContext:    provenance.Context,
+		DockerDaemonID:   provenance.DaemonID,
+		DockerDaemonOS:   provenance.DaemonOS,
+		DockerDaemonArch: provenance.DaemonArch,
+		RecordedAt:       time.Now().UTC(),
 	}
 }
 
@@ -195,36 +230,36 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 			ensureNginx := func(t *testing.T) { b.EnsureImage(t, nginxImage) }
 
 			// Cold: remove the image so the run includes the pull.
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/cold",
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/cold",
 				func(t *testing.T) { b.EnsureImageAbsent(t, redisImage) },
 				nil,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/warm", nil, ensureRedis,
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/warm", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, redisImage, "6379/tcp")
 					return terminateCleanup(t, ctr), err
 				})
 			b.EnsureImage(t, nginxImage)
-			runScenario(t, &doc, b.Name, LibraryContainerGo, nginxImage, "run/warm-nginx", nil, ensureNginx,
+			runScenario(t, &doc, b, LibraryContainerGo, nginxImage, "run/warm-nginx", nil, ensureNginx,
 				func(t *testing.T) (func(), error) {
 					ctr, err := containerGoStart(t, nginxImage, "80/tcp")
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/no-wait", nil, ensureRedis,
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/no-wait", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage)
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forlog", nil, ensureRedis,
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/forlog", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage,
 						container.WithWaitStrategy(wait.ForLog("Ready to accept connections")))
 					return terminateCleanup(t, ctr), err
 				})
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/forexec", nil, ensureRedis,
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/forexec", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					ctr, err := container.Run(context.Background(), redisImage,
 						container.WithWaitStrategy(wait.ForExec([]string{"redis-cli", "ping"})))
@@ -232,7 +267,7 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 				})
 
 			// Multi: five sequential containers in one process.
-			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/multi-5", nil, ensureRedis,
+			runScenario(t, &doc, b, LibraryContainerGo, redisImage, "run/multi-5", nil, ensureRedis,
 				func(t *testing.T) (func(), error) {
 					var containers []*container.Container
 					for range 5 {
@@ -286,7 +321,8 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 						t.Fatalf("run/parallel-8 iteration %d: %v", i, err)
 					}
 				}
-				record(&doc, b.Name, LibraryContainerGo, redisImage, "run/parallel-8", i, elapsed, "")
+				observation := observeWorkloadImage(t, b, redisImage)
+				record(&doc, b.Name, LibraryContainerGo, redisImage, "run/parallel-8", i, elapsed, "", observation)
 				for _, ctr := range containers {
 					if err := ctr.Terminate(context.Background()); err != nil {
 						t.Logf("run/parallel-8 iteration %d: terminate: %v", i, err)
@@ -336,6 +372,10 @@ func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
 // resolved repository digest is verified against the policy pin.
 func prepareTestcontainersRyuk(t *testing.T, b ibench.Backend) string {
 	t.Helper()
+	//nolint:staticcheck // verify the dependency's default before starting a reaper.
+	if tc.ReaperDefaultImage != ibench.TestcontainersRyukTag {
+		t.Fatalf("testcontainers Ryuk default = %q, want pinned tag %q", tc.ReaperDefaultImage, ibench.TestcontainersRyukTag)
+	}
 	if b.ImageExists == nil || b.ImageDigest == nil || b.TagImage == nil {
 		t.Fatal("Docker image inspect/digest/tag operations are required for the Ryuk benchmark")
 	}
@@ -439,6 +479,7 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 	dockerBackend := ibench.DockerBackend()
 	sessionID := requireCanonicalTestcontainersConfig(t)
+	requireFreshTestcontainersSession(t, dockerBackend, sessionID)
 	env := benchEnv(t, dockerBackend)
 	env.ReaperSessionID = sessionID
 	doc := Doc{SchemaVersion: ibench.CurrentSchemaVersion, Env: env}
@@ -458,12 +499,13 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 		_ = ctr.Terminate(context.Background())
 		t.Fatalf("session-init Ryuk provenance: %v", err)
 	}
-	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, elapsed, cacheState)
+	observation := observeWorkloadImage(t, dockerBackend, redisImage)
+	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, elapsed, cacheState, observation)
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("terminate: %v", err)
 	}
 
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/single", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
+	runScenario(t, &doc, dockerBackend, LibraryTestcontainersGo, redisImage, "tc/single", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
 		func(t *testing.T) (func(), error) {
 			ctr, err := tc.GenericContainer(context.Background(), tcRequest())
 			return tcTerminateCleanup(t, ctr), err
@@ -471,7 +513,7 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 
 	// Multi: five sequential containers in one process; the session
 	// initialization was already paid above.
-	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
+	runScenario(t, &doc, dockerBackend, LibraryTestcontainersGo, redisImage, "tc/multi-5", nil, func(t *testing.T) { dockerBackend.EnsureImage(t, redisImage) },
 		func(t *testing.T) (func(), error) {
 			var containers []tc.Container
 			for range 5 {

@@ -35,6 +35,15 @@ func TestAppleImageIdentityUsesNestedDescriptor(t *testing.T) {
 	}
 }
 
+func TestImageIdentityRejectsAmbiguousInspectResults(t *testing.T) {
+	if _, err := parseDockerImageIdentity([]byte(`[{"Id":"sha256:one"},{"Id":"sha256:two"}]`), "redis:7-alpine"); err == nil {
+		t.Fatal("ambiguous Docker image identity was accepted")
+	}
+	if _, err := parseAppleImageIdentity([]byte(`[{"id":"one"},{"id":"two"}]`), "redis:7-alpine"); err == nil {
+		t.Fatal("ambiguous Apple image identity was accepted")
+	}
+}
+
 func TestDockerRepoDigestSelectsPinnedRepository(t *testing.T) {
 	got, err := dockerRepoDigest("testcontainers/ryuk:0.14.0", []byte(`["testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0"]`))
 	if err != nil {
@@ -183,12 +192,43 @@ func TestVerifyImageAbsentChecksContentAndTags(t *testing.T) {
 	}
 }
 
+func TestContainerNotFoundClassifierIsSpecific(t *testing.T) {
+	if !isContainerNotFoundError(errors.New("Error: no such container: reaper_session")) {
+		t.Fatal("container not-found error was not recognized")
+	}
+	if isContainerNotFoundError(errors.New("Error: no such object")) {
+		t.Fatal("generic no-such-object error was treated as a missing container")
+	}
+}
+
 func TestBackendSelectionRejectsInvalidEnvironment(t *testing.T) {
 	if err := validateBackendSelection("podman", "docker"); err == nil {
 		t.Fatal("validateBackendSelection accepted an invalid backend")
 	}
 	if err := validateBackendSelection("apple", "docker"); err != nil {
 		t.Fatalf("validateBackendSelection rejected a valid other backend: %v", err)
+	}
+}
+
+func TestAppleVersionsRecordOnlyContainerAPIServer(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  "--version") echo 1.3.0 ;;
+  "system version --format json") echo '[{"appName":"container","version":"1.3.0"},{"appName":"container-apiserver","version":"apiserver-version"}]' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "container"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	versions, err := AppleBackend().Versions()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if versions[AppleClientVersionKey] != "1.3.0" || versions[AppleServiceVersionKey] != "apiserver-version" {
+		t.Fatalf("versions = %+v", versions)
 	}
 }
 
@@ -228,6 +268,92 @@ esac
 	}
 	if _, err := AppleBackend().Versions(); err == nil {
 		t.Fatal("Versions ignored an operational Apple service error")
+	}
+}
+
+func TestAppleServiceVersionParsesOnlyAPIServerComponent(t *testing.T) {
+	version, err := parseAppleServiceVersion([]byte(`[{"appName":"container","version":"1.3.0"},{"appName":"container-apiserver","version":"container-apiserver version 1.3.0 (build: release, commit: abc)","buildType":"release","commit":"abc"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if version != "container-apiserver version 1.3.0 (build: release, commit: abc)" {
+		t.Fatalf("version = %q", version)
+	}
+	for name, data := range map[string]string{
+		"client only": `[{"appName":"container","version":"1.3.0"}]`,
+		"malformed":   `not-json`,
+		"null":        `null`,
+		"ambiguous":   `[{"appName":"container-apiserver","version":"1"},{"appName":"container-apiserver","version":"2"}]`,
+	} {
+		if _, err := parseAppleServiceVersion([]byte(data)); err == nil {
+			t.Errorf("%s Apple system version was accepted", name)
+		}
+	}
+}
+
+func TestDockerCaptureProvenanceFailsClosedWhenUnavailable(t *testing.T) {
+	if _, err := (Backend{Name: "docker"}).CaptureProvenance(); err == nil {
+		t.Fatal("Docker provenance was accepted without a capture operation")
+	}
+	if _, err := (Backend{Name: "apple"}).CaptureProvenance(); err != nil {
+		t.Fatalf("Apple empty provenance should be valid: %v", err)
+	}
+}
+
+func TestDockerProvenanceRejectsConnectionOverrides(t *testing.T) {
+	t.Setenv("DOCKER_API_VERSION", "1.44")
+	if err := rejectDockerConnectionOverrides(); err == nil {
+		t.Fatal("Docker API version override was accepted")
+	}
+	t.Setenv("DOCKER_API_VERSION", "")
+	t.Setenv("DOCKER_AUTH_CONFIG", `{"auths":{}}`)
+	if err := rejectDockerConnectionOverrides(); err == nil {
+		t.Fatal("Docker auth override was accepted")
+	}
+}
+
+func TestDockerProvenanceCapturesEffectiveContextAndDaemon(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  "info --format {{json .}}") echo '{"ID":"daemon-id","OperatingSystem":"Docker Desktop","OSType":"linux","Architecture":"arm64"}' ;;
+  "context show") echo 'default' ;;
+  "context inspect default") echo '[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+	provenance, err := DockerBackend().CaptureProvenance()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if provenance.Endpoint != "unix:///var/run/docker.sock" || provenance.Context != "default" || provenance.DaemonID != "daemon-id" || provenance.DaemonOS != "linux" || provenance.DaemonArch != "arm64" {
+		t.Fatalf("provenance = %+v", provenance)
+	}
+}
+
+func TestDockerProvenanceRejectsEndpointContextMismatch(t *testing.T) {
+	dir := t.TempDir()
+	script := `#!/bin/sh
+case "$*" in
+  "info --format {{json .}}") echo '{"ID":"daemon-id","OSType":"linux","Architecture":"arm64"}' ;;
+  "context show") echo 'default' ;;
+  "context inspect default") echo '[{"Name":"default","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]' ;;
+  *) exit 1 ;;
+esac
+`
+	if err := os.WriteFile(filepath.Join(dir, "docker"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("DOCKER_HOST", "tcp://remote.example:2375")
+	if _, err := DockerBackend().CaptureProvenance(); err == nil {
+		t.Fatal("Docker endpoint/context mismatch was accepted")
 	}
 }
 

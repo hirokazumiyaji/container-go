@@ -27,6 +27,10 @@ const (
 // from Backend.ImageIdentity or Backend.ImageDigest.
 var ErrImageNotFound = errors.New("benchmark image not found")
 
+// ErrContainerNotFound is returned when a named benchmark container does
+// not exist. It is distinct from daemon or CLI operational failures.
+var ErrContainerNotFound = errors.New("benchmark container not found")
+
 // ImageIdentity is the information needed to prove that an image reference
 // and all of its known content aliases are gone. ContentID is a backend
 // image ID when one is available; Digest is a repository digest. Tags are
@@ -49,6 +53,17 @@ type ContainerIdentity struct {
 	ImageReference string
 	ImageID        string
 	Labels         map[string]string
+}
+
+// BackendProvenance identifies the effective backend selected by the CLI.
+// Docker fields are populated only for Docker results; Apple results leave
+// them empty so a mixed document cannot silently compare different daemons.
+type BackendProvenance struct {
+	Endpoint   string
+	Context    string
+	DaemonID   string
+	DaemonOS   string
+	DaemonArch string
 }
 
 // commandError preserves stderr from a command that failed. exec.Command's
@@ -107,6 +122,19 @@ func isImageNotFoundError(err error) bool {
 		(strings.Contains(text, "no such object") && strings.Contains(text, "image"))
 }
 
+func isContainerNotFoundError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		return true
+	}
+	text := strings.ToLower(commandStderr(err) + " " + err.Error())
+	return strings.Contains(text, "no such container") ||
+		(strings.Contains(text, "no such object") && strings.Contains(text, "container")) ||
+		strings.Contains(text, "container not found")
+}
+
 func inspectImage(run func(...string) ([]byte, error), image string, args ...string) ([]byte, error) {
 	out, err := run(args...)
 	if err != nil {
@@ -138,8 +166,8 @@ func parseDockerImageIdentity(data []byte, image string) (ImageIdentity, error) 
 	if err := json.Unmarshal(data, &records); err != nil {
 		return ImageIdentity{}, fmt.Errorf("decode Docker image identity for %s: %w", image, err)
 	}
-	if len(records) == 0 {
-		return ImageIdentity{}, fmt.Errorf("docker image identity for %s is empty", image)
+	if len(records) != 1 {
+		return ImageIdentity{}, fmt.Errorf("docker image identity for %s returned %d records", image, len(records))
 	}
 	record := records[0]
 	identity := ImageIdentity{
@@ -182,8 +210,8 @@ func parseAppleImageIdentity(data []byte, image string) (ImageIdentity, error) {
 	if err := json.Unmarshal(data, &records); err != nil {
 		return ImageIdentity{}, fmt.Errorf("decode Apple image identity for %s: %w", image, err)
 	}
-	if len(records) == 0 {
-		return ImageIdentity{}, fmt.Errorf("apple image identity for %s is empty", image)
+	if len(records) != 1 {
+		return ImageIdentity{}, fmt.Errorf("apple image identity for %s returned %d records", image, len(records))
 	}
 	record := records[0]
 	identity := ImageIdentity{Reference: image, ContentID: record.ID, Digest: record.Descriptor.Digest}
@@ -267,6 +295,28 @@ type Backend struct {
 	// ContainerInspect returns an identity for a named container. It is
 	// used only by the Docker/testcontainers benchmark.
 	ContainerInspect func(name string) (ContainerIdentity, error)
+	// Provenance records the effective endpoint and daemon identity.
+	Provenance func() (BackendProvenance, error)
+}
+
+// CaptureProvenance returns the backend-specific effective provenance.
+// Backends without a provenance operation return an empty value, except for
+// Docker where omitting provenance would make a strict result unverifiable.
+func (b Backend) CaptureProvenance() (BackendProvenance, error) {
+	if b.Provenance == nil {
+		if b.Name == "docker" {
+			return BackendProvenance{}, fmt.Errorf("docker provenance operation is unavailable")
+		}
+		return BackendProvenance{}, nil
+	}
+	return b.Provenance()
+}
+
+// ObserveImage returns the backend-observed content identity for image. The
+// benchmark uses this after the timed region instead of copying the policy
+// digest into the result.
+func (b Backend) ObserveImage(image string) (ImageIdentity, error) {
+	return b.imageIdentity(image)
 }
 
 // DockerBackend returns the harness for the docker CLI.
@@ -343,9 +393,15 @@ func DockerBackend() Backend {
 		ContainerInspect: func(name string) (ContainerIdentity, error) {
 			out, err := run("inspect", "--type", "container", name)
 			if err != nil {
+				if isContainerNotFoundError(err) {
+					return ContainerIdentity{}, fmt.Errorf("%w: %s", ErrContainerNotFound, name)
+				}
 				return ContainerIdentity{}, fmt.Errorf("inspect Docker container %s: %w", name, err)
 			}
 			return parseDockerContainerIdentity(out, name)
+		},
+		Provenance: func() (BackendProvenance, error) {
+			return captureDockerProvenance(run)
 		},
 	}
 }
@@ -443,12 +499,18 @@ func (b Backend) Versions() (map[string]string, error) {
 		}
 		versions[AppleClientVersionKey] = client
 		if len(b.ServiceVersionArgs) > 0 {
-			service, err := run(b.ServiceVersionArgs...)
-			if err == nil {
-				versions[AppleServiceVersionKey] = service
-			} else if !b.ServiceVersionOptional || !isUnsupportedServiceVersionError(err) {
-				return nil, fmt.Errorf("record Apple service version: %w", err)
+			out, serviceErr := runCommand(b.Bin, b.ServiceVersionArgs...)
+			if serviceErr != nil {
+				if b.ServiceVersionOptional && isUnsupportedServiceVersionError(serviceErr) {
+					break
+				}
+				return nil, fmt.Errorf("record Apple service version: %w", serviceErr)
 			}
+			service, err := parseAppleServiceVersion(out)
+			if err != nil {
+				return nil, err
+			}
+			versions[AppleServiceVersionKey] = service
 		}
 	default:
 		return nil, fmt.Errorf("record versions: unsupported backend %q", b.Name)

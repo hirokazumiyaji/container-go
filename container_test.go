@@ -15,9 +15,16 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	// The developer's shell must not redirect fixture-backed tests to
-	// another backend; tests opting in use t.Setenv.
-	os.Unsetenv("CONTAINERGO_BACKEND")
+	if integrationTestBuild {
+		if err := validateBackendEnv(os.Getenv(backendEnv)); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+	} else {
+		// The developer's shell must not redirect fixture-backed unit tests
+		// to another backend; tests opting in use t.Setenv.
+		os.Unsetenv(backendEnv)
+	}
 	os.Exit(m.Run())
 }
 

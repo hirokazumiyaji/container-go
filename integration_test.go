@@ -21,14 +21,23 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
+func requireIntegrationBackend(t *testing.T, expected string) {
+	t.Helper()
+	switch backend := os.Getenv("CONTAINERGO_BACKEND"); backend {
+	case "", expected:
+	case "apple", "docker":
+		t.Skipf("CONTAINERGO_BACKEND=%s; skipping %s integration", backend, expected)
+	default:
+		t.Fatalf("invalid CONTAINERGO_BACKEND=%q: valid values are \"apple\" and \"docker\"", backend)
+	}
+}
+
 // requireSystem skips unless the Apple Container CLI is installed and
-// its system service answers. When CONTAINERGO_BACKEND is set to a
-// non-apple value, Apple integration tests are skipped.
+// its system service answers. A valid non-Apple selection skips these tests;
+// an invalid selection fails the integration binary.
 func requireSystem(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple integration", backend)
-	}
+	requireIntegrationBackend(t, "apple")
 	if _, err := exec.LookPath("container"); err != nil {
 		t.Skip("container CLI not installed")
 	}

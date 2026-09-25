@@ -29,6 +29,10 @@ type (
 	SourceMetadata = ibench.SourceMetadata
 	// Source is a shorter alias for SourceMetadata.
 	Source = ibench.Source
+	// BaselineScenario records all policy inputs for one baseline row.
+	BaselineScenario = ibench.BaselineScenario
+	// BaselineProvenance is the complete machine-checkable baseline record.
+	BaselineProvenance = ibench.BaselineProvenance
 )
 
 // Library names a code path under measurement.
@@ -115,6 +119,17 @@ func ValidateScenarioSet(results []Result) error { return ibench.ValidateScenari
 // CompareDocs rejects invalid documents and mismatched image, scenario,
 // or environment inputs while allowing clean source commits to differ.
 func CompareDocs(baseline, candidate Doc) error { return ibench.CompareDocs(baseline, candidate) }
+
+// GenerateBaselineProvenance creates the canonical baseline policy record.
+func GenerateBaselineProvenance(env Env) BaselineProvenance {
+	return ibench.GenerateBaselineProvenance(env)
+}
+
+// ValidateBaselineProvenance verifies complete baseline environment and
+// scenario provenance, not just row shape.
+func ValidateBaselineProvenance(baseline BaselineProvenance) error {
+	return ibench.ValidateBaselineProvenance(baseline)
+}
 
 // Table renders summaries as a fixed-width human-readable table.
 func Table(summaries []Summary) string { return ibench.Table(summaries) }

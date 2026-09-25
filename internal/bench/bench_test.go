@@ -23,17 +23,20 @@ func sampleResults() []Result {
 			panic("unknown test scenario: " + scenario)
 		}
 		return Result{
-			Backend:            "docker",
-			Library:            LibraryContainerGo,
-			Image:              policy.Image,
-			ImageDigest:        policy.ImageDigest,
-			WorkloadCacheState: policy.WorkloadCacheStates[0],
-			Scenario:           scenario,
-			Iteration:          it,
-			Iterations:         policy.Iterations,
-			Commit:             testCommit,
-			DurationNS:         int64(d),
-			Subprocesses:       spawns,
+			Backend:             "docker",
+			Library:             LibraryContainerGo,
+			Image:               policy.Image,
+			ImageDigest:         policy.ImageDigest,
+			ExpectedImageDigest: policy.ImageDigest,
+			ObservedImageDigest: policy.ImageDigest,
+			ObservedImageID:     "sha256:workload",
+			WorkloadCacheState:  policy.WorkloadCacheStates[0],
+			Scenario:            scenario,
+			Iteration:           it,
+			Iterations:          policy.Iterations,
+			Commit:              testCommit,
+			DurationNS:          int64(d),
+			Subprocesses:        spawns,
 		}
 	}
 	return []Result{
@@ -45,17 +48,20 @@ func sampleResults() []Result {
 		run("run/cold", 1, 2*time.Second, 4),
 		run("run/cold", 2, 3*time.Second, 4),
 		{
-			Backend:         "docker",
-			Library:         LibraryTestcontainersGo,
-			Image:           RedisImage,
-			ImageDigest:     RedisImageDigest,
-			RyukImage:       TestcontainersRyukImage,
-			RyukImageDigest: TestcontainersRyukImageDigest,
-			Scenario:        "tc/single",
-			Iteration:       1,
-			Iterations:      DefaultIterations,
-			Commit:          testCommit,
-			DurationNS:      int64(900 * time.Millisecond),
+			Backend:             "docker",
+			Library:             LibraryTestcontainersGo,
+			Image:               RedisImage,
+			ImageDigest:         RedisImageDigest,
+			ExpectedImageDigest: RedisImageDigest,
+			ObservedImageDigest: RedisImageDigest,
+			ObservedImageID:     "sha256:workload",
+			RyukImage:           TestcontainersRyukImage,
+			RyukImageDigest:     TestcontainersRyukImageDigest,
+			Scenario:            "tc/single",
+			Iteration:           1,
+			Iterations:          DefaultIterations,
+			Commit:              testCommit,
+			DurationNS:          int64(900 * time.Millisecond),
 		},
 	}
 }
@@ -65,16 +71,19 @@ func completeResults(commit string) []Result {
 	for _, policy := range ScenarioPoliciesFor("docker", LibraryContainerGo) {
 		for iteration := 1; iteration <= policy.Iterations; iteration++ {
 			results = append(results, Result{
-				Backend:            "docker",
-				Library:            LibraryContainerGo,
-				Image:              policy.Image,
-				ImageDigest:        policy.ImageDigest,
-				WorkloadCacheState: policy.WorkloadCacheStates[0],
-				Scenario:           policy.Name,
-				Iteration:          iteration,
-				Iterations:         policy.Iterations,
-				Commit:             commit,
-				DurationNS:         1,
+				Backend:             "docker",
+				Library:             LibraryContainerGo,
+				Image:               policy.Image,
+				ImageDigest:         policy.ImageDigest,
+				ExpectedImageDigest: policy.ImageDigest,
+				ObservedImageDigest: policy.ImageDigest,
+				ObservedImageID:     "sha256:workload",
+				WorkloadCacheState:  policy.WorkloadCacheStates[0],
+				Scenario:            policy.Name,
+				Iteration:           iteration,
+				Iterations:          policy.Iterations,
+				Commit:              commit,
+				DurationNS:          1,
 			})
 		}
 	}
@@ -85,19 +94,22 @@ func completeResults(commit string) []Result {
 				cacheState = CacheStateWarm
 			}
 			results = append(results, Result{
-				Backend:            "docker",
-				Library:            LibraryTestcontainersGo,
-				Image:              policy.Image,
-				ImageDigest:        policy.ImageDigest,
-				WorkloadCacheState: policy.WorkloadCacheStates[0],
-				RyukImage:          policy.RyukImage,
-				RyukImageDigest:    policy.RyukImageDigest,
-				CacheState:         cacheState,
-				Scenario:           policy.Name,
-				Iteration:          iteration,
-				Iterations:         policy.Iterations,
-				Commit:             commit,
-				DurationNS:         1,
+				Backend:             "docker",
+				Library:             LibraryTestcontainersGo,
+				Image:               policy.Image,
+				ImageDigest:         policy.ImageDigest,
+				ExpectedImageDigest: policy.ImageDigest,
+				ObservedImageDigest: policy.ImageDigest,
+				ObservedImageID:     "sha256:workload",
+				WorkloadCacheState:  policy.WorkloadCacheStates[0],
+				RyukImage:           policy.RyukImage,
+				RyukImageDigest:     policy.RyukImageDigest,
+				CacheState:          cacheState,
+				Scenario:            policy.Name,
+				Iteration:           iteration,
+				Iterations:          policy.Iterations,
+				Commit:              commit,
+				DurationNS:          1,
 			})
 		}
 	}
@@ -106,14 +118,19 @@ func completeResults(commit string) []Result {
 
 func testEnv(commit string) Env {
 	return Env{
-		OS:              "darwin",
-		Arch:            "arm64",
-		CPUs:            10,
-		Go:              "go1.27.0",
-		Host:            "bench-host",
-		Commit:          commit,
-		Tree:            testTree,
-		ReaperSessionID: testReaperSession,
+		OS:               "darwin",
+		Arch:             "arm64",
+		CPUs:             10,
+		Go:               "go1.27.0",
+		Host:             "bench-host",
+		Commit:           commit,
+		Tree:             testTree,
+		ReaperSessionID:  testReaperSession,
+		DockerEndpoint:   "unix:///var/run/docker.sock",
+		DockerContext:    "default",
+		DockerDaemonID:   "daemon-id",
+		DockerDaemonOS:   "linux",
+		DockerDaemonArch: "arm64",
 		CLIs: map[string]string{
 			DockerClientVersionKey: "29.8.0",
 			DockerServerVersionKey: "29.8.0",
@@ -278,6 +295,24 @@ func TestValidateDocChecksReproducibilityMetadata(t *testing.T) {
 	if err := ValidateDoc(doc); err == nil {
 		t.Fatal("ValidateDoc accepted the wrong workload cache state")
 	}
+
+	doc = completeDoc(testCommit)
+	doc.Results[0].ObservedImageDigest = NginxImageDigest
+	if err := ValidateDoc(doc); err == nil {
+		t.Fatal("ValidateDoc accepted a mismatched observed image digest")
+	}
+
+	doc = completeDoc(testCommit)
+	doc.Results[0].ExpectedImageDigest = ""
+	if err := ValidateDoc(doc); err == nil {
+		t.Fatal("ValidateDoc accepted a missing expected image digest")
+	}
+
+	doc = completeDoc(testCommit)
+	doc.Results[0].ObservedImageID = ""
+	if err := ValidateDoc(doc); err == nil {
+		t.Fatal("ValidateDoc accepted a missing Docker observed image ID")
+	}
 }
 
 func TestPinnedImagesMatchPolicyDigests(t *testing.T) {
@@ -430,6 +465,31 @@ func TestCompareDocsValidatesAndAllowsSourceRevisionChanges(t *testing.T) {
 	candidate.Env.Go = "go1.26.0"
 	if err := CompareDocs(baseline, candidate); err == nil {
 		t.Fatal("CompareDocs accepted a changed Go environment")
+	}
+
+	for name, mutate := range map[string]func(*Env){
+		"endpoint":    func(env *Env) { env.DockerEndpoint = "tcp://other.example:2375" },
+		"context":     func(env *Env) { env.DockerContext = "other" },
+		"daemon ID":   func(env *Env) { env.DockerDaemonID = "other-daemon" },
+		"daemon OS":   func(env *Env) { env.DockerDaemonOS = "windows" },
+		"daemon arch": func(env *Env) { env.DockerDaemonArch = "amd64" },
+	} {
+		candidate = completeDoc(candidateCommit)
+		mutate(&candidate.Env)
+		if err := CompareDocs(baseline, candidate); err == nil {
+			t.Errorf("CompareDocs accepted changed Docker %s provenance", name)
+		}
+	}
+
+	candidate = completeDoc(candidateCommit)
+	candidate.Results[0].ObservedImageDigest = NginxImageDigest
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted changed observed image digest")
+	}
+	candidate = completeDoc(candidateCommit)
+	candidate.Results[0].ObservedImageID = "sha256:other"
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted changed observed image ID")
 	}
 
 	candidate = completeDoc(candidateCommit)

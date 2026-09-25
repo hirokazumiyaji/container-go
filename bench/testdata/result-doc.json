@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "env": {
     "os": "darwin",
     "arch": "arm64",
@@ -14,7 +14,12 @@
       "docker.client": "29.8.0",
       "docker.server": "29.8.0"
     },
-    "recorded_at": "2026-08-29T01:30:00Z"
+    "recorded_at": "2026-08-29T01:30:00Z",
+    "docker_endpoint": "unix:///var/run/docker.sock",
+    "docker_context": "default",
+    "docker_daemon_id": "daemon-id",
+    "docker_daemon_os": "linux",
+    "docker_daemon_arch": "arm64"
   },
   "results": [
     {
@@ -28,7 +33,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "cold"
+      "workload_cache_state": "cold",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -41,7 +49,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "cold"
+      "workload_cache_state": "cold",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -54,7 +65,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "cold"
+      "workload_cache_state": "cold",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -67,7 +81,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "cold"
+      "workload_cache_state": "cold",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -80,7 +97,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "cold"
+      "workload_cache_state": "cold",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -93,7 +113,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -106,7 +129,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -119,7 +145,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -132,7 +161,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -145,7 +177,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -158,7 +193,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -171,7 +209,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -184,7 +225,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -197,7 +241,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -210,7 +257,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_digest": "sha256:1ed1b0e1d7652937d6cbdaf4018c7b6fc009a7dd6c3047351e2eddda745de43f",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -223,7 +273,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -236,7 +289,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -249,7 +305,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -262,7 +321,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -275,7 +337,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -288,7 +353,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -301,7 +369,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -314,7 +385,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -327,7 +401,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -340,7 +417,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -353,7 +433,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -366,7 +449,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -379,7 +465,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -392,7 +481,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -405,7 +497,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -418,7 +513,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -431,7 +529,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -444,7 +545,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -457,7 +561,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -470,7 +577,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -483,7 +593,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -496,7 +609,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -509,7 +625,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -522,7 +641,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -535,7 +657,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -551,7 +676,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -566,7 +694,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -581,7 +712,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -596,7 +730,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -611,7 +748,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -626,7 +766,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -641,7 +784,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -656,7 +802,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -671,7 +820,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -686,7 +838,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     },
     {
       "backend": "docker",
@@ -701,7 +856,10 @@
       "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 1,
       "subprocesses": 0,
-      "workload_cache_state": "warm"
+      "workload_cache_state": "warm",
+      "expected_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "observed_image_id": "sha256:workload"
     }
   ]
 }

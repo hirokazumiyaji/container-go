@@ -2,6 +2,7 @@ package container
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -33,6 +34,12 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 		if row.iterations != policy.Iterations {
 			t.Errorf("baseline %s/%s/%s iterations = %d, want %d", key.Backend, key.Library, key.Scenario, row.iterations, policy.Iterations)
 		}
+		if row.image != policy.Image || row.imageDigest != policy.ImageDigest || row.workloadCache != policy.WorkloadCacheStates[0] {
+			t.Errorf("baseline %s/%s/%s image/cache provenance does not match policy: row=%+v", key.Backend, key.Library, key.Scenario, row)
+		}
+		if scenarioCacheState(row.ryukCache, policy.CacheStates) == "" {
+			t.Errorf("baseline %s/%s/%s Ryuk cache provenance = %q, want one of %v", key.Backend, key.Library, key.Scenario, row.ryukCache, policy.CacheStates)
+		}
 	}
 	for _, required := range []string{
 		bench.RedisImage,
@@ -40,15 +47,26 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 		bench.TestcontainersRyukImage,
 		"schema_version",
 		"workload_cache_state",
+		"expected_image_digest",
+		"observed_image_digest",
+		"observed_image_id",
 		"env.tree",
 		"env.dirty",
 		"docker.client",
 		"docker.server",
+		"docker_endpoint",
+		"docker_context",
+		"docker_daemon_id",
+		"docker_daemon_os",
+		"docker_daemon_arch",
 		"apple.client",
 		"apple.service",
 		"ryuk_image",
 		"cache_state",
 		"reaper_session_id",
+		"TESTCONTAINERS_CONFIG",
+		"ryuk.container.image",
+		"Java-properties",
 	} {
 		if !bytes.Contains(data, []byte(required)) {
 			t.Errorf("benchmark documentation does not describe %q", required)
@@ -64,8 +82,54 @@ func TestBenchmarkDocumentationMatchesScenarioPolicy(t *testing.T) {
 	}
 }
 
+func TestBenchmarkBaselineProvenanceIsComplete(t *testing.T) {
+	data := readRepositoryFile(t, filepath.Join("testdata", "benchmark-baseline.json"))
+	var baseline bench.BaselineProvenance
+	if err := json.Unmarshal(data, &baseline); err != nil {
+		t.Fatalf("decode benchmark baseline provenance: %v", err)
+	}
+	if err := bench.ValidateBaselineProvenance(baseline); err != nil {
+		t.Fatalf("validate benchmark baseline provenance: %v", err)
+	}
+}
+
+func TestBenchmarkDocumentationMatchesBaselineFixture(t *testing.T) {
+	docs := parseBenchmarkRows(t, readRepositoryFile(t, filepath.Join("docs", "benchmarks.md")))
+	var baseline bench.BaselineProvenance
+	if err := json.Unmarshal(readRepositoryFile(t, filepath.Join("testdata", "benchmark-baseline.json")), &baseline); err != nil {
+		t.Fatal(err)
+	}
+	for _, scenario := range baseline.Scenarios {
+		key := bench.ScenarioKey{Backend: scenario.Backend, Library: scenario.Library, Scenario: scenario.Scenario}
+		row, ok := docs[key]
+		if !ok {
+			t.Errorf("documentation is missing baseline scenario %s/%s/%s", key.Backend, key.Library, key.Scenario)
+			continue
+		}
+		if row.iterations != scenario.Iterations || row.image != scenario.Image || row.imageDigest != scenario.ImageDigest {
+			t.Errorf("documentation row %s/%s/%s = %+v, baseline = %+v", key.Backend, key.Library, key.Scenario, row, scenario)
+		}
+		if len(scenario.WorkloadCacheStates) != 1 || row.workloadCache != scenario.WorkloadCacheStates[0] {
+			t.Errorf("documentation workload cache for %s/%s/%s = %q, baseline = %v", key.Backend, key.Library, key.Scenario, row.workloadCache, scenario.WorkloadCacheStates)
+		}
+		wantRyuk := "-"
+		if len(scenario.RyukCacheStates) == 2 && scenario.RyukCacheStates[0] == bench.CacheStateCold && scenario.RyukCacheStates[1] == bench.CacheStateWarm {
+			wantRyuk = "cold/warm"
+		} else if len(scenario.RyukCacheStates) == 1 {
+			wantRyuk = scenario.RyukCacheStates[0]
+		}
+		if row.ryukCache != wantRyuk {
+			t.Errorf("documentation Ryuk cache for %s/%s/%s = %q, baseline = %q", key.Backend, key.Library, key.Scenario, row.ryukCache, wantRyuk)
+		}
+	}
+}
+
 type benchmarkRow struct {
-	iterations int
+	iterations    int
+	image         string
+	imageDigest   string
+	workloadCache string
+	ryukCache     string
 }
 
 func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchmarkRow {
@@ -88,7 +152,7 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchma
 			break
 		}
 		cells := strings.Split(strings.Trim(line, "|"), "|")
-		if len(cells) < 4 {
+		if len(cells) < 8 {
 			t.Fatalf("malformed baseline row: %q", line)
 		}
 		key := bench.ScenarioKey{
@@ -103,9 +167,33 @@ func parseBenchmarkRows(t *testing.T, data []byte) map[bench.ScenarioKey]benchma
 		if _, exists := rows[key]; exists {
 			t.Errorf("baseline has duplicate scenario key %s/%s/%s", key.Backend, key.Library, key.Scenario)
 		}
-		rows[key] = benchmarkRow{iterations: iterations}
+		rows[key] = benchmarkRow{
+			iterations:    iterations,
+			image:         strings.TrimSpace(cells[4]),
+			imageDigest:   strings.TrimSpace(cells[5]),
+			workloadCache: strings.TrimSpace(cells[6]),
+			ryukCache:     strings.TrimSpace(cells[7]),
+		}
 	}
 	return rows
+}
+
+func scenarioCacheState(value string, allowed []string) string {
+	if len(allowed) == 0 {
+		if value == "-" {
+			return "-"
+		}
+		return ""
+	}
+	if len(allowed) == 2 && allowed[0] == bench.CacheStateCold && allowed[1] == bench.CacheStateWarm && value == "cold/warm" {
+		return value
+	}
+	for _, state := range allowed {
+		if value == state {
+			return value
+		}
+	}
+	return ""
 }
 
 func readRepositoryFile(t *testing.T, relative string) []byte {

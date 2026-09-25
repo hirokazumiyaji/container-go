@@ -17,7 +17,7 @@ import (
 // CurrentSchemaVersion is the strict, reproducible result schema. ParseDoc
 // remains permissive for older documents, but ValidateDoc and CompareDocs
 // accept only this version.
-const CurrentSchemaVersion = 3
+const CurrentSchemaVersion = 4
 
 // Library names a code path under measurement.
 const (
@@ -33,8 +33,13 @@ type Result struct {
 	Library string `json:"library"`
 	// Image is the immutable image reference the scenario started.
 	Image string `json:"image"`
-	// ImageDigest is the content digest resolved for Image.
-	ImageDigest string `json:"image_digest,omitempty"`
+	// ImageDigest is retained as the expected content digest for Image.
+	// ExpectedImageDigest and ObservedImageDigest make the provenance
+	// distinction explicit in newly recorded documents.
+	ImageDigest         string `json:"image_digest"`
+	ExpectedImageDigest string `json:"expected_image_digest"`
+	ObservedImageDigest string `json:"observed_image_digest"`
+	ObservedImageID     string `json:"observed_image_id,omitempty"`
 	// WorkloadCacheState records whether the workload image was absent or
 	// present at the instant the timed region started. It is required for
 	// every result and is independent of the testcontainers Ryuk state.
@@ -83,8 +88,15 @@ type Env struct {
 	CLIs  map[string]string `json:"clis"`
 	// ReaperSessionID is the actual generated testcontainers session used
 	// by a testcontainers result. It is empty for container-go-only docs.
-	ReaperSessionID string    `json:"reaper_session_id,omitempty"`
-	RecordedAt      time.Time `json:"recorded_at"`
+	ReaperSessionID string `json:"reaper_session_id,omitempty"`
+	// Docker provenance fields describe the effective CLI endpoint and
+	// daemon selected for Docker results.
+	DockerEndpoint   string    `json:"docker_endpoint,omitempty"`
+	DockerContext    string    `json:"docker_context,omitempty"`
+	DockerDaemonID   string    `json:"docker_daemon_id,omitempty"`
+	DockerDaemonOS   string    `json:"docker_daemon_os,omitempty"`
+	DockerDaemonArch string    `json:"docker_daemon_arch,omitempty"`
+	RecordedAt       time.Time `json:"recorded_at"`
 
 	// metadataPresent and dirtyPresent preserve JSON field presence while
 	// keeping Dirty source-compatible as a bool. They are intentionally
@@ -123,6 +135,11 @@ func NormalizeEnv(env Env) Env {
 	env.Commit = strings.TrimSpace(env.Commit)
 	env.Tree = strings.TrimSpace(env.Tree)
 	env.ReaperSessionID = strings.TrimSpace(env.ReaperSessionID)
+	env.DockerEndpoint = strings.TrimSpace(env.DockerEndpoint)
+	env.DockerContext = strings.TrimSpace(env.DockerContext)
+	env.DockerDaemonID = strings.TrimSpace(env.DockerDaemonID)
+	env.DockerDaemonOS = strings.TrimSpace(env.DockerDaemonOS)
+	env.DockerDaemonArch = strings.TrimSpace(env.DockerDaemonArch)
 	if !env.RecordedAt.IsZero() {
 		env.RecordedAt = env.RecordedAt.UTC()
 	}

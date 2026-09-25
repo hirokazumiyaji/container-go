@@ -80,20 +80,40 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 		if err := ctr.Terminate(context.Background()); err != nil {
 			t.Logf("%s iteration %d: terminate: %v", scenario, i, err)
 		}
+		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:            b.Name,
-			Library:            bench.LibraryContainerGo,
-			Image:              image,
-			ImageDigest:        policy.ImageDigest,
-			WorkloadCacheState: policy.WorkloadCacheStates[0],
-			Scenario:           scenario,
-			Iteration:          i,
-			Iterations:         policy.Iterations,
-			Commit:             doc.Env.Commit,
-			DurationNS:         int64(elapsed),
-			Subprocesses:       spawns,
+			Backend:             b.Name,
+			Library:             bench.LibraryContainerGo,
+			Image:               image,
+			ImageDigest:         policy.ImageDigest,
+			ExpectedImageDigest: policy.ImageDigest,
+			ObservedImageDigest: identity.Digest,
+			ObservedImageID:     identity.ContentID,
+			WorkloadCacheState:  policy.WorkloadCacheStates[0],
+			Scenario:            scenario,
+			Iteration:           i,
+			Iterations:          policy.Iterations,
+			Commit:              doc.Env.Commit,
+			DurationNS:          int64(elapsed),
+			Subprocesses:        spawns,
 		})
 	}
+}
+
+func observeBenchImage(t *testing.T, b bench.Backend, image string) bench.ImageIdentity {
+	t.Helper()
+	identity, err := b.ObserveImage(image)
+	if err != nil {
+		t.Fatalf("observe workload image %s: %v", image, err)
+	}
+	expected := bench.ImageDigest(image)
+	if identity.Digest == "" || identity.Digest != expected {
+		t.Fatalf("observed workload image %s digest = %q, want %q", image, identity.Digest, expected)
+	}
+	if b.Name == "docker" && identity.ContentID == "" {
+		t.Fatalf("observed Docker workload image %s has no content ID", image)
+	}
+	return identity
 }
 
 // TestIntegrationBenchCounting records Run→ready durations and
@@ -186,18 +206,22 @@ func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image
 				t.Logf("multi iteration %d: terminate: %v", i, err)
 			}
 		}
+		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:            b.Name,
-			Library:            bench.LibraryContainerGo,
-			Image:              image,
-			ImageDigest:        policy.ImageDigest,
-			WorkloadCacheState: policy.WorkloadCacheStates[0],
-			Scenario:           "run/multi-5",
-			Iteration:          i,
-			Iterations:         policy.Iterations,
-			Commit:             doc.Env.Commit,
-			DurationNS:         int64(elapsed),
-			Subprocesses:       r.count(),
+			Backend:             b.Name,
+			Library:             bench.LibraryContainerGo,
+			Image:               image,
+			ImageDigest:         policy.ImageDigest,
+			ExpectedImageDigest: policy.ImageDigest,
+			ObservedImageDigest: identity.Digest,
+			ObservedImageID:     identity.ContentID,
+			WorkloadCacheState:  policy.WorkloadCacheStates[0],
+			Scenario:            "run/multi-5",
+			Iteration:           i,
+			Iterations:          policy.Iterations,
+			Commit:              doc.Env.Commit,
+			DurationNS:          int64(elapsed),
+			Subprocesses:        r.count(),
 		})
 	}
 }
@@ -250,18 +274,22 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 				t.Logf("parallel iteration %d: terminate: %v", i, err)
 			}
 		}
+		identity := observeBenchImage(t, b, image)
 		doc.Results = append(doc.Results, bench.Result{
-			Backend:            b.Name,
-			Library:            bench.LibraryContainerGo,
-			Image:              image,
-			ImageDigest:        policy.ImageDigest,
-			WorkloadCacheState: policy.WorkloadCacheStates[0],
-			Scenario:           "run/parallel-8",
-			Iteration:          i,
-			Iterations:         policy.Iterations,
-			Commit:             doc.Env.Commit,
-			DurationNS:         int64(elapsed),
-			Subprocesses:       spawns,
+			Backend:             b.Name,
+			Library:             bench.LibraryContainerGo,
+			Image:               image,
+			ImageDigest:         policy.ImageDigest,
+			ExpectedImageDigest: policy.ImageDigest,
+			ObservedImageDigest: identity.Digest,
+			ObservedImageID:     identity.ContentID,
+			WorkloadCacheState:  policy.WorkloadCacheStates[0],
+			Scenario:            "run/parallel-8",
+			Iteration:           i,
+			Iterations:          policy.Iterations,
+			Commit:              doc.Env.Commit,
+			DurationNS:          int64(elapsed),
+			Subprocesses:        spawns,
 		})
 	}
 }
@@ -280,17 +308,26 @@ func benchEnv(t *testing.T, b bench.Backend) bench.Env {
 	if err != nil {
 		t.Fatalf("record backend versions: %v", err)
 	}
+	provenance, err := b.CaptureProvenance()
+	if err != nil {
+		t.Fatalf("record backend provenance: %v", err)
+	}
 	return bench.Env{
-		OS:         runtime.GOOS,
-		Arch:       runtime.GOARCH,
-		CPUs:       runtime.NumCPU(),
-		Go:         runtime.Version(),
-		Host:       host,
-		Commit:     source.Commit,
-		Tree:       source.Tree,
-		Dirty:      source.Dirty,
-		CLIs:       versions,
-		RecordedAt: time.Now().UTC(),
+		OS:               runtime.GOOS,
+		Arch:             runtime.GOARCH,
+		CPUs:             runtime.NumCPU(),
+		Go:               runtime.Version(),
+		Host:             host,
+		Commit:           source.Commit,
+		Tree:             source.Tree,
+		Dirty:            source.Dirty,
+		CLIs:             versions,
+		DockerEndpoint:   provenance.Endpoint,
+		DockerContext:    provenance.Context,
+		DockerDaemonID:   provenance.DaemonID,
+		DockerDaemonOS:   provenance.DaemonOS,
+		DockerDaemonArch: provenance.DaemonArch,
+		RecordedAt:       time.Now().UTC(),
 	}
 }
 

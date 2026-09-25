@@ -36,6 +36,41 @@ func ValidateDoc(d Doc) error {
 	return nil
 }
 
+// validateCompleteBaselineEnvironment adds the metadata requirements for the
+// all-backends baseline record. Result documents are backend-specific, but a
+// canonical baseline covers Docker, Apple, and testcontainers scenarios and
+// therefore cannot silently omit one of their service identities.
+func validateCompleteBaselineEnvironment(env Env) error {
+	for _, name := range []string{
+		DockerClientVersionKey,
+		DockerServerVersionKey,
+		AppleClientVersionKey,
+		AppleServiceVersionKey,
+	} {
+		if strings.TrimSpace(env.CLIs[name]) == "" {
+			return fmt.Errorf("env.clis[%q] is required for the complete baseline", name)
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "env.docker_endpoint", value: env.DockerEndpoint},
+		{name: "env.docker_context", value: env.DockerContext},
+		{name: "env.docker_daemon_id", value: env.DockerDaemonID},
+		{name: "env.docker_daemon_os", value: env.DockerDaemonOS},
+		{name: "env.docker_daemon_arch", value: env.DockerDaemonArch},
+	} {
+		if strings.TrimSpace(field.value) == "" {
+			return fmt.Errorf("%s is required for the complete baseline", field.name)
+		}
+	}
+	if env.ReaperSessionID == "" {
+		return fmt.Errorf("env.reaper_session_id is required for the complete baseline")
+	}
+	return nil
+}
+
 func validateEnvironment(env Env) error {
 	if env.metadataPresent && !env.dirtyPresent {
 		return fmt.Errorf("env.dirty is required")
@@ -77,7 +112,13 @@ func validateEnvironment(env Env) error {
 		AppleClientVersionKey:  true,
 		AppleServiceVersionKey: true,
 	}
-	for name, version := range env.CLIs {
+	cliNames := make([]string, 0, len(env.CLIs))
+	for name := range env.CLIs {
+		cliNames = append(cliNames, name)
+	}
+	sort.Strings(cliNames)
+	for _, name := range cliNames {
+		version := env.CLIs[name]
 		if !allowedCLIs[name] {
 			return fmt.Errorf("env.clis[%q] is not a recognized backend version key", name)
 		}
@@ -94,6 +135,22 @@ func validateEnvironment(env Env) error {
 		}
 		if !validSessionID(env.ReaperSessionID) {
 			return fmt.Errorf("env.reaper_session_id = %q, want a normalized session ID", env.ReaperSessionID)
+		}
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{name: "docker_endpoint", value: env.DockerEndpoint},
+		{name: "docker_context", value: env.DockerContext},
+		{name: "docker_daemon_id", value: env.DockerDaemonID},
+		{name: "docker_daemon_os", value: env.DockerDaemonOS},
+		{name: "docker_daemon_arch", value: env.DockerDaemonArch},
+	} {
+		if field.value != "" {
+			if err := validateMetadataValue("env."+field.name, field.value); err != nil {
+				return err
+			}
 		}
 	}
 	if env.RecordedAt.IsZero() {
@@ -131,12 +188,18 @@ func validateVersionMetadata(env Env, results []Result) error {
 			usesTestcontainers = true
 		}
 	}
-	for name := range env.CLIs {
-		if usesDocker && strings.HasPrefix(name, "apple.") {
-			return fmt.Errorf("env.clis[%q] is not valid for a Docker-only result set", name)
+	if usesDocker {
+		for _, name := range []string{AppleClientVersionKey, AppleServiceVersionKey} {
+			if _, ok := env.CLIs[name]; ok {
+				return fmt.Errorf("env.clis[%q] is not valid for a Docker-only result set", name)
+			}
 		}
-		if usesApple && strings.HasPrefix(name, "docker.") {
-			return fmt.Errorf("env.clis[%q] is not valid for an Apple-only result set", name)
+	}
+	if usesApple {
+		for _, name := range []string{DockerClientVersionKey, DockerServerVersionKey} {
+			if _, ok := env.CLIs[name]; ok {
+				return fmt.Errorf("env.clis[%q] is not valid for an Apple-only result set", name)
+			}
 		}
 	}
 	keys := make([]string, 0, len(required))
@@ -147,6 +210,29 @@ func validateVersionMetadata(env Env, results []Result) error {
 	for _, key := range keys {
 		if strings.TrimSpace(env.CLIs[key]) == "" {
 			return fmt.Errorf("env.clis[%q] is required for the recorded backends", key)
+		}
+	}
+	provenanceFields := []struct {
+		name  string
+		value string
+	}{
+		{name: "env.docker_endpoint", value: env.DockerEndpoint},
+		{name: "env.docker_context", value: env.DockerContext},
+		{name: "env.docker_daemon_id", value: env.DockerDaemonID},
+		{name: "env.docker_daemon_os", value: env.DockerDaemonOS},
+		{name: "env.docker_daemon_arch", value: env.DockerDaemonArch},
+	}
+	if usesDocker {
+		for _, field := range provenanceFields {
+			if field.value == "" {
+				return fmt.Errorf("%s is required for Docker results", field.name)
+			}
+		}
+	} else {
+		for _, field := range provenanceFields {
+			if field.value != "" {
+				return fmt.Errorf("%s is only valid for Docker results", field.name)
+			}
 		}
 	}
 	if usesTestcontainers {
@@ -209,6 +295,28 @@ func ValidateResult(result Result) error {
 	}
 	if result.ImageDigest != policy.ImageDigest {
 		return fmt.Errorf("%s image digest = %q, want %q", result.Scenario, result.ImageDigest, policy.ImageDigest)
+	}
+	if result.ExpectedImageDigest == "" {
+		return fmt.Errorf("%s expected_image_digest is required", result.Scenario)
+	}
+	if result.ExpectedImageDigest != result.ImageDigest || result.ExpectedImageDigest != policy.ImageDigest {
+		return fmt.Errorf("%s expected image digest = %q, want %q", result.Scenario, result.ExpectedImageDigest, policy.ImageDigest)
+	}
+	if result.ObservedImageDigest == "" {
+		return fmt.Errorf("%s observed_image_digest is required", result.Scenario)
+	}
+	if !validSHA256Digest(result.ObservedImageDigest) {
+		return fmt.Errorf("%s observed image digest = %q, want a sha256 digest", result.Scenario, result.ObservedImageDigest)
+	}
+	if result.ObservedImageDigest != result.ExpectedImageDigest {
+		return fmt.Errorf("%s observed image digest = %q, want expected %q", result.Scenario, result.ObservedImageDigest, result.ExpectedImageDigest)
+	}
+	if result.ObservedImageID != "" {
+		if err := validateMetadataValue("observed_image_id", result.ObservedImageID); err != nil {
+			return fmt.Errorf("%s: %w", result.Scenario, err)
+		}
+	} else if result.Backend == "docker" {
+		return fmt.Errorf("%s observed_image_id is required for Docker results", result.Scenario)
 	}
 	if referenceDigest := ImageDigest(result.Image); referenceDigest == "" {
 		return fmt.Errorf("%s image %q is not pinned to a valid sha256 digest", result.Scenario, result.Image)
@@ -421,6 +529,21 @@ func compareEnvironment(baseline, candidate Env) error {
 	if baseline.Host != candidate.Host {
 		return fmt.Errorf("host mismatch: baseline %q, candidate %q", baseline.Host, candidate.Host)
 	}
+	for _, field := range []struct {
+		name      string
+		baseline  string
+		candidate string
+	}{
+		{name: "docker endpoint", baseline: baseline.DockerEndpoint, candidate: candidate.DockerEndpoint},
+		{name: "docker context", baseline: baseline.DockerContext, candidate: candidate.DockerContext},
+		{name: "docker daemon ID", baseline: baseline.DockerDaemonID, candidate: candidate.DockerDaemonID},
+		{name: "docker daemon OS", baseline: baseline.DockerDaemonOS, candidate: candidate.DockerDaemonOS},
+		{name: "docker daemon arch", baseline: baseline.DockerDaemonArch, candidate: candidate.DockerDaemonArch},
+	} {
+		if field.baseline != field.candidate {
+			return fmt.Errorf("%s mismatch: baseline %q, candidate %q", field.name, field.baseline, field.candidate)
+		}
+	}
 	if len(baseline.CLIs) != len(candidate.CLIs) {
 		return fmt.Errorf("CLI version set mismatch")
 	}
@@ -471,8 +594,14 @@ func compareGroups(baseline, candidate resultGroup) error {
 		if first.Image != other.Image {
 			return fmt.Errorf("image reference mismatch for %q: baseline %q, candidate %q", first.Scenario, first.Image, other.Image)
 		}
-		if first.ImageDigest != other.ImageDigest {
-			return fmt.Errorf("image digest mismatch for %q: baseline %q, candidate %q", first.Scenario, first.ImageDigest, other.ImageDigest)
+		if first.ImageDigest != other.ImageDigest || first.ExpectedImageDigest != other.ExpectedImageDigest {
+			return fmt.Errorf("expected image digest mismatch for %q", first.Scenario)
+		}
+		if first.ObservedImageDigest != other.ObservedImageDigest {
+			return fmt.Errorf("observed image digest mismatch for %q: baseline %q, candidate %q", first.Scenario, first.ObservedImageDigest, other.ObservedImageDigest)
+		}
+		if first.ObservedImageID != other.ObservedImageID {
+			return fmt.Errorf("observed image ID mismatch for %q: baseline %q, candidate %q", first.Scenario, first.ObservedImageID, other.ObservedImageID)
 		}
 		if first.WorkloadCacheState != other.WorkloadCacheState {
 			return fmt.Errorf("workload cache state mismatch for %q: baseline %q, candidate %q", first.Scenario, first.WorkloadCacheState, other.WorkloadCacheState)

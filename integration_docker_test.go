@@ -21,13 +21,11 @@ import (
 )
 
 // requireDocker skips unless the docker CLI and daemon are available,
-// and routes this test to the Docker backend. When CONTAINERGO_BACKEND
-// is set to a non-docker value, Docker integration tests are skipped.
+// and routes this test to the Docker backend. A valid non-Docker selection
+// skips these tests; an invalid selection fails the integration binary.
 func requireDocker(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
-	}
+	requireIntegrationBackend(t, "docker")
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -144,8 +142,8 @@ func TestIntegrationDockerParallelStarts(t *testing.T) {
 
 func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
-		// The child's TestMain unsets CONTAINERGO_BACKEND, so the
-		// env-passed selection never reaches Run; pin it here.
+		// Integration TestMain preserves the validated selection; pin the
+		// child explicitly as well so this helper remains self-contained.
 		os.Setenv("CONTAINERGO_BACKEND", "docker")
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationAlpine,

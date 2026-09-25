@@ -15,7 +15,10 @@ import (
 
 func requireAppleCLI(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
+	if err := validateBackendEnv(os.Getenv(backendEnv)); err != nil {
+		t.Fatal(err)
+	}
+	if backend := os.Getenv(backendEnv); backend != "" && backend != "apple" {
 		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple CLI checks", backend)
 	}
 	if _, err := exec.LookPath("container"); err != nil {
@@ -28,7 +31,10 @@ func requireAppleCLI(t *testing.T) {
 
 func requireDockerCLI(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
+	if err := validateBackendEnv(os.Getenv(backendEnv)); err != nil {
+		t.Fatal(err)
+	}
+	if backend := os.Getenv(backendEnv); backend != "" && backend != "docker" {
 		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker CLI checks", backend)
 	}
 	if _, err := exec.LookPath("docker"); err != nil {

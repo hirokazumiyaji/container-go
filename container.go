@@ -361,6 +361,10 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return c.ipFromInfo(info)
+}
+
+func (c *Container) ipFromInfo(info *engineInfo) (string, error) {
 	if info.ip == "" {
 		return "", fmt.Errorf("container %s has no reported IP address", c.id)
 	}
@@ -372,6 +376,10 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
 func (c *Container) Host(ctx context.Context) (string, error) {
+	info, err := c.inspectDynamic(ctx)
+	if err != nil {
+		return "", err
+	}
 	if len(c.published) > 0 {
 		addr := c.published[0].connectAddr()
 		if !c.eng.directIP() {
@@ -380,7 +388,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		return addr, nil
 	}
 	if c.eng.directIP() {
-		return c.ContainerIP(ctx)
+		return c.ipFromInfo(info)
 	}
 	return c.eng.defaultHost(), nil
 }
@@ -407,30 +415,40 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
+	var published *publishSpec
+	for i := range c.published {
+		p := &c.published[i]
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+			published = p
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
+
+	// Resolve against one fresh identity-checked inspect even when the
+	// caller supplied an explicit binding. Do not call Host or ContainerIP
+	// here: those public methods would perform a second inspect.
+	info, err := c.inspectDynamic(ctx)
+	if err != nil {
+		return "", 0, err
+	}
+	if published != nil {
+		addr := published.connectAddr()
+		if !c.eng.directIP() {
+			addr = dockerConnectHost(addr, c.eng)
+		}
+		return addr, published.hostPort, nil
+	}
 	if c.eng.directIP() {
-		ip, err := c.ContainerIP(ctx)
+		ip, err := c.ipFromInfo(info)
 		if err != nil {
 			return "", 0, err
 		}
 		return ip, spec.port, nil
 	}
 	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.inspectDynamic(ctx)
-	if err != nil {
-		return "", 0, err
-	}
 	for _, b := range info.bound {
 		if b.containerPort == spec.port && b.proto == spec.proto {
 			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
@@ -490,13 +508,13 @@ func (c *Container) updateIdentityLocked(info *engineInfo) error {
 	}
 	if c.creation != "" {
 		actual := identity.labels[creationLabel]
-		if actual != "" && actual != c.creation {
-			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-		}
-		// A name-only handle cannot distinguish a replacement when the
-		// backend omits the generation label. Once a generation has been
-		// observed, however, its disappearance is also a mismatch.
-		if actual == "" && c.uid == "" && cached != nil && cached.labels[creationLabel] != "" {
+		if c.uid == "" {
+			// A name-only handle cannot verify ownership without the
+			// generation label, including on its first inspect.
+			if actual == "" || actual != c.creation {
+				return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+			}
+		} else if actual != "" && actual != c.creation {
 			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
 	}

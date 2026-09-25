@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -203,11 +204,18 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		ip:     c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
-		for _, n := range c.NetworkSettings.Networks {
-			if n.IPAddress != "" {
-				info.ip = n.IPAddress
-				break
+		// The legacy top-level address is preferred when present. Otherwise
+		// choose the lexicographically first network name with an address;
+		// ranging over a map directly would make repeated inspects unstable.
+		networkNames := make([]string, 0, len(c.NetworkSettings.Networks))
+		for name, network := range c.NetworkSettings.Networks {
+			if network.IPAddress != "" {
+				networkNames = append(networkNames, name)
 			}
+		}
+		sort.Strings(networkNames)
+		if len(networkNames) > 0 {
+			info.ip = c.NetworkSettings.Networks[networkNames[0]].IPAddress
 		}
 	}
 	for portProto, bindings := range c.NetworkSettings.Ports {

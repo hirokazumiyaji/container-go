@@ -212,7 +212,10 @@ By default, `Host` returns the container's real IP (from inspect's
 When a client demands a `localhost` endpoint (or the container IP is
 unreachable in a given setup), publish explicitly with
 `WithPublishedPort("127.0.0.1:15432:5432")`. Then `Host` returns the
-given host address and `MappedPort` the host port.
+given host address and `MappedPort` the host port. Every host or endpoint
+resolution performs a fresh identity-checked inspect. For Docker with
+multiple networks, the legacy top-level address is preferred; otherwise
+the lexicographically first network with an address is selected.
 
 `MappedPort` errors with `ErrPortNotExposed` for ports not declared
 via `WithExposedPorts`. The declarations also feed wait strategies

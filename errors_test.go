@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -57,6 +58,16 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		return []byte("29.7"), nil, nil
 	}
 	return nil, nil, n.err
+}
+
+func TestErrGenerationReplacedDescribesHandleMismatch(t *testing.T) {
+	message := ErrGenerationReplaced.Error()
+	if !strings.Contains(message, "handle") || !strings.Contains(message, "replaced") {
+		t.Fatalf("ErrGenerationReplaced = %q, want handle/replaced wording", message)
+	}
+	if strings.Contains(message, "delete") {
+		t.Fatalf("ErrGenerationReplaced = %q, must not be delete-specific", message)
+	}
 }
 
 func TestCLIErrorAliasUsableWithErrorsAs(t *testing.T) {

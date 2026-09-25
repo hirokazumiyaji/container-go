@@ -31,9 +31,9 @@ var ErrImageNotFound = errors.New("image not found in local store")
 var ErrContainerNotFound = errors.New("container not found")
 
 // ErrGenerationReplaced reports that a handle's immutable identity no
-// longer matches the live container. Destructive and endpoint operations
-// refuse to act on the replacement.
-var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+// longer matches the live container. Read, state, endpoint, and destructive
+// operations refuse to act on the replacement.
+var ErrGenerationReplaced = errors.New("container was recreated; handle refers to a replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).

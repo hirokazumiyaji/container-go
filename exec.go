@@ -134,16 +134,6 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	target := c.inspectTarget()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, target)
-	if err != nil {
-		return false
-	}
-	return info.state == StateRunning
+	info, err := c.inspectFresh(ctx)
+	return err == nil && info.state == StateRunning
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,10 +155,11 @@ func TestParseInspectTargetErrors(t *testing.T) {
 func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
 	otherID := strings.Repeat("a", 64)
 	cases := []struct {
-		name    string
-		target  string
-		data    string
-		wantUID string
+		name         string
+		target       string
+		data         string
+		wantUID      string
+		wantNotFound bool
 	}{
 		{
 			name:    "exact ID",
@@ -166,10 +168,30 @@ func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
 			wantUID: dockerFixtureID,
 		},
 		{
-			name:    "name",
+			name:    "logical name",
 			target:  "myctr",
 			data:    `[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`,
 			wantUID: dockerFixtureID,
+		},
+		{
+			name:   "logical name with multiple objects",
+			target: "myctr",
+			data: `[{"Id":"` + otherID + `","Name":"/other","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:   "exact ID wins over matching name",
+			target: dockerFixtureID,
+			data: `[{"Id":"` + otherID + `","Name":"/` + dockerFixtureID + `","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:         "full ID does not fall back to name",
+			target:       dockerFixtureID,
+			data:         `[{"Id":"` + otherID + `","Name":"/` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantNotFound: true,
 		},
 		{
 			name:   "multiple objects",
@@ -182,6 +204,12 @@ func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			info, err := (dockerEngine{}).parseInspect([]byte(tc.data), tc.target)
+			if tc.wantNotFound {
+				if !errors.Is(err, ErrContainerNotFound) {
+					t.Fatalf("error = %v, want ErrContainerNotFound", err)
+				}
+				return
+			}
 			if err != nil {
 				t.Fatalf("parseInspect: %v", err)
 			}
@@ -210,6 +238,114 @@ func TestDockerInspectUsesRunIDAndRejectsMismatch(t *testing.T) {
 	}
 	if !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
+	}
+}
+
+type blockingDockerInspectRunner struct {
+	*fakeRunner
+	data []byte
+
+	mu            sync.Mutex
+	inspectTarget []string
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+}
+
+func (r *blockingDockerInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 || args[0] != "inspect" {
+		return r.fakeRunner.Run(ctx, args...)
+	}
+	r.mu.Lock()
+	r.inspectTarget = append(r.inspectTarget, args[len(args)-1])
+	call := len(r.inspectTarget)
+	if call == 1 {
+		close(r.firstStarted)
+	}
+	if call == 2 {
+		close(r.secondStarted)
+	}
+	r.mu.Unlock()
+
+	if call == 1 {
+		select {
+		case <-r.secondStarted:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return r.data, nil, nil
+}
+
+func (r *blockingDockerInspectRunner) targets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.inspectTarget)
+}
+
+func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &blockingDockerInspectRunner{
+		fakeRunner:    newTestRunner(),
+		data:          data,
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	ctr := &Container{
+		id:      "myctr",
+		runner:  runner,
+		eng:     dockerEngine{},
+		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+	}
+
+	start := make(chan struct{})
+	endpointResult := make(chan error, 1)
+	stateResult := make(chan struct {
+		state State
+		err   error
+	}, 1)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		_, err := ctr.Endpoint(context.Background(), "6379/tcp")
+		endpointResult <- err
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		state, err := ctr.State(context.Background())
+		stateResult <- struct {
+			state State
+			err   error
+		}{state: state, err: err}
+	}()
+	ready.Wait()
+	close(start)
+
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+	if err := <-endpointResult; err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	result := <-stateResult
+	if result.err != nil {
+		t.Fatalf("State: %v", result.err)
+	}
+	if result.state != StateRunning {
+		t.Fatalf("State = %q, want %q", result.state, StateRunning)
+	}
+	if got := ctr.uid; got != dockerFixtureID {
+		t.Fatalf("uid = %q, want %q", got, dockerFixtureID)
+	}
+	wantTargets := []string{"myctr", dockerFixtureID}
+	if got := runner.targets(); !slices.Equal(got, wantTargets) {
+		t.Errorf("inspect targets = %v, want %v", got, wantTargets)
 	}
 }
 

@@ -97,8 +97,9 @@ type Container struct {
 	// check unnecessary: a replacement never shares it.
 	uid string
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	mu        sync.Mutex
+	info      *engineInfo // cached first inspect; immutable fields only
+	inspectMu sync.Mutex  // serializes inspect and protects uid after publication
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -314,8 +315,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	if target := c.inspectTarget(); target != c.id {
+		return c.delete(ctx, target)
 	}
 	if c.creation == "" {
 		return c.delete(ctx, c.id)
@@ -453,26 +454,39 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	return info, nil
+}
+
+func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target := c.inspectTargetLocked()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if err != nil {
+		return nil, wrapNotFound(c.classify(ctx, err))
+	}
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return nil, err
+	}
 	if c.uid == "" {
 		c.uid = info.uid
 	}
 	return info, nil
 }
 
-func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	target := c.inspectTarget()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
-	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
-	}
-	return c.eng.parseInspect(stdout, target)
-}
-
 // inspectTarget prefers an immutable ID so a same-name replacement cannot
 // satisfy a Docker inspect.
 func (c *Container) inspectTarget() string {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+	return c.inspectTargetLocked()
+}
+
+func (c *Container) inspectTargetLocked() string {
 	if c.uid != "" {
 		return c.uid
 	}

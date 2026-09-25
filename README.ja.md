@@ -123,10 +123,13 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
-すべての戦略は `WithStartupTimeout`（既定 60 秒）と `WithPollInterval`（既定 100 ミリ秒）を持ちます。
-`ForAll` と `ForAny` では `WithStartupTimeout` で合成全体のタイムアウトも設定できます。
+すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を受け付けます。
+`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間です。
+`ForAll` と `ForAny` は既定では合成全体のタイムEOUTを持ちません。正の `WithStartupTimeout` を指定すると合成全体を制限し、0 または負の値では制限せず各子の戦略のタイムアウトを適用します。
+
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
-created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF も再-open します。
+created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
+`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。
 待機に失敗した場合はロールバック削除し、エラーにログ末尾を添付します。
 
 カスタム戦略向けの `wait.Target` は従来の `Running` メソッドを維持します。

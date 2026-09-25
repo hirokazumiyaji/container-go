@@ -238,16 +238,21 @@ provides:
 - `wait.ForExec(cmd []string)`: wait until `container exec` exits with
   an accepted code (0 by default)
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition. Each child keeps its own `WithStartupTimeout`; the whole
-  composition can also be bounded with `WithStartupTimeout` (or
-  `context.WithTimeout` from the caller).
+  composition. Each child keeps its own `WithStartupTimeout`; a positive
+  composition `WithStartupTimeout` bounds the whole sequence/concurrent
+  wait. With no positive composition timeout, zero or a negative value
+  leaves the composition unbounded and the child timeouts apply.
 
-Every strategy carries `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). A stopping, stopped, or paused
-container fails the wait without burning the remaining timeout. Created,
-restarting, unknown, and transient inspect states remain retryable;
-transient log-stream open and EOF failures reopen the stream. Failed waits
-carry a log tail capped at 1MiB for diagnosis.
+Every leaf strategy carries `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms, except `ForExec`, which defaults to
+250ms). For `ForLog`, the poll interval is the delay before reopening a
+stream that ends before the pattern is found. A stopping, stopped, or
+paused container fails the wait without burning the remaining timeout.
+Created, restarting, unknown, and transient inspect states remain
+retryable; transient log-stream open and EOF failures reopen the stream,
+while a terminal log-stream error is returned. `ForLog` counts occurrences
+across reconnects after de-duplicating the replayed log prefix. Failed
+waits carry a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:
 

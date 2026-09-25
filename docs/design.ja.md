@@ -164,11 +164,13 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForListeningPort(port string)`：コンテナ IP の対象ポートへ `net.DialTimeout` が成功するまで待つ
 - `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。各子は自身の `WithStartupTimeout` を持ち、正の合成 `WithStartupTimeout` で合成全体を制限できる。合成のタイムアウトを正の値にしなければ、0 または負の値では合成を無制限にし、各子のタイムアウトを適用する。
 
-すべての戦略は `WithStartupTimeout`（既定 60 秒）と `WithPollInterval`（既定 100 ミリ秒）を持つ。
+すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を持つ。
+`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間である。
 コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。
-created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。
+created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。終了コードを伴うログストリームエラーは返却する。
+`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。
 失敗した待機には、診断用に上限 1 MiB のログ末尾を添える。
 
 戦略のインターフェースは次のとおり。

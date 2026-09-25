@@ -134,13 +134,20 @@ wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
-Every strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept
-`WithStartupTimeout` to bound the composition). Waiting fails fast when the
-container is stopping, stopped, or paused. Created, restarting, unknown, and
-transient inspect states retry under the timeout; transient log stream open/EOF
-failures are reopened. A failed wait rolls the container back with a tail of its
-logs attached to the error.
+Every leaf strategy accepts `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms, except `ForExec`, which defaults to
+250ms). For `ForLog`, the poll interval is the delay before reopening a
+stream that ends before the pattern is found. `ForAll` and `ForAny` have
+no composition-wide timeout by default; a positive `WithStartupTimeout`
+bounds the whole composition, while zero or a negative value leaves it
+unbounded and lets each child strategy's timeout apply.
+
+Waiting fails fast when the container is stopping, stopped, or paused.
+Created, restarting, unknown, and transient inspect states retry under the
+timeout; transient log stream open/EOF failures are reopened, while a
+terminal log-stream error is returned. `ForLog` counts occurrences across
+reconnects after de-duplicating the replayed log prefix. A failed wait rolls
+the container back with a tail of its logs attached to the error.
 
 For custom strategies, `wait.Target` retains its original `Running` method.
 Implement the optional `wait.StateTarget` interface when the target can

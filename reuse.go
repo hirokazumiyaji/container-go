@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -29,12 +30,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	info := base.info
-	if info == nil {
-		info, err = inspectNamed(ctx, cfg, cfg.name)
-		if err != nil {
-			return nil, err
+	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer infoCancel()
+	info, err := reuseInfoForCaller(infoCtx, cfg, base.info)
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect", cfg.name)
 		}
+		return nil, err
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
 		return nil, err
@@ -73,30 +76,44 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if isNotFound(err) {
+				// Creation carries its own runTimeout budget detached from
+				// the attach deadline: a leader pulling a large image must
+				// not be cut off after reuseAttachTimeout.
+				ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
+				if createErr == nil {
+					return ctr, nil
+				}
+				// nameConflict: another process won create. createRaceMissing
+				// covers Apple's concurrent-create race where run reaches
+				// "Starting container" then reports the ID as not found.
+				// Re-inspect and attach (or recreate) until the deadline.
+				if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+					if !waitReusePoll(ctx) {
+						return nil, reuseContextError(ctx, cfg.name)
+					}
+					continue
+				}
+				return nil, createErr
+			}
+			// Inspect can race a peer creating/replacing the container, or
+			// the backend can briefly lose its daemon. Keep the attach
+			// resolution bounded instead of failing on the first transient
+			// or incomplete response.
+			if !retryReuseInspect(err) {
 				return nil, err
 			}
-			// Creation carries its own runTimeout budget detached from
-			// the attach deadline: a leader pulling a large image must
-			// not be cut off after reuseAttachTimeout.
-			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
-			if createErr == nil {
-				return ctr, nil
+			if !waitReusePoll(ctx) {
+				return nil, reuseContextError(ctx, cfg.name)
 			}
-			// nameConflict: another process won create. createRaceMissing
-			// covers Apple's concurrent-create race where run reaches
-			// "Starting container" then reports the ID as not found.
-			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
-				time.Sleep(reusePollInterval)
-				continue
-			}
-			return nil, createErr
+			continue
 		}
 
 		switch info.state {
 		case StateCreated, StateRestarting, StateUnknown:
-			time.Sleep(reusePollInterval)
+			if !waitReusePoll(ctx) {
+				return nil, reuseContextError(ctx, cfg.name)
+			}
 			continue
 		case StateStopping:
 			return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
@@ -117,6 +134,12 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if !reuseInfoComplete(cfg, info) {
+				if !waitReusePoll(ctx) {
+					return nil, reuseContextError(ctx, cfg.name)
+				}
+				continue
+			}
 			ctr := &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -129,7 +152,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			ctr.cacheInfo(info)
 			return ctr, nil
 		default:
-			time.Sleep(reusePollInterval)
+			if !waitReusePoll(ctx) {
+				return nil, reuseContextError(ctx, cfg.name)
+			}
 		}
 	}
 }
@@ -178,10 +203,14 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
+	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	info, err := reuseInfoForCaller(infoCtx, cfg, ctr.info)
+	infoCancel()
+	if err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
 		return nil, err
 	}
+	ctr.cacheInfo(info)
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -222,6 +251,106 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
 	return namedContainer(cfg, id).inspectFresh(ctx)
+}
+
+// reuseInfoComplete reports whether inspect contains all connection data
+// needed by this request. A Running status alone is not enough: Apple can
+// report a container before its network address appears, and Docker can
+// report it before an exposed port receives a host binding.
+func reuseInfoComplete(cfg *config, info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	if len(cfg.exposed) == 0 && len(cfg.published) == 0 {
+		return true
+	}
+	ctr := &Container{eng: cfg.eng, exposed: cfg.exposed, published: cfg.published}
+	if !ctr.infoComplete(info) {
+		return false
+	}
+	for _, p := range cfg.published {
+		if !hasPublishedBinding(info.bound, p) {
+			return false
+		}
+	}
+	return true
+}
+
+// reuseInfoReady additionally requires the lifecycle state to be running.
+// A complete Created inspect still lacks a usable container and must be
+// refreshed before WithReuse publishes a handle.
+func reuseInfoReady(cfg *config, info *engineInfo) bool {
+	return info != nil && info.state == StateRunning && reuseInfoComplete(cfg, info)
+}
+
+// retryReuseInspect keeps a launch failure permanent while allowing
+// transient daemon/CLI failures to be retried within the attach budget.
+func retryReuseInspect(err error) bool {
+	if err == nil {
+		return true
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var launchErr *exec.Error
+	return !errors.As(err, &launchErr)
+}
+
+// reuseInfoForCaller fills a missing/incomplete inspect without turning a
+// backend's brief inspect failure into a failed WithReuse call. The initial
+// value is usually the shared ensure's cached complete inspect; the loop is
+// primarily for callers that received a Running result before its endpoint
+// data became visible.
+func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (*engineInfo, error) {
+	if reuseInfoReady(cfg, initial) {
+		return initial, nil
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, err := inspectNamed(ctx, cfg, cfg.name)
+		if err == nil {
+			if reuseInfoReady(cfg, info) {
+				return info, nil
+			}
+			switch info.state {
+			case StateStopping:
+				return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
+			case StatePaused:
+				return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
+			case StateStopped:
+				return nil, fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)
+			}
+		}
+		if err != nil && isNotFound(err) {
+			return nil, err
+		}
+		if err != nil && !retryReuseInspect(err) {
+			return nil, err
+		}
+		if !waitReusePoll(ctx) {
+			return nil, ctx.Err()
+		}
+	}
+}
+
+func waitReusePoll(ctx context.Context) bool {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func reuseContextError(ctx context.Context, name string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container", name)
+	}
+	return ctx.Err()
 }
 
 func namedContainer(cfg *config, id string) *Container {

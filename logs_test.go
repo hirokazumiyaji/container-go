@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
@@ -178,12 +179,16 @@ func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
 
 func writeFollowLogsStub(t *testing.T) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("follow-log shell stub requires a POSIX shell")
+	}
 	path := filepath.Join(t.TempDir(), "docker")
 	script := `#!/bin/sh
 if [ "$1" = "version" ]; then
   printf '29.7\n'
   exit 0
 fi
+head -c 70000 /dev/zero >&2
 printf 'Error response from daemon: No such container: myctr\n' >&2
 exit 1
 `

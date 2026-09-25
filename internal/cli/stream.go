@@ -9,13 +9,14 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 // Streamer starts a long-lived CLI invocation (e.g. `logs --follow`)
 // and exposes its combined stdout and stderr as a stream. A terminal
 // process failure is returned by Read. Closing the stream terminates the
-// child process.
+// child process and its process group.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
@@ -24,35 +25,69 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	cmd.WaitDelay = 3 * time.Second
-	// Keep the reader open until the command has been waited. The exec
-	// package's copy goroutines can therefore finish writing all output
-	// before the reader observes EOF.
-	pr, pw := io.Pipe()
-	stderr := &limitedBuffer{}
-	cmd.Stdout = pw
-	cmd.Stderr = &streamStderr{output: pw, stderr: stderr}
-	stream := &processStream{
-		ReadCloser: pr,
-		cmd:        cmd,
-		ctx:        ctx,
-		binary:     bin,
-		args:       append([]string(nil), args...),
-		output:     pw,
-		stderr:     stderr,
-		waitDone:   make(chan struct{}),
+	configureProcessTree(cmd)
+
+	// Keep OS pipes as the command's stdout/stderr. os/exec does not join
+	// a caller-owned *os.File with a copy goroutine, so Wait can reap the
+	// direct child even when the public stream is not being read. Our two
+	// pumps merge those pipes into the public stream asynchronously.
+	stdoutRead, stdoutWrite, err := os.Pipe()
+	if err != nil {
+		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
-	// Cancel closes the reader as well as killing the child. This is the
-	// callback used by exec.CommandContext's context watcher.
+	stderrRead, stderrWrite, err := os.Pipe()
+	if err != nil {
+		_ = stdoutRead.Close()
+		_ = stdoutWrite.Close()
+		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+	}
+	pr, pw := io.Pipe()
+	stream := &processStream{
+		ReadCloser:  pr,
+		cmd:         cmd,
+		ctx:         ctx,
+		binary:      bin,
+		args:        append([]string(nil), args...),
+		output:      pw,
+		stderr:      &tailBuffer{},
+		stdoutRead:  stdoutRead,
+		stderrRead:  stderrRead,
+		stdoutWrite: stdoutWrite,
+		stderrWrite: stderrWrite,
+		waitDone:    make(chan struct{}),
+		pumpsDone:   make(chan struct{}),
+	}
+	cmd.Stdout = stdoutWrite
+	cmd.Stderr = stderrWrite
+	// Cancel closes the reader as well as killing the process tree. This
+	// is the callback used by exec.CommandContext's context watcher.
 	cmd.Cancel = stream.cancel
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
+		stream.closeSourceFiles()
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 
-	// Wait is deliberately owned by one caller. Every other lifecycle
-	// path coordinates through waitOnce, so EOF, cancellation, and Close
-	// cannot reap the child more than once.
+	// The child owns inherited copies of the write ends. Closing the
+	// parent's copies lets the pumps observe EOF when the child exits.
+	_ = stdoutWrite.Close()
+	_ = stderrWrite.Close()
+	stream.stdoutWrite = nil
+	stream.stderrWrite = nil
+
+	stream.pumpWG.Add(2)
+	go stream.pump(stdoutRead, false)
+	go stream.pump(stderrRead, true)
+	go func() {
+		stream.pumpWG.Wait()
+		stream.outputCloseOnce.Do(func() { _ = stream.output.Close() })
+		close(stream.pumpsDone)
+	}()
+
+	// Wait is deliberately owned by one caller. Every lifecycle path
+	// coordinates through waitOnce, so EOF, cancellation, and Close cannot
+	// reap the child more than once.
 	go stream.wait()
 	return stream, nil
 }
@@ -64,73 +99,69 @@ type processStream struct {
 	binary string
 	args   []string
 	output *io.PipeWriter
-	stderr *limitedBuffer
+	stderr *tailBuffer
+
+	stdoutRead  *os.File
+	stderrRead  *os.File
+	stdoutWrite *os.File
+	stderrWrite *os.File
 
 	waitOnce sync.Once
 	waitDone chan struct{}
 	waitErr  error
+	// waitCalls is an internal invariant probe: the sole cmd.Wait call
+	// must remain exactly-once even when lifecycle paths race.
+	waitCalls atomic.Int32
 
-	closeOnce       sync.Once
+	pumpWG          sync.WaitGroup
+	pumpsDone       chan struct{}
+	outputCloseOnce sync.Once
+	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
-	stateMu         sync.Mutex
-	closed          bool
-	cancelled       bool
-	completed       bool
-	ctxErr          error
+
+	terminateOnce sync.Once
+	terminateErr  error
+
+	closeOnce sync.Once
+	stateMu   sync.Mutex
+	closed    bool
+	cancelled bool
+	ctxErr    error
 }
 
-// streamStderr forwards CLI stderr to the stream while retaining a
-// bounded diagnostic copy for a terminal CLIError.
-type streamStderr struct {
+// streamOutput retains a rolling stderr diagnostic while forwarding the
+// bytes to the public stream.
+type streamOutput struct {
 	output io.Writer
-	stderr *limitedBuffer
+	stderr *tailBuffer
 }
 
-func (w *streamStderr) Write(p []byte) (int, error) {
+func (w *streamOutput) Write(p []byte) (int, error) {
 	if _, err := w.stderr.Write(p); err != nil {
 		return 0, err
 	}
 	return w.output.Write(p)
 }
 
-// limitedBuffer retains at most maxStderr bytes while always reporting a
-// complete write to the forwarding stream.
-type limitedBuffer struct {
-	mu   sync.Mutex
-	data []byte
-}
-
-func (b *limitedBuffer) Write(p []byte) (int, error) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.data) < maxStderr {
-		remaining := maxStderr - len(b.data)
-		if remaining > len(p) {
-			remaining = len(p)
-		}
-		b.data = append(b.data, p[:remaining]...)
+func (s *processStream) pump(r *os.File, stderr bool) {
+	defer s.pumpWG.Done()
+	defer func() { _ = r.Close() }()
+	var output io.Writer = s.output
+	if stderr {
+		output = &streamOutput{output: s.output, stderr: s.stderr}
 	}
-	return len(p), nil
-}
-
-func (b *limitedBuffer) String() string {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return string(append([]byte(nil), b.data...))
+	_, _ = io.Copy(output, r)
 }
 
 func (s *processStream) wait() {
 	s.waitOnce.Do(func() {
+		s.waitCalls.Add(1)
 		err := s.cmd.Wait()
 		ctxErr := s.ctx.Err()
 		s.stateMu.Lock()
 		s.waitErr = err
 		s.ctxErr = ctxErr
-		s.completed = true
 		s.stateMu.Unlock()
-		// Cmd.Wait has joined the stdout/stderr copy goroutines, so no
-		// output can be lost by closing the writer now.
-		_ = s.output.Close()
 		close(s.waitDone)
 	})
 }
@@ -141,11 +172,6 @@ func (s *processStream) cancel() error {
 
 func (s *processStream) requestTermination(cancelled bool) error {
 	s.stateMu.Lock()
-	if s.completed {
-		s.stateMu.Unlock()
-		s.closeReader()
-		return os.ErrProcessDone
-	}
 	if cancelled {
 		s.cancelled = true
 	} else {
@@ -153,12 +179,25 @@ func (s *processStream) requestTermination(cancelled bool) error {
 	}
 	s.stateMu.Unlock()
 
-	// Kill first so an output-heavy child cannot turn the intentional
-	// termination into a SIGPIPE exit. Closing the reader then releases
-	// any exec copy goroutine blocked while forwarding output.
-	killErr := s.cmd.Process.Kill()
+	// Kill the whole process group first so an output-heavy descendant
+	// cannot keep the CLI alive. closeSourceFiles then releases pumps that
+	// may be blocked writing to the public reader.
+	s.terminateOnce.Do(func() {
+		s.terminateErr = terminateProcessTree(s.cmd)
+	})
 	s.closeReader()
-	return killErr
+	s.closeSourceFiles()
+	return s.terminateErr
+}
+
+func (s *processStream) closeSourceFiles() {
+	s.sourceCloseOnce.Do(func() {
+		for _, f := range []*os.File{s.stdoutRead, s.stderrRead, s.stdoutWrite, s.stderrWrite} {
+			if f != nil {
+				_ = f.Close()
+			}
+		}
+	})
 }
 
 func (s *processStream) closeReader() {
@@ -248,7 +287,7 @@ func (s *processStream) cliError(exitErr *exec.ExitError) error {
 		Binary:   s.binary,
 		Args:     s.args,
 		ExitCode: exitErr.ExitCode(),
-		Stderr:   truncateStderr(s.stderr.String()),
+		Stderr:   s.stderr.String(),
 	}
 }
 
@@ -264,6 +303,7 @@ func (s *processStream) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.requestTermination(false)
 		s.wait()
+		<-s.pumpsDone
 	})
 	return nil
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +14,9 @@ import (
 // writeStub creates an executable shell script and returns its path.
 func writeStub(t *testing.T, script string) string {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("shell-stub tests require a POSIX shell")
+	}
 	path := filepath.Join(t.TempDir(), "container")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
 		t.Fatal(err)
@@ -58,8 +62,9 @@ func TestExecRunnerNonZeroExitReturnsCLIError(t *testing.T) {
 }
 
 func TestExecRunnerCapsStderr(t *testing.T) {
-	// Emit ~1MiB of stderr, far beyond the 64KiB cap.
-	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; exit 1`)}
+	// Emit ~1MiB of stderr, far beyond the 64KiB cap, then finish with
+	// the diagnostic that classification needs.
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; printf 'Error response from daemon: No such container: terminal\n' >&2; exit 1`)}
 
 	stdout, stderr, err := r.Run(context.Background(), "run")
 	var cliErr *CLIError
@@ -68,6 +73,12 @@ func TestExecRunnerCapsStderr(t *testing.T) {
 	}
 	if len(cliErr.Stderr) > maxStderr {
 		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
+		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
+	}
+	if strings.Contains(cliErr.Stderr, "FIRST_BYTES_SENTINEL") {
+		t.Errorf("Stderr retained the first bytes instead of the terminal tail")
 	}
 	// The returned output buffers stay whole for exec/log results.
 	if len(stderr) <= maxStderr {

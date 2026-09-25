@@ -7,10 +7,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -205,10 +208,15 @@ func TestReaperDoesNotStageInspectOutputOnDisk(t *testing.T) {
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, `sleep "$inspect_timeout"`) ||
-		!strings.Contains(reaperScript, `sleep "$delete_timeout"`) ||
-		!strings.Contains(reaperScript, "kill -KILL") {
-		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
+	if !strings.Contains(reaperScript, `sleep "$run_timeout"`) ||
+		!strings.Contains(reaperScript, `kill -KILL -"$command_group"`) ||
+		!strings.Contains(reaperScript, `kill -TERM "$timer_pid"`) {
+		t.Error("reaper script must bound each backend call with a supervised process group")
+	}
+	if strings.Contains(reaperScript, "kill_backend_tree") ||
+		strings.Contains(reaperScript, "process_identity") ||
+		strings.Contains(reaperScript, "lstart=") {
+		t.Error("reaper script must not signal a descendant PID after a lookup")
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
@@ -357,6 +365,73 @@ fi
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force "+first) {
 		t.Fatalf("timed-out first entry was deleted: %q", data)
 	}
+}
+
+func TestReaperSuccessfulOperationCancelsTimeoutProcessGroup(t *testing.T) {
+	realSleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skipf("sleep unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	sleepLog := filepath.Join(dir, "sleep-pids.log")
+	timerStarted := filepath.Join(dir, "timer-started")
+	sleepPath := filepath.Join(dir, "sleep")
+	script := fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$$\" >> %q\n: > %q\nexec %q \"$@\"\n", sleepLog, timerStarted, realSleep)
+	if err := os.WriteFile(sleepPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	bin := filepath.Join(dir, "container")
+	logPath := filepath.Join(dir, "calls.log")
+	backendScript := fmt.Sprintf("#!/bin/sh\necho \"$@\" >> %q\nwhile [ ! -e %q ]; do /bin/sleep 0.01; done\n", logPath, timerStarted)
+	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(bin, "rm")
+	r.timeoutSeconds = 1
+	uid := strings.Repeat("ab", 32)
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
+
+	var pids []int
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(sleepLog)
+		for _, field := range strings.Fields(string(data)) {
+			pid, parseErr := strconv.Atoi(field)
+			if parseErr == nil && pid > 0 {
+				pids = append(pids, pid)
+			}
+		}
+		if len(pids) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if len(pids) == 0 {
+		t.Fatal("reaper did not start its timeout helper")
+	}
+
+	// The backend completed, so the timer must be canceled immediately. If
+	// its sleep child survives, it can later run the timeout path against a
+	// recycled backend PID and signal an unrelated process.
+	deadline = time.Now().Add(500 * time.Millisecond)
+	for _, pid := range pids {
+		for time.Now().Before(deadline) {
+			if err := syscall.Kill(pid, 0); errors.Is(err, syscall.ESRCH) {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if err := syscall.Kill(pid, 0); err == nil || !errors.Is(err, syscall.ESRCH) {
+			t.Fatalf("timeout helper pid %d survived successful operation: %v", pid, err)
+		}
+	}
+	waitForReaperExitForTest(t, r)
 }
 
 func TestReaperRegistrationHonorsContextWhileWriterBlocks(t *testing.T) {

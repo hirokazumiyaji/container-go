@@ -67,26 +67,72 @@ done
 locked_command='
   inspect_timeout="${REAPER_INSPECT_TIMEOUT:-10}"
   delete_timeout="${REAPER_DELETE_TIMEOUT:-30}"
-  process_identity() {
-    ps -o lstart= -p "$1" 2>/dev/null | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"
+  process_group() {
+    ps -o pgid= -p "$1" 2>/dev/null | tr -d "[:space:]"
   }
-  kill_backend_tree() {
-    kill_root=$1
-    kill_identity=$2
-    kill_depth=${3:-0}
-    [ "$kill_depth" -lt 32 ] || return 0
-    if [ -n "$kill_identity" ]; then
-      [ "$(process_identity "$kill_root")" = "$kill_identity" ] || return 0
-    fi
-    kill_children=$(pgrep -P "$kill_root" 2>/dev/null || true)
-    for kill_child in $kill_children; do
-      case "$kill_child" in
-        ""|*[!0-9]*) continue ;;
+  run_with_timeout() {
+    run_timeout=$1
+    shift
+    # The background subshell is the operation supervisor. With monitor
+    # mode enabled only for this launch it receives a fresh process group;
+    # its backend and timer remain inside that group. The parent shell keeps
+    # the supervisor unreaped while the timer runs, so the numeric group ID
+    # cannot be recycled before the group signal.
+    set -m 2>/dev/null
+    (
+      set +m 2>/dev/null
+      parent_group=$(process_group "$$")
+      case "$parent_group" in
+        ""|*[!0-9]*) parent_group= ;;
       esac
-      child_identity=$(process_identity "$kill_child")
-      kill_backend_tree "$kill_child" "$child_identity" "$((kill_depth + 1))"
-    done
-    kill -KILL "$kill_root" 2>/dev/null || true
+      "$@" &
+      command_pid=$!
+      command_group=$(process_group "$command_pid")
+      case "$command_group" in
+        ""|0|*[!0-9]*) command_group= ;;
+      esac
+      if [ -z "$parent_group" ] || [ "$command_group" = "$parent_group" ]; then
+        # Never signal the reaper or lock-helper group. A shell that cannot
+        # create a private group fails closed instead of risking a recycled
+        # numeric PID.
+        command_group=
+      fi
+      (
+        timer_sleeper=
+        cleanup_timer() {
+          if [ -n "$timer_sleeper" ]; then
+            kill -KILL "$timer_sleeper" 2>/dev/null || true
+            wait "$timer_sleeper" 2>/dev/null || true
+          fi
+        }
+        trap "cleanup_timer; exit 0" HUP INT TERM
+        sleep "$run_timeout" &
+        timer_sleeper=$!
+        wait "$timer_sleeper"
+        timer_sleeper=
+        # The supervisor is still alive and the group is still owned while
+        # this signal is issued. Do not walk numeric descendant PIDs: a
+        # child can exit and its PID can be reused between lookup and kill.
+        # A process-group signal covers the complete supervised tree without
+        # that PID-reuse window.
+        if [ -n "$command_group" ]; then
+          kill -KILL -"$command_group" 2>/dev/null || true
+        fi
+      ) &
+      timer_pid=$!
+      wait "$command_pid" 2>/dev/null
+      command_rc=$?
+      # Keep the timer child unreaped until it has acknowledged cancellation;
+      # its sleep child is explicitly reaped by cleanup_timer.
+      kill -TERM "$timer_pid" 2>/dev/null || true
+      wait "$timer_pid" 2>/dev/null || true
+      exit "$command_rc"
+    ) &
+    supervisor_pid=$!
+    wait "$supervisor_pid" 2>/dev/null
+    command_rc=$?
+    set +m 2>/dev/null
+    return "$command_rc"
   }
   lockpath=$1
   expected=$2
@@ -132,13 +178,8 @@ locked_command='
   if [ -n "$creation" ]; then
     inspect_fields=$(
       {
-        "$bin" inspect "$id" 2>/dev/null & inspect_pid=$!
-        inspect_identity=$(process_identity "$inspect_pid")
-        (sleep "$inspect_timeout"; kill_backend_tree "$inspect_pid" "$inspect_identity") >/dev/null 2>&1 & killer=$!
-        wait "$inspect_pid" 2>/dev/null
-        inspect_rc=$?
-        kill "$killer" 2>/dev/null || true
-        printf "\n__containergo_inspect_rc__%s\n" "$inspect_rc"
+        run_with_timeout "$inspect_timeout" "$bin" inspect "$id" 2>/dev/null
+        printf "\n__containergo_inspect_rc__%s\n" "$?"
       } | sed -n \
         -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
         -e "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/id=\1/p" \
@@ -159,7 +200,7 @@ locked_command='
       *) exit 0 ;;
     esac
   fi
-  (set -m 2>/dev/null; "$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; pid_identity=$(process_identity "$pid"); (sleep "$delete_timeout"; kill_backend_tree "$pid" "$pid_identity") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; set +m 2>/dev/null; kill "$killer" 2>/dev/null || true; exit "$rc") || true
+  run_with_timeout "$delete_timeout" "$bin" "$sub" --force "$target" >/dev/null 2>&1 || true
 '
 lock_bin=""
 lock_flag1=""
@@ -179,26 +220,61 @@ case "$lock_helper" in
     exit 0
     ;;
 esac
-process_identity() {
-  ps -o lstart= -p "$1" 2>/dev/null | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"
+process_group() {
+  ps -o pgid= -p "$1" 2>/dev/null | tr -d "[:space:]"
 }
-kill_backend_tree() {
-  kill_root=$1
-  kill_identity=$2
-  kill_depth=${3:-0}
-  [ "$kill_depth" -lt 32 ] || return 0
-  if [ -n "$kill_identity" ]; then
-    [ "$(process_identity "$kill_root")" = "$kill_identity" ] || return 0
-  fi
-  kill_children=$(pgrep -P "$kill_root" 2>/dev/null || true)
-  for kill_child in $kill_children; do
-    case "$kill_child" in
-      ""|*[!0-9]*) continue ;;
+run_with_timeout() {
+  run_timeout=$1
+  shift
+  # Keep a live, unreaped supervisor around the backend. The supervisor owns
+  # a fresh process group, so the timeout signal cannot target a recycled
+  # process or group ID. The timer is in that same group and is explicitly
+  # reaped on the successful path.
+  set -m 2>/dev/null
+  (
+    set +m 2>/dev/null
+    parent_group=$(process_group "$$")
+    case "$parent_group" in
+      ""|*[!0-9]*) parent_group= ;;
     esac
-    child_identity=$(process_identity "$kill_child")
-    kill_backend_tree "$kill_child" "$child_identity" "$((kill_depth + 1))"
-  done
-  kill -KILL "$kill_root" 2>/dev/null || true
+    "$@" &
+    command_pid=$!
+    command_group=$(process_group "$command_pid")
+    case "$command_group" in
+      ""|0|*[!0-9]*) command_group= ;;
+    esac
+    if [ -z "$parent_group" ] || [ "$command_group" = "$parent_group" ]; then
+      command_group=
+    fi
+    (
+      timer_sleeper=
+      cleanup_timer() {
+        if [ -n "$timer_sleeper" ]; then
+          kill -KILL "$timer_sleeper" 2>/dev/null || true
+          wait "$timer_sleeper" 2>/dev/null || true
+        fi
+      }
+      trap "cleanup_timer; exit 0" HUP INT TERM
+      sleep "$run_timeout" &
+      timer_sleeper=$!
+      wait "$timer_sleeper"
+      if [ -n "$command_group" ]; then
+        kill -KILL -"$command_group" 2>/dev/null || true
+      fi
+      timer_sleeper=
+    ) &
+    timer_pid=$!
+    wait "$command_pid" 2>/dev/null
+    command_rc=$?
+    kill -TERM "$timer_pid" 2>/dev/null || true
+    wait "$timer_pid" 2>/dev/null || true
+    exit "$command_rc"
+  ) &
+  supervisor_pid=$!
+  wait "$supervisor_pid" 2>/dev/null
+  command_rc=$?
+  set +m 2>/dev/null
+  return "$command_rc"
 }
 run_locked() {
   [ -n "$lock_bin" ] || return 0
@@ -232,7 +308,7 @@ run_guarded() {
     sh -c "$locked_command" reaper-locked - - "$id" "$creation" "$bin" "$sub" "$key" >/dev/null 2>&1 || true
 }
 run_unlocked() {
-  (set -m 2>/dev/null; "$@" >/dev/null 2>&1 & pid=$!; pid_identity=$(process_identity "$pid"); (sleep "$delete_timeout"; kill_backend_tree "$pid" "$pid_identity") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; set +m 2>/dev/null; kill "$killer" 2>/dev/null || true; exit "$rc") || true
+  run_with_timeout "$delete_timeout" "$@" >/dev/null 2>&1 || true
 }
 printf "%s\n" "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue

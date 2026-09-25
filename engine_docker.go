@@ -193,25 +193,49 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	match := -1
-	for i, container := range containers {
-		if dockerIDRE.MatchString(container.ID) && container.ID == target {
-			match = i
-			break
-		}
+
+	// Select the object addressed by the request before validating its Id.
+	// Docker can return a successful, non-empty response for a name lookup
+	// even when the object has a malformed Id. Treating that response as
+	// "not in output" would turn a protocol failure into ErrContainerNotFound,
+	// which makes cleanup and Terminate silently skip the operation.
+	targetIsID := dockerIDRE.MatchString(target)
+	targetIsName := nameRE.MatchString(target)
+	if !targetIsID && !targetIsName {
+		return nil, fmt.Errorf("invalid Docker container target %q", target)
 	}
-	if match < 0 && !dockerIDRE.MatchString(target) {
+	match := -1
+	if targetIsID {
 		for i, container := range containers {
-			if dockerIDRE.MatchString(container.ID) && strings.TrimPrefix(container.Name, "/") == target {
+			if container.ID == target {
+				match = i
+				break
+			}
+		}
+	} else {
+		for i, container := range containers {
+			if strings.TrimPrefix(container.Name, "/") == target {
 				match = i
 				break
 			}
 		}
 	}
 	if match < 0 {
+		// A successful response containing a malformed object is not
+		// evidence that the requested container is absent. Report the
+		// protocol failure before allowing cleanup or Terminate to treat it
+		// as a clean not-found result.
+		for _, container := range containers {
+			if !dockerIDRE.MatchString(container.ID) {
+				return nil, fmt.Errorf("docker inspect returned invalid container ID %q", container.ID)
+			}
+		}
 		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
 	}
 	c := containers[match]
+	if targetIsID && c.ID != target {
+		return nil, fmt.Errorf("docker inspect returned container ID %q for target %q", c.ID, target)
+	}
 	if !dockerIDRE.MatchString(c.ID) {
 		return nil, fmt.Errorf("docker inspect returned invalid container ID %q", c.ID)
 	}

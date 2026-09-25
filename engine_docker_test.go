@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"slices"
 	"strings"
@@ -103,6 +104,47 @@ func TestDockerParseInspect(t *testing.T) {
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)
+	}
+}
+
+func TestDockerParseInspectRejectsMalformedIDForMatchingName(t *testing.T) {
+	for _, data := range [][]byte{
+		[]byte(`[{"Id":"","Name":"/myctr"}]`),
+		[]byte(`[{"Id":"not-a-container-id","Name":"/myctr"}]`),
+	} {
+		_, err := (dockerEngine{}).parseInspect(data, "myctr")
+		if err == nil {
+			t.Fatalf("parseInspect(%s) accepted a malformed matching object", data)
+		}
+		if errors.Is(err, ErrContainerNotFound) {
+			t.Fatalf("parseInspect(%s) error = %v, want a protocol error rather than not-found", data, err)
+		}
+		if !strings.Contains(err.Error(), "invalid container ID") {
+			t.Fatalf("parseInspect(%s) error = %v, want invalid container ID", data, err)
+		}
+	}
+}
+
+func TestDockerParseInspectRejectsMalformedObjectWhenTargetIsAbsent(t *testing.T) {
+	data := []byte(`[{"Id":"not-a-container-id","Name":"/other"}]`)
+
+	_, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err == nil {
+		t.Fatal("parseInspect accepted malformed non-empty output as target absence")
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("parseInspect error = %v, want a protocol error rather than not-found", err)
+	}
+}
+
+func TestDockerParseInspectDoesNotFallbackFromImmutableIDToName(t *testing.T) {
+	const target = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	const other = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
+	data := []byte(`[{"Id":"` + other + `","Name":"/` + target + `"}]`)
+
+	_, err := (dockerEngine{}).parseInspect(data, target)
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("parseInspect error = %v, want target-not-found", err)
 	}
 }
 

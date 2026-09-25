@@ -1,4 +1,4 @@
-//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris && !windows
+//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris && !illumos && !windows
 
 package cli
 
@@ -10,6 +10,8 @@ import (
 // These platforms have no portable process-group or job-object API in this
 // package. Cancellation still terminates and reaps the direct CLI child;
 // detached descendants cannot be guaranteed and are not reaped here.
+func processGroupTerminationSupported() bool { return false }
+
 func configureProcessTree(*exec.Cmd) {}
 
 type otherProcessTree struct{}

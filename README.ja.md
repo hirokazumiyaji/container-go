@@ -145,11 +145,11 @@ command の非ゼロ終了は結果であり、backend、timeout、cancellation 
 CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
 いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
 
-context error によって local CLI が終了した場合、直接の command lifecycle が所有する間だけ Unix の process group をベストエフォートで停止します。直接の子を回収した後は、古い process group ID には signal を送りません。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。
+context error によって local CLI が終了した場合、stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ process group をベストエフォートで停止します。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。他の Unix target は直接の子 handle だけを使います。直接の子を回収した後は、古い process group ID には signal を送りません。
 Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
 Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
-backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、command の起動中に context error が実際に競合した場合だけ `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
-この分類は local の終了コードに依存しません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用でき、command の起動中に context error が実際に競合した場合だけ `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。保守的な direct-handle fallback では、remote process の終了を主張せず context error だけを返すことがあります。この分類は local の終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
 後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 backend 側 process が残っている可能性があるため、caller は container を terminate するか backend 固有の cleanup を実行してください。

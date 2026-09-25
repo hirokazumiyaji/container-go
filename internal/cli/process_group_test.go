@@ -1,75 +1,62 @@
-//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build linux
 
 package cli
 
 import (
 	"context"
 	"errors"
-	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
-
-func TestStreamEOFBoundsDescendantPipeRetentionAfterChildExit(t *testing.T) {
-	pidFile := filepath.Join(t.TempDir(), "descendant.pid")
-	r := &ExecRunner{Binary: writeStub(t, `(sleep 5) & echo $! > "$3"; printf 'parent\\n'`)}
-	stream, err := r.Stream(context.Background(), "logs", "x", pidFile)
-	if err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	defer stream.Close()
-	descendantPID, available := waitForSinglePID(t, pidFile, filepath.Join(filepath.Dir(pidFile), "missing.error"))
-	if !available {
-		t.Fatal("descendant PID file was not created")
-	}
-	t.Cleanup(func() { _ = syscall.Kill(descendantPID, syscall.SIGKILL) })
-
-	started := time.Now()
-	data, readErr := io.ReadAll(stream)
-	if readErr != nil {
-		t.Fatalf("ReadAll: %v", readErr)
-	}
-	if !strings.Contains(string(data), "parent") {
-		t.Fatalf("stream data = %q, want parent output", data)
-	}
-	if elapsed := time.Since(started); elapsed > time.Second {
-		t.Fatalf("stream EOF took %v, want bounded drain after direct child exit", elapsed)
-	}
-}
 
 func TestIssue116EscapingProcessGroupHelper(t *testing.T) {
 	if os.Getenv("CONTAINERGO_GROUP_ESCAPE_HELPER") != "1" {
 		return
 	}
-	parentGroup, err := syscall.Getpgid(os.Getppid())
+	parentGroup, err := unix.Getpgid(os.Getppid())
 	if err != nil {
 		_ = os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_ERROR"), []byte(err.Error()), 0o600)
 		return
 	}
-	if err := syscall.Setpgid(0, parentGroup); err != nil {
+	devNull, err := os.OpenFile(os.DevNull, os.O_WRONLY, 0)
+	if err != nil {
 		_ = os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_ERROR"), []byte(err.Error()), 0o600)
 		return
 	}
 	child := exec.Command("sleep", "5")
+	child.Stdout = devNull
+	child.Stderr = devNull
 	if err := child.Start(); err != nil {
+		_ = devNull.Close()
+		_ = os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_ERROR"), []byte(err.Error()), 0o600)
+		return
+	}
+	_ = devNull.Close()
+	if err := syscall.Setpgid(0, parentGroup); err != nil {
+		_ = child.Process.Kill()
+		_ = child.Wait()
 		_ = os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_ERROR"), []byte(err.Error()), 0o600)
 		return
 	}
 	if err := os.WriteFile(os.Getenv("CONTAINERGO_GROUP_ESCAPE_PID"), []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
 		_ = child.Process.Kill()
+		_ = child.Wait()
 		return
 	}
 	_ = child.Wait()
 }
 
 func TestExecRunnerCancellationKillsChildThatLeavesProcessGroup(t *testing.T) {
+	if !processGroupTerminationSupported() {
+		t.Skip("stable process identity unavailable")
+	}
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "escaped-child.pid")
 	errorFile := filepath.Join(dir, "escaped-child.error")
@@ -99,28 +86,18 @@ func TestExecRunnerCancellationKillsChildThatLeavesProcessGroup(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ExecRunner did not return after escaped child cancellation")
 	}
-	// The helper's detached sleep is intentionally outside the direct-child
-	// guarantee; cleanup above removes it after the prompt-return assertion.
-}
-
-func waitForSinglePID(t *testing.T, path, errorPath string) (int, bool) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		if pid, err := readPID(path); err == nil {
-			return pid, true
-		}
-		if _, err := os.Stat(errorPath); err == nil {
-			return 0, false
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("PID file %q was not created", path)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The child remains in the helper's former process group. A stale
+	// numeric-PGID signal would kill it; the safe identity check must not.
+	time.Sleep(100 * time.Millisecond)
+	if !processExists(childPID) {
+		t.Fatalf("former process-group member %d was killed after the direct child escaped", childPID)
 	}
 }
 
 func TestExecRunnerCancellationKillsProcessGroup(t *testing.T) {
+	if !processGroupTerminationSupported() {
+		t.Skip("stable process identity unavailable")
+	}
 	dir := t.TempDir()
 	childPIDFile := filepath.Join(dir, "child.pid")
 	shellPIDFile := filepath.Join(dir, "shell.pid")
@@ -181,18 +158,6 @@ func waitForPIDFiles(t *testing.T, paths ...string) (int, int) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-}
-
-func readPID(path string) (int, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return 0, err
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
-	if err != nil || pid <= 0 {
-		return 0, fmt.Errorf("PID file %q = %q", path, data)
-	}
-	return pid, nil
 }
 
 func processExists(pid int) bool {

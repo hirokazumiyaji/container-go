@@ -199,22 +199,29 @@ classified independently of that status. This matters on Windows, where
 status remains observable but does not suppress the typed error. A
 later verification inspect that consumes the deadline does not by itself
 produce `ExecTerminationError`.
-Cancellation is owned by the local command lifecycle. Unix process-group
-termination is attempted only while the direct child handle still owns
-the process; after the child is reaped, no former numeric group ID is
-used. The direct child is also killed after the group signal because it
-may have changed process groups. Windows uses a lifecycle-owned Job
-Object handle, with direct-child fallback when assignment is unavailable.
-Assignment occurs after `Start`; descendants created during that short
-post-Start attachment window are outside the Job Object boundary. The
-supported backend CLIs do not expose a common exec-instance kill
-operation, so Exec returns `*ExecTerminationError` (also
-`errors.Is(..., ErrExecTerminationUnsupported)`) rather than claiming
-that the daemon-side process stopped. A successful empty-job or
-already-finished-child termination is not treated as active-process
-evidence. Callers must terminate the container or use backend-specific
-cleanup. Callers must read the output reader even when the error is
-non-nil.
+Cancellation is owned by the local command lifecycle. On Unix targets with a
+stable process identity, process-group termination is attempted only while the
+direct child handle still owns the process; the direct child is also
+killed after the group signal because it may have changed process groups. Unix
+targets without that identity use the direct child handle conservatively. After
+the child is reaped, no former numeric group ID is used. Windows uses a
+lifecycle-owned Job Object handle, with direct-child fallback when assignment
+is unavailable. Assignment occurs after `Start`; descendants created during
+that short post-Start attachment window are outside the Job Object boundary.
+The supported backend CLIs do not expose a common exec-instance kill
+operation, so when active-child evidence is available Exec returns
+`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
+rather than claiming that the daemon-side process stopped. A conservative
+direct-handle fallback may return only the context error. A successful
+empty-job or already-finished-child termination is not treated as
+active-process evidence. Callers must terminate the container or use
+backend-specific cleanup. Callers must read the output reader even when the
+error is non-nil. On Linux the stable identity is a pidfd-backed process
+reference; kernels without pidfd support use the same conservative direct-handle
+fallback as other Unix targets.
+Windows-specific lifecycle tests are build-constrained. This development
+environment cross-compiles and vets Windows packages but cannot execute the
+Windows Job Object runtime tests, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -416,9 +423,10 @@ bounded only by host resources.
 
 **Keep streams finite**. `FollowLogs` returns the `container logs --follow`
 child as an `io.ReadCloser`; `Close` or context cancellation terminates
-and reaps the direct CLI child. Unix process-group termination is gated
-by the direct process handle, while Windows uses a lifecycle-owned Job
-Object handle with direct-child fallback. The library does not reap
+and reaps the direct CLI child. Unix process-group termination is used only
+where a stable process identity can establish the child state; other Unix targets
+use the direct child handle. Windows uses a lifecycle-owned Job Object handle
+with direct-child fallback. The library does not reap
 detached descendants, and detached/reparented helpers are outside the
 boundary. After the direct child exits, stream endpoint pumps receive a
 bounded drain window and are then closed, so descendants retaining

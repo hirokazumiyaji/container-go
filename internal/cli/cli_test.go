@@ -265,8 +265,14 @@ func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
 	defer cancel()
 	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
 	status, reported := RunStatusOf(err)
-	if !reported || !status.Started || !status.Reaped || !status.TerminatedByCancellation {
-		t.Fatalf("run status = %+v, reported=%t; want started/reaped/cancel-terminated", status, reported)
+	if !reported || !status.Started || !status.Reaped {
+		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
+	}
+	if processGroupTerminationSupported() && !status.TerminatedByCancellation {
+		t.Fatalf("run status = %+v, want active cancellation termination", status)
+	}
+	if !processGroupTerminationSupported() && status.TerminatedByCancellation {
+		t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
 	}
 }
 

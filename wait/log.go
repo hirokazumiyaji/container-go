@@ -200,17 +200,19 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		probeCtx, probeCancel := context.WithTimeout(ctx, 5*time.Second)
 		running, runningErr := target.Running(probeCtx)
 		probeCancel()
+		contextErr = ctx.Err()
+		probeParts := make([]error, 0, 3)
 		if runningErr != nil {
-			return errors.Join(
-				fmt.Errorf("wait for log %q: check container state: %w", s.pattern, runningErr),
-				streamErr,
-			)
+			probeParts = append(probeParts, fmt.Errorf("wait for log %q: check container state: %w", s.pattern, runningErr))
 		}
-		if !running {
-			return errors.Join(
-				fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern),
-				streamErr,
-			)
+		if runningErr == nil && !running {
+			probeParts = append(probeParts, fmt.Errorf("wait for log %q: container stopped before pattern appeared", s.pattern))
+		}
+		if contextErr != nil {
+			probeParts = append(probeParts, fmt.Errorf("wait for log %q: %w", s.pattern, contextErr))
+		}
+		if len(probeParts) > 0 {
+			return errors.Join(append(probeParts, streamErr)...)
 		}
 		return errors.Join(
 			fmt.Errorf("wait for log %q: log stream ended before pattern appeared: %w", s.pattern, streamErr),

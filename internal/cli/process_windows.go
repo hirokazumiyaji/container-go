@@ -12,7 +12,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-const windowsStillActive = 259
+func processGroupTerminationSupported() bool { return true }
 
 // Windows process-tree termination uses a Job Object handle rather than a
 // numeric PID. The handle remains valid across child exit and cannot be
@@ -52,7 +52,7 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 	// handle so termination can distinguish an active child from a finished
 	// or empty job.
 	process, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
 		false,
 		uint32(cmd.Process.Pid),
 	)
@@ -100,12 +100,15 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 	}
 }
 
+// windowsProcessActive uses the process object's signaled state rather than
+// GetExitCodeProcess: 259 is reserved as STILL_ACTIVE but can also be a real
+// application exit code.
 func windowsProcessActive(process windows.Handle) (bool, error) {
-	var exitCode uint32
-	if err := windows.GetExitCodeProcess(process, &exitCode); err != nil {
+	event, err := windows.WaitForSingleObject(process, 0)
+	if err != nil {
 		return false, err
 	}
-	return exitCode == windowsStillActive, nil
+	return event == uint32(windows.WAIT_TIMEOUT), nil
 }
 
 func (t *windowsProcessTree) close() {
@@ -127,7 +130,7 @@ func terminateDirectProcess(cmd *exec.Cmd) terminationResult {
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	process, queryErr := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
+		windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
 		false,
 		uint32(cmd.Process.Pid),
 	)

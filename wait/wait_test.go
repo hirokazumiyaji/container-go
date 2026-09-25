@@ -267,6 +267,54 @@ func TestForLogDoesNotProbeAfterReaderFailure(t *testing.T) {
 	}
 }
 
+type forLogCancelProbeTarget struct {
+	*fakeTarget
+	cancel   context.CancelFunc
+	probeErr error
+}
+
+func (t *forLogCancelProbeTarget) Running(context.Context) (bool, error) {
+	t.cancel()
+	return false, t.probeErr
+}
+
+func TestForLogJoinsCallerCancellationAfterFinalProbe(t *testing.T) {
+	probeErr := errors.New("state probe failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	target := &forLogCancelProbeTarget{fakeTarget: newFakeTarget(), cancel: cancel, probeErr: probeErr}
+	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, probeErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForLog error = %v, want probe and caller cancellation", err)
+	}
+}
+
+type forLogDeadlineProbeTarget struct {
+	*fakeTarget
+}
+
+func (t *forLogDeadlineProbeTarget) Running(ctx context.Context) (bool, error) {
+	t.runningCalls.Add(1)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestForLogJoinsCallerDeadlineAfterFinalProbe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	target := &forLogDeadlineProbeTarget{fakeTarget: newFakeTarget()}
+	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForLog error = %v, want caller deadline", err)
+	}
+	if target.runningCalls.Load() == 0 {
+		t.Fatal("final Running probe was not called")
+	}
+}
+
 type cancelAwareLogStream struct {
 	ctx    context.Context
 	closed chan struct{}

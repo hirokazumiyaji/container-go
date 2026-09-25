@@ -18,7 +18,8 @@ import (
 // process failure is returned by Read after Stream has returned. Closing
 // the stream terminates the direct CLI child. On platforms with process
 // groups it also makes a best-effort attempt to terminate descendants
-// while that child is owned; this package does not reap those descendants.
+// while that child is owned and the platform can prove a stable process
+// identity; this package does not reap those descendants.
 // Once the direct child is reaped, Close does not signal its former group.
 type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)

@@ -147,12 +147,13 @@ CLI が返した終了コードが利用できる場合は、最初の戻り値�
 command の起動中 실제로 context error が競合した場合だけ、その分類は終了コードに依存しません。
 Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
 後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
-context 取消時は直接の command lifecycle が所有する間だけ Unix の local CLI process group を停止します。直接の子を回収した後は古い process group ID に signal を送りません。group signal の後は直接の子にも kill を送ります。
+context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
 Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。
 Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
-backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。
 process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。
-したがって error が non-nil でも reader を読む。
+したがって error が non-nil でも reader を読む。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
@@ -266,6 +267,7 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
+Unix では stable process identity で child state を確認できる target だけ process group を使い、他の target では直接の子 handle を使う。
 直接 child の終了後に descendant が stdout/stderr を保持しても、stream は制限時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
 `ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
 cancel 後に caller context から外した state probe を開始しません。

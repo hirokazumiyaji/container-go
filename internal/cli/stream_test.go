@@ -3,6 +3,9 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +96,24 @@ func TestStreamCloseIsIdempotent(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestStreamClassifiesNonExecutableAbsolutePath(t *testing.T) {
+	backend := filepath.Join(t.TempDir(), "backend")
+	if err := os.WriteFile(backend, []byte("not executable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := (&ExecRunner{Binary: backend}).Stream(context.Background(), "logs", "--follow", "x")
+	if err == nil {
+		_ = stream.Close()
+		t.Fatal("Stream unexpectedly started a non-executable backend")
+	}
+	if !errors.Is(err, ErrStreamSetup) {
+		t.Fatalf("error = %v, want ErrStreamSetup", err)
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("error = %v, want underlying permission cause", err)
 	}
 }

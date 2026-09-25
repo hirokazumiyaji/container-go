@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
@@ -15,6 +16,10 @@ type CLIError = cli.CLIError
 // ErrSystemNotRunning reports that the Apple Container system service is
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
+
+// ErrLogStreamSetup reports that a log stream cannot be started with the
+// configured runner or backend executable and will not be retried.
+var ErrLogStreamSetup = wait.ErrLogStreamSetup
 
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts.

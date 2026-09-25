@@ -9,7 +9,8 @@ import (
 
 const compositeDrainTimeout = 100 * time.Millisecond
 
-// AllStrategy waits for every strategy, in order.
+// AllStrategy waits for every strategy, in order. Before accepting each
+// successful strategy it performs a bounded, fail-closed lifecycle check.
 type AllStrategy struct {
 	strategies     []Strategy
 	startupTimeout time.Duration
@@ -29,11 +30,14 @@ func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 }
 
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	callerCtx := ctx
+	if err := callerCtx.Err(); err != nil {
+		return fmt.Errorf("wait for all: caller context ended before waiting: %w", err)
+	}
 	if len(s.strategies) == 0 {
 		return nil
 	}
 
-	callerCtx := ctx
 	runCtx, runCancel := context.WithCancel(ctx)
 	defer runCancel()
 	waitCtx := runCtx
@@ -83,6 +87,15 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			if contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("after strategy %d", i)); contextErr != nil {
 				return contextErr
 			}
+			if finalErr := finalLifecycleCheck(waitCtx, target, "wait for all"); finalErr != nil {
+				if contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("after strategy %d", i)); contextErr != nil {
+					return errors.Join(contextErr, finalErr)
+				}
+				return finalErr
+			}
+			if contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("after strategy %d final lifecycle check", i)); contextErr != nil {
+				return contextErr
+			}
 		case <-waitCtx.Done():
 			contextErr := compositeContextError("wait for all", callerCtx, waitCtx, s.startupTimeout, startupDeadline, fmt.Sprintf("in strategy %d", i))
 			if contextErr == nil {
@@ -94,7 +107,8 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	return nil
 }
 
-// AnyStrategy waits until one of the strategies succeeds.
+// AnyStrategy waits until one of the strategies succeeds. Before accepting
+// a success it performs a bounded, fail-closed lifecycle check.
 type AnyStrategy struct {
 	strategies     []Strategy
 	startupTimeout time.Duration
@@ -114,12 +128,12 @@ func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 }
 
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
-	if len(s.strategies) == 0 {
-		return nil
-	}
 	callerCtx := ctx
 	if err := callerCtx.Err(); err != nil {
 		return fmt.Errorf("wait for any: caller context ended before waiting: %w", err)
+	}
+	if len(s.strategies) == 0 {
+		return nil
 	}
 
 	runCtx, runCancel := context.WithCancel(ctx)
@@ -136,6 +150,9 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for any")
 	if err != nil {
 		return err
+	}
+	if contextErr := compositeContextError("wait for any", callerCtx, waitCtx, s.startupTimeout, startupDeadline, "before strategies"); contextErr != nil {
+		return contextErr
 	}
 
 	results := make(chan error, len(s.strategies))
@@ -162,6 +179,15 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				return errors.Join(contextErr, err)
 			}
 			if err == nil {
+				if finalErr := finalLifecycleCheck(waitCtx, target, "wait for any"); finalErr != nil {
+					if contextErr := compositeContextError("wait for any", callerCtx, waitCtx, s.startupTimeout, startupDeadline, "after a successful strategy"); contextErr != nil {
+						return errors.Join(contextErr, finalErr)
+					}
+					return finalErr
+				}
+				if contextErr := compositeContextError("wait for any", callerCtx, waitCtx, s.startupTimeout, startupDeadline, "after the final lifecycle check"); contextErr != nil {
+					return contextErr
+				}
 				return nil
 			}
 			errs = append(errs, err)
@@ -181,12 +207,40 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	return errors.Join(errs...)
 }
 
+// finalLifecycleCheck closes the ticker race at a successful strategy
+// boundary. A composite never accepts success without one bounded state
+// observation made after the child returns; probe failure is fail-closed.
+func finalLifecycleCheck(ctx context.Context, target Target, what string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+	defer cancel()
+	if err := probeCtx.Err(); err != nil {
+		return err
+	}
+	state, err := targetState(probeCtx, target)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if err != nil {
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+	}
+	if terminalWaitState(state) {
+		return stateFailure(what, state, nil, nil)
+	}
+	return nil
+}
+
 // startLifecycleMonitor performs the initial lifecycle check and then
 // watches for terminal transitions while custom strategies run. The
 // returned channel is buffered and the monitor stops when the caller's
 // context ends; a custom strategy that ignores cancellation cannot hold up
 // the composite strategy's fail-fast return.
 func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
 	var lastStateErr error
 	state, err := targetState(ctx, target)
 	if err != nil {

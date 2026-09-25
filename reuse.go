@@ -29,6 +29,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err != nil {
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
 	defer infoCancel()
@@ -39,7 +42,13 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		return nil, err
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
@@ -55,6 +64,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 	ctr.cacheInfo(info)
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -236,8 +248,14 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cfg.waitStrategy == nil {
-		return nil
+		return ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
 		tail := ctr.logTail(context.WithoutCancel(ctx))
@@ -246,7 +264,7 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		}
 		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
 	}
-	return nil
+	return ctx.Err()
 }
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
@@ -302,7 +320,13 @@ func retryReuseInspect(err error) bool {
 // primarily for callers that received a Running result before its endpoint
 // data became visible.
 func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if reuseInfoReady(cfg, initial) {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		return initial, nil
 	}
 	for {
@@ -310,8 +334,14 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, initial *engineInfo) (
 			return nil, err
 		}
 		info, err := inspectNamed(ctx, cfg, cfg.name)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		if err == nil {
 			if reuseInfoReady(cfg, info) {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
 				return info, nil
 			}
 			switch info.state {

@@ -19,6 +19,10 @@ const maxStderr = 64 * 1024
 // Container system service or Docker daemon) is not running.
 var ErrSystemNotRunning = errors.New("container backend is not running")
 
+// ErrStreamSetup identifies a deterministic log-stream setup failure.
+// Retrying the same runner and backend path cannot recover from it.
+var ErrStreamSetup = errors.New("log stream setup failed")
+
 // Probe is the backend-specific liveness check Classify runs after a
 // failure: a cheap CLI invocation plus the hint to show the user when
 // it fails.

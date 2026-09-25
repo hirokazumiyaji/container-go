@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"crypto/sha256"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -14,8 +15,20 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+// ErrLogStreamSetup identifies deterministic log-stream setup failures
+// that readiness strategies must not retry.
+var ErrLogStreamSetup = cli.ErrStreamSetup
+
 // LogStrategy waits until a pattern appears in the container's log
 // stream. Patterns are matched per line.
+//
+// Log replay follows Target.FollowLogs' full-history contract: every
+// connection starts at the first currently retained log line, and history
+// is treated as append-only for the duration of one wait. Empty or partial
+// reconnects do not move the occurrence cursor; a later full replay must
+// catch up before new lines are counted. A completed replay that has the
+// same length but different content is treated as a replacement baseline,
+// covering backends that rotate history between reconnects.
 type LogStrategy struct {
 	options
 	pattern     string
@@ -53,19 +66,17 @@ func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
 type logScanResult struct {
 	matches int
 	err     error
-	lines   [][sha256.Size]byte
+	replay  logReplay
 }
 
+// logReplay is a fixed-size cursor over the longest complete log history
+// observed so far. The digest is advanced across reconnects; retaining a
+// fingerprint for every historical line is neither necessary nor bounded.
 type logReplay struct {
-	previous [][sha256.Size]byte
 	matches  int
-}
-
-func (r logReplay) matchesPrevious(index int, line string) bool {
-	if index >= len(r.previous) {
-		return false
-	}
-	return r.previous[index] == sha256.Sum256([]byte(line))
+	complete bool
+	digest   [sha256.Size]byte
+	lines    uint64
 }
 
 func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
@@ -102,8 +113,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		return stateFailure(what, state, lastCheckErr, lastStateErr)
 	}
 
-	var previous [][sha256.Size]byte
-	matches := 0
+	replay := logReplay{}
 	for {
 		if err := callerCtx.Err(); err != nil {
 			return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
@@ -124,10 +134,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				lastCheckErr = fmt.Errorf("open log stream: %w", err)
 			}
 		} else {
-			scanResult, streamErr := s.scanStream(waitCtx, stream, match, logReplay{
-				previous: previous,
-				matches:  matches,
-			}, target, what, &lastStateErr)
+			scanResult, streamErr := s.scanStream(waitCtx, stream, match, replay, target, what, &lastStateErr)
 			if streamErr != nil {
 				_ = stream.Close()
 				return streamErr
@@ -136,8 +143,8 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				_ = stream.Close()
 				return logWaitEnded(callerCtx, waitCtx, what, timeout, lastCheckErr, lastStateErr)
 			}
-			previous = scanResult.lines
-			matches = scanResult.matches
+			replay = scanResult.replay
+			matches := replay.matches
 			// A terminal stream error wins over a matching line that may
 			// have been returned in the same read.
 			if scanResult.err != nil && permanentLogStreamError(scanResult.err) {
@@ -207,24 +214,51 @@ func (s *LogStrategy) scanStream(
 	go func() {
 		scanner := bufio.NewScanner(stream)
 		scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-		var lines [][sha256.Size]byte
-		matches := replay.matches
+		digest := sha256.New()
+		var digestSum [sha256.Size]byte
+		var lineLength [8]byte
+		var lineCount uint64
+		next := replay
+		divergentMatches := 0
+		reachedBaseline := replay.complete && replay.lines == 0
+		ended := true
 		for scanner.Scan() {
 			line := scanner.Text()
-			index := len(lines)
-			lines = append(lines, sha256.Sum256([]byte(line)))
-			if !replay.matchesPrevious(index, line) {
-				matches += match(line)
+			binary.LittleEndian.PutUint64(lineLength[:], uint64(len(line)))
+			_, _ = digest.Write(lineLength[:])
+			_, _ = digest.Write([]byte(line))
+			lineCount++
+			currentDigest := [sha256.Size]byte(digest.Sum(digestSum[:0]))
+			countLine := !replay.complete || reachedBaseline
+			if replay.complete && !reachedBaseline && lineCount == replay.lines && currentDigest == replay.digest {
+				reachedBaseline = true
+				countLine = false
 			}
-			if matches >= s.occurrences {
+			if countLine {
+				next.matches += match(line)
+			} else {
+				divergentMatches += match(line)
+			}
+			if next.matches >= s.occurrences {
+				ended = false
 				if settleErr := settleScanner(ctx, scanner); settleErr != nil && !errors.Is(settleErr, io.EOF) {
-					results <- logScanResult{matches: matches, err: settleErr, lines: lines}
+					results <- logScanResult{matches: next.matches, err: settleErr, replay: next}
 					return
 				}
 				break
 			}
 		}
-		results <- logScanResult{matches: matches, err: scanner.Err(), lines: lines}
+		scanErr := scanner.Err()
+		replaceHistory := ended && scanErr == nil && replay.complete && !reachedBaseline && lineCount > 0 && lineCount == replay.lines
+		if replaceHistory {
+			next.matches += divergentMatches
+		}
+		if ended && scanErr == nil && (!replay.complete || reachedBaseline || replaceHistory) {
+			next.complete = true
+			next.digest = [sha256.Size]byte(digest.Sum(digestSum[:0]))
+			next.lines = lineCount
+		}
+		results <- logScanResult{matches: next.matches, err: scanErr, replay: next}
 	}()
 
 	ticker := time.NewTicker(stateCheckInterval)
@@ -252,7 +286,7 @@ func (s *LogStrategy) scanStream(
 }
 
 func permanentLogStreamError(err error) bool {
-	if permanentProbeError(err) || errors.Is(err, bufio.ErrTooLong) {
+	if permanentProbeError(err) || errors.Is(err, ErrLogStreamSetup) || errors.Is(err, bufio.ErrTooLong) {
 		return true
 	}
 	var cliErr *cli.CLIError

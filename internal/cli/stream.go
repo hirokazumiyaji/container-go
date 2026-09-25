@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -47,6 +48,9 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	if err := cmd.Start(); err != nil {
 		_ = pr.Close()
 		_ = pw.Close()
+		if permanentStreamStartError(bin, err) {
+			return nil, fmt.Errorf("%s %s: %w: %w", bin, strings.Join(args, " "), ErrStreamSetup, err)
+		}
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 
@@ -55,6 +59,18 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 	// cannot reap the child more than once.
 	go stream.wait()
 	return stream, nil
+}
+
+// permanentStreamStartError reports setup failures that cannot change when
+// the same runner opens the same backend again. Absolute paths bypass
+// exec.LookPath, so permission and existence failures arrive as PathError
+// rather than exec.Error and need explicit classification.
+func permanentStreamStartError(bin string, err error) bool {
+	var execErr *exec.Error
+	if errors.As(err, &execErr) {
+		return true
+	}
+	return filepath.IsAbs(bin) && (os.IsPermission(err) || os.IsNotExist(err))
 }
 
 type processStream struct {

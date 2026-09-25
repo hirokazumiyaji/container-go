@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strconv"
 	"time"
@@ -61,7 +62,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
-		return nil, errors.New("logs: runner does not support streaming")
+		return nil, fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup)
 	}
 	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
 	if err != nil {

@@ -53,7 +53,11 @@ type Target interface {
 	// is terminal for a startup wait. Transient lifecycle states need the
 	// richer StateTarget interface.
 	Running(ctx context.Context) (bool, error)
-	// FollowLogs streams log output; Close releases the stream.
+	// FollowLogs streams log output; Close releases the stream. ForLog
+	// requires each connection to begin with all currently retained log
+	// history and treats that history as append-only during one wait.
+	// Empty or partial reconnects are allowed and do not advance ForLog's
+	// replay cursor.
 	FollowLogs(ctx context.Context) (io.ReadCloser, error)
 	// ExecCommand runs a command in the container and returns its
 	// exit code.

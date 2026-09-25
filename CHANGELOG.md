@@ -20,7 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   explicit fallback and fail-closed policies; handle foreign Docker
   RepoDigests with the inspected local ID, require Apple pinned references
   to be locally addressable, and keep operational addressability errors
-  distinct from successful identity-unavailable results.
+  distinct from successful identity-unavailable results. Treat Apple
+  `name@digest` aliases as explicitly mutable, validate selected platform
+  variants while retaining the root index digest, and accept verified
+  unprefixed Docker image IDs in canonical `sha256:` form.
 
 ### Changed
 

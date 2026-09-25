@@ -238,10 +238,14 @@ Docker は repository が一致する registry digest を優先し、取得で�
 場合は inspect した local image ID にフォールバックする。別の repository
 の `RepoDigests` を持つ local alias も同じ local ID で実行し、明示的な
 pinned repository / digest の conflict だけを mismatch として扱う。
-Apple Container は descriptor または指定 platform の variant digest を使い、
-ID だけの record は digest 参照に正規化する。
+Apple Container は root image descriptor を run / reuse の identity として
+使い、指定した platform の variant は別途検証する。
+descriptor が利用可能な ID だけの record は digest 参照に正規化する。
 この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
 ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
+呼び出し側の Apple `name@digest` も mutable alias であり、atomic な run
+address ではないため、`WithAllowMutableImageTag` で明示的に受け入れる場合を
+除いて拒否する。
 利用可能な identity を返さない backend version では既定で
 `ErrImageIdentityUnavailable` を返して fail closed する。repository の
 provenance がない bare digest は identity として扱わず、bare Docker image
@@ -257,10 +261,11 @@ local に存在しないことが確認された場合は `ErrImageIdentityNotLo
 transport、permission、cancellation エラーは operational error として返し、
 mutable fallback の根拠にしない。`WithAllowMutableImageTag` は identity が
 取得できない、または resolved reference が local にない mutable input の
-明示的な互換 fallback であり、identity の保証ではない。呼び出し側の digest
-や Docker image ID を mutable tag に降格させることもない。local build の
-Apple image で local digest 参照がない場合は、この明示 fallback が必要に
-なることがある。
+明示的な互換 fallback であり、identity の保証ではない。
+Apple の `name@digest` にもこの明示指定が必要だが、bare digest や Docker
+image ID を mutable tag に降格させることはない。
+local build の Apple image で local digest 参照がない場合は、この明示
+fallback が必要になることがある。
 
 ## パフォーマンス設計
 

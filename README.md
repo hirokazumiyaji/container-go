@@ -154,11 +154,12 @@ falls back to the inspected local image `Id`. A local Docker tag whose
 `RepoDigests` belong to another repository is treated as a local alias
 and safely uses that `Id`; only an explicit `image@digest` whose
 repository or digest conflicts is rejected as
-`ErrImageIdentityMismatch`. Apple Container uses the image descriptor
-(or the selected platform variant) digest, normalizing an ID-only
-record to a digest reference. Reuse compares the resolved digest/ID
-identity, not the original tag, and removes a newly-created reused
-container if its post-create identity or port validation fails.
+`ErrImageIdentityMismatch`. Apple Container uses the root image
+descriptor as the run/reuse identity, validates the selected platform
+variant separately, and normalizes an ID-only record to a digest
+reference when the descriptor is available. Reuse compares the resolved
+digest/ID identity, not the original tag, and removes a newly-created
+reused container if its post-create identity or port validation fails.
 
 Apple has no runtime `--pull=never` switch. Before `Run` passes any
 pinned Apple reference to `container run`, it verifies that exact
@@ -182,13 +183,16 @@ container.Run(ctx, "redis:7-alpine",
 
 With that option, a mutable input may run the original tag; this
 deliberately retains the tag-replacement window and is not an identity
-guarantee. It never downgrades a caller-supplied digest or a Docker
-image-ID-shaped value. Pinning cannot make a mutable registry tag's
-pull-to-inspect resolution atomic when another actor can modify the
-shared backend. Prefer a caller-supplied `image@sha256:...` and treat
-the backend's identity metadata as the compatibility boundary. Locally
-built Apple images may require `WithAllowMutableImageTag` when no
-locally addressable digest reference exists.
+guarantee. Apple also treats a caller-supplied `image@sha256:...` as
+a mutable alias, so that spelling is rejected by default and requires
+this explicit option. The option never downgrades a bare digest or a
+Docker image-ID-shaped value. Pinning cannot make a mutable registry
+tag's pull-to-inspect resolution atomic when another actor can modify
+the shared backend. Prefer a caller-supplied `image@sha256:...` when
+the backend provides an atomic address and treat its identity metadata
+as the compatibility boundary. Locally built Apple images may require
+`WithAllowMutableImageTag` when no locally addressable digest reference
+exists.
 
 ```go
 container.Run(ctx, "redis:7-alpine",
@@ -273,15 +277,16 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
-- `Run` passes the identity returned by image inspect (or a Docker image
-  ID) to the backend, so a later local tag reassignment does not change
-  that create. Apple pinned references are checked for local
-  addressability before create; `container run` is never used as an
-  implicit fetch. This is a backend/API guarantee, not a claim that every
-  tag-to-registry operation is atomic: a mutable tag can still be
-  replaced before the post-pull inspect, and an identity-less backend
-  requires the explicit `WithAllowMutableImageTag` compatibility
-  fallback.
+- `Run` passes the verified identity returned by image inspect (or a
+  Docker image ID) to the backend, so a later local tag reassignment
+  does not change that create. Apple descriptor-backed references are
+  checked for local addressability before create; caller-supplied
+  `name@digest` aliases are rejected unless `WithAllowMutableImageTag`
+  explicitly accepts their mutable semantics. `container run` is never
+  used as an implicit fetch. This is a backend/API guarantee, not a
+  claim that every tag-to-registry operation is atomic: a mutable tag
+  can still be replaced before the post-pull inspect, and an
+  identity-less backend requires the explicit compatibility fallback.
 
 ## Differences from testcontainers-go
 

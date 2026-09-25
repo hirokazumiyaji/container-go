@@ -47,11 +47,13 @@ func WithPullPolicy(policy PullPolicy) Option {
 // WithAllowMutableImageTag permits Run to execute the caller's original
 // mutable tag when the backend's image-inspect response contains no
 // usable immutable identity, or when a resolved Apple reference cannot
-// be addressed locally. This is an explicit compatibility escape hatch:
-// it does not prevent a tag from being replaced after inspection, so it
-// is not an identity guarantee. It never downgrades a caller-supplied
-// digest or Docker image-ID-shaped value. Without this option Run fails
-// closed with ErrImageIdentityUnavailable or ErrImageIdentityNotLocal.
+// be addressed locally. It also opts into Apple's name@digest alias
+// spelling, which is not an atomic run address. This is an explicit
+// compatibility escape hatch: it does not prevent a tag or alias from
+// being replaced after inspection, so it is not an identity guarantee.
+// It never downgrades a bare digest or Docker image-ID-shaped value.
+// Without this option Run fails closed with ErrImageIdentityUnavailable
+// or ErrImageIdentityNotLocal.
 func WithAllowMutableImageTag() Option {
 	return func(c *config) error {
 		c.allowMutableImageTag = true
@@ -77,10 +79,14 @@ func Pull(ctx context.Context, image string) error {
 // pullWith is the fake-runner-driven core of Pull: the flight shares one
 // backend pull of the image, and failures go through Classify.
 func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error {
-	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, ""), func() error {
+	cfg := &config{runner: r, eng: eng}
+	if err := eng.checkConfig(cfg); err != nil {
+		return err
+	}
+	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, cfg.platform), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
-		return pullImage(execCtx, r, eng, image, "")
+		return pullImage(execCtx, r, eng, image, cfg.platform)
 	})
 }
 
@@ -179,6 +185,16 @@ func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentit
 				return imageIdentity{}, err
 			}
 			if exists {
+				// A record without a complete requested variant is not
+				// proof that PullMissing already has the requested
+				// platform. Pull explicitly when that policy permits;
+				// PullNever still returns the typed not-local error below.
+				if identity.notLocal && c.pullPolicy == PullMissing {
+					if err := pullImage(execCtx, c.runner, c.eng, image, platform); err != nil {
+						return imageIdentity{}, err
+					}
+					return c.resolveImage(execCtx, image, platform)
+				}
 				return c.resolveInspectedImage(execCtx, image, platform, identity)
 			}
 			if err := pullImage(execCtx, c.runner, c.eng, image, platform); err != nil {
@@ -241,7 +257,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 			// cancellation) must be returned unchanged and must not be
 			// hidden by a mutable fallback.
 			if c.canUseMutableFallback(image) && imageAddressMissing(c.eng, pullErr) {
-				return imageIdentity{reference: image}, nil
+				return mutableImageReference(image, identity), nil
 			}
 			if imageAddressMissing(c.eng, pullErr) {
 				return imageIdentity{}, fmt.Errorf("%w: %s could not be made locally addressable: %w", ErrImageIdentityNotLocal, pinned.reference, pullErr)
@@ -255,16 +271,23 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	}
 	if !pinnedExists {
 		if c.canUseMutableFallback(image) {
-			return imageIdentity{reference: image}, nil
+			return mutableImageReference(image, pinned), nil
 		}
 		return imageIdentity{}, fmt.Errorf("%w: %s cannot run %s without fetching it", ErrImageIdentityNotLocal, c.eng.name(), pinned.reference)
+	}
+	if checked.notLocal {
+		reason := checked.notLocalReason
+		if reason == "" {
+			reason = "the requested platform variant is not locally addressable"
+		}
+		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s (%s)", ErrImageIdentityNotLocal, pinned.reference, reason)
 	}
 	if checked.mismatch {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s resolves to another image", ErrImageIdentityMismatch, pinned.reference)
 	}
 	if !checked.pinned {
 		if c.canUseMutableFallback(image) {
-			return imageIdentity{reference: image}, nil
+			return mutableImageReference(image, checked), nil
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
@@ -306,18 +329,42 @@ func imageMissingError(eng engine, err error) bool {
 }
 
 func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, error) {
+	if identity.notLocal {
+		reason := identity.notLocalReason
+		if reason == "" {
+			reason = "the requested platform variant is not locally addressable"
+		}
+		return imageIdentity{}, fmt.Errorf("%w: %s (%s)", ErrImageIdentityNotLocal, image, reason)
+	}
 	if identity.mismatch {
 		return imageIdentity{}, fmt.Errorf("%w: %s", ErrImageIdentityMismatch, image)
+	}
+	requestedDigest := imageDigest(image)
+	if identity.mutableAlias {
+		if validImageDigest(requestedDigest) && identity.digest != "" && !strings.EqualFold(requestedDigest, identity.digest) {
+			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected %s", ErrImageIdentityMismatch, image, requestedDigest, identity.digest)
+		}
+		if c.eng.name() == "apple" {
+			if c.allowMutableImageTag {
+				return mutableImageReference(image, identity), nil
+			}
+			return imageIdentity{}, fmt.Errorf("%w: %s (Apple name@digest is a mutable alias; use WithAllowMutableImageTag to opt into running it)", ErrImageIdentityUnavailable, image)
+		}
 	}
 	if identity.pinned {
 		if !imageIdentityIsVerified(identity) {
 			return imageIdentity{}, fmt.Errorf("%w: %s (%s returned an identity without repository provenance or a verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
 		}
-		if requestedDigest := imageDigest(image); validImageDigest(requestedDigest) &&
-			identity.digest != "" && requestedDigest != identity.digest {
+		if validImageDigest(requestedDigest) && identity.digest != "" && !strings.EqualFold(requestedDigest, identity.digest) {
 			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected %s", ErrImageIdentityMismatch, image, requestedDigest, identity.digest)
 		}
 		return identity, nil
+	}
+	if c.eng.name() == "apple" && isRepositoryDigestReference(image) {
+		if c.allowMutableImageTag {
+			return mutableImageReference(image, identity), nil
+		}
+		return imageIdentity{}, fmt.Errorf("%w: %s (Apple name@digest is a mutable alias; use WithAllowMutableImageTag to opt into running it)", ErrImageIdentityUnavailable, image)
 	}
 	// A successful identity-less Apple inspect cannot establish that a
 	// caller-pinned digest is the local image. Mutable tags remain
@@ -335,7 +382,7 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 		return imageIdentity{reference: image, digest: requestedDigest, pinned: true}, nil
 	}
 	if c.canUseMutableFallback(image) {
-		return imageIdentity{reference: image}, nil
+		return mutableImageReference(image, identity), nil
 	}
 	return imageIdentity{}, fmt.Errorf("%w: %s (%s image inspect did not report a usable digest or verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
 }
@@ -343,7 +390,7 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 // imageIdentityIsVerified rejects a digest-shaped identity that has no
 // repository provenance and no verified backend image ID.
 func imageIdentityIsVerified(identity imageIdentity) bool {
-	if !identity.pinned || !imageRE.MatchString(identity.reference) {
+	if identity.mutableAlias || !identity.pinned || !imageRE.MatchString(identity.reference) {
 		return false
 	}
 	if isImageID(identity.id) {
@@ -354,6 +401,13 @@ func imageIdentityIsVerified(identity imageIdentity) bool {
 
 func (c *config) canUseMutableFallback(image string) bool {
 	return c.allowMutableImageTag && !isBareImageReference(image) && !strings.Contains(image, "@")
+}
+
+func mutableImageReference(image string, identity imageIdentity) imageIdentity {
+	identity.reference = image
+	identity.pinned = false
+	identity.mutableAlias = false
+	return identity
 }
 
 // inspectImage returns both existence and the identity reported by the
@@ -379,8 +433,8 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 // imageExists reports whether the image (and requested platform
 // variant, when set) is in the backend's store.
 func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform string) (bool, error) {
-	_, exists, err := inspectImage(ctx, r, eng, image, platform)
-	return exists, err
+	identity, exists, err := inspectImage(ctx, r, eng, image, platform)
+	return exists && !identity.notLocal, err
 }
 
 // pullImage fetches the image (and requested platform variant, when

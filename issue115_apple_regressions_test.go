@@ -96,8 +96,11 @@ func TestIssue115AppleFixtureUsesImageResourceDescriptor(t *testing.T) {
 	}
 
 	variant, exists := (appleEngine{}).parseImageIdentity(issue115AppleImageFixture(t), "docker.io/library/redis:7-alpine", "linux/arm64/v8")
-	if !exists || variant.digest != "sha256:2222222222222222222222222222222222222222222222222222222222222222" {
-		t.Fatalf("variant identity = %+v, exists = %v", variant, exists)
+	if !exists || variant.digest != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
+		t.Fatalf("variant identity = %+v, exists = %v, want root descriptor", variant, exists)
+	}
+	if variant.variantDigest != "sha256:2222222222222222222222222222222222222222222222222222222222222222" || variant.platform != "linux/arm64/v8" {
+		t.Fatalf("variant metadata = %+v, want selected platform digest", variant)
 	}
 }
 

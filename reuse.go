@@ -318,8 +318,16 @@ func imageFromInfo(info *engineInfo) imageIdentity {
 		if imageReferenceBase(reference) == "" && isImageID(info.imageID) {
 			return imageIdentity{reference: info.imageID, digest: info.imageDigest, id: info.imageID, pinned: true}
 		}
-		if imageReferenceBase(reference) != "" {
-			return imageIdentity{reference: reference, digest: info.imageDigest, id: info.imageID, pinned: true}
+		if base := imageReferenceBase(reference); base != "" {
+			// Container inspect may report a tag plus a separate
+			// configuration descriptor digest. Synthesize the same
+			// index@digest reference used for a new run so reuse compares
+			// the root content rather than a mutable tag spelling.
+			synthesized := base + "@" + info.imageDigest
+			if !imageRE.MatchString(synthesized) {
+				return imageIdentity{}
+			}
+			return imageIdentity{reference: synthesized, digest: info.imageDigest, id: info.imageID, pinned: true}
 		}
 		// A digest without repository provenance is not a safe identity.
 		return imageIdentity{}
@@ -429,7 +437,7 @@ func imagesCompatible(requested, actual string) bool {
 	reqDigest := imageDigest(requested)
 	actDigest := imageDigest(actual)
 	if reqDigest != "" {
-		if reqDigest != actDigest {
+		if !strings.EqualFold(reqDigest, actDigest) {
 			return false
 		}
 		reqBase := imageReferenceBase(requested)

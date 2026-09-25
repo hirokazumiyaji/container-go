@@ -345,14 +345,17 @@ func TestIssue115AppleImageIdentityUsesIDAsDigestReference(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleImageIdentityUsesSelectedPlatformVariant(t *testing.T) {
+func TestIssue115AppleImageIdentityUsesRootForSelectedPlatformVariant(t *testing.T) {
 	data := []byte(`[{"id":"` + issue115ImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue115ImageIdentityOld + `"}},"variants":[{"digest":"` + issue115ImageIdentityNew + `","platform":{"os":"linux","architecture":"arm64"}}]}]`)
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "linux/arm64")
 	if !exists {
 		t.Fatal("selected platform was reported absent")
 	}
-	if identity.digest != issue115ImageIdentityNew {
-		t.Fatalf("identity = %+v, want selected variant %q", identity, issue115ImageIdentityNew)
+	if identity.digest != issue115ImageIdentityOld || identity.reference != "redis:7-alpine@"+issue115ImageIdentityOld {
+		t.Fatalf("identity = %+v, want root descriptor identity", identity)
+	}
+	if identity.variantDigest != issue115ImageIdentityNew || identity.platform != "linux/arm64" {
+		t.Fatalf("identity = %+v, want separately tracked platform variant", identity)
 	}
 }
 

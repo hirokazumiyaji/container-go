@@ -7,10 +7,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// imageIdentity is the backend's immutable image address when one is
-// available. reference is the exact argument that should be passed to
+// imageIdentity is the backend's verified image content identity when one
+// is available. reference is the exact argument that should be passed to
 // run; digest and id record the identities behind that argument. pinned
-// is false only for the explicit mutable-tag fallback.
+// records verified content identity, while mutableAlias marks a reference
+// spelling that Run may execute only through the explicit mutable fallback.
 //
 // id is intentionally reserved for a verified backend local image ID
 // (currently Docker's Id). A caller-supplied sha256:... value is not an
@@ -21,6 +22,24 @@ type imageIdentity struct {
 	digest    string
 	id        string
 	pinned    bool
+	// platform and variantDigest describe an explicitly selected image
+	// variant. digest remains the root/index descriptor used as the run
+	// identity; the variant is validation metadata, not the reference
+	// passed to run.
+	platform      string
+	variantDigest string
+	// mutableAlias marks a caller-supplied Apple name@digest. Its digest
+	// is useful for comparison, but the Apple backend does not expose an
+	// atomic address for that spelling, so Run must not treat the
+	// synthesized reference as immutable unless the caller explicitly
+	// accepts the compatibility fallback.
+	mutableAlias bool
+	// notLocal means the backend returned an image record but could not
+	// prove that the requested platform variant is locally addressable.
+	// It is deliberately distinct from an absent image or an unavailable
+	// identity.
+	notLocal       bool
+	notLocalReason string
 	// mismatch means the backend returned an identity for a different
 	// image than the one requested. It must never be downgraded to the
 	// mutable-tag fallback.
@@ -166,10 +185,16 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 	if !a.pinned || !b.pinned {
 		return false
 	}
+	if a.platform != "" && b.platform != "" && a.platform != b.platform {
+		return false
+	}
+	if a.variantDigest != "" && b.variantDigest != "" && !strings.EqualFold(a.variantDigest, b.variantDigest) {
+		return false
+	}
 	if isImageID(a.id) && isImageID(b.id) && strings.EqualFold(a.id, b.id) {
 		return true
 	}
-	if !validImageDigest(a.digest) || !validImageDigest(b.digest) || a.digest != b.digest {
+	if !validImageDigest(a.digest) || !validImageDigest(b.digest) || !strings.EqualFold(a.digest, b.digest) {
 		return false
 	}
 	// A digest is content-addressed, but a reference also names the
@@ -206,6 +231,10 @@ func imageReferenceBase(ref string) string {
 	return base
 }
 
+func isRepositoryDigestReference(ref string) bool {
+	return imageReferenceBase(ref) != "" && validImageDigest(imageDigest(ref))
+}
+
 // isBareImageDigest recognizes a digest used without a repository, such
 // as sha256:<64hex>. It is kept separate from isImageID because the
 // latter is the Docker local-ID syntax used only after inspect verifies
@@ -227,11 +256,25 @@ func isBareImageDigest(ref string) bool {
 	}
 }
 
-// isBareImageID recognizes the unprefixed 64-hex form Apple uses for
-// ImageResource.id. It is a local identifier, not a repository name.
+// isBareImageID recognizes the unprefixed 64-hex image-ID spelling. It
+// is a local identifier, not a repository name.
 func isBareImageID(ref string) bool {
 	ref = strings.TrimSpace(ref)
 	return len(ref) == 64 && isHex(ref)
+}
+
+// canonicalDockerImageID normalizes Docker's accepted 64-hex and
+// sha256:<64hex> ID spellings to the canonical run argument. It returns
+// false for any other reference.
+func canonicalDockerImageID(ref string) (string, bool) {
+	ref = strings.TrimSpace(ref)
+	if isImageID(ref) {
+		return ref, true
+	}
+	if isBareImageID(ref) {
+		return "sha256:" + ref, true
+	}
+	return "", false
 }
 
 // isBareImageReference identifies either spelling of an ID-shaped or

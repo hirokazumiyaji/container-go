@@ -30,9 +30,11 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // repository-bearing digest or a verified local image ID). It is not
 // used for transport, permission, or cancellation failures. Run fails
 // closed by default; WithAllowMutableImageTag opts into passing the
-// original mutable tag to the backend. PullNever also rejects an
-// identity-less Apple inspect even when the caller supplied a digest,
-// because the backend has not confirmed the local identity.
+// original mutable tag to the backend. For Apple, that option also
+// explicitly accepts a caller-supplied name@digest alias as mutable;
+// it is never treated as an atomic immutable run address. PullNever also
+// rejects an identity-less Apple inspect even when the caller supplied a
+// digest, because the backend has not confirmed the local identity.
 var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
 
 // ErrImageIdentityMismatch reports that image inspect returned an

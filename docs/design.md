@@ -372,11 +372,15 @@ env-file contents.
 passes the reported immutable identity to the backend. Docker prefers a
 matching registry digest and falls back to the inspected local image ID;
 a local alias with a foreign `RepoDigests` entry also uses that ID, while
-an explicit pinned repository/digest conflict is an error. Apple
-Container uses the descriptor or selected platform-variant digest and
-normalizes an ID-only image record to a digest reference. This prevents
-a later local tag reassignment from changing that create, but it does not
-make a mutable tag's pull-to-inspect operation atomic. If a backend
+an explicit pinned repository/digest conflict is an error. Apple Container uses the root image descriptor as the run/reuse identity
+and validates the selected platform variant separately. An ID-only image
+record is normalized to a digest reference when a repository and
+descriptor prove that identity. This prevents a later local tag
+reassignment from changing that create, but it does not make a mutable
+tag's pull-to-inspect operation atomic. A caller-supplied Apple
+`name@digest` is also an alias rather than an atomic run address, so it
+is rejected unless `WithAllowMutableImageTag` explicitly accepts the
+mutable fallback. If a backend
 version reports no usable identity, the default policy fails closed with
 `ErrImageIdentityUnavailable`. A digest without repository provenance is
 not identity proof; a bare Docker image ID is accepted only when the
@@ -395,7 +399,9 @@ errors from the addressability check remain operational errors and never
 authorize the mutable fallback. `WithAllowMutableImageTag` is an
 explicit compatibility escape hatch for a mutable input whose identity
 is unavailable or whose resolved reference is not locally addressable;
-it carries no identity guarantee and never downgrades a caller-supplied
+it carries no identity guarantee. It is also required for a caller-
+supplied Apple `name@digest`, which the backend exposes as a mutable
+alias rather than an atomic run address. It never downgrades a bare
 digest or Docker image-ID-shaped value. Locally built Apple images may
 therefore require the explicit mutable-tag fallback when no local digest
 reference is available.

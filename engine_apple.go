@@ -36,7 +36,108 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-func (appleEngine) checkConfig(*config) error { return nil }
+func (appleEngine) checkConfig(cfg *config) error {
+	if err := resolveEffectivePlatform(cfg); err != nil {
+		return err
+	}
+	if cfg.platform != "" {
+		return validateApplePlatform(cfg.platform)
+	}
+	return nil
+}
+
+// validateApplePlatform mirrors the platform grammar accepted by Apple
+// Container. Docker keeps the generic platformRE grammar.
+func validateApplePlatform(platform string) error {
+	parts := strings.Split(platform, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+	}
+	if len(parts) > 3 || (len(parts) == 3 && parts[2] == "") {
+		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+	}
+	if parts[0] != "linux" {
+		return fmt.Errorf("apple backend supports only linux platforms, got %q", platform)
+	}
+	if len(parts) == 2 {
+		return nil
+	}
+
+	arch, variant := parts[1], parts[2]
+	valid := false
+	switch arch {
+	case "arm":
+		valid = variant == "v5" || variant == "v6" || variant == "v7" || variant == "v8"
+	case "armhf":
+		valid = variant == "v7"
+	case "armel":
+		valid = variant == "v6"
+	case "aarch64", "arm64":
+		valid = variant == "v8" || variant == "8"
+	case "x86_64", "x86-64", "amd64":
+		valid = variant == "v1"
+	}
+	if !valid {
+		return fmt.Errorf("invalid platform %q for Apple backend: variant %q is not valid for architecture %q", platform, variant, arch)
+	}
+	return nil
+}
+
+// applePlatform is the normalized selector used when matching an Apple
+// image variant. Apple treats architecture aliases and the default arm64
+// variant as equivalent.
+type applePlatform struct {
+	os           string
+	architecture string
+	variant      string
+}
+
+func parseApplePlatformSelector(platform string) (applePlatform, bool) {
+	parts := strings.Split(platform, "/")
+	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+		return applePlatform{}, false
+	}
+	if len(parts) == 3 && parts[2] == "" {
+		return applePlatform{}, false
+	}
+	variant := ""
+	if len(parts) == 3 {
+		variant = parts[2]
+	} else {
+		switch parts[1] {
+		case "arm", "armhf", "armel":
+			variant = "v7"
+		case "aarch64", "arm64":
+			variant = "v8"
+		}
+	}
+	return canonicalApplePlatform(parts[0], parts[1], variant), true
+}
+
+func canonicalApplePlatform(osName, architecture, variant string) applePlatform {
+	p := applePlatform{os: osName, architecture: architecture, variant: variant}
+	switch architecture {
+	case "aarch64", "arm64":
+		p.architecture = "arm64"
+		if variant == "" || variant == "v8" || variant == "8" {
+			p.variant = "v8"
+		}
+	case "x86_64", "x86-64", "amd64":
+		p.architecture = "amd64"
+		if variant == "v1" {
+			p.variant = ""
+		}
+	case "armhf", "armel":
+		p.architecture = "arm"
+	}
+	return p
+}
+
+func applePlatformsEqual(want, have applePlatform) bool {
+	return want.os == have.os &&
+		want.architecture == have.architecture &&
+		want.variant == have.variant
+}
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
@@ -206,16 +307,15 @@ func (appleEngine) imageMissing(err error) bool {
 func (appleEngine) imageIdentityNeedsLocalCheck() bool { return true }
 
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
-	_, exists := (appleEngine{}).parseImageIdentity(data, "", platform)
-	return exists
+	identity, exists := (appleEngine{}).parseImageIdentity(data, "", platform)
+	return exists && !identity.notLocal
 }
 
-// parseImageIdentity reads the descriptor exposed by current Apple
-// Container releases and also accepts the older flat ImageDescription
-// shape. A platform-specific variant digest is preferred when the
-// caller selected a platform; otherwise the index digest pins the
-// complete image. Apple image-resource IDs are treated as local
-// identifiers, not Docker's sha256:<hex> image-ID syntax.
+// parseImageIdentity reads the root index descriptor exposed by current
+// Apple Container releases and also accepts the older flat
+// ImageDescription shape. When a platform is selected, the variant is
+// validated separately while the root descriptor remains the run and
+// reuse identity.
 func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool) {
 	var records []appleImageInspectRecord
 	if err := json.Unmarshal(data, &records); err != nil {
@@ -227,48 +327,88 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 	if len(records) == 0 {
 		return imageIdentity{}, false
 	}
-	for _, record := range records {
-		if platform != "" && len(record.Variants) > 0 {
-			wantOS, wantArch, wantVariant := splitPlatform(platform)
-			matched := false
-			variantDigest := ""
-			for _, variant := range record.Variants {
-				if wantOS != "" && variant.Platform.OS != wantOS {
-					continue
-				}
-				if wantArch != "" && variant.Platform.Architecture != wantArch {
-					continue
-				}
-				if wantVariant != "" && variant.Platform.Variant != wantVariant {
-					continue
-				}
-				matched = true
-				variantDigest = variant.Digest
-				break
-			}
-			if !matched {
-				return imageIdentity{}, false
-			}
-			digest := variantDigest
-			if digest == "" {
-				digest = record.Configuration.Descriptor.Digest
-			}
-			return finishAppleImageIdentity(image, record, digest), true
+	record := records[0]
+	rootDigest, rootOK := appleRootDescriptorDigest(record)
+	if platform != "" {
+		variantDigest, variantOK := applePlatformVariantDigest(record, platform)
+		if !variantOK {
+			return imageIdentity{
+				notLocal:       true,
+				notLocalReason: "Apple image inspect has no complete matching platform variant",
+				platform:       platform,
+			}, true
 		}
-
-		digest := record.Configuration.Descriptor.Digest
-		if digest == "" {
-			digest = record.Configuration.Image.Descriptor.Digest
+		if !rootOK {
+			// A selected variant is not a substitute for the root
+			// index identity used by run and reuse.
+			return imageIdentity{}, true
 		}
-		if digest == "" {
-			digest = record.Descriptor.Digest
-		}
-		return finishAppleImageIdentity(image, record, digest), true
+		return finishAppleImageIdentity(image, record, rootDigest, platform, variantDigest), true
 	}
-	return imageIdentity{}, false
+	if !rootOK && appleDescriptorPresent(record) {
+		// A malformed descriptor is not equivalent to an older
+		// descriptor-less response. Do not fall back to an ID when the
+		// backend supplied an unusable descriptor field.
+		return imageIdentity{}, true
+	}
+	return finishAppleImageIdentity(image, record, rootDigest, "", ""), true
 }
 
-func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest string) imageIdentity {
+// appleRootDescriptorDigest returns the index/root descriptor digest,
+// rejecting conflicting or malformed descriptor fields.
+func appleRootDescriptorDigest(record appleImageInspectRecord) (string, bool) {
+	var digest string
+	for _, candidate := range []string{
+		record.Configuration.Descriptor.Digest,
+		record.Configuration.Image.Descriptor.Digest,
+		record.Descriptor.Digest,
+	} {
+		if candidate == "" {
+			continue
+		}
+		if !validImageDigest(candidate) {
+			return "", false
+		}
+		if digest != "" && !strings.EqualFold(digest, candidate) {
+			return "", false
+		}
+		digest = candidate
+	}
+	return digest, digest != ""
+}
+
+func appleDescriptorPresent(record appleImageInspectRecord) bool {
+	return record.Configuration.Descriptor.Digest != "" ||
+		record.Configuration.Image.Descriptor.Digest != "" ||
+		record.Descriptor.Digest != ""
+}
+
+// applePlatformVariantDigest validates every listed variant before
+// selecting one. An empty or incomplete list is not local evidence for
+// an explicit platform request.
+func applePlatformVariantDigest(record appleImageInspectRecord, platform string) (string, bool) {
+	if len(record.Variants) == 0 {
+		return "", false
+	}
+	want, ok := parseApplePlatformSelector(platform)
+	if !ok {
+		return "", false
+	}
+	selected := ""
+	for _, variant := range record.Variants {
+		if variant.Platform.OS == "" || variant.Platform.Architecture == "" || !validImageDigest(variant.Digest) {
+			return "", false
+		}
+		have := canonicalApplePlatform(variant.Platform.OS, variant.Platform.Architecture, variant.Platform.Variant)
+		if applePlatformsEqual(want, have) {
+			selected = variant.Digest
+			break
+		}
+	}
+	return selected, selected != ""
+}
+
+func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest, platform, variantDigest string) imageIdentity {
 	reference := record.Configuration.Name
 	if reference == "" {
 		reference = record.Configuration.Reference
@@ -307,7 +447,7 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	if validImageDigest(digest) {
 		// The descriptor is authoritative. Do not copy an ID-shaped field
 		// into imageIdentity.id: that field is a Docker-only local-ID ABI.
-		return imageReferenceWithDigest(requested, reference, digest, "")
+		return appleIdentityWithAlias(appleIdentityWithVariant(imageReferenceWithDigest(requested, reference, digest, ""), platform, variantDigest), requested)
 	}
 	if isImageID(record.ID) {
 		// Apple must not treat a Docker-style ID field as an immutable
@@ -319,9 +459,24 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		// without a descriptor. Keep the compatibility fallback, but do
 		// not classify it as a Docker image ID.
 		digest := "sha256:" + record.ID
-		return imageReferenceWithDigest(requested, reference, digest, "")
+		return appleIdentityWithAlias(appleIdentityWithVariant(imageReferenceWithDigest(requested, reference, digest, ""), platform, variantDigest), requested)
 	}
 	return imageIdentity{}
+}
+
+func appleIdentityWithVariant(identity imageIdentity, platform, variantDigest string) imageIdentity {
+	identity.platform = platform
+	identity.variantDigest = variantDigest
+	return identity
+}
+
+// appleIdentityWithAlias records whether the caller supplied the
+// name@digest spelling. A reference synthesized from a mutable tag has
+// already been resolved through the inspected root descriptor and keeps
+// the normal descriptor-backed run path; the caller's spelling does not.
+func appleIdentityWithAlias(identity imageIdentity, requested string) imageIdentity {
+	identity.mutableAlias = isRepositoryDigestReference(requested)
+	return identity
 }
 
 // appleImageIDMatchesDescriptor verifies the only safe interpretation of
@@ -342,20 +497,6 @@ func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
 		return isImageID(recordID) && strings.EqualFold(recordID, digest)
 	}
 	return len(recordID) == 64 && isHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
-}
-
-func splitPlatform(p string) (os, arch, variant string) {
-	parts := strings.Split(p, "/")
-	if len(parts) > 0 {
-		os = parts[0]
-	}
-	if len(parts) > 1 {
-		arch = parts[1]
-	}
-	if len(parts) > 2 {
-		variant = parts[2]
-	}
-	return os, arch, variant
 }
 
 func (appleEngine) listReuseGroupArgs(string) []string {

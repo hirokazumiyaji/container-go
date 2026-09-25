@@ -351,9 +351,10 @@ func (dockerEngine) parseImageExists(data []byte, platform string) bool {
 
 // parseImageIdentity prefers a registry digest because it remains tied
 // to the repository the caller requested, and falls back to Docker's
-// local image ID for locally built or otherwise digest-less images.
-// Both forms prevent a later tag reassignment from changing run's
-// target.
+// local image ID for locally built or otherwise digest-less images. It
+// accepts both the canonical sha256:... ID and Docker's 64-hex spelling
+// only after the inspected Id matches exactly. Both forms prevent a
+// later tag reassignment from changing run's target.
 func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
 	var images []dockerImageInspect
 	if err := json.Unmarshal(data, &images); err != nil {
@@ -365,22 +366,23 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 	if len(images) == 0 {
 		return imageIdentity{}, false
 	}
-	requestedID := isImageID(image)
-	if image != "" && isBareImageReference(image) && !requestedID {
+	requestedID, requestedIsID := canonicalDockerImageID(image)
+	if image != "" && isBareImageReference(image) && !requestedIsID {
 		// A malformed or unprefixed digest/ID-shaped value is not a
 		// Docker image-ID request that inspect can verify.
 		return imageIdentity{}, true
 	}
-	explicitPinned := requestedID || (image != "" && validImageDigest(imageDigest(image)))
+	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
 	sawExplicitConflict := false
 	fallbackID := ""
 	for _, img := range images {
 		// An ID-shaped request is only accepted when inspect reports that
 		// exact verified local ID. A registry digest from a different
 		// record must not turn an unverified caller token into a pin.
-		if requestedID {
-			if isImageID(img.ID) && strings.EqualFold(img.ID, image) {
-				return imageReferenceWithDigest(image, "", "", img.ID), true
+		if requestedIsID {
+			inspectedID, ok := canonicalDockerImageID(img.ID)
+			if ok && strings.EqualFold(inspectedID, requestedID) {
+				return imageReferenceWithDigest(requestedID, "", "", inspectedID), true
 			}
 			continue
 		}
@@ -396,7 +398,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 					// manifest and its repository. A foreign RepoDigest
 					// is a conflict, even when its digest happens to be
 					// the same.
-					if requestedDigest != digest || imageRepository(image) != imageRepository(repoDigest) {
+					if !strings.EqualFold(requestedDigest, digest) || imageRepository(image) != imageRepository(repoDigest) {
 						sawExplicitConflict = true
 						continue
 					}

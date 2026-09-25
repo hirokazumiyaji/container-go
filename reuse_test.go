@@ -44,6 +44,28 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 	return r.fakeRunner.Run(ctx, args...)
 }
 
+type reuseParentRunner struct {
+	*reuseCreateRunner
+	parentCalls atomic.Int32
+}
+
+func (r *reuseParentRunner) RunWithParentDeath(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.parentCalls.Add(1)
+	return r.Run(ctx, args...)
+}
+
+func TestReuseCreateUsesParentDeathRunner(t *testing.T) {
+	base := newReuseCreateRunner()
+	runner := &reuseParentRunner{reuseCreateRunner: base}
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), withRunner(runner), withEngine(appleEngine{})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := runner.parentCalls.Load(); got != 1 {
+		t.Fatalf("parent-death create calls = %d, want 1", got)
+	}
+}
+
 func TestWithReuseRequiresName(t *testing.T) {
 	_, err := Run(context.Background(), "redis:7-alpine", WithReuse(), withRunner(newTestRunner()))
 	if err == nil || !strings.Contains(err.Error(), "WithReuse requires WithName") {

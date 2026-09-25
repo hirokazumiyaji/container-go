@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
@@ -72,6 +73,81 @@ func TestExecRunnerParentDeathKillsBackendTree(t *testing.T) {
 	_ = helper.Wait()
 	waitForProcessGone(t, pid)
 	waitForProcessGone(t, child)
+}
+
+func TestExecRunnerCancellationKillsOrdinaryTree(t *testing.T) {
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "backend.pid")
+	childPath := filepath.Join(dir, "child.pid")
+	target := filepath.Join(dir, "backend")
+	script := "#!/bin/sh\n" +
+		"echo $$ > " + pidPath + "\n" +
+		"sleep 30 &\n" +
+		"echo $! > " + childPath + "\n" +
+		"trap '' TERM\n" +
+		"wait\n"
+	if err := os.WriteFile(target, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	runner := &ExecRunner{Binary: target}
+	result := make(chan error, 1)
+	go func() {
+		_, _, err := runner.Run(ctx, "run")
+		result <- err
+	}()
+	waitForPIDFile(t, pidPath)
+	waitForPIDFile(t, childPath)
+	cancel()
+	if err := <-result; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Run error = %v, want context cancellation", err)
+	}
+	waitForProcessGone(t, mustReadPIDFile(t, pidPath))
+	waitForProcessGone(t, mustReadPIDFile(t, childPath))
+}
+
+func mustReadPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		t.Fatalf("pid file %s = %q", path, data)
+	}
+	return pid
+}
+
+func TestExecRunnerStreamCloseKillsTree(t *testing.T) {
+	dir := t.TempDir()
+	childPath := filepath.Join(dir, "stream-child.pid")
+	target := filepath.Join(dir, "stream-target")
+	script := "#!/bin/sh\n" +
+		"sleep 30 &\n" +
+		"echo $! > " + childPath + "\n" +
+		"echo line\n" +
+		"wait\n"
+	if err := os.WriteFile(target, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stream, err := (&ExecRunner{Binary: target}).Stream(context.Background(), "logs")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	childPID := waitForPIDFile(t, childPath)
+	scanner := bufio.NewScanner(stream)
+	if !scanner.Scan() {
+		t.Fatalf("stream ended before output: %v", scanner.Err())
+	}
+	if scanner.Text() != "line" {
+		t.Fatalf("stream line = %q, want line", scanner.Text())
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	waitForProcessGone(t, childPID)
 }
 
 func TestExecRunnerParentDeathHelper(t *testing.T) {

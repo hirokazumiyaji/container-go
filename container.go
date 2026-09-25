@@ -161,7 +161,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// Register the name and generation before the backend can create the
 	// container. If this process dies immediately after run succeeds, the
 	// reaper can still find and delete only this exact generation.
-	preRegisterRunWithGlobalReaper(cfg)
+	if err := preRegisterRunWithGlobalReaper(cfg); err != nil {
+		return nil, fmt.Errorf("reaper pre-registration: %w", err)
+	}
 	stdout, _, err := runCreate(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -222,13 +224,14 @@ func runCreate(ctx context.Context, cfg *config, args ...string) ([]byte, []byte
 	return cfg.runner.Run(ctx, args...)
 }
 
-func preRegisterRunWithGlobalReaper(cfg *config) {
+func preRegisterRunWithGlobalReaper(cfg *config) error {
 	if bin, subcommand, ok := runReaperTarget(cfg); ok {
-		// Registration is insurance, so a reaper failure must not turn a
-		// successful container start into a startup failure. The helper
-		// logs the invariant breach and retains the entry for a later retry.
-		_ = preRegisterWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
+		// Registration is part of the create safety boundary. The helper
+		// logs and returns failures so the caller aborts before invoking a
+		// backend create that could otherwise be orphaned.
+		return preRegisterWithGlobalReaper(bin, subcommand, cfg.name, cfg.creation)
 	}
+	return nil
 }
 
 func runReaperTarget(cfg *config) (binary, subcommand string, ok bool) {

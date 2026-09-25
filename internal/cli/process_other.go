@@ -16,6 +16,14 @@ func commandWithParentDeath(ctx context.Context, binary string, args []string) (
 
 func configureProcessGroup(*exec.Cmd) {}
 
+type directPlatformProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) { return directPlatformProcessTree{}, nil }
+func (directPlatformProcessTree) terminate(cmd *exec.Cmd) error {
+	return killProcessGroup(cmd)
+}
+func (directPlatformProcessTree) close() {}
+
 func killProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil

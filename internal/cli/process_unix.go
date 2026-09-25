@@ -19,16 +19,8 @@ bin=$1
 shift
 "$bin" "$@" 3<&- &
 child=$!
-kill_descendants() {
-  children=$(pgrep -P "$1" 2>/dev/null) || children=
-  for descendant in $children; do
-    kill_descendants "$descendant"
-    kill -9 "$descendant" 2>/dev/null || true
-  done
-}
 (
   IFS= read -r _ <&3
-  kill_descendants "$child"
   kill -KILL "-$$" 2>/dev/null || kill -KILL "$child" 2>/dev/null || true
 ) &
 watcher=$!
@@ -67,6 +59,31 @@ func configureProcessGroup(cmd *exec.Cmd) {
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
+
+type unixProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) { return unixProcessTree{}, nil }
+
+func (unixProcessTree) terminate(cmd *exec.Cmd) error {
+	if cmd == nil || cmd.Process == nil {
+		return os.ErrProcessDone
+	}
+	// Signal the direct handle first. os.Process serializes this with Wait;
+	// after Wait it returns ErrProcessDone instead of authorizing a numeric
+	// group signal against a potentially reused PID.
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+			return os.ErrProcessDone
+		}
+		if killErr := cmd.Process.Kill(); killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return err
+		}
+		return nil
+	}
+	return killProcessGroup(cmd)
+}
+
+func (unixProcessTree) close() {}
 
 func killProcessGroup(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {

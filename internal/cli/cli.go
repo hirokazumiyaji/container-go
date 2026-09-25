@@ -127,12 +127,13 @@ func (r *ExecRunner) run(ctx context.Context, parentDeath bool, args ...string) 
 		if err != nil {
 			return nil, nil, err
 		}
-		configureProcessGroup(cmd)
-		cmd.Cancel = func() error { return killProcessGroup(cmd) }
 		defer closeGuard()
 	} else {
 		cmd = exec.CommandContext(ctx, bin, args...)
 	}
+	configureProcessGroup(cmd)
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	cmd.Cancel = lifecycle.terminate
 
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
@@ -141,7 +142,17 @@ func (r *ExecRunner) run(ctx context.Context, parentDeath bool, args ...string) 
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err = cmd.Run()
+	if err := cmd.Start(); err != nil {
+		lifecycle.failStart()
+		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	tree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		tree = directProcessTree{}
+	}
+	lifecycle.publishStart(tree)
+
+	err = lifecycle.result()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.

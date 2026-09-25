@@ -7,3 +7,5 @@ import "context"
 func lockName(context.Context, string) (func(), error) {
 	return func() {}, nil
 }
+
+func ensureReaperNameLock(string) error { return nil }

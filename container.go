@@ -106,7 +106,7 @@ type Container struct {
 // with the joined error so the container is not orphaned. WithReuse
 // switches to get-or-create; see WithReuse for the shared-handle
 // lifecycle.
-func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
+func Run(ctx context.Context, image string, opts ...Option) (result *Container, retErr error) {
 	cfg := newConfig()
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
@@ -133,6 +133,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(cfg); err != nil {
 		return nil, err
 	}
+	// Establish the run budget before env-file security preflight. The
+	// preflight takes the root advisory lock and may otherwise outlive a
+	// canceled caller while another process is holding that lock.
+	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	defer cancel()
+
 	// Reject Windows before an image pull or any env-file storage setup.
 	// chmod's 0600/0700 bits do not provide per-user secrecy there.
 	if len(cfg.env) > 0 {
@@ -140,9 +146,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		// Validate the private root and reclaim provably stale directories
-		// before spending time on an image pull or backend create.
-		if err := cleanupStaleEnvFiles(); err != nil {
-			return nil, err
+		// before spending time on an image pull or backend create. The
+		// security cleanup has its own finite budget in addition to the
+		// caller's run deadline.
+		cleanupCtx, cleanupCancel := context.WithTimeout(runCtx, envFileSecurityTimeout)
+		err := cleanupStaleEnvFilesContext(cleanupCtx)
+		cleanupCancel()
+		if err != nil {
+			// A trusted directory whose cleanup is still pending must not
+			// turn a shared reuse attach into a failed flight. Other
+			// security-scan failures remain fail-closed.
+			if !cfg.reuse || !isRetryablePendingEnvCleanupError(err) {
+				return nil, err
+			}
 		}
 	}
 	if cfg.reuse {
@@ -153,8 +169,6 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	cfg.creation = newCreationID()
 
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
-	defer cancel()
 	// The pull policy brings the image into the local store before the
 	// run command; both share the aggregated flight so concurrent Runs
 	// of the same image pull once.
@@ -168,18 +182,30 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	// before returning; the first error is still preserved below.
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
+		path, dir, err := writeEnvFileContext(runCtx, cfg.env)
 		if err != nil {
 			if dir != "" {
-				return nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+				// A late root-lock error can return a published directory
+				// together with the write error. Keep ownership until a
+				// bounded retry has also failed.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
 			}
 			return nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() { retryEnvFileCleanup(&envDir) }()
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
 	}
 	stdout, _, runErr := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
-	envCleanupErr := cleanupEnvFile(envDir)
+	envCleanupErr := cleanupEnvFileAfterUseContext(runCtx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
 	}
@@ -211,6 +237,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
+	}
+	// Do not perform file copies or readiness polling while the env file
+	// still exists. The handle is usable, and the deferred retry retains
+	// ownership for a later safe cleanup attempt.
+	if envCleanupErr != nil {
+		return c, envCleanupErr
 	}
 
 	for _, f := range cfg.files {

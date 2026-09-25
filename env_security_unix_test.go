@@ -9,8 +9,12 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 func TestEnvFileOwnershipValidation(t *testing.T) {
@@ -25,6 +29,275 @@ func TestEnvFileOwnershipValidation(t *testing.T) {
 	}
 	if err := validateEnvOwnership(info, uid+1, envDirMode); err == nil {
 		t.Fatal("directory with a different owner was accepted")
+	}
+}
+
+type issue97EnvPathInfo struct {
+	os.FileInfo
+	uid  uint32
+	mode os.FileMode
+}
+
+func (i issue97EnvPathInfo) Sys() any {
+	stat := *(i.FileInfo.Sys().(*syscall.Stat_t))
+	stat.Uid = i.uid
+	return &stat
+}
+
+func (i issue97EnvPathInfo) Mode() os.FileMode { return i.mode }
+
+func TestIssue97TrustedEnvPathAncestorsRequireRootOrCurrentOwner(t *testing.T) {
+	info, err := os.Stat(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := currentEnvFileUID()
+	foreign := uid + 1
+	if foreign == 0 {
+		foreign = uid + 2
+	}
+	for _, mode := range []os.FileMode{0o755, 0o777 | os.ModeSticky} {
+		if !trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: 0, mode: mode}) {
+			t.Errorf("root-owned mode %04o was rejected", mode)
+		}
+		if !trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: uid, mode: mode}) {
+			t.Errorf("current-user-owned mode %04o was rejected", mode)
+		}
+		if trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: foreign, mode: mode}) {
+			t.Errorf("foreign-owned mode %04o was trusted", mode)
+		}
+	}
+}
+
+func TestIssue97RunEnvPreflightHonorsContextWhileRootLocked(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	root := isolateEnvFileRoot(t)
+	markerPath := filepath.Join(root, envFileRootMarkerName)
+	marker, err := openEnvFileNoFollow(markerPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireEnvFileRootLock(marker); err != nil {
+		_ = marker.Close()
+		t.Fatal(err)
+	}
+	defer closeEnvFileLock(marker)
+
+	f := newTestRunner()
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	_, err = Run(ctx, "redis:7-alpine",
+		WithName("locked-root"), WithEnv(map[string]string{"TOKEN": "secret"}),
+		withRunner(f), withEngine(appleEngine{}))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run error = %v, want context deadline", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("Run reached backend while root preflight was blocked: %v", f.calls)
+	}
+}
+
+func TestIssue97RootMarkerWaiterAcceptsCompletedCreatorChild(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	if err := withEnvFileRoot(base, func(string) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, envFileRootName)
+	markerPath := filepath.Join(root, envFileRootMarkerName)
+	if err := os.Remove(markerPath); err != nil {
+		t.Fatal(err)
+	}
+	partial := envFileRootLockMarker[:len(envFileRootLockMarker)/2]
+	if err := os.WriteFile(markerPath, []byte(partial), envFileMode); err != nil {
+		t.Fatal(err)
+	}
+	marker, err := openEnvFileNoFollow(markerPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := acquireEnvFileRootLock(marker); err != nil {
+		_ = marker.Close()
+		t.Fatal(err)
+	}
+	if err := marker.Truncate(0); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := marker.Seek(0, 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAll(marker, envFileRootLockMarker); err != nil {
+		t.Fatal(err)
+	}
+	child := filepath.Join(root, envFileDirPrefix+"creator-child")
+	if err := os.Mkdir(child, envDirMode); err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(child)
+
+	result := make(chan error, 1)
+	go func() {
+		result <- withEnvFileRoot(base, func(string) error { return nil })
+	}()
+	// Give the waiter a chance to observe the partial marker and block on
+	// the creator's lock before the creator completes.
+	time.Sleep(20 * time.Millisecond)
+	if err := closeEnvFileLock(marker); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("completed creator marker was rejected: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("root marker waiter did not finish")
+	}
+}
+
+type issue97EnvCleanupGateRunner struct {
+	*fakeRunner
+	envPath string
+}
+
+func (r *issue97EnvCleanupGateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "run" {
+		for i, arg := range args {
+			if arg == "--env-file" && i+1 < len(args) {
+				r.envPath = args[i+1]
+				_ = os.Remove(filepath.Join(filepath.Dir(r.envPath), envFileDirMarkerName))
+			}
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+type issue97EnvCleanupGateWait struct {
+	called *bool
+}
+
+func (w issue97EnvCleanupGateWait) WaitUntilReady(context.Context, wait.Target) error {
+	*w.called = true
+	return nil
+}
+
+func TestIssue97RunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	root := isolateEnvFileRoot(t)
+	hostFile := filepath.Join(root, "host.txt")
+	if err := os.WriteFile(hostFile, []byte("host"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &issue97EnvCleanupGateRunner{fakeRunner: newTestRunner()}
+	waitCalled := false
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("cleanup-gate"), WithEnv(map[string]string{"TOKEN": "secret"}),
+		WithFiles(File{HostPath: hostFile, ContainerPath: "/tmp/host"}),
+		WithWaitStrategy(issue97EnvCleanupGateWait{called: &waitCalled}),
+		withRunner(runner), withEngine(appleEngine{}))
+	if ctr == nil || ctr.ID() != "cleanup-gate" {
+		t.Fatalf("Run handle = %v, error = %v; want usable handle", ctr, err)
+	}
+	if err == nil {
+		t.Fatal("want env cleanup error")
+	}
+	if runner.callWith("cp") != nil {
+		t.Fatal("file copy ran while env cleanup was unresolved")
+	}
+	if waitCalled {
+		t.Fatal("readiness wait ran while env cleanup was unresolved")
+	}
+	dir := filepath.Dir(runner.envPath)
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("cleanup ownership was lost")
+	}
+	state.mu.Lock()
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if lock != nil {
+		_ = closeEnvFileLock(lock)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(dir)
+}
+
+func TestIssue97LateWriteErrorRetainsPublishedEnvOwnership(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	base := t.TempDir()
+	lateErr := errors.New("injected late root error")
+	var path, dir string
+	path, dir, err := writeEnvFileAtWithRoot(base, map[string]string{"TOKEN": "secret"}, func(base string, fn func(string) error) error {
+		err := withEnvFileRoot(base, func(root string) error {
+			if err := fn(root); err != nil {
+				return err
+			}
+			entries, readErr := os.ReadDir(root)
+			if readErr != nil {
+				return readErr
+			}
+			for _, entry := range entries {
+				if strings.HasPrefix(entry.Name(), envFileDirPrefix) {
+					return os.Remove(filepath.Join(root, entry.Name(), envFileDirMarkerName))
+				}
+			}
+			return nil
+		})
+		return errors.Join(err, lateErr)
+	})
+	if !errors.Is(err, lateErr) || path == "" || dir == "" {
+		t.Fatalf("write result = (%q, %q, %v), want published path plus late error", path, dir, err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("late write error dropped env ownership")
+	}
+	state.mu.Lock()
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if lock != nil {
+		_ = closeEnvFileLock(lock)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(dir)
+}
+
+func TestIssue97PendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	root := isolateEnvFileRoot(t)
+	_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateErr := errors.New("injected late close failure")
+	err = cleanupEnvFileAtWithClose(filepath.Dir(root), dir, removeExpectedEnvChildren, func(lock *os.File) error {
+		_ = closeEnvFileLock(lock)
+		return lateErr
+	})
+	if !errors.Is(err, lateErr) {
+		t.Fatalf("cleanup error = %v, want late close error", err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil || !state.pending {
+		t.Fatalf("pending cleanup state = %#v, want retained ownership", state)
+	}
+	if err := cleanupStaleEnvFilesAt(filepath.Dir(root)); err != nil {
+		t.Fatalf("pending cleanup drain: %v", err)
+	}
+	if state := loadEnvCleanupState(dir); state != nil {
+		t.Fatalf("pending cleanup state remains after drain: %#v", state)
 	}
 }
 
@@ -211,6 +484,139 @@ func TestPublicReuseReturnsHandleWhenEnvCleanupFails(t *testing.T) {
 	if runner.envPath == "" {
 		t.Fatal("runner did not observe env-file path")
 	}
+	dir := filepath.Dir(runner.envPath)
+	if state := loadEnvCleanupState(dir); state != nil {
+		state.mu.Lock()
+		lock := state.lock
+		state.lock = nil
+		state.mu.Unlock()
+		if lock != nil {
+			_ = closeEnvFileLock(lock)
+		}
+		clearEnvCleanupState(state)
+	}
+	_ = os.RemoveAll(dir)
+}
+
+type issue97BlockingReuseCleanupRunner struct {
+	*reuseCreateRunner
+	started chan struct{}
+	release chan struct{}
+	once    atomic.Bool
+	envPath string
+}
+
+func (r *issue97BlockingReuseCleanupRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "run" && r.once.CompareAndSwap(false, true) {
+		for i, arg := range args {
+			if arg == "--env-file" && i+1 < len(args) {
+				r.envPath = args[i+1]
+				_ = os.Remove(filepath.Join(filepath.Dir(r.envPath), envFileDirMarkerName))
+			}
+		}
+		close(r.started)
+		<-r.release
+	}
+	return r.reuseCreateRunner.Run(ctx, args...)
+}
+
+func TestIssue97ReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	isolateEnvFileRoot(t)
+	runner := &issue97BlockingReuseCleanupRunner{
+		reuseCreateRunner: newReuseCreateRunner(),
+		started:           make(chan struct{}),
+		release:           make(chan struct{}),
+	}
+	leaderResult := make(chan struct {
+		ctr *Container
+		err error
+	}, 1)
+	leaderWait := &recordingStrategy{}
+	go func() {
+		ctr, err := Run(context.Background(), "redis:7-alpine",
+			WithName("warning-reuse"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}),
+			WithWaitStrategy(leaderWait), withRunner(runner), withEngine(appleEngine{}))
+		leaderResult <- struct {
+			ctr *Container
+			err error
+		}{ctr, err}
+	}()
+	select {
+	case <-runner.started:
+	case <-time.After(time.Second):
+		t.Fatal("reuse leader did not reach create")
+	}
+
+	var joins atomic.Int32
+	joined := make(chan struct{})
+	oldJoin := reuseFlights.onJoin
+	reuseFlights.onJoin = func(string) {
+		if joins.Add(1) == 2 {
+			close(joined)
+		}
+	}
+	defer func() { reuseFlights.onJoin = oldJoin }()
+
+	compatibleWait := &recordingStrategy{}
+	compatibleResult := make(chan struct {
+		ctr *Container
+		err error
+	}, 1)
+	go func() {
+		ctr, err := Run(context.Background(), "redis:7-alpine",
+			WithName("warning-reuse"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}),
+			WithWaitStrategy(compatibleWait), withRunner(runner), withEngine(appleEngine{}))
+		compatibleResult <- struct {
+			ctr *Container
+			err error
+		}{ctr, err}
+	}()
+	mismatchResult := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "nginx:alpine",
+			WithName("warning-reuse"), WithReuse(),
+			withRunner(runner), withEngine(appleEngine{}))
+		mismatchResult <- err
+	}()
+	select {
+	case <-joined:
+	case <-time.After(time.Second):
+		t.Fatal("reuse waiters did not join the in-flight create")
+	}
+	close(runner.release)
+
+	leader := <-leaderResult
+	if leader.ctr == nil || leader.err == nil {
+		t.Fatalf("leader result = (%v, %v), want handle plus cleanup warning", leader.ctr, leader.err)
+	}
+	if leaderWait.called {
+		t.Fatal("cleanup-warning leader performed readiness work")
+	}
+	compatible := <-compatibleResult
+	if compatible.err != nil || compatible.ctr == nil {
+		t.Fatalf("compatible waiter result = (%v, %v), want successful handle", compatible.ctr, compatible.err)
+	}
+	if !compatibleWait.called {
+		t.Fatal("compatible waiter skipped its readiness strategy")
+	}
+	if err := <-mismatchResult; err == nil || !strings.Contains(err.Error(), "does not match") {
+		t.Fatalf("mismatched waiter error = %v, want compatibility failure", err)
+	}
+	var runCalls int
+	runner.mu.Lock()
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "run" {
+			runCalls++
+		}
+	}
+	runner.mu.Unlock()
+	if runCalls != 1 {
+		t.Fatalf("run calls = %d, want 1 shared create", runCalls)
+	}
+
 	dir := filepath.Dir(runner.envPath)
 	if state := loadEnvCleanupState(dir); state != nil {
 		state.mu.Lock()

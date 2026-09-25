@@ -59,7 +59,7 @@ func WithExecWorkDir(dir string) ExecOption {
 
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error.
-func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
 	if len(cmd) == 0 {
 		return 0, nil, errors.New("exec: command must not be empty")
 	}
@@ -72,26 +72,37 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
+		path, dir, err := writeEnvFileContext(ctx, cfg.env)
 		if err != nil {
 			if dir != "" {
-				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+				// Preserve ownership when a late root-lock error is
+				// returned with a published env directory.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
 			}
 			return 0, nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() { retryEnvFileCleanup(&envDir) }()
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
 	}
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
-	envCleanupErr := cleanupEnvFile(envDir)
+	envCleanupErr := cleanupEnvFileAfterUseContext(ctx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
 	}
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, envCleanupErr
 	}

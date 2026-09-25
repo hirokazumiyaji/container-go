@@ -15,34 +15,70 @@ import (
 // own compatibility check and wait strategy afterward.
 var reuseFlights flightGroup[*Container]
 
+type reuseCleanupWarning struct {
+	err error
+}
+
+func (w *reuseCleanupWarning) Error() string { return w.err.Error() }
+func (w *reuseCleanupWarning) Unwrap() error { return w.err }
+
+func isReuseCleanupWarning(err error) bool {
+	var warning *reuseCleanupWarning
+	return errors.As(err, &warning)
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
-	base, err := reuseFlights.do(ctx, key, func() (*Container, error) {
+	var leaderWarning error
+	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Shared ensure must not die with the first caller's cancel;
 		// waiters keep waiting on their own contexts.
 		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reuseAttachTimeout)
 		defer cancel()
-		return reuseEnsureContainer(flightCtx, image, cfg)
+		ctr, ensureErr := reuseEnsureContainer(flightCtx, image, cfg)
+		if ctr != nil && isReuseCleanupWarning(ensureErr) {
+			// A cleanup warning belongs to the creator's returned handle,
+			// but it is a successful shared create. Do not make every
+			// waiter observe a failed flight.
+			leaderWarning = ensureErr
+			return ctr, nil
+		}
+		return ctr, ensureErr
 	})
 	if err != nil {
-		// A successful create can still report an env-file cleanup error.
-		// Preserve the handle at this boundary so callers never lose the
-		// only usable reference to the shared container.
-		if base != nil {
+		// A post-create result can carry a real error together with a
+		// usable handle. Only the flight leader may receive that handle;
+		// waiters must retry/attach and perform their own checks.
+		if leader && base != nil {
 			return base, err
 		}
 		return nil, err
 	}
+	if base == nil {
+		return nil, errors.New("reuse returned an empty container handle")
+	}
 
-	info := base.info
-	if info == nil {
+	// A creator's cached inspect is usable only for that creator. A waiter
+	// must verify the named container with its own context before applying
+	// compatibility and readiness checks; a warning result has no cached
+	// inspect and therefore takes the fresh-inspect path for every caller.
+	var info *engineInfo
+	if leader && leaderWarning == nil && base.info != nil {
+		info = base.info
+	} else {
 		info, err = inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
+			if leader && leaderWarning != nil {
+				// The create itself succeeded and the only known warning is
+				// cleanup. Preserve that usable handle even if the fresh
+				// verification needed for compatibility cannot complete.
+				return base, joinEnvFileCleanupError(err, leaderWarning)
+			}
 			return nil, err
 		}
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, err
+		return nil, joinEnvFileCleanupError(err, leaderWarning)
 	}
 
 	ctr := &Container{
@@ -56,8 +92,17 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
 	}
+	// The creator stops before readiness work when its env artifact is
+	// still present. Waiters that received the successful shared result
+	// still run their own compatibility/readiness path below.
+	if leader && leaderWarning != nil {
+		return ctr, leaderWarning
+	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
-		return nil, err
+		return nil, joinEnvFileCleanupError(err, leaderWarning)
+	}
+	if leader {
+		return ctr, leaderWarning
 	}
 	return ctr, nil
 }
@@ -141,7 +186,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 	}
 }
 
-func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
+func reuseCreate(ctx context.Context, image string, cfg *config) (result *Container, retErr error) {
 	if cfg.creation == "" {
 		cfg.creation = newCreationID()
 	}
@@ -159,18 +204,29 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	// removal is returned and retried by the deferred cleanup.
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
+		path, dir, err := writeEnvFileContext(runCtx, cfg.env)
 		if err != nil {
 			if dir != "" {
-				return nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+				// Keep retry ownership when a late root-lock error is
+				// returned together with a published env directory.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
 			}
 			return nil, err
 		}
 		envFile, envDir = path, dir
-		defer func() { retryEnvFileCleanup(&envDir) }()
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
 	}
 	stdout, _, runErr := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
-	envCleanupErr := cleanupEnvFile(envDir)
+	envCleanupErr := cleanupEnvFileAfterUseContext(runCtx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
 	}
@@ -196,6 +252,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
 	}
+	if envCleanupErr != nil {
+		// The handle is usable, but no further post-create operation may
+		// run while the secret artifact remains. The deferred retry keeps
+		// ownership and the flight layer carries this as a warning.
+		return ctr, &reuseCleanupWarning{err: envCleanupErr}
+	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
 		if cleanupErr != nil {
@@ -212,7 +274,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
 	}
-	return ctr, envCleanupErr
+	return ctr, nil
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a

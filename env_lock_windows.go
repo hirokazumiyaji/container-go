@@ -2,7 +2,10 @@
 
 package container
 
-import "os"
+import (
+	"context"
+	"os"
+)
 
 const envFileLocksSupported = false
 
@@ -16,6 +19,14 @@ func acquireEnvFileLock(*os.File) error {
 
 func acquireEnvFileRootLock(*os.File) error {
 	return ErrEnvFileUnsupported
+}
+
+func acquireEnvFileRootLockContext(context.Context, *os.File) error {
+	return ErrEnvFileUnsupported
+}
+
+func tryAcquireEnvFileRootLock(*os.File) (bool, error) {
+	return false, ErrEnvFileUnsupported
 }
 
 func tryAcquireEnvFileLock(*os.File) (bool, error) {

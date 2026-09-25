@@ -3,12 +3,14 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 )
 
 const envFileLocksSupported = true
@@ -22,7 +24,54 @@ func acquireEnvFileLock(f *os.File) error {
 }
 
 func acquireEnvFileRootLock(f *os.File) error {
-	return syscall.Flock(int(f.Fd()), syscall.LOCK_EX)
+	return acquireEnvFileRootLockContext(context.Background(), f)
+}
+
+// acquireEnvFileRootLockContext never parks the caller in flock's blocking
+// mode. Polling the non-blocking operation lets a canceled Run or cleanup
+// operation release the descriptor and return its context error promptly.
+func acquireEnvFileRootLockContext(ctx context.Context, f *os.File) error {
+	ctx, cancel := boundedEnvContext(ctx)
+	defer cancel()
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		locked, err := tryAcquireEnvFileRootLock(f)
+		if err != nil {
+			return err
+		}
+		if locked {
+			if err := ctx.Err(); err != nil {
+				_ = releaseEnvFileRootLock(f)
+				return err
+			}
+			return nil
+		}
+		timer := time.NewTimer(envRootLockPollInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func tryAcquireEnvFileRootLock(f *os.File) (bool, error) {
+	err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EINTR) {
+		return false, nil
+	}
+	return false, err
 }
 
 func tryAcquireEnvFileLock(f *os.File) (bool, error) {

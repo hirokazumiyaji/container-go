@@ -127,11 +127,10 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		if err != nil {
 			return err
 		}
-		path := s.path
-		if !strings.HasPrefix(path, "/") {
-			path = "/" + path
+		probeURL, err := buildHTTPProbeURL(scheme, endpoint, s.path)
+		if err != nil {
+			return err
 		}
-		probeURL := (&url.URL{Scheme: scheme, Host: endpoint, Path: path}).String()
 		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, nil)
 		if err != nil {
 			return err
@@ -154,8 +153,46 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	}, true)
 }
 
+func buildHTTPProbeURL(scheme, endpoint, callerPath string) (string, error) {
+	pathRef, err := url.Parse(callerPath)
+	if err == nil && pathRef.Scheme == "" && pathRef.Opaque == "" && pathRef.Host == "" && pathRef.User == nil && !strings.HasPrefix(callerPath, "//") {
+		return (&url.URL{
+			Scheme:      scheme,
+			Host:        endpoint,
+			Path:        pathRef.Path,
+			RawPath:     pathRef.RawPath,
+			ForceQuery:  pathRef.ForceQuery,
+			RawQuery:    pathRef.RawQuery,
+			Fragment:    pathRef.Fragment,
+			RawFragment: pathRef.RawFragment,
+		}).String(), nil
+	}
+
+	// Keep authority-looking legacy paths literal while still parsing their
+	// query, fragment, and pre-escaped path components.
+	literalPath, literalErr := url.Parse("/." + callerPath)
+	if literalErr != nil {
+		return "", literalErr
+	}
+	literalPath.Path = strings.TrimPrefix(literalPath.Path, "/.")
+	literalPath.RawPath = strings.TrimPrefix(literalPath.RawPath, "/.")
+	return (&url.URL{
+		Scheme:      scheme,
+		Host:        endpoint,
+		Path:        literalPath.Path,
+		RawPath:     literalPath.RawPath,
+		ForceQuery:  literalPath.ForceQuery,
+		RawQuery:    literalPath.RawQuery,
+		Fragment:    literalPath.Fragment,
+		RawFragment: literalPath.RawFragment,
+	}).String(), nil
+}
+
 func newDefaultHTTPClient(tlsConfig *tls.Config) *http.Client {
-	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport := &http.Transport{}
+	if defaultTransport, ok := http.DefaultTransport.(*http.Transport); ok && defaultTransport != nil {
+		transport = defaultTransport.Clone()
+	}
 	transport.Proxy = nil
 	if tlsConfig != nil {
 		transport.TLSClientConfig = tlsConfig.Clone()

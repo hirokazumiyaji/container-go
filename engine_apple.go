@@ -42,6 +42,8 @@ func (appleEngine) probe() cli.Probe {
 	return cli.Probe{
 		Args:          []string{"system", "status"},
 		Hint:          "run `container system start`",
+		Binary:        "container",
+		Operation:     "system",
 		IsUnavailable: appleProbeUnavailable,
 	}
 }
@@ -52,9 +54,15 @@ func appleProbeUnavailable(err error) bool {
 		return false
 	}
 	// A reachable daemon can fail for client-side configuration or
-	// authentication reasons. Those diagnostics veto every probe branch.
-	if cli.IsProbeConfigurationError(err) {
-		return false
+	// authentication reasons. Those diagnostics veto only the matching
+	// system-status branch.
+	for _, branch := range branches {
+		if branch.ctx.operation != "system" {
+			continue
+		}
+		if cli.IsProbeConfigurationError(branch.cause) {
+			return false
+		}
 	}
 	for _, branch := range branches {
 		if branch.ctx.operation != "system" {

@@ -80,7 +80,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.operationTarget(), cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
@@ -91,37 +91,48 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// the CLI also returns a real non-zero status. Preserve the context
 	// and any CLI diagnostic in the returned error.
 	var cliErr *cli.CLIError
-	hasCLIError := errors.As(err, &cliErr)
-	if isExecContextError(err) || (hasCLIError && cliErr.ExitCode < 0) || ctx.Err() != nil {
+	hasSelected := false
+	if c.eng != nil {
+		var selected cliErrorBranch
+		selected, hasSelected = matchingCLIErrorBranch(err, c.eng.binary(), "exec", c.operationTarget(), c.id)
+		if hasSelected {
+			cliErr = selected.ctx.err
+		}
+	}
+	if !hasSelected {
+		_ = errors.As(err, &cliErr)
+	}
+	if isExecContextError(err) || (cliErr != nil && cliErr.ExitCode < 0) || ctx.Err() != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
 			err = errors.Join(err, ctxErr)
 		}
 		code := 0
-		if hasCLIError && cliErr.ExitCode >= 0 {
+		if cliErr != nil && cliErr.ExitCode >= 0 {
 			code = cliErr.ExitCode
 		}
 		return code, output, err
 	}
-	if !cli.IsCommandExit(err) {
-		return 0, output, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	if cliErr == nil {
+		return 0, output, wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "exec"), "exec", c.operationTarget(), c.id)
 	}
 	// A timeout-shaped command exit is an operation failure, not an
 	// application result. Classify returns it without probing the backend.
-	if cli.IsOperationTimeoutError(err) {
-		return cliErr.ExitCode, output, c.classify(ctx, err)
+	if isExecOperationTimeout(err, cliErr) {
+		return cliErr.ExitCode, output, c.classifyOperation(ctx, err, "exec")
 	}
 	// Exec diagnostics can come from the workload itself. Do not use the
 	// broad text-based liveness classifier here: a positive workload exit
 	// is still a result even when it says "permission denied" or mentions
 	// configuration. Only structured OS errors and the CLI's 126/127
 	// command-exec statuses are definitive client-side failures.
-	if isDefinitiveExecError(err) {
+	if isDefinitiveExecError(err, cliErr) {
 		return cliErr.ExitCode, output, err
 	}
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
-	if !isNotFoundFor(c.eng, err) && !maybeInfraExecErr(c.eng, err) {
+	if !isNotFoundForOperation(c.eng, err, "exec", c.operationTarget(), c.id) &&
+		!maybeInfraExecErr(c.eng, err, c.operationTarget(), c.id) {
 		return cliErr.ExitCode, output, nil
 	}
 	verification := c.verifyExecContainer(ctx)
@@ -129,7 +140,8 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return cliErr.ExitCode, output, nil
 	}
 	if verification.err != nil {
-		return 0, nil, errors.Join(err, verification.err)
+		joined := errors.Join(err, verification.err)
+		return 0, nil, wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id)
 	}
 	return 0, nil, errors.Join(err, &execInspectionStateError{state: verification.state})
 }
@@ -138,11 +150,23 @@ func isExecContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
+func isExecOperationTimeout(err error, cliErr *cli.CLIError) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	return cliErr != nil && cliErr.ExitCode < 0
+}
+
 // isDefinitiveExecError identifies client-side failures that are
 // represented by structured evidence rather than workload output. Exec
 // forwards the workload's stderr through CLIError, so diagnostic phrases
 // alone cannot establish that the backend or the CLI invocation failed.
-func isDefinitiveExecError(err error) bool {
+func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
 	if err == nil {
 		return false
 	}
@@ -154,16 +178,18 @@ func isDefinitiveExecError(err error) bool {
 	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 		return true
 	}
-	var cliErr *cli.CLIError
-	return errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
+	return cliErr != nil && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
-func maybeInfraExecErr(eng engine, err error) bool {
+func maybeInfraExecErr(eng engine, err error, targets ...string) bool {
 	for _, branch := range backendCLIErrorBranches(err, eng.binary()) {
 		if branch.ctx.operation != "exec" {
+			continue
+		}
+		if len(targets) > 0 && !branchTargetMatchesAny(branch, targets) {
 			continue
 		}
 		stderr, _ := branchLines(branch, false)
@@ -214,20 +240,21 @@ func (e *execInspectionStateError) Error() string {
 func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.operationTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return execInspection{
 			state: StateUnknown,
-			err:   wrapNotFoundFor(c.eng, c.classify(qCtx, err)),
+			err:   wrapNotFoundForOperation(c.eng, c.classifyOperation(qCtx, err, "inspect"), "inspect", target, c.id),
 		}
 	}
 	if len(bytes.TrimSpace(stdout)) == 0 {
 		return execInspection{
 			state: StateUnknown,
-			err:   &execInspectEmptyError{target: c.id},
+			err:   &execInspectEmptyError{target: target},
 		}
 	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
 		if errors.Is(err, errInspectTargetNotFound) {
 			return execInspection{state: StateUnknown, err: wrapInspectTargetNotFound(err)}
@@ -240,6 +267,7 @@ func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 			err:   fmt.Errorf("exec verification: inspect returned no state"),
 		}
 	}
+	c.setImmutableUID(info.uid)
 	return execInspection{state: info.state}
 }
 

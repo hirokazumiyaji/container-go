@@ -2,6 +2,7 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -37,6 +38,8 @@ const (
 	dockerStderrNoSuchCtr    = "no such container:"
 )
 
+var errInvalidDockerInspect = errors.New("invalid docker container inspect output")
+
 var dockerDesktopUnableToStartRE = regexp.MustCompile(`(?i)^(error response from daemon: )?docker desktop is unable to start\b`)
 
 func (dockerEngine) name() string   { return "docker" }
@@ -65,6 +68,8 @@ func (dockerEngine) probe() cli.Probe {
 	return cli.Probe{
 		Args:          []string{"version", "--format", "{{.Server.Version}}"},
 		Hint:          "start the Docker daemon",
+		Binary:        "docker",
+		Operation:     "version",
 		IsUnavailable: dockerProbeUnavailable,
 	}
 }
@@ -75,10 +80,15 @@ func dockerProbeUnavailable(err error) bool {
 		return false
 	}
 	// A reachable daemon can fail the client for TLS, certificate, SSH,
-	// proxy, authentication, or endpoint-configuration reasons. None of
-	// those failures prove that the daemon is stopped.
-	if cli.IsProbeConfigurationError(err) {
-		return false
+	// proxy, authentication, or endpoint-configuration reasons. Those
+	// diagnostics veto only the matching version branch.
+	for _, branch := range branches {
+		if branch.ctx.operation != "version" {
+			continue
+		}
+		if cli.IsProbeConfigurationError(branch.cause) {
+			return false
+		}
 	}
 	for _, branch := range branches {
 		if branch.ctx.operation != "version" {
@@ -216,16 +226,20 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
-func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
+func (dockerEngine) inspectArgs(id string) []string {
+	return []string{"inspect", "--type=container", id}
+}
 
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
+type dockerInspectState struct {
+	Status string `json:"Status"`
+}
+
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
-		Status string `json:"Status"`
-	} `json:"State"`
+	ID     string              `json:"Id"`
+	Name   string              `json:"Name"`
+	State  *dockerInspectState `json:"State"`
 	Config struct {
 		Image  string            `json:"Image"`
 		Labels map[string]string `json:"Labels"`
@@ -246,13 +260,27 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	if strings.TrimSpace(string(data)) == "" {
 		return nil, newInspectTargetNotFound(id, "empty inspect output")
 	}
-	var containers []dockerInspect
-	if err := json.Unmarshal(data, &containers); err != nil {
+	var raw json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("decode docker inspect output: %w", err)
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("%w: expected a container array, got null", errInvalidDockerInspect)
+	}
+	var rawContainers []json.RawMessage
+	if err := json.Unmarshal(data, &rawContainers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	var c dockerInspect
 	found := false
-	for _, candidate := range containers {
+	for _, rawContainer := range rawContainers {
+		var candidate dockerInspect
+		if err := json.Unmarshal(rawContainer, &candidate); err != nil {
+			return nil, fmt.Errorf("%w: invalid container entry: %v", errInvalidDockerInspect, err)
+		}
+		if candidate.State == nil || strings.TrimSpace(candidate.State.Status) == "" {
+			return nil, fmt.Errorf("%w: container State.Status is required", errInvalidDockerInspect)
+		}
 		if dockerInspectTargetMatches(candidate, id) {
 			c = candidate
 			found = true
@@ -304,15 +332,33 @@ func dockerInspectTargetMatches(c dockerInspect, target string) bool {
 	if target == "" {
 		return false
 	}
+	if dockerTargetIsID(target) {
+		return dockerIDMatches(c.ID, target)
+	}
 	if dockerIDMatches(c.ID, target) {
 		return true
 	}
 	return strings.TrimPrefix(strings.TrimSpace(c.Name), "/") == target
 }
 
+func dockerTargetIsID(target string) bool {
+	id := strings.TrimPrefix(strings.TrimSpace(target), "sha256:")
+	if len(id) != 64 {
+		return false
+	}
+	for _, r := range id {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
 func dockerIDMatches(got, want string) bool {
-	return strings.TrimPrefix(strings.TrimSpace(got), "sha256:") ==
-		strings.TrimPrefix(strings.TrimSpace(want), "sha256:")
+	return strings.EqualFold(
+		strings.TrimPrefix(strings.TrimSpace(got), "sha256:"),
+		strings.TrimPrefix(strings.TrimSpace(want), "sha256:"),
+	)
 }
 
 // dockerState maps Docker's status vocabulary onto State.

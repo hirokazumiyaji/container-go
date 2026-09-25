@@ -153,7 +153,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
-		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
+		classified := classifyErrorFor(ctx, cfg.runner, err, cfg.eng, "run", cfg.name)
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete

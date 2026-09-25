@@ -123,6 +123,9 @@ func TestDockerStateMapping(t *testing.T) {
 
 func TestDockerLifecycleArgs(t *testing.T) {
 	e := dockerEngine{}
+	if got := e.inspectArgs("myctr"); !slices.Equal(got, []string{"inspect", "--type=container", "myctr"}) {
+		t.Errorf("inspectArgs = %v", got)
+	}
 	d := 10 * time.Second
 	if got := e.stopArgs("myctr", &d); !slices.Equal(got, []string{"stop", "--time", "10", "myctr"}) {
 		t.Errorf("stopArgs = %v", got)

@@ -98,8 +98,9 @@ type Container struct {
 	// check unnecessary: a replacement never shares it.
 	uid string
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	mu    sync.Mutex
+	uidMu sync.RWMutex
+	info  *engineInfo // cached first inspect; immutable fields only
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -161,7 +162,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
-		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
+		classified := classifyErrorFor(ctx, cfg.runner, err, cfg.eng, "run", cfg.name)
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
@@ -252,7 +253,12 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 	}
 	target := cfg.name
-	if info.uid != "" {
+	if cfg.eng.name() == "docker" {
+		if info.uid == "" {
+			return
+		}
+		target = info.uid
+	} else if info.uid != "" {
 		target = info.uid
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
@@ -282,8 +288,58 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 // ID returns the container ID (identical to its name).
 func (c *Container) ID() string { return c.id }
 
+// operationTarget returns the immutable target for backend operations.
+// Docker handles prefer the ID returned by run/inspect; name-based handles
+// (including Apple Container) retain the original name.
+func (c *Container) operationTarget() string {
+	if c.eng != nil && c.eng.name() == "docker" {
+		if uid := c.immutableUID(); uid != "" {
+			return uid
+		}
+	}
+	return c.id
+}
+
+func (c *Container) immutableUID() string {
+	if c.eng == nil || c.eng.name() != "docker" {
+		return ""
+	}
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+func (c *Container) setImmutableUID(uid string) {
+	if uid == "" || c.eng == nil || c.eng.name() != "docker" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
+}
+
 func (c *Container) classify(ctx context.Context, err error) error {
 	return classifyError(ctx, c.runner, err, c.eng)
+}
+
+func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
+	if c.eng == nil {
+		return c.classify(ctx, err)
+	}
+	target := c.operationTarget()
+	if target == c.id {
+		return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target)
+	}
+	return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target, c.id)
+}
+
+func (c *Container) deleteOperation() string {
+	if c.eng != nil && c.eng.name() == "docker" {
+		return "rm"
+	}
+	return "delete"
 }
 
 // State returns the current lifecycle state.
@@ -300,8 +356,8 @@ func (c *Container) State(ctx context.Context) (State, error) {
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
-	return c.classify(ctx, err)
+	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.operationTarget(), timeout)...)
+	return c.classifyOperation(ctx, err, "stop")
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -315,8 +371,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	if uid := c.immutableUID(); uid != "" {
+		return c.delete(ctx, uid)
 	}
 	if c.creation == "" {
 		return c.delete(ctx, c.id)
@@ -327,7 +383,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFoundFor(c.eng, err) {
+	if isNotFoundForOperation(c.eng, err, "inspect", c.operationTarget(), c.id) {
 		return nil
 	}
 	if err != nil {
@@ -337,6 +393,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 	// it counts as a replacement too.
 	if info.labels[creationLabel] != c.creation {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.eng.name() == "docker" && info.uid == "" {
+		return fmt.Errorf("terminate %s: inspect returned no immutable Docker ID", c.id)
 	}
 	if info.uid != "" {
 		return c.delete(ctx, info.uid)
@@ -348,10 +407,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFoundFor(c.eng, err) {
+	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		return nil
 	}
-	return c.classify(ctx, err)
+	return c.classifyOperation(ctx, err, c.deleteOperation())
 }
 
 // ContainerIP returns the container's address on its first attached
@@ -447,6 +506,7 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.info != nil {
+		c.setImmutableUID(c.info.uid)
 		return c.info, nil
 	}
 	info, err := c.inspectFresh(ctx)
@@ -454,22 +514,24 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
+	c.setImmutableUID(info.uid)
 	return info, nil
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.operationTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
-		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		return nil, wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "inspect"), "inspect", target, c.id)
 	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
 	if errors.Is(err, errInspectTargetNotFound) {
 		return nil, wrapInspectTargetNotFound(err)
+	}
+	if err == nil && info != nil {
+		c.setImmutableUID(info.uid)
 	}
 	return info, err
 }

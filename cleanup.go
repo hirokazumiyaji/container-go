@@ -58,7 +58,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
-		return nil, classifyError(ctx, r, err, eng)
+		return nil, classifyErrorFor(ctx, r, err, eng, commandOperation(listArgs), "")
 	}
 	ids, err := parse(stdout)
 	if err != nil {

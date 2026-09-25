@@ -25,8 +25,12 @@ var ErrSystemNotRunning = errors.New("container backend is not running")
 // failure: a cheap CLI invocation plus the hint to show the user when
 // it fails.
 type Probe struct {
-	Args []string
-	Hint string
+	Args   []string
+	Hint   string
+	Binary string
+	// Operation names the backend command represented by Args. It lets
+	// classifiers ignore joined CLIError branches from other operations.
+	Operation string
 	// IsUnavailable reports whether a probe failure means that the
 	// backend is not running. A nil predicate uses conservative
 	// liveness-text matching; caller cancellation and other
@@ -214,12 +218,18 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// truncateOutput bounds a diagnostic copy kept in CLIError.
+// truncateOutput bounds a diagnostic copy kept in CLIError while keeping
+// both its beginning and its decisive tail. Backend diagnostics often put
+// the actionable daemon/object error after a long prefix.
 func truncateOutput(s string) string {
-	if len(s) > maxStderr {
-		return s[:maxStderr]
+	if len(s) <= maxStderr {
+		return s
 	}
-	return s
+	const marker = "\n...[diagnostic truncated]...\n"
+	available := maxStderr - len(marker)
+	head := available / 2
+	tail := available - head
+	return s[:head] + marker + s[len(s)-tail:]
 }
 
 // truncateStderr bounds the stderr diagnostic copy kept in CLIError.
@@ -239,6 +249,114 @@ func IsCommandExit(err error) bool {
 // cannot stall error handling forever. Caller cancellation still
 // aborts the probe via context propagation.
 const probeTimeout = 5 * time.Second
+
+func probeRelevantError(err error, probe Probe) error {
+	if err == nil {
+		return nil
+	}
+	operation := probe.Operation
+	if operation == "" {
+		operation = probeOperation(probe.Args)
+	}
+	if operation == "" {
+		return err
+	}
+
+	var branches []error
+	var nonCLI []error
+	stdoutByCLIError := make(map[*CLIError]string)
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil {
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if stdout, _, _ := DiagnosticText(cur); stdout != "" {
+			var owner *CLIError
+			if errors.As(cur, &owner) {
+				stdoutByCLIError[owner] = stdout
+			}
+		}
+		if cliErr, ok := cur.(*CLIError); ok {
+			if probe.Binary == "" || probeBinaryMatches(cliErr.Binary, probe.Binary) {
+				if probeOperation(cliErr.Args) == operation {
+					cause := error(cliErr)
+					if stdout := stdoutByCLIError[cliErr]; stdout != "" {
+						cause = WithStdout(cliErr, stdout)
+					}
+					branches = append(branches, cause)
+				}
+			}
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+		}
+	}
+	walk(err)
+	collectProbeNonCLI(err, &nonCLI)
+	if len(branches) == 0 {
+		return err
+	}
+	parts := append(branches, nonCLI...)
+	return errors.Join(parts...)
+}
+
+func collectProbeNonCLI(err error, out *[]error) {
+	if err == nil {
+		return
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			collectProbeNonCLI(child, out)
+		}
+		return
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		child := wrapped.Unwrap()
+		if _, joined := child.(interface{ Unwrap() []error }); joined {
+			collectProbeNonCLI(child, out)
+			return
+		}
+	}
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) {
+		return
+	}
+	*out = append(*out, err)
+}
+
+func probeOperation(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	if args[0] == "image" {
+		if len(args) > 1 {
+			return "image " + args[1]
+		}
+		return "image"
+	}
+	return args[0]
+}
+
+func probeBinaryMatches(got, want string) bool {
+	if want == "" {
+		return true
+	}
+	got = strings.TrimSpace(strings.ToLower(got))
+	if got == "" {
+		got = "container"
+	}
+	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
+		got = got[i+1:]
+	}
+	return got == strings.ToLower(want)
+}
 
 // Classify augments a failed CLI call. When the backend-specific probe
 // identifies a liveness failure, the result is marked with
@@ -290,6 +408,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
+	probeForClassification := probeRelevantError(probeErr, probe)
 	if isNonLivenessError(err) &&
 		(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err) || isAmbiguousObjectError(err)) {
 		// The command already identified a precise configuration,
@@ -300,24 +419,24 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	// Configuration/authentication diagnostics can be attached to any
 	// joined probe branch. Check them before a liveness-looking branch or
 	// an explicit backend predicate can add the sentinel.
-	if IsProbeConfigurationError(probeErr) {
+	if IsProbeConfigurationError(probeForClassification) {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	// A returned deadline is the bounded probe's liveness evidence when
 	// it is the only cause. A joined permission, configuration, or
 	// cancellation cause is a client-side veto and must remain a joined
 	// ordinary failure instead.
-	if isReturnedProbeTimeout(probeErr) && !probeVetoError(probeErr) {
+	if isReturnedProbeTimeout(probeForClassification) && !probeVetoError(probeForClassification) {
 		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
 	}
 	// A timeout belonging to the bounded probe is evidence that the
 	// backend did not answer, unless the runner reported a distinct
 	// non-liveness error. A caller deadline was handled above.
-	if isProbeNonLiveness(probeCtx, probeErr) {
+	if isProbeNonLiveness(probeCtx, probeForClassification) {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if probeCtx.Err() == context.DeadlineExceeded {
-		if isDefinitiveNonLivenessError(probeErr) {
+		if isDefinitiveNonLivenessError(probeForClassification) {
 			return joinProbeFailure(ctx, probeCtx, err, probeErr)
 		}
 		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
@@ -328,7 +447,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
-	unavailable := probeUnavailable(probe, probeErr)
+	unavailable := probeUnavailable(probe, probeForClassification)
 	// Check again after the predicate. In particular, a predicate that
 	// cancels the caller and then reports liveness must not win the
 	// race and add ErrSystemNotRunning.

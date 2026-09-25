@@ -32,57 +32,106 @@ type cliErrorBranch struct {
 	ctx    cliErrorContext
 	stdout string
 	stderr string
+	cause  error
 }
 
-// backendCLIErrorBranches returns every matching CLIError branch in an
-// error tree. A definitive joined client-side failure vetoes all absence
-// matching before any branch is considered. Stdout is retained on matching
-// branches because diagnosticError carries it as a side channel while
-// preserving the public CLIError shape.
+// backendCLIErrorBranches returns every CLIError branch in an error tree
+// that belongs to backend. Stdout is keyed by the CLIError that owns it:
+// joined parents and siblings never lend their diagnostics to another
+// branch.
 func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
-	if err == nil || cli.IsDefinitiveNonLivenessError(err) {
+	if err == nil {
 		return nil
 	}
 	var branches []cliErrorBranch
-	var walk func(error, string)
-	walk = func(cur error, inheritedStdout string) {
+	stdoutByCLIError := make(map[*cli.CLIError]string)
+	var walk func(error)
+	walk = func(cur error) {
 		if cur == nil {
 			return
 		}
 		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
-			if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" && inheritedStdout == "" {
-				inheritedStdout = stdout
-			}
 			for _, child := range joined.Unwrap() {
-				walk(child, inheritedStdout)
+				walk(child)
 			}
 			return
 		}
-		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" && inheritedStdout == "" {
-			inheritedStdout = stdout
+		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" {
+			var owner *cli.CLIError
+			if errors.As(cur, &owner) {
+				stdoutByCLIError[owner] = stdout
+			}
 		}
 		if cliErr, ok := cur.(*cli.CLIError); ok {
 			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
 				return
 			}
 			operation := commandOperation(cliErr.Args)
+			stdout := stdoutByCLIError[cliErr]
+			cause := error(cliErr)
+			if stdout != "" {
+				cause = cli.WithStdout(cliErr, stdout)
+			}
 			branches = append(branches, cliErrorBranch{
 				ctx: cliErrorContext{
 					err:       cliErr,
 					operation: operation,
 					target:    commandTarget(cliErr.Args, operation),
 				},
-				stdout: inheritedStdout,
+				stdout: stdout,
 				stderr: cliErr.Stderr,
+				cause:  cause,
 			})
 			return
 		}
 		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
-			walk(wrapped.Unwrap(), inheritedStdout)
+			walk(wrapped.Unwrap())
 		}
 	}
-	walk(err, "")
+	walk(err)
 	return branches
+}
+
+func matchingCLIErrorBranch(err error, backend, operation string, targets ...string) (cliErrorBranch, bool) {
+	branches := backendCLIErrorBranches(err, backend)
+	hasTarget := false
+	for _, target := range targets {
+		if target != "" {
+			hasTarget = true
+			break
+		}
+	}
+	if !hasTarget {
+		for _, branch := range branches {
+			if branch.ctx.operation == operation {
+				return branch, true
+			}
+		}
+		return cliErrorBranch{}, false
+	}
+	for _, target := range targets {
+		if target == "" {
+			continue
+		}
+		for _, branch := range branches {
+			if branch.ctx.operation == operation && branchTargetMatchesAny(branch, []string{target}) {
+				return branch, true
+			}
+		}
+	}
+	return cliErrorBranch{}, false
+}
+
+func branchTargetMatchesAny(branch cliErrorBranch, targets []string) bool {
+	if strings.TrimSpace(branch.ctx.target) == "" {
+		return true
+	}
+	for _, target := range targets {
+		if target != "" && sameCLITarget(branch.ctx.target, target) {
+			return true
+		}
+	}
+	return false
 }
 
 func cliBinaryMatches(got, want string) bool {
@@ -123,7 +172,7 @@ func commandTarget(args []string, operation string) string {
 				return value
 			}
 		}
-	case "image inspect":
+	case "image inspect", "image pull":
 		return firstPositional(args, 2, "--platform")
 	case "inspect":
 		return firstPositional(args, 1)
@@ -131,10 +180,18 @@ func commandTarget(args []string, operation string) string {
 		return firstPositional(args, 1, "--env-file", "--user", "--workdir")
 	case "logs":
 		return firstPositional(args, 1, "--tail", "--since", "-n")
+	case "pull":
+		return firstPositional(args, 1, "--platform")
 	case "stop":
 		return firstPositional(args, 1, "--time")
 	case "delete", "rm":
 		return firstPositional(args, 1)
+	case "cp":
+		for _, arg := range args[1:] {
+			if target, path, ok := strings.Cut(arg, ":"); ok && target != "" && strings.HasPrefix(path, "/") {
+				return target
+			}
+		}
 	}
 	return ""
 }
@@ -331,6 +388,12 @@ func hasNonCLIAmbiguousObjectText(err error) bool {
 		}
 		return false
 	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		child := wrapped.Unwrap()
+		if _, joined := child.(interface{ Unwrap() []error }); joined {
+			return hasNonCLIAmbiguousObjectText(child)
+		}
+	}
 	if _, ok := err.(*cli.CLIError); ok {
 		return false
 	}
@@ -348,7 +411,7 @@ func hasNonCLIAmbiguousObjectText(err error) bool {
 }
 
 func isAmbiguousApplicationError(eng engine, err error) bool {
-	if eng == nil || err == nil || cli.IsDefinitiveNonLivenessError(err) {
+	if eng == nil || err == nil {
 		return false
 	}
 	branches := backendCLIErrorBranches(err, eng.binary())

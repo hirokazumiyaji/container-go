@@ -62,10 +62,16 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if c.ID != id {
 			continue
 		}
+		image := c.Configuration.Image.Reference
+		imageDigest := c.Configuration.Image.Descriptor.Digest
+		if image != "" && validImageDigest(imageDigest) {
+			image = stripImageDigest(image) + "@" + imageDigest
+		}
 		info := &engineInfo{
-			state:  State(c.Status.State),
-			labels: c.Configuration.Labels,
-			image:  c.Configuration.Image.Reference,
+			state:       State(c.Status.State),
+			labels:      c.Configuration.Labels,
+			image:       image,
+			imageDigest: imageDigest,
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -151,6 +157,36 @@ func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
 	return ids, nil
 }
 
+type appleImageDescriptor struct {
+	Digest string `json:"digest"`
+}
+
+type appleImageVariant struct {
+	Digest   string `json:"digest"`
+	Platform struct {
+		OS           string `json:"os"`
+		Architecture string `json:"architecture"`
+		Variant      string `json:"variant"`
+	} `json:"platform"`
+}
+
+type appleImageInspectRecord struct {
+	ID            string               `json:"id"`
+	Reference     string               `json:"reference"`
+	Name          string               `json:"name"`
+	Descriptor    appleImageDescriptor `json:"descriptor"`
+	Configuration struct {
+		Name       string               `json:"name"`
+		Reference  string               `json:"reference"`
+		Descriptor appleImageDescriptor `json:"descriptor"`
+		Image      struct {
+			Reference  string               `json:"reference"`
+			Descriptor appleImageDescriptor `json:"descriptor"`
+		} `json:"image"`
+	} `json:"configuration"`
+	Variants []appleImageVariant `json:"variants"`
+}
+
 func (appleEngine) imageInspectArgs(image, _ string) []string {
 	return []string{"image", "inspect", image}
 }
@@ -167,45 +203,99 @@ func (appleEngine) imageMissing(err error) bool {
 	return appleStderrContains(err, appleStderrNotFound)
 }
 
+func (appleEngine) imageIdentityNeedsLocalCheck() bool { return true }
+
 func (appleEngine) parseImageExists(data []byte, platform string) bool {
-	var raw []json.RawMessage
-	if err := json.Unmarshal(data, &raw); err != nil || len(raw) == 0 {
-		return false
+	_, exists := (appleEngine{}).parseImageIdentity(data, "", platform)
+	return exists
+}
+
+// parseImageIdentity reads the descriptor exposed by current Apple
+// Container releases and also accepts the older flat ImageDescription
+// shape. A platform-specific variant digest is preferred when the
+// caller selected a platform; otherwise the index digest pins the
+// complete image.
+func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imageIdentity, bool) {
+	var records []appleImageInspectRecord
+	if err := json.Unmarshal(data, &records); err != nil || len(records) == 0 {
+		return imageIdentity{}, false
 	}
-	if platform == "" {
-		return true
-	}
-	var images []struct {
-		Variants []struct {
-			Platform struct {
-				Os           string `json:"os"`
-				Architecture string `json:"architecture"`
-				Variant      string `json:"variant"`
-			} `json:"platform"`
-		} `json:"variants"`
-	}
-	if err := json.Unmarshal(data, &images); err != nil {
-		return true
-	}
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
-	for _, img := range images {
-		if len(img.Variants) == 0 {
-			return true
+	for _, record := range records {
+		if platform != "" && len(record.Variants) > 0 {
+			wantOS, wantArch, wantVariant := splitPlatform(platform)
+			matched := false
+			variantDigest := ""
+			for _, variant := range record.Variants {
+				if wantOS != "" && variant.Platform.OS != wantOS {
+					continue
+				}
+				if wantArch != "" && variant.Platform.Architecture != wantArch {
+					continue
+				}
+				if wantVariant != "" && variant.Platform.Variant != wantVariant {
+					continue
+				}
+				matched = true
+				variantDigest = variant.Digest
+				break
+			}
+			if !matched {
+				return imageIdentity{}, false
+			}
+			digest := variantDigest
+			if digest == "" {
+				digest = record.Configuration.Descriptor.Digest
+			}
+			return finishAppleImageIdentity(image, record, digest), true
 		}
-		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != wantOS {
-				continue
-			}
-			if wantArch != "" && v.Platform.Architecture != wantArch {
-				continue
-			}
-			if wantVariant != "" && v.Platform.Variant != wantVariant {
-				continue
-			}
-			return true
+
+		digest := record.Configuration.Descriptor.Digest
+		if digest == "" {
+			digest = record.Configuration.Image.Descriptor.Digest
 		}
+		if digest == "" {
+			digest = record.Descriptor.Digest
+		}
+		return finishAppleImageIdentity(image, record, digest), true
 	}
-	return false
+	return imageIdentity{}, false
+}
+
+func finishAppleImageIdentity(requested string, record appleImageInspectRecord, digest string) imageIdentity {
+	reference := record.Configuration.Name
+	if reference == "" {
+		reference = record.Configuration.Reference
+	}
+	if reference == "" {
+		reference = record.Configuration.Image.Reference
+	}
+	if reference == "" {
+		reference = record.Reference
+	}
+	if reference == "" {
+		reference = record.Name
+	}
+	if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
+		requestedDigest := imageDigest(requested)
+		if requestedDigest == "" || imageDigest(reference) != "" || imageRepository(requested) != imageRepository(reference) {
+			return imageIdentity{mismatch: true}
+		}
+		// A caller-supplied digest with an older response that only
+		// repeats the name is still safe: the successful inspect proves
+		// the requested reference exists, and pinImage will retain the
+		// caller's digest.
+	}
+	if validImageDigest(digest) {
+		return imageReferenceWithDigest(requested, reference, digest, "")
+	}
+	if isImageID(record.ID) {
+		return imageReferenceWithDigest(requested, reference, record.ID, record.ID)
+	}
+	if len(record.ID) == 64 && isHex(record.ID) {
+		digest := "sha256:" + record.ID
+		return imageReferenceWithDigest(requested, reference, digest, digest)
+	}
+	return imageIdentity{}
 }
 
 func splitPlatform(p string) (os, arch, variant string) {

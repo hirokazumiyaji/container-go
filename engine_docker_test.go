@@ -182,6 +182,8 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
 		return d.inspectJSON, nil, nil
+	case "image", "pull":
+		return d.fakeRunner.Run(ctx, args...)
 	default:
 		return nil, nil, nil
 	}

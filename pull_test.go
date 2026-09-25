@@ -366,13 +366,20 @@ func TestEnsureImagePullAlwaysDoesNotJoinMissingFlight(t *testing.T) {
 
 	inspectEntered := make(chan struct{})
 	releaseInspect := make(chan struct{})
-	var inspectOnce sync.Once
+	var inspectMu sync.Mutex
+	inspectCalls := 0
 	r := &hookRunner{
 		fakeRunner: base,
 		before: func(args []string) {
 			if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
-				inspectOnce.Do(func() { close(inspectEntered) })
-				<-releaseInspect
+				inspectMu.Lock()
+				inspectCalls++
+				first := inspectCalls == 1
+				inspectMu.Unlock()
+				if first {
+					close(inspectEntered)
+					<-releaseInspect
+				}
 			}
 		},
 	}

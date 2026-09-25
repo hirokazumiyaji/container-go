@@ -68,7 +68,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
-			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+			return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}]`), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
@@ -171,8 +171,8 @@ func TestRunInvokesRunDetachedWithImage(t *testing.T) {
 	if !slices.Contains(runCall, "--detach") {
 		t.Errorf("run call missing --detach: %v", runCall)
 	}
-	if runCall[len(runCall)-1] != "redis:7-alpine" {
-		t.Errorf("image not last arg: %v", runCall)
+	if !strings.HasPrefix(runCall[len(runCall)-1], "redis:7-alpine@") {
+		t.Errorf("run image is not digest-pinned: %v", runCall)
 	}
 	if ctr.ID() != "myctr" {
 		t.Errorf("ID = %q", ctr.ID())
@@ -184,9 +184,15 @@ func TestRunAppendsCmdAfterImage(t *testing.T) {
 	runTestContainer(t, f, WithCmd("redis-server", "--appendonly", "yes"))
 
 	runCall := f.callWith("run")
-	i := slices.Index(runCall, "redis:7-alpine")
+	i := -1
+	for j, arg := range runCall {
+		if strings.HasPrefix(arg, "redis:7-alpine@") {
+			i = j
+			break
+		}
+	}
 	if i < 0 || !slices.Equal(runCall[i+1:], []string{"redis-server", "--appendonly", "yes"}) {
-		t.Errorf("cmd not after image: %v", runCall)
+		t.Errorf("cmd not after pinned image: %v", runCall)
 	}
 }
 

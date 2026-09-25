@@ -161,10 +161,19 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
+// dockerImageInspect mirrors the fields of `docker image inspect`
+// output needed to pin the image that will be run. RepoDigests is the
+// registry digest; Id is the immutable local image ID fallback.
+type dockerImageInspect struct {
+	ID          string   `json:"Id"`
+	RepoDigests []string `json:"RepoDigests"`
+}
+
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
 	ID    string `json:"Id"`
+	Image string `json:"Image"`
 	Name  string `json:"Name"`
 	State struct {
 		Status string `json:"Status"`
@@ -196,11 +205,13 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[0]
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		image:       c.Config.Image,
+		imageID:     c.Image,
+		imageDigest: imageDigest(c.Config.Image),
+		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {
@@ -331,12 +342,59 @@ func (dockerEngine) imageMissing(err error) bool {
 	return dockerStderrContains(err, dockerStderrNoSuchImage)
 }
 
-func (dockerEngine) parseImageExists(data []byte, _ string) bool {
-	var images []json.RawMessage
-	if err := json.Unmarshal(data, &images); err != nil {
-		return false
+func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
+
+func (dockerEngine) parseImageExists(data []byte, platform string) bool {
+	_, exists := (dockerEngine{}).parseImageIdentity(data, "", platform)
+	return exists
+}
+
+// parseImageIdentity prefers a registry digest because it remains tied
+// to the repository the caller requested, and falls back to Docker's
+// local image ID for locally built or otherwise digest-less images.
+// Both forms prevent a later tag reassignment from changing run's
+// target.
+func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
+	var images []dockerImageInspect
+	if err := json.Unmarshal(data, &images); err != nil || len(images) == 0 {
+		return imageIdentity{}, false
 	}
-	return len(images) > 0
+	for _, img := range images {
+		for _, repoDigest := range img.RepoDigests {
+			digest := imageDigest(repoDigest)
+			if !validImageDigest(digest) || stripImageDigest(repoDigest) == "" {
+				continue
+			}
+			if image != "" && !isImageID(image) {
+				requestedDigest := imageDigest(image)
+				if requestedDigest != "" {
+					if requestedDigest != digest {
+						continue
+					}
+				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
+					// Docker's RepoDigests commonly omit the tag. In
+					// that form the repository still has to match,
+					// but an explicitly pinned digest must match too.
+					continue
+				}
+			}
+			return imageReferenceWithDigest(image, repoDigest, digest, img.ID), true
+		}
+		if image != "" && !isImageID(image) && len(img.RepoDigests) > 0 {
+			return imageIdentity{mismatch: true}, true
+		}
+		if img.ID != "" {
+			if image == "" || isImageID(image) {
+				return imageReferenceWithDigest(image, "", "", img.ID), true
+			}
+			// The image was inspected by this exact reference. An ID is
+			// still a safe fallback when Docker omitted RepoDigests.
+			return imageReferenceWithDigest(image, "", "", img.ID), true
+		}
+		// A non-empty Docker inspect array proves existence even when
+		// this old/versioned response has no usable identity fields.
+	}
+	return imageIdentity{}, true
 }
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {

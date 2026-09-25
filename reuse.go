@@ -40,6 +40,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
+	containerImage := imageFromInfo(info)
+	if base.image.pinned {
+		containerImage = base.image
+	}
 	ctr := &Container{
 		id:        base.id,
 		runner:    base.runner,
@@ -50,6 +54,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		info:      info,
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
+		image:     containerImage,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -123,6 +128,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				info:      info,
 				creation:  info.labels[creationLabel],
 				uid:       info.uid,
+				image:     imageFromInfo(info),
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -148,10 +154,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	// even when the caller's context carries a tighter attach deadline.
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
-	if err := cfg.ensureImage(runCtx, image); err != nil {
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
@@ -173,6 +180,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		reused:    true,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
+		image:     resolvedImage,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))
@@ -243,6 +251,24 @@ func createRaceMissing(err error) bool {
 		return true
 	}
 	return strings.Contains(s, "container not found")
+}
+
+// imageFromInfo retains the identity reported while inspecting a
+// container, including the digest form when the backend exposes one.
+func imageFromInfo(info *engineInfo) imageIdentity {
+	if info == nil {
+		return imageIdentity{}
+	}
+	if validImageDigest(info.imageDigest) && info.image != "" {
+		return imageIdentity{reference: info.image, digest: info.imageDigest, pinned: true}
+	}
+	if isImageID(info.imageID) {
+		return imageIdentity{reference: info.imageID, id: info.imageID, pinned: true}
+	}
+	if info.image != "" {
+		return imageIdentity{reference: info.image}
+	}
+	return imageIdentity{}
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted
@@ -327,6 +353,18 @@ func imagesCompatible(requested, actual string) bool {
 	req := normalizeImageRef(stripImageDigest(requested))
 	act := normalizeImageRef(stripImageDigest(actual))
 	return req == act
+}
+
+// imageRepository returns the canonical repository portion of an image
+// reference, discarding any tag or digest. It is used for a digest
+// response that has no tag but still must not cross a registry or
+// namespace boundary.
+func imageRepository(ref string) string {
+	ref = stripImageDigest(ref)
+	if i := strings.LastIndex(ref, ":"); i >= 0 && !strings.Contains(ref[i+1:], "/") {
+		ref = ref[:i]
+	}
+	return strings.TrimSuffix(normalizeImageRef(ref), ":latest")
 }
 
 // normalizeImageRef expands Docker Hub short names to a canonical

@@ -231,6 +231,26 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 **ログに秘密を書かない**。
 デバッグログ(`WithLogger` で注入)に CLI の argv を出す場合、env-file の中身は出力しない。
 
+**create 前の image identity を固定する**。
+`PullMissing` と `PullAlways` は local store を準備した後にも image inspect
+を行い、解決した immutable identity を backend の `run` に渡す。
+Docker は registry digest を優先し、取得できない場合は local image ID を使う。
+Apple Container は descriptor または指定 platform の variant digest を使う。
+この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
+ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
+identity を返さない backend version では既定で
+`ErrImageIdentityUnavailable` を返して fail closed する。
+`WithAllowMutableImageTag` は identity が取得できない、または local から
+直接指定できない backend の明示的な互換 fallback であり、identity の
+保証ではない。
+Apple Container の `run` に `--pull=never` はないため、`PullMissing` と
+`PullAlways` では、local store にない digest 参照を `container run` が
+exact digest として fetch することがある。
+`PullNever` は先に pinned reference の存在を確認し、暗黙の fetch を許さず
+`ErrImageIdentityNotLocal` を返す。
+local build の Apple image で local digest 参照がない場合は、明示的な
+mutable tag fallback が必要である。
+
 ## パフォーマンス設計
 
 **子プロセス数を最小にする**。
@@ -259,6 +279,12 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
+- `ErrImageIdentityUnavailable`：inspect が immutable な image identity を
+  返さず、mutable tag fallback も指定されていない
+- `ErrImageIdentityNotLocal`：`PullNever` で、暗黙の fetch なしには
+  実行できない pinned reference が解決された
+- `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。
+  mutable tag fallback は使わない
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 

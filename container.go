@@ -96,6 +96,10 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// image is the image identity resolved immediately before create.
+	// reference is what was passed to run; it is immutable-pinned
+	// unless the caller explicitly allowed the mutable-tag fallback.
+	image imageIdentity
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -154,11 +158,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	defer cancel()
 	// The pull policy brings the image into the local store before the
 	// run command; both share the aggregated flight so concurrent Runs
-	// of the same image pull once.
-	if err := cfg.ensureImage(runCtx, image); err != nil {
+	// of the same image pull once. The resolved reference, rather than
+	// the caller's mutable tag, is passed to run.
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupFailedCreate(ctx, cfg, err, classified)
@@ -173,6 +179,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		published: cfg.published,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
+		image:     resolvedImage,
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -453,6 +460,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	if c.image.reference == "" {
+		c.image = imageFromInfo(info)
+	}
 	if c.uid == "" {
 		c.uid = info.uid
 	}

@@ -25,6 +25,24 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
+// ErrImageIdentityUnavailable reports that the backend inspected an
+// image successfully but did not provide a digest or an immutable local
+// ID. Run fails closed by default; WithAllowMutableImageTag opts into
+// passing the original mutable tag to the backend.
+var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
+
+// ErrImageIdentityMismatch reports that image inspect returned an
+// identity that does not belong to the requested image. It is never
+// downgraded to the mutable-tag fallback.
+var ErrImageIdentityMismatch = errors.New("backend reported a different image identity")
+
+// ErrImageIdentityNotLocal reports that PullNever resolved an
+// immutable identity that the backend cannot address from its local
+// image store. Apple Container has no run-time --pull=never switch;
+// running the digest could otherwise fetch it, so PullNever fails
+// before create instead.
+var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally for PullNever")
+
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, and Logs wrap it with %w so callers can use
 // errors.Is instead of matching CLI stderr text.

@@ -1,10 +1,26 @@
 package container
 
 import (
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
+
+// imageIdentity is the backend's immutable image address when one is
+// available. reference is the exact argument that should be passed to
+// run; digest and id record the identities behind that argument. pinned
+// is false only for the explicit mutable-tag fallback.
+type imageIdentity struct {
+	reference string
+	digest    string
+	id        string
+	pinned    bool
+	// mismatch means the backend returned an identity for a different
+	// image than the one requested. It must never be downgraded to the
+	// mutable-tag fallback.
+	mismatch bool
+}
 
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
@@ -14,8 +30,13 @@ type engineInfo struct {
 	// Id). Empty when the backend addresses containers by name only
 	// (Apple Container), where a delete cannot be bound to a generation.
 	uid string
-	// image is the image reference the container was created from.
+	// image is the image reference the container was created from. It
+	// includes a digest when the backend reports one.
 	image string
+	// imageID is Docker's immutable local image ID when reported.
+	imageID string
+	// imageDigest is the OCI digest reported for the container image.
+	imageDigest string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
@@ -91,4 +112,77 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+}
+
+// imageReferenceWithDigest builds the immutable reference used for run.
+// A backend may report a canonical registry name, so the caller's name
+// is retained as the base whenever possible. A Docker image ID is used
+// as-is because it is already an immutable run target; Apple IDs are
+// converted to digest references by its parser because its CLI does
+// not accept a bare 64-byte hex reference.
+func imageReferenceWithDigest(requested, reported, digest, id string) imageIdentity {
+	digest = strings.TrimSpace(digest)
+	id = strings.TrimSpace(id)
+	if digest != "" {
+		if requestedID := strings.TrimSpace(requested); isImageID(requestedID) {
+			return imageIdentity{reference: requestedID, digest: requestedID, id: requestedID, pinned: true}
+		}
+		base := stripImageDigest(requested)
+		if base == "" {
+			base = stripImageDigest(reported)
+		}
+		if base == "" || !validImageDigest(digest) || !imageRE.MatchString(base+"@"+digest) {
+			return imageIdentity{}
+		}
+		return imageIdentity{reference: base + "@" + digest, digest: digest, id: id, pinned: true}
+	}
+	if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) {
+		return imageIdentity{reference: requested, digest: requestedDigest, id: id, pinned: true}
+	}
+	if id != "" && isImageID(id) {
+		return imageIdentity{reference: id, id: id, pinned: true}
+	}
+	return imageIdentity{}
+}
+
+// isImageID recognizes Docker's content-addressed local image ID. The
+// backend controls this value, but keeping it to a single safe token
+// prevents malformed inspect output from becoming an image argument.
+func isImageID(ref string) bool {
+	const prefix = "sha256:"
+	return strings.HasPrefix(ref, prefix) && len(ref) == len(prefix)+64 &&
+		isHex(strings.TrimPrefix(ref, prefix)) && imageRE.MatchString(ref)
+}
+
+func isHex(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func validImageDigest(digest string) bool {
+	i := strings.IndexByte(digest, ':')
+	if i <= 0 || i == len(digest)-1 {
+		return false
+	}
+	algorithm := strings.ToLower(digest[:i])
+	encoded := digest[i+1:]
+	wantLength := 0
+	switch algorithm {
+	case "sha256":
+		wantLength = 64
+	case "sha384":
+		wantLength = 96
+	case "sha512":
+		wantLength = 128
+	default:
+		return false
+	}
+	return len(encoded) == wantLength && isHex(encoded)
 }

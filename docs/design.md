@@ -363,6 +363,25 @@ the library has no credential input path.
 **No secrets in logs**. Debug logging of CLI argv never includes
 env-file contents.
 
+**Image identity is resolved before create**. After `PullMissing` or
+`PullAlways` prepares the local store, `Run` inspects the image again and
+passes the reported immutable identity to the backend. Docker prefers a
+registry digest and falls back to its local image ID; Apple Container
+uses the descriptor or selected platform-variant digest. This prevents a
+later local tag reassignment from changing that create, but it does not
+make a mutable tag's pull-to-inspect operation atomic. If a backend
+version reports no identity, the default policy fails closed with
+`ErrImageIdentityUnavailable`. `WithAllowMutableImageTag` is an explicit
+compatibility escape hatch for an identity-less or not-locally-addressable
+backend and carries no identity guarantee. Apple
+Container has no `--pull=never` run flag; with `PullMissing` or
+`PullAlways`, an absent local digest reference may cause
+`container run` to fetch that exact digest. `PullNever` checks the
+pinned reference first and returns `ErrImageIdentityNotLocal` instead
+of allowing that implicit fetch. Locally built Apple images may
+therefore require the explicit mutable-tag fallback when no local
+digest reference is available.
+
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
@@ -396,6 +415,12 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrImageIdentityUnavailable`: inspect returned no immutable image identity
+  and the caller did not opt into the mutable-tag fallback
+- `ErrImageIdentityNotLocal`: PullNever resolved a pinned reference that
+  the backend cannot address without an implicit fetch
+- `ErrImageIdentityMismatch`: inspect returned an identity for a
+  different image; the mutable-tag fallback is not used
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit

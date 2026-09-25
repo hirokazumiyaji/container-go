@@ -147,11 +147,43 @@ in one process share the pull: the first caller fetches, the rest wait
 for it. The Docker backend passes `--pull=never` so pulling happens
 only through this aggregated path.
 
+After the inspect (and after a pull, when needed), `Run` resolves the
+image identity and passes that identity to the backend instead of the
+caller's mutable tag. Docker prefers `RepoDigests` and falls back to its
+local image `Id`; Apple Container uses the image descriptor (or the
+selected platform variant) digest. The handle retains the resolved
+identity for compatibility checks. If a backend/version reports no
+usable identity, `Run` fails closed with
+`errors.Is(err, container.ErrImageIdentityUnavailable)`.
+
+For compatibility with a backend that cannot report or locally address
+an identity, opt in explicitly:
+
+```go
+container.Run(ctx, "redis:7-alpine",
+    container.WithAllowMutableImageTag())
+```
+
+That option deliberately runs the original tag and therefore retains
+the tag-replacement window; it is not an identity guarantee. Pinning
+also cannot make a mutable registry tag's pull-to-inspect resolution
+atomic when another actor can modify the shared backend. Prefer a
+caller-supplied `image@sha256:...` and treat the backend's identity
+metadata as the compatibility boundary. Apple Container has no
+`--pull=never` run flag; with `PullMissing` or `PullAlways`, a digest
+reference that is not already present may be fetched exactly by
+`container run`. `PullNever` checks that pinned reference first and
+returns `ErrImageIdentityNotLocal` rather than allowing that implicit
+fetch. A locally built Apple image may therefore need
+`WithAllowMutableImageTag`, or a backend-supported digest reference,
+to run without a registry pull.
+
 ```go
 container.Run(ctx, "redis:7-alpine",
     container.WithPullPolicy(container.PullAlways)) // pull on every Run
 // container.PullNever: fail before starting when the image is absent
-// (errors.Is(err, container.ErrImageNotFound))
+// (errors.Is(err, container.ErrImageNotFound)); a pinned identity that
+// is not locally addressable also fails with ErrImageIdentityNotLocal
 
 container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 ```
@@ -227,6 +259,13 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
+- `Run` passes the identity returned by image inspect (or a Docker image
+  ID) to the backend, so a later local tag reassignment does not change
+  that create. This is a backend/API guarantee, not a claim that every
+  tag-to-registry operation is atomic: a mutable tag can still be
+  replaced before the post-pull inspect, and an identity-less backend
+  requires the explicit `WithAllowMutableImageTag` compatibility
+  fallback.
 
 ## Differences from testcontainers-go
 

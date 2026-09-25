@@ -23,7 +23,15 @@ type Configuration struct {
 }
 
 type Image struct {
-	Reference string `json:"reference"`
+	Reference  string     `json:"reference"`
+	Descriptor Descriptor `json:"descriptor"`
+}
+
+// Descriptor is the OCI descriptor reported alongside an image
+// reference. Older CLI versions may omit it, so callers must treat a
+// zero digest as identity-unavailable rather than infer one.
+type Descriptor struct {
+	Digest string `json:"digest"`
 }
 
 type PublishedPort struct {

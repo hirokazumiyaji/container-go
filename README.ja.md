@@ -127,6 +127,45 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
+## イメージの解決と固定
+
+`Run` は `PullMissing` と `PullAlways` の両方で、image inspect の後に
+解決した image identity を backend の `run` に渡します。
+Docker は `RepoDigests` を優先し、取得できない場合はローカルの image
+`Id` を使います。
+Apple Container は image descriptor、または指定した platform の variant
+digest を使います。
+inspect 後にローカルの tag を別 image へ付け替えても、create の対象は
+resolution 時の identity に固定されます。
+identity を取得または local から直接指定できない backend では、既定で
+`errors.Is(err, container.ErrImageIdentityUnavailable)` として失敗します。
+`WithAllowMutableImageTag()` を指定した場合だけ、元の tag 実行を明示的に
+許可します。
+この fallback は tag の置き換えを防ぐ保証ではありません。
+pull 完了から inspect の間に発生する mutable tag の変更や、共有 daemon
+に対する別 process の変更を、CLI API だけで原子的に排除できるとは
+仮定しません。
+再現性が重要な場合は `image@sha256:...` を呼び出し側から渡してください。
+Apple Container の `run` には `--pull=never` がないため、`PullMissing` と
+`PullAlways` では、local image store にない digest 参照を `container run`
+が exact digest として fetch することがあります。
+`PullNever` は先に pinned reference の存在を確認し、暗黙の fetch を
+許さず `ErrImageIdentityNotLocal` を返します。
+local build の Apple image を registry pull なしで実行するには
+`WithAllowMutableImageTag` または backend が対応する digest 参照を
+使用します。
+
+```go
+container.Run(ctx, "redis:7-alpine",
+    container.WithPullPolicy(container.PullAlways)) // 毎回 pull する
+// container.PullNever: image がなければ開始前に失敗する
+// (errors.Is(err, container.ErrImageNotFound))。pinned identity を
+// local image store から直接指定できない場合も ErrImageIdentityNotLocal で
+// 失敗する
+
+container.Pull(ctx, "redis:7-alpine") // 明示的な fetch。Run と同じ flight を使う
+```
+
 ## クリーンアップの契約
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。
@@ -191,6 +230,12 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   プロセス一覧(`ps`)に現れません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry
   login`(macOS Keychain 保存)を使ってください。
+- `Run` は image inspect が返した identity、または Docker の image ID を
+  backend に渡すため、inspect 後の local tag 変更で create 対象が変わり
+  ません。これは backend API の範囲での保証です。mutable tag の pull から
+  inspect までの操作を原子化するものではありません。
+  identity を取得できない backend では
+  `WithAllowMutableImageTag` による明示的な fallback が必要です。
 
 ## testcontainers-go との違い
 

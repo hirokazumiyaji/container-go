@@ -18,7 +18,10 @@ const (
 	// PullAlways fetches the image on every Run.
 	PullAlways
 	// PullNever never fetches; Run fails before starting when the
-	// image is absent.
+	// image is absent. The Docker backend honors this strictly. Apple
+	// Container has no run-time switch that can prevent its implicit image
+	// resolution, so Run rejects this policy with ErrPullNeverUnsupported;
+	// use PullMissing or PullAlways as the documented Apple fallback.
 	PullNever
 )
 

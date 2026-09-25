@@ -27,12 +27,14 @@ Go のテストコードから使い捨てのコンテナを起動し、接続�
 - 各コンテナは軽量 VM として起動し、vmnet ブリッジ(既定は `default`、`192.168.64.0/24`)上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開(`--publish`)は必須ではない。
 - すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返す(追加フィールドは `internal/inspect` が無視する)。
 - CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗する。起動状態は `container system status` で確認できる。
-- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない。
+- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない(先頭文字の後に少なくとも 1 文字必要)。
+- `run`/`create` は Linux image のみを実行する。resource / forwarding の制約として memory は 200 MiB 以上、publish port は 2〜65535、publish descriptor は最大 64 個。network name は英小文字の 1〜63 文字で、 英数字の途中にだけ dot/hyphen/underscore を使える。
 - Docker にある次の機能が存在しない：ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチ。これらに相当する挙動はクライアント側で実装する必要がある。
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。
 - `--rm` で削除しても匿名ボリュームは残る。
 - エラー分類は `engine_apple.go` が持つ CLI stderr 部分文字列に依存する(名前衝突、image/container missing)。ライブ CLI に対する回帰は `cli_compat_integration_test.go` で確認する。
+- Apple の `run`/`create` には image 解決を止める `--pull=never` 相当がないため、厳密な `PullNever` は保証できない。backend は CLI 呼び出し前に拒否し、`PullMissing`/`PullAlways` を明示的な fallback とする。厳密な no-fetch は Docker だけが保証する。
 
 ## 実現方式の選定
 
@@ -214,7 +216,7 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
 ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証してからパイプへ書く。
+スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` で検証してからパイプへ書く。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。
@@ -223,7 +225,7 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 
 **入力を検証する**。
 コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、環境変数キーは `=` と NUL を含まないこと、コピー対象のパスは絶対パスかつ有効な UTF-8 であることを、CLI へ渡す前に検証する。
-CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
+CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。`appleEngine.checkConfig` は image 解決前に platform、name、network、memory、publish の backend 固有制約も適用する。
 
 **認証情報を扱わない**。
 レジストリ認証は `container registry login`(資格情報は macOS Keychain に保存される)に委ね、本ライブラリは資格情報の入力経路を持たない。
@@ -321,6 +323,8 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
 プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
 正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
+
+**Apple capability の違い**：`appleEngine.checkConfig` は、CLI 呼び出し前に non-Linux platform、Apple 規格外の container/network name、200 MiB 未満の memory と overflow、publish port 1、publish の overlap、64 個を超える publish descriptor を拒否する。`WithExposedPorts` は library 側の宣言で、Apple の `--publish` flag には変換しない。Apple には run 時の no-fetch スイッチがないため `PullNever` も拒否し、`ErrPullNeverUnsupported` と明示的な fallback(`PullMissing`/`PullAlways`)を契約とする。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`docker context` 経由のリモート指定は検知できない。

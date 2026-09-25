@@ -16,8 +16,9 @@ import (
 
 func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
-	// another backend; tests opting in use t.Setenv.
+	// another backend or platform; tests opting in use t.Setenv.
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv("CONTAINER_DEFAULT_PLATFORM")
 	os.Exit(m.Run())
 }
 

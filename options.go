@@ -148,9 +148,13 @@ func WithReuseGroup(group string) Option {
 	}
 }
 
-// nameRE is Apple Container's container name rule; the name doubles as
-// the container ID.
+// nameRE is the shared safe container-name form; Apple applies an
+// additional minimum-length rule in its backend validator.
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
+// networkNameRE is the common syntactic guard. Apple applies its stricter
+// lowercase/no-separator rule in appleEngine.checkConfig.
+var networkNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 // labelKeyRE is the Docker-style label key rule the CLI enforces,
 // extended with slash-separated OCI segments.
@@ -345,7 +349,7 @@ func WithWorkingDir(dir string) Option {
 // "default".
 func WithNetwork(name string) Option {
 	return func(c *config) error {
-		if !nameRE.MatchString(name) {
+		if !networkNameRE.MatchString(name) {
 			return fmt.Errorf("invalid network name %q", name)
 		}
 		c.network = name

@@ -22,8 +22,14 @@ var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
-// is absent.
+// is absent on a backend that supports that policy.
 var ErrImageNotFound = errors.New("image not found in local store")
+
+// ErrPullNeverUnsupported reports that the selected backend cannot honor
+// PullNever without allowing its run command to fetch an image implicitly.
+// Apple Container returns this before inspecting or starting a container;
+// callers can use PullMissing or PullAlways as the documented fallback.
+var ErrPullNeverUnsupported = errors.New("PullNever is unsupported by this backend")
 
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, and Logs wrap it with %w so callers can use

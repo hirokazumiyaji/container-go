@@ -127,6 +127,34 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
+## Image pull の契約
+
+```go
+container.Run(ctx, "redis:7-alpine",
+    container.WithPullPolicy(container.PullAlways)) // 毎回 pull する
+// Docker の PullNever は厳密な no-fetch。Apple では inspect/run の前に
+// container.ErrPullNeverUnsupported を返します。
+
+container.Pull(ctx, "redis:7-alpine") // 明示的な pull
+```
+
+`PullNever` の厳密な no-fetch 保証は Docker バックエンドだけです。Apple
+Container の `container run` には CLI 自身のイメージ解決を止めるスイッチが
+ないため、ライブラリはレジストリへの暗黙の fetch を許さず、CLI 呼び出し前に
+拒否します。Apple では `PullMissing`(既定)または `PullAlways` を fallback と
+して使います。ただし `PullMissing` は image がなければ pull するため、
+no-network 保証ではありません。
+
+### Apple の capability validation
+
+Apple backend は image の解決や container create の前に静的 capability を検証します。
+Apple は Linux image のみを実行するため、`WithPlatform` や platform 未指定時の `CONTAINER_DEFAULT_PLATFORM` の non-Linux 指定を拒否します。
+`container name` は 2〜63 文字の Apple 規則、network name は小文字の 1〜63 文字です。
+公開 API の `WithNetwork` は MAC/MTU の comma 付き property を意図的に受け付けません。
+memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G`/`T`/`P` suffix)表記を使い、unit 誤りや overflow を拒否します。
+publish port は 2〜65535、publish descriptor は最大 64 個です。
+`WithExposedPorts` は library 側の宣言であり、Apple の `--publish` flag には変換されません。
+
 ## クリーンアップの契約
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。

@@ -150,11 +150,33 @@ only through this aggregated path.
 ```go
 container.Run(ctx, "redis:7-alpine",
     container.WithPullPolicy(container.PullAlways)) // pull on every Run
-// container.PullNever: fail before starting when the image is absent
-// (errors.Is(err, container.ErrImageNotFound))
+// container.PullNever: strict Docker-only no-fetch policy; Apple returns
+// container.ErrPullNeverUnsupported before inspecting or starting.
+// On Docker, a missing image returns container.ErrImageNotFound.
 
 container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 ```
+
+`PullNever` is a strict no-fetch contract only on the Docker backend. Apple
+Container's `container run` has no switch that prevents its own image
+resolution, so this library rejects the policy before any CLI call rather than
+silently allowing a registry fetch. Use `PullMissing` (the default) or
+`PullAlways` as the documented Apple fallback; `PullMissing` may still pull an
+absent image and is not a no-network guarantee.
+
+### Apple capability validation
+
+The Apple backend checks the CLI's static limits before it resolves an image or
+creates a container. Apple runs Linux images only; `WithPlatform` (and, when
+no platform option is supplied, a non-Linux `CONTAINER_DEFAULT_PLATFORM`) is
+rejected. Apple container names must be 2–63 characters and match its name
+rule. Network names are lowercase 1–63-character names (the public
+`WithNetwork` option intentionally does not accept comma-separated MAC/MTU
+properties). Memory is at least 200 MiB and uses the same integer with an
+optional `K`/`M`/`G`/`T`/`P` suffix as `WithMemory`; invalid units and
+overflow are rejected. Published ports must be 2–65535, and Apple
+accepts at most 64 published-port descriptors. `WithExposedPorts` remains a
+library-side declaration and is not turned into an Apple `--publish` flag.
 
 ## Cleanup contract
 

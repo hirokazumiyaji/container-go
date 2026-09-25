@@ -43,7 +43,13 @@ The design decisions below rest on these properties of Apple Container
   fail while the service is down; `container system status` reports
   its state.
 - The container name is the container ID. Names must match
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters.
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters;
+  the leading character plus at least one following character is required.
+- The run/create path runs Linux images only. Its resource and forwarding
+  checks require at least 200 MiB of memory, published ports 2–65535, and no
+  more than 64 publish descriptors. Network names are lowercase, 1–63
+  characters, and may use dots, hyphens, or underscores only between
+  alphanumerics.
 - Several Docker features do not exist: healthchecks, a `wait`
   command, an event stream, label filters on `ls`, and re-attaching to
   a running container. Their behavior must be reproduced client-side.
@@ -56,6 +62,11 @@ The design decisions below rest on these properties of Apple Container
   `engine_apple.go` (name conflict, image/container missing). Those
   matchers are regression-tested against a live CLI in
   `cli_compat_integration_test.go`.
+- Apple Container's `run` and `create` commands resolve the image as part of
+  their normal path and expose no `--pull=never` equivalent. A strict
+  `PullNever` guarantee is therefore unavailable on Apple; the backend
+  rejects it before any CLI call and documents `PullMissing`/`PullAlways` as
+  fallbacks. Docker remains the strict no-fetch backend.
 
 ## Choosing the implementation strategy
 
@@ -339,7 +350,7 @@ exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
 expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
+Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` before
 writing it to the pipe. The two layers together leave no command
 injection through IDs.
 
@@ -354,7 +365,11 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 environment keys (no `=`, no NUL), and copy paths (absolute, valid
 UTF-8) are all validated before reaching the CLI. The CLI validates
 too, but validating first gives clearer errors and independence from
-future CLI changes.
+future CLI changes. `appleEngine.checkConfig` applies backend-specific
+platform, name, network, memory, and publish limits before image
+resolution; `WithExposedPorts` remains a library-side declaration and is not
+converted into an Apple `--publish` flag. Docker keeps its own backend-specific
+checks.
 
 **Handle no credentials**. Registry auth is delegated to
 `container registry login` (credentials live in the macOS Keychain);
@@ -475,6 +490,13 @@ runner), wait strategies, cleanup, and validation are shared. The
 normalized record holds four things: state (mapped onto running /
 stopped / stopping / unknown), labels, the container IP, and host-side
 port bindings (container port → host address and port).
+
+**Apple capability differences**: `appleEngine.checkConfig` rejects
+non-Linux platforms, Apple-invalid container/network names, memory below
+200 MiB (including overflow), published port 1, overlapping publishes, and more than
+64 publish descriptors before invoking the CLI. `PullNever` is also rejected
+with `ErrPullNeverUnsupported`, because Apple has no run-time no-fetch flag;
+`PullMissing` and `PullAlways` are the explicit documented fallbacks.
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults

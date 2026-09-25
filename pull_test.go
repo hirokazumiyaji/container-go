@@ -466,21 +466,21 @@ func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
 }
 
 func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
-	f := newTestRunner()
-	// fakeRunner answers list calls with empty output by default; drive
-	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	// The Docker list path is ID-only; each listed ID is inspected twice
+	// before the immutable target is deleted.
+	uidA := strings.Repeat("a", 64)
+	uidB := strings.Repeat("b", 64)
+	r := &reuseGroupRunner{ids: []string{uidA, uidB}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
 	}
-	if len(removed) != 2 {
-		t.Errorf("removed = %v, want 2 ids", removed)
+	if !slices.Equal(removed, []string{uidA, uidB}) {
+		t.Errorf("removed = %v, want immutable IDs %v", removed, r.ids)
 	}
 	if r.listCalls != 1 || r.deleteCalls != 2 {
 		t.Errorf("list=%d delete=%d, want 1/2", r.listCalls, r.deleteCalls)
 	}
-	_ = f
 }
 
 type reuseGroupRunner struct {
@@ -493,11 +493,11 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	switch args[0] {
 	case "ps":
 		r.listCalls++
-		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte("a\nb\n"), nil, nil
-	case "ls":
-		r.listCalls++
-		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil
+		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
+	case "inspect":
+		uid := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/group","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{"%s":"true","%s":"true","%s":"aaaaaaaaaaaaaaaa","%s":"integration"}},"NetworkSettings":{}}]`,
+			uid, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
 	case "rm", "delete":
 		r.deleteCalls++
 		return nil, nil, nil

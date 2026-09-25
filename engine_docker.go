@@ -436,9 +436,9 @@ func (dockerEngine) platformCompatible(selector, actual string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 

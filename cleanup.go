@@ -87,6 +87,9 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	if err != nil {
 		return nil, err
 	}
+	if reuseGroup != "" && eng.name() == "docker" {
+		return pruneDockerReuseGroupListed(ctx, r, eng, ids, errKind, reuseGroup)
+	}
 
 	var listed map[string]pruneCandidate
 	if eng.name() == "apple" {
@@ -126,6 +129,121 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		removed = append(removed, id)
 	}
 	return removed, errors.Join(errs...)
+}
+
+// dockerPruneCandidate is the list-time snapshot for one immutable Docker
+// target. Docker list output is deliberately ID-only; labels and lifecycle
+// state are captured by an inspect addressed by that ID, then compared with
+// a second inspect before the ID is deleted.
+type dockerPruneCandidate struct {
+	listedID   string
+	uid        string
+	labels     map[string]string
+	creation   string
+	state      State
+	managed    bool
+	reuse      bool
+	reuseGroup string
+}
+
+func pruneDockerReuseGroupListed(ctx context.Context, r cli.Runner, eng engine, listedIDs []string, errKind, reuseGroup string) ([]string, error) {
+	var removed []string
+	var errs []error
+	for _, listedID := range listedIDs {
+		// A name returned by an older/fake list command is not a safe
+		// list-time identity. Docker IDs are never reused, so refusing a
+		// non-ID here closes the name-replacement window rather than
+		// guessing which generation the list entry selected.
+		if !dockerIDRE.MatchString(listedID) {
+			errs = append(errs, fmt.Errorf("%s %s: list result is not a full immutable Docker ID", errKind, listedID))
+			continue
+		}
+
+		candidate, err := inspectDockerPruneCandidate(ctx, r, eng, listedID)
+		if isNotFound(err) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s %s: inspect list candidate: %w", errKind, listedID, err))
+			continue
+		}
+		if !dockerPruneCandidateEligible(candidate, reuseGroup) {
+			continue
+		}
+
+		fresh, err := inspectDockerPruneCandidate(ctx, r, eng, candidate.uid)
+		if isNotFound(err) {
+			continue
+		}
+		if err != nil {
+			errs = append(errs, fmt.Errorf("%s %s: inspect fresh candidate: %w", errKind, listedID, err))
+			continue
+		}
+		if !dockerPruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
+			continue
+		}
+		target := fresh.uid
+		if !validImmutableID(eng, target) {
+			errs = append(errs, fmt.Errorf("%s %s: fresh inspect returned no valid immutable ID", errKind, listedID))
+			continue
+		}
+		dCtx, dCancel := withMaxTimeout(ctx, queryTimeout)
+		_, _, err = r.Run(dCtx, eng.deleteArgs(target)...)
+		dCancel()
+		if err != nil && !isNotFound(err) {
+			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, listedID, err))
+			continue
+		}
+		removed = append(removed, target)
+	}
+	return removed, errors.Join(errs...)
+}
+
+func inspectDockerPruneCandidate(ctx context.Context, r cli.Runner, eng engine, target string) (dockerPruneCandidate, error) {
+	qCtx, cancel := withMaxTimeout(ctx, queryTimeout)
+	defer cancel()
+	ctr := &Container{id: target, runner: r, eng: eng, nameInspect: true}
+	info, err := ctr.inspectFreshLocked(qCtx)
+	if err != nil {
+		return dockerPruneCandidate{}, err
+	}
+	if info == nil {
+		return dockerPruneCandidate{}, fmt.Errorf("inspect returned no container identity")
+	}
+	return dockerPruneCandidate{
+		listedID:   target,
+		uid:        info.uid,
+		labels:     info.labels,
+		creation:   info.labels[creationLabel],
+		state:      info.state,
+		managed:    info.labels[managedLabel] == "true",
+		reuse:      info.labels[reuseLabel] == "true",
+		reuseGroup: info.labels[reuseGroupLabel],
+	}, nil
+}
+
+func dockerPruneCandidateEligible(candidate dockerPruneCandidate, reuseGroup string) bool {
+	return dockerIDRE.MatchString(candidate.listedID) &&
+		dockerIDRE.MatchString(candidate.uid) &&
+		candidate.managed && candidate.reuse &&
+		validCreationID(candidate.creation) &&
+		(candidate.state == StateRunning || candidate.state == StateStopped) &&
+		candidate.reuseGroup == reuseGroup
+}
+
+func dockerPruneCandidateStillCurrent(listed, fresh dockerPruneCandidate, reuseGroup string) bool {
+	if !dockerPruneCandidateEligible(fresh, reuseGroup) || listed.uid != fresh.uid {
+		return false
+	}
+	if listed.state != fresh.state || listed.creation != fresh.creation {
+		return false
+	}
+	for _, key := range []string{managedLabel, reuseLabel, reuseGroupLabel, sessionLabel} {
+		if listed.labels[key] != fresh.labels[key] {
+			return false
+		}
+	}
+	return true
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {

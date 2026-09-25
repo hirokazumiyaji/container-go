@@ -35,7 +35,7 @@ func waitReuseReady(ctx context.Context, cfg *config, ctr *Container) (*engineIn
 		if err != nil {
 			return nil, err
 		}
-		if info.state == StateRunning && reusePortsReady(info, cfg) {
+		if info.state == StateRunning && reuseEndpointMetadataReady(info, cfg) {
 			return info, nil
 		}
 		if err := waitReusePoll(readyCtx); err != nil {
@@ -84,9 +84,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 	// The ensure path already waited for running state. Only perform an
 	// additional poll when the list-time snapshot does not yet contain all
-	// requested bindings; this preserves the baseline inspect contract for
-	// ordinary ready containers while closing the post-start binding race.
-	if !reusePortsReady(info, cfg) {
+	// requested endpoint metadata; this preserves the baseline inspect
+	// contract for ordinary ready containers while closing post-start
+	// address/binding races.
+	if !reuseEndpointMetadataReady(info, cfg) {
 		info, err = waitReuseReady(ctx, cfg, ctr)
 		if err != nil {
 			return nil, err
@@ -122,20 +123,45 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
 	}
 	defer unlock()
-	fresh, err := ctr.inspectFreshLocked(finalCtx)
-	if err != nil {
-		// A Docker handle with a resolved immutable ID that disappears
-		// from its final inspect is necessarily no longer the generation
-		// observed before readiness. Report that replacement explicitly;
-		// never fall back to inspecting the logical name.
-		if ctr.uid != "" && isNotFound(err) {
-			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+	var fresh *engineInfo
+	for {
+		fresh, err = ctr.inspectFreshLocked(finalCtx)
+		if err != nil {
+			// A Docker handle with a resolved immutable ID that disappears
+			// from its final inspect is necessarily no longer the generation
+			// observed before readiness. Report that replacement explicitly;
+			// never fall back to inspecting the logical name.
+			if ctr.uid != "" && isNotFound(err) {
+				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+			}
+			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
 		}
-		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+		if err := sameContainerIdentity(cfg.eng, info, fresh); err != nil {
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
+		if reuseEndpointMetadataReady(fresh, cfg) || fresh.state != StateRunning {
+			break
+		}
+		// The final inspect can race the backend's network publication just
+		// like the pre-readiness inspect. Keep the name lock while retrying
+		// so an incomplete IP/binding snapshot is never published as the
+		// handle's cached baseline.
+		if err := checkReuseOwned(fresh, image, cfg); err != nil {
+			return nil, err
+		}
+		if err := waitReusePoll(finalCtx); err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return nil, fmt.Errorf("reuse %s: timed out waiting for final endpoint metadata: %w", cfg.name, err)
+			}
+			return nil, err
+		}
 	}
 	if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
 		return nil, err
 	}
+	ctr.mu.Lock()
+	ctr.info = fresh
+	ctr.mu.Unlock()
 	return ctr, nil
 }
 
@@ -281,8 +307,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 
 // reusePostCreate verifies and initializes a newly-created reuse
 // generation. A successful `run` can return before Apple reaches running
-// state or publishes all requested port bindings, so wait for both before
-// establishing the baseline used by the caller's compatibility check.
+// state or publishes all requested endpoint metadata, so wait for both
+// before establishing the baseline used by the caller's compatibility
+// check.
 //
 //nolint:unused // retained for package callers using the original post-create helper
 func reusePostCreate(ctx context.Context, cfg *config, ctr *Container) error {
@@ -307,7 +334,7 @@ func reusePostCreateWithImage(ctx context.Context, cfg *config, ctr *Container, 
 				return err
 			}
 		}
-		if info.state == StateRunning && reusePortsReady(info, cfg) {
+		if info.state == StateRunning && reuseEndpointMetadataReady(info, cfg) {
 			ready = info
 			break
 		}
@@ -341,7 +368,7 @@ func reusePostCreateWithImage(ctx context.Context, cfg *config, ctr *Container, 
 				return err
 			}
 		}
-		if fresh.state != StateRunning || !reusePortsReady(fresh, cfg) {
+		if fresh.state != StateRunning || !reuseEndpointMetadataReady(fresh, cfg) {
 			return fmt.Errorf("reuse %s: post-create generation changed before initialization", cfg.name)
 		}
 		if err := sameContainerIdentity(cfg.eng, ready, fresh); err != nil {
@@ -385,23 +412,65 @@ func verifyReusePostCreateInfo(cfg *config, ctr *Container, info *engineInfo) er
 	return nil
 }
 
-func reusePortsReady(info *engineInfo, cfg *config) bool {
+// reuseEndpointMetadataReady reports whether the inspect contains all
+// endpoint data this request can actually use. Apple resolves an exposed
+// port through the container IP, so an attach that is running but has not
+// reported an address yet is not a usable reuse baseline.
+func reuseEndpointMetadataReady(info *engineInfo, cfg *config) bool {
 	if info == nil {
 		return false
 	}
-	if !cfg.eng.directIP() {
-		for _, spec := range cfg.exposed {
+	if cfg.eng.directIP() && reuseNeedsDirectIP(cfg) && info.ip == "" {
+		return false
+	}
+	return endpointMetadataReady(info, cfg.eng, cfg.exposed, cfg.published)
+}
+
+func endpointMetadataReady(info *engineInfo, eng engine, exposed []portSpec, published []publishSpec) bool {
+	if info == nil {
+		return false
+	}
+	if !eng.directIP() {
+		for _, spec := range exposed {
 			if !hasBoundPort(info.bound, spec.port, spec.proto) {
 				return false
 			}
 		}
 	}
-	for _, p := range cfg.published {
+	for _, p := range published {
 		if !hasPublishedBinding(info.bound, p) {
 			return false
 		}
 	}
 	return true
+}
+
+// reuseNeedsDirectIP reports whether at least one exposed port will be
+// resolved through a direct-IP endpoint. An explicitly published port is
+// usable through its host binding even when the backend has not assigned an
+// IP yet.
+func reuseNeedsDirectIP(cfg *config) bool {
+	for _, spec := range cfg.exposed {
+		published := false
+		for _, p := range cfg.published {
+			if p.containerPort == spec.port && p.proto == spec.proto {
+				published = true
+				break
+			}
+		}
+		if !published {
+			return true
+		}
+	}
+	return false
+}
+
+// reusePortsReady is retained for package callers that used the original
+// helper name; it now includes direct-IP address readiness.
+//
+//nolint:unused // retained for package callers using the original helper
+func reusePortsReady(info *engineInfo, cfg *config) bool {
+	return reuseEndpointMetadataReady(info, cfg)
 }
 
 // deleteStoppedReuse removes a stopped reuse container only after
@@ -577,6 +646,9 @@ func checkReuseLabels(info *engineInfo, cfg *config) error {
 func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 	if err := checkReuseOwned(info, image, cfg); err != nil {
 		return err
+	}
+	if !reuseEndpointMetadataReady(info, cfg) {
+		return fmt.Errorf("reuse %s: endpoint metadata is incomplete", cfg.name)
 	}
 	// Auto-published exposed ports only appear as host bindings on
 	// published-port backends. Explicit WithPublishedPort always needs

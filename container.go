@@ -695,21 +695,47 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
-// cachedInfo returns the first successful inspect result. Only fields
-// that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// cachedInfo returns the first complete successful inspect result. An
+// Apple inspect can briefly report a running container before its network
+// address or host bindings are published; do not pin that incomplete
+// baseline, because a later Endpoint/ContainerIP call must be able to see
+// the completed metadata.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.info != nil {
-		return c.info, nil
+		if c.infoEndpointReady(c.info) {
+			return c.info, nil
+		}
+		info, err := c.inspectFresh(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if c.infoEndpointReady(info) {
+			c.info = info
+		}
+		return info, nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
+	if c.infoEndpointReady(info) {
+		c.info = info
+	}
 	return info, nil
+}
+
+func (c *Container) infoEndpointReady(info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	// ContainerIP is a direct-IP operation even when no port was declared,
+	// so an empty Apple address is never a cacheable baseline.
+	if c.eng.directIP() && info.ip == "" {
+		return false
+	}
+	return endpointMetadataReady(info, c.eng, c.exposed, c.published)
 }
 
 // inspectFresh serializes a name-addressed Apple inspect with the same

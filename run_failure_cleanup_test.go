@@ -117,6 +117,26 @@ func TestRunFailureCleansUpOwnedContainer(t *testing.T) {
 	}
 }
 
+func TestRunFailureCleansUpDockerByImmutableID(t *testing.T) {
+	const uid = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	base := newTestRunner()
+	base.imagePresent = true
+	labels := `{"` + managedLabel + `":"true","` + sessionLabel + `":%q,"` + creationLabel + `":"__CONTAINER_CREATION__"}`
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectJSON: fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":%s}}]`, uid, fmt.Sprintf(labels, sessionID())),
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(dockerEngine{}))
+	if err == nil {
+		t.Fatal("want error for failed run")
+	}
+	if len(r.deleted) != 1 || r.deleted[0] != uid {
+		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
+	}
+}
+
 func TestRunFailurePreservesNameConflict(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true

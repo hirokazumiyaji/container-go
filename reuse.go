@@ -54,6 +54,23 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
+	// Readiness can outlive the generation inspected by the ensure path.
+	// Re-inspect immediately before returning and refuse to hand out a
+	// handle for a different, unowned, or no-longer-running object.
+	fresh, err := ctr.inspectFresh(ctx)
+	if err != nil {
+		// A Docker handle with a resolved immutable ID that disappears
+		// from its final inspect is necessarily no longer the generation
+		// observed before readiness. Report that replacement explicitly;
+		// never fall back to inspecting the logical name.
+		if ctr.uid != "" && isNotFound(err) {
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+		}
+		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+	}
+	if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -107,7 +124,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
+			if err := deleteStoppedReuseWithImage(ctx, cfg, info, image); err != nil {
 				return nil, err
 			}
 			recreated = true
@@ -192,18 +209,29 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 
 // deleteStoppedReuse removes a stopped reuse container only after
 // verifying the managed, reuse, and creation labels on the inspected
-// container. It then binds a handle to that generation so Terminate
-// re-checks it and deletes by immutable ID. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// container. The image-aware production path additionally verifies the
+// requested image. A fresh inspect must still be StateStopped; a
+// same-generation running replacement is therefore never deleted.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	return deleteStoppedReuseWithImage(ctx, cfg, info, "")
+}
+
+func deleteStoppedReuseWithImage(ctx context.Context, cfg *config, info *engineInfo, image string) error {
 	if err := checkReuseLabels(info, cfg); err != nil {
 		return err
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
-	err := ctr.Terminate(ctx)
+	ctr.uid = info.uid
+	if image != "" {
+		if err := checkReuseOwned(info, image, cfg); err != nil {
+			return err
+		}
+	}
+	_, err := ctr.terminateByNameWithImage(ctx, info, true, image)
 	if errors.Is(err, ErrGenerationReplaced) {
+		// A different generation means the name was recreated. Let the
+		// ensure loop inspect and attach to that fresh generation.
 		return nil
 	}
 	return err
@@ -221,6 +249,52 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
 	}
 	return nil
+}
+
+// verifyReuseResult applies the final ownership and identity checks after
+// readiness. The initial inspect is part of the comparison: a fresh
+// inspect alone cannot tell whether a backend returned a different object
+// with compatible labels.
+func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) error {
+	// Recheck the live ownership/configuration first so an unowned or
+	// incompatible replacement gets the same fail-closed treatment as the
+	// initial attach check.
+	if err := checkReuseCompat(fresh, image, cfg); err != nil {
+		return err
+	}
+	if err := sameContainerIdentity(cfg.eng, before, fresh); err != nil {
+		return fmt.Errorf("reuse %s: %w", cfg.name, err)
+	}
+	if before.state != StateRunning || fresh.state != StateRunning {
+		return fmt.Errorf("reuse %s: state changed from %s to %s before return", cfg.name, before.state, fresh.state)
+	}
+	if fresh.image != before.image {
+		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
+	}
+	if fresh.platform != before.platform {
+		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
+	}
+	if !sameReusePorts(before.bound, fresh.bound) {
+		return fmt.Errorf("reuse %s: published ports changed before return", cfg.name)
+	}
+	return nil
+}
+
+func sameReusePorts(before, fresh []boundPort) bool {
+	if len(before) != len(fresh) {
+		return false
+	}
+	counts := make(map[boundPort]int, len(before))
+	for _, port := range before {
+		counts[port]++
+	}
+	for _, port := range fresh {
+		if counts[port] == 0 {
+			return false
+		}
+		counts[port]--
+	}
+	return true
 }
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
@@ -257,16 +331,33 @@ func createRaceMissing(err error) bool {
 // reuse marker alone can be present on a foreign container, and a
 // generation is what makes a later name-based delete safe.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+	if info == nil {
+		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
+	}
 	if err := checkReuseLabels(info, cfg); err != nil {
 		return err
 	}
+	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, info.uid) {
+		return fmt.Errorf("reuse %s: existing container has no valid immutable ID", cfg.name)
+	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	}
+	if cfg.platform != "" {
+		if info.platform == "" {
+			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
+		}
+		if !strings.EqualFold(cfg.platform, info.platform) {
+			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
+		}
 	}
 	return nil
 }
 
 func checkReuseLabels(info *engineInfo, cfg *config) error {
+	if info == nil {
+		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
+	}
 	if info.labels[reuseLabel] != "true" {
 		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
 	}
@@ -274,7 +365,7 @@ func checkReuseLabels(info *engineInfo, cfg *config) error {
 		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
 	}
 	if !creationRE.MatchString(info.labels[creationLabel]) {
-		return fmt.Errorf("reuse %s: existing container has no valid creation generation", cfg.name)
+		return fmt.Errorf("reuse %s: existing container has no valid creation generation: %w", cfg.name, ErrGenerationReplaced)
 	}
 	return nil
 }

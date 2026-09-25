@@ -93,6 +93,7 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state: StateStopped,
+		uid:   strings.Repeat("0f", 32),
 		labels: map[string]string{
 			managedLabel:  "true",
 			reuseLabel:    "true",
@@ -166,7 +167,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":

@@ -97,8 +97,9 @@ type Container struct {
 	// check unnecessary: a replacement never shares it.
 	uid string
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	mu        sync.Mutex
+	info      *engineInfo // cached first inspect; immutable fields only
+	inspectMu sync.Mutex  // serializes inspect and protects uid after publication
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -224,7 +225,9 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // same-name container: name conflicts are skipped, and only a container
 // carrying this process's managed+session labels is removed. The
 // creation label must exist and match this Run's generation; a reuse
-// create must also carry the reuse label.
+// create must also carry the reuse label. Docker additionally requires
+// a valid ID from that same fresh inspect and never falls back to the
+// logical name.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return
@@ -256,9 +259,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if !ok || actual != cfg.creation {
 		return
 	}
-	target := cfg.name
-	if info.uid != "" {
-		target = info.uid
+	target, err := verifiedDeleteTarget(cfg.eng, info, cfg.name)
+	if err != nil {
+		return
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
@@ -310,43 +313,79 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 }
 
 // Terminate force-removes the container. Removing a container that no
-// longer exists is a success. A handle with an immutable ID deletes by
-// it, so a same-name replacement is never touched. Without one (Apple
-// Container) the delete goes by name: the creation generation must
-// match a fresh inspect, and inspect and delete run under the per-name
-// lock so no other process using this library can delete and recreate
-// the name in between; an external `container delete` plus re-create
-// inside that window is not detectable by name (see lockName). An
-// inspect failure other than not-found aborts the delete rather than
-// risk a replacement.
+// longer exists is a success. A handle with a verified immutable ID
+// deletes by that ID, so a same-name replacement is never touched. A
+// name-addressed handle must carry a valid creation generation and match
+// a fresh inspect under the per-name lock. Handles created before
+// generation tracking are deliberately not name-deleted: there is no
+// identity with which to prove that a same-name replacement is not the
+// object the caller meant.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	c.inspectMu.Lock()
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if uid != "" {
+		if !validImmutableID(c.eng, uid) {
+			return fmt.Errorf("terminate %s: invalid immutable container ID %q", c.id, uid)
+		}
+		return c.delete(ctx, uid)
 	}
-	if c.creation == "" {
-		return c.delete(ctx, c.id)
+	if !validCreationID(c.creation) {
+		return fmt.Errorf("terminate %s: refusing name delete without a valid creation generation", c.id)
 	}
+	_, err := c.terminateByName(ctx, nil, false)
+	return err
+}
+
+// terminateByName performs the locked inspect/delete critical section for
+// a name-addressed operation. expected is the generation/identity seen by
+// the caller before this fresh inspect; a nil expected value uses c's
+// creation generation. stoppedOnly prevents deletion unless the fresh
+// object is actually stopped.
+func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, stoppedOnly bool) (bool, error) {
+	return c.terminateByNameWithImage(ctx, expected, stoppedOnly, "")
+}
+
+func (c *Container) terminateByNameWithImage(ctx context.Context, expected *engineInfo, stoppedOnly bool, image string) (bool, error) {
 	unlock, err := lockName(ctx, c.id)
 	if err != nil {
-		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		return false, fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}
 	defer unlock()
-	info, err := c.inspectFresh(ctx)
+
+	fresh, err := c.inspectFresh(ctx)
 	if isNotFound(err) {
-		return nil
+		return false, nil
 	}
 	if err != nil {
-		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		return false, fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	if expected != nil {
+		if err := sameContainerIdentity(c.eng, expected, fresh); err != nil {
+			return false, err
+		}
+	} else {
+		if !validCreationID(c.creation) {
+			return false, fmt.Errorf("terminate %s: refusing name delete without a valid creation generation", c.id)
+		}
+		if fresh.labels[creationLabel] != c.creation {
+			return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		if requiresImmutableID(c.eng) && !validImmutableID(c.eng, fresh.uid) {
+			return false, fmt.Errorf("terminate %s: refusing Docker name fallback without a valid inspect ID", c.id)
+		}
 	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
+	if image != "" && !imagesCompatible(image, fresh.image) {
+		return false, fmt.Errorf("terminate %s: image %q does not match existing %q", c.id, image, fresh.image)
 	}
-	return c.delete(ctx, c.id)
+	if stoppedOnly && fresh.state != StateStopped {
+		return false, nil
+	}
+	target, err := verifiedDeleteTarget(c.eng, fresh, c.id)
+	if err != nil {
+		return false, err
+	}
+	return true, c.delete(ctx, target)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
@@ -459,20 +498,51 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	return info, nil
+}
+
+func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+
+	uid := c.uid
+	if uid != "" && !validImmutableID(c.eng, uid) {
+		return nil, fmt.Errorf("container %s has invalid immutable ID %q", c.id, uid)
+	}
+	target := c.inspectTargetLocked()
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if err != nil {
+		return nil, wrapNotFound(c.classify(ctx, err))
+	}
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return nil, err
+	}
+	if uid != "" && requiresImmutableID(c.eng) && info.uid != uid {
+		return nil, fmt.Errorf("%w: inspected Docker ID changed", ErrContainerNotFound)
+	}
 	if c.uid == "" {
 		c.uid = info.uid
 	}
 	return info, nil
 }
 
-func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+// inspectTarget prefers an immutable ID so a same-name replacement cannot
+// satisfy a Docker inspect. A non-empty malformed value is retained as the
+// target and rejected by the caller rather than falling back to the name.
+func (c *Container) inspectTarget() string {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+	return c.inspectTargetLocked()
+}
+
+func (c *Container) inspectTargetLocked() string {
+	if c.uid != "" {
+		return c.uid
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	return c.id
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

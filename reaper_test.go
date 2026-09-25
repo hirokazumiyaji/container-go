@@ -45,11 +45,13 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
+	one := strings.Repeat("1", 64)
+	two := strings.Repeat("2", 64)
 
-	if err := r.register("ctr-one", ""); err != nil {
+	if err := r.register(one, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("ctr-two", ""); err != nil {
+	if err := r.register(two, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -57,7 +59,7 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	// dies, however it dies.
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
+	waitForLogLines(t, logPath, "delete --force "+one, "delete --force "+two)
 }
 
 func TestReaperRejectsInvalidID(t *testing.T) {
@@ -78,8 +80,10 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
+	before := strings.Repeat("a", 64)
+	after := strings.Repeat("b", 64)
 
-	if err := r.register("before-crash", ""); err != nil {
+	if err := r.register(before, ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 
@@ -87,12 +91,12 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	// reaps what it knows, then the next register must respawn it.
 	r.killForTest()
 
-	if err := r.register("after-crash", ""); err != nil {
+	if err := r.register(after, ""); err != nil {
 		t.Fatalf("register after crash: %v", err)
 	}
 	r.closeStdin()
 
-	waitForLogLines(t, logPath, "delete --force before-crash", "delete --force after-crash")
+	waitForLogLines(t, logPath, "delete --force "+before, "delete --force "+after)
 }
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
@@ -119,7 +123,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
-	if err := r.register("ok", ""); err != nil {
+	if err := r.register(strings.Repeat("c", 64), ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
@@ -232,5 +236,35 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	waitForLogLines(t, logPath, "rm --force "+uid)
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
 		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
+	}
+}
+
+func TestReaperDoesNotFallbackToDockerNameWithoutInspectID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := dir + "/calls.log"
+	binPath := dir + "/docker"
+	creation := "0123456789abcdef"
+	uid := strings.Repeat("cd", 32)
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then\n" +
+		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "rm")
+	if err := r.register(uid, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect "+uid)
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "rm --force "+uid) {
+			t.Fatalf("reaper deleted without a Docker inspect ID: %q", data)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 }

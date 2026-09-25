@@ -19,8 +19,8 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated as an Apple Container name or a full Docker ID, and the
+// script itself disables globbing and quotes every expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -57,6 +57,9 @@ echo "$ids" | while IFS= read -r line; do
   creation=${line#* }
   [ "$id" = "$line" ] && creation=""
   target="$id"
+  if [ -z "$creation" ] && [ "$sub" = "rm" ] && ! printf '%s\n' "$id" | grep -Eq '^[0-9a-f]{64}$'; then
+    continue
+  fi
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
     ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
@@ -64,7 +67,12 @@ echo "$ids" | while IFS= read -r line; do
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
     [ "$got" = "$creation" ] || continue
-    [ -n "$uid" ] && target="$uid"
+    if [ "$sub" = "rm" ]; then
+      [ -n "$uid" ] || continue
+      target="$uid"
+    elif [ -n "$uid" ]; then
+      target="$uid"
+    fi
   fi
   run_with_timeout "$bin" "$sub" --force "$target" || true
 done
@@ -114,14 +122,17 @@ func newReaper(binary, subcommand string) *reaper {
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for
-// backward compatibility.
+// ID from creationLabel. A name-addressed entry must carry a generation;
+// an empty generation is accepted only for a full immutable Docker ID.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	}
+	if creation == "" && !dockerIDRE.MatchString(id) {
+		return fmt.Errorf("reaper: refusing name delete without a creation generation")
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()

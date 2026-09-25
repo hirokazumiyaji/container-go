@@ -42,6 +42,8 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
+func (dockerEngine) requiresImmutableID() bool { return true }
+
 // checkConfig rejects explicit loopback publish binds on a remote
 // daemon: Docker would listen on the remote machine's loopback, which
 // no rewrite of the client-facing address can make reachable.
@@ -164,9 +166,10 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID       string `json:"Id"`
+	Name     string `json:"Name"`
+	Platform string `json:"Platform"`
+	State    struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -185,22 +188,40 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
-func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	match := -1
+	for i, c := range containers {
+		if dockerIDRE.MatchString(target) {
+			if c.ID == target {
+				match = i
+				break
+			}
+			continue
+		}
+		if strings.TrimPrefix(c.Name, "/") == target {
+			match = i
+			break
+		}
 	}
-	c := containers[0]
+	if match < 0 {
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
+	}
+	c := containers[match]
+	if !dockerIDRE.MatchString(c.ID) {
+		return nil, fmt.Errorf("docker inspect for %s returned invalid container ID %q", target, c.ID)
+	}
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:    dockerState(c.State.Status),
+		labels:   c.Config.Labels,
+		uid:      c.ID,
+		image:    c.Config.Image,
+		platform: c.Platform,
+		ip:       c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

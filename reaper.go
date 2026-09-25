@@ -165,6 +165,9 @@ var (
 	reaperWriteTimeout         = 500 * time.Millisecond
 	reaperProcessStopTimeout   = time.Second
 	reaperOperationLockTimeout = 30 * time.Second
+	// Reconciliation must outlive a deliberately shortened public gate
+	// timeout used while a lifecycle intent is being recorded.
+	reaperReconcileLockTimeout = 30 * time.Second
 	reaperOperationTimeout     = 5 * time.Second
 	reaperRecoveryTimeout      = 5 * time.Second
 )
@@ -318,6 +321,12 @@ type reaper struct {
 	command       func() *exec.Cmd
 	backoff       func(int) time.Duration
 	killProcess   func(*reaperProcess)
+
+	// stateGeneration advances for every durable register/unregister
+	// intent, even when the operation gate cannot yet be acquired.
+	stateGeneration  uint64
+	reconcilePending bool
+	reconcileRunning bool
 }
 
 func newReaper(binary, subcommand string) *reaper {
@@ -327,6 +336,104 @@ func newReaper(binary, subcommand string) *reaper {
 		now:         time.Now,
 		killProcess: killReaperProcess,
 	}
+}
+
+func (r *reaper) recordRegisterIntent(entry reaperEntry) {
+	r.mu.Lock()
+	if !r.containsActiveLocked(entry) {
+		r.removeCompletedLocked(entry)
+		r.entries = append(r.entries, entry)
+	}
+	r.stateGeneration++
+	r.mu.Unlock()
+}
+
+func (r *reaper) recordUnregisterIntent(entry reaperEntry) bool {
+	r.mu.Lock()
+	removed := r.removeActiveLocked(entry)
+	if removed {
+		r.rememberCompletedLocked(entry)
+	}
+	r.stateGeneration++
+	r.mu.Unlock()
+	return removed
+}
+
+// requestReconcile makes a gate-timeout intent durable. The worker owns
+// process replacement and replays the current active set, so a completed
+// cancellation can never be replayed merely because the gate was busy.
+func (r *reaper) requestReconcile() {
+	r.mu.Lock()
+	r.reconcilePending = true
+	process := r.processLocked()
+	if len(r.entries) == 0 && process == nil {
+		r.reconcilePending = false
+		r.mu.Unlock()
+		return
+	}
+	if r.reconcileRunning {
+		r.mu.Unlock()
+		return
+	}
+	r.reconcileRunning = true
+	r.mu.Unlock()
+	go r.reconcileLoop()
+}
+
+func (r *reaper) reconcileLoop() {
+	// Keep retrying after a failed replacement. Active entries are the
+	// watchdog's source of truth, so a transient backend or gate failure
+	// must not permanently discard the pending reconciliation.
+	r.mu.Lock()
+	observed := r.stateGeneration
+	r.mu.Unlock()
+	for {
+		err := r.reconcileOnce()
+		r.mu.Lock()
+		if r.stateGeneration != observed {
+			observed = r.stateGeneration
+			r.mu.Unlock()
+			continue
+		}
+		if err != nil {
+			delay := r.reconcileRetryDelayLocked()
+			r.mu.Unlock()
+			timer := time.NewTimer(delay)
+			<-timer.C
+			continue
+		}
+		r.reconcilePending = false
+		r.reconcileRunning = false
+		r.mu.Unlock()
+		return
+	}
+}
+
+func (r *reaper) reconcileOnce() error {
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperReconcileLockTimeout)
+	defer lockCancel()
+	if err := r.lockOperation(lockCtx); err != nil {
+		return err
+	}
+	defer r.unlockOperation()
+
+	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+	defer cancel()
+	return r.respawnAndReplay(ctx)
+}
+
+func (r *reaper) reconcileRetryDelayLocked() time.Duration {
+	if !r.retryAt.IsZero() {
+		if delay := r.retryAt.Sub(r.nowLocked()); delay > 0 {
+			return delay
+		}
+	}
+	if r.retryLevel > 0 {
+		if delay := r.backoffLocked(r.retryLevel); delay > 0 {
+			return delay
+		}
+	}
+	return initialReaperSpawnBackoff
 }
 
 // register adds a container ID to the reaper's active kill list,
@@ -341,23 +448,37 @@ func (r *reaper) register(id, creation string) error {
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
+
+	// Record the active entry before waiting for the operation gate. If the
+	// gate is busy past its budget, the registration is still part of the
+	// durable replay set and requestReconcile can replace the child later.
+	entry := reaperEntry{id: id, creation: creation}
+	r.recordRegisterIntent(entry)
 	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
 	defer lockCancel()
 	if err := r.lockOperation(lockCtx); err != nil {
+		r.requestReconcile()
 		return err
 	}
 	defer r.unlockOperation()
 	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
 	defer cancel()
-	return r.registerContext(ctx, reaperEntry{id: id, creation: creation})
+	return r.registerContextReady(ctx, entry)
 }
 
 func (r *reaper) registerContext(ctx context.Context, entry reaperEntry) error {
+	r.recordRegisterIntent(entry)
+	return r.registerContextReady(ctx, entry)
+}
+
+func (r *reaper) registerContextReady(ctx context.Context, entry reaperEntry) error {
 	r.mu.Lock()
-	duplicate := r.containsActiveLocked(entry)
-	if !duplicate {
-		r.removeCompletedLocked(entry)
-		r.entries = append(r.entries, entry)
+	// A later unregister may have superseded this registration while it
+	// waited for the operation gate. Let that lifecycle transition own the
+	// pipe record instead of reintroducing a completed entry.
+	if !r.containsActiveLocked(entry) {
+		r.mu.Unlock()
+		return nil
 	}
 	if !r.retryReadyLocked() {
 		err := r.spawnCooldownErrorLocked()
@@ -502,24 +623,42 @@ func (r *reaper) unregister(id, creation string) error {
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
+
+	// Complete the in-memory lifecycle transition before waiting for the
+	// operation gate. The active set and completion history therefore stay
+	// safe even when the child cannot be updated before the timeout.
+	entry := reaperEntry{id: id, creation: creation}
+	removed := r.recordUnregisterIntent(entry)
+	if !removed {
+		return nil
+	}
 	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
 	defer lockCancel()
 	if err := r.lockOperation(lockCtx); err != nil {
+		r.requestReconcile()
 		return err
 	}
 	defer r.unlockOperation()
 	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
 	defer cancel()
-	return r.unregisterContext(ctx, reaperEntry{id: id, creation: creation})
+	return r.unregisterContextReady(ctx, entry)
 }
 
 func (r *reaper) unregisterContext(ctx context.Context, entry reaperEntry) error {
+	if !r.recordUnregisterIntent(entry) {
+		return nil
+	}
+	return r.unregisterContextReady(ctx, entry)
+}
+
+func (r *reaper) unregisterContextReady(ctx context.Context, entry reaperEntry) error {
 	r.mu.Lock()
-	if !r.removeActiveLocked(entry) {
+	// A later registration may have superseded this cancellation while it
+	// waited for the operation gate. Its + record must be allowed to win.
+	if r.containsActiveLocked(entry) {
 		r.mu.Unlock()
 		return nil
 	}
-	r.rememberCompletedLocked(entry)
 	process := r.processLocked()
 	r.mu.Unlock()
 

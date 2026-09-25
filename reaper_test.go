@@ -9,9 +9,14 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+func reaperShellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
 
 // writeReaperStub creates a fake `container` binary that logs its argv.
 func writeReaperStub(t *testing.T) (binPath, logPath string) {
@@ -217,6 +222,222 @@ func TestReaperOperationCancellationWhileWaitingDoesNotEnterLifecycle(t *testing
 	r.mu.Unlock()
 	if entries != 1 {
 		t.Fatalf("entries after canceled wait = %d, want unchanged 1", entries)
+	}
+}
+
+func waitForReaperReplacement(t *testing.T, r *reaper, old *reaperProcess, entries int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		replaced := r.process != nil && r.process != old
+		active := len(r.entries)
+		settled := !r.reconcilePending
+		r.mu.Unlock()
+		if replaced && active == entries && settled {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.mu.Lock()
+	process := r.process
+	active := len(r.entries)
+	pending := r.reconcilePending
+	r.mu.Unlock()
+	t.Fatalf("reaper did not reconcile: replaced=%t active=%d pending=%t process=%p", process != nil && process != old, active, pending, process)
+}
+
+func TestReaperUnregisterContextNoop(t *testing.T) {
+	r := newReaper("unused", "delete")
+	if err := r.unregisterContext(context.Background(), reaperEntry{id: "missing"}); err != nil {
+		t.Fatalf("unregister missing context entry: %v", err)
+	}
+}
+
+func TestReaperRegisterGateTimeoutKeepsEntryAndReconciles(t *testing.T) {
+	oldLockTimeout := reaperOperationLockTimeout
+	reaperOperationLockTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { reaperOperationLockTimeout = oldLockTimeout })
+
+	var spawns atomic.Int32
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd {
+		spawns.Add(1)
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	if err := r.registerContext(context.Background(), reaperEntry{id: "existing"}); err != nil {
+		t.Fatalf("initial register: %v", err)
+	}
+	r.mu.Lock()
+	old := r.process
+	r.mu.Unlock()
+	if old == nil {
+		t.Fatal("initial register did not spawn a reaper")
+	}
+
+	r.opMu.Lock()
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			r.opMu.Unlock()
+		}
+	}()
+	result := make(chan error, 1)
+	go func() { result <- r.register("pending", "") }()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("register gate error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("register did not time out waiting for the operation gate")
+	}
+
+	r.mu.Lock()
+	active := len(r.entries)
+	pending := r.reconcilePending
+	r.mu.Unlock()
+	if active != 2 {
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatalf("active entries after gate timeout = %d, want durable pending registration and existing entry", active)
+	}
+	if !pending {
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("register gate timeout did not arrange reconciliation")
+	}
+
+	r.opMu.Unlock()
+	gateHeld = false
+	waitForReaperReplacement(t, r, old, 2)
+	if got := spawns.Load(); got < 2 {
+		t.Fatalf("reaper spawns = %d, want replacement after gate timeout", got)
+	}
+}
+
+func TestReaperUnregisterGateTimeoutCompletesWithoutReplay(t *testing.T) {
+	oldLockTimeout := reaperOperationLockTimeout
+	reaperOperationLockTimeout = 25 * time.Millisecond
+	t.Cleanup(func() { reaperOperationLockTimeout = oldLockTimeout })
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "active.log")
+	readerPath := filepath.Join(dir, "reader.sh")
+	reader := "#!/bin/sh\n" +
+		"awk 'substr($0, 1, 2) == \"+ \" { active[substr($0, 3)] = 1; next } " +
+		"substr($0, 1, 2) == \"- \" { delete active[substr($0, 3)]; next } " +
+		"END { for (entry in active) print \"active \" entry }' >> " + reaperShellQuote(logPath) + "\n"
+	if err := os.WriteFile(readerPath, []byte(reader), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	var spawns atomic.Int32
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd {
+		spawns.Add(1)
+		return exec.Command(readerPath)
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	for _, id := range []string{"completed", "active"} {
+		if err := r.registerContext(context.Background(), reaperEntry{id: id}); err != nil {
+			t.Fatalf("register %s: %v", id, err)
+		}
+	}
+	r.mu.Lock()
+	old := r.process
+	r.mu.Unlock()
+	if old == nil {
+		t.Fatal("initial register did not spawn a reaper")
+	}
+
+	r.opMu.Lock()
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			r.opMu.Unlock()
+		}
+	}()
+	result := make(chan error, 1)
+	go func() { result <- r.unregister("completed", "") }()
+
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("unregister gate error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(time.Second):
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("unregister did not time out waiting for the operation gate")
+	}
+
+	r.mu.Lock()
+	active := len(r.entries)
+	completed := false
+	for _, entry := range r.completed {
+		if entry == (reaperEntry{id: "completed"}) {
+			completed = true
+			break
+		}
+	}
+	pending := r.reconcilePending
+	r.mu.Unlock()
+	if active != 1 {
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatalf("active entries after gate timeout = %d, want completed entry removed", active)
+	}
+	if !completed {
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("unregister gate timeout did not durably record completion")
+	}
+	if !pending {
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("unregister gate timeout did not arrange reconciliation")
+	}
+
+	r.opMu.Unlock()
+	gateHeld = false
+	waitForReaperReplacement(t, r, old, 1)
+	if got := spawns.Load(); got < 2 {
+		t.Fatalf("reaper spawns = %d, want replacement after gate timeout", got)
+	}
+	r.mu.Lock()
+	completedAfter := false
+	for _, entry := range r.completed {
+		if entry == (reaperEntry{id: "completed"}) {
+			completedAfter = true
+			break
+		}
+	}
+	r.mu.Unlock()
+	if !completedAfter {
+		t.Fatal("reconciliation discarded the durable completed entry")
+	}
+
+	r.closeStdin()
+	waitForReaperExit(t, r)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "active completed") {
+		t.Fatalf("completed entry was replayed after gate timeout: %q", data)
+	}
+	if !strings.Contains(string(data), "active active") {
+		t.Fatalf("replacement replay log = %q, want active entry", data)
 	}
 }
 

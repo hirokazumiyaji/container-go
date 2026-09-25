@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -121,6 +122,13 @@ func TestAppleExecReleasesNameLockBeforeRunner(t *testing.T) {
 		t.Fatal("State deadlocked behind the Apple Exec name lock")
 	}
 
+	writerCtx, writerCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	_, writerErr := lockName(writerCtx, "myctr")
+	writerCancel()
+	if !errors.Is(writerErr, context.DeadlineExceeded) {
+		t.Fatalf("replacement lock while Exec is running = %v, want deadline", writerErr)
+	}
+
 	runner.unblock()
 	select {
 	case err := <-execDone:
@@ -130,4 +138,9 @@ func TestAppleExecReleasesNameLockBeforeRunner(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("Exec did not finish after releasing the runner")
 	}
+	unlock, err := lockName(context.Background(), "myctr")
+	if err != nil {
+		t.Fatalf("replacement lock after Exec completion: %v", err)
+	}
+	unlock()
 }

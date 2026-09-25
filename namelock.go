@@ -431,14 +431,23 @@ func reaperNameLockPath(name string) (string, error) {
 	return path, nil
 }
 
+//nolint:unused // retained for in-package callers using exclusive flock acquisition
 func flockWithContext(ctx context.Context, f *os.File) error {
+	return flockWithContextMode(ctx, f, false)
+}
+
+func flockWithContextMode(ctx context.Context, f *os.File, shared bool) error {
+	operation := syscall.LOCK_EX
+	if shared {
+		operation = syscall.LOCK_SH
+	}
 	ticker := time.NewTicker(nameLockPoll)
 	defer ticker.Stop()
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(int(f.Fd()), operation|syscall.LOCK_NB)
 		if err == nil {
 			return nil
 		}
@@ -486,11 +495,15 @@ func acquireLockFile(ctx context.Context, args ...interface{}) (func(), error) {
 }
 
 func acquireLockFileWithHooks(ctx context.Context, path string, create bool, hooks *nameLockHooks, stage nameLockStage) (func(), error) {
+	return acquireLockFileWithMode(ctx, path, create, hooks, stage, false)
+}
+
+func acquireLockFileWithMode(ctx context.Context, path string, create bool, hooks *nameLockHooks, stage nameLockStage, shared bool) (func(), error) {
 	f, err := openLockFileWithHooks(path, create, hooks, stage)
 	if err != nil {
 		return nil, err
 	}
-	if err := flockWithContext(ctx, f); err != nil {
+	if err := flockWithContextMode(ctx, f, shared); err != nil {
 		_ = f.Close()
 		return nil, err
 	}
@@ -517,7 +530,19 @@ func lockName(ctx context.Context, name string) (func(), error) {
 	return lockNameWithHooks(ctx, name, nil)
 }
 
+// lockNameShared acquires the compatibility barriers in shared mode. It is
+// used by generation-pinned name operations and read-only probes: multiple
+// readers may coexist, while lockName's exclusive mode still blocks
+// replacement until the operation finishes.
+func lockNameShared(ctx context.Context, name string) (func(), error) {
+	return lockNameWithMode(ctx, name, true, nil)
+}
+
 func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (func(), error) {
+	return lockNameWithMode(ctx, name, false, hooks)
+}
+
+func lockNameWithMode(ctx context.Context, name string, shared bool, hooks *nameLockHooks) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -544,7 +569,7 @@ func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (
 		}
 	}
 	acquire := func(stage nameLockStage, path string) error {
-		unlock, err := acquireLockFileWithHooks(ctx, path, true, hooks, stage)
+		unlock, err := acquireLockFileWithMode(ctx, path, true, hooks, stage, shared)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return fmt.Errorf("acquire %s lock: %w", stage, err)

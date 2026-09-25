@@ -461,10 +461,22 @@ func (c *Container) verifiedOperationTarget() (string, error) {
 }
 
 // verifiedOperationTargetWithLock verifies the target and, for Apple,
-// returns a release function that keeps the name lock until the caller has
-// finished the complete backend operation. The returned release function is
-// always safe to call, including on an error path.
+// returns a release function that keeps the exclusive name lock until the
+// caller has finished the complete backend operation. The returned release
+// function is always safe to call, including on an error path.
 func (c *Container) verifiedOperationTargetWithLock(ctx context.Context) (string, func(), error) {
+	return c.verifiedOperationTargetWithMode(ctx, false)
+}
+
+// verifiedOperationTargetWithSharedLock verifies the target while holding a
+// shared generation pin. Read-only probes can run concurrently, while an
+// exclusive lockName writer cannot replace the name until the operation is
+// complete.
+func (c *Container) verifiedOperationTargetWithSharedLock(ctx context.Context) (string, func(), error) {
+	return c.verifiedOperationTargetWithMode(ctx, true)
+}
+
+func (c *Container) verifiedOperationTargetWithMode(ctx context.Context, shared bool) (string, func(), error) {
 	noop := func() {}
 	c.inspectMu.Lock()
 	uid := c.uid
@@ -486,7 +498,11 @@ func (c *Container) verifiedOperationTargetWithLock(ctx context.Context) (string
 	}
 
 	lockCtx, cancel := withMaxTimeout(ctx, queryTimeout)
-	unlock, err := lockName(lockCtx, c.id)
+	lock := lockName
+	if shared {
+		lock = lockNameShared
+	}
+	unlock, err := lock(lockCtx, c.id)
 	if err != nil {
 		cancel()
 		return "", noop, fmt.Errorf("lock name: %w", err)
@@ -508,7 +524,7 @@ func (c *Container) classify(ctx context.Context, err error) error {
 
 // State returns the current lifecycle state.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectFreshRead(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -736,16 +752,31 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 // dynamic, so returning a previous inspect would make an explicit
 // published endpoint look live after the backend changed underneath it.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
-	return c.inspectFresh(ctx)
+	return c.inspectFreshRead(ctx)
 }
 
 // inspectFresh serializes a name-addressed Apple inspect with the same
 // lock used by operations. Callers that already hold that lock must use
 // inspectFreshLocked instead.
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	return c.inspectFreshWithMode(ctx, false)
+}
+
+// inspectFreshRead is the shared-lock counterpart used by read-only
+// lifecycle and endpoint probes. It keeps replacement writers out while
+// allowing concurrent readers and generation-pinned operations.
+func (c *Container) inspectFreshRead(ctx context.Context) (*engineInfo, error) {
+	return c.inspectFreshWithMode(ctx, true)
+}
+
+func (c *Container) inspectFreshWithMode(ctx context.Context, shared bool) (*engineInfo, error) {
 	if c.eng.name() == "apple" {
 		lockCtx, cancel := withMaxTimeout(ctx, queryTimeout)
-		unlock, err := lockName(lockCtx, c.id)
+		lock := lockName
+		if shared {
+			lock = lockNameShared
+		}
+		unlock, err := lock(lockCtx, c.id)
 		if err != nil {
 			cancel()
 			return nil, fmt.Errorf("inspect %s: lock name: %w", c.id, err)

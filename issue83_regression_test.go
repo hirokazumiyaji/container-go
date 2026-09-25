@@ -128,7 +128,7 @@ func TestReviewAppleOperationsRecheckGenerationBeforeNameUse(t *testing.T) {
 	}
 }
 
-func TestReviewAppleLogTailAndStreamingReleaseGenerationLock(t *testing.T) {
+func TestReviewAppleLogTailAndStreamingBlockReplacementWhileOpen(t *testing.T) {
 	const name = "review-stream"
 	runner := &reviewOperationRunner{
 		inspectA: reviewAppleInspect(name, reviewCreationB, "running", ""),
@@ -160,15 +160,24 @@ func TestReviewAppleLogTailAndStreamingReleaseGenerationLock(t *testing.T) {
 	}()
 	select {
 	case err := <-lockResult:
-		if err != nil {
-			t.Fatalf("lock while stream is open: %v", err)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("replacement lock while stream is open = %v, want deadline", err)
 		}
 	case <-time.After(time.Second):
-		t.Fatal("name lock remained held for the stream lifetime")
+		t.Fatal("replacement lock did not wait for stream completion")
+	}
+	state, err := ctr.State(context.Background())
+	if err != nil || state != StateRunning {
+		t.Fatalf("shared State while stream is open = (%s, %v)", state, err)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("stream close: %v", err)
 	}
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("replacement lock after stream close: %v", err)
+	}
+	unlock()
 }
 
 type reviewPruneRunner struct {

@@ -40,7 +40,7 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // output. Long-lived reuse containers can grow unbounded logs, so
 // prefer Tail for diagnostics.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -69,34 +69,32 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
-	// The identity check and stream creation are protected by the Apple
-	// name lock, but the lock must not span the stream lifetime. Wait
-	// strategies such as ForAny may probe State/Endpoint while this stream
-	// is still open; retaining the exclusive lock would deadlock those
-	// probes until the stream context expires.
-	unlock()
 	if err != nil {
+		unlock()
 		return nil, err
 	}
-	return newContextReadCloser(ctx, stream), nil
+	// The shared generation pin blocks replacement writers while allowing
+	// concurrent State/Endpoint readers, including wait.ForAny probes.
+	return newLockedReadCloser(ctx, stream, unlock), nil
 }
 
-// contextReadCloser preserves cancellation-driven cleanup without holding
-// any backend name lock after FollowLogs has established the stream.
-type contextReadCloser struct {
+// lockedReadCloser keeps the shared generation pin for the complete stream
+// lifetime. Close is idempotent and also releases the pin on cancellation.
+type lockedReadCloser struct {
 	io.ReadCloser
-	done chan struct{}
-	once sync.Once
-	err  error
+	unlock func()
+	done   chan struct{}
+	once   sync.Once
+	err    error
 }
 
-func newContextReadCloser(ctx context.Context, stream io.ReadCloser) io.ReadCloser {
-	r := &contextReadCloser{ReadCloser: stream, done: make(chan struct{})}
+func newLockedReadCloser(ctx context.Context, stream io.ReadCloser, unlock func()) io.ReadCloser {
+	r := &lockedReadCloser{ReadCloser: stream, unlock: unlock, done: make(chan struct{})}
 	go func() {
 		select {
 		case <-ctx.Done():
@@ -107,10 +105,11 @@ func newContextReadCloser(ctx context.Context, stream io.ReadCloser) io.ReadClos
 	return r
 }
 
-func (r *contextReadCloser) Close() error {
+func (r *lockedReadCloser) Close() error {
 	r.once.Do(func() {
 		r.err = r.ReadCloser.Close()
 		close(r.done)
+		r.unlock()
 	})
 	return r.err
 }

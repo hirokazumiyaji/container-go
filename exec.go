@@ -80,15 +80,14 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	// Verify the generation/target while the Apple name lock is held, but
-	// do not keep that lock across the potentially unbounded exec process.
-	// State/Endpoint probes from concurrent wait strategies must remain able
-	// to acquire the same name lock.
-	unlock()
+	// Keep the shared generation pin through the backend invocation and any
+	// follow-up state check. Replacement writers remain excluded, while
+	// State/Endpoint readers can still run concurrently.
+	defer unlock()
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {

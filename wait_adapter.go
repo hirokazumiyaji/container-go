@@ -61,7 +61,7 @@ const logTailLimit = 1024 * 1024
 // so neither the CLI output nor the Go buffer grows with total log
 // size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithSharedLock(ctx)
 	if err != nil {
 		return ""
 	}

@@ -13,6 +13,10 @@ func lockName(context.Context, string) (func(), error) {
 	return func() {}, nil
 }
 
+func lockNameShared(ctx context.Context, name string) (func(), error) {
+	return lockName(ctx, name)
+}
+
 // The normal reaper registration is already a no-op on Windows. Keep the
 // name-lock helper fail-closed so a future caller cannot accidentally use
 // an unlocked name-addressed reaper entry.

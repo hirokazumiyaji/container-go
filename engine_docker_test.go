@@ -146,7 +146,7 @@ func TestDockerLifecycleArgs(t *testing.T) {
 }
 
 func TestParseDockerVersionPair(t *testing.T) {
-	client, server, err := parseDockerVersionPair([]byte(`{"Client":{"Version":"v29.7.0-ce"},"Server":{"Version":"29.7.2+desktop"}}`))
+	client, server, err := parseDockerVersionPair([]byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.2"}}`))
 	if err != nil {
 		t.Fatalf("parseDockerVersionPair: %v", err)
 	}
@@ -158,8 +158,18 @@ func TestParseDockerVersionPair(t *testing.T) {
 	}
 	for _, raw := range []string{
 		`{"Client":{"Version":"29.7"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.07.0"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"v29.7.0"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":" 29.7.0 "},"Server":{"Version":"29.7.0"}}`,
 		`{"Client":{"Version":"-29.7.0"},"Server":{"Version":"29.7.0"}}`,
 		`{"Client":{"Version":"29.7.0-rc.1"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-dev"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-10-gdeadbee"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-0.1"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-ce"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0+garbage"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.2+desktop"}}`,
 		`{"Client":{"Version":"29.7.0"},"Server":{"Version":"not-a-version"}}`,
 	} {
 		if _, _, err := parseDockerVersionPair([]byte(raw)); err == nil {

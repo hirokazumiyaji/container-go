@@ -304,39 +304,23 @@ func (v dockerVersion) less(other dockerVersion) bool {
 	return v.patch < other.patch
 }
 
+var dockerVersionRE = regexp.MustCompile(`^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$`)
+
+// parseDockerVersion accepts only the plain stable x.y.z form emitted by
+// supported Docker releases. Suffixes describe development or distribution
+// builds whose copy-out behavior has not been verified, so they fail closed.
 func parseDockerVersion(raw string) (dockerVersion, error) {
-	original := strings.TrimSpace(raw)
-	value := strings.TrimPrefix(original, "v")
-	if value == "" || value[0] < '0' || value[0] > '9' {
-		return dockerVersion{}, fmt.Errorf("version %q has a non-numeric component", original)
+	if !dockerVersionRE.MatchString(raw) {
+		return dockerVersion{}, fmt.Errorf("version %q is not a stable major.minor.patch release", raw)
 	}
-	if i := strings.IndexAny(value, "-+"); i >= 0 {
-		suffix := strings.ToLower(value[i+1:])
-		for _, marker := range []string{"alpha", "beta", "rc", "pre"} {
-			if strings.HasPrefix(suffix, marker) {
-				return dockerVersion{}, fmt.Errorf("version %q is a prerelease", original)
-			}
-		}
-		value = value[:i]
-	}
-	parts := strings.Split(value, ".")
-	if len(parts) != 3 {
-		return dockerVersion{}, fmt.Errorf("version %q is not major.minor.patch", original)
-	}
-	var version dockerVersion
+
+	parts := strings.Split(raw, ".")
+	version := dockerVersion{}
 	values := []*int{&version.major, &version.minor, &version.patch}
 	for i, part := range parts {
-		if part == "" {
-			return dockerVersion{}, fmt.Errorf("version %q has an empty component", original)
-		}
-		for _, r := range part {
-			if r < '0' || r > '9' {
-				return dockerVersion{}, fmt.Errorf("version %q has a non-numeric component", original)
-			}
-		}
 		n, err := strconv.Atoi(part)
 		if err != nil {
-			return dockerVersion{}, fmt.Errorf("version %q: %w", original, err)
+			return dockerVersion{}, fmt.Errorf("version %q: %w", raw, err)
 		}
 		*values[i] = n
 	}
@@ -348,8 +332,8 @@ func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
 	if err := json.Unmarshal(data, &output); err != nil {
 		return dockerVersion{}, dockerVersion{}, fmt.Errorf("decode Docker version output: %w", err)
 	}
-	clientRaw := strings.TrimSpace(output.Client.Version)
-	serverRaw := strings.TrimSpace(output.Server.Version)
+	clientRaw := output.Client.Version
+	serverRaw := output.Server.Version
 	if clientRaw == "" {
 		return dockerVersion{}, dockerVersion{}, fmt.Errorf("docker client version is empty")
 	}

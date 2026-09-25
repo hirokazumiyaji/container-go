@@ -109,6 +109,26 @@ func TestCopyFileFromContainerRejectsUnsupportedDockerVersionBeforeCopy(t *testi
 			output: `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.6.9"}}`,
 		},
 		{
+			name:   "client development suffix",
+			output: `{"Client":{"Version":"29.7.0-dev"},"Server":{"Version":"29.7.0"}}`,
+		},
+		{
+			name:   "server git describe suffix",
+			output: `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0-10-gdeadbee"}}`,
+		},
+		{
+			name:   "client numeric suffix",
+			output: `{"Client":{"Version":"29.7.0-0.1"},"Server":{"Version":"29.7.0"}}`,
+		},
+		{
+			name:   "server empty suffix",
+			output: `{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0-"}}`,
+		},
+		{
+			name:   "client unknown build metadata",
+			output: `{"Client":{"Version":"29.7.0+garbage"},"Server":{"Version":"29.7.0"}}`,
+		},
+		{
 			name:   "malformed",
 			output: `{"Client":{"Version":"29.7.0"}}`,
 		},

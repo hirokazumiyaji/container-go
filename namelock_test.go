@@ -10,10 +10,101 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 )
+
+func TestNameLockPathIsStableAcrossTempDirs(t *testing.T) {
+	name := "lock-" + newContainerName()
+	first, err := nameLockPath(name)
+	if err != nil {
+		t.Fatalf("nameLockPath: %v", err)
+	}
+
+	t.Setenv("TMPDIR", t.TempDir())
+	second, err := nameLockPath(name)
+	if err != nil {
+		t.Fatalf("nameLockPath after TMPDIR change: %v", err)
+	}
+	if first != second {
+		t.Fatalf("nameLockPath changed with TMPDIR: %q != %q", first, second)
+	}
+	if strings.Contains(filepath.Base(first), name) {
+		t.Fatalf("lock filename %q contains the un-hashed name", filepath.Base(first))
+	}
+}
+
+func TestNameLockRejectsSymlink(t *testing.T) {
+	name := "lock-" + newContainerName()
+	path, err := nameLockPath(name)
+	if err != nil {
+		t.Fatalf("nameLockPath: %v", err)
+	}
+	target := filepath.Join(t.TempDir(), "target")
+	if err := os.WriteFile(target, []byte("do not lock"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if _, err := lockName(context.Background(), name); err == nil {
+		t.Fatal("lockName followed a pre-existing symlink")
+	}
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "do not lock" {
+		t.Fatalf("symlink target changed to %q", data)
+	}
+}
+
+func TestNameLockRejectsWrongPermissions(t *testing.T) {
+	name := "lock-" + newContainerName()
+	path, err := nameLockPath(name)
+	if err != nil {
+		t.Fatalf("nameLockPath: %v", err)
+	}
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := lockName(context.Background(), name); err == nil {
+		t.Fatal("lockName accepted a world-readable lock file")
+	}
+}
+
+func TestNameLockReusesStaleFile(t *testing.T) {
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("initial lock: %v", err)
+	}
+	path, err := nameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unlock()
+
+	// The file is deliberately retained after unlock. It is stale as a
+	// lock, but its inode remains the coordination point.
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stale lock file missing: %v", err)
+	}
+	if info.Size() != 0 {
+		t.Fatalf("lock file size = %d, want zero", info.Size())
+	}
+	unlock, err = lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lock stale file: %v", err)
+	}
+	unlock()
+}
 
 func TestLockNameSerializesHolders(t *testing.T) {
 	name := "lock-" + newContainerName()
@@ -57,6 +148,33 @@ func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 	}
 	if r.deleteCalls != 0 {
 		t.Errorf("deleteCalls = %d, want 0 while the name is locked elsewhere", r.deleteCalls)
+	}
+}
+
+func TestTerminateContainerBoundsNameLockWait(t *testing.T) {
+	oldTimeout := terminateTimeout
+	terminateTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { terminateTimeout = oldTimeout })
+
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lockName: %v", err)
+	}
+	defer unlock()
+
+	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	start := time.Now()
+	err = TerminateContainer(ctr)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("TerminateContainer = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("TerminateContainer took %v, want bounded wait", elapsed)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", r.deleteCalls)
 	}
 }
 
@@ -107,7 +225,7 @@ func TestRunAppleCreateTakesNameLock(t *testing.T) {
 
 const nameLockHelperEnv = "CONTAINERGO_NAMELOCK_HELPER"
 
-func TestNameLockExcludesAnotherProcess(t *testing.T) {
+func TestNameLockExcludesAnotherProcessAcrossTempDirs(t *testing.T) {
 	name := "lock-" + newContainerName()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestNameLockHelperProcess$")
 	stdin, err := cmd.StdinPipe()
@@ -119,7 +237,12 @@ func TestNameLockExcludesAnotherProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 	cmd.Stderr = os.Stderr
-	cmd.Env = append(os.Environ(), nameLockHelperEnv+"=1", "CONTAINERGO_NAMELOCK_NAME="+name)
+	// A different process TMPDIR must not select a different lock inode.
+	cmd.Env = append(os.Environ(),
+		nameLockHelperEnv+"=1",
+		"CONTAINERGO_NAMELOCK_NAME="+name,
+		"TMPDIR="+t.TempDir(),
+	)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
@@ -166,7 +289,8 @@ func TestNameLockExcludesAnotherProcess(t *testing.T) {
 }
 
 // TestNameLockHelperProcess is launched as a separate test binary by
-// TestNameLockExcludesAnotherProcess. It holds the lock until stdin closes.
+// TestNameLockExcludesAnotherProcessAcrossTempDirs. It holds the lock
+// until stdin closes.
 func TestNameLockHelperProcess(t *testing.T) {
 	if os.Getenv(nameLockHelperEnv) != "1" {
 		return

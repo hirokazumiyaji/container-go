@@ -138,8 +138,11 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    から返ります。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
-   削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
-   Windows では前 2 層のみでクリーンアップします。
+   削除します。Apple Container では、名前指定の削除で Prune や作成と同じ
+   安定したユーザー単位ロックを取得します。ロックまたは必要な `lockf` が
+   利用できない場合は、該当エントリを削除せず fail closed にします。
+   リーパーは `/bin/sh` を必要とするため Windows では動かず、Windows では
+   前 2 層のみでクリーンアップします。
 
 補足:
 
@@ -147,9 +150,12 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。
-  Apple Container では、名前ごとのロックを保持したまま各候補を再検査し、
-  世代、managed ラベル、状態が一致する場合だけ削除します。
-  ロックを取得しない直接の `container` CLI による削除と再作成は、この保証の対象外です。
+  Apple Container では、安定した名前ごとのロックを保持したまま各候補を再検査し、
+  その検査時点で世代、managed ラベル、状態が一致する場合だけ削除します。
+  ロックはプロセス固有の `TMPDIR` ではなく、非公開のユーザーキャッシュ名前空間にある。
+  名前ロックで保護する手順を使うライブラリの操作(リーパーを含む)とはロックで同期できます。
+  一方、直接の `container` CLI、ロックを取らない `Stop`、他の外部ツールとは同期できません。
+  検査後に状態が変更(停止/開始、ラベルや世代の変更、削除/再作成など)された場合も、この保証の対象外です。
 
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 
@@ -175,7 +181,9 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
 - image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
-- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
+- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。
+  watchdog リーパーも同様にガードする。ただし検査は名前ロック内でその時点の状態を調べるだけであり、
+  検査後に外部が状態を変更する行為までは保護しない。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
@@ -190,8 +198,8 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 ## セキュリティ上の注意
 
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
-  シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
-  stdin データとしてのみ渡ります。
+  シェルスクリプト(リーパー)は固定文字列で、コンテナ ID とライブラリが生成した
+  ロックパスは検証済みの stdin データとしてのみ渡します。
 - 環境変数はパーミッション 0600 の一時 env ファイル経由で渡すため、秘密が
   プロセス一覧(`ps`)に現れません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry

@@ -38,6 +38,10 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -212,9 +216,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 }
 
 // runCreateLocked serializes a name-addressed create with the guarded
-// prune/delete paths. The attempted result is separate from the error so
-// callers do not run failed-create cleanup when acquiring the lock itself
-// failed and no create command was issued.
+// prune/delete and watchdog-reaper paths. The attempted result is separate
+// from the error so callers do not run failed-create cleanup when acquiring
+// the lock itself failed and no create command was issued.
 func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
 	if cfg.eng.nameAddressedDeletes() {
 		unlock, lockErr := lockName(ctx, cfg.name)
@@ -326,13 +330,17 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // longer exists is a success. A handle with an immutable ID deletes by
 // it, so a same-name replacement is never touched. Without one (Apple
 // Container) the delete goes by name: the creation generation must
-// match a fresh inspect, and inspect and delete run under the per-name
-// lock so no other process using this library can delete and recreate
-// the name in between; an external `container delete` plus re-create
-// inside that window is not detectable by name (see lockName). An
-// inspect failure other than not-found aborts the delete rather than
-// risk a replacement.
+// match a fresh inspect, and inspect and delete run under the stable
+// per-name lock so no other process using the guarded protocol can
+// mutate the name in between. A direct `container` CLI call, an
+// unguarded library operation, or another external actor can still
+// change state, labels, generation, or the name target after inspect;
+// that point-in-time limitation is not detectable by name (see
+// lockName). An inspect failure other than not-found aborts the delete
+// rather than risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
+	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
+	defer cancel()
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
 	}

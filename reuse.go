@@ -392,11 +392,12 @@ func stripImageDigest(ref string) string {
 
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. On Apple Container, the
-// list-time generation, managed label, group, and state are rechecked under
-// the per-name lock before a name-based delete. Use it as a CI teardown
-// step; ordinary Prune still only removes stopped managed containers. A
-// direct Apple Container CLI replacement outside the lock is outside the
-// guarantee.
+// list-time generation, managed label, group, and state are rechecked at
+// that instant under the stable per-name lock before a name-based delete.
+// Use it as a CI teardown step; ordinary Prune still only removes stopped
+// managed containers. Direct Apple Container CLI calls, unguarded library
+// operations, and other external state mutations after the inspect are
+// outside the lock and guarantee.
 func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if group == "" {
 		return nil, fmt.Errorf("reuse group must not be empty")

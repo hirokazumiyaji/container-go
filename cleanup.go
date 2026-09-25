@@ -19,11 +19,15 @@ func keepContainers() bool {
 // TerminateContainer removes the container. It is nil-safe so it can be
 // deferred before the error check on Run. Shared WithReuse handles are
 // left alone; call ctr.Terminate explicitly to remove a reused container.
+// The complete operation, including the Apple name-lock wait, is bounded
+// by terminateTimeout so a stuck peer cannot stall test cleanup forever.
 func TerminateContainer(ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	return ctr.Terminate(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+	defer cancel()
+	return ctr.Terminate(ctx)
 }
 
 // Cleanup registers container removal via tb.Cleanup. It is nil-safe,
@@ -39,10 +43,13 @@ func Cleanup(tb testing.TB, ctr *Container) {
 
 // Prune removes stopped containers created by this library, from any
 // session. On Apple Container, each list candidate is re-inspected and
-// its generation, managed label, and state must still match before the
-// name is deleted under the per-name lock. It returns the IDs it removed.
-// A direct Apple Container CLI operation that replaces a name outside
-// this lock is outside the guarantee.
+// its generation, managed label, and state must still match at that
+// instant before the name is deleted under the stable per-name lock. It
+// returns the IDs it removed. The lock coordinates library operations
+// that use the guarded name-lock protocol, but a direct Apple Container
+// CLI call, an unguarded operation such as Stop, or another external
+// actor can mutate the name after inspect; such state changes are
+// outside this guarantee.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {

@@ -167,8 +167,11 @@ Three layers make sure containers do not outlive your tests:
    returning.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
+   SIGKILL and panics included. On Apple Container its name-addressed
+   delete takes the same stable, user-scoped lock as prune and create;
+   if that lock or the required `lockf` helper is unavailable, the
+   reaper skips the entry (fail closed). The reaper needs `/bin/sh`, so
+   it is unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
 Extras:
@@ -177,10 +180,16 @@ Extras:
 - `container.Prune(ctx)` removes stopped containers this library
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label). On Apple Container,
-  pruning re-inspects each candidate under a per-name lock and requires
-  its generation, managed label, and state to still match. A direct
-  `container` CLI delete/re-create that does not take the lock remains
-  outside this guarantee.
+  pruning re-inspects each candidate under a stable per-name lock and
+  requires its generation, managed label, and state to still match at
+  that inspect. The lock lives in a private user-cache namespace, not
+  the process `TMPDIR`. The lock coordinates library operations that use
+  the guarded name-lock protocol, including the watchdog reaper, but it
+  cannot serialize direct `container` CLI calls or other unguarded
+  actors (for example, a concurrent `Stop`). Any state mutation after
+  the inspect — stopping/starting, changing labels or generation,
+  deleting/recreating, or otherwise changing what the name addresses —
+  is outside this guarantee.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -211,7 +220,10 @@ Contract:
   matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
-  watchdog reaper guards deletion the same way.
+  watchdog reaper guards deletion the same way. These checks are
+  point-in-time checks under the name lock; an external actor can still
+  mutate the name after the inspect, so callers must not treat the
+  guarantee as protection from uncoordinated external state changes.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
@@ -227,8 +239,8 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
-  script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  script (the reaper) is a fixed string that receives container IDs and
+  the library-generated lock path only as validated stdin data.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use

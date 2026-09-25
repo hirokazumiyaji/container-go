@@ -3,24 +3,12 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
 
 func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
-	ports := make([]string, maxOptionCount+1)
-	for i := range ports {
-		ports[i] = "1/tcp"
-	}
-	mounts := make([]Mount, maxOptionCount+1)
-	for i := range mounts {
-		mounts[i] = Mount{Type: MountTmpfs, Target: "/tmp"}
-	}
-	options := make([]Option, maxOptionCount+1)
-	for i := range options {
-		options[i] = WithReuse()
-	}
-
 	tests := []struct {
 		name string
 		opts []Option
@@ -49,18 +37,6 @@ func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
 			name: "zero cpus",
 			opts: []Option{WithCPUs(0)},
 		},
-		{
-			name: "too many exposed ports",
-			opts: []Option{WithExposedPorts(ports...)},
-		},
-		{
-			name: "too many mounts",
-			opts: []Option{WithMounts(mounts...)},
-		},
-		{
-			name: "too many options",
-			opts: options,
-		},
 	}
 
 	for _, tt := range tests {
@@ -81,6 +57,54 @@ func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
 			}
 			if len(f.calls) != 0 {
 				t.Fatalf("backend was called despite invalid options: %v", f.calls)
+			}
+		})
+	}
+}
+
+func TestPreviouslyValidLargeCollectionsRemainAccepted(t *testing.T) {
+	const n = 129 // just above the removed universal cap
+
+	env := make(map[string]string, n)
+	labels := make(map[string]string, n)
+	mounts := make([]Mount, 0, n)
+	ports := make([]string, 0, n)
+	files := make([]File, 0, n)
+	cmd := make([]string, 0, n)
+	options := make([]Option, 0, n)
+	for i := 0; i < n; i++ {
+		env[fmt.Sprintf("VAR_%03d", i)] = "value"
+		labels[fmt.Sprintf("label-%03d", i)] = "value"
+		mounts = append(mounts, Mount{Type: MountTmpfs, Target: fmt.Sprintf("/mount-%03d", i)})
+		ports = append(ports, "1/tcp")
+		files = append(files, File{
+			HostPath:      "testdata/docker_inspect_v29.json",
+			ContainerPath: fmt.Sprintf("/file-%03d", i),
+		})
+		cmd = append(cmd, fmt.Sprintf("arg-%03d", i))
+		options = append(options, WithCmd("ok"))
+	}
+
+	tests := []struct {
+		name string
+		opts []Option
+	}{
+		{name: "commands", opts: []Option{WithCmd(cmd...)}},
+		{name: "environment", opts: []Option{WithEnv(env)}},
+		{name: "labels", opts: []Option{WithLabels(labels)}},
+		{name: "mounts", opts: []Option{WithMounts(mounts...)}},
+		{name: "ports", opts: []Option{WithExposedPorts(ports...)}},
+		{name: "files", opts: []Option{WithFiles(files...)}},
+		{name: "options", opts: options},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestRunner()
+			opts := append([]Option{}, tt.opts...)
+			opts = append(opts, WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
+			if _, err := Run(context.Background(), "redis:7-alpine", opts...); err != nil {
+				t.Fatalf("Run rejected previously valid %s input: %v", tt.name, err)
 			}
 		})
 	}
@@ -129,6 +153,30 @@ func TestReuseGroupValidationIsSharedByCreateAndPrune(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestExecRejectsNilOptionBeforeBackend(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+
+	code, output, err := ctr.Exec(context.Background(), []string{"true"}, nil)
+	if code != 0 || output != nil {
+		t.Fatalf("Exec result = (%d, %v), want zero values", code, output)
+	}
+	if err == nil {
+		t.Fatal("Exec accepted a nil option")
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) {
+		t.Fatalf("error = %T %v, want *ValidationError", err, err)
+	}
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called for a nil Exec option: %v", f.calls)
 	}
 }
 

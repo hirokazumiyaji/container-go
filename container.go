@@ -106,9 +106,6 @@ type Container struct {
 // removed before returning. WithReuse switches to get-or-create; see
 // WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
-	if err := checkOptionCount("Run", len(opts)); err != nil {
-		return nil, err
-	}
 	cfg := newConfig()
 	for i, opt := range opts {
 		if opt == nil {

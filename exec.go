@@ -24,9 +24,6 @@ type execConfig struct {
 // passed via a temporary env file.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
-		if err := checkOptionCount("WithExecEnv", len(env)); err != nil {
-			return err
-		}
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
 				return validationErrorf("WithExecEnv", k, "invalid exec environment variable %q", k)
@@ -62,11 +59,10 @@ func WithExecWorkDir(dir string) ExecOption {
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
-	if err := checkOptionCount("Exec", len(opts)); err != nil {
-		return 0, nil, err
-	}
-	if err := checkOptionCount("Exec command", len(cmd)); err != nil {
-		return 0, nil, err
+	for i, opt := range opts {
+		if opt == nil {
+			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
+		}
 	}
 	if len(cmd) == 0 {
 		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")

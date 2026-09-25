@@ -2,12 +2,14 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"errors"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -55,6 +57,39 @@ func TestDockerRunArgsSkipAutoPublishForExplicitlyPublished(t *testing.T) {
 	}
 	if strings.Contains(joined, "--publish 127.0.0.1::6379/tcp") {
 		t.Errorf("auto-publish must not duplicate explicit publish: %s", joined)
+	}
+}
+
+func TestDockerRemoteLoopbackPublishReturnsValidationError(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://remote.example:2375")
+	cfg := dockerTestConfig(t, WithPublishedPort("127.0.0.1:18080:80"))
+
+	check := func(err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("remote loopback publish was accepted")
+		}
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("error = %T %v, want *ValidationError", err, err)
+		}
+		if !errors.Is(err, ErrInvalidOption) {
+			t.Fatalf("error = %v, want ErrInvalidOption", err)
+		}
+		if validationErr.Option != "WithPublishedPort" {
+			t.Errorf("validation option = %q, want WithPublishedPort", validationErr.Option)
+		}
+	}
+
+	check((dockerEngine{}).checkConfig(cfg))
+
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPublishedPort("127.0.0.1:18080:80"),
+		withRunner(f), withEngine(dockerEngine{}))
+	check(err)
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called before remote-publish validation: %v", f.calls)
 	}
 }
 

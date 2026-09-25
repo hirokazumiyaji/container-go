@@ -16,11 +16,6 @@ import (
 type Option func(*config) error
 
 const (
-	// maxOptionCount bounds both the number of Option functions and the
-	// number of values in each public collection option. It is a
-	// backend-neutral guard against accidentally building an unbounded
-	// argv or env file.
-	maxOptionCount = 128
 	// maxMemoryBytes is a portable, backend-neutral ceiling. Individual
 	// backends may enforce a smaller capability limit in checkConfig.
 	maxMemoryBytes     uint64 = 1 << 50 // 1 PiB
@@ -62,35 +57,10 @@ func newConfig() *config {
 	}
 }
 
-func checkOptionCount(option string, n int) error {
-	if n > maxOptionCount {
-		return validationErrorf(option, n, "option count exceeds maximum %d: got %d", maxOptionCount, n)
-	}
-	return nil
-}
-
+// validate checks invariants that may be assembled by multiple options.
+// Collection cardinality is intentionally left to the backend and caller;
+// there is no universal item-count policy for public options.
 func (c *config) validate() error {
-	if err := checkOptionCount("environment", len(c.env)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("labels", len(c.labels)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("exposed ports", len(c.exposed)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("published ports", len(c.published)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("mounts", len(c.mounts)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("files", len(c.files)); err != nil {
-		return err
-	}
-	if err := checkOptionCount("command arguments", len(c.cmd)); err != nil {
-		return err
-	}
 	if c.memory != "" {
 		if err := validateMemorySize(c.memory); err != nil {
 			return err
@@ -267,9 +237,6 @@ func WithName(name string) Option {
 // temporary env file so values never appear in the process table.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
-		if err := checkOptionCount("WithEnv", len(env)); err != nil {
-			return err
-		}
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") {
 				return validationErrorf("WithEnv", k, "invalid environment variable name %q", k)
@@ -286,9 +253,6 @@ func WithEnv(env map[string]string) Option {
 // WithCmd overrides the arguments passed to the image's entrypoint.
 func WithCmd(cmd ...string) Option {
 	return func(c *config) error {
-		if err := checkOptionCount("WithCmd", len(cmd)); err != nil {
-			return err
-		}
 		c.cmd = cmd
 		return nil
 	}
@@ -311,12 +275,6 @@ func WithEntrypoint(entrypoint string) Option {
 // that MappedPort and Endpoint may resolve.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
-		if err := checkOptionCount("WithExposedPorts", len(ports)); err != nil {
-			return err
-		}
-		if len(c.exposed)+len(ports) > maxOptionCount {
-			return validationErrorf("WithExposedPorts", len(c.exposed)+len(ports), "option count exceeds maximum %d: got %d", maxOptionCount, len(c.exposed)+len(ports))
-		}
 		specs := make([]portSpec, 0, len(ports))
 		for _, p := range ports {
 			spec, err := parsePortSpec(p)
@@ -335,9 +293,6 @@ func WithExposedPorts(ports ...string) Option {
 // resolve to the container's own IP, which needs no host port at all.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
-		if len(c.published) >= maxOptionCount {
-			return validationErrorf("WithPublishedPort", len(c.published)+1, "option count exceeds maximum %d: got %d", maxOptionCount, len(c.published)+1)
-		}
 		ps, err := parsePublishSpec(spec)
 		if err != nil {
 			return newValidationError("WithPublishedPort", spec, err)
@@ -351,9 +306,6 @@ func WithPublishedPort(spec string) Option {
 // always applies. Internal labels are reserved and rejected.
 func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
-		if err := checkOptionCount("WithLabels", len(labels)); err != nil {
-			return err
-		}
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
 				return validationErrorf("WithLabels", k, "invalid label key %q", k)
@@ -377,12 +329,6 @@ func WithLabels(labels map[string]string) Option {
 // WithMounts adds bind, volume, or tmpfs mounts.
 func WithMounts(mounts ...Mount) Option {
 	return func(c *config) error {
-		if err := checkOptionCount("WithMounts", len(mounts)); err != nil {
-			return err
-		}
-		if len(c.mounts)+len(mounts) > maxOptionCount {
-			return validationErrorf("WithMounts", len(c.mounts)+len(mounts), "option count exceeds maximum %d: got %d", maxOptionCount, len(c.mounts)+len(mounts))
-		}
 		for _, m := range mounts {
 			if err := m.validate(); err != nil {
 				return err

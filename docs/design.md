@@ -29,8 +29,11 @@ Three constraints shape the design.
 
 ## Apple Container facts the design relies on
 
-The design decisions below rest on these properties of Apple Container
-(verified against v1.2.x–1.3.x; fixtures cover 1.2.2 and 1.3.0).
+The design decisions below rest on properties of Apple Container's CLI and
+source (fixtures cover 1.2.2 and 1.3.0). The API-server version is queried at
+runtime when a live check needs it; it is not inferred from the CLI version,
+and an unavailable server version is reported as unavailable rather than
+treated as verified.
 
 - Host requirement: macOS 26 or later on Apple Silicon.
 - Each container boots as a lightweight VM with a real IP on a vmnet
@@ -45,11 +48,16 @@ The design decisions below rest on these properties of Apple Container
 - The container name is the container ID. Names must match
   `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters;
   the leading character plus at least one following character is required.
-- The run/create path runs Linux images only. Its resource and forwarding
-  checks require at least 200 MiB of memory, published ports 2–65535, and no
-  more than 64 publish descriptors. Network names are lowercase, 1–63
-  characters, and may use dots, hyphens, or underscores only between
-  alphanumerics.
+- The run/create path runs Linux images only. Its platform grammar requires
+  `os/arch[/variant]`; bare `linux` and variants not defined for the chosen
+  architecture are rejected. On Apple, `CONTAINER_DEFAULT_PLATFORM` is
+  resolved into the effective config platform when no explicit option is
+  supplied, so the same platform reaches image inspection, pull flights,
+  pulls, and run. The
+  resource and forwarding checks require at least 200 MiB of memory,
+  published ports 2–65535, and no more than 64 publish descriptors. Network
+  names are lowercase, 1–63 characters, and may use dots, hyphens, or
+  underscores only between alphanumerics.
 - Several Docker features do not exist: healthchecks, a `wait`
   command, an event stream, label filters on `ls`, and re-attaching to
   a running container. Their behavior must be reproduced client-side.
@@ -61,7 +69,9 @@ The design decisions below rest on these properties of Apple Container
 - Error classification depends on CLI stderr substrings owned by
   `engine_apple.go` (name conflict, image/container missing). Those
   matchers are regression-tested against a live CLI in
-  `cli_compat_integration_test.go`.
+  `cli_compat_integration_test.go`. The capability matrix additionally
+  requires `CONTAINERGO_BACKEND=apple` and `CONTAINERGO_APPLE_LIVE=1`,
+  and skips when the API-server version cannot be established.
 - Apple Container's `run` and `create` commands resolve the image as part of
   their normal path and expose no `--pull=never` equivalent. A strict
   `PullNever` guarantee is therefore unavailable on Apple; the backend
@@ -368,8 +378,8 @@ too, but validating first gives clearer errors and independence from
 future CLI changes. `appleEngine.checkConfig` applies backend-specific
 platform, name, network, memory, and publish limits before image
 resolution; `WithExposedPorts` remains a library-side declaration and is not
-converted into an Apple `--publish` flag. Docker keeps its own backend-specific
-checks.
+converted into an Apple `--publish` flag. The same check runs for the public
+`Pull` path. Docker keeps its own backend-specific checks.
 
 **Handle no credentials**. Registry auth is delegated to
 `container registry login` (credentials live in the macOS Keychain);
@@ -492,11 +502,13 @@ stopped / stopping / unknown), labels, the container IP, and host-side
 port bindings (container port → host address and port).
 
 **Apple capability differences**: `appleEngine.checkConfig` rejects
-non-Linux platforms, Apple-invalid container/network names, memory below
-200 MiB (including overflow), published port 1, overlapping publishes, and more than
+non-Linux or malformed Apple platforms (including bare `linux` and invalid
+variants), Apple-invalid container/network names, memory below 200 MiB
+(including overflow), published port 1, overlapping publishes, and more than
 64 publish descriptors before invoking the CLI. `PullNever` is also rejected
 with `ErrPullNeverUnsupported`, because Apple has no run-time no-fetch flag;
-`PullMissing` and `PullAlways` are the explicit documented fallbacks.
+`PullMissing` and `PullAlways` are the explicit documented fallbacks. The
+public `Pull` helper applies the same platform and capability validation.
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults
@@ -570,8 +582,8 @@ v0.2 (Docker backend) proceeds as:
 
 ## References
 
-- [apple/container](https://github.com/apple/container) v1.2.2
-  command reference and `ContainerResource` sources
+- [apple/container](https://github.com/apple/container) v1.2.2 and v1.3.0
+  command/source references and `ContainerResource` sources
 - [shiguredo/container-rs](https://github.com/shiguredo/container-rs):
   the direct-XPC prior art; its watchdog reaper, cleanup contract, and
   catalog of macOS-specific constraints (port races, forwarding

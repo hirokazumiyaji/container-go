@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
 func requireAppleCLI(t *testing.T) {
@@ -23,7 +25,9 @@ func requireAppleCLI(t *testing.T) {
 	if _, err := exec.LookPath("container"); err != nil {
 		t.Skip("container CLI not installed")
 	}
-	if err := exec.Command("container", "system", "status").Run(); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := exec.CommandContext(ctx, "container", "system", "status").Run(); err != nil {
 		t.Skip("apple container system service not running; run `container system start`")
 	}
 }
@@ -41,6 +45,17 @@ func requireDockerCLI(t *testing.T) {
 	}
 }
 
+func requireAppleCapabilityLive(t *testing.T) {
+	t.Helper()
+	if os.Getenv(appleCapabilityLiveEnv) != "1" {
+		t.Skipf("set %s=1 to run the Apple capability matrix", appleCapabilityLiveEnv)
+	}
+	if backend := os.Getenv(backendEnv); backend != "apple" {
+		t.Skipf("the Apple capability matrix requires %s=apple (got %q)", backendEnv, backend)
+	}
+	requireAppleCLI(t)
+}
+
 // TestIntegrationAppleCLIErrorMatchers exercises nameConflict,
 // imageMissing, and containerMissing against live Apple Container stderr.
 func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
@@ -48,13 +63,14 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	eng := appleEngine{}
 	r := &cli.ExecRunner{Binary: eng.binary()}
 	ctx := context.Background()
-	name := fmt.Sprintf("containergo-compat-%d", time.Now().UnixNano())
+	token := newAppleCapabilityToken(t)
+	name := appleCapabilityName(token, "compat")
 
-	if _, _, err := r.Run(ctx, "run", "--detach", "--name", name, integrationRedis); err != nil {
+	if _, _, err := r.Run(ctx, "run", "--detach", "--name", name, "--label", appleCapabilityLabel+"="+token, integrationRedis); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _, _ = r.Run(context.Background(), "delete", "--force", name)
+		cleanupAppleCapabilityContainer(t, r, name, token)
 	})
 
 	_, _, conflictErr := r.Run(ctx, "run", "--detach", "--name", name, integrationRedis)
@@ -85,56 +101,218 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	}
 }
 
-// requireAppleCapabilityVersion keeps the live matrix tied to the two Apple
-// releases whose source/help was used to derive the Go validator. A newer
-// CLI is not silently treated as proof of an older contract.
+const appleCapabilityLabel = "com.github.hirokazumiyaji.container-go.capability-test"
+
+var appleCapabilityFixtureVersions = map[string]struct{}{
+	"1.2.2": {},
+	"1.3.0": {},
+}
+
+type appleVersionEntry struct {
+	AppName string `json:"appName"`
+	Version string `json:"version"`
+}
+
+type appleStatusVersion struct {
+	APIServerVersion string `json:"apiServerVersion"`
+}
+
+// requireAppleCapabilityVersion keeps the live matrix tied to the Apple
+// releases whose source/help was used to derive the Go validator. It also
+// records the API-server version separately: a CLI-only response is not
+// evidence that the server/API version is known.
 func requireAppleCapabilityVersion(t *testing.T, r *cli.ExecRunner) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	stdout, _, err := r.Run(ctx, "system", "version", "--format", "json")
+	stdout, stderr, err := r.Run(ctx, "system", "version", "--format", "json")
 	if err != nil {
-		t.Skipf("cannot read Apple Container version: %v", err)
+		t.Skipf("cannot read Apple Container version: %v (%s)", err, stderr)
 	}
-	var entries []struct {
-		AppName string `json:"appName"`
-		Version string `json:"version"`
-	}
+	var entries []appleVersionEntry
 	if err := json.Unmarshal(stdout, &entries); err != nil {
 		t.Skipf("cannot decode Apple Container version %q: %v", stdout, err)
 	}
-	version := ""
+
+	cliVersion := ""
+	apiVersion := ""
 	for _, entry := range entries {
-		if entry.AppName == "container" {
-			version = entry.Version
-			break
+		switch entry.AppName {
+		case "container":
+			if cliVersion == "" {
+				cliVersion = strings.TrimSpace(entry.Version)
+			}
+		case "container-apiserver":
+			if apiVersion == "" {
+				apiVersion = strings.TrimSpace(entry.Version)
+			}
 		}
 	}
-	if version == "" && len(entries) > 0 {
-		version = entries[0].Version
+	if cliVersion == "" {
+		t.Skipf("Apple Container version response has no container CLI entry: %q", stdout)
 	}
-	if version != "1.2.2" && version != "1.3.0" {
-		t.Skipf("Apple Container %s is outside the 1.2.2/1.3.0 capability fixtures", version)
+	if _, ok := appleCapabilityFixtureVersions[cliVersion]; !ok {
+		t.Skipf("Apple Container CLI %s is outside the 1.2.2/1.3.0 capability fixtures", cliVersion)
 	}
-	return version
+
+	// Older service combinations can omit the server component from
+	// `system version`; status JSON exposes the same API-server fields.
+	if apiVersion == "" {
+		statusCtx, statusCancel := context.WithTimeout(context.Background(), 30*time.Second)
+		statusOut, statusErr, statusRunErr := r.Run(statusCtx, "system", "status", "--format", "json")
+		statusCancel()
+		if statusRunErr != nil {
+			t.Skipf("Apple Container API server version is unavailable from system status: %v (%s)", statusRunErr, statusErr)
+		}
+		var status appleStatusVersion
+		if err := json.Unmarshal(statusOut, &status); err != nil {
+			t.Skipf("cannot decode Apple Container system status %q: %v", statusOut, err)
+		}
+		apiVersion = strings.TrimSpace(status.APIServerVersion)
+	}
+	if apiVersion == "" {
+		t.Skipf("Apple Container CLI %s is available, but the API server version is unavailable; skipping the live matrix", cliVersion)
+	}
+	if _, ok := appleCapabilityFixtureVersions[apiVersion]; !ok {
+		t.Skipf("Apple Container API server %s is outside the 1.2.2/1.3.0 capability fixtures", apiVersion)
+	}
+	if apiVersion != cliVersion {
+		t.Skipf("Apple Container CLI %s and API server %s differ; skipping the live matrix", cliVersion, apiVersion)
+	}
+	t.Logf("using Apple Container CLI/API server version %s", cliVersion)
+	return cliVersion
 }
 
-func runAppleCapabilityCase(t *testing.T, r *cli.ExecRunner, args []string, want string) {
+func newAppleCapabilityToken(t *testing.T) string {
 	t.Helper()
-	name := ""
-	for i, arg := range args {
-		if arg == "--name" && i+1 < len(args) {
-			name = args[i+1]
-			break
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		t.Fatalf("generate Apple capability test identity: %v", err)
+	}
+	return fmt.Sprintf("%d-%x", os.Getpid(), b)
+}
+
+func appleCapabilityName(token, suffix string) string {
+	return "containergo-cap-" + token + "-" + suffix
+}
+
+func appleCapabilityArgs(name, token string, extra ...string) []string {
+	args := []string{"run", "--detach", "--name", name, "--label", appleCapabilityLabel + "=" + token}
+	args = append(args, extra...)
+	return append(args, integrationAlpine, "true")
+}
+
+func requireAppleCapabilityNameFree(t *testing.T, r *cli.ExecRunner, name string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, stderr, err := r.Run(ctx, "inspect", name)
+	if err == nil {
+		t.Skipf("refusing to touch existing Apple container %q", name)
+	}
+	if !isNotFound(err) {
+		t.Skipf("cannot verify that Apple container %q is unused; refusing cleanup: %v (%s)", name, err, stderr)
+	}
+}
+
+func appleCapabilityOwned(r *cli.ExecRunner, name, token string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stdout, _, err := r.Run(ctx, "inspect", name)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	containers, err := inspect.Decode(stdout)
+	if err != nil {
+		return false, err
+	}
+	for _, ctr := range containers {
+		if ctr.ID == name && ctr.Configuration.Labels[appleCapabilityLabel] == token {
+			return true, nil
 		}
 	}
-	if name != "" {
-		defer func() {
-			cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cleanupCancel()
-			_, _, _ = r.Run(cleanupCtx, "delete", "--force", name)
-		}()
+	return false, nil
+}
+
+func cleanupAppleCapabilityContainer(t *testing.T, r *cli.ExecRunner, name, token string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	unlock, err := lockName(ctx, name)
+	if err != nil {
+		t.Logf("Apple capability cleanup %s: lock name: %v", name, err)
+		return
 	}
+	defer unlock()
+
+	owned, err := appleCapabilityOwned(r, name, token)
+	if err != nil {
+		t.Logf("Apple capability cleanup %s: inspect ownership: %v", name, err)
+		return
+	}
+	if !owned {
+		// A name collision or an external replacement must never turn into
+		// deletion of a container that this test did not create.
+		return
+	}
+	_, stderr, err := r.Run(ctx, "delete", "--force", name)
+	if err != nil && !isNotFound(err) {
+		t.Logf("Apple capability cleanup %s: delete: %v (%s)", name, err, stderr)
+	}
+}
+
+func dockerLiveOwned(r *cli.ExecRunner, name, token string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	stdout, _, err := r.Run(ctx, "inspect", name)
+	if err != nil {
+		if isNotFound(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	info, err := (dockerEngine{}).parseInspect(stdout, name)
+	if err != nil {
+		return false, err
+	}
+	return info.labels[appleCapabilityLabel] == token, nil
+}
+
+func cleanupDockerLiveContainer(t *testing.T, r *cli.ExecRunner, name, token string) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	unlock, err := lockName(ctx, name)
+	if err != nil {
+		t.Logf("Docker live-test cleanup %s: lock name: %v", name, err)
+		return
+	}
+	defer unlock()
+
+	owned, err := dockerLiveOwned(r, name, token)
+	if err != nil {
+		t.Logf("Docker live-test cleanup %s: inspect ownership: %v", name, err)
+		return
+	}
+	if !owned {
+		return
+	}
+	_, stderr, err := r.Run(ctx, "rm", "--force", name)
+	if err != nil && !isNotFound(err) {
+		t.Logf("Docker live-test cleanup %s: delete: %v (%s)", name, err, stderr)
+	}
+}
+
+func runAppleCapabilityCase(t *testing.T, r *cli.ExecRunner, name, token string, args []string, want string) {
+	t.Helper()
+	if want == "" {
+		t.Fatal("Apple capability case has no assertion")
+	}
+	requireAppleCapabilityNameFree(t, r, name)
+	defer cleanupAppleCapabilityContainer(t, r, name, token)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
@@ -142,21 +320,22 @@ func runAppleCapabilityCase(t *testing.T, r *cli.ExecRunner, args []string, want
 	if err == nil {
 		t.Fatalf("Apple capability case unexpectedly succeeded: %s (stdout=%s)", strings.Join(args, " "), stdout)
 	}
-	if want != "" && !strings.Contains(strings.ToLower(string(stdout)+string(stderr)), strings.ToLower(want)) {
-		t.Fatalf("Apple capability case %q: stderr %q does not contain %q", strings.Join(args, " "), stderr, want)
+	output := strings.ToLower(string(stdout) + "\n" + string(stderr))
+	if !strings.Contains(output, strings.ToLower(want)) {
+		t.Fatalf("Apple capability case %q: output %q does not contain %q", strings.Join(args, " "), output, want)
 	}
 }
 
-// TestIntegrationAppleCapabilityMatrix exercises the limits that are easy to
-// regress in the Apple CLI itself. It is intentionally version-gated to the
-// 1.2.2 and 1.3.0 source/help fixtures; the Go-side early rejection is covered
-// by unit tests and does not require a live daemon.
+// TestIntegrationAppleCapabilityMatrix is an explicitly opt-in live test. It
+// is version-gated to the 1.2.2 and 1.3.0 fixtures, uses one ownership label
+// and unique name per case, and never deletes a name whose label is not its
+// own. The Go-side early rejection is covered by unit tests.
 func TestIntegrationAppleCapabilityMatrix(t *testing.T) {
-	requireAppleCLI(t)
+	requireAppleCapabilityLive(t)
 	eng := appleEngine{}
 	r := &cli.ExecRunner{Binary: eng.binary()}
 	version := requireAppleCapabilityVersion(t, r)
-	t.Logf("checking Apple Container capability matrix for %s", version)
+	t.Logf("checking Apple Container capability matrix for CLI/API %s", version)
 
 	pullCtx, pullCancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	_, pullStderr, pullErr := r.Run(pullCtx, "image", "pull", integrationAlpine)
@@ -165,50 +344,76 @@ func TestIntegrationAppleCapabilityMatrix(t *testing.T) {
 		t.Skipf("cannot prepare Apple capability fixture image: %v (%s)", pullErr, pullStderr)
 	}
 
+	token := newAppleCapabilityToken(t)
 	cases := []struct {
-		name string
-		args []string
-		want string
+		name   string
+		suffix string
+		extra  []string
+		want   string
 	}{
 		{
-			name: "one-character container name",
-			args: []string{"run", "--detach", "--name", "a", integrationAlpine, "true"},
-			want: "valid container ID",
+			name:   "one-character container name",
+			suffix: "name",
+			want:   "valid container ID",
 		},
 		{
-			name: "non-Linux platform",
-			args: []string{"run", "--detach", "--name", "containergo-cap-platform", "--platform", "windows/amd64", integrationAlpine, "true"},
+			name:   "bare Linux platform",
+			suffix: "bare-platform",
+			extra:  []string{"--platform", "linux"},
+			want:   "missing architecture",
 		},
 		{
-			name: "invalid network name",
-			args: []string{"run", "--detach", "--name", "containergo-cap-network", "--network", "INVALID", integrationAlpine, "true"},
-			want: "network",
+			name:   "non-Linux platform",
+			suffix: "platform",
+			extra:  []string{"--platform", "windows/amd64"},
+			want:   "unsupported platform",
 		},
 		{
-			name: "host port one",
-			args: []string{"run", "--detach", "--name", "containergo-cap-port", "--publish", "1:80", integrationAlpine, "true"},
-			want: "invalid publish host port",
+			name:   "invalid platform variant",
+			suffix: "variant",
+			extra:  []string{"--platform", "linux/arm64/v7"},
+			want:   "invalid variant",
 		},
 		{
-			name: "memory below minimum",
-			args: []string{"run", "--detach", "--name", "containergo-cap-memory", "--memory", "1K", integrationAlpine, "true"},
-			want: "minimum memory amount allowed is 200 MiB",
+			name:   "invalid network name",
+			suffix: "network",
+			extra:  []string{"--network", "INVALID"},
+			want:   "network",
+		},
+		{
+			name:   "host port one",
+			suffix: "port",
+			extra:  []string{"--publish", "1:80"},
+			want:   "invalid publish host port",
+		},
+		{
+			name:   "memory below minimum",
+			suffix: "memory",
+			extra:  []string{"--memory", "1K"},
+			want:   "minimum memory amount allowed is 200 MiB",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			runAppleCapabilityCase(t, r, tc.args, tc.want)
+			// The one-character case necessarily uses "a"; the preflight
+			// refuses to touch it if a user already owns that name.
+			name := "a"
+			if tc.suffix != "name" {
+				name = appleCapabilityName(token, tc.suffix)
+			}
+			runAppleCapabilityCase(t, r, name, token, appleCapabilityArgs(name, token, tc.extra...), tc.want)
 		})
 	}
 
 	// The upstream limit is a count of publish descriptors, not a count of
 	// ports in one range. Use unique descriptors to reach exactly 65.
-	args := []string{"run", "--detach", "--name", "containergo-cap-count"}
+	name := appleCapabilityName(token, "count")
+	args := []string{"run", "--detach", "--name", name, "--label", appleCapabilityLabel + "=" + token}
 	for i := 0; i < applePublishedPortLimit+1; i++ {
 		args = append(args, "--publish", fmt.Sprintf("%d:80/tcp", 20000+i))
 	}
 	args = append(args, integrationAlpine, "true")
-	runAppleCapabilityCase(t, r, args, "cannot exceed more than 64 port publish descriptors")
+	runAppleCapabilityCase(t, r, name, token, args, "cannot exceed more than 64 port publish descriptors")
 }
 
 // TestIntegrationDockerCLIErrorMatchers exercises the Docker matchers
@@ -218,13 +423,14 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	eng := dockerEngine{}
 	r := &cli.ExecRunner{Binary: eng.binary()}
 	ctx := context.Background()
-	name := fmt.Sprintf("containergo-compat-%d", time.Now().UnixNano())
+	token := newAppleCapabilityToken(t)
+	name := appleCapabilityName(token, "compat")
 
-	if _, _, err := r.Run(ctx, "run", "-d", "--name", name, integrationRedis); err != nil {
+	if _, _, err := r.Run(ctx, "run", "-d", "--name", name, "--label", appleCapabilityLabel+"="+token, integrationRedis); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _, _ = r.Run(context.Background(), "rm", "--force", name)
+		cleanupDockerLiveContainer(t, r, name, token)
 	})
 
 	_, _, conflictErr := r.Run(ctx, "run", "-d", "--name", name, integrationRedis)

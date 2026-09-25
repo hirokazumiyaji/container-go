@@ -42,14 +42,18 @@ macOS で Docker(Docker Desktop など)を使う場合は
 
 Go 1.23 以上が必要です。
 
-動作確認済みバックエンド(本ライブラリがマッチする CLI stderr 文言と
+動作確認済みのバックエンド(本ライブラリがマッチする CLI stderr 文言と
 inspect JSON 形状):
 
-| バックエンド | 確認済みバージョン |
+| バックエンド | このリポジトリで確認した根拠 |
 |---|---|
-| Apple Container | 1.2.x–1.3.x |
+| Apple Container CLI | 1.2.2 / 1.3.0 の source・help・inspect fixture |
 | Docker Engine / CLI | 29.x |
 
+Apple の API サーババージョンは `container system version` または
+`container system status` から実行時に取得し、CLI バージョンから推測しません。
+オプトインした live matrix は、サーババージョンを取得できない場合や CLI と
+異なる場合に skip するため、未確認の API サーバ互換範囲を主張しません。
 新しい CLI ではエラー文言や JSON フィールドが変わる可能性があります。
 `engine_apple.go` / `engine_docker.go` 先頭の stderr マッチャと、
 `internal/inspect/testdata/`・`testdata/` のフィクスチャを参照してください。
@@ -148,7 +152,22 @@ no-network 保証ではありません。
 ### Apple の capability validation
 
 Apple backend は image の解決や container create の前に静的 capability を検証します。
-Apple は Linux image のみを実行するため、`WithPlatform` や platform 未指定時の `CONTAINER_DEFAULT_PLATFORM` の non-Linux 指定を拒否します。
+Apple が受理する platform grammar は `os/arch[/variant]` で、bare `linux` や
+選択した architecture に定義されていない variant を拒否します。platform
+未指定時の `CONTAINER_DEFAULT_PLATFORM` は実効 platform として解決し、image
+inspect、pull flight、pull、run で同じ値を使います。明示した `WithPlatform`
+が優先されます。これは Apple CLI の設定なので Docker では消費しません。
+Apple 固有の grammar も Docker には適用しません。
+
+live matrix は `CONTAINERGO_BACKEND=apple` と `CONTAINERGO_APPLE_LIVE=1` の
+両方を明示した場合だけ実行します。一意な name と ownership label を使い、
+label が一致しない container は削除しません。
+
+```sh
+CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
+  go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
+```
+
 `container name` は 2〜63 文字の Apple 規則、network name は小文字の 1〜63 文字です。
 公開 API の `WithNetwork` は MAC/MTU の comma 付き property を意図的に受け付けません。
 memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G`/`T`/`P` suffix)表記を使い、unit 誤りや overflow を拒否します。

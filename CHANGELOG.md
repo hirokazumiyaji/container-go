@@ -12,10 +12,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Validate Apple Container's platform, name, network, port, and memory
   capabilities before image resolution; reject unsupported `PullNever` with
   `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.
-- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
-  versions; centralize stderr matchers on each engine with source comments;
-  add live CLI compatibility integration tests; add Apple inspect fixture
-  for 1.3.0.
+- Document Apple Container CLI source/help and inspect fixtures for 1.2.2
+  and 1.3.0, plus Docker 29.x CLI behavior. The live Apple matrix is
+  explicitly opt-in, reports an unavailable or mismatched API-server version
+  as a skip, and uses ownership-checked cleanup.
+- Resolve Apple Container's `CONTAINER_DEFAULT_PLATFORM` into the effective
+  platform across image inspection, pull flights, pulls, and runs; apply the
+  same capability checks to public `Pull`.
 
 ### Changed
 

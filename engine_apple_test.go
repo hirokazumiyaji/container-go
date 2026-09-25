@@ -40,7 +40,9 @@ func TestAppleCapabilityValidationPrecedesCLI(t *testing.T) {
 		name string
 		opt  Option
 	}{
-		{name: "platform", opt: WithPlatform("windows/amd64")},
+		{name: "bare platform", opt: WithPlatform("linux")},
+		{name: "non-Linux platform", opt: WithPlatform("windows/amd64")},
+		{name: "invalid platform variant", opt: WithPlatform("linux/arm64/v7")},
 		{name: "container name", opt: WithName("a")},
 		{name: "network name", opt: WithNetwork("INVALID")},
 		{name: "published port", opt: WithPublishedPort("1:80")},
@@ -56,14 +58,25 @@ func TestAppleCheckConfigPlatform(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		platform string
-		wantErr  bool
+		wantErr  string
 	}{
-		{name: "default", platform: "", wantErr: false},
-		{name: "linux", platform: "linux", wantErr: false},
-		{name: "linux amd64", platform: "linux/amd64", wantErr: false},
-		{name: "linux variant", platform: "linux/arm/v7", wantErr: false},
-		{name: "windows", platform: "windows/amd64", wantErr: true},
-		{name: "freebsd", platform: "freebsd/amd64", wantErr: true},
+		{name: "default"},
+		{name: "linux amd64", platform: "linux/amd64"},
+		{name: "linux arm64", platform: "linux/arm64"},
+		{name: "linux arm v7", platform: "linux/arm/v7"},
+		{name: "linux arm v8", platform: "linux/arm/v8"},
+		{name: "armhf v7", platform: "linux/armhf/v7"},
+		{name: "armel v6", platform: "linux/armel/v6"},
+		{name: "aarch64 8", platform: "linux/aarch64/8"},
+		{name: "amd64 v1", platform: "linux/amd64/v1"},
+		{name: "bare linux", platform: "linux", wantErr: "os/arch"},
+		{name: "windows", platform: "windows/amd64", wantErr: "only linux"},
+		{name: "freebsd", platform: "freebsd/amd64", wantErr: "only linux"},
+		{name: "arm64 v7", platform: "linux/arm64/v7", wantErr: "not valid"},
+		{name: "arm v9", platform: "linux/arm/v9", wantErr: "not valid"},
+		{name: "amd64 v2", platform: "linux/amd64/v2", wantErr: "not valid"},
+		{name: "x86 v3", platform: "linux/x86_64/v3", wantErr: "not valid"},
+		{name: "ppc64le variant", platform: "linux/ppc64le/v1", wantErr: "not valid"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := appleCapabilityConfig(t)
@@ -73,9 +86,9 @@ func TestAppleCheckConfigPlatform(t *testing.T) {
 				}
 			}
 			err := (appleEngine{}).checkConfig(cfg)
-			if tc.wantErr {
-				if err == nil || !strings.Contains(err.Error(), "linux") {
-					t.Fatalf("checkConfig(%q) = %v, want Linux capability error", tc.platform, err)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("checkConfig(%q) = %v, want error containing %q", tc.platform, err, tc.wantErr)
 				}
 				return
 			}
@@ -87,15 +100,24 @@ func TestAppleCheckConfigPlatform(t *testing.T) {
 }
 
 func TestAppleCheckConfigUsesDefaultPlatformEnvironment(t *testing.T) {
-	t.Setenv("CONTAINER_DEFAULT_PLATFORM", "windows/amd64")
+	t.Setenv(defaultPlatformEnv, "windows/amd64")
 	cfg := appleCapabilityConfig(t)
 	if err := (appleEngine{}).checkConfig(cfg); err == nil || !strings.Contains(err.Error(), "linux") {
 		t.Fatalf("checkConfig with non-Linux default = %v, want Linux capability error", err)
 	}
 
-	t.Setenv("CONTAINER_DEFAULT_PLATFORM", "linux/arm64")
+	t.Setenv(defaultPlatformEnv, "linux/arm64")
+	cfg = appleCapabilityConfig(t)
 	if err := (appleEngine{}).checkConfig(cfg); err != nil {
 		t.Fatalf("checkConfig with Linux default = %v", err)
+	}
+	if cfg.platform != "linux/arm64" {
+		t.Fatalf("effective platform = %q, want linux/arm64", cfg.platform)
+	}
+
+	t.Setenv(defaultPlatformEnv, "linux/arm64/v7")
+	if err := (appleEngine{}).checkConfig(appleCapabilityConfig(t)); err == nil || !strings.Contains(err.Error(), "not valid") {
+		t.Fatalf("checkConfig with invalid variant default = %v", err)
 	}
 }
 
@@ -239,6 +261,23 @@ func TestAppleCheckConfigMemory(t *testing.T) {
 	}
 	if _, err := appleMemoryBytes("18446744073709551616"); err == nil || !strings.Contains(err.Error(), "overflow") {
 		t.Fatalf("byte overflow = %v, want overflow error", err)
+	}
+}
+
+func TestAppleDefaultPlatformValidationPrecedesImageWork(t *testing.T) {
+	for _, platform := range []string{"linux", "linux/arm64/v7", "windows/amd64"} {
+		t.Run(platform, func(t *testing.T) {
+			t.Setenv(defaultPlatformEnv, platform)
+			f := newTestRunner()
+			_, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
+			if err == nil {
+				t.Fatalf("Run accepted invalid Apple default platform %q", platform)
+			}
+			if len(f.calls) != 0 {
+				t.Fatalf("invalid Apple default reached image work: %v", f.calls)
+			}
+		})
 	}
 }
 

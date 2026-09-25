@@ -86,6 +86,151 @@ func TestPlatformEmptyPreservesCallCounts(t *testing.T) {
 	}
 }
 
+func hasPlatformArg(args []string, platform string) bool {
+	for i := 0; i+1 < len(args); i++ {
+		if args[i] == "--platform" && args[i+1] == platform {
+			return true
+		}
+	}
+	return false
+}
+
+func TestRunResolvesDefaultPlatformForInspectPullAndRun(t *testing.T) {
+	t.Setenv(defaultPlatformEnv, "linux/arm64")
+	f := newTestRunner()
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPullPolicy(PullMissing), withRunner(f), withEngine(appleEngine{})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var inspect, pull, run []string
+	for _, call := range f.calls {
+		switch {
+		case len(call) >= 2 && call[0] == "image" && call[1] == "inspect":
+			inspect = call
+		case len(call) >= 2 && call[0] == "image" && call[1] == "pull":
+			pull = call
+		case len(call) > 0 && call[0] == "run":
+			run = call
+		}
+	}
+	if inspect == nil || pull == nil || run == nil {
+		t.Fatalf("inspect/pull/run calls missing: %v", f.calls)
+	}
+	// Apple image inspect has no --platform option; imageExists receives the
+	// effective platform and applies it while parsing returned variants.
+	if hasPlatformArg(inspect, "linux/arm64") {
+		t.Fatalf("Apple image inspect unexpectedly used --platform: %v", inspect)
+	}
+	if !hasPlatformArg(pull, "linux/arm64") || !hasPlatformArg(run, "linux/arm64") {
+		t.Fatalf("effective platform missing from pull/run: %v", f.calls)
+	}
+}
+
+func TestExplicitPlatformOverridesDefaultPlatform(t *testing.T) {
+	t.Setenv(defaultPlatformEnv, "linux/arm64")
+	f := newTestRunner()
+	f.imagePresent = true
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPlatform("linux/amd64"), withRunner(f), withEngine(appleEngine{})); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	for _, call := range f.calls {
+		if hasPlatformArg(call, "linux/arm64") {
+			t.Fatalf("default platform overrode explicit platform: %v", call)
+		}
+	}
+	if !hasPlatformArg(f.callWith("run"), "linux/amd64") {
+		t.Fatalf("run args do not use explicit platform: %v", f.callWith("run"))
+	}
+}
+
+func TestPullWithResolvesDefaultPlatform(t *testing.T) {
+	t.Setenv(defaultPlatformEnv, "linux/arm64")
+	f := newTestRunner()
+	if err := pullWith(context.Background(), f, appleEngine{}, "redis:7-alpine"); err != nil {
+		t.Fatalf("pullWith: %v", err)
+	}
+	var pull []string
+	for _, call := range f.calls {
+		if len(call) >= 2 && call[0] == "image" && call[1] == "pull" {
+			pull = call
+		}
+	}
+	if f.pullCalls != 1 || !hasPlatformArg(pull, "linux/arm64") {
+		t.Fatalf("pull did not use effective platform: calls=%v", f.calls)
+	}
+}
+
+func TestPullWithAppliesAppleCapabilityValidation(t *testing.T) {
+	for _, platform := range []string{"linux", "windows/amd64", "linux/arm64/v7"} {
+		t.Run(platform, func(t *testing.T) {
+			t.Setenv(defaultPlatformEnv, platform)
+			f := newTestRunner()
+			err := pullWith(context.Background(), f, appleEngine{}, "redis:7-alpine")
+			if err == nil {
+				t.Fatalf("pullWith accepted Apple default platform %q", platform)
+			}
+			if len(f.calls) != 0 {
+				t.Fatalf("invalid Apple default reached CLI: %v", f.calls)
+			}
+		})
+	}
+}
+
+func TestExplicitPlatformIgnoresInvalidAppleDefault(t *testing.T) {
+	t.Setenv(defaultPlatformEnv, "not-a-platform")
+	f := newTestRunner()
+	f.imagePresent = true
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPlatform("linux/amd64"), withRunner(f), withEngine(appleEngine{})); err != nil {
+		t.Fatalf("explicit platform should take precedence over invalid default: %v", err)
+	}
+}
+
+func TestDockerIgnoresAppleDefaultPlatform(t *testing.T) {
+	t.Setenv(defaultPlatformEnv, "linux/arm64")
+	f := newTestRunner()
+	f.imagePresent = true
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(f), withEngine(dockerEngine{})); err != nil {
+		t.Fatalf("Docker unexpectedly consumed Apple default platform: %v", err)
+	}
+	for _, call := range f.calls {
+		if hasPlatformArg(call, "linux/arm64") {
+			t.Fatalf("Docker unexpectedly used Apple default platform: %v", call)
+		}
+	}
+}
+
+func TestDockerKeepsBarePlatformCompatible(t *testing.T) {
+	f := newTestRunner()
+	f.imagePresent = true
+	if _, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPlatform("linux"), withRunner(f), withEngine(dockerEngine{})); err != nil {
+		t.Fatalf("Docker rejected bare platform: %v", err)
+	}
+	if !hasPlatformArg(f.callWith("run"), "linux") {
+		t.Fatalf("run args missing bare platform: %v", f.callWith("run"))
+	}
+}
+
+func TestDockerKeepsGenericVariantPlatforms(t *testing.T) {
+	for _, platform := range []string{"linux/arm64/v7", "linux/amd64/v2", "linux/unknown"} {
+		t.Run(platform, func(t *testing.T) {
+			f := newTestRunner()
+			f.imagePresent = true
+			if _, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), WithPlatform(platform), withRunner(f), withEngine(dockerEngine{})); err != nil {
+				t.Fatalf("Docker rejected generic platform %q: %v", platform, err)
+			}
+			if !hasPlatformArg(f.callWith("run"), platform) {
+				t.Fatalf("run args missing platform %q: %v", platform, f.callWith("run"))
+			}
+		})
+	}
+}
+
 func TestAppleParseImageExistsPlatform(t *testing.T) {
 	data := []byte(`[{"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}]`)
 	if !(appleEngine{}).parseImageExists(data, "linux/arm64") {

@@ -357,11 +357,14 @@ func WithNetwork(name string) Option {
 	}
 }
 
-// platformRE matches "os", "os/arch", or "os/arch/variant".
+// platformRE matches the shared Docker-style "os", "os/arch", or
+// "os/arch/variant" forms. Apple applies its stricter os/arch[/variant]
+// grammar in checkConfig.
 var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
 
 // WithPlatform selects the image platform, e.g. "linux/amd64" (runs via
-// Rosetta).
+// Rosetta). Apple Container applies its own os/arch[/variant] and variant
+// validation after this shared syntax check.
 func WithPlatform(p string) Option {
 	return func(c *config) error {
 		if !platformRE.MatchString(p) {

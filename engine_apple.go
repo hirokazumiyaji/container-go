@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -17,8 +16,10 @@ import (
 // appleEngine drives Apple Container's `container` CLI.
 type appleEngine struct{}
 
-// Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Verified against Apple Container CLI source/help and inspect fixtures for
+// 1.2.2 and 1.3.0. API-server versions are runtime-reported and are not
+// inferred from the CLI version. Stderr substrings below are matched
+// case-insensitively on CLIError.Stderr.
 // Sources (apple/container):
 //   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,
 //     message: "container with id \(id) already exists")
@@ -56,29 +57,60 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
+// validateApplePlatform mirrors ContainerizationOCI.Platform's grammar while
+// applying Apple Container's Linux-only run/create contract. Apple requires an
+// architecture and only accepts variants defined for that architecture.
+func validateApplePlatform(platform string) error {
+	parts := strings.Split(platform, "/")
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+	}
+	if len(parts) > 3 || (len(parts) == 3 && parts[2] == "") {
+		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+	}
+	if parts[0] != "linux" {
+		return fmt.Errorf("apple backend supports only linux platforms, got %q", platform)
+	}
+
+	arch := parts[1]
+	if len(parts) == 2 {
+		return nil
+	}
+	variant := parts[2]
+	valid := false
+	switch arch {
+	case "arm":
+		valid = variant == "v5" || variant == "v6" || variant == "v7" || variant == "v8"
+	case "armhf":
+		valid = variant == "v7"
+	case "armel":
+		valid = variant == "v6"
+	case "aarch64", "arm64":
+		valid = variant == "v8" || variant == "8"
+	case "x86_64", "x86-64", "amd64":
+		valid = variant == "v1"
+	}
+	if !valid {
+		return fmt.Errorf("invalid platform %q for Apple backend: variant %q is not valid for architecture %q", platform, variant, arch)
+	}
+	return nil
+}
+
 // checkConfig applies the parts of Apple Container's CLI contract that are
 // independent of the current service state. The Apple CLI performs these
 // checks only after it has already resolved the image, so doing them here
 // avoids surprising pulls and makes the backend limits visible to callers.
 func (appleEngine) checkConfig(cfg *config) error {
+	if err := resolveEffectivePlatform(cfg); err != nil {
+		return err
+	}
 	if cfg.pullPolicy == PullNever {
 		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
 	}
 
-	platform := cfg.platform
-	if platform == "" {
-		// Apple resolves this environment variable itself when no
-		// --platform flag is supplied. Validate it here as well so a
-		// non-Linux default cannot reach the CLI.
-		platform = os.Getenv("CONTAINER_DEFAULT_PLATFORM")
-	}
-	if platform != "" {
-		if !platformRE.MatchString(platform) {
-			return fmt.Errorf("invalid platform %q for Apple backend", platform)
-		}
-		osName, _, _ := splitPlatform(platform)
-		if osName != "linux" {
-			return fmt.Errorf("apple backend supports only linux platforms, got %q", platform)
+	if cfg.platform != "" {
+		if err := validateApplePlatform(cfg.platform); err != nil {
+			return err
 		}
 	}
 

@@ -59,13 +59,18 @@ func Pull(ctx context.Context, image string) error {
 	return pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image)
 }
 
-// pullWith is the fake-runner-driven core of Pull: the flight shares one
-// backend pull of the image, and failures go through Classify.
+// pullWith is the fake-runner-driven core of Pull. It resolves and validates
+// the effective backend configuration before entering the pull flight, so the
+// public helper and Run apply the same platform and capability rules.
 func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error {
-	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, ""), func() error {
+	cfg := &config{runner: r, eng: eng}
+	if err := eng.checkConfig(cfg); err != nil {
+		return err
+	}
+	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, cfg.platform), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
-		return pullImage(execCtx, r, eng, image, "")
+		return pullImage(execCtx, r, eng, image, cfg.platform)
 	})
 }
 
@@ -86,6 +91,9 @@ var imageFlights flightGroup[struct{}]
 // the image, operation, and platform: the first caller inspects and/or
 // pulls, the rest wait.
 func (c *config) ensureImage(ctx context.Context, image string) error {
+	if err := c.eng.checkConfig(c); err != nil {
+		return err
+	}
 	platform := c.platform
 	switch c.pullPolicy {
 	case PullNever:

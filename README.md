@@ -42,17 +42,22 @@ auth are handled by the docker CLI itself.
 
 Go 1.23+ is required.
 
-Verified backends (CLI stderr wording and inspect JSON shapes this library
-matches against):
+Verified backend behavior (CLI stderr wording and inspect JSON shapes this
+library matches against):
 
-| Backend | Verified versions |
+| Backend | Evidence used by this repository |
 |---|---|
-| Apple Container | 1.2.x–1.3.x |
+| Apple Container CLI | 1.2.2 and 1.3.0 source/help and inspect fixtures |
 | Docker Engine / CLI | 29.x |
 
-Newer CLI releases may change error text or JSON fields; see the stderr
-matchers at the top of `engine_apple.go` / `engine_docker.go` and the
-fixtures under `internal/inspect/testdata/` and `testdata/`.
+The Apple API-server version is read at runtime from `container system
+version` or `container system status`; it is not inferred from the CLI
+version. The opt-in live matrix skips when that server version is unavailable
+or differs from the CLI version, so this repository does not claim an
+unobserved API-server compatibility range. Newer CLI releases may change error
+text or JSON fields; see the stderr matchers at the top of `engine_apple.go` /
+`engine_docker.go` and the fixtures under `internal/inspect/testdata/` and
+`testdata/`.
 
 ## Installation
 
@@ -167,16 +172,31 @@ absent image and is not a no-network guarantee.
 ### Apple capability validation
 
 The Apple backend checks the CLI's static limits before it resolves an image or
-creates a container. Apple runs Linux images only; `WithPlatform` (and, when
-no platform option is supplied, a non-Linux `CONTAINER_DEFAULT_PLATFORM`) is
-rejected. Apple container names must be 2–63 characters and match its name
-rule. Network names are lowercase 1–63-character names (the public
-`WithNetwork` option intentionally does not accept comma-separated MAC/MTU
-properties). Memory is at least 200 MiB and uses the same integer with an
-optional `K`/`M`/`G`/`T`/`P` suffix as `WithMemory`; invalid units and
-overflow are rejected. Published ports must be 2–65535, and Apple
-accepts at most 64 published-port descriptors. `WithExposedPorts` remains a
-library-side declaration and is not turned into an Apple `--publish` flag.
+creates a container. Apple runs Linux images only. `WithPlatform` must use
+Apple's `os/arch[/variant]` grammar: bare `linux` and variants not defined for
+the selected architecture are rejected. When no platform option is supplied,
+`CONTAINER_DEFAULT_PLATFORM` is resolved into the effective platform and used
+consistently for image inspection, pull flights, pulls, and `run`; an explicit
+`WithPlatform` value takes precedence. This is Apple CLI configuration, so
+Docker does not consume it; the Apple-only grammar is not applied there either.
+
+The opt-in live matrix requires both `CONTAINERGO_BACKEND=apple` and
+`CONTAINERGO_APPLE_LIVE=1`; it uses unique names and ownership labels and
+never deletes a container whose label does not match. Run it with:
+
+```sh
+CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
+  go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
+```
+
+Apple container names must be 2–63 characters and match its name rule. Network
+names are lowercase 1–63-character names (the public `WithNetwork` option
+intentionally does not accept comma-separated MAC/MTU properties). Memory is at
+least 200 MiB and uses the same integer with an optional `K`/`M`/`G`/`T`/`P`
+suffix as `WithMemory`; invalid units and overflow are rejected. Published
+ports must be 2–65535, and Apple accepts at most 64 published-port descriptors.
+`WithExposedPorts` remains a library-side declaration and is not turned into an
+Apple `--publish` flag.
 
 ## Cleanup contract
 

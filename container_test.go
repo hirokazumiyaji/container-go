@@ -14,10 +14,16 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+const appleCapabilityLiveEnv = "CONTAINERGO_APPLE_LIVE"
+
 func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
-	// another backend or platform; tests opting in use t.Setenv.
-	os.Unsetenv("CONTAINERGO_BACKEND")
+	// another backend or platform; tests opting in use t.Setenv. Preserve
+	// the backend only for the explicitly opt-in Apple live matrix so its
+	// guard can distinguish an intentional Docker selection.
+	if os.Getenv(appleCapabilityLiveEnv) != "1" {
+		os.Unsetenv("CONTAINERGO_BACKEND")
+	}
 	os.Unsetenv("CONTAINER_DEFAULT_PLATFORM")
 	os.Exit(m.Run())
 }

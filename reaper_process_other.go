@@ -1,4 +1,4 @@
-//go:build !windows && !darwin && !linux
+//go:build !windows && !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
 
 package container
 
@@ -8,14 +8,12 @@ func prepareReaperCommand(_ *exec.Cmd) {}
 
 func reaperProcessGroupID(_ *exec.Cmd) int { return 0 }
 
-func killReaperProcess(process *reaperProcess) {
-	if process == nil {
-		return
-	}
-	process.killMu.Lock()
-	defer process.killMu.Unlock()
-	cmd, _, _, live := process.identity()
-	if !live || cmd == nil || cmd.Process == nil {
+func waitForReaperProcessExit(_ *exec.Cmd) bool { return false }
+func waitForReaperTermination(_ *exec.Cmd) bool { return false }
+func waitForReaperProcessGroupExit(_ int)       {}
+
+func killReaperProcess(cmd *exec.Cmd, _ int) {
+	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	_ = cmd.Process.Kill()

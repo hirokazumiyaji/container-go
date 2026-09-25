@@ -321,7 +321,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	err := c.terminate(ctx)
 	if err == nil || errors.Is(err, ErrGenerationReplaced) {
-		unregisterWithGlobalReaper(c.reaper)
+		unregisterWithGlobalReaper(c.reaper, ctx)
 	}
 	return err
 }

@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -45,22 +46,61 @@ import (
 // rather than by the number of containers created during the process
 // lifetime.
 //
-// SHELLOPTS may enable monitor mode. Disable it before any background
-// helpers so they remain in the reaper's process group.
+// SHELLOPTS may enable monitor mode. Each backend command is launched by a
+// short-lived supervisor that owns a fresh process group; monitor mode is
+// disabled inside that supervisor before it starts the command and timeout
+// helper, so all descendants remain in the owned group.
 const reaperScript = `set -f
 set +m
 bin="$1"
 sub="$2"
 key="$3"
+timeout_seconds="${4:-30}"
+case "$timeout_seconds" in
+  ''|*[!0-9]*) timeout_seconds=30 ;;
+esac
+[ "$timeout_seconds" -gt 0 ] 2>/dev/null || timeout_seconds=30
+pgrep_bin=$(command -v pgrep 2>/dev/null) || pgrep_bin=
+case "$pgrep_bin" in
+  /*) [ -x "$pgrep_bin" ] || pgrep_bin= ;;
+  *) pgrep_bin= ;;
+esac
+kill_descendants() {
+  kill_parent="$1"
+  kill_depth="$2"
+  kill_skip="$3"
+  [ "$kill_depth" -ge 32 ] 2>/dev/null && return 0
+  [ -n "$pgrep_bin" ] || return 0
+  kill_children=$("$pgrep_bin" -P "$kill_parent" 2>/dev/null) || kill_children=
+  for kill_child in $kill_children; do
+    case "$kill_child" in
+      ''|*[!0-9]*) continue ;;
+    esac
+    [ "$kill_child" = "$kill_skip" ] && continue
+    kill_descendants "$kill_child" "$((kill_depth + 1))" "$kill_skip"
+    kill -KILL "$kill_child" 2>/dev/null || true
+  done
+}
+kill_pipeline() {
+  pipeline_group="$1"
+  pipeline_root="$2"
+  # The supervisor is still alive while this runs, so its process-group ID
+  # is owned and cannot be recycled. Visit the command's descendants first
+  # to catch a child that created a nested group, then signal the owned
+  # supervisor group once.
+  kill_descendants "$pipeline_root" 0 "$pipeline_root"
+  kill -KILL -"$pipeline_group" 2>/dev/null || true
+}
 start_killer() {
   killer_target="$1"
   killer_delay="$2"
+  killer_root="$3"
   killer_ready=$(mktemp "${TMPDIR:-/tmp}/containergo-reaper.XXXXXX") || return 1
   (
     killer_sleeper=""
     cleanup_killer() {
       if [ -n "$killer_sleeper" ]; then
-        kill -9 "$killer_sleeper" 2>/dev/null || true
+        kill -KILL "$killer_sleeper" 2>/dev/null || true
         wait "$killer_sleeper" 2>/dev/null || true
       fi
       killer_sleeper=""
@@ -72,7 +112,8 @@ start_killer() {
     printf '%s\n' "$killer_sleeper" >"$killer_ready" || exit 1
     wait "$killer_sleeper"
     killer_sleeper=""
-    kill -9 "$killer_target" 2>/dev/null || true
+    rm -f "$killer_ready" 2>/dev/null || true
+    kill_pipeline "$killer_target" "$killer_root"
   ) &
   killer="$!"
   killer_attempts=0
@@ -105,16 +146,49 @@ stop_killer() {
   wait "$1" 2>/dev/null || true
 }
 run_with_timeout() {
-  "$@" >/dev/null 2>&1 & pid=$!
-  if ! start_killer "$pid" 30; then
-    kill -9 "$pid" 2>/dev/null || true
-    wait "$pid" 2>/dev/null || true
-    return 1
-  fi
-  wait "$pid" 2>/dev/null
-  rc=$?
-  stop_killer "$killer"
-  return "$rc"
+  timeout_seconds="$1"
+  shift
+  group_file=$(mktemp "${TMPDIR:-/tmp}/containergo-reaper-group.XXXXXX") || return 1
+  group_value="$group_file.value"
+  trap 'rm -f "$group_file" "$group_value" 2>/dev/null || true' 0 1 2 15
+  # With monitor mode enabled only for this launch, the supervisor is a
+  # process-group leader. It remains alive while the command is reaped and
+  # the timer is canceled, so the PGID cannot be recycled underneath us.
+  set -m
+  (
+    set +m
+    trap 'rm -f "$group_file" "$group_value" 2>/dev/null || true' 0 1 2 15
+    group_attempts=0
+    while [ ! -s "$group_file" ]; do
+      group_attempts=$((group_attempts + 1))
+      [ "$group_attempts" -lt 2000 ] || exit 1
+      /bin/sleep 0.001
+    done
+    supervisor_group=$(sed -n '1p' "$group_file")
+    case "$supervisor_group" in
+      ''|*[!0-9]*) exit 1 ;;
+    esac
+    [ "$supervisor_group" -gt 0 ] 2>/dev/null || exit 1
+    SHELLOPTS= "$@" &
+    command_pid=$!
+    if ! start_killer "$supervisor_group" "$timeout_seconds" "$command_pid"; then
+      kill_pipeline "$supervisor_group" "$command_pid"
+      wait "$command_pid" 2>/dev/null || true
+      exit 1
+    fi
+    wait "$command_pid" 2>/dev/null
+    command_rc=$?
+    stop_killer "$killer"
+    exit "$command_rc"
+  ) &
+  supervisor_pid=$!
+  printf '%s\n' "$supervisor_pid" >"$group_value" || true
+  mv "$group_value" "$group_file" 2>/dev/null || true
+  wait "$supervisor_pid" 2>/dev/null
+  command_rc=$?
+  set +m
+  rm -f "$group_file" "$group_value" 2>/dev/null || true
+  return "$command_rc"
 }
 awk '
   substr($0, 1, 2) == "+ " {
@@ -136,14 +210,17 @@ awk '
   target="$id"
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; if ! start_killer "$pid" 10; then kill -9 "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true; exit 1; fi; wait "$pid" 2>/dev/null; rc=$?; stop_killer "$killer"; exit "$rc") || { rm -f "$tmp"; continue; }
+    if ! run_with_timeout "$timeout_seconds" "$bin" inspect "$id" >"$tmp"; then
+      rm -f "$tmp"
+      continue
+    fi
     got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
     [ "$got" = "$creation" ] || continue
     [ -n "$uid" ] && target="$uid"
   fi
-  run_with_timeout "$bin" "$sub" --force "$target" || true
+  run_with_timeout "$timeout_seconds" "$bin" "$sub" --force "$target" || true
 done
 `
 
@@ -250,7 +327,7 @@ type reaperRegistration struct {
 }
 
 // reaperProcess owns one child and the identity used to stop it. The
-// identity is cleared as soon as Wait reaps the child. In particular, a
+// identity is cleared only after Wait reaps the child. In particular, a
 // later register or unregister must never derive a process-group signal
 // from a PID that the operating system may already have recycled.
 type reaperProcess struct {
@@ -258,17 +335,75 @@ type reaperProcess struct {
 	stdin  io.WriteCloser
 	exited chan struct{}
 
-	mu     sync.Mutex
-	killMu sync.Mutex
-	pid    int
-	pgid   int
-	reaped bool
+	// killMu serializes the one group signal with the hand-off to Wait.
+	// The direct child is deliberately left waitable while the signal is
+	// decided, so a saved PGID cannot be recycled underneath the signal.
+	killMu     sync.Mutex
+	mu         sync.Mutex
+	pid        int
+	pgid       int
+	groupOwned bool
+	reaped     bool
+	stop       sync.Once
+}
+
+// terminate claims the process-group signal before Wait is allowed to reap
+// the direct child. The platform implementation may use the numeric PGID
+// only while this process object still owns the unreaped child.
+func (p *reaperProcess) terminate() {
+	if p == nil {
+		return
+	}
+	p.killMu.Lock()
+	defer p.killMu.Unlock()
+
+	p.mu.Lock()
+	if p.reaped {
+		p.mu.Unlock()
+		return
+	}
+	cmd := p.cmd
+	pgid := 0
+	if p.groupOwned && cmd != nil && cmd.Process != nil {
+		// Setpgid makes the direct child the group leader. Deriving the
+		// value from the still-owned handle avoids ever signaling a stale
+		// numeric field left on the process object.
+		pgid = cmd.Process.Pid
+	}
+	p.mu.Unlock()
+
+	p.stop.Do(func() {
+		killReaperProcess(cmd, pgid)
+	})
+}
+
+// waitAndMarkReaped is the only path that calls Cmd.Wait. It holds killMu
+// across the hand-off so terminate cannot use a PGID after Wait has made the
+// numeric identity reusable.
+func (p *reaperProcess) waitAndMarkReaped() {
+	if p == nil || p.cmd == nil {
+		return
+	}
+	p.killMu.Lock()
+	defer p.killMu.Unlock()
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.reaped {
+		return
+	}
+	_ = p.cmd.Wait()
+	p.reaped = true
+	p.pid = 0
+	p.pgid = 0
 }
 
 func (p *reaperProcess) markReaped() {
 	if p == nil {
 		return
 	}
+	p.killMu.Lock()
+	defer p.killMu.Unlock()
 	p.mu.Lock()
 	p.reaped = true
 	p.pid = 0
@@ -320,21 +455,29 @@ type reaper struct {
 	now           func() time.Time
 	command       func() *exec.Cmd
 	backoff       func(int) time.Duration
-	killProcess   func(*reaperProcess)
+	// timeoutSeconds is an internal test seam; production uses 30 seconds.
+	timeoutSeconds int
+	killProcess    func(*reaperProcess)
 
 	// stateGeneration advances for every durable register/unregister
 	// intent, even when the operation gate cannot yet be acquired.
 	stateGeneration  uint64
 	reconcilePending bool
 	reconcileRunning bool
+	reconcileWake    chan struct{}
+	reconcileSeen    uint64
+	closed           bool
 }
 
 func newReaper(binary, subcommand string) *reaper {
 	return &reaper{
-		binary:      binary,
-		subcommand:  subcommand,
-		now:         time.Now,
-		killProcess: killReaperProcess,
+		binary:         binary,
+		subcommand:     subcommand,
+		now:            time.Now,
+		timeoutSeconds: 30,
+		killProcess: func(process *reaperProcess) {
+			process.terminate()
+		},
 	}
 }
 
@@ -359,11 +502,15 @@ func (r *reaper) recordUnregisterIntent(entry reaperEntry) bool {
 	return removed
 }
 
-// requestReconcile makes a gate-timeout intent durable. The worker owns
+// requestReconcile makes a failed lifecycle intent durable. The worker owns
 // process replacement and replays the current active set, so a completed
 // cancellation can never be replayed merely because the gate was busy.
 func (r *reaper) requestReconcile() {
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
 	r.reconcilePending = true
 	process := r.processLocked()
 	if len(r.entries) == 0 && process == nil {
@@ -372,40 +519,94 @@ func (r *reaper) requestReconcile() {
 		return
 	}
 	if r.reconcileRunning {
+		// A new durable intent should interrupt a backoff wait. A retry
+		// requested by the worker itself does not change stateGeneration and
+		// therefore does not bypass the cooldown.
+		if r.reconcileSeen != r.stateGeneration {
+			if r.reconcileWake == nil {
+				r.reconcileWake = make(chan struct{}, 1)
+			}
+			select {
+			case r.reconcileWake <- struct{}{}:
+			default:
+			}
+		}
 		r.mu.Unlock()
 		return
 	}
+	if r.reconcileWake == nil {
+		r.reconcileWake = make(chan struct{}, 1)
+	}
 	r.reconcileRunning = true
+	r.reconcileSeen = r.stateGeneration
 	r.mu.Unlock()
 	go r.reconcileLoop()
+}
+
+func (r *reaper) clearReconcileRequestLocked() {
+	r.reconcilePending = false
+	if r.reconcileRunning && r.reconcileWake != nil {
+		select {
+		case r.reconcileWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (r *reaper) reconcileLoop() {
 	// Keep retrying after a failed replacement. Active entries are the
 	// watchdog's source of truth, so a transient backend or gate failure
 	// must not permanently discard the pending reconciliation.
-	r.mu.Lock()
-	observed := r.stateGeneration
-	r.mu.Unlock()
 	for {
+		r.mu.Lock()
+		if r.closed {
+			r.reconcilePending = false
+			r.reconcileRunning = false
+			r.mu.Unlock()
+			return
+		}
+		observed := r.stateGeneration
+		r.reconcileSeen = observed
+		wake := r.reconcileWake
+		r.mu.Unlock()
+
 		err := r.reconcileOnce()
 		r.mu.Lock()
+		if r.closed {
+			r.reconcilePending = false
+			r.reconcileRunning = false
+			r.mu.Unlock()
+			return
+		}
 		if r.stateGeneration != observed {
-			observed = r.stateGeneration
+			r.reconcileSeen = r.stateGeneration
 			r.mu.Unlock()
 			continue
 		}
-		if err != nil {
-			delay := r.reconcileRetryDelayLocked()
+		if err == nil {
+			r.reconcilePending = false
+			r.reconcileRunning = false
 			r.mu.Unlock()
-			timer := time.NewTimer(delay)
-			<-timer.C
-			continue
+			return
 		}
-		r.reconcilePending = false
-		r.reconcileRunning = false
+
+		delay := r.reconcileRetryDelayLocked()
 		r.mu.Unlock()
-		return
+		timer := time.NewTimer(delay)
+		if wake == nil {
+			<-timer.C
+		} else {
+			select {
+			case <-timer.C:
+			case <-wake:
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -416,6 +617,12 @@ func (r *reaper) reconcileOnce() error {
 		return err
 	}
 	defer r.unlockOperation()
+	r.mu.Lock()
+	pending := r.reconcilePending
+	r.mu.Unlock()
+	if !pending {
+		return nil
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
 	defer cancel()
@@ -423,17 +630,20 @@ func (r *reaper) reconcileOnce() error {
 }
 
 func (r *reaper) reconcileRetryDelayLocked() time.Duration {
+	delay := time.Duration(0)
 	if !r.retryAt.IsZero() {
-		if delay := r.retryAt.Sub(r.nowLocked()); delay > 0 {
-			return delay
-		}
+		delay = r.retryAt.Sub(r.nowLocked())
 	}
-	if r.retryLevel > 0 {
-		if delay := r.backoffLocked(r.retryLevel); delay > 0 {
-			return delay
-		}
+	if delay <= 0 && r.retryLevel > 0 {
+		delay = r.backoffLocked(r.retryLevel)
 	}
-	return initialReaperSpawnBackoff
+	if delay <= 0 {
+		delay = initialReaperSpawnBackoff
+	}
+	if delay > maxReaperSpawnBackoff {
+		return maxReaperSpawnBackoff
+	}
+	return delay
 }
 
 // register adds a container ID to the reaper's active kill list,
@@ -483,6 +693,7 @@ func (r *reaper) registerContextReady(ctx context.Context, entry reaperEntry) er
 	if !r.retryReadyLocked() {
 		err := r.spawnCooldownErrorLocked()
 		r.mu.Unlock()
+		r.requestReconcile()
 		return err
 	}
 	process := r.processLocked()
@@ -539,7 +750,10 @@ func (r *reaper) processLocked() *reaperProcess {
 		exited: r.exited,
 		pid:    r.pid,
 		pgid:   r.pgid,
-		reaped: channelClosed(r.exited),
+		// Alias-only observations do not carry an ownership proof for a
+		// numeric group signal; the real process object is created by spawn.
+		groupOwned: false,
+		reaped:     channelClosed(r.exited),
 	}
 	return r.process
 }
@@ -617,6 +831,19 @@ func writeReaperRecord(ctx context.Context, stdin io.WriteCloser, line string) e
 // exits. If the child is gone, only the still-active entries are
 // replayed into its replacement.
 func (r *reaper) unregister(id, creation string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer cancel()
+	return r.unregisterWithContext(ctx, id, creation)
+}
+
+// unregisterWithContext records the completion before acquiring the gate,
+// but uses the caller's context for the gate itself. A canceled Terminate
+// therefore returns without opening a fresh 30-second background wait; the
+// durable intent is handed to the reconciliation worker instead.
+func (r *reaper) unregisterWithContext(ctx context.Context, id, creation string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
@@ -632,16 +859,29 @@ func (r *reaper) unregister(id, creation string) error {
 	if !removed {
 		return nil
 	}
-	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
-	defer lockCancel()
-	if err := r.lockOperation(lockCtx); err != nil {
+	gateCtx, gateCancel := reaperGateContext(ctx)
+	defer gateCancel()
+	if err := r.lockOperation(gateCtx); err != nil {
 		r.requestReconcile()
 		return err
 	}
 	defer r.unlockOperation()
-	ctx, cancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
-	defer cancel()
-	return r.unregisterContextReady(ctx, entry)
+	if err := ctx.Err(); err != nil {
+		r.requestReconcile()
+		return err
+	}
+	opCtx, opCancel := context.WithTimeout(ctx, reaperOperationTimeout)
+	defer opCancel()
+	return r.unregisterContextReady(opCtx, entry)
+}
+
+func reaperGateContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	// WithTimeout also preserves an earlier caller deadline, while the
+	// package bound prevents a background Terminate from waiting forever.
+	return context.WithTimeout(ctx, reaperOperationLockTimeout)
 }
 
 func (r *reaper) unregisterContext(ctx context.Context, entry reaperEntry) error {
@@ -670,6 +910,13 @@ func (r *reaper) unregisterContextReady(ctx context.Context, entry reaperEntry) 
 			// cycle; EOF still lets the child exit without deletes.
 			return nil
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		// The caller has already paid its cancellation cost. Do not enter
+		// a fresh synchronous recovery budget; the worker will stop the old
+		// child and replay the durable active set.
+		r.requestReconcile()
+		return err
 	}
 
 	// A failed or bounded-out cancellation cannot be trusted to reach the
@@ -719,19 +966,30 @@ func (r *reaper) removeCompletedLocked(entry reaperEntry) {
 	}
 }
 
-// recoverAndReplay detaches the failed process before doing any signal
-// work. Once detached, a later lifecycle operation cannot accidentally
-// signal the old PID/PGID, even if shutdown itself takes time. Recovery
-// gets a fresh budget: a caller cancellation (including expiry while
-// waiting for the operation gate) must not leave active entries without a
-// watchdog.
-func (r *reaper) recoverAndReplay(_ context.Context, process *reaperProcess) error {
+// recoverAndReplay stops the failed process before doing any replay work.
+// The process stays published until the shutdown barrier completes, so a
+// later recovery cannot overlap an old process tree or lose the only handle
+// to it. Recovery gets a fresh budget: a caller cancellation (including
+// expiry while waiting for the operation gate) must not leave active entries
+// without a watchdog.
+func (r *reaper) recoverAndReplay(_ context.Context, process *reaperProcess) (err error) {
 	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
 	defer cancel()
-	if detached := r.detachProcess(process); detached != nil {
-		if err := r.stopProcess(detached, ctx); err != nil {
-			return err
+	defer func() {
+		if err != nil {
+			r.requestReconcile()
 		}
+	}()
+	if process == nil {
+		r.mu.Lock()
+		process = r.process
+		r.mu.Unlock()
+	}
+	if process != nil {
+		if stopErr := r.stopProcess(process, ctx); stopErr != nil {
+			return stopErr
+		}
+		r.detachProcess(process)
 	}
 	return r.respawnAndReplay(ctx)
 }
@@ -764,7 +1022,7 @@ func (r *reaper) stopProcess(process *reaperProcess, ctx context.Context) error 
 		if r.killProcess != nil {
 			r.killProcess(process)
 		} else {
-			killReaperProcess(process)
+			process.terminate()
 		}
 	}
 	if process.stdin != nil {
@@ -773,38 +1031,54 @@ func (r *reaper) stopProcess(process *reaperProcess, ctx context.Context) error 
 	if process.cmd == nil || process.cmd.Process == nil || process.exited == nil {
 		return nil
 	}
-
-	// Shutdown gets its own small budget even when the caller's pipe-write
-	// context has just expired. This keeps cancellation bounded while still
-	// giving SIGKILL a chance to settle the child before replay.
-	stopCtx, cancel := context.WithTimeout(context.Background(), reaperProcessStopTimeout)
-	defer cancel()
-	if ctx != nil {
-		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) > 0 && time.Until(deadline) < reaperProcessStopTimeout {
-			stopCtx, cancel = context.WithDeadline(context.Background(), deadline)
-			defer cancel()
-		}
+	if ctx == nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(context.Background(), reaperProcessStopTimeout)
+		defer cancel()
+	} else if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, reaperProcessStopTimeout)
+		defer cancel()
 	}
 	select {
 	case <-process.exited:
 		return nil
-	case <-stopCtx.Done():
-		return fmt.Errorf("reaper: child shutdown: %w", stopCtx.Err())
+	case <-ctx.Done():
+		return fmt.Errorf("reaper: child shutdown: %w", ctx.Err())
 	}
 }
 
-func (r *reaper) respawnAndReplay(ctx context.Context) error {
-	// A recovery path may already have detached the failed child. This
-	// also covers callers that enter replay after a child exited by itself.
-	if current := r.detachProcess(nil); current != nil {
-		if err := r.stopProcess(current, ctx); err != nil {
-			return err
+func (r *reaper) respawnAndReplay(ctx context.Context) (err error) {
+	defer func() {
+		if err != nil {
+			r.requestReconcile()
 		}
+	}()
+	// A recovery path may already have stopped the failed child. This also
+	// covers callers that enter replay after a child exited by itself.
+	r.mu.Lock()
+	if r.closed {
+		r.reconcilePending = false
+		r.mu.Unlock()
+		return nil
+	}
+	current := r.process
+	r.mu.Unlock()
+	if current != nil {
+		if stopErr := r.stopProcess(current, ctx); stopErr != nil {
+			return stopErr
+		}
+		r.detachProcess(current)
 	}
 
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
 	if len(r.entries) == 0 {
 		r.clearSpawnFailureLocked()
+		r.clearReconcileRequestLocked()
 		r.mu.Unlock()
 		return nil
 	}
@@ -851,15 +1125,20 @@ func (r *reaper) respawnAndReplay(ctx context.Context) error {
 			r.mu.Lock()
 			if r.process == process {
 				r.clearSpawnFailureLocked()
+				r.clearReconcileRequestLocked()
 			}
 			r.mu.Unlock()
 			return nil
 		}
-		if detached := r.detachProcess(process); detached != nil {
-			if stopErr := r.stopProcess(detached, ctx); stopErr != nil {
+		r.mu.Lock()
+		current := r.process
+		r.mu.Unlock()
+		if current == process {
+			if stopErr := r.stopProcess(process, ctx); stopErr != nil {
 				lastErr = stopErr
 				break
 			}
+			r.detachProcess(process)
 		}
 		r.mu.Lock()
 		r.recordSpawnFailureLocked()
@@ -892,7 +1171,11 @@ func (r *reaper) spawnProcessLocked() (*reaperProcess, error) {
 	if r.command != nil {
 		cmd = r.command()
 	} else {
-		cmd = exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+		timeout := r.timeoutSeconds
+		if timeout <= 0 {
+			timeout = 30
+		}
+		cmd = exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout))
 	}
 	if cmd == nil {
 		return nil, errors.New("reaper: nil spawn command")
@@ -906,33 +1189,49 @@ func (r *reaper) spawnProcessLocked() (*reaperProcess, error) {
 		_ = stdin.Close()
 		return nil, err
 	}
+	pgid := reaperProcessGroupID(cmd)
 	process := &reaperProcess{
-		cmd:    cmd,
-		stdin:  stdin,
-		exited: make(chan struct{}),
-		pid:    cmd.Process.Pid,
-		pgid:   reaperProcessGroupID(cmd),
+		cmd:        cmd,
+		stdin:      stdin,
+		exited:     make(chan struct{}),
+		pid:        cmd.Process.Pid,
+		pgid:       pgid,
+		groupOwned: pgid > 0,
 	}
 	r.process = process
 	r.cmd, r.stdin, r.exited = cmd, stdin, process.exited
 	r.pid, r.pgid = process.pid, process.pgid
-	go func() {
-		_ = cmd.Wait()
-		process.markReaped()
-		r.mu.Lock()
-		if r.process == process {
-			// Retain only the completion channel for waiters. Clearing the
-			// command and pipe aliases prevents a delayed lifecycle call
-			// from treating a reaped child as an active writer.
-			r.cmd = nil
-			r.stdin = nil
-			r.pid = 0
-			r.pgid = 0
-		}
-		r.mu.Unlock()
-		close(process.exited)
-	}()
+	go r.waitProcess(process)
 	return process, nil
+}
+
+func (r *reaper) waitProcess(process *reaperProcess) {
+	if process == nil {
+		return
+	}
+	if process.cmd != nil && process.cmd.Process != nil {
+		// Wait4(WNOWAIT) leaves the direct child waitable. Only after that
+		// observation do we decide whether the process group needs a
+		// signal, and Cmd.Wait is not called until the group is gone.
+		_ = waitForReaperTermination(process.cmd)
+		process.terminate()
+		waitForReaperProcessGroupExit(process.pgid)
+		process.waitAndMarkReaped()
+	} else {
+		process.markReaped()
+	}
+	r.mu.Lock()
+	if r.process == process {
+		// Retain only the completion channel for waiters. Clearing the
+		// command and pipe aliases prevents a delayed lifecycle call from
+		// treating a reaped child as an active writer.
+		r.cmd = nil
+		r.stdin = nil
+		r.pid = 0
+		r.pgid = 0
+	}
+	r.mu.Unlock()
+	close(process.exited)
 }
 
 // spawnLocked preserves the original package-test helper shape. New code
@@ -1037,10 +1336,28 @@ func (r *reaper) spawnCooldownErrorLocked() error {
 	return fmt.Errorf("%w until %s", errReaperSpawnCooldown, r.retryAt.Format(time.RFC3339Nano))
 }
 
-// closeStdin hands the reaper the same EOF it would see on parent
-// death. Test hook and best-effort shutdown.
+// closeStdin hands the reaper the same EOF it would see on parent death and
+// stops any pending reconciliation from replacing it. Test hook and
+// best-effort shutdown.
 func (r *reaper) closeStdin() {
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperProcessStopTimeout)
+	defer lockCancel()
+	if err := r.lockOperation(lockCtx); err == nil {
+		defer r.unlockOperation()
+	}
 	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	r.reconcilePending = false
+	if r.reconcileWake != nil {
+		select {
+		case r.reconcileWake <- struct{}{}:
+		default:
+		}
+	}
 	stdin := r.stdin
 	r.mu.Unlock()
 	if stdin != nil {
@@ -1050,17 +1367,21 @@ func (r *reaper) closeStdin() {
 
 // killForTest kills the reaper process group and waits until the child
 // is reaped, so the next write deterministically fails. It uses the same
-// detach-before-signal path as production recovery.
+// stop-before-detach path as production recovery.
 func (r *reaper) killForTest() {
 	_ = r.lockOperation(context.Background())
 	defer r.unlockOperation()
-	process := r.detachProcess(nil)
+	r.mu.Lock()
+	process := r.process
+	r.mu.Unlock()
 	if process == nil {
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reaperProcessStopTimeout)
 	defer cancel()
-	_ = r.stopProcess(process, ctx)
+	if r.stopProcess(process, ctx) == nil {
+		r.detachProcess(process)
+	}
 }
 
 var (
@@ -1087,11 +1408,16 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) *reaperRe
 	return &reaperRegistration{reaper: r, entry: reaperEntry{id: id, creation: creation}}
 }
 
-func unregisterWithGlobalReaper(registration *reaperRegistration) {
+func unregisterWithGlobalReaper(registration *reaperRegistration, callers ...context.Context) {
 	if registration == nil || registration.reaper == nil {
 		return
 	}
-	if err := registration.reaper.unregister(registration.entry.id, registration.entry.creation); err != nil {
+	ctx := context.Background()
+	if len(callers) > 0 && callers[0] != nil {
+		ctx = callers[0]
+	}
+	if err := registration.reaper.unregisterWithContext(ctx, registration.entry.id, registration.entry.creation); err != nil &&
+		!errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		log.Printf("container-go: reaper unregister %s: %v", registration.entry.id, err)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -69,6 +70,141 @@ func waitForReaperTestReadyFiles(t *testing.T, dir string, want int) {
 	}
 	entries, _ := os.ReadDir(dir)
 	t.Fatalf("timeout helper readiness files = %v, want at least %d", entries, want)
+}
+
+func TestReaperProcessGroupIsStoppedBeforeWait(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "child.pid")
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30 & echo $! > "+reaperTestShellQuote(pidPath)+"; wait")
+	prepareReaperCommand(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	process := &reaperProcess{
+		cmd:        cmd,
+		stdin:      stdin,
+		exited:     make(chan struct{}),
+		pid:        cmd.Process.Pid,
+		pgid:       reaperProcessGroupID(cmd),
+		groupOwned: true,
+	}
+	r := newReaper("unused", "delete")
+	go r.waitProcess(process)
+	pid := waitForReaperTestPIDFile(t, pidPath)
+	process.terminate()
+	select {
+	case <-process.exited:
+	case <-time.After(5 * time.Second):
+		t.Fatal("reaper process group did not finish before wait")
+	}
+	waitForReaperTestProcessGone(t, pid)
+	_ = stdin.Close()
+	if process.pid != 0 || process.pgid != 0 {
+		t.Fatalf("reaped process identity = pid:%d pgid:%d, want 0/0", process.pid, process.pgid)
+	}
+	// A late caller must not turn the old numeric identity into a signal.
+	process.terminate()
+}
+
+func TestReaperRecoveryKillsNestedCommandGroup(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "nested.pid")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = delete ]; then\n" +
+		"  /bin/sleep 30 &\n" +
+		"  child=$!\n" +
+		"  printf '%s\\n' \"$child\" > " + reaperTestShellQuote(pidPath) + "\n" +
+		"  wait \"$child\"\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	r.timeoutSeconds = 30
+	if err := r.register("nested", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.mu.Lock()
+	stdin := r.stdin
+	r.mu.Unlock()
+	if err := stdin.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pid := waitForReaperTestPIDFile(t, pidPath)
+	r.killForTest()
+	waitForReaperTestProcessGone(t, pid)
+}
+
+func TestReaperTimeoutKillsBackendDescendant(t *testing.T) {
+	if _, err := os.Stat("/bin/sh"); err != nil {
+		t.Skipf("/bin/sh unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "descendant.pid")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = delete ]; then\n" +
+		"  /bin/sleep 30 &\n" +
+		"  child=$!\n" +
+		"  printf '%s\\n' \"$child\" > " + reaperTestShellQuote(pidPath) + "\n" +
+		"  wait \"$child\"\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	r.timeoutSeconds = 1
+	if err := r.register("tree", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+
+	pid := waitForReaperTestPIDFile(t, pidPath)
+	waitForReaperTestProcessGone(t, pid)
+	waitForReaperExit(t, r)
+}
+
+func waitForReaperTestPIDFile(t *testing.T, path string) int {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(path)
+		if err == nil {
+			pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil && pid > 0 {
+				return pid
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for PID file %s", path)
+	return 0
+}
+
+func waitForReaperTestProcessGone(t *testing.T, pid int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("ps", "-o", "state=", "-p", strconv.Itoa(pid)).Output()
+		state := strings.TrimSpace(string(out))
+		if err != nil || state == "" || strings.HasPrefix(state, "Z") {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatalf("descendant process %d survived reaper timeout cleanup", pid)
 }
 
 func TestReaperFastCallsReapTimeoutHelpers(t *testing.T) {

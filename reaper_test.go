@@ -504,7 +504,7 @@ func TestReaperCanceledReplayStillRespawns(t *testing.T) {
 	var killOnce sync.Once
 	r.killProcess = func(process *reaperProcess) {
 		killOnce.Do(func() { close(killed) })
-		killReaperProcess(process)
+		process.terminate()
 	}
 	t.Cleanup(func() {
 		r.closeStdin()
@@ -608,9 +608,10 @@ func TestReaperDelayedRegistrationAndUnregisterDoNotSignalReapedProcess(t *testi
 
 func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `sleep "$killer_delay"`) ||
-		!strings.Contains(reaperScript, `kill -9 "$killer_target"`) ||
+		!strings.Contains(reaperScript, "kill_descendants") ||
+		!strings.Contains(reaperScript, `kill -KILL -"$pipeline_group"`) ||
 		!strings.Contains(reaperScript, "stop_killer") {
-		t.Error("reaper script must bound each backend call with a cancellable sleep/kill helper")
+		t.Error("reaper script must bound each backend call with an owned process group and descendant cleanup")
 	}
 	// The creation label must be read as a structural JSON field, anchored
 	// at line start on the quoted key, and compared for exact equality.
@@ -994,16 +995,60 @@ func TestReaperCompletedEntriesAreBounded(t *testing.T) {
 	}
 }
 
+func TestReaperFailedSpawnSchedulesDurableRecovery(t *testing.T) {
+	oldRecoveryTimeout := reaperRecoveryTimeout
+	reaperRecoveryTimeout = 500 * time.Millisecond
+	t.Cleanup(func() { reaperRecoveryTimeout = oldRecoveryTimeout })
+
+	missing := filepath.Join(t.TempDir(), "missing-reaper-command")
+	var attempts atomic.Int32
+	r := newReaper("unused", "delete")
+	r.backoff = func(int) time.Duration { return 10 * time.Millisecond }
+	r.command = func() *exec.Cmd {
+		if attempts.Add(1) <= maxReaperSpawnFailures {
+			return exec.Command(missing)
+		}
+		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	if err := r.register("active", ""); err == nil {
+		t.Fatal("register unexpectedly succeeded")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		process := r.process
+		entries := len(r.entries)
+		r.mu.Unlock()
+		if process != nil && processLive(process) && entries == 1 {
+			if got := attempts.Load(); got <= maxReaperSpawnFailures {
+				t.Fatalf("reaper attempts = %d, want scheduled retry after cooldown", got)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("failed spawn was not actively reconciled; attempts=%d", attempts.Load())
+}
+
 func TestReaperSpawnFailuresRetryAfterBackoff(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
+	var nowMu sync.RWMutex
 	now := time.Unix(100, 0)
-	r.now = func() time.Time { return now }
+	r.now = func() time.Time {
+		nowMu.RLock()
+		defer nowMu.RUnlock()
+		return now
+	}
 	missing := filepath.Join(t.TempDir(), "missing-reaper-command")
-	attempts := 0
+	var attempts atomic.Int32
 	r.command = func() *exec.Cmd {
-		attempts++
-		if attempts <= maxReaperSpawnFailures {
+		if attempts.Add(1) <= maxReaperSpawnFailures {
 			return exec.Command(missing)
 		}
 		return nil
@@ -1012,36 +1057,51 @@ func TestReaperSpawnFailuresRetryAfterBackoff(t *testing.T) {
 	if err := r.register("first", ""); err == nil {
 		t.Fatal("first registration unexpectedly succeeded")
 	}
-	if !r.gaveUp || r.spawnFailures != maxReaperSpawnFailures {
-		t.Fatalf("failure state = gaveUp:%v failures:%d, want true/%d", r.gaveUp, r.spawnFailures, maxReaperSpawnFailures)
+	r.mu.Lock()
+	gaveUp, failures := r.gaveUp, r.spawnFailures
+	entryCount := len(r.entries)
+	retryAt := r.retryAt
+	r.mu.Unlock()
+	if !gaveUp || failures != maxReaperSpawnFailures {
+		t.Fatalf("failure state = gaveUp:%v failures:%d, want true/%d", gaveUp, failures, maxReaperSpawnFailures)
 	}
-	if got := len(r.entries); got != 1 {
-		t.Fatalf("active entries after failure = %d, want 1", got)
+	if entryCount != 1 {
+		t.Fatalf("active entries after failure = %d, want 1", entryCount)
 	}
-	if !r.retryAt.After(now) {
-		t.Fatalf("retry deadline = %s, want after %s", r.retryAt, now)
+	nowMu.RLock()
+	currentNow := now
+	nowMu.RUnlock()
+	if !retryAt.After(currentNow) {
+		t.Fatalf("retry deadline = %s, want after %s", retryAt, currentNow)
 	}
-	if got := r.retryAt.Sub(now); got != initialReaperSpawnBackoff {
+	if got := retryAt.Sub(currentNow); got != initialReaperSpawnBackoff {
 		t.Fatalf("first retry backoff = %s, want %s", got, initialReaperSpawnBackoff)
 	}
 
 	if err := r.register("during-cooldown", ""); !errors.Is(err, errReaperSpawnCooldown) {
 		t.Fatalf("registration during cooldown = %v, want cooldown error", err)
 	}
-	if attempts != maxReaperSpawnFailures {
-		t.Fatalf("spawn attempts during cooldown = %d, want %d", attempts, maxReaperSpawnFailures)
+	if got := attempts.Load(); got != maxReaperSpawnFailures {
+		t.Fatalf("spawn attempts during cooldown = %d, want %d", got, maxReaperSpawnFailures)
 	}
 
-	now = r.retryAt
+	nowMu.Lock()
+	now = retryAt
+	nowMu.Unlock()
+	r.mu.Lock()
 	r.command = nil
+	r.mu.Unlock()
 	if err := r.register("after-recovery", ""); err != nil {
 		t.Fatalf("registration after recovery: %v", err)
 	}
-	if r.gaveUp || r.spawnFailures != 0 {
-		t.Fatalf("failure state after recovery = gaveUp:%v failures:%d, want false/0", r.gaveUp, r.spawnFailures)
+	r.mu.Lock()
+	gaveUp, failures = r.gaveUp, r.spawnFailures
+	r.mu.Unlock()
+	if gaveUp || failures != 0 {
+		t.Fatalf("failure state after recovery = gaveUp:%v failures:%d, want false/0", gaveUp, failures)
 	}
-	if attempts != maxReaperSpawnFailures {
-		t.Fatalf("failed command attempts = %d, want %d", attempts, maxReaperSpawnFailures)
+	if got := attempts.Load(); got != maxReaperSpawnFailures {
+		t.Fatalf("failed command attempts = %d, want %d", got, maxReaperSpawnFailures)
 	}
 
 	r.closeStdin()
@@ -1052,6 +1112,74 @@ func TestReaperSpawnFailuresRetryAfterBackoff(t *testing.T) {
 			t.Errorf("replay log = %q, want %q", data, want)
 		}
 	}
+}
+
+type cancelingDeleteRunner struct {
+	cancel context.CancelFunc
+}
+
+func (r *cancelingDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "delete" {
+		r.cancel()
+	}
+	return nil, nil, nil
+}
+
+func TestTerminateUsesCallerContextForReaperGate(t *testing.T) {
+	r := newReaper("unused", "delete")
+	r.command = func() *exec.Cmd { return exec.Command("/bin/sh", "-c", "cat >/dev/null") }
+	if err := r.register("ctr", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	r.opMu.Lock()
+	gateHeld := true
+	defer func() {
+		if gateHeld {
+			r.opMu.Unlock()
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	runner := &cancelingDeleteRunner{cancel: cancel}
+	ctr := &Container{
+		id:     "ctr",
+		uid:    "opaque-container-id",
+		runner: runner,
+		eng:    appleEngine{},
+		reaper: &reaperRegistration{reaper: r, entry: reaperEntry{id: "ctr"}},
+	}
+	result := make(chan error, 1)
+	go func() { result <- ctr.Terminate(ctx) }()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Terminate after successful delete: %v", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		r.opMu.Unlock()
+		gateHeld = false
+		t.Fatal("successful Terminate waited on a fresh background reaper gate")
+	}
+
+	r.opMu.Unlock()
+	gateHeld = false
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		entries := len(r.entries)
+		process := r.process
+		pending := r.reconcilePending
+		r.mu.Unlock()
+		if entries == 0 && process == nil && !pending {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("canceled Terminate did not leave durable background reconciliation")
 }
 
 func TestTerminateUnregistersReaperEntry(t *testing.T) {

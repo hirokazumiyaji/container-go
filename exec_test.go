@@ -135,14 +135,6 @@ func TestExecReturnsStructuredPermissionAndConfigFailures(t *testing.T) {
 			),
 			code: 18,
 		},
-		{
-			name: "command execution status",
-			err: &cli.CLIError{
-				Binary: "container", Args: []string{"exec", "myctr", "app"},
-				ExitCode: 126, Stderr: "permission denied",
-			},
-			code: 126,
-		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

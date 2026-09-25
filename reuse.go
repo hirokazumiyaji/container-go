@@ -73,7 +73,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFoundFor(cfg.eng, err) {
+			if !isNotFoundForOperation(cfg.eng, err, "inspect", cfg.name) {
 				return nil, err
 			}
 			// Creation carries its own runTimeout budget detached from

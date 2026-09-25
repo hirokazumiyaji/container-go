@@ -2,6 +2,8 @@ package container
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -29,6 +31,8 @@ const (
 	appleStderrAlreadyExists = "already exists"
 	appleStderrImageNotFound = "image not found:"
 )
+
+var errInvalidAppleInspect = errors.New("invalid apple container inspect output")
 
 func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
@@ -111,11 +115,38 @@ func (appleEngine) parseRunID([]byte) string { return "" }
 
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
+func decodeAppleInspect(data []byte) ([]inspect.Container, error) {
+	var raw json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("%w: decode container inspect output: %v", errInvalidAppleInspect, err)
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("%w: expected a container array, got null", errInvalidAppleInspect)
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("%w: %v", errInvalidAppleInspect, err)
+	}
+	for _, entry := range entries {
+		if strings.TrimSpace(string(entry)) == "null" {
+			return nil, fmt.Errorf("%w: null container entry", errInvalidAppleInspect)
+		}
+		var container inspect.Container
+		if err := json.Unmarshal(entry, &container); err != nil {
+			return nil, fmt.Errorf("%w: invalid container entry: %v", errInvalidAppleInspect, err)
+		}
+		if strings.TrimSpace(container.ID) == "" || strings.TrimSpace(container.Status.State) == "" {
+			return nil, fmt.Errorf("%w: container id and status.state are required", errInvalidAppleInspect)
+		}
+	}
+	return inspect.Decode(data)
+}
+
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	if strings.TrimSpace(string(data)) == "" {
 		return nil, newInspectTargetNotFound(id, "empty inspect output")
 	}
-	containers, err := inspect.Decode(data)
+	containers, err := decodeAppleInspect(data)
 	if err != nil {
 		return nil, err
 	}

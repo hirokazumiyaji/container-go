@@ -123,10 +123,15 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// Exec diagnostics can come from the workload itself. Do not use the
 	// broad text-based liveness classifier here: a positive workload exit
 	// is still a result even when it says "permission denied" or mentions
-	// configuration. Only structured OS errors and the CLI's 126/127
-	// command-exec statuses are definitive client-side failures.
+	// configuration. Only structured OS and timeout evidence is definitive.
 	if isDefinitiveExecError(err, cliErr) {
 		return cliErr.ExitCode, output, err
+	}
+	// Docker and Apple may use 126/127 for the command's own permission
+	// or lookup result. They are workload exit statuses, not failures of
+	// the Exec invocation.
+	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+		return cliErr.ExitCode, output, nil
 	}
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
@@ -178,20 +183,14 @@ func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
 	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
 		return true
 	}
-	return cliErr != nil && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127)
+	return false
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
 func maybeInfraExecErr(eng engine, err error, targets ...string) bool {
-	for _, branch := range backendCLIErrorBranches(err, eng.binary()) {
-		if branch.ctx.operation != "exec" {
-			continue
-		}
-		if len(targets) > 0 && !branchTargetMatchesAny(branch, targets) {
-			continue
-		}
+	for _, branch := range matchingCLIErrorBranches(err, eng.binary(), "exec", targets...) {
 		stderr, _ := branchLines(branch, false)
 		if len(stderr) == 0 {
 			return true

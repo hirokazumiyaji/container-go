@@ -250,6 +250,48 @@ func IsCommandExit(err error) bool {
 // aborts the probe via context propagation.
 const probeTimeout = 5 * time.Second
 
+func attachProbeStdout(err error, stdout string, probe Probe) error {
+	if err == nil || stdout == "" {
+		return err
+	}
+	operation := probe.Operation
+	if operation == "" {
+		operation = probeOperation(probe.Args)
+	}
+	if operation == "" {
+		return err
+	}
+	branch := matchingProbeCLIError(err, probe.Binary, operation)
+	if branch == nil {
+		return err
+	}
+	return errors.Join(err, WithStdout(branch, stdout))
+}
+
+func matchingProbeCLIError(err error, binary, operation string) *CLIError {
+	if err == nil {
+		return nil
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if branch := matchingProbeCLIError(child, binary, operation); branch != nil {
+				return branch
+			}
+		}
+		return nil
+	}
+	if cliErr, ok := err.(*CLIError); ok {
+		if (binary == "" || probeBinaryMatches(cliErr.Binary, binary)) && probeOperation(cliErr.Args) == operation {
+			return cliErr
+		}
+		return nil
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return matchingProbeCLIError(wrapped.Unwrap(), binary, operation)
+	}
+	return nil
+}
+
 func probeRelevantError(err error, probe Probe) error {
 	if err == nil {
 		return nil
@@ -387,9 +429,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	probeStdout, _, probeErr := r.Run(probeCtx, probe.Args...)
 	if probeErr != nil {
 		// Runners may return stdout separately from the error. Attach it
-		// to the CLI side representation before backend classifiers inspect
-		// the probe, without replacing the probe's original error chain.
-		probeErr = withStdout(probeErr, string(probeStdout))
+		// to the matching binary/operation branch before backend classifiers
+		// inspect the probe, without replacing the probe's original chain.
+		probeErr = attachProbeStdout(probeErr, string(probeStdout), probe)
 	}
 	if probeErr == nil {
 		// A runner can return successfully just as the caller cancels.

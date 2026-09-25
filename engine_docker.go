@@ -278,6 +278,9 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if err := json.Unmarshal(rawContainer, &candidate); err != nil {
 			return nil, fmt.Errorf("%w: invalid container entry: %v", errInvalidDockerInspect, err)
 		}
+		if !dockerIDRE.MatchString(candidate.ID) {
+			return nil, fmt.Errorf("%w: container Id must be a canonical 64-hex value", errInvalidDockerInspect)
+		}
 		if candidate.State == nil || strings.TrimSpace(candidate.State.Status) == "" {
 			return nil, fmt.Errorf("%w: container State.Status is required", errInvalidDockerInspect)
 		}

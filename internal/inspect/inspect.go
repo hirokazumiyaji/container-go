@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/netip"
+	"strings"
 )
 
 // Container is one element of the array both commands emit.
@@ -49,9 +50,30 @@ type Network struct {
 
 // Decode parses the JSON array output.
 func Decode(data []byte) ([]Container, error) {
-	var containers []Container
-	if err := json.Unmarshal(data, &containers); err != nil {
+	var raw json.RawMessage
+	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("decode container inspect output: %w", err)
+	}
+	if strings.TrimSpace(string(raw)) == "null" {
+		return nil, fmt.Errorf("decode container inspect output: expected a container array, got null")
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(data, &entries); err != nil {
+		return nil, fmt.Errorf("decode container inspect output: %w", err)
+	}
+	containers := make([]Container, 0, len(entries))
+	for _, entry := range entries {
+		if strings.TrimSpace(string(entry)) == "null" {
+			return nil, fmt.Errorf("decode container inspect output: null container entry")
+		}
+		var container Container
+		if err := json.Unmarshal(entry, &container); err != nil {
+			return nil, fmt.Errorf("decode container inspect output: %w", err)
+		}
+		if container.ID == "" || container.Status.State == "" {
+			return nil, fmt.Errorf("decode container inspect output: container id and status.state are required")
+		}
+		containers = append(containers, container)
 	}
 	return containers, nil
 }

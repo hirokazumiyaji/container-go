@@ -69,9 +69,10 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	var errs []error
 	for _, id := range ids {
 		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
+		deleteArgs := eng.deleteArgs(id)
+		_, _, err := r.Run(dCtx, deleteArgs...)
 		dCancel()
-		if err != nil && !isNotFoundFor(eng, err) {
+		if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
 			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
 			continue
 		}

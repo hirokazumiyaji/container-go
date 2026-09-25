@@ -142,16 +142,20 @@ func isNotFoundForOperation(eng engine, err error, operation string, targets ...
 	if eng == nil {
 		return isNotFound(err)
 	}
-	branches := backendCLIErrorBranches(err, eng.binary())
-	selected := make([]cliErrorBranch, 0, len(branches))
-	for _, branch := range branches {
-		if branch.ctx.operation != operation {
-			continue
+	selected := matchingCLIErrorBranches(err, eng.binary(), operation, targets...)
+	if errors.Is(err, ErrContainerNotFound) {
+		if len(selected) == 0 {
+			return true
 		}
-		if len(targets) > 0 && !branchTargetMatchesAny(branch, targets) {
-			continue
+		if hasNonCLIDefinitiveErrorText(err) {
+			return false
 		}
-		selected = append(selected, branch)
+		for _, branch := range selected {
+			if cli.IsDefinitiveNonLivenessError(branch.cause) {
+				return false
+			}
+		}
+		return true
 	}
 	if len(selected) == 0 {
 		return false

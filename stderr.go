@@ -45,6 +45,7 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 	}
 	var branches []cliErrorBranch
 	stdoutByCLIError := make(map[*cli.CLIError]string)
+	branchIndex := make(map[*cli.CLIError]int)
 	var walk func(error)
 	walk = func(cur error) {
 		if cur == nil {
@@ -72,6 +73,14 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 			if stdout != "" {
 				cause = cli.WithStdout(cliErr, stdout)
 			}
+			if index, ok := branchIndex[cliErr]; ok {
+				if stdout != "" {
+					branches[index].stdout = stdout
+					branches[index].cause = cause
+				}
+				return
+			}
+			branchIndex[cliErr] = len(branches)
 			branches = append(branches, cliErrorBranch{
 				ctx: cliErrorContext{
 					err:       cliErr,
@@ -92,8 +101,9 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 	return branches
 }
 
-func matchingCLIErrorBranch(err error, backend, operation string, targets ...string) (cliErrorBranch, bool) {
+func matchingCLIErrorBranches(err error, backend, operation string, targets ...string) []cliErrorBranch {
 	branches := backendCLIErrorBranches(err, backend)
+	operationBranches := make([]cliErrorBranch, 0, len(branches))
 	hasTarget := false
 	for _, target := range targets {
 		if target != "" {
@@ -101,37 +111,44 @@ func matchingCLIErrorBranch(err error, backend, operation string, targets ...str
 			break
 		}
 	}
-	if !hasTarget {
-		for _, branch := range branches {
-			if branch.ctx.operation == operation {
-				return branch, true
-			}
+	for _, branch := range branches {
+		if branch.ctx.operation == operation {
+			operationBranches = append(operationBranches, branch)
 		}
-		return cliErrorBranch{}, false
+	}
+	if !hasTarget {
+		return operationBranches
+	}
+
+	targetless := make([]cliErrorBranch, 0, len(operationBranches))
+	for _, branch := range operationBranches {
+		if strings.TrimSpace(branch.ctx.target) == "" {
+			targetless = append(targetless, branch)
+		}
 	}
 	for _, target := range targets {
 		if target == "" {
 			continue
 		}
-		for _, branch := range branches {
-			if branch.ctx.operation == operation && branchTargetMatchesAny(branch, []string{target}) {
-				return branch, true
+		exact := make([]cliErrorBranch, 0, len(operationBranches))
+		for _, branch := range operationBranches {
+			if strings.TrimSpace(branch.ctx.target) != "" && sameCLITarget(branch.ctx.target, target) {
+				exact = append(exact, branch)
 			}
 		}
-	}
-	return cliErrorBranch{}, false
-}
-
-func branchTargetMatchesAny(branch cliErrorBranch, targets []string) bool {
-	if strings.TrimSpace(branch.ctx.target) == "" {
-		return true
-	}
-	for _, target := range targets {
-		if target != "" && sameCLITarget(branch.ctx.target, target) {
-			return true
+		if len(exact) > 0 {
+			return exact
 		}
 	}
-	return false
+	return targetless
+}
+
+func matchingCLIErrorBranch(err error, backend, operation string, targets ...string) (cliErrorBranch, bool) {
+	branches := matchingCLIErrorBranches(err, backend, operation, targets...)
+	if len(branches) == 0 {
+		return cliErrorBranch{}, false
+	}
+	return branches[0], true
 }
 
 func cliBinaryMatches(got, want string) bool {

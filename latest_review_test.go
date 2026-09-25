@@ -351,13 +351,14 @@ func TestDirectStructuredAbsenceStillMatches(t *testing.T) {
 func TestInspectTargetValidationWrapsConfirmedAbsence(t *testing.T) {
 	const appleValid = `[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{}},"status":{"state":"running","networks":[]}}]`
 	const appleOther = `[{"id":"other","configuration":{"id":"other","image":{"reference":"redis"},"labels":{}},"status":{"state":"running","networks":[]}}]`
-	const dockerValidByName = `[{"Id":"other-id","Name":"/myctr","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
-	const dockerValidByID = `[{"Id":"myctr","Name":"/other","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
-	const dockerOther = `[{"Id":"other-id","Name":"/other","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
+	const dockerValidByName = `[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
+	const dockerValidByID = `[{"Id":"` + dockerFixtureID + `","Name":"/other","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
+	const dockerOther = `[{"Id":"` + dockerFixtureID + `","Name":"/other","State":{"Status":"running"},"Config":{"Image":"redis","Labels":{}},"NetworkSettings":{}}]`
 	cases := []struct {
 		name       string
 		eng        engine
 		stdout     string
+		uid        string
 		wantAbsent bool
 		wantOK     bool
 		wantParse  bool
@@ -371,12 +372,12 @@ func TestInspectTargetValidationWrapsConfirmedAbsence(t *testing.T) {
 		{name: "docker empty", eng: dockerEngine{}, stdout: "[]", wantAbsent: true},
 		{name: "docker mismatch", eng: dockerEngine{}, stdout: dockerOther, wantAbsent: true},
 		{name: "docker valid name", eng: dockerEngine{}, stdout: dockerValidByName, wantOK: true},
-		{name: "docker valid id", eng: dockerEngine{}, stdout: dockerValidByID, wantOK: true},
+		{name: "docker valid id", eng: dockerEngine{}, stdout: dockerValidByID, uid: dockerFixtureID, wantOK: true},
 		{name: "docker parse", eng: dockerEngine{}, stdout: "{", wantParse: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctr := &Container{id: "myctr", runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng}
+			ctr := &Container{id: "myctr", uid: tc.uid, runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng}
 			_, err := ctr.State(context.Background())
 			switch {
 			case tc.wantOK && err != nil:

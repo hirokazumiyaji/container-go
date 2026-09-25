@@ -1,6 +1,8 @@
 package container
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -71,6 +73,31 @@ func TestReaperDeletesRegisteredDockerIDOnEOF(t *testing.T) {
 	r.closeStdin()
 
 	waitForLogLines(t, logPath, "rm --force "+id)
+}
+
+func TestRegisterWithGlobalReaperLogsValidationFailure(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "docker")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	registerWithGlobalReaper(binary, "rm", "bad id", "")
+
+	for _, want := range []string{
+		"container-go: reaper registration failed",
+		`invalid container id "bad id"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %q, want %q", logs.String(), want)
+		}
+	}
 }
 
 func TestReaperRejectsInvalidID(t *testing.T) {

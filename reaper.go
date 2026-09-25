@@ -219,9 +219,9 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
+// process-wide reaper for its backend binary. Reaper trouble is logged
+// but never fails container startup. The reaper needs /bin/sh, so on
+// Windows this is a no-op and cleanup relies on the normal paths.
 func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
@@ -233,5 +233,7 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
+	}
 }

@@ -1,9 +1,10 @@
+//go:build !windows
+
 package container
 
 import (
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -125,10 +126,6 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 }
 
 func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
-	}
-
 	stagingDir := t.TempDir()
 	workDir := t.TempDir()
 	started := filepath.Join(workDir, "inspect-started")

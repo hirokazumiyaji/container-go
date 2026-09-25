@@ -243,7 +243,7 @@ func createRaceMissing(err error) bool {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
-		if appleIDMissingLine(line, target) {
+		if appleTypedContainerIDNotFoundLine(line, target) || appleIDMissingLine(line, target) {
 			return true
 		}
 		for _, wrapper := range []string{

@@ -269,30 +269,102 @@ func (appleEngine) containerMissing(err error) bool {
 		return false
 	}
 	switch command {
-	case "inspect":
+	case "inspect", "exec", "stop", "delete", "rm", "logs":
 		return hasCLIErrorLine(err, func(line string) bool {
-			rest, ok := strings.CutPrefix(line, "container not found:")
-			return ok && cliTargetListMatches(rest, target)
-		})
-	case "exec":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleExecMissingLine(line, target)
-		})
-	case "stop":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleStateMissingLine(line, target, "failed to stop container:")
-		})
-	case "delete", "rm":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleStateMissingLine(line, target, "failed to delete container:")
-		})
-	case "logs":
-		return hasCLIErrorLine(err, func(line string) bool {
-			return appleLogsMissingLine(line, target)
+			return appleContainerMissingLine(line, target, command)
 		})
 	default:
 		return false
 	}
+}
+
+func appleContainerMissingLine(line, target, command string) bool {
+	if appleTypedNotFoundLine(line, target, command) {
+		return true
+	}
+	switch command {
+	case "inspect":
+		rest, ok := strings.CutPrefix(line, "container not found:")
+		return ok && cliTargetListMatches(rest, target)
+	case "exec":
+		return appleExecMissingLine(line, target)
+	case "stop":
+		return appleStateMissingLine(line, target, "failed to stop container:")
+	case "delete", "rm":
+		return appleStateMissingLine(line, target, "failed to delete container:")
+	case "logs":
+		return appleLogsMissingLine(line, target)
+	default:
+		return false
+	}
+}
+
+// appleTypedNotFoundLine handles the structured ContainerizationError
+// spelling emitted by Apple Container 1.3.0. The CLI prints descriptions
+// such as notFound: "container not found: id" and can wrap that value in
+// internalError: "..." (cause: "...") layers. Only these typed forms
+// are accepted; an arbitrary application line containing "not found" is
+// deliberately not a backend absence result.
+func appleTypedNotFoundLine(line, target, command string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleContainerNotFoundMessage(message, target, command)
+}
+
+func appleTypedContainerIDNotFoundLine(line, target string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleIDMessageMatches(message, target)
+}
+
+func appleTypedNotFoundMessage(line string) (string, bool) {
+	current := strings.ToLower(strings.TrimSpace(line))
+	for range 6 {
+		current = strings.TrimSpace(current)
+		current = strings.Trim(current, "()")
+		current = strings.TrimSpace(current)
+		if strings.HasPrefix(current, "notfound:") {
+			message := strings.TrimSpace(strings.TrimPrefix(current, "notfound:"))
+			message = strings.TrimSpace(strings.Trim(message, `"'`))
+			message = strings.ReplaceAll(message, `\"`, `"`)
+			return message, message != ""
+		}
+		if strings.HasPrefix(current, "internalerror:") || strings.HasPrefix(current, "cause:") {
+			index := strings.Index(current, "cause:")
+			if index < 0 {
+				return "", false
+			}
+			current = strings.TrimSpace(current[index+len("cause:"):])
+			if len(current) >= 2 && current[0] == '"' && current[len(current)-1] == '"' {
+				current = current[1 : len(current)-1]
+			}
+			current = strings.ReplaceAll(current, `\"`, `"`)
+			continue
+		}
+		return "", false
+	}
+	return "", false
+}
+
+func appleContainerNotFoundMessage(message, target, command string) bool {
+	message = strings.TrimSpace(strings.Trim(message, `"'`))
+	if rest, ok := strings.CutPrefix(message, "container not found:"); ok {
+		return cliTargetListMatches(rest, target)
+	}
+	if rest, ok := strings.CutPrefix(message, "get failed:"); ok {
+		return command == "exec" && appleExecMissingLine("get failed:"+rest, target)
+	}
+	if appleIDMessageMatches(message, target) {
+		switch command {
+		case "inspect", "exec", "stop", "delete", "rm", "logs":
+			return true
+		default:
+			return false
+		}
+	}
+	return false
+}
+
+func appleIDMessageMatches(message, target string) bool {
+	return appleIDMissingLine(strings.TrimSpace(strings.Trim(message, `"'`)), target)
 }
 
 func appleExecMissingLine(line, target string) bool {

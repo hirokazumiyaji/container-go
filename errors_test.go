@@ -119,6 +119,22 @@ func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "typed Apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: `Error: notFound: "container with id myctr not found"`,
+			},
+			want: true,
+		},
+		{
+			name: "nested typed Apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: `Error: internalError: "failed to run container" (cause: "notFound: \"container with id myctr not found\"")`,
+			},
+			want: true,
+		},
+		{
 			name: "generic application message",
 			err: &cli.CLIError{
 				Binary: "container", Args: []string{"run", "--name", "myctr"},

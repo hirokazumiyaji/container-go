@@ -32,7 +32,9 @@ Go のテストコードから使い捨てのコンテナを起動し、接続�
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。
 - `--rm` で削除しても匿名ボリュームは残る。
-- エラー分類は `engine_apple.go` が持つ CLI stderr 部分文字列に依存する(名前衝突、image/container missing)。ライブ CLI に対する回帰は `cli_compat_integration_test.go` で確認する。
+- エラー分類はコマンド、実行ファイル、対象 ID に依存する。
+  Apple の matcher は 1.3.0 の型付き `notFound` と入れ子の `internalError`/`cause` を解釈し、「not found」を含むだけのアプリケーション出力は除外する。
+  これらの形式はフィクスチャで回帰テストし、ライブ CLI の確認は `cli_compat_integration_test.go` で維持する。
 
 ## 実現方式の選定
 
@@ -324,6 +326,8 @@ macOS で Docker Desktop を使いたい場合は `CONTAINERGO_BACKEND=docker` �
 container-rs は Docker Engine API を直接叩くが、本ライブラリでは採らない。
 API 直叩きは tar 生成、ログストリームの逆多重化、レジストリ認証、Windows named pipe を自前実装する必要があり、CLI ラッパーで統一すれば既存のランナー層(引数配列実行、タイムアウト、ストリーミング)をそのまま共有できるためである。
 `DOCKER_HOST` やコンテキスト、認証の解決は docker CLI 自身に委ねられる。
+Docker の `run` 出力には 64 文字の小文字 16 進コンテナ ID が含まれる。
+ライブラリはこの不変 ID をライフサイクル操作とリーパー登録に保持し、同一名に置き換えられたコンテナを削除しないようにする。
 
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
 プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
@@ -338,6 +342,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
 `Prune` は Docker ではデーモンのフィルタ（`--filter label=... --filter status=exited --filter status=dead`）を使う。
+`created` と `running` のコンテナは対象から除外する。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
 

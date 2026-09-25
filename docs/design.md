@@ -52,10 +52,11 @@ The design decisions below rest on these properties of Apple Container
   Docker/OCI-style keys.
 - `container cp` only works on running containers.
 - `--rm` removal leaves anonymous volumes behind.
-- Error classification depends on CLI stderr substrings owned by
-  `engine_apple.go` (name conflict, image/container missing). Those
-  matchers are regression-tested against a live CLI in
-  `cli_compat_integration_test.go`.
+- Error classification is command-, binary-, and target-aware. The Apple
+  matcher accepts the typed 1.3.0 `notFound` and nested
+  `internalError`/`cause` forms, while rejecting application output that
+  merely contains “not found”. These cases are fixture-tested and the
+  live CLI check remains in `cli_compat_integration_test.go`.
 
 ## Choosing the implementation strategy
 
@@ -481,6 +482,10 @@ CLI wrapper shares the existing runner layer (argv execution,
 timeouts, streaming) unchanged. `DOCKER_HOST`, contexts, and auth
 resolution stay the docker CLI's job.
 
+Docker `run` output supplies a full 64-character lowercase hexadecimal
+container ID. The library keeps that immutable ID for lifecycle and
+reaper operations so a same-name replacement cannot be deleted.
+
 **Internal structure**: a backend is an internal interface owning only
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
@@ -510,8 +515,9 @@ The Apple backend's direct-IP default is unchanged.
 command per backend (`delete --force` for Apple, `rm --force --volumes`
 for Docker). The reaper depends on `/bin/sh` and thus does not run on
 Windows; v0.2 documents that Windows relies on the normal cleanup
-paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
-on Docker (`--filter label=... --filter status=exited`).
+paths (`Cleanup`, rollback) only. `Prune` uses daemon-side filters on
+Docker for both `status=exited` and `status=dead`; `created` and
+`running` containers are left alone.
 
 **Liveness detection**: the probe command switches per backend
 (`system status` for Apple, `info` for Docker).

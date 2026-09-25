@@ -467,6 +467,239 @@ func TestTerminateContainerBoundsNameLockWait(t *testing.T) {
 	}
 }
 
+func TestCleanupRetainsReaperLeasedStateLock(t *testing.T) {
+	name := "leased-cleanup-" + newContainerName()
+	paths, _, err := reaperNameLockSet(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawState, err := rawNameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	initial := nameLockMaxFiles + 5
+	dir := filepath.Dir(rawState)
+	for i := 0; i < initial; i++ {
+		path := filepath.Join(dir, fmt.Sprintf("%064x.lock", i+1))
+		if err := os.WriteFile(path, nil, nameLockFilePerm); err != nil {
+			t.Fatal(err)
+		}
+		old := time.Now().Add(-2 * nameLockRetention)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	old := time.Now().Add(-2 * nameLockRetention)
+	if err := os.Chtimes(rawState, old, old); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupNameLockFilesAt(context.Background(), dir, "", time.Now(), 1000, 1000); err != nil {
+		t.Fatalf("cleanupNameLockFilesAt: %v", err)
+	}
+	rawInfo, err := os.Stat(rawState)
+	if err != nil {
+		t.Fatalf("leased raw lock removed: %v", err)
+	}
+	leaseInfo, err := os.Stat(paths[3])
+	if err != nil {
+		t.Fatalf("reaper lease removed: %v", err)
+	}
+	if !os.SameFile(rawInfo, leaseInfo) {
+		t.Fatal("reaper lease and raw lock do not share an inode")
+	}
+}
+
+func TestReaperUsesLeaseAfterOriginalStateReplacement(t *testing.T) {
+	requireReaperLockf(t)
+	name := "reaper-lease-replacement-" + newContainerName()
+	creation := "0123456789abcdef"
+	paths, _, err := reaperNameLockSet(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rawState, err := rawNameLockPath(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalInfo, err := os.Stat(rawState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	if err := r.register(name, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := os.Remove(rawState); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rawState, nil, nameLockFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	replacementInfo, err := os.Stat(rawState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if os.SameFile(originalInfo, replacementInfo) {
+		t.Fatal("test replacement reused the original inode")
+	}
+	replacementUnlock, err := acquireLockFile(context.Background(), stateNameLockStage, rawState, false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force "+name)
+	waitReaperExitForTest(t, r)
+	replacementUnlock()
+	if _, err := os.Stat(paths[3]); err != nil {
+		t.Fatalf("original replacement removed the durable lease: %v", err)
+	}
+}
+
+func TestReaperFailsClosedWhenLeaseReplaced(t *testing.T) {
+	requireReaperLockf(t)
+	name := "reaper-lease-symlink-" + newContainerName()
+	creation := "0123456789abcdef"
+	paths, _, err := reaperNameLockSet(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := paths[3]
+	if err := os.Remove(lease); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(t.TempDir(), "replacement")
+	if err := os.WriteFile(target, nil, nameLockFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, lease); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitReaperExitForTest(t, r)
+	})
+	// Registration rejects the invalid lease before starting a child.
+	if err := r.register(name, creation); err == nil {
+		t.Fatal("reaper registration accepted a symlink lease")
+	}
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force "+name) {
+		t.Fatalf("reaper deleted through a replaced lease: %q", data)
+	}
+}
+
+func TestReaperReplacedLeaseDuringInspectFailsClosed(t *testing.T) {
+	requireReaperLockf(t)
+	name := "reaper-lease-race-" + newContainerName()
+	creation := "0123456789abcdef"
+	paths, _, err := reaperNameLockSet(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	inspectStarted := filepath.Join(dir, "inspect-started")
+	releaseInspect := filepath.Join(dir, "release-inspect")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then\n" +
+		"  : > " + inspectStarted + "\n" +
+		"  while [ ! -e " + releaseInspect + " ]; do sleep 0.05; done\n" +
+		"  printf '    \"" + creationLabel + "\": \"" + creation + "\"\n'\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register(name, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(releaseInspect, nil, 0o600)
+		r.closeStdin()
+		waitReaperExitForTest(t, r)
+	})
+	r.closeStdin()
+	waitForFile(t, inspectStarted)
+	if err := os.Remove(paths[3]); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(paths[3], nil, nameLockFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(releaseInspect, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	waitReaperExitForTest(t, r)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force "+name) {
+		t.Fatalf("reaper deleted after lease replacement: %q", data)
+	}
+}
+
+func TestReaperNameLockPathsCompatibilityShape(t *testing.T) {
+	statePath, maintenancePath, err := reaperNameLockPaths("compat-" + newContainerName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if statePath == "" || maintenancePath == "" || filepath.Dir(statePath) != filepath.Dir(maintenancePath) {
+		t.Fatalf("compatibility paths = %q, %q", statePath, maintenancePath)
+	}
+}
+
+func TestReaperAcquiresEveryMigrationBarrierBeforeDelete(t *testing.T) {
+	requireReaperLockf(t)
+	for _, tc := range []struct {
+		name  string
+		index int
+	}{
+		{name: "legacy TMPDIR", index: 0},
+		{name: "transitional cache", index: 1},
+		{name: "maintenance", index: 2},
+		{name: "durable state", index: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			name := "reaper-barrier-" + newContainerName()
+			creation := "0123456789abcdef"
+			paths, _, err := reaperNameLockSet(name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bin, logPath := writeReaperStub(t)
+			r := newReaper(bin, "delete")
+			if err := r.register(name, creation); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			holder, err := acquireLockFile(context.Background(), stateNameLockStage, paths[tc.index], false, nil)
+			if err != nil {
+				r.closeStdin()
+				waitReaperExitForTest(t, r)
+				t.Fatal(err)
+			}
+			released := false
+			t.Cleanup(func() {
+				if !released {
+					holder()
+				}
+				r.closeStdin()
+				waitReaperExitForTest(t, r)
+			})
+			r.closeStdin()
+			time.Sleep(150 * time.Millisecond)
+			if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force "+name) {
+				holder()
+				released = true
+				t.Fatalf("reaper deleted while %s was held: %q", tc.name, data)
+			}
+			holder()
+			released = true
+			waitForLogLines(t, logPath, "delete --force "+name)
+		})
+	}
+}
+
 func TestNameLockHelperProcess(t *testing.T) {
 	if os.Getenv("CONTAINERGO_LOCK_HELPER") != "1" {
 		return

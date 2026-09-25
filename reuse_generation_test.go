@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -102,6 +103,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 		labels: map[string]string{
 			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
 		},
+		uid: strings.Repeat("0f", 32),
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
@@ -112,6 +114,158 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	// so a same-name replacement created after the check is not found.
 	if len(r.deleted) != 1 || r.deleted[0] != r.uid {
 		t.Errorf("deleted = %v, want [%s]", r.deleted, r.uid)
+	}
+}
+
+type dockerStoppedReuseSnapshot struct {
+	uid      string
+	creation string
+	state    string
+	group    string
+	managed  bool
+	reuse    bool
+}
+
+type dockerStoppedReuseRunner struct {
+	snapshots []dockerStoppedReuseSnapshot
+	inspect   int
+	deleted   []string
+}
+
+func (r *dockerStoppedReuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		if r.inspect >= len(r.snapshots) {
+			return nil, nil, fmt.Errorf("unexpected inspect %d", r.inspect+1)
+		}
+		snapshot := r.snapshots[r.inspect]
+		r.inspect++
+		labels := fmt.Sprintf(`"%s":"%t","%s":"%t","%s":"%s"`, managedLabel, snapshot.managed, reuseLabel, snapshot.reuse, creationLabel, snapshot.creation)
+		if snapshot.group != "" {
+			labels += fmt.Sprintf(`,"%s":"%s"`, reuseGroupLabel, snapshot.group)
+		}
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/shared","State":{"Status":%q},"Config":{"Image":"redis","Labels":{%s}},"NetworkSettings":{}}]`, snapshot.uid, snapshot.state, labels)), nil, nil
+	case "rm":
+		r.deleted = append(r.deleted, args[len(args)-1])
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestDeleteStoppedReuseSkipsDockerUIDReplacement(t *testing.T) {
+	uid := strings.Repeat("a1", 32)
+	info := &engineInfo{
+		state: StateStopped,
+		uid:   uid,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+	}
+	r := &dockerStoppedReuseRunner{snapshots: []dockerStoppedReuseSnapshot{{
+		uid: strings.Repeat("b2", 32), creation: "aaaaaaaaaaaaaaaa", state: "exited", managed: true, reuse: true,
+	}}}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse = %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete of a different UID", r.deleted)
+	}
+}
+
+func TestDeleteStoppedReuseSkipsDockerGenerationReplacement(t *testing.T) {
+	uid := strings.Repeat("a1", 32)
+	info := &engineInfo{
+		state: StateStopped,
+		uid:   uid,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+	}
+	r := &dockerStoppedReuseRunner{snapshots: []dockerStoppedReuseSnapshot{{
+		uid: uid, creation: "bbbbbbbbbbbbbbbb", state: "exited", managed: true, reuse: true,
+	}}}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse = %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete of a different generation", r.deleted)
+	}
+}
+
+func TestDeleteStoppedReuseSkipsDockerRunningRace(t *testing.T) {
+	uid := strings.Repeat("a1", 32)
+	info := &engineInfo{
+		state: StateStopped,
+		uid:   uid,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+	}
+	r := &dockerStoppedReuseRunner{snapshots: []dockerStoppedReuseSnapshot{{
+		uid: uid, creation: "aaaaaaaaaaaaaaaa", state: "running", managed: true, reuse: true,
+	}}}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse = %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete after the stopped-to-running race", r.deleted)
+	}
+}
+
+func TestDeleteStoppedReuseSkipsDockerMetadataReplacement(t *testing.T) {
+	uid := strings.Repeat("a1", 32)
+	info := &engineInfo{
+		state: StateStopped,
+		uid:   uid,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa", reuseGroupLabel: "team-a",
+		},
+	}
+	for _, tc := range []struct {
+		name    string
+		group   string
+		managed bool
+		reuse   bool
+	}{
+		{name: "group changed", group: "team-b", managed: true, reuse: true},
+		{name: "managed marker removed", group: "team-a", managed: false, reuse: true},
+		{name: "reuse marker removed", group: "team-a", managed: true, reuse: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &dockerStoppedReuseRunner{snapshots: []dockerStoppedReuseSnapshot{{
+				uid: uid, creation: "aaaaaaaaaaaaaaaa", state: "exited", group: tc.group, managed: tc.managed, reuse: tc.reuse,
+			}}}
+			cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+			if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+				t.Fatalf("deleteStoppedReuse = %v", err)
+			}
+			if len(r.deleted) != 0 {
+				t.Fatalf("deleted = %v, want no delete after %s", r.deleted, tc.name)
+			}
+		})
+	}
+}
+
+func TestDeleteStoppedReuseDockerRejectsUnverifiedOriginalUID(t *testing.T) {
+	info := &engineInfo{
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel: "true", reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+	}
+	r := &dockerStoppedReuseRunner{snapshots: []dockerStoppedReuseSnapshot{{
+		uid: strings.Repeat("a1", 32), creation: "aaaaaaaaaaaaaaaa", state: "exited", managed: true, reuse: true,
+	}}}
+	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err == nil || !strings.Contains(err.Error(), "verified immutable ID") {
+		t.Fatalf("deleteStoppedReuse = %v, want unverified-original-UID refusal", err)
+	}
+	if len(r.deleted) != 0 || r.inspect != 0 {
+		t.Fatalf("deleted = %v, inspect calls = %d; want fail closed before inspect", r.deleted, r.inspect)
 	}
 }
 
@@ -170,7 +324,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":

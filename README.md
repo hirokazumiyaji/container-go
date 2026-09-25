@@ -167,11 +167,13 @@ Three layers make sure containers do not outlive your tests:
    returning.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. On Apple it holds the same durable
-   per-name lock across generation inspection and deletion, and skips
-   an entry if that lock or `lockf` is unavailable. The reaper needs
-   `/bin/sh`, so it is unavailable on Windows — there, cleanup relies
-   on the first two layers only.
+   SIGKILL and panics included. On Apple it holds the legacy,
+   transitional, maintenance, and durable name-lock barriers in order
+   across generation inspection and deletion. Registered lock inodes
+   use durable hard-link leases protected from age/cap cleanup, and an
+   entry is skipped if any lease, identity check, or `lockf` invocation
+   is unavailable. The reaper needs `/bin/sh`, so it is unavailable on
+   Windows — there, cleanup relies on the first two layers only.
 
 Extras:
 

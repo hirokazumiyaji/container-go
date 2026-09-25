@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/user"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -29,6 +30,7 @@ const (
 	nameLockCleanupScan     = nameLockMaxFiles + 2
 	nameLockCleanupDelete   = 32
 	nameLockMaintenanceFile = ".maintenance.lock"
+	nameLockLeaseSuffix     = ".reaper-lease"
 )
 
 type nameLockStage string
@@ -54,10 +56,18 @@ type nameLockHooks struct {
 // the account database.
 var nameLockStateRootOverride string
 
-// nameLockPath returns the durable, per-user state path for name. The
-// digest keeps arbitrary container names out of the filesystem path and
-// avoids both path traversal and filename-length surprises.
+// nameLockPath returns the durable, per-user state path for name. If a
+// reaper lease exists, its hard link is the canonical path so a normal
+// caller and the reaper continue to use the same inode.
 func nameLockPath(name string) (string, error) {
+	raw, err := rawNameLockPath(name)
+	if err != nil {
+		return "", err
+	}
+	return canonicalNameLockPath(raw)
+}
+
+func rawNameLockPath(name string) (string, error) {
 	dir, err := nameLockDir()
 	if err != nil {
 		return "", err
@@ -65,26 +75,172 @@ func nameLockPath(name string) (string, error) {
 	return filepath.Join(dir, nameLockFileName(name)), nil
 }
 
-// reaperNameLockPaths prepares the durable state and maintenance inodes
-// before a shell reaper receives their paths. The shell must never be
-// allowed to create or follow a different inode for a name-addressed
-// delete or cleanup race.
+// canonicalNameLockPath returns a durable reaper lease when one is
+// present. A lease is a hard link to the original lock inode, so cleanup
+// may retain the lease while the replaceable original path is recreated.
+func canonicalNameLockPath(path string) (string, error) {
+	leasePath := path + nameLockLeaseSuffix
+	leaseInfo, err := os.Lstat(leasePath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return path, nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("stat reaper lease %s: %w", leasePath, err)
+	}
+	if err := checkLockFile(leaseInfo, leasePath); err != nil {
+		return "", fmt.Errorf("validate reaper lease %s: %w", leasePath, err)
+	}
+	originalInfo, err := os.Lstat(path)
+	if err == nil {
+		if err := checkLockFile(originalInfo, path); err != nil {
+			return "", fmt.Errorf("validate leased lock %s: %w", path, err)
+		}
+		if !os.SameFile(originalInfo, leaseInfo) {
+			return "", fmt.Errorf("reaper lease %s does not match lock inode %s", leasePath, path)
+		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", fmt.Errorf("stat leased lock %s: %w", path, err)
+	}
+	return leasePath, nil
+}
+
+// reaperNameLockSet prepares all four compatibility barriers in the
+// same order used by lockName. Each path is pinned with a hard-link lease
+// so cleanup cannot unlink the inode before the shell reaper locks it.
+func reaperNameLockSet(name string) ([]string, []string, error) {
+	legacyPath, err := rawLegacyNameLockPath(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	transitionalPath, err := rawTransitionalNameLockPath(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	statePath, err := rawNameLockPath(name)
+	if err != nil {
+		return nil, nil, err
+	}
+	maintenancePath := filepath.Join(filepath.Dir(statePath), nameLockMaintenanceFile)
+	rawPaths := []string{legacyPath, transitionalPath, maintenancePath, statePath}
+
+	// Cleanup takes this maintenance lock before unlinking any state lock.
+	// Holding it while leases are created closes the registration/cleanup
+	// race without retaining a name lock.
+	leaseCtx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+	defer cancel()
+	maintenanceUnlock, err := acquireLockFile(leaseCtx, maintenanceNameLockStage, maintenancePath, false, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer maintenanceUnlock()
+
+	paths := make([]string, 0, len(rawPaths))
+	for _, rawPath := range rawPaths {
+		leasePath, err := ensureReaperLease(rawPath)
+		if err != nil {
+			return nil, nil, err
+		}
+		paths = append(paths, leasePath)
+	}
+	identities := make([]string, 0, len(paths))
+	for _, path := range paths {
+		f, err := openLockFile(path, true, stateNameLockStage, nil)
+		if err != nil {
+			return nil, nil, err
+		}
+		info, statErr := f.Stat()
+		if statErr != nil {
+			_ = f.Close()
+			return nil, nil, statErr
+		}
+		identity, identityErr := lockFileIdentity(info)
+		closeErr := f.Close()
+		if identityErr != nil {
+			return nil, nil, identityErr
+		}
+		if closeErr != nil {
+			return nil, nil, closeErr
+		}
+		identities = append(identities, identity)
+	}
+	return paths, identities, nil
+}
+
+// reaperNameLockPaths preserves the pre-lease helper shape for package
+// callers while the reaper itself uses the complete ordered set above.
 func reaperNameLockPaths(name string) (statePath, maintenancePath string, err error) {
-	statePath, err = nameLockPath(name)
+	paths, _, err := reaperNameLockSet(name)
 	if err != nil {
 		return "", "", err
 	}
-	maintenancePath = filepath.Join(filepath.Dir(statePath), nameLockMaintenanceFile)
-	for _, path := range []string{statePath, maintenancePath} {
-		f, openErr := openLockFile(path, true, stateNameLockStage, nil)
-		if openErr != nil {
-			return "", "", openErr
+	if len(paths) != 4 {
+		return "", "", fmt.Errorf("reaper lock set has %d barriers, want 4", len(paths))
+	}
+	return paths[3], paths[2], nil
+}
+
+func ensureReaperLease(rawPath string) (string, error) {
+	leasePath := rawPath + nameLockLeaseSuffix
+	if existing, err := canonicalNameLockPath(rawPath); err != nil {
+		return "", err
+	} else if existing != rawPath {
+		return existing, nil
+	}
+
+	f, err := openLockFile(rawPath, true, stateNameLockStage, nil)
+	if err != nil {
+		return "", err
+	}
+	openedInfo, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	if err := os.Link(rawPath, leasePath); err != nil && !errors.Is(err, fs.ErrExist) {
+		_ = f.Close()
+		return "", fmt.Errorf("create reaper lease %s: %w", leasePath, err)
+	}
+	leaseFile, err := openLockFile(leasePath, true, stateNameLockStage, nil)
+	if err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	leaseInfo, err := leaseFile.Stat()
+	if err == nil && !os.SameFile(openedInfo, leaseInfo) {
+		err = fmt.Errorf("reaper lease %s does not match lock inode %s", leasePath, rawPath)
+	}
+	closeErr := leaseFile.Close()
+	rawCloseErr := f.Close()
+	if err != nil {
+		return "", err
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if rawCloseErr != nil {
+		return "", rawCloseErr
+	}
+	return leasePath, nil
+}
+
+func lockFileIdentity(info os.FileInfo) (string, error) {
+	value := reflect.ValueOf(info.Sys())
+	if value.IsValid() {
+		if value.Kind() == reflect.Pointer {
+			if value.IsNil() {
+				return "", fmt.Errorf("lock file stat is nil")
+			}
+			value = value.Elem()
 		}
-		if closeErr := f.Close(); closeErr != nil {
-			return "", "", fmt.Errorf("close prepared reaper lock file %s: %w", path, closeErr)
+		if value.Kind() == reflect.Struct {
+			dev := value.FieldByName("Dev")
+			ino := value.FieldByName("Ino")
+			if dev.IsValid() && ino.IsValid() {
+				return fmt.Sprintf("%d:%d", dev.Interface(), ino.Interface()), nil
+			}
 		}
 	}
-	return statePath, maintenancePath, nil
+	return "", fmt.Errorf("lock file device/inode identity is unavailable")
 }
 
 func nameLockFileName(name string) string {
@@ -168,6 +324,14 @@ func existingUserDir(path string) (string, error) {
 // hardened revision. It remains a mandatory migration barrier until old
 // binaries can no longer coexist with this one.
 func transitionalNameLockPath(name string) (string, error) {
+	raw, err := rawTransitionalNameLockPath(name)
+	if err != nil {
+		return "", err
+	}
+	return canonicalNameLockPath(raw)
+}
+
+func rawTransitionalNameLockPath(name string) (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("find transitional user cache directory: %w", err)
@@ -188,6 +352,14 @@ func transitionalNameLockPath(name string) (string, error) {
 }
 
 func legacyNameLockPath(name string) (string, error) {
+	raw, err := rawLegacyNameLockPath(name)
+	if err != nil {
+		return "", err
+	}
+	return canonicalNameLockPath(raw)
+}
+
+func rawLegacyNameLockPath(name string) (string, error) {
 	tempDir := os.TempDir()
 	// Resolve safe system symlinks such as /var -> /private/var. The old
 	// binary opens the alias, while this revision opens the same final
@@ -200,6 +372,11 @@ func legacyNameLockPath(name string) (string, error) {
 		return "", fmt.Errorf("legacy temporary directory %s is not user-safe: %w", resolved, err)
 	}
 	return filepath.Join(resolved, "containergo-"+name+".lock"), nil
+}
+
+func maintenanceNameLockPath(stateDir string) (string, error) {
+	raw := filepath.Join(stateDir, nameLockMaintenanceFile)
+	return canonicalNameLockPath(raw)
 }
 
 // prepareUserBase resolves all existing path components, creates missing
@@ -361,12 +538,12 @@ func checkLockFile(info os.FileInfo, path string) error {
 
 // lockName serializes name-addressed creates and generation-checked
 // deletes across cooperating processes on this host. Every new caller
-// takes three barriers in a fixed order: the parent revision's TMPDIR
-// flock, the UserCacheDir flock introduced by the first hardened revision,
-// and the durable state flock. An old caller takes only its historical
-// barrier, so coordination with an old binary is guaranteed only when its
-// historical path is the same. Failure to establish a historical namespace
-// is a fail-closed compatibility error.
+// takes the parent revision's TMPDIR flock, the UserCacheDir flock
+// introduced by the first hardened revision, namespace maintenance, and
+// the durable state flock, in that order. An old caller takes only its
+// historical barrier, so coordination with an old binary is guaranteed
+// only when its historical path is the same. Failure to establish a
+// historical namespace is a fail-closed compatibility error.
 func lockName(ctx context.Context, name string) (func(), error) {
 	return lockNameWithHooks(ctx, name, nil)
 }
@@ -421,11 +598,24 @@ func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (
 	}
 
 	stateDir := filepath.Dir(statePath)
-	maintenancePath := filepath.Join(stateDir, nameLockMaintenanceFile)
+	maintenancePath, err := maintenanceNameLockPath(stateDir)
+	if err != nil {
+		release()
+		return nil, fmt.Errorf("%w: resolve lock maintenance: %w", ErrNameLockCompatibility, err)
+	}
 	maintenanceUnlock, err := acquireLockFile(ctx, maintenanceNameLockStage, maintenancePath, false, nil)
 	if err != nil {
 		release()
 		return nil, wrapNameLockAcquireError("lock maintenance", err)
+	}
+	// A reaper may have created a lease while we waited for maintenance.
+	// Re-resolve the durable path under that barrier so this caller never
+	// opens a newly-created inode while the reaper still owns the lease.
+	statePath, err = canonicalNameLockPath(statePath)
+	if err != nil {
+		maintenanceUnlock()
+		release()
+		return nil, fmt.Errorf("%w: resolve durable lock: %w", ErrNameLockCompatibility, err)
 	}
 	if err := acquire(stateNameLockStage, statePath, true); err != nil {
 		maintenanceUnlock()
@@ -602,7 +792,11 @@ func cleanupNameLockFiles(ctx context.Context, dir, keep string, now time.Time) 
 }
 
 func cleanupNameLockFilesAt(ctx context.Context, dir, keep string, now time.Time, scanLimit, deleteLimit int) error {
-	maintenanceUnlock, err := acquireLockFile(ctx, maintenanceNameLockStage, filepath.Join(dir, nameLockMaintenanceFile), false, nil)
+	maintenancePath, err := maintenanceNameLockPath(dir)
+	if err != nil {
+		return err
+	}
+	maintenanceUnlock, err := acquireLockFile(ctx, maintenanceNameLockStage, maintenancePath, false, nil)
 	if err != nil {
 		return err
 	}
@@ -669,6 +863,13 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 			unlock()
 			continue
 		}
+		// A reaper lease is a durable hard-link reference to this exact
+		// inode. It is never removed by age/cap cleanup while the entry is
+		// registered, even if the original path is old.
+		if reaperLeaseExists(path) {
+			unlock()
+			continue
+		}
 		info, err := f.Stat()
 		if err != nil || (!overLimit && now.Sub(info.ModTime()) < nameLockRetention) {
 			unlock()
@@ -694,6 +895,11 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 		removed++
 	}
 	return nil
+}
+
+func reaperLeaseExists(path string) bool {
+	_, err := os.Lstat(path + nameLockLeaseSuffix)
+	return err == nil || !errors.Is(err, fs.ErrNotExist)
 }
 
 func isNameLockFile(name string) bool {

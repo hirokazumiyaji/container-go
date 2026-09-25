@@ -127,8 +127,14 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || exit 0`) {
 		t.Error("reaper script must compare the extracted generation exactly")
 	}
-	if !strings.Contains(reaperScript, `command -v lockf`) || !strings.Contains(reaperScript, `"$lockf_bin" -k -n -w -t 30`) {
-		t.Error("reaper script must hold the stable name lock across inspect and delete")
+	if !strings.Contains(reaperScript, `command -v lockf`) || !strings.Contains(reaperScript, `"$lockf_bin" -k -n -t 30`) ||
+		!strings.Contains(reaperScript, `identities_valid`) {
+		t.Error("reaper script must hold all stable name locks across inspect and delete")
+	}
+	for _, variable := range []string{"lock1", "lock2", "lock3", "lock4"} {
+		if !strings.Contains(reaperScript, variable) {
+			t.Errorf("reaper script does not carry %s", variable)
+		}
 	}
 }
 
@@ -233,6 +239,50 @@ func waitForFile(t *testing.T, path string) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", path)
+}
+
+func TestReaperUsesMigrationBarrierOrder(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
+	name := "reaper-order-" + newContainerName()
+	creation := "0123456789abcdef"
+	paths, _, err := reaperNameLockSet(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "lockf.log")
+	lockfPath := filepath.Join(dir, "lockf")
+	script := `#!/bin/sh
+printf '%s\n' "$5" >> ` + logPath + `
+shift 5
+exec "$@"
+`
+	if err := os.WriteFile(lockfPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	bin, deleteLog := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	if err := r.register(name, creation); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, deleteLog, "delete --force "+name)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("lockf log: %v", err)
+	}
+	got := strings.Split(strings.TrimSuffix(string(data), "\n"), "\n")
+	if len(got) != len(paths) {
+		t.Fatalf("lockf calls = %q, want %d barriers", got, len(paths))
+	}
+	for i, want := range paths {
+		if got[i] != want {
+			t.Fatalf("lockf call %d = %q, want %q", i+1, got[i], want)
+		}
+	}
 }
 
 func TestReaperAppleDeleteCoordinatesWithPrune(t *testing.T) {

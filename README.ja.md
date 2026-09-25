@@ -138,10 +138,12 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    から返ります。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
-   削除します。Apple では世代 inspect と delete の間にも同じ stable
-   name lock を保持し、lock や `lockf` がなければ fail closed して
-   スキップします。リーパーは `/bin/sh` を必要とするため Windows では
-   動かず、Windows では前 2 層のみでクリーンアップします。
+   削除します。Apple では legacy、transitional、maintenance、durable の
+   4 つの name-lock barrier を順番に保持します。登録済み lock inode は
+   age/cap cleanup から保護する durable hard-link lease を使い、lease、
+   identity、lockf のいずれかが欠ければ fail closed してスキップします。
+   リーパーは `/bin/sh` を必要とするため Windows では動かず、Windows では
+   前 2 層のみでクリーンアップします。
 
 補足:
 

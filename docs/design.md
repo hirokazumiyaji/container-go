@@ -314,20 +314,23 @@ on Docker also uses that verified immutable ID and does not take an Apple
 name lock. Apple Container addresses containers by name only, so there
 inspect, create, prune, and delete use the guarded per-name protocol.
 
-A new caller takes three barriers in a fixed order: the parent revision's
-`TMPDIR` lock, the `UserCacheDir` lock introduced by the first hardened
-revision, and a lock under a fixed per-user state directory derived from
-the account database. `XDG_STATE_HOME` and `HOME` do not select this
-coordination namespace. The historical locks remain mandatory migration
-barriers. Resolving or locking either historical namespace can fail, but
-the caller then returns a compatibility error before entering the critical
-section. The state filename is a SHA-256 digest of the name, so different
-process environment values do not split new state callers. Every historical
-and state file is opened with `O_NOFOLLOW`; its type, owner, `0600` mode,
-and path-to-open-file inode identity are checked before and after `flock`.
-The state directory and its parents reject paths that another user could
-replace; a standard sticky temporary root is accepted because its sticky
-rule protects entries owned by this user.
+A new caller takes the historical barriers in a fixed order: the parent
+revision's `TMPDIR` lock, the `UserCacheDir` lock introduced by the first
+hardened revision, then the namespace maintenance lock and the lock under a
+fixed per-user state directory derived from the account database. `XDG_STATE_HOME`
+and `HOME` do not select this coordination namespace. The historical locks
+remain mandatory migration barriers. Resolving or locking either historical
+namespace can fail, but the caller then returns a compatibility error before
+entering the critical section. The state filename is a SHA-256 digest of the
+name, so different process environment values do not split new state callers.
+Every historical and state file is opened with `O_NOFOLLOW`; its type, owner,
+`0600` mode, and path-to-open-file inode identity are checked before and after
+`flock`. A registered reaper entry creates durable hard-link leases for all
+four barriers; cleanup skips leased inodes even when they are old or over the
+retention cap, and the shell locks those validated lease paths rather than
+reopening a cleanup-replaceable path. The state directory and its parents
+reject paths that another user could replace; a standard sticky temporary
+root is accepted because its sticky rule protects entries owned by this user.
 
 Recently used state lock files are retained because the kernel releases
 `flock` when a holder exits, while unlinking a live file would create a
@@ -337,7 +340,10 @@ for a state lock held by the caller performing cleanup. Each acquisition
 inspects at most 258 directory entries (256 name-lock files plus the
 maintenance file) and removes at most 32 files. Files older than seven days
 are eligible; if the bounded scan shows that the 256-file retention cap is
-exceeded, an otherwise-unlocked file may be removed earlier. Cleanup uses
+exceeded, an otherwise-unlocked file may be removed earlier. A reaper lease
+is an explicit exception: its hard-linked inode is retained until the
+reaper entry is no longer registered, and a malformed or replaced lease
+causes cleanup to fail closed rather than unlink the original. Cleanup uses
 nonblocking exclusive `flock` and skips a busy candidate, so it never
 unlinks an inode held by another cooperating process. The historical files
 are not swept while old binaries can coexist.
@@ -349,21 +355,24 @@ name, and closing that gap would need an immutable ID or an atomic
 conditional delete that Apple Container does not provide. An old binary
 that uses a different historical `TMPDIR` cannot be coordinated with the
 new state-only barrier; mixed-revision safety is therefore limited to
-matching historical paths and requires staged rollout. An inspect failure
-other than not-found aborts the delete (fail closed). Lock and directory
-failures from failed-create cleanup are joined to `Run`'s error, so a
-container left behind cannot be hidden by a silent lock error. `Run`'s
-rollback and reuse post-create rollback preserve the cleanup error in the
-returned error chain.
+matching historical paths and requires staged rollout. The reaper follows
+the same four-barrier order and fails closed if any historical path, lease,
+or `lockf` invocation is unavailable. An inspect failure other than
+not-found aborts the delete (fail closed). Lock and directory failures from
+failed-create cleanup are joined to `Run`'s error, so a container left
+behind cannot be hidden by a silent lock error. `Run`'s rollback and reuse
+post-create rollback preserve the cleanup error in the returned error chain.
 
 `Terminate` and `TerminateContainer` apply one 30-second aggregate budget by
 default, rather than a fresh 30 seconds for each barrier, inspect, and
 delete. `cleanupFailedCreate` uses one 30-second budget for lock acquisition
 and both backend operations. An earlier caller deadline still wins. The
 watchdog reaper registers Docker containers by verified immutable `Id`; for
-Apple it stores a valid generation and stable lock path, reads the label as
-a line-anchored JSON field (`"key": "value"`, never a substring), and holds
-that lock across inspect and delete with `lockf`. If the helper or lock path
+Apple it stores a valid generation and the four leased lock paths, reads the
+label as a line-anchored JSON field (`"key": "value"`, never a substring),
+and holds legacy, transitional, maintenance, and durable locks across
+inspect and delete with `lockf`. It rechecks the registered device/inode
+identity before and after inspect. If any helper, lease, or lock invocation
 is unavailable, the entry is skipped rather than deleted unlocked. The
 leader's own pull/create uses an independent `runTimeout` budget;
 `reuseAttachTimeout` bounds only attach polling for another process's

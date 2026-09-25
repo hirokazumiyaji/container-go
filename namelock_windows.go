@@ -19,6 +19,10 @@ func nameLockPath(string) (string, error) {
 	return "", fmt.Errorf("name-addressed locks are unavailable on Windows")
 }
 
+func reaperNameLockSet(string) ([]string, []string, error) {
+	return nil, nil, fmt.Errorf("name-addressed reaper is unavailable on Windows")
+}
+
 func reaperNameLockPaths(string) (string, string, error) {
 	return "", "", fmt.Errorf("name-addressed reaper is unavailable on Windows")
 }

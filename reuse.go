@@ -200,6 +200,9 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 	if err := checkReuseIdentity(info, cfg); err != nil {
 		return err
 	}
+	if info.state != StateStopped {
+		return fmt.Errorf("reuse %s: container is not stopped", cfg.name)
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
 	ctr.uid = info.uid
@@ -226,6 +229,12 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 		return ctr.delete(guardCtx, freshTarget(fresh, ctr))
 	}
 
+	// A Docker name can be replaced between the initial stopped inspect
+	// and this fresh inspect. Never use the fresh UID as a new target: the
+	// original inspected UID is the only verified identity we may delete.
+	if !verifiedImmutableID(cfg.eng, info.uid) {
+		return fmt.Errorf("reuse %s: stopped handle has no verified immutable ID", cfg.name)
+	}
 	fresh, err := ctr.inspectFresh(ctx)
 	if isNotFound(err) {
 		return nil
@@ -233,10 +242,12 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 	if err != nil {
 		return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
 	}
-	if !verifiedImmutableID(cfg.eng, fresh.uid) {
-		return fmt.Errorf("reuse %s: backend did not return a verified immutable ID", cfg.name)
+	if !sameStoppedReuseGeneration(info, fresh) ||
+		!verifiedImmutableID(cfg.eng, fresh.uid) ||
+		info.uid != fresh.uid || fresh.state != StateStopped {
+		return nil
 	}
-	return ctr.delete(ctx, fresh.uid)
+	return ctr.delete(ctx, info.uid)
 }
 
 func checkReuseIdentity(info *engineInfo, cfg *config) error {

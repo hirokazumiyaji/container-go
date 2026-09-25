@@ -31,7 +31,6 @@ import (
 // is never staged in a host file. Backend-specific delete flags are
 // retained for the normal cleanup and reaper paths.
 const reaperScript = `set -f
-set -m 2>/dev/null || true
 bin="$1"
 sub="$2"
 key="$3"
@@ -43,11 +42,32 @@ case "$timeout" in ''|*[!0-9]*) timeout=30;; esac
 case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 [ "$timeout" -gt 0 ] 2>/dev/null || timeout=30
 [ "$pending_attempts" -gt 0 ] 2>/dev/null || pending_attempts=1
+tab=$(printf '\t')
+
+# Keep the backend operation in a separate shell process. The same
+# operation is run either directly for an immutable ID or under lockf/
+# flock for a name-addressed generation. The fixed helper contains no
+# inspect output and is passed only validated IDs and options.
+entry_script=
+while IFS= read -r entry_line
+do
+  entry_script="$entry_script$entry_line
+"
+done <<'REAPER_ENTRY'
+set -f
+set -m 2>/dev/null || true
+bin="$REAPER_BIN"
+sub="$REAPER_SUB"
+key="$REAPER_KEY"
+timeout="$REAPER_TIMEOUT"
+pending_attempts="$REAPER_PENDING_ATTEMPTS"
+entry_id="$1"
+entry_creation="$2"
+entry_pending="$3"
+shift 3
 
 # Keep a backend call bounded without leaving the sleep process behind.
-# The timer is a shell child with a TERM trap; the trap kills and reaps
-# its sleeper before the timer itself is reaped. Job control lets the
-# timeout signal the backend process group when the host supports it.
+# Job control gives the command its own process group when supported.
 run_with_timeout() {
   seconds="$1"
   shift
@@ -98,10 +118,6 @@ inspect_projection() {
 }
 
 process_entry() {
-  entry_id="$1"
-  entry_creation="$2"
-  entry_pending="$3"
-  shift 3
   target="$entry_id"
   if [ -n "$entry_creation" ]; then
     tries=0
@@ -143,31 +159,115 @@ process_entry() {
   run_with_timeout "$timeout" "$bin" "$sub" --force "$@" "$target" >/dev/null 2>&1 || true
 }
 
+process_entry "$@"
+REAPER_ENTRY
+
+run_entry() {
+  entry_state="$1"
+  entry_id="$2"
+  entry_creation="$3"
+  entry_lock="$4"
+  shift 4
+  [ -n "$entry_id" ] || return 0
+  [ "$entry_creation" = "-" ] && entry_creation=
+  [ "$entry_state" = S ] && return 0
+  pending=0
+  [ "$entry_state" = P ] && pending=1
+
+  # Every name-addressed operation must share the Go name lock. An
+  # immutable Docker ID is the only operation that may run unlocked.
+  case "$entry_id" in
+    *[!A-Za-z0-9_.-]*) [ -n "$entry_lock" ] || return 0 ;;
+  esac
+  case "$sub" in
+    delete)
+      if [ -z "$entry_lock" ]; then
+        entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"
+      fi
+      ;;
+    rm)
+      case "$entry_id" in
+        *[!0-9a-f]*)
+          if [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
+          ;;
+        *)
+          if [ "${#entry_id}" -ne 64 ] && [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
+          ;;
+      esac
+      ;;
+  esac
+  if [ -n "$entry_lock" ]; then
+    [ -L "$entry_lock" ] && return 0
+    lockf_bin=$(command -v lockf 2>/dev/null) || lockf_bin=
+    case "$lockf_bin" in
+      /*) [ -x "$lockf_bin" ] || lockf_bin= ;;
+      *) lockf_bin= ;;
+    esac
+    if [ -n "$lockf_bin" ]; then
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+        "$lockf_bin" -k -t 30 "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@"
+      return $?
+    fi
+    flock_bin=$(command -v flock 2>/dev/null) || flock_bin=
+    case "$flock_bin" in
+      /*) [ -x "$flock_bin" ] || flock_bin= ;;
+      *) flock_bin= ;;
+    esac
+    if [ -n "$flock_bin" ]; then
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+        "$flock_bin" -x "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@"
+      return $?
+    else
+      return 0
+    fi
+  fi
+  REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+  REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+    sh -c "$entry_script" reaper-entry "$entry_id" "$entry_creation" "$pending" "$@"
+}
+
 # The input is a small event stream. P marks a create that is still
-# settling, C changes that exact key to active, and + is an already
-# complete entry. Plain id lines remain accepted for compatibility with
-# older package-local users of the reaper.
+# settling, C changes that exact key to active, S makes it non-destructive,
+# and + is an already complete entry. The fourth field is the shared
+# name-lock path. Plain id lines remain accepted for compatibility.
 awk '
+{
+  if (index($0, "\t") != 0) { print; next }
+  n=split($0, legacy, /[[:space:]]+/)
+  if (n == 1) { print legacy[1]; next }
+  if (legacy[1] == "+" || legacy[1] == "P" || legacy[1] == "C" || legacy[1] == "S" || legacy[1] == "-") {
+    gen=(n >= 3 && legacy[3] != "" ? legacy[3] : "-")
+    line=legacy[1] "\t" legacy[2] "\t" gen
+    if (n >= 4) line=line "\t" legacy[4]
+    print line
+  } else {
+    print legacy[1] "\t" legacy[2] "\t" legacy[3]
+  }
+}
+' | awk -F '\t' '
 function key(id, gen) { return id SUBSEP gen }
-$1 == "P" && NF >= 3 { active[key($2, $3)] = "P"; next }
-$1 == "C" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="A"; next }
-$1 == "S" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="S"; next }
-$1 == "+" && NF >= 2 { active[key($2, $3)]="A"; next }
-$1 == "-" && NF >= 2 { delete active[key($2, $3)]; next }
-NF == 1 { active[key($1, $2)]="A"; next }
-NF >= 2 && $1 !~ /^[+PCS-]$/ { active[key($1, $2)]="A"; next }
+$1 == "P" && NF >= 3 { k=key($2, $3); active[k]="P"; locks[k]=$4; next }
+$1 == "C" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="A"; if (NF >= 4) locks[k]=$4; next }
+$1 == "S" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="S"; if (NF >= 4) locks[k]=$4; next }
+$1 == "+" && NF >= 2 { gen=$3; if (gen == "-") gen=""; k=key($2, gen); active[k]="A"; locks[k]=$4; next }
+$1 == "-" && NF >= 2 { gen=$3; if (gen == "-") gen=""; k=key($2, gen); delete active[k]; delete locks[k]; next }
+NF == 1 { active[key($1, "")]="A"; next }
+NF >= 2 && $1 !~ /^[+PCS-]$/ { k=key($1, $2); active[k]="A"; locks[k]=$3; next }
 END {
   for (k in active) {
     split(k, fields, SUBSEP)
-    print active[k], fields[1], fields[2]
+    gen=(fields[2] == "" ? "-" : fields[2])
+    line=active[k] "\t" fields[1] "\t" gen
+    if (locks[k] != "") line=line "\t" locks[k]
+    print line
   }
 }
-' | while IFS=' ' read -r state entry_id entry_creation; do
-  [ -n "$entry_id" ] || continue
-  [ "$state" = S ] && continue
-  pending=0
-  [ "$state" = P ] && pending=1
-  process_entry "$entry_id" "$entry_creation" "$pending" "$@"
+' | while IFS="$tab" read -r state entry_id entry_creation entry_lock; do
+  run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@"
 done
 `
 
@@ -196,6 +296,7 @@ var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 type reaperEntry struct {
 	id       string
 	creation string
+	lockPath string
 	pending  bool
 	shared   bool
 }
@@ -214,6 +315,7 @@ type reaper struct {
 	opMu          sync.Mutex
 	mu            sync.Mutex
 	cmd           *exec.Cmd
+	pgid          int
 	stdin         io.WriteCloser
 	exited        chan struct{}
 	entries       []reaperEntry
@@ -246,6 +348,9 @@ func validateReaperEntry(entry reaperEntry) error {
 	if entry.pending && entry.creation == "" {
 		return errors.New("reaper: pending entry requires a creation id")
 	}
+	if strings.ContainsAny(entry.lockPath, "\t\r\n") {
+		return errors.New("reaper: lock path contains a control character")
+	}
 	return nil
 }
 
@@ -257,8 +362,35 @@ func (r *reaper) registerPending(id, creation string) error {
 	return r.registerEntry(reaperEntry{id: id, creation: creation, pending: true})
 }
 
-func (r *reaper) registerEntry(entry reaperEntry) error {
+func (r *reaper) prepareEntry(entry reaperEntry) (reaperEntry, error) {
 	if err := r.validateEntry(entry); err != nil {
+		return reaperEntry{}, err
+	}
+	// A full Docker ID is already immutable; a supplied generation is
+	// redundant and must not turn the entry into a name lookup.
+	if r.subcommand == "rm" && dockerIDRE.MatchString(entry.id) {
+		entry.creation = ""
+		entry.pending = false
+	}
+	// Apple is name-addressed, and Docker may temporarily address a
+	// generation by name before run returns its immutable ID. Both use
+	// the same lock file as Go's generation-checked name operations.
+	if r.subcommand == "delete" || !dockerIDRE.MatchString(entry.id) {
+		lockPath, err := reaperNameLockPath(entry.id)
+		if err != nil {
+			return reaperEntry{}, fmt.Errorf("reaper: prepare name lock: %w", err)
+		}
+		entry.lockPath = lockPath
+	}
+	if err := validateReaperEntry(entry); err != nil {
+		return reaperEntry{}, err
+	}
+	return entry, nil
+}
+
+func (r *reaper) registerEntry(entry reaperEntry) error {
+	entry, err := r.prepareEntry(entry)
+	if err != nil {
 		return err
 	}
 	r.opMu.Lock()
@@ -286,6 +418,10 @@ func (r *reaper) registerEntry(entry reaperEntry) error {
 			}
 			if existing.pending {
 				r.entries[i] = entry
+				changed = true
+			} else if existing.lockPath == "" && entry.lockPath != "" {
+				existing.lockPath = entry.lockPath
+				r.entries[i] = existing
 				changed = true
 			}
 			break
@@ -334,9 +470,14 @@ func writeReaperEntry(stdin io.Writer, entry reaperEntry) error {
 	} else if entry.pending {
 		prefix = "P"
 	}
-	line := prefix + " " + entry.id
+	line := prefix + "\t" + entry.id
 	if entry.creation != "" {
-		line += " " + entry.creation
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
+	}
+	if entry.lockPath != "" {
+		line += "\t" + entry.lockPath
 	}
 	n, err := io.WriteString(stdin, line+"\n")
 	if err == nil && n != len(line)+1 {
@@ -356,9 +497,14 @@ func writeReaperCompletion(stdin io.Writer, entry reaperEntry) error {
 	if stdin == nil {
 		return io.ErrClosedPipe
 	}
-	line := "C " + entry.id
+	line := "C\t" + entry.id
 	if entry.creation != "" {
-		line += " " + entry.creation
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
+	}
+	if entry.lockPath != "" {
+		line += "\t" + entry.lockPath
 	}
 	n, err := io.WriteString(stdin, line+"\n")
 	if err == nil && n != len(line)+1 {
@@ -368,8 +514,8 @@ func writeReaperCompletion(stdin io.Writer, entry reaperEntry) error {
 }
 
 func (r *reaper) completePending(id, creation string) error {
-	entry := reaperEntry{id: id, creation: creation}
-	if err := r.validateEntry(entry); err != nil {
+	entry, err := r.prepareEntry(reaperEntry{id: id, creation: creation})
+	if err != nil {
 		return err
 	}
 	r.opMu.Lock()
@@ -465,14 +611,11 @@ func (r *reaper) unregister(id, creation string) error {
 	defer r.opMu.Unlock()
 
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return nil
-	}
 	index := -1
 	for i, existing := range r.entries {
 		if existing.id == id && existing.creation == creation {
 			index = i
+			entry = existing
 			break
 		}
 	}
@@ -480,31 +623,67 @@ func (r *reaper) unregister(id, creation string) error {
 		r.mu.Unlock()
 		return nil
 	}
-	r.entries = append(r.entries[:index], r.entries[index+1:]...)
+	closed := r.closed
 	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
-	empty := len(r.entries) == 0
 	r.mu.Unlock()
 
-	if empty {
-		r.stopCurrentProcess()
+	if closed {
+		r.removeEntryLocked(entry)
 		return nil
 	}
-	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
+	// If the child is already gone, the confirmed delete cannot be
+	// undone by a later replay; remove the durable intent immediately.
+	// A live child, however, keeps the record until it accepts the
+	// removal event so an uncertain pipe failure cannot lose cleanup.
+	if stdin == nil || channelClosed(exited) {
+		r.removeEntryLocked(entry)
+		if r.entriesEmpty() {
+			r.stopCurrentProcess()
+		}
+		return nil
+	}
+	// Keep the entry in memory until the removal event is accepted by
+	// the child. If the pipe write fails, replay the retained entry
+	// instead of silently losing a pending cleanup guarantee.
+	if failures < maxReaperSpawnFailures {
 		if err := writeReaperRemoval(stdin, entry); err == nil {
+			r.removeEntryLocked(entry)
 			r.clearSpawnFailure()
+			if r.entriesEmpty() {
+				r.stopCurrentProcess()
+			}
 			return nil
 		}
 	}
 	return r.respawnAndReplayLocked()
 }
 
+func (r *reaper) removeEntryLocked(entry reaperEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, existing := range r.entries {
+		if existing.id == entry.id && existing.creation == entry.creation {
+			r.entries = append(r.entries[:i], r.entries[i+1:]...)
+			return
+		}
+	}
+}
+
+func (r *reaper) entriesEmpty() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.entries) == 0
+}
+
 func writeReaperRemoval(stdin io.Writer, entry reaperEntry) error {
 	if stdin == nil {
 		return io.ErrClosedPipe
 	}
-	line := "- " + entry.id
+	line := "-\t" + entry.id
 	if entry.creation != "" {
-		line += " " + entry.creation
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
 	}
 	n, err := io.WriteString(stdin, line+"\n")
 	if err == nil && n != len(line)+1 {
@@ -596,6 +775,7 @@ func (r *reaper) spawnLocked() error {
 	args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
 	args = append(args, r.deleteFlags...)
 	cmd := exec.Command("/bin/sh", args...)
+	configureReaperProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -610,7 +790,7 @@ func (r *reaper) spawnLocked() error {
 		close(exited)
 	}()
 	r.mu.Lock()
-	r.cmd, r.stdin, r.exited = cmd, stdin, exited
+	r.cmd, r.pgid, r.stdin, r.exited = cmd, reaperProcessGroupID(cmd), stdin, exited
 	r.mu.Unlock()
 	go r.monitorChild(cmd, exited)
 	return nil
@@ -630,17 +810,17 @@ func (r *reaper) monitorChild(cmd *exec.Cmd, exited <-chan struct{}) {
 
 func (r *reaper) stopCurrentProcess() {
 	r.mu.Lock()
-	cmd, stdin, exited := r.cmd, r.stdin, r.exited
-	r.cmd, r.stdin, r.exited = nil, nil, nil
+	cmd, pgid, stdin, exited := r.cmd, r.pgid, r.stdin, r.exited
+	r.cmd, r.pgid, r.stdin, r.exited = nil, 0, nil, nil
 	r.mu.Unlock()
 	if cmd == nil {
 		return
 	}
-	if cmd.Process != nil {
-		_ = cmd.Process.Kill()
-	}
 	if stdin != nil {
 		_ = stdin.Close()
+	}
+	if !channelClosed(exited) {
+		killReaperProcess(cmd, pgid)
 	}
 	if exited != nil {
 		<-exited

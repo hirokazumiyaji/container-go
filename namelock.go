@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -23,8 +24,27 @@ import (
 // backend, which Apple Container does not offer. The lock file lives
 // in the temp directory and is never removed, since removing it would
 // race with a concurrent locker.
+func nameLockFilePath(name string) string {
+	return filepath.Join(os.TempDir(), "containergo-"+name+".lock")
+}
+
+func reaperNameLockPath(name string) (string, error) {
+	if !nameRE.MatchString(name) {
+		return "", fmt.Errorf("invalid container name %q", name)
+	}
+	path := nameLockFilePath(name)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return "", err
+	}
+	if err := f.Close(); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
 func lockName(ctx context.Context, name string) (unlock func(), err error) {
-	f, err := os.OpenFile(filepath.Join(os.TempDir(), "containergo-"+name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	f, err := os.OpenFile(nameLockFilePath(name), os.O_CREATE|os.O_RDWR|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, err
 	}

@@ -62,6 +62,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		info := &engineInfo{
 			state:  State(c.Status.State),
+			name:   c.ID,
 			labels: c.Configuration.Labels,
 			image:  c.Configuration.Image.Reference,
 		}

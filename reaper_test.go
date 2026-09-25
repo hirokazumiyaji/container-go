@@ -168,7 +168,12 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 	r.killForTest()
 	reaperKilled = true
 	_ = os.WriteFile(release, nil, 0o600)
-	waitForPath(t, done)
+	// Stopping the reaper owns the complete process tree. The backend
+	// inspect descendant must not survive the stopped shell.
+	time.Sleep(300 * time.Millisecond)
+	if _, err := os.Stat(done); err == nil {
+		t.Fatal("reaper descendant survived process-group shutdown")
+	}
 
 	entries, err := os.ReadDir(stagingDir)
 	if err != nil {

@@ -128,6 +128,11 @@ func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 		d.calls = append(d.calls, args)
 		return []byte(d.output), nil, nil
 	}
+	if args[0] == "inspect" {
+		d.calls = append(d.calls, args)
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:"integration"}},"NetworkSettings":{}}]`, id, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
+	}
 	if args[0] == "rm" && d.deleteErr != nil {
 		d.calls = append(d.calls, args)
 		return nil, nil, d.deleteErr

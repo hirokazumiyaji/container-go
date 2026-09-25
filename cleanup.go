@@ -123,7 +123,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 			}
 			didRemove, err = pruneNamedCandidateWithMetadata(ctx, r, eng, candidate, errKind, reuseGroup)
 		} else {
-			didRemove, err = deletePruneCandidate(ctx, r, eng, id, errKind)
+			didRemove, err = pruneDockerCandidate(ctx, r, eng, id, errKind, reuseGroup)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -136,13 +136,45 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	return removed, errors.Join(errs...)
 }
 
+//nolint:unused // retained for package-local callers using the pre-metadata helper
 func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
+	return pruneDockerCandidate(ctx, r, eng, id, errKind, "")
+}
+
+func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
+	if !dockerIDRE.MatchString(id) {
+		return false, nil
+	}
+	inspectContainer := &Container{id: id, uid: id, runner: r, eng: eng}
+	fresh, err := inspectContainer.inspectFresh(ctx)
+	if isNotFoundFor(eng, err) {
+		unregisterContainerReaper(&config{runner: r, eng: eng}, "", "", id)
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, err)
+	}
+	candidate := pruneCandidate{
+		id:         id,
+		labels:     fresh.labels,
+		creation:   fresh.labels[creationLabel],
+		state:      fresh.state,
+		managed:    fresh.labels[managedLabel] == "true",
+		reuse:      fresh.labels[reuseLabel] == "true",
+		reuseGroup: fresh.labels[reuseGroupLabel],
+	}
+	if !pruneCandidateEligible(candidate, reuseGroup) {
+		// In particular, ordinary prune never force-deletes a candidate
+		// that became running after the daemon-side list.
+		return false, nil
+	}
 	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer dCancel()
-	_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
+	_, _, err = r.Run(dCtx, eng.deleteArgs(id)...)
 	if err != nil && !isNotFoundFor(eng, err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
+	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
 	return true, nil
 }
 
@@ -171,7 +203,7 @@ func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
 }
 
 func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
-	if candidate.id == "" || !nameRE.MatchString(candidate.id) || !candidate.managed ||
+	if candidate.id == "" || (!nameRE.MatchString(candidate.id) && !dockerIDRE.MatchString(candidate.id)) || !candidate.managed ||
 		!creationRE.MatchString(candidate.creation) || candidate.state == "" || candidate.state == StateUnknown {
 		return false
 	}
@@ -227,8 +259,9 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	defer unlock()
 
-	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(guardCtx)
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
 	if isNotFoundFor(eng, err) {
+		unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
 		return false, nil
 	}
 	if err != nil {
@@ -241,6 +274,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if err != nil && !isNotFoundFor(eng, err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
+	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
 	return true, nil
 }
 
@@ -260,8 +294,9 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errK
 		return false, fmt.Errorf("%s %s: lock name: %w", errKind, id, err)
 	}
 	defer unlock()
-	fresh, err := (&Container{id: id, runner: r, eng: eng}).inspectFresh(guardCtx)
+	fresh, err := (&Container{id: id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
 	if isNotFoundFor(eng, err) {
+		unregisterContainerReaper(&config{runner: r, eng: eng, name: id}, id, "", "")
 		return false, nil
 	}
 	if err != nil {
@@ -283,5 +318,6 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, id, errK
 	if err != nil && !isNotFoundFor(eng, err) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
+	unregisterContainerReaper(&config{runner: r, eng: eng, name: id, creation: candidate.creation}, id, candidate.creation, "")
 	return true, nil
 }

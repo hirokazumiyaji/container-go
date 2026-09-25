@@ -195,9 +195,13 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("container %s not in inspect output", id)
 	}
 	c := containers[0]
+	if dockerIDRE.MatchString(id) && c.ID != id {
+		return nil, fmt.Errorf("docker inspect target %s returned container %s", id, c.ID)
+	}
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
+		name:   strings.TrimPrefix(c.Name, "/"),
 		labels: c.Config.Labels,
 		uid:    c.ID,
 		image:  c.Config.Image,

@@ -9,6 +9,7 @@ import (
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
 	state  State
+	name   string
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only

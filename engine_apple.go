@@ -32,9 +32,10 @@ const (
 	appleStderrNoSuchCtr = "no such container" // defensive; not observed on 1.3.0
 )
 
-func (appleEngine) name() string   { return "apple" }
-func (appleEngine) binary() string { return "container" }
-func (appleEngine) directIP() bool { return true }
+func (appleEngine) name() string               { return "apple" }
+func (appleEngine) binary() string             { return "container" }
+func (appleEngine) directIP() bool             { return true }
+func (appleEngine) nameAddressedDeletes() bool { return true }
 
 func (appleEngine) checkConfig(*config) error { return nil }
 
@@ -62,11 +63,17 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if c.ID != id {
 			continue
 		}
+		image := c.Configuration.Image.Reference
+		imageDigest := c.Configuration.Image.Descriptor.Digest
+		if image != "" && validOCIDigest(imageDigest) {
+			image = stripImageDigest(image) + "@" + imageDigest
+		}
 		info := &engineInfo{
-			state:    State(c.Status.State),
-			labels:   c.Configuration.Labels,
-			image:    c.Configuration.Image.Reference,
-			platform: formatInspectPlatform(c.Configuration.Platform.OS, c.Configuration.Platform.Architecture, c.Configuration.Platform.Variant),
+			state:       State(c.Status.State),
+			labels:      c.Configuration.Labels,
+			image:       image,
+			imageDigest: imageDigest,
+			platform:    formatInspectPlatform(c.Configuration.Platform.OS, c.Configuration.Platform.Architecture, c.Configuration.Platform.Variant),
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip

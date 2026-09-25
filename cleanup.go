@@ -8,10 +8,11 @@ import (
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	backendinspect "github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
-// keepContainers reports whether CONTAINERGO_KEEP=1 disables all
-// automatic cleanup (for debugging).
+// keepContainers reports whether CONTAINERGO_KEEP=1 disables automatic
+// cleanup and enables the documented verified partial-handle policy.
 func keepContainers() bool {
 	return os.Getenv("CONTAINERGO_KEEP") == "1"
 }
@@ -23,7 +24,9 @@ func TerminateContainer(ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	return ctr.Terminate(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+	defer cancel()
+	return ctr.Terminate(ctx)
 }
 
 // Cleanup registers container removal via tb.Cleanup. It is nil-safe,
@@ -51,9 +54,23 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
 }
 
-// pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. errKind prefixes per-ID delete failures ("prune", …).
+type pruneCandidate struct {
+	id         string
+	labels     map[string]string
+	creation   string
+	state      State
+	reuseGroup string
+}
+
+// pruneListed lists containers with listArgs, parses IDs, and removes each
+// still-current candidate. Apple candidates are revalidated under their
+// name lock; Docker IDs are immutable delete targets. errKind prefixes
+// per-ID delete failures ("prune", …).
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
+	return pruneListedWithGroup(ctx, r, eng, listArgs, parse, errKind, "")
+}
+
+func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
@@ -64,18 +81,123 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	if err != nil {
 		return nil, err
 	}
+	var listed map[string]pruneCandidate
+	if usesNameAddressedDeletes(eng) {
+		listed, err = applePruneCandidates(stdout)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	var removed []string
 	var errs []error
 	for _, id := range ids {
-		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
-		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
-		dCancel()
-		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
+		var didRemove bool
+		if usesNameAddressedDeletes(eng) {
+			candidate, ok := listed[id]
+			if !ok {
+				err = fmt.Errorf("%s %s: list candidate metadata missing", errKind, id)
+			} else {
+				didRemove, err = pruneNamedCandidate(ctx, r, eng, candidate, errKind, reuseGroup)
+			}
+		} else {
+			didRemove, err = deletePruneCandidate(ctx, r, eng, id, errKind)
+		}
+		if err != nil {
+			errs = append(errs, err)
 			continue
 		}
-		removed = append(removed, id)
+		if didRemove {
+			removed = append(removed, id)
+		}
 	}
 	return removed, errors.Join(errs...)
+}
+
+func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
+	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
+	defer dCancel()
+	_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
+	if err != nil && !isNotFound(err) {
+		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
+	}
+	return true, nil
+}
+
+// pruneNamedCandidate closes the list/inspect/delete race for name-
+// addressed backends. The list-time candidate is only a snapshot: the
+// live generation, labels, state, and reuse group are checked again while
+// the stable per-name lock is held, immediately before deletion.
+func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+	if !usesNameAddressedDeletes(eng) || !nameRE.MatchString(candidate.id) ||
+		!pruneCandidateEligible(candidate, reuseGroup) {
+		return false, nil
+	}
+
+	guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
+	defer guardCancel()
+	unlock, err := lockName(guardCtx, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: lock name: %w", errKind, candidate.id, err)
+	}
+	defer unlock()
+
+	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(guardCtx)
+	if isNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
+		return false, nil
+	}
+	target := candidate.id
+	if fresh.uid != "" {
+		target = fresh.uid
+	}
+	return deletePruneCandidate(guardCtx, r, eng, target, errKind)
+}
+
+func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {
+	containers, err := backendinspect.Decode(data)
+	if err != nil {
+		return nil, err
+	}
+	candidates := make(map[string]pruneCandidate, len(containers))
+	for _, c := range containers {
+		labels := c.Configuration.Labels
+		candidates[c.ID] = pruneCandidate{
+			id:         c.ID,
+			labels:     labels,
+			creation:   labels[creationLabel],
+			state:      State(c.Status.State),
+			reuseGroup: labels[reuseGroupLabel],
+		}
+	}
+	return candidates, nil
+}
+
+func pruneCandidateEligible(candidate pruneCandidate, reuseGroup string) bool {
+	if candidate.state == "" || candidate.state == StateUnknown || candidate.creation == "" ||
+		!creationRE.MatchString(candidate.creation) || candidate.labels[managedLabel] != "true" {
+		return false
+	}
+	if reuseGroup == "" {
+		return candidate.state == StateStopped
+	}
+	return candidate.reuseGroup == reuseGroup
+}
+
+func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
+	if fresh == nil || !pruneCandidateEligible(pruneCandidate{
+		id:         candidate.id,
+		labels:     fresh.labels,
+		creation:   fresh.labels[creationLabel],
+		state:      fresh.state,
+		reuseGroup: fresh.labels[reuseGroupLabel],
+	}, reuseGroup) {
+		return false
+	}
+	return fresh.state == candidate.state && fresh.labels[creationLabel] == candidate.creation
 }

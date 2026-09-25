@@ -498,13 +498,24 @@ func TestImagesCompatible(t *testing.T) {
 	}
 }
 
+func pruneGroupInspect(id string) []byte {
+	group := "integration"
+	if id == "g2" {
+		group = "other"
+	}
+	data := reuseInspectJSONWithCreation(id, "running", "redis:7-alpine", "0123456789abcdef")
+	return []byte(strings.Replace(string(data),
+		`"com.github.hirokazumiyaji.container-go.reuse": "true",`,
+		`"com.github.hirokazumiyaji.container-go.reuse": "true","`+reuseGroupLabel+`":"`+group+`",`, 1))
+}
+
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
-	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}
+	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON, inspectJSON: pruneGroupInspect}
 	removed, err := pruneReuseGroupWith(context.Background(), f, appleEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("PruneReuseGroup: %v", err)

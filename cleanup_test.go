@@ -2,8 +2,10 @@ package container
 
 import (
 	"context"
+	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -62,7 +64,8 @@ func TestCleanupIsNilSafe(t *testing.T) {
 // lsRunner serves a canned `ls` listing and records deletes.
 type lsRunner struct {
 	*fakeRunner
-	lsJSON string
+	lsJSON      string
+	inspectJSON func(string) []byte
 }
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -70,17 +73,30 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
+	if args[0] == "inspect" && l.inspectJSON != nil {
+		return l.inspectJSON(args[len(args)-1]), nil, nil
+	}
 	return l.fakeRunner.Run(ctx, args...)
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
+func stoppedPruneInspect(id string) []byte {
+	return []byte(strings.Replace(
+		reuseInspectJSONWithCreation(id, "running", "redis:7-alpine", "0123456789abcdef"),
+		`"state": "running"`, `"state": "stopped"`, 1))
+}
+
 func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
-	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
+	f := &lsRunner{
+		fakeRunner:  newTestRunner(),
+		lsJSON:      pruneLsJSON,
+		inspectJSON: stoppedPruneInspect,
+	}
 
 	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {
@@ -102,6 +118,51 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	}
 	if !slices.Equal(deleted, []string{"managed-stopped"}) {
 		t.Errorf("deleted = %v", deleted)
+	}
+}
+
+type pruneRaceRunner struct {
+	mu           sync.Mutex
+	id           string
+	inspectCalls int
+	deleted      []string
+}
+
+func (r *pruneRaceRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "ls":
+		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}}]`, r.id)), nil, nil
+	case "inspect":
+		r.mu.Lock()
+		r.inspectCalls++
+		n := r.inspectCalls
+		r.mu.Unlock()
+		_ = n
+		return []byte(strings.Replace(reuseInspectJSONWithCreation(r.id, "running", "redis:7-alpine", "bbbbbbbbbbbbbbbb"), `"state": "running"`, `"state": "stopped"`, 1)), nil, nil
+	case "delete":
+		r.mu.Lock()
+		r.deleted = append(r.deleted, args[len(args)-1])
+		r.mu.Unlock()
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestPruneRevalidatesAppleCandidateUnderStableLock(t *testing.T) {
+	r := &pruneRaceRunner{id: "prune-race-" + newContainerName()}
+	removed, err := pruneWith(context.Background(), r, appleEngine{})
+	if err != nil {
+		t.Fatalf("pruneWith: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want stale candidate skipped", removed)
+	}
+	r.mu.Lock()
+	deleted := append([]string(nil), r.deleted...)
+	r.mu.Unlock()
+	if len(deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete after generation replacement", deleted)
 	}
 }
 

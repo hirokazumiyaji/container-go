@@ -185,6 +185,23 @@ func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	}
 }
 
+func TestClassifyProbeFailurePreservesOriginalCLIError(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint failed"}
+	probeErr := &CLIError{Args: appleProbe.Args, ExitCode: 1, Stderr: "service down"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		strings.Join(appleProbe.Args, " "): {err: probeErr},
+	}}
+
+	err := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
+	}
+	var got *CLIError
+	if !errors.As(err, &got) || got != orig {
+		t.Fatalf("error = %v, want original *CLIError in chain", err)
+	}
+}
+
 func TestClassifyUsesProbeSpecificHint(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
 	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}

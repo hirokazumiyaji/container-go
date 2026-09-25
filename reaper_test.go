@@ -128,6 +128,18 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	}
 }
 
+func TestReaperNameEntriesCarryStableLockPath(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	if err := r.register("guarded-name", ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	defer r.closeStdin()
+	if len(r.entries) != 1 || !validReaperLockPath(r.entries[0].lockPath) {
+		t.Fatalf("entry = %+v, want stable lock path", r.entries)
+	}
+}
+
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")

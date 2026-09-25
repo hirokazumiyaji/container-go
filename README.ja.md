@@ -134,20 +134,33 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で削除を登録します。
    defer 派には `container.TerminateContainer(ctr)` があります。どちらも
    nil 安全なので、`Run` のエラーチェックより前に呼べます。
-2. `Run` が途中で失敗した場合は、`Run` 自身が作成済みリソースを削除して
-   から返ります。削除にも失敗した場合は、返された `*CleanupError` から
-   元の error と cleanup error の両方を取得できます。
+2. `Run` が途中で失敗した場合は、安全だと確認できる場合は `Run` 自身が
+   作成済みリソースを削除してから返ります。削除に失敗した場合は、返された
+   `*CleanupError` から元の error と cleanup error の両方を取得できます。
+   failed create が既に running の reuse generation を残している場合、
+   peer が採用している可能性があるため自動削除せず、保持された generation を
+   CleanupError として報告します。`CONTAINERGO_KEEP=1` では、所有者を確認
+   できた partial handle を error とともに返すので、明示的に確認・終了できます。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
-   削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
-   Windows では前 2 層のみでクリーンアップします。
+   削除します。Docker の full 64-hex ID と Apple の name のどちらも登録
+   対象です。リーパーは `/bin/sh` を必要とするため Windows では動かず、
+   Windows では前 2 層のみでクリーンアップします。Apple の name lock を
+   取得できない場合、reaper は協調しない unlocked delete を行わず entry を
+   skip します。
 
 補足:
 
-- `CONTAINERGO_KEEP=1` でコンテナを残せます(デバッグ用)。
+- `CONTAINERGO_KEEP=1` でコンテナを残せます(デバッグ用)。確認済みの
+  failed create には partial handle policy も適用されます。
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
-  停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
-  を削除します。
+  停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベルと有効な
+  creation generation 付き)を削除します。Apple backend では stable な
+  name lock 上で list candidate を再確認してから削除します。
+
+backend probe も失敗した場合、返された error は
+`errors.Is(err, container.ErrSystemNotRunning)` と、元の command failure
+に対する `errors.As(err, *container.CLIError)` の両方を満たします。
 
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 
@@ -170,31 +183,44 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 
 - `WithName` 必須。待機戦略は attach 時も必ず再実行する。
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
-- stopped の残骸は削除して再作成する。running のまま ready にならない
-  場合は削除せずエラーを返す。
+- stopped generation は managed、reuse、有効な generation label を
+  確認できた場合だけ削除・再作成する。failed create が running の
+  generation を残した場合、peer が採用している可能性があるため自動削除
+  せず、`CleanupError` として保持中の generation を報告する。
+  `CONTAINERGO_KEEP=1` では所有者を確認した partial handle を返す。
+  running のまま ready にならない場合も削除せずエラーになる。
 - image / port が既存と不一致なら分かりやすいエラーを返す。
   既存の reuse container には managed、reuse、有効な creation generation label が必要で、欠ける場合は fail closed する。
   `PullAlways` は reuse を解決する前にローカル image を更新し、container が既に running でも pull failure を隠さない。
   pull 後に running container の image が一致しなければ、共有 container を再作成せずエラーにする。digest を指定している場合は digest 不一致も含む。
   mutable tag はローカル store を更新するが、既に running の共有 container は置き換えない。厳密な image identity が必要なら digest を固定する。
   `PullMissing` と `PullNever` は attach 専用に image を fetch しない。
-  attach 解決中に stopped generation を確認した場合は stopped-reuse の delete / recreate policy に従う。
-  readiness 後に stopped へ変化した場合は stopped handle を返さずエラーにする。
-- `WithFiles` は attach する caller も含めて reuse の全 caller で copy する。
-  Docker は inspect した immutable UID を copy target に使い、Apple は per-name lock 内で generation を確認する。
-  identity 確認から copy の間に replacement があれば fail closed にする。
-  attach 中の copy failure は shared container を削除せずにエラーを返す。
-  reuse leader も post-start の copy / inspect failure では新規 generation を残す。peer が既にそれを使っている可能性があるためである。
-  同じ path への copy は shared state の変更なので、並行 caller は競合する target を避ける。
-  `WithEnv` / `WithCmd` / `WithEntrypoint` / `WithLabels` / `WithMounts` / `WithCPUs` / `WithMemory` / `WithUser` / `WithWorkingDir` / `WithNetwork` は作成専用 option として attach 時に意図的に無視する。
-  必要な場合は別 name を使う。
-  `WithPlatform` は既存 container の platform と一致することを要求し、`PullAlways` は指定 platform の image variant を fetch する。
+  `WithPlatform` は OS・architecture・variant を field ごとに比較する。
+  Apple inspect の OCI descriptor digest も image identity として保持する。
   `WithReuseGroup` は新規作成・再作成時の tag 付けのみで、reuse の compatibility key には含めない。
-- 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
+- `WithFiles` は shared ensure flight の後、create leader も含めた reuse の
+  全 caller で copy する。leader の copy failure が成功した waiter を
+  poison することはない。Docker は inspect した immutable UID を copy
+  target に使い、Apple は stable な per-name lock 内で generation を確認
+  する。identity 確認から copy の間に replacement があれば fail closed に
+  する。copy failure は shared container を削除せずにエラーにする。
+  同じ path への copy は shared state の変更なので、並行 caller は競合する
+  target を避ける。
+  `WithEnv` / `WithCmd` / `WithEntrypoint` / `WithLabels` / `WithMounts` /
+  `WithCPUs` / `WithMemory` / `WithUser` / `WithWorkingDir` / `WithNetwork` は
+  作成専用 option として attach 時に意図的に無視する。必要な場合は別 name
+  を使う。
+- Apple の create、generation-checked delete、prune は、協力する host 上の
+  process 間で stable な per-name lock を使う。prune candidate は lock 内で
+  再 inspect してから削除する。直接の `container` CLI 呼び出しや別の
+  implementation は lock を使わないため、この保証の対象外。
+- 各作成は世代ラベルを持ち、`Terminate`、stopped reuse、prune、watchdog
+  リーパーは置き換わった世代の削除を拒否する。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
-  コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
+  コンテナを強制削除する(CI 終了時)。通常の `Prune` は Apple では
+  lock 上で candidate を再確認しつつ stopped のみを削除する。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って
@@ -204,7 +230,9 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
   シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
-  stdin データとしてのみ渡ります。
+  Apple name または Docker の full 64-hex ID として stdin に渡します。
+  Apple の name-addressed reaper エントリは library cleanup と同じ
+  stable lock を使います。
 - 環境変数はパーミッション 0600 の一時 env ファイル経由で渡すため、秘密が
   プロセス一覧(`ps`)に現れません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry

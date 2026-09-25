@@ -38,6 +38,10 @@ const (
 var (
 	reuseAttachTimeout = 60 * time.Second
 	reusePollInterval  = 100 * time.Millisecond
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
 )
 
 // sessionID identifies all containers created by this process.
@@ -103,8 +107,10 @@ type Container struct {
 
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
-// WithReuse for the shared-handle lifecycle.
+// normally removed before returning. With CONTAINERGO_KEEP=1, a verified
+// failed create may return a partial handle with its error so the caller
+// can inspect or explicitly terminate it. WithReuse switches to
+// get-or-create; see WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -158,9 +164,16 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		if keepContainers() {
+			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
+			return retained, withCleanupError(classified, retainedErr)
+		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, withCleanupError(classified, cleanupErr)
 	}
@@ -191,7 +204,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, c.rollback(ctx, err)
+			return rollbackResult(ctx, c, err)
 		}
 	}
 	if cfg.waitStrategy != nil {
@@ -202,10 +215,32 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			if tail != "" {
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, c.rollback(ctx, err)
+			return rollbackResult(ctx, c, err)
 		}
 	}
 	return c, nil
+}
+
+// runCreateLocked serializes a name-addressed create with guarded
+// delete/prune paths. The attempted result is separate from the error so
+// callers do not run failed-create cleanup when acquiring the lock itself
+// failed and no create command was issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
+	if !usesNameAddressedDeletes(cfg.eng) {
+		stdout, _, err = cfg.runner.Run(ctx, args...)
+		return stdout, true, err
+	}
+
+	lockCtx, lockCancel := withDefaultTimeout(ctx, queryTimeout)
+	defer lockCancel()
+	unlock, err := lockName(lockCtx, cfg.name)
+	if err != nil {
+		return nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, err)
+	}
+	defer unlock()
+
+	stdout, _, err = cfg.runner.Run(ctx, args...)
+	return stdout, true, err
 }
 
 // rollback removes a container Run created but cannot return. A failed
@@ -213,6 +248,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // delete when it cannot verify the generation, and the caller must know
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	if keepContainers() {
+		return cause
+	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
 		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
 		return withCleanupError(cause, cleanupErr)
@@ -228,6 +266,9 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // clean and returns nil; any other failure to inspect or remove it is
 // returned to Run so the container left behind is visible to the caller.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
+	if keepContainers() {
+		return nil
+	}
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
 	}
@@ -261,6 +302,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	actual, ok := info.labels[creationLabel]
 	if !ok || actual != cfg.creation {
 		return nil
+	}
+	if cfg.reuse && info.state == StateRunning {
+		return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
 	}
 	target := cfg.name
 	if info.uid != "" {
@@ -329,10 +373,15 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
+	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
+	defer cancel()
+	if c.uid != "" && !usesNameAddressedDeletes(c.eng) {
 		return c.delete(ctx, c.uid)
 	}
 	if c.creation == "" {
+		if usesNameAddressedDeletes(c.eng) {
+			return fmt.Errorf("terminate %s: missing creation generation; refusing name-addressed delete", c.id)
+		}
 		return c.delete(ctx, c.id)
 	}
 	unlock, err := lockName(ctx, c.id)

@@ -42,9 +42,9 @@ type config struct {
 	// PullAlways fetch before entering the shared ensure flight.
 	imagePrepared bool
 	// reusedCreated is set only on the caller whose flight callback
-	// created the container. Other callers still apply their own files
-	// after attaching to the shared generation. The identity fields let
-	// the post-ensure inspect detect a replacement before that decision.
+	// created the container. It lets the post-ensure inspect detect a
+	// replacement; file application itself happens per caller after the
+	// shared flight.
 	reusedCreated           bool
 	reusedCreatedUID        string
 	reusedCreatedGeneration string

@@ -286,8 +286,10 @@ which no signal handler can.
 
 The CLI has no label filter, so orphan sweeps filter
 `container ls -a --format json` client-side. A helper `Prune(ctx)`
-removes stopped containers carrying the managed label from any
-session.
+removes stopped containers carrying the managed label from any session.
+For Apple Container, it captures list-time generation/state metadata and
+re-checks it under the stable per-name lock immediately before delete;
+stale or foreign candidates are skipped.
 
 Setting `CONTAINERGO_KEEP=1` disables deletion in `Cleanup` and the
 reaper (for debugging).
@@ -299,65 +301,77 @@ volumes must be named, and their lifecycle belongs to the caller.
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. Existing
-containers must also carry the managed, reuse, and valid creation labels;
-otherwise reuse fails closed. `PullAlways` is a per-caller operation: it
-fetches before the shared ensure flight,
-including for an attach, and a pull failure is returned. The image is
-re-inspected after that fetch. A running reused container is never
-recreated on a post-pull mismatch; the caller gets the existing
-mismatch error instead (digest-pinned requests must match exactly).
-Mutable tags refresh the local store but do not replace an already-running
-shared container; callers that need exact image identity should pin a
-digest. `PullMissing` and `PullNever` do not add an attach-only fetch.
-A stopped generation seen during attach resolution follows the
-stopped-reuse delete/recreate policy; if it becomes stopped after the
-readiness wait, the call fails instead of returning a stopped handle.
+narrow: image reference (including a reported OCI digest when present),
+platform fields, and declared/published ports. Existing containers must
+also carry the managed, reuse, and valid creation labels; otherwise reuse
+fails closed. `PullAlways` is a per-caller operation: it fetches before
+the shared ensure flight, including for an attach, and a pull failure is
+returned. The image is re-inspected after that fetch. A running reused
+container is never recreated on a post-pull mismatch; the caller gets the
+existing mismatch error instead (digest-pinned requests must match
+exactly). Mutable tags refresh the local store but do not replace an
+already-running shared container; callers that need exact image identity
+should pin a digest. `PullMissing` and `PullNever` do not add an
+attach-only fetch. `WithPlatform` is compared field by field (OS,
+architecture, and variant), and Apple inspect output carries the OCI
+descriptor digest into the normalized image identity. A stopped
+generation is recycled only after its labels and generation are
+verified; a failed create that left a running generation is not
+auto-deleted because a peer may have adopted it. Such a failure is
+reported as cleanup/partial-handle information. If a generation becomes
+stopped after readiness, the call fails instead of returning a stopped
+handle.
 
-`WithFiles` is also per-caller. The creation leader copies its files
-before the shared handle is published, and every waiter/attach caller
-copies its own files before its wait strategy runs. Docker copies target
-the inspected immutable UID. Apple copies hold the per-name lock and
-verify the creation generation immediately before the copy; a replacement
-between verification and copy fails closed. A failed reuse copy returns
-an error but leaves the shared generation intact because other callers may
-own it. Copies to the same path are shared-state mutations; concurrent
-callers should avoid conflicting targets. A reuse leader also leaves its
-newly created generation in place after a post-start copy or inspect
-failure, because another process may already be using it; callers must
-coordinate explicit cleanup. Ordinary `Run` rollback still reports a
-`CleanupError` containing both the operation and termination failures.
-Creation-only options (`env`, `cmd`,
-`entrypoint`, `labels`, `mounts`, resource/user/workdir/network settings)
-and `reuseGroup` are intentionally not applied to an existing container.
-`platform` is different: it is checked against the existing container,
-and `PullAlways` uses it to fetch the requested variant. Callers needing
-isolation from the other creation options should use distinct names or
-reset state via `Exec`.
+`WithFiles` is also per-caller. The shared ensure flight only creates or
+attaches the generation; it never applies a leader's files. After the
+flight returns, every caller—including the create leader—applies its own
+files before its wait strategy. Consequently, one caller's copy failure
+does not poison successful waiters. Docker copies target the inspected
+immutable UID. Apple copies hold the stable per-name lock and verify the
+creation generation immediately before the copy; a replacement between
+verification and copy fails closed. A failed reuse copy returns an error
+but leaves the shared generation intact because other callers may own it.
+Copies to the same path are shared-state mutations; concurrent callers
+should avoid conflicting targets. A reuse leader also leaves its newly
+created generation in place after a post-start copy or inspect failure,
+because another process may already be using it; callers must coordinate
+explicit cleanup. Ordinary `Run` rollback still reports a `CleanupError`
+containing both the operation and termination failures. Creation-only
+options (`env`, `cmd`, `entrypoint`, `labels`, `mounts`, resource/user/
+workdir/network settings) and `reuseGroup` are intentionally not applied
+to an existing container. `platform` is different: it is checked
+field by field against the existing container, and `PullAlways` uses it
+to fetch the requested variant. Callers needing isolation from the other
+creation options should use distinct names or reset state via `Exec`.
 
-Each creation carries a `creationLabel` generation (16-hex). `Terminate`
-and the stopped-recreate path refuse to delete a replaced name. On
-Docker the handle keeps the immutable `Id` printed by `docker run` (or
-returned by inspect) and deletes by it, so no generation check is
-needed: a replacement never shares the ID. Apple Container addresses
-containers by name only, so there the delete is name-based: the
-generation must match a fresh inspect, and inspect plus delete run
-under a per-name `flock` in the temp directory (`containergo-<name>.lock`)
-that every such delete in this library takes. That guarantee is
-limited to cooperating processes using this library on the same host:
-a direct `container delete` plus re-create by an external tool inside
-that window is indistinguishable by name, and closing it would need an
-immutable ID or an atomic conditional delete that Apple Container does
-not provide. An inspect
-failure other than not-found aborts the delete (fail closed); `Run`'s
-rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Docker containers by
-`Id`; for Apple it stores the generation, reads the label as a
-line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each backend call carries a 10-30s timeout
-via POSIX `sleep`/`kill` (no `timeout(1)` dependency) so one hung
-daemon call cannot wedge the rest. The leader's own pull/create uses an
-independent `runTimeout` budget; `reuseAttachTimeout` bounds only
+Each creation carries a `creationLabel` generation (16-hex). `Terminate`,
+the stopped-recreate path, and `Prune` refuse to delete a replaced name.
+On Docker the handle keeps the immutable `Id` printed by `docker run` (or
+returned by inspect) and deletes by it, so no generation check is needed:
+a replacement never shares the ID. Apple Container addresses containers
+by name only, so there the delete is name-based: the generation must
+match a fresh inspect, and inspect plus delete run under a stable,
+user-scoped per-name `flock` in the user cache directory. Apple create,
+generation-checked delete, and prune all take that same lock, and prune
+revalidates each list candidate's managed label, generation, state, and
+reuse group while holding it. The lock file is persistent so a process
+cannot unlink an inode another process is using. The guarantee is limited
+to cooperating processes using this guarded library protocol on the same
+host: a direct `container` CLI call or another implementation does not
+take the lock and can still replace the name after the point-in-time
+check. An inspect failure other than not-found aborts the delete (fail
+closed); `Run`'s rollback reports a container left behind that way in
+its error rather than hiding it. The watchdog reaper registers Docker
+containers by their full 64-hex `Id`; for Apple it stores the generation,
+acquires the same stable name lock, reads the label as a line-anchored
+JSON field (`"key": "value"`, never a substring), and skips deletion on
+mismatch. If the Apple lock cannot be acquired, the reaper skips the
+name-addressed entry instead of deleting without coordination. Each
+backend call carries a 10-30s timeout via POSIX `sleep`/`kill` (no
+`timeout(1)` dependency) so one hung daemon call cannot wedge the rest.
+Lock waits, inspect/delete operations, and `TerminateContainer` use
+bounded contexts. The leader's own pull/create
+uses an independent `runTimeout` budget; `reuseAttachTimeout` bounds only
 attach polling for another process's container.
 
 ## Security design
@@ -365,14 +379,14 @@ attach polling for another process's container.
 As a library that spawns subprocesses, these rules hold.
 
 **No shell involvement**. Every CLI call passes an argv array to
-`exec.Command`; no shell string is ever assembled. The single
-exception is the watchdog reaper's shell script. Its body is a fixed
-string; container IDs enter only as stdin data. The script defeats
-word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
-writing it to the pipe. The two layers together leave no command
-injection through IDs.
+`exec.Command`; no shell string is ever assembled. The single exception
+is the watchdog reaper's shell script. Its body is fixed; validated
+Apple names or Docker's full 64-hex IDs enter only as stdin data. The
+script defeats word splitting and globbing (`set -f`, `IFS=`, `read -r`,
+quoted expansions). Apple name-addressed entries also carry a stable
+lock path, validated before the child receives it, and the child must
+acquire that lock before its inspect/delete pair. The two layers
+together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -406,10 +420,12 @@ ForHTTP dial the container IP directly without spawning the CLI. Only
 ForExec and state queries poll through subprocesses, cheap enough at
 the 100ms interval.
 
-**Never serialize parallel startups**. The library holds no global
-lock (reaper ID registration takes a mutex for a one-line write).
+**Serialize only cooperating name operations**. Docker's immutable-ID
+paths do not need a name lock. Apple create, generation-checked delete,
+prune, and reaper operations use a stable per-name lock; unrelated names
+still start in parallel. Reaper ID registration takes a short mutex.
 Because the default design consumes no host ports, parallelism is
-bounded only by host resources.
+bounded mainly by host resources.
 
 **Keep streams finite**. `Logs` returns the `container logs --follow`
 child as an `io.ReadCloser` whose `Close` (or context cancellation)
@@ -430,7 +446,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+  code, and stderr (capped at 64KiB). If the follow-up backend probe
+  also fails, the returned error wraps both `ErrSystemNotRunning` and
+  the original `*CLIError`.
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

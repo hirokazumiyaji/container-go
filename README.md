@@ -164,20 +164,35 @@ Three layers make sure containers do not outlive your tests:
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
 2. If `Run` fails partway, it removes whatever it created before
-   returning. If removal also fails, the returned `*CleanupError`
-   preserves both the original operation error and the cleanup error.
+   returning when it can prove that cleanup is safe. If removal fails,
+   the returned `*CleanupError` preserves both the original operation
+   error and the cleanup error. A failed reuse create that is already
+   running is never auto-deleted, because another caller may have adopted
+   it; the error reports that retained generation instead. With
+   `CONTAINERGO_KEEP=1`, a verified partial handle is returned alongside
+   the error for explicit inspection or termination.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+   SIGKILL and panics included. Docker's full 64-hex container IDs and
+   Apple names are both valid registration targets. The reaper needs
+   `/bin/sh`, so it is unavailable on Windows — there, cleanup relies on
+   the first two layers only. If the Apple name lock cannot be acquired,
+   the reaper skips that entry rather than deleting without coordination.
 
 Extras:
 
-- `CONTAINERGO_KEEP=1` keeps containers around for debugging.
+- `CONTAINERGO_KEEP=1` keeps containers around for debugging and enables
+  the documented partial-handle policy for verified failed creates.
 - `container.Prune(ctx)` removes stopped containers this library
   created in any previous session (they carry the
-  `com.github.hirokazumiyaji.container-go` label).
+  `com.github.hirokazumiyaji.container-go` label and a valid creation
+  generation). On Apple Container it
+  re-inspects each list candidate under the stable name lock immediately
+  before deleting it.
+
+When a backend probe also fails, the returned error satisfies both
+`errors.Is(err, container.ErrSystemNotRunning)` and
+`errors.As(err, *container.CLIError)` for the original command failure.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -200,8 +215,12 @@ Contract:
 
 - `WithName` is required; readiness strategies always re-run.
 - Name conflicts from a racing create are treated as success and attach.
-- Stopped leftovers are deleted and recreated; a running container that
-  never becomes ready is left alone and returns an error.
+- A stopped generation is deleted and recreated only after its managed,
+  reuse, and valid generation labels are verified. A failed create that
+  left a running generation is not auto-deleted, because a peer may have
+  adopted it; `Run` returns a `CleanupError` describing the retained
+  generation (or a verified partial handle with `CONTAINERGO_KEEP=1`).
+  A running container that never becomes ready is likewise left alone.
 - Image / port mismatches vs the existing container return a clear error.
   Existing reuse containers must carry the managed, reuse, and valid
   creation-generation labels; otherwise reuse fails closed. `PullAlways`
@@ -212,35 +231,37 @@ Contract:
   digest differs from the container image. Mutable tag requests refresh
   the local store but do not replace an already-running shared container;
   pin a digest when the exact image identity matters. `PullMissing` and
-  `PullNever` do not add an attach-only fetch. A stopped generation seen
-  during attach resolution follows the stopped-reuse delete/recreate
-  policy; a generation that becomes stopped after readiness returns an
-  error rather than a stopped handle.
-- `WithFiles` is copied for every reuse caller, including attach callers.
-  Docker copies target the inspected immutable UID; Apple copies verify the
-  generation under the per-name lock. A replacement between identity
+  `PullNever` do not add an attach-only fetch. `WithPlatform` is compared
+  field by field (OS, architecture, and variant), and Apple inspect
+  output carries the OCI descriptor digest into the image identity.
+  `WithReuseGroup` only tags a newly created/recreated generation and is
+  not part of the reuse compatibility key.
+- `WithFiles` is applied after the shared ensure flight for every reuse
+  caller, including the create leader and attach callers. A leader's copy
+  failure therefore does not poison successful waiters. Docker copies
+  target the inspected immutable UID; Apple copies verify the generation
+  under the stable per-name lock. A replacement between identity
   verification and copy fails closed. A failed reuse copy returns an error
   without deleting the shared generation. Copies to the same path are
   shared-state mutations, so concurrent callers should avoid conflicting
-  targets. A reuse leader also leaves a newly created generation in place
-  after a post-start copy or inspect failure, because a peer may already
-  be using it. Creation-only options — `WithEnv`, `WithCmd`,
+  targets. Creation-only options — `WithEnv`, `WithCmd`,
   `WithEntrypoint`, `WithLabels`, `WithMounts`, `WithCPUs`, `WithMemory`,
   `WithUser`, `WithWorkingDir`, and `WithNetwork` — are intentionally
-  ignored on attach; use distinct names when they matter. `WithPlatform`
-  is checked against the existing container, and `PullAlways` uses it
-  when fetching the requested platform variant. `WithReuseGroup` only
-  tags a newly created/recreated generation and is not part of the reuse
-  compatibility key.
-- Each creation carries a generation label; `Terminate` and the
-  stopped-recreate path refuse to delete a replaced generation, and the
-  watchdog reaper guards deletion the same way.
+  ignored on attach; use distinct names when they matter.
+- Apple create, generation-checked delete, and prune operations use a
+  stable per-name lock shared by cooperating processes on the host. Each
+  prune candidate is re-inspected under that lock before deletion. A
+  direct `container` CLI call or another implementation does not take the
+  lock and remains outside this guarantee.
+- Each creation carries a generation label; `Terminate`, stopped reuse,
+  prune, and the watchdog reaper refuse to delete a replaced generation.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). Ordinary `Prune` still
-  only deletes stopped managed containers.
+  only deletes stopped managed containers, with Apple candidates
+  revalidated under the lock.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup
@@ -248,8 +269,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
-  script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data.
+  script (the reaper) is a fixed string that receives validated Apple
+  names or Docker's full 64-hex IDs only as stdin data. Name-addressed
+  Apple reaper entries use the same stable lock as library cleanup paths.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
 - Registry credentials are never handled by this library; use

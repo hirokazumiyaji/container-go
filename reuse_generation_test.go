@@ -71,6 +71,42 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	}
 }
 
+type runningPeerRunner struct {
+	deleteCalls int
+}
+
+func (r *runningPeerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "inspect":
+		return reviewAppleInspect("shared", "running", "redis:7-alpine", "0123456789abcdef", "linux/amd64"), nil, nil
+	case "delete", "rm":
+		r.deleteCalls++
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestDeleteStoppedReuseDoesNotDeleteGenerationThatBecameRunning(t *testing.T) {
+	const generation = "0123456789abcdef"
+	runner := &runningPeerRunner{}
+	cfg := &config{runner: runner, eng: appleEngine{}, name: "shared"}
+	info := &engineInfo{
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: generation,
+		},
+	}
+	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
+		t.Fatalf("deleteStoppedReuse: %v", err)
+	}
+	if runner.deleteCalls != 0 {
+		t.Fatal("running generation was deleted after a peer could adopt it")
+	}
+}
+
 func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	info := &engineInfo{
 		state: StateStopped,
@@ -166,7 +202,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":

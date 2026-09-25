@@ -17,13 +17,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Apply `WithFiles` and `WithPullPolicy(PullAlways)` for every
-  `WithReuse` caller, including attach callers. Pull failures and
-  post-pull image mismatches are returned without replacing a running
-  shared container. Attach copies use immutable/generation-bound targets,
-  reuse post-start failures do not delete shared generations, and cleanup
-  failures remain in `CleanupError` chains. Other creation-only options
-  remain intentionally ignored on attach, while `WithPlatform` is checked
-  and used by pulls.
+  `WithReuse` caller, including attach callers. File application happens
+  after the shared ensure flight so a leader's copy failure cannot poison
+  waiters. Pull failures and post-pull image mismatches are returned
+  without replacing a running shared container. Attach copies use
+  immutable/generation-bound targets, reuse post-start failures do not
+  delete shared generations, and cleanup failures remain in
+  `CleanupError` chains. A failed reuse create that is already running is
+  never auto-deleted because a peer may have adopted it; verified
+  `CONTAINERGO_KEEP=1` failures return a partial handle. Other
+  creation-only options remain intentionally ignored on attach, while
+  `WithPlatform` is compared field by field, Apple OCI descriptor digests
+  are carried into image identity, and platform-specific pulls use the
+  requested variant.
+- Serialize cooperating Apple name creates, generation-checked deletes,
+  and prune operations with a stable per-name lock. Apple prune
+  candidates are revalidated under that lock with bounded contexts, and
+  the watchdog reaper uses the same lock for name-addressed entries.
+- Accept Docker's full 64-hex container IDs in watchdog registration and
+  preserve the original `*CLIError` when a backend liveness probe also
+  fails.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

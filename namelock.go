@@ -4,31 +4,75 @@ package container
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"syscall"
 	"time"
 )
 
-// lockName serializes generation-checked, name-addressed deletes of one
-// container name across processes on this host. Apple Container has no
-// immutable container ID, so an inspect-then-delete by name is only
-// safe if no other process can delete and recreate the name in between;
-// every such delete in this library takes this lock first. That covers
-// cooperating processes using this library only: a direct `container`
-// CLI invocation or another implementation does not take the lock and
-// can still replace the name inside the window. Closing that would
-// need an immutable ID or an atomic conditional delete from the
-// backend, which Apple Container does not offer. The lock file lives
-// in the temp directory and is never removed, since removing it would
-// race with a concurrent locker.
+const nameLockPoll = 10 * time.Millisecond
+
+// nameLockPath returns a stable, user-scoped path for name. The digest
+// keeps arbitrary names out of the filesystem path and, unlike TempDir,
+// gives cooperating processes the same lock even when they have different
+// TMPDIR values.
+func reaperNameLockPath(name string) (string, error) {
+	path, err := nameLockPath(name)
+	if err != nil {
+		return "", err
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return "", fmt.Errorf("prepare reaper lock file %s: %w", path, err)
+	}
+	if err := f.Close(); err != nil {
+		return "", fmt.Errorf("close reaper lock file %s: %w", path, err)
+	}
+	return path, nil
+}
+
+func nameLockPath(name string) (string, error) {
+	cacheDir, err := os.UserCacheDir()
+	if err != nil {
+		return "", fmt.Errorf("find user cache directory: %w", err)
+	}
+	dir := filepath.Join(cacheDir, "container-go", "locks")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", fmt.Errorf("create lock directory %s: %w", dir, err)
+	}
+	digest := sha256.Sum256([]byte(name))
+	return filepath.Join(dir, hex.EncodeToString(digest[:])+".lock"), nil
+}
+
+// lockName serializes name-addressed creates and generation-checked
+// deletes of one container name across cooperating processes on this
+// host. Apple Container has no immutable container ID, so an inspect-
+// then-delete (or create) by name is only safe while all library paths
+// that can mutate that name hold this lock. Direct CLI calls and other
+// implementations do not participate in the protocol.
 func lockName(ctx context.Context, name string) (unlock func(), err error) {
-	f, err := os.OpenFile(filepath.Join(os.TempDir(), "containergo-"+name+".lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	path, err := nameLockPath(name)
 	if err != nil {
 		return nil, err
 	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("open lock file %s: %w", path, err)
+	}
+	ticker := time.NewTicker(nameLockPoll)
+	defer ticker.Stop()
 	for {
+		if err := ctx.Err(); err != nil {
+			_ = f.Close()
+			return nil, err
+		}
 		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
 			return func() {
@@ -36,7 +80,7 @@ func lockName(ctx context.Context, name string) (unlock func(), err error) {
 				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
 			_ = f.Close()
 			return nil, err
 		}
@@ -44,7 +88,7 @@ func lockName(ctx context.Context, name string) (unlock func(), err error) {
 		case <-ctx.Done():
 			_ = f.Close()
 			return nil, ctx.Err()
-		case <-time.After(10 * time.Millisecond):
+		case <-ticker.C:
 		}
 	}
 }

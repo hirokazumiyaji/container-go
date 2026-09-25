@@ -7,3 +7,6 @@ import "context"
 func lockName(context.Context, string) (func(), error) {
 	return func() {}, nil
 }
+
+// The watchdog reaper is disabled on Windows, so no lock path is needed.
+func reaperNameLockPath(string) (string, error) { return "", nil }

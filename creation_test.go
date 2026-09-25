@@ -88,6 +88,17 @@ func TestTerminateDeletesSameGeneration(t *testing.T) {
 	}
 }
 
+func TestTerminateRefusesAppleNameDeleteWithoutGeneration(t *testing.T) {
+	runner := newTestRunner()
+	ctr := &Container{id: "unverified-apple", runner: runner, eng: appleEngine{}}
+	if err := ctr.Terminate(context.Background()); err == nil || !strings.Contains(err.Error(), "missing creation generation") {
+		t.Fatalf("Terminate = %v, want missing-generation refusal", err)
+	}
+	if runner.callWith("delete") != nil {
+		t.Fatal("delete issued without a verified Apple generation")
+	}
+}
+
 func TestRunAddsCreationLabel(t *testing.T) {
 	f := newTestRunner()
 	f.imagePresent = true

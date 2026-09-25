@@ -1,10 +1,17 @@
 package container
 
 import (
+	"regexp"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
+
+var ociDigestRE = regexp.MustCompile(`^(?:sha256:[0-9a-fA-F]{64}|sha384:[0-9a-fA-F]{96}|sha512:[0-9a-fA-F]{128})$`)
+
+func validOCIDigest(digest string) bool {
+	return ociDigestRE.MatchString(digest)
+}
 
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
@@ -14,8 +21,12 @@ type engineInfo struct {
 	// Id). Empty when the backend addresses containers by name only
 	// (Apple Container), where a delete cannot be bound to a generation.
 	uid string
-	// image is the image reference the container was created from.
+	// image is the image reference the container was created from. When
+	// the backend reports an OCI descriptor, image includes its digest.
 	image string
+	// imageDigest is the immutable OCI digest reported for the image,
+	// independent of the human-readable reference form.
+	imageDigest string
 	// platform is the platform reported by inspect, normalized when
 	// possible. An empty value means the backend did not report one.
 	platform string
@@ -94,4 +105,16 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+}
+
+// nameAddressedEngine is an optional backend capability. Keeping it
+// separate from engine preserves compatibility with small test doubles
+// that only implement the original backend contract.
+type nameAddressedEngine interface {
+	nameAddressedDeletes() bool
+}
+
+func usesNameAddressedDeletes(eng engine) bool {
+	capability, ok := eng.(nameAddressedEngine)
+	return ok && capability.nameAddressedDeletes()
 }

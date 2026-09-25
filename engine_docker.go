@@ -38,9 +38,10 @@ const (
 	dockerStderrNoSuchCtr    = "no such container"
 )
 
-func (dockerEngine) name() string   { return "docker" }
-func (dockerEngine) binary() string { return "docker" }
-func (dockerEngine) directIP() bool { return false }
+func (dockerEngine) name() string               { return "docker" }
+func (dockerEngine) binary() string             { return "docker" }
+func (dockerEngine) directIP() bool             { return false }
+func (dockerEngine) nameAddressedDeletes() bool { return false }
 
 // checkConfig rejects explicit loopback publish binds on a remote
 // daemon: Docker would listen on the remote machine's loopback, which
@@ -165,6 +166,7 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
 	ID       string `json:"Id"`
+	Image    string `json:"Image"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
 	State    struct {
@@ -197,12 +199,13 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[0]
 
 	info := &engineInfo{
-		state:    dockerState(c.State.Status),
-		labels:   c.Config.Labels,
-		uid:      c.ID,
-		image:    c.Config.Image,
-		platform: c.Platform,
-		ip:       c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		image:       c.Config.Image,
+		imageDigest: imageDigest(c.Config.Image),
+		platform:    c.Platform,
+		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

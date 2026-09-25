@@ -24,7 +24,17 @@ type Configuration struct {
 }
 
 type Image struct {
-	Reference string `json:"reference"`
+	Reference  string     `json:"reference"`
+	Descriptor Descriptor `json:"descriptor"`
+}
+
+// Descriptor is the OCI descriptor Apple Container reports alongside an
+// image reference. Older CLI versions may omit individual fields, so
+// callers must treat a zero digest as identity-unavailable.
+type Descriptor struct {
+	Digest    string `json:"digest"`
+	MediaType string `json:"mediaType"`
+	Size      int64  `json:"size"`
 }
 
 type Platform struct {

@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -172,6 +173,58 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	cleanupFailedCreate(ctx, cfg, runErr, runErr)
 	if len(r.deleted) != 1 {
 		t.Fatalf("deleted = %v, want cleanup even after cancel", r.deleted)
+	}
+}
+
+func TestReuseRunFailureLeavesRunningGenerationForPeers(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	name := "running-peer-" + newContainerName()
+	inner := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint failed"},
+		inspectJSON: strings.ReplaceAll(ownedReuseInspectJSON(name), `"state": "created"`, `"state": "running"`),
+	}
+	calls := 0
+	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName(name), WithReuse(), withRunner(wrapper), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want failed create error")
+	}
+	if !strings.Contains(err.Error(), "running reuse generation") {
+		t.Fatalf("error = %v, want running-generation cleanup refusal", err)
+	}
+	var cleanupErr *CleanupError
+	if !errors.As(err, &cleanupErr) {
+		t.Fatalf("error = %v, want CleanupError", err)
+	}
+	if len(inner.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no automatic delete of running reuse generation", inner.deleted)
+	}
+}
+
+func TestKeepReturnsVerifiedPartialHandleAfterCreateFailure(t *testing.T) {
+	t.Setenv("CONTAINERGO_KEEP", "1")
+	base := newTestRunner()
+	base.imagePresent = true
+	name := "keep-partial-" + newContainerName()
+	runner := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "start failed"},
+		inspectJSON: ownedInspectJSON(name),
+	}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName(name), withRunner(runner), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want create error")
+	}
+	if ctr == nil || ctr.ID() != name {
+		t.Fatalf("partial handle = %v, want verified handle for %q", ctr, name)
+	}
+	if len(runner.deleted) != 0 {
+		t.Fatalf("deleted = %v, want KEEP to retain failed create", runner.deleted)
 	}
 }
 

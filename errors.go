@@ -36,8 +36,9 @@ func withCleanupError(err, cleanupErr error) error {
 	return &CleanupError{Err: err, CleanupErr: cleanupErr}
 }
 
-// ErrSystemNotRunning reports that the Apple Container system service is
-// not running. Start it with `container system start`.
+// ErrSystemNotRunning reports that the selected backend is not running.
+// Start Apple Container with `container system start`, or start the
+// Docker daemon.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was not declared via

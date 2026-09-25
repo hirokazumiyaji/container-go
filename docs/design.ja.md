@@ -185,7 +185,12 @@ type Strategy interface {
 テストプロセスの終了パターンごとに、コンテナが確実に削除される経路を用意する。
 
 **正常経路**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を呼ぶ。
-`Run` の途中失敗時は `Run` 自身がロールバック削除を行う。
+`Run` の途中失敗時は `Run` 自身が、安全だと確認できた作成済みリソースを
+ロールバック削除する。削除に失敗した場合は `*CleanupError` に元の error と
+cleanup error の両方が残る。failed create が既に running の reuse generation
+を残した場合は、peer が採用している可能性があるため自動削除せず、保持された
+generation を CleanupError として報告する。`CONTAINERGO_KEEP=1` では、所有者を
+確認できた partial handle を error とともに返す。
 
 **異常終了経路(SIGKILL、パニック、`os.Exit`)**：Go の defer も t.Cleanup も走らないため、外部プロセスによる**watchdog リーパー**を用意する。
 ライブラリ初期化時に `/bin/sh` の子プロセスを一つ起動し、標準入力のパイプ越しにコンテナ ID を登録する。
@@ -200,11 +205,37 @@ type Strategy interface {
 
 CLI にラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側でフィルタして行う。
 この掃除を行うヘルパー `Prune(ctx)` (自セッション以外も含め、本ライブラリのラベルを持つ停止済みコンテナを削除する)を提供する。
+Apple Container では list 時の generation/state を取得し、stable な per-name lock
+上で再確認してから name を削除する。stale または外部管理的 candidate は削除しない。
 
-環境変数 `CONTAINERGO_KEEP=1` を設定した場合、`Cleanup` とリーパーは削除を行わない(デバッグ用)。
+環境変数 `CONTAINERGO_KEEP=1` を設定した場合、`Cleanup` とリーパーは削除を行わない(デバッグ用)。所有者が確認できた failed create には partial handle を返す。
 
 匿名ボリュームは `--rm` でも残る仕様のため、本ライブラリは匿名ボリュームを作らない。
 ボリュームが必要な場合は名前付きで作らせ、ライフサイクルは利用者に委ねる。
+
+## Reuse の世代と Apple の協調ロック
+
+`WithReuse` は `WithName` に対する process 間 get-or-create である。
+既存の container には managed、reuse、16 桁の creation generation label が必要である。
+ラベルが欠ける container は引き継ぎも削除もせず、失敗として返す。
+
+image の比較は参照名と、inspect が返す OCI descriptor digest を使う。
+`WithPlatform` は OS、architecture、variant をそれぞれ比較する。
+指定していない selector の要素は wildcard として扱い、backend がその要素を返さない場合は不一致とする。
+Docker の immutable ID は generation check に代わる削除 target である。
+
+`WithFiles` は shared ensure flight の外で、create leader を含む各 caller が適用する。
+したがって leader の copy failure が 다른 waiter の結果を汚染することはない。
+copy の前後は Docker の immutable UID、または Apple の generation と stable な per-name lock で確認する。
+検査後に同じ name が別 generation に置き換わった場合は copy を失敗させる。
+
+Apple Container は name で delete するため、本ライブラリの create、generation-checked delete、prune は同じ stable lock を使う。
+`Prune` は list 時の managed label、generation、state、reuse group を記録し、lock 内で再 inspect してから削除する。
+直接の `container` CLI 呼び出しや別の implementation はこの lock を使わないため、保証は対象としない。
+
+failed create が running generation を残した場合、ライブラリはそれを自動削除しない。
+peer がすでに引き継いでいる可能性があるためである。
+通常の cleanup error として残存を報告し、`CONTAINERGO_KEEP=1` では所有者を確認した partial handle を返す。
 
 ## セキュリティ設計
 
@@ -213,8 +244,10 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証してからパイプへ書く。
+スクリプト本文は固定文字列で、検証済みの Apple name または Docker の full 64-hex ID を標準入力からデータとして渡す。
+スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+Apple の name-addressed entry は library cleanup と同じ stable lock path を持ち、child は inspect と delete の前にその lock を取得する。
+lock を取得できない場合、child は協調しない delete を行わず entry を skip する。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。
@@ -242,8 +275,9 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 ポーリングのたびに子プロセスを起動するのは ForExec と状態照会だけで、これらも 100 ミリ秒間隔のポーリングで問題ない程度に軽い。
 
 **並列起動を妨げない**。
-ライブラリ内にグローバルロックを置かない(watchdog リーパーへの ID 登録のみミューテックスで直列化するが、書き込みは 1 行で済む)。
-ホストポートを消費しない既定設計により、並列数の上限はホストのリソースだけで決まる。
+Docker の immutable-ID 経路には name lock を置かない。
+Apple の create、generation-checked delete、prune、reaper だけが同じ stable per-name lock を使うため、異なる name の起動は並列できる。
+ホストポートを消費しない既定設計により、並列数の上限は主にホストのリソースで決まる。
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
@@ -260,7 +294,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する。backend probe も失敗した場合は `ErrSystemNotRunning` と元の `*CLIError` の両方を error chain に保持する
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

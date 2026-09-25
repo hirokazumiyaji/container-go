@@ -84,7 +84,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if err != nil {
 		return 0, nil, err
 	}
-	defer unlock()
+	// Verify the generation/target while the Apple name lock is held, but
+	// do not keep that lock across the potentially unbounded exec process.
+	// State/Endpoint probes from concurrent wait strategies must remain able
+	// to acquire the same name lock.
+	unlock()
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
@@ -101,7 +105,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
 		return cliErr.ExitCode, output, nil
 	}
-	if c.execContainerRunning(ctx) {
+	if c.execContainerRunningTarget(ctx, target) {
 		return cliErr.ExitCode, output, nil
 	}
 	return 0, nil, wrapNotFound(c.classify(ctx, err))
@@ -135,16 +139,41 @@ func execCLIStderr(err error) (string, bool) {
 	return strings.ToLower(cliErr.Stderr), true
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
+// execContainerRunning retains the historical helper for package callers.
+// It verifies and releases the operation lock before inspecting the target.
+//
+//nolint:unused // retained for in-package callers using the original helper
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	// Exec calls this while verifiedOperationTargetWithLock holds the Apple
-	// name lock. Inspect through the lock-aware path so an ambiguous command
-	// result cannot fall back to an unlocked replacement name.
-	info, err := c.inspectFreshLocked(ctx)
+	target, unlock, err := c.verifiedOperationTargetWithLock(ctx)
 	if err != nil {
 		return false
+	}
+	unlock()
+	return c.execContainerRunningTarget(ctx, target)
+}
+
+// execContainerRunningTarget verifies the already-verified operation target
+// without taking a second Apple name lock. The caller's initial generation
+// check remains authoritative for name-addressed Apple handles.
+func (c *Container) execContainerRunningTarget(ctx context.Context, target string) bool {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if err != nil {
+		return false
+	}
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return false
+	}
+	if requiresImmutableID(c.eng) {
+		if !validImmutableID(c.eng, info.uid) || info.uid != target {
+			return false
+		}
+	} else if c.eng.name() == "apple" {
+		if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
+			return false
+		}
 	}
 	return info.state == StateRunning
 }

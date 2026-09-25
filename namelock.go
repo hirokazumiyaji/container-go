@@ -54,6 +54,36 @@ func nameLockFileName(name string) string {
 	return hex.EncodeToString(digest[:]) + ".lock"
 }
 
+// resolveTrustedBase resolves aliases in an established platform/home/cache
+// base while retaining missing trailing components. The private namespace
+// appended by the callers is still walked strictly by privateDirPath, so a
+// symlink introduced inside container-go/locks is never silently followed.
+func resolveTrustedBase(path string) (string, error) {
+	if !filepath.IsAbs(path) {
+		return "", fmt.Errorf("trusted lock base %q is not absolute", path)
+	}
+	current := filepath.Clean(path)
+	var missing []string
+	for {
+		resolved, err := filepath.EvalSymlinks(current)
+		if err == nil {
+			for i := len(missing) - 1; i >= 0; i-- {
+				resolved = filepath.Join(resolved, missing[i])
+			}
+			return filepath.Clean(resolved), nil
+		}
+		if !errors.Is(err, fs.ErrNotExist) {
+			return "", err
+		}
+		parent := filepath.Dir(current)
+		if parent == current {
+			return "", err
+		}
+		missing = append(missing, filepath.Base(current))
+		current = parent
+	}
+}
+
 // nameLockPath returns the durable, account-scoped coordination path. The
 // file name is hashed so arbitrary container names cannot alter the path.
 func nameLockPath(name string) (string, error) {
@@ -72,11 +102,11 @@ func legacyNameLockPath(name string) (string, error) {
 		return "", fmt.Errorf("invalid container name %q", name)
 	}
 	// This is the exact path used by the pre-cache revision. Resolve a
-	// system symlink such as /var -> /private/var where possible so a new
-	// process and an old process open the same directory inode.
-	tempDir := os.TempDir()
-	if resolved, err := filepath.EvalSymlinks(tempDir); err == nil {
-		tempDir = resolved
+	// system symlink such as /var -> /private/var so a new process and an
+	// old process open the same directory inode.
+	tempDir, err := resolveTrustedBase(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("resolve legacy temporary directory: %w", err)
 	}
 	return filepath.Join(tempDir, "containergo-"+name+".lock"), nil
 }
@@ -88,6 +118,10 @@ func transitionalNameLockPath(name string) (string, error) {
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
 		return "", fmt.Errorf("transitional user cache directory: %w", err)
+	}
+	cacheDir, err = resolveTrustedBase(cacheDir)
+	if err != nil {
+		return "", fmt.Errorf("resolve transitional user cache directory: %w", err)
 	}
 	lockDir, err := privateDirPath(filepath.Join(cacheDir, "container-go", "locks"))
 	if err != nil {
@@ -104,6 +138,10 @@ func durableNameLockDir() (string, error) {
 			return "", fmt.Errorf("find account home: %w", err)
 		}
 		base = current.HomeDir
+	}
+	base, err := resolveTrustedBase(base)
+	if err != nil {
+		return "", fmt.Errorf("resolve durable account base: %w", err)
 	}
 	if runtime.GOOS == "darwin" {
 		base = filepath.Join(base, "Library", "Application Support")

@@ -132,13 +132,13 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 `Container.Exec` は有限時間・バッファリングされる操作です。caller の
 context に deadline がない場合、Exec は 30 秒の既定 deadline を適用し、
 ハングした backend が test を無期限にブロックしないようにします。
-`WithExecTimeout(d)` でこの bound を変更でき、caller の deadline は
-常に優先されます。`WithExecTimeout(0)` を明示すると library の既定
-deadline を無効にできます。これは意図的な長時間実行コマンドの場合だけ
-使用し、cancellable な context(可能なら deadline 付き)を併用して
-ください。長寿命のプロセスは通常、コンテナの本体的コマンド
-(`WithCmd`)として起動し、出力には `FollowLogs` を使ってください。
-長-open な `Exec` 呼び出しは避けてください。
+正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と
+caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定
+deadline のみを無効化し、caller の deadline は取り除きません。これは
+意図的な長時間実行コマンドの場合だけ使用し、cancellable な context
+(可能なら deadline 付き)を併用してください。長寿命のプロセスは通常、
+コンテナの本体的コマンド(`WithCmd`)として起動し、出力には `FollowLogs`
+を使ってください。長-open な `Exec` 呼び出しは避けてください。
 
 Exec は既存の `(exitCode, output, error)` 契約を維持します。command
 の非ゼロ終了は結果であり、backend・timeout・cancellation のエラーは
@@ -146,6 +146,16 @@ Exec は既存の `(exitCode, output, error)` 契約を維持します。command
 場合は、その error と併せて `exitCode` にも保持されます。いずれのエラー
 でも、失敗前に生成された partial stdout/stderr を保持しているため
 `output` を読んでください。
+
+context が期限切れになって終了コードが取得できない場合、Unix では
+local CLI の process group を停止します(Windows では local process のみを
+停止し、child cleanup は platform に依存します)。対応する backend CLI
+には exec instance を kill する共通操作がありません。そのため container
+側 process が終了したと誤認せず、`*ExecTerminationError`(`errors.Is(err,
+ErrExecTerminationUnsupported)`)を返します。process が残り得るため、
+caller は container を terminate するか backend 固有の cleanup を実行
+してください。context 期限と競合して終了コードが取得できた場合は、
+その status を保持し、この warning は出しません。
 
 ## クリーンアップの契約
 

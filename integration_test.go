@@ -128,6 +128,10 @@ func TestIntegrationExecPreservesPartialOutputOnTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Exec error = %v, want context.DeadlineExceeded", err)
 	}
+	var terminationErr *container.ExecTerminationError
+	if !errors.As(err, &terminationErr) || !errors.Is(err, container.ErrExecTerminationUnsupported) {
+		t.Fatalf("Exec error = %v, want typed unsupported termination error", err)
+	}
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0 on infrastructure timeout", code)
 	}

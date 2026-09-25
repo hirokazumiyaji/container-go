@@ -116,7 +116,7 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	}
 }
 
-func TestIntegrationDockerExecPreservesPartialOutputOnTimeout(t *testing.T) {
+func TestIntegrationDockerExecReportsDaemonProcessMaySurviveTimeout(t *testing.T) {
 	requireDocker(t)
 
 	ctr, err := container.Run(context.Background(), integrationAlpine,
@@ -131,6 +131,10 @@ func TestIntegrationDockerExecPreservesPartialOutputOnTimeout(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Exec error = %v, want context.DeadlineExceeded", err)
 	}
+	var terminationErr *container.ExecTerminationError
+	if !errors.As(err, &terminationErr) || !errors.Is(err, container.ErrExecTerminationUnsupported) {
+		t.Fatalf("Exec error = %v, want typed unsupported termination error", err)
+	}
 	if code != 0 {
 		t.Errorf("exit code = %d, want 0 on infrastructure timeout", code)
 	}
@@ -143,6 +147,32 @@ func TestIntegrationDockerExecPreservesPartialOutputOnTimeout(t *testing.T) {
 	}
 	if !strings.Contains(string(data), "partial-output") {
 		t.Fatalf("output = %q, want partial command output", data)
+	}
+
+	// Docker has no CLI operation that kills an exec instance by ID. The
+	// local CLI is stopped, but the container-side command can continue;
+	// the public error must make that limitation explicit. Cleanup below
+	// terminates the container so this regression does not leak the process.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, psOut, psErr := ctr.Exec(context.Background(), []string{"ps", "-eo", "pid,args"})
+		if psErr != nil {
+			t.Fatalf("inspect daemon process: %v", psErr)
+		}
+		psData, readErr := io.ReadAll(psOut)
+		if readErr != nil {
+			t.Fatalf("read process list: %v", readErr)
+		}
+		if strings.Contains(string(psData), "sleep 30") {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon-side exec process disappeared without a termination capability: %q", psData)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("cleanup timed-out exec container: %v", err)
 	}
 }
 

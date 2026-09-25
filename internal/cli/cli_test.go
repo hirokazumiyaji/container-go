@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -114,7 +115,7 @@ func TestExecRunnerPreservesLargeFailureOutput(t *testing.T) {
 }
 
 func TestExecRunnerHonorsContextCancellation(t *testing.T) {
-	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
+	r := &ExecRunner{Binary: writeStub(t, `sleep 5`)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -130,7 +131,7 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 }
 
 func TestExecRunnerPreservesOutputOnContextCancellation(t *testing.T) {
-	r := &ExecRunner{Binary: writeStub(t, `printf 'partial stdout'; printf 'partial stderr' >&2; sleep 30`)}
+	r := &ExecRunner{Binary: writeStub(t, `printf 'partial stdout'; printf 'partial stderr' >&2; sleep 5`)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
@@ -141,6 +142,25 @@ func TestExecRunnerPreservesOutputOnContextCancellation(t *testing.T) {
 	}
 	if string(stdout) != "partial stdout" || string(stderr) != "partial stderr" {
 		t.Fatalf("output = %q/%q, want partial output", stdout, stderr)
+	}
+}
+
+func TestCommandErrorPreservesExitStatusWhenContextExpires(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 7")
+	rawErr := cmd.Run()
+	if rawErr == nil {
+		t.Fatal("stub command unexpectedly succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := commandError(ctx, "stub", []string{"exec"}, nil, rawErr)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want CLIError exit code 7", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
 	}
 }
 

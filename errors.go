@@ -34,6 +34,34 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrExecTerminationUnsupported reports that Exec stopped its local CLI
+// process after a context deadline or cancellation, but could not prove
+// that the backend-side exec process stopped. Neither supported CLI
+// exposes a common exec-instance kill operation.
+var ErrExecTerminationUnsupported = errors.New("exec process termination is unsupported by backend")
+
+// ExecTerminationError preserves the context or infrastructure error while
+// making the possible daemon-side process leak explicit. Callers should
+// terminate the container or use a backend-specific cleanup mechanism when
+// this error is returned.
+type ExecTerminationError struct {
+	// Err is the context or infrastructure error that stopped local Exec.
+	Err error
+}
+
+func (e *ExecTerminationError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrExecTerminationUnsupported.Error()
+	}
+	return fmt.Sprintf("%s: %v (terminate the container or use backend-specific cleanup)", ErrExecTerminationUnsupported, e.Err)
+}
+
+func (e *ExecTerminationError) Unwrap() error { return e.Err }
+
+func (e *ExecTerminationError) Is(target error) bool {
+	return target == ErrExecTerminationUnsupported
+}
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {

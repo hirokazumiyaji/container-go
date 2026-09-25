@@ -28,10 +28,11 @@ type execConfig struct {
 	timeoutSet bool
 }
 
-// WithExecTimeout sets the deadline for one Exec invocation when ctx has
-// no earlier deadline. The default is 30 seconds. A zero value disables
-// the library default for deliberately long-running commands; callers
-// should then pass a cancellable context.
+// WithExecTimeout sets an upper bound for one Exec invocation. A
+// positive d and the caller's deadline are combined, with the earlier
+// deadline winning. The default is 30 seconds. A zero value disables
+// only the library default for deliberately long-running commands;
+// callers should then pass a cancellable context.
 func WithExecTimeout(d time.Duration) ExecOption {
 	return func(c *execConfig) error {
 		if d < 0 {
@@ -79,12 +80,28 @@ func WithExecWorkDir(dir string) ExecOption {
 	}
 }
 
+func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, context.CancelFunc) {
+	if cfg.timeoutSet {
+		if cfg.timeout == 0 {
+			return ctx, func() {}
+		}
+		// WithTimeout preserves the earlier deadline when ctx already
+		// has one, while still bounding a caller that supplied a later
+		// deadline.
+		return context.WithTimeout(ctx, cfg.timeout)
+	}
+	return withDefaultTimeout(ctx, cfg.timeout)
+}
+
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error. When
 // the backend or the context fails, the reader still contains whatever
 // stdout and stderr the command produced before the failure; callers
 // should read it even when err is non-nil. If the backend reports an
 // exit status, that status is returned alongside the classified error.
+// When a context error has no exit status, Exec returns an
+// ExecTerminationError because the backend-side process may still be
+// running and neither supported CLI exposes a common exec-instance kill.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	if len(cmd) == 0 {
 		return 0, nil, errors.New("exec: command must not be empty")
@@ -107,12 +124,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	}
 
 	// Exec is a buffered, bounded operation by default. An explicit zero
-	// timeout opts out of the library deadline; a caller deadline always
-	// remains authoritative.
-	execCtx, cancel := ctx, context.CancelFunc(func() {})
-	if !cfg.timeoutSet || cfg.timeout > 0 {
-		execCtx, cancel = withDefaultTimeout(ctx, cfg.timeout)
-	}
+	// timeout opts out of the library default. A positive custom timeout
+	// is combined with the caller's deadline, so the earlier one wins.
+	execCtx, cancel := withExecTimeout(ctx, cfg)
 	defer cancel()
 
 	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
@@ -123,7 +137,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if !cli.IsCommandExit(err) {
 		// A launch, context, or transport failure has no command exit
 		// code, but the CLI may still have emitted useful diagnostics.
-		return 0, output, wrapNotFound(c.classify(execCtx, err))
+		classified := wrapNotFound(c.classify(execCtx, err))
+		if isExecContextError(err) {
+			classified = &ExecTerminationError{Err: classified}
+		}
+		return 0, output, classified
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -131,14 +149,38 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
+		if contextErr := execContextResultError(err, cliErr); contextErr != nil {
+			return cliErr.ExitCode, output, contextErr
+		}
 		return cliErr.ExitCode, output, nil
 	}
 	if c.execContainerRunning(execCtx) {
+		if contextErr := execContextResultError(err, cliErr); contextErr != nil {
+			return cliErr.ExitCode, output, contextErr
+		}
 		return cliErr.ExitCode, output, nil
 	}
 	// Preserve both the CLI exit code and the classified infrastructure
 	// error. The output reader is intentionally non-nil on this path.
-	return cliErr.ExitCode, output, wrapNotFound(c.classify(execCtx, err))
+	classified := wrapNotFound(c.classify(execCtx, err))
+	if isExecContextError(err) && cliErr.ExitCode < 0 {
+		classified = &ExecTerminationError{Err: classified}
+	}
+	return cliErr.ExitCode, output, classified
+}
+
+func isExecContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func execContextResultError(err error, cliErr *cli.CLIError) error {
+	if !isExecContextError(err) {
+		return nil
+	}
+	if cliErr.ExitCode < 0 {
+		return &ExecTerminationError{Err: err}
+	}
+	return err
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

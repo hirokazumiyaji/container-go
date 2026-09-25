@@ -77,7 +77,8 @@ func (e *CLIError) Error() string {
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
-// argv vector; no shell is involved.
+// argv vector; no shell is involved. Cancellation kills the local process
+// group on Unix; it does not claim to terminate a process inside a backend.
 type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
@@ -94,6 +95,11 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	configureProcessGroup(cmd)
+	// CommandContext's default cancellation kills only the CLI process.
+	// Kill the local process group so a shell wrapper cannot leave a child
+	// (for example, sleep) behind while the caller is being cancelled.
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -105,22 +111,39 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
-	if err != nil {
-		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
-			}
-		}
-		return stdout.Bytes(), stderr.Bytes(), err
+	return stdout.Bytes(), stderr.Bytes(), commandError(ctx, bin, args, stderr.Bytes(), err)
+}
+
+func commandError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
+	if err == nil {
+		return nil
 	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		exitCode := exitErr.ExitCode()
+		if ctxErr := ctx.Err(); ctxErr != nil && exitCode < 0 {
+			// A signal has no usable process exit status. Let the
+			// caller surface the context/termination limitation rather
+			// than presenting -1 as a command result.
+			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+		}
+		cliErr := &CLIError{
+			Binary:   bin,
+			Args:     args,
+			ExitCode: exitCode,
+			Stderr:   truncateStderr(string(stderr)),
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The process did produce an exit status, but cancellation
+			// raced with its completion. Keep both facts observable.
+			return errors.Join(cliErr, ctxErr)
+		}
+		return cliErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+	}
+	return err
 }
 
 // truncateStderr bounds the diagnostic copy kept in CLIError.

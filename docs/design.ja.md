@@ -136,16 +136,25 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Exec` は有限時間・バッファリングされる操作で、終了コードと stdout+stderr
 を返す(非ゼロ終了は結果であり error ではない)。caller の context に
-deadline がない場合は 30 秒の既定 deadline を適用する。
-`WithExecTimeout(d)` で既定値を上書きでき、`WithExecTimeout(0)` を
-明示すると library の deadline を無効化できる。caller の deadline は
-常に優先されるため、長時間実行する command には cancellable な context
-も渡す。長寿命のプロセスは通常 `WithCmd` で本体的コマンドとして起動し、
-出力は `FollowLogs` で取得する(Long-open な Exec は避ける)。
+deadline がない場合は 30 秒の既定 deadline を適用する。正の
+`WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の
+deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline
+のみを無効化し、caller の deadline は取り除かない。
+長寿命のプロセスは通常 `WithCmd` で本体的コマンドとして起動し、出力は
+`FollowLogs` で取得する(Long-open な Exec は避ける)。
 backend・timeout・cancellation error の場合も、failure 前に生成された
 partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
 backend の終了コードが利用できる場合は、最初の戻り値にも保持する。
-したがって error が non-nil でも reader を読む。
+context が期限切れになって終了コードが取得できない場合、Unix の local CLI
+process group は停止するが(Windows では local process のみを停止し、
+child cleanup は platform に依存する)、対応する backend CLI には exec
+instance を kill する共通操作がない。そのため container 側 process の終了を
+誤認せず、
+`*ExecTerminationError`(`errors.Is(err,
+ErrExecTerminationUnsupported)`)を返す。process が残り得るため、caller は
+container を terminate するか backend 固有 cleanup を実行する。context
+期限と競合して終了コードが取得できた場合は status を保持し、この warning
+は出さない。したがって error が non-nil でも reader を読む。
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
@@ -265,9 +274,12 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系と public Exec は 30 秒、pull を伴う run は 10 分)を持つ。
 `Exec` は有限・バッファリング操作であり、`WithExecTimeout(0)` は意図的な
 長時間実行 command のための明示的な escape hatch とする(その場合でも
-cancellable な context を併用する)。長寿命の出力には別の streaming API
+cancellable な context を併用する)。正の `WithExecTimeout` は指定値と
+caller の deadline の早い方を用いる。長寿命の出力には別の streaming API
 `FollowLogs` を使う。
-コンテキスト取消時は子プロセスへ SIGKILL を送って回収し、ゾンビとハングを残さない。
+コンテキスト取消時は Unix の local CLI process group へ SIGKILL を送って
+回収する(Windows では local process のみを停止し、child cleanup は
+platform に依存する)。これは remote exec process の kill を意味しない。
 
 ## エラー処理
 
@@ -277,6 +289,7 @@ cancellable な context を併用する)。長寿命の出力には別の stream
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：context の期限切れまたは取消で process の終了コードが取得できなかった場合。local CLI は停止したが、backend 側 exec process は残っている可能性がある
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

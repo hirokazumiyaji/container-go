@@ -20,6 +20,8 @@ type Streamer interface {
 
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
 	cmd := exec.CommandContext(ctx, r.binary(), args...)
+	configureProcessGroup(cmd)
+	cmd.Cancel = func() error { return killProcessGroup(cmd) }
 	cmd.WaitDelay = 3 * time.Second
 	// One pipe carries both output streams: `docker logs` splits the
 	// container's stdout/stderr across the CLI's two streams.
@@ -48,7 +50,7 @@ type processStream struct {
 
 func (s *processStream) Close() error {
 	s.once.Do(func() {
-		_ = s.cmd.Process.Kill()
+		_ = killProcessGroup(s.cmd)
 		_ = s.ReadCloser.Close()
 		// Reap the child; the error is the expected kill signal.
 		_ = s.cmd.Wait()

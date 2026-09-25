@@ -182,17 +182,27 @@ func (c *Container) Terminate(ctx context.Context) error
 `Exec` is a finite, buffered operation. It returns the exit code with
 combined stdout+stderr (a non-zero exit is a result, not an error);
 this is kept for v1 compatibility. When the caller's context has no
-deadline, Exec applies a 30-second default. `WithExecTimeout(d)`
-overrides that default, while `WithExecTimeout(0)` explicitly disables
-the library deadline for a deliberately long-running command. A
-caller deadline remains authoritative in either case, so a long-running
-command should also receive a cancellable context. Start persistent
-processes as the container's main command (`WithCmd`) and use
-`FollowLogs` for their output rather than holding an Exec call open.
+deadline, Exec applies a 30-second default. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default for a deliberately long-running command; it does not remove a
+caller deadline. Start persistent processes as the container's main
+command (`WithCmd`) and use `FollowLogs` for their output rather than
+holding an Exec call open.
+
 On backend, timeout, or cancellation errors, Exec retains partial
 stdout+stderr in its reader and returns the classified error; a backend
-exit status, when available, remains in the first return value. Callers
-must read the reader even when the error is non-nil.
+exit status, when available, remains in the first return value. If the
+context expires without an exit status, cancellation stops only the
+local CLI process group on Unix (on Windows the local process is
+stopped, while child cleanup is platform-dependent). The supported
+backend CLIs do not expose a common exec-instance kill operation, so
+Exec returns
+`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
+rather than claiming that the daemon-side process stopped. Callers must
+terminate the container or use backend-specific cleanup. An exit status
+that races with context expiry is preserved without that warning.
+Callers must read the output reader even when the error is non-nil.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -401,8 +411,12 @@ carries a default timeout (30s for queries and public Exec, 10min for
 pull-bearing runs). `Exec` is finite and buffered by design;
 `WithExecTimeout(0)` is the explicit escape hatch for an intentional
 long-running command, which should still use a cancellable context.
-`FollowLogs` is the separate streaming API for long-lived output. On
-cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
+A positive `WithExecTimeout` uses the earlier of its value and the
+caller's deadline. `FollowLogs` is the separate streaming API for long-lived
+output. On cancellation the local CLI process group is SIGKILLed and
+reaped on Unix; Windows stops the local process, with child cleanup
+platform-dependent. This does not imply that a remote exec process was
+killed.
 
 ## Error handling
 
@@ -416,6 +430,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
+  expiry or cancellation returned no process exit status; the local CLI
+  was stopped, but the backend-side exec process may still be running
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

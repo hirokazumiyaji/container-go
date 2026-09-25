@@ -227,6 +227,17 @@ func waitForIssue116ExecResult(t *testing.T, result <-chan issue116ExecResult) i
 	}
 }
 
+func assertExecTerminationError(t *testing.T, err error) {
+	t.Helper()
+	var terminationErr *ExecTerminationError
+	if !errors.As(err, &terminationErr) {
+		t.Fatalf("error = %v, want *ExecTerminationError", err)
+	}
+	if !errors.Is(err, ErrExecTerminationUnsupported) {
+		t.Fatalf("error = %v, want ErrExecTerminationUnsupported", err)
+	}
+}
+
 func TestExecAddsDefaultDeadline(t *testing.T) {
 	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
@@ -240,6 +251,37 @@ func TestExecAddsDefaultDeadline(t *testing.T) {
 	remaining := time.Until(f.deadline)
 	if remaining <= 0 || remaining > defaultExecTimeout+time.Second {
 		t.Fatalf("default deadline = %v away, want within %v", remaining, defaultExecTimeout)
+	}
+}
+
+func TestExecCustomTimeoutUsesEarlierCallerDeadline(t *testing.T) {
+	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	callerDeadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+
+	if _, _, err := ctr.Exec(ctx, []string{"true"}, WithExecTimeout(5*time.Second)); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if f.deadline.After(callerDeadline) {
+		t.Fatalf("deadline = %v, want no later than caller deadline %v", f.deadline, callerDeadline)
+	}
+}
+
+func TestExecCustomTimeoutBoundsLaterCallerDeadline(t *testing.T) {
+	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	callerDeadline := time.Now().Add(2 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+
+	if _, _, err := ctr.Exec(ctx, []string{"true"}, WithExecTimeout(20*time.Millisecond)); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	remaining := time.Until(f.deadline)
+	if remaining <= 0 || remaining > 200*time.Millisecond {
+		t.Fatalf("custom deadline = %v away, want it to bound the later caller deadline", remaining)
 	}
 }
 
@@ -264,6 +306,7 @@ func TestExecDefaultTimeoutStopsBlockingBackend(t *testing.T) {
 	if !errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
 	}
+	assertExecTerminationError(t, got.err)
 	if got.out == nil {
 		t.Fatal("Exec returned nil output on default timeout")
 	}
@@ -296,6 +339,7 @@ func TestExecCancellationPreservesPartialOutput(t *testing.T) {
 	if !errors.Is(got.err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", got.err)
 	}
+	assertExecTerminationError(t, got.err)
 	if got.out == nil {
 		t.Fatal("Exec returned nil output on cancellation")
 	}
@@ -326,6 +370,7 @@ func TestExecTimeoutPreservesPartialOutput(t *testing.T) {
 	if !errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
 	}
+	assertExecTerminationError(t, got.err)
 	if got.out == nil {
 		t.Fatal("Exec returned nil output on timeout")
 	}
@@ -395,6 +440,42 @@ func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
 	}
 }
 
+type issue116ConcurrentExitRunner struct {
+	*fakeRunner
+}
+
+func (r *issue116ConcurrentExitRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		<-ctx.Done()
+		return []byte("exit stdout"), []byte("exit stderr"), errors.Join(
+			&cli.CLIError{Args: args, ExitCode: 7, Stderr: "command failed"},
+			ctx.Err(),
+		)
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestExecPreservesExitStatusWhenContextExpiresConcurrently(t *testing.T) {
+	f := &issue116ConcurrentExitRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"false"}, WithExecTimeout(20*time.Millisecond))
+	if code != 7 || out == nil {
+		t.Fatalf("code/output = %d/%v, want code 7 and output", code, out)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want exit status 7", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	var terminationErr *ExecTerminationError
+	if errors.As(err, &terminationErr) {
+		t.Fatal("a completed command with an exit status must not claim termination was unsupported")
+	}
+}
+
 func TestExecZeroTimeoutDisablesDefaultDeadline(t *testing.T) {
 	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
@@ -404,5 +485,20 @@ func TestExecZeroTimeoutDisablesDefaultDeadline(t *testing.T) {
 	}
 	if f.has {
 		t.Fatal("WithExecTimeout(0) unexpectedly added a deadline")
+	}
+}
+
+func TestExecZeroTimeoutKeepsCallerDeadline(t *testing.T) {
+	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+	callerDeadline := time.Now().Add(time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
+	defer cancel()
+
+	if _, _, err := ctr.Exec(ctx, []string{"true"}, WithExecTimeout(0)); err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+	if !f.has || f.deadline.After(callerDeadline) {
+		t.Fatalf("deadline = %v (has=%t), want caller deadline %v", f.deadline, f.has, callerDeadline)
 	}
 }

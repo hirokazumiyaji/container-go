@@ -143,13 +143,14 @@ logs attached to the error.
 
 `Container.Exec` is a finite, buffered operation. When the caller's
 context has no deadline, Exec applies a 30-second default so a hung
-backend cannot block a test indefinitely. `WithExecTimeout(d)` changes
-that bound; a caller deadline always remains authoritative. Passing
-`WithExecTimeout(0)` explicitly opts out of the library deadline. Use
-that only for a deliberately long-running command and pair it with a
-cancellable context (prefer a deadline). Long-lived processes should
-normally be the container's main command (`WithCmd`) with `FollowLogs`
-for output rather than a long-lived `Exec` call.
+backend cannot block a test indefinitely. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default; it does not remove a caller deadline. Use zero only for a
+deliberately long-running command and pair it with a cancellable
+context (prefer a deadline). Long-lived processes should normally be
+the container's main command (`WithCmd`) with `FollowLogs` for output
+rather than a long-lived `Exec` call.
 
 Exec keeps the existing `(exitCode, output, error)` contract: a
 command's non-zero exit is a result, while a backend, timeout, or
@@ -157,6 +158,17 @@ cancellation error is returned with the classified error. A backend
 exit status, when available, is retained in `exitCode` even alongside
 that error. In either error case, read `output` to retain partial stdout
 and stderr produced before the failure.
+
+Cancellation stops the local CLI process group on Unix (on Windows,
+the local process is stopped but child cleanup is platform-dependent).
+Neither supported backend CLI exposes a common kill operation for an
+exec instance. If a context expires without a command exit status, Exec
+returns an `*ExecTerminationError` (`errors.Is(err,
+ErrExecTerminationUnsupported)`) instead of claiming that the
+container-side process stopped. The process may still be running; callers
+must terminate the container or use a backend-specific cleanup path.
+An exit status that races with context expiry is preserved and does not
+produce this warning.
 
 ## Image pulls
 

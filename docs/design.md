@@ -277,9 +277,10 @@ reaches EOF. Apple entries require a generation, verify it, and run
 `container delete --force` while holding the same legacy,
 transitional, and durable account-state locks as `Prune` and create. A
 missing lock or platform lock helper (`lockf` on macOS, `flock` elsewhere)
-makes that entry fail closed. Full
-immutable Docker IDs are the only generation-less entries. While the
-parent lives the reaper does nothing
+makes that entry fail closed. Docker entries always use a full immutable
+ID; generation-bearing entries verify the label and still delete only by
+that ID. Full immutable Docker IDs are also the only generation-less
+entries. While the parent lives the reaper does nothing
 (deletion belongs to the normal path; the reaper is insurance). This
 mirrors container-rs's watchdog and covers SIGKILL, which no signal
 handler can.
@@ -354,8 +355,9 @@ inspection, optional reaper registration, and delete; operational errors
 are joined to the original `Run` or reuse-create error rather than hidden.
 The watchdog reaper takes the same ordered barriers for Apple name entries;
 if the platform lock helper or any prepared lock file is unavailable, it
-skips that entry rather than performing an unlocked delete. Generation-less reaper entries
-are accepted only for full immutable Docker IDs. It registers Docker
+skips that entry rather than performing an unlocked delete. Generation-bearing Docker reaper entries require a full immutable ID and
+are never allowed to fall back to a name; generation-less entries are
+accepted only for full immutable Docker IDs. It registers Docker
 containers by `Id`; for Apple it stores
 the generation, reads the label as a line-anchored JSON field
 (`"key": "value"`, never a substring), and skips deletion on mismatch.

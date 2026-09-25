@@ -142,7 +142,8 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    削除します。Apple Container では、名前指定の削除に作成世代を必須とし、
    Prune や作成と同じ順序のユーザー単位ロックを取得します。いずれかのロックや
    必要なロック補助コマンド(macOS では `lockf`、その他では `flock`)が利用できない場合は、
-   該当エントリを削除せず fail closed にします。
+   該当エントリを削除せず fail closed にします。Docker のエントリは常に完全な
+   不変 ID を使い、世代が指定された場合もラベルを検証してからその ID だけを削除します。
    リーパーは `/bin/sh` を必要とするため Windows では動かず、Windows では
    前 2 層のみでクリーンアップします。
 

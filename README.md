@@ -172,9 +172,11 @@ Three layers make sure containers do not outlive your tests:
    delete requires a creation generation and takes the same ordered,
    user-scoped lock barriers as prune and create; if any lock or the
    platform lock helper (`lockf` on macOS, `flock` elsewhere) is
-   unavailable, the reaper skips the entry (fail closed). The reaper needs `/bin/sh`, so
-   it is unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+   unavailable, the reaper skips the entry (fail closed). Docker entries
+   always use a full immutable ID; when a generation is supplied, the
+   reaper verifies that label and still deletes only by that ID. The reaper
+   needs `/bin/sh`, so it is unavailable on Windows — there, cleanup relies
+   on the first two layers only.
 
 Extras:
 

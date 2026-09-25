@@ -159,6 +159,31 @@ func TestReaperDoesNotFollowReplacedLockSymlink(t *testing.T) {
 	}
 }
 
+func TestReaperRejectsReplacedLockInode(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	name := "reaper-inode-" + newContainerName()
+	targets, err := reaperNameLockPaths(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := targets[len(targets)-1].path
+	r := newReaper(bin, "delete")
+	if err := r.register(name, "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, nil, nameLockFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	waitForReaperExitForTest(t, r)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force "+name) {
+		t.Fatalf("reaper deleted through a replaced lock inode: %q", data)
+	}
+}
+
 func TestReaperSelectsPortableLockHelperByOS(t *testing.T) {
 	if got := reaperLockHelperForOS("darwin"); got != "lockf" {
 		t.Errorf("darwin helper = %q, want lockf", got)

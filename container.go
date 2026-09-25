@@ -460,14 +460,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 	if info.labels[creationLabel] != c.creation {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if info.uid != "" {
-		if c.eng.nameAddressedDeletes() || isImmutableContainerID(c.eng, info.uid) {
-			return c.delete(ctx, info.uid)
-		}
-		return fmt.Errorf("%w: %s has no verified immutable container ID", ErrGenerationReplaced, c.id)
-	}
 	if c.eng.nameAddressedDeletes() {
 		return c.delete(ctx, c.id)
+	}
+	if info.uid != "" && isImmutableContainerID(c.eng, info.uid) {
+		return c.delete(ctx, info.uid)
 	}
 	return fmt.Errorf("%w: %s has no verified immutable container ID", ErrGenerationReplaced, c.id)
 }

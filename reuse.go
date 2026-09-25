@@ -222,6 +222,9 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 	if err := checkReuseIdentity(info, cfg); err != nil {
 		return err
 	}
+	if info.state != StateStopped {
+		return nil
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
 	ctr.uid = info.uid
@@ -301,7 +304,8 @@ func sameStoppedReuseIdentity(before, fresh *engineInfo) bool {
 		return false
 	}
 	creation := before.labels[creationLabel]
-	return creationRE.MatchString(creation) &&
+	return before.state == StateStopped && fresh.state == StateStopped &&
+		creationRE.MatchString(creation) &&
 		creationRE.MatchString(before.labels[sessionLabel]) &&
 		fresh.labels[creationLabel] == creation &&
 		before.labels[sessionLabel] == fresh.labels[sessionLabel] &&

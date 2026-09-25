@@ -67,16 +67,24 @@ done
 locked_command='
   inspect_timeout="${REAPER_INSPECT_TIMEOUT:-10}"
   delete_timeout="${REAPER_DELETE_TIMEOUT:-30}"
+  process_identity() {
+    ps -o lstart= -p "$1" 2>/dev/null | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"
+  }
   kill_backend_tree() {
     kill_root=$1
-    kill_depth=${2:-0}
+    kill_identity=$2
+    kill_depth=${3:-0}
     [ "$kill_depth" -lt 32 ] || return 0
+    if [ -n "$kill_identity" ]; then
+      [ "$(process_identity "$kill_root")" = "$kill_identity" ] || return 0
+    fi
     kill_children=$(pgrep -P "$kill_root" 2>/dev/null || true)
     for kill_child in $kill_children; do
       case "$kill_child" in
         ""|*[!0-9]*) continue ;;
       esac
-      kill_backend_tree "$kill_child" "$((kill_depth + 1))"
+      child_identity=$(process_identity "$kill_child")
+      kill_backend_tree "$kill_child" "$child_identity" "$((kill_depth + 1))"
     done
     kill -KILL "$kill_root" 2>/dev/null || true
   }
@@ -125,7 +133,8 @@ locked_command='
     inspect_fields=$(
       {
         "$bin" inspect "$id" 2>/dev/null & inspect_pid=$!
-        (sleep "$inspect_timeout"; kill_backend_tree "$inspect_pid") >/dev/null 2>&1 & killer=$!
+        inspect_identity=$(process_identity "$inspect_pid")
+        (sleep "$inspect_timeout"; kill_backend_tree "$inspect_pid" "$inspect_identity") >/dev/null 2>&1 & killer=$!
         wait "$inspect_pid" 2>/dev/null
         inspect_rc=$?
         kill "$killer" 2>/dev/null || true
@@ -150,7 +159,7 @@ locked_command='
       *) exit 0 ;;
     esac
   fi
-  ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep "$delete_timeout"; kill_backend_tree "$pid") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null || true; exit "$rc") || true
+  (set -m 2>/dev/null; "$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; pid_identity=$(process_identity "$pid"); (sleep "$delete_timeout"; kill_backend_tree "$pid" "$pid_identity") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; set +m 2>/dev/null; kill "$killer" 2>/dev/null || true; exit "$rc") || true
 '
 lock_bin=""
 lock_flag1=""
@@ -170,6 +179,27 @@ case "$lock_helper" in
     exit 0
     ;;
 esac
+process_identity() {
+  ps -o lstart= -p "$1" 2>/dev/null | sed -e "s/^[[:space:]]*//" -e "s/[[:space:]]*$//"
+}
+kill_backend_tree() {
+  kill_root=$1
+  kill_identity=$2
+  kill_depth=${3:-0}
+  [ "$kill_depth" -lt 32 ] || return 0
+  if [ -n "$kill_identity" ]; then
+    [ "$(process_identity "$kill_root")" = "$kill_identity" ] || return 0
+  fi
+  kill_children=$(pgrep -P "$kill_root" 2>/dev/null || true)
+  for kill_child in $kill_children; do
+    case "$kill_child" in
+      ""|*[!0-9]*) continue ;;
+    esac
+    child_identity=$(process_identity "$kill_child")
+    kill_backend_tree "$kill_child" "$child_identity" "$((kill_depth + 1))"
+  done
+  kill -KILL "$kill_root" 2>/dev/null || true
+}
 run_locked() {
   [ -n "$lock_bin" ] || return 0
   id=$1
@@ -202,7 +232,7 @@ run_guarded() {
     sh -c "$locked_command" reaper-locked - - "$id" "$creation" "$bin" "$sub" "$key" >/dev/null 2>&1 || true
 }
 run_unlocked() {
-  ("$@" >/dev/null 2>&1 & pid=$!; (sleep "$delete_timeout"; kill_backend_tree "$pid") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null || true; exit "$rc") || true
+  (set -m 2>/dev/null; "$@" >/dev/null 2>&1 & pid=$!; pid_identity=$(process_identity "$pid"); (sleep "$delete_timeout"; kill_backend_tree "$pid" "$pid_identity") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; set +m 2>/dev/null; kill "$killer" 2>/dev/null || true; exit "$rc") || true
 }
 printf "%s\n" "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue

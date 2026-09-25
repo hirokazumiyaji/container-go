@@ -344,7 +344,7 @@ v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、�
 `Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
 Apple Container では、作成世代を必須とし、作成時と削除時の同じ安定名前ロック、managed ラベル、状態の再検査を使う。
 正規のロックは OS アカウントから導いた永続状態領域にあり、`HOME`、XDG、`TMPDIR` に依存しない。旧 `TMPDIR` とユーザーキャッシュ領域の移行用ロックも固定順で取得する。
-reaper の inspect/delete も同じ 3 つのロックを取得し、ロックや `lockf` がなければ fail closed する。世代なしの reaper 登録は完全な不変 Docker ID だけを受け付ける。
+reaper の inspect/delete も同じ 3 つのロックを取得し、ロックや `lockf` がなければ fail closed する。Docker の reaper 登録は完全な不変 ID だけを要求し、世代を検証した場合も名前にはフォールバックせず、その ID だけを削除する。世代なしの reaper 登録も完全な不変 Docker ID だけを受け付ける。
 外部ツールが再検査後に状態を変更する操作は、この保証の対象外である。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。

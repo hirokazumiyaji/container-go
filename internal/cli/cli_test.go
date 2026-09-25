@@ -151,6 +151,56 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 }
 
+func TestExecRunnerPreservesCLIErrorWhenCancellationRacesWithExit(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "process-exited")
+	r := &ExecRunner{Binary: writeStub(t, `
+parent=$$
+(
+  while kill -0 "$parent" 2>/dev/null; do sleep 0.01; done
+  : > "$1"
+  sleep 0.1
+) &
+echo "real exit" >&2
+exit 3
+`)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		ticker := time.NewTicker(time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if _, err := os.Stat(marker); err == nil {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+
+	_, stderr, err := r.Run(ctx, marker)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError after a real non-zero exit", err)
+	}
+	if cliErr.ExitCode != 3 {
+		t.Errorf("ExitCode = %d, want 3", cliErr.ExitCode)
+	}
+	if !strings.Contains(cliErr.Stderr, "real exit") {
+		t.Errorf("CLIError.Stderr = %q, want real command diagnostic", cliErr.Stderr)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("error = %v, want concurrent context cancellation", err)
+	}
+	if got := string(stderr); !strings.Contains(got, "real exit") {
+		t.Errorf("stderr = %q, want real command diagnostic", got)
+	}
+}
+
 func TestCLIErrorIncludesBinaryName(t *testing.T) {
 	err := &CLIError{Binary: "docker", Args: []string{"run", "--detach"}, ExitCode: 125, Stderr: "conflict"}
 	got := err.Error()
@@ -281,18 +331,25 @@ func TestClassifyPassesThroughNil(t *testing.T) {
 }
 
 type hangingProbeRunner struct {
-	started chan struct{}
+	started         chan struct{}
+	afterContextErr error
 }
 
 func (h *hangingProbeRunner) Run(ctx context.Context, _ ...string) ([]byte, []byte, error) {
 	close(h.started)
 	<-ctx.Done()
+	if h.afterContextErr != nil {
+		return nil, nil, h.afterContextErr
+	}
 	return nil, nil, ctx.Err()
 }
 
-func TestClassifyProbeTimesOut(t *testing.T) {
+func TestClassifyProbeTimeoutPreservesExplicitDeadline(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
-	r := &hangingProbeRunner{started: make(chan struct{})}
+	r := &hangingProbeRunner{
+		started:         make(chan struct{}),
+		afterContextErr: errors.New("transport stopped"),
+	}
 	start := time.Now()
 	err := Classify(context.Background(), r, orig, appleProbe)
 	elapsed := time.Since(start)

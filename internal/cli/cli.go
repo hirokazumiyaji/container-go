@@ -123,18 +123,25 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
-		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
-		}
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
+			cliErr := &CLIError{
 				Binary:   bin,
 				Args:     args,
 				ExitCode: exitErr.ExitCode(),
 				Stdout:   truncateOutput(stdout.String()),
 				Stderr:   truncateStderr(stderr.String()),
 			}
+			// Cancellation can race with observing a real command exit.
+			// Preserve both facts so classification can still inspect the
+			// CLIError after Run returns.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return stdout.Bytes(), stderr.Bytes(), errors.Join(cliErr, ctxErr)
+			}
+			return stdout.Bytes(), stderr.Bytes(), cliErr
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
@@ -201,72 +208,76 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 
 	// Cancellation takes precedence over every probe classification. It
 	// may race with the runner returning, so check it before inspecting
-	// the diagnostic and retain ctx.Err explicitly when the runner did
-	// not wrap it.
+	// the diagnostic and retain caller and probe context errors explicitly
+	// when the runner did not wrap them.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(err, probeErr, ctxErr)
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if isNonLivenessError(err) {
 		// The command already identified a configuration, permission,
 		// TLS, or other client-side failure. A failed probe cannot
 		// replace that diagnosis with daemon-down.
-		return joinProbeFailure(ctx, err, probeErr)
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 
 	// A timeout belonging to the bounded probe is evidence that the
 	// backend did not answer, unless the runner reported a distinct
 	// non-liveness error. A caller deadline was handled above.
 	if isProbeNonLiveness(probeCtx, probeErr) {
-		return joinProbeFailure(ctx, err, probeErr)
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if probeCtx.Err() == context.DeadlineExceeded {
-		return classifySystemNotRunning(ctx, err, probeErr, probe.Hint)
+		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
 	}
 
 	// Check immediately before invoking a backend predicate. The
 	// predicate may be user-provided and can itself take time.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(err, probeErr, ctxErr)
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	unavailable := probeUnavailable(probe, probeErr)
 	// Check again after the predicate. In particular, a predicate that
 	// cancels the caller and then reports liveness must not win the
 	// race and add ErrSystemNotRunning.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(err, probeErr, ctxErr)
+		return joinProbeFailure(ctx, probeCtx, err, probeErr)
 	}
 	if unavailable {
-		return classifySystemNotRunning(ctx, err, probeErr, probe.Hint)
+		return classifySystemNotRunning(ctx, probeCtx, err, probeErr, probe.Hint)
 	}
 
 	// A failed probe is not proof that the backend is down. Keep both
 	// errors so callers can inspect the original diagnostic.
-	return joinProbeFailure(ctx, err, probeErr)
+	return joinProbeFailure(ctx, probeCtx, err, probeErr)
 }
 
-func joinProbeFailure(ctx context.Context, original, probeErr error) error {
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(original, probeErr, ctxErr)
+func joinProbeFailure(ctx, probeCtx context.Context, original, probeErr error) error {
+	joined := withContextError(probeCtx, errors.Join(original, probeErr))
+	return withContextError(ctx, joined)
+}
+
+func withContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+		return errors.Join(err, ctxErr)
 	}
-	return errors.Join(original, probeErr)
+	return err
 }
 
-func classifySystemNotRunning(ctx context.Context, original, probeErr error, hint string) error {
+func classifySystemNotRunning(ctx, probeCtx context.Context, original, probeErr error, hint string) error {
 	// Keep this check at the point where the sentinel is added. Context
 	// cancellation can race with all of the preceding diagnostics checks.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(original, probeErr, ctxErr)
+		return joinProbeFailure(ctx, probeCtx, original, probeErr)
 	}
 	classified := errors.Join(
 		fmt.Errorf("%w: %s", ErrSystemNotRunning, hint),
-		original,
-		probeErr,
+		withContextError(probeCtx, errors.Join(original, probeErr)),
 	)
 	// Building the joined error can itself race with cancellation. Do
 	// not return a daemon-down result if cancellation was observed while
 	// it was being assembled.
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(original, probeErr, ctxErr)
+		return joinProbeFailure(ctx, probeCtx, original, probeErr)
 	}
 	return classified
 }
@@ -369,8 +380,10 @@ func isNonLivenessError(err error) bool {
 
 func containsNonLivenessText(s string) bool {
 	for _, fragment := range []string{
-		// Permission and authorization failures.
-		"permission",
+		// Permission and authorization failures. Keep these as diagnostic
+		// phrases: bare "permission" can occur in an endpoint path.
+		"permission denied",
+		"insufficient permissions",
 		"operation not permitted",
 		"operation canceled",
 		"operation cancelled",
@@ -380,9 +393,14 @@ func containsNonLivenessText(s string) bool {
 		"not permitted",
 		"unauthorized",
 		"forbidden",
-		// Configuration and context failures.
-		"config",
-		"configuration",
+		// Configuration and context failures. A bare "config" can be a
+		// legitimate directory or filename in a backend endpoint.
+		"invalid config",
+		"invalid configuration",
+		"config file",
+		"configuration file",
+		"config directory",
+		"configuration directory",
 		"invalid context",
 		"unknown context",
 		"no such context",
@@ -391,10 +409,18 @@ func containsNonLivenessText(s string) bool {
 		"context canceled",
 		"context cancelled",
 		"deadline exceeded",
-		// TLS and certificate verification failures.
+		// TLS and certificate verification failures. A bare "certificate"
+		// can also be a hostname or endpoint-path component.
 		"tls",
 		"x509",
-		"certificate",
+		"certificate signed by unknown authority",
+		"certificate verification failed",
+		"certificate verify failed",
+		"certificate has expired",
+		"certificate is not trusted",
+		"certificate is invalid",
+		"unable to verify certificate",
+		"failed to verify certificate",
 		"unknown authority",
 		"handshake failure",
 		"http response to https",

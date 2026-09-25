@@ -48,6 +48,49 @@ func TestAppleSystemStatusRealStdoutClassifiesProbeFailure(t *testing.T) {
 	}
 }
 
+func TestClassifyDaemonDownWithTermsInEndpointPaths(t *testing.T) {
+	cases := []struct {
+		name       string
+		diagnostic string
+	}{
+		{
+			name:       "config",
+			diagnostic: "Cannot connect to the Docker daemon at unix:///Users/test/.config/containers/run/docker.sock: connect: connection refused",
+		},
+		{
+			name:       "permission",
+			diagnostic: "Cannot connect to the Docker daemon at unix:///Volumes/permission/docker.sock: connect: connection refused",
+		},
+		{
+			name:       "certificate",
+			diagnostic: "Cannot connect to the Docker daemon at tcp://certificate.internal:2376: connect: connection refused",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			original := &cli.CLIError{
+				Binary:   "docker",
+				Args:     []string{"version"},
+				ExitCode: 1,
+				Stderr:   tc.diagnostic,
+			}
+			probeErr := &cli.CLIError{
+				Binary:   "docker",
+				Args:     []string{"version", "--format", "{{.Server.Version}}"},
+				ExitCode: 1,
+				Stderr:   tc.diagnostic,
+			}
+			runner := &classifyProbeRunner{probeErr: probeErr}
+
+			got := cli.Classify(context.Background(), runner, original, dockerEngine{}.probe())
+			if !errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("error = %v, want daemon-down classification for endpoint path", got)
+			}
+		})
+	}
+}
+
 func TestClassifyProbeFailureMatrix(t *testing.T) {
 	backends := []struct {
 		name       string

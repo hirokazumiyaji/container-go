@@ -26,8 +26,6 @@ import (
 // and after. The testcontainers-go wall-clock comparison lives in the
 // separate bench module; see docs/benchmarks.md.
 
-const benchIterations = 5
-
 // benchEngines maps a harness backend onto the internal engine that
 // builds the CLI argv vectors.
 func benchEngines(b bench.Backend) (engine, bool) {
@@ -54,13 +52,17 @@ func benchPortOptions(b bench.Backend, eng engine) func(cli.Runner) []Option {
 	}
 }
 
-// benchScenario runs one scenario benchIterations times, recording
-// duration and subprocess count per iteration. prep runs before each
+// benchScenario runs one scenario according to the shared iteration policy,
+// recording duration and subprocess count per iteration. prep runs before each
 // timed iteration (image removal for cold, image ensure for warm).
 // Terminate happens after the measurement.
 func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenario string, prep func(*testing.T), opts func(cli.Runner) []Option) {
 	t.Helper()
-	for i := 1; i <= benchIterations; i++ {
+	policy, ok := bench.ScenarioPolicyFor(scenario)
+	if !ok {
+		t.Fatalf("no benchmark policy for scenario %q", scenario)
+	}
+	for i := 1; i <= policy.Iterations; i++ {
 		if prep != nil {
 			prep(t)
 		} else {
@@ -81,8 +83,11 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 			Backend:      b.Name,
 			Library:      bench.LibraryContainerGo,
 			Image:        image,
+			ImageDigest:  policy.ImageDigest,
 			Scenario:     scenario,
 			Iteration:    i,
+			Iterations:   policy.Iterations,
+			Commit:       doc.Env.Commit,
 			DurationNS:   int64(elapsed),
 			Subprocesses: spawns,
 		})
@@ -100,9 +105,9 @@ func TestIntegrationBenchCounting(t *testing.T) {
 			if !ok {
 				t.Fatalf("no engine for backend %s", b.Name)
 			}
-			image := integrationRedis
+			image := bench.PinnedRedisImage
 
-			doc := bench.Doc{Env: benchEnv(b)}
+			doc := bench.Doc{Env: benchEnv(t, b)}
 			benchScenario(t, &doc, b, image, "run/cold", func(t *testing.T) {
 				b.EnsureImageAbsent(t, image)
 			}, benchPortOptions(b, eng))
@@ -126,6 +131,9 @@ func TestIntegrationBenchCounting(t *testing.T) {
 			})
 			benchParallel(t, &doc, b, eng, image)
 
+			if err := bench.ValidateDoc(doc); err != nil {
+				t.Fatalf("validate benchmark result: %v", err)
+			}
 			path := writeBenchDoc(t, b.Name, doc)
 			t.Log("\n" + bench.Table(bench.Summarize(doc.Results)))
 			t.Logf("results written to %s", path)
@@ -141,7 +149,11 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 	const n = 8
 	b.EnsureImage(t, image)
 
-	for i := 1; i <= benchIterations; i++ {
+	policy, ok := bench.ScenarioPolicyFor("run/parallel-8")
+	if !ok {
+		t.Fatal("no benchmark policy for run/parallel-8")
+	}
+	for i := 1; i <= policy.Iterations; i++ {
 		var (
 			mu         sync.Mutex
 			containers []*Container
@@ -181,25 +193,41 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 			Backend:      b.Name,
 			Library:      bench.LibraryContainerGo,
 			Image:        image,
+			ImageDigest:  policy.ImageDigest,
 			Scenario:     "run/parallel-8",
 			Iteration:    i,
+			Iterations:   policy.Iterations,
+			Commit:       doc.Env.Commit,
 			DurationNS:   int64(elapsed),
 			Subprocesses: spawns,
 		})
 	}
 }
 
-func benchEnv(b bench.Backend) bench.Env {
+func benchEnv(t *testing.T, b bench.Backend) bench.Env {
+	t.Helper()
+	commit, err := bench.CurrentCommit()
+	if err != nil {
+		t.Fatalf("resolve benchmark commit: %v", err)
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
 	env := bench.Env{
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
 		CPUs:       runtime.NumCPU(),
 		Go:         runtime.Version(),
+		Host:       host,
+		Commit:     commit,
 		CLIs:       map[string]string{},
 		RecordedAt: time.Now().UTC(),
 	}
 	out, err := exec.Command(b.Bin, b.VersionArgs...).Output()
-	if err == nil {
+	if err != nil {
+		env.CLIs[b.Name] = "unknown"
+	} else {
 		env.CLIs[b.Name] = strings.TrimSpace(string(out))
 	}
 	return env

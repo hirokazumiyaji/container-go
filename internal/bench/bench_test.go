@@ -6,14 +6,23 @@ import (
 	"time"
 )
 
+const testCommit = "0123456789abcdef0123456789abcdef01234567"
+
 func sampleResults() []Result {
 	run := func(scenario string, it int, d time.Duration, spawns int64) Result {
+		policy, ok := ScenarioPolicyFor(scenario)
+		if !ok {
+			panic("unknown test scenario: " + scenario)
+		}
 		return Result{
 			Backend:      "docker",
 			Library:      LibraryContainerGo,
-			Image:        "redis:7-alpine",
+			Image:        policy.Image,
+			ImageDigest:  policy.ImageDigest,
 			Scenario:     scenario,
 			Iteration:    it,
+			Iterations:   policy.Iterations,
+			Commit:       testCommit,
 			DurationNS:   int64(d),
 			Subprocesses: spawns,
 		}
@@ -27,12 +36,15 @@ func sampleResults() []Result {
 		run("run/cold", 1, 2*time.Second, 4),
 		run("run/cold", 2, 3*time.Second, 4),
 		{
-			Backend:    "docker",
-			Library:    LibraryTestcontainersGo,
-			Image:      "redis:7-alpine",
-			Scenario:   "tc/single",
-			Iteration:  1,
-			DurationNS: int64(900 * time.Millisecond),
+			Backend:     "docker",
+			Library:     LibraryTestcontainersGo,
+			Image:       RedisImage,
+			ImageDigest: RedisImageDigest,
+			Scenario:    "tc/single",
+			Iteration:   1,
+			Iterations:  DefaultIterations,
+			Commit:      testCommit,
+			DurationNS:  int64(900 * time.Millisecond),
 		},
 	}
 }
@@ -77,11 +89,14 @@ func TestSummarizeEmpty(t *testing.T) {
 func TestDocJSONRoundTrip(t *testing.T) {
 	doc := Doc{
 		Env: Env{
-			OS:   "darwin",
-			Arch: "arm64",
-			CPUs: 10,
-			Go:   "go1.27.0",
-			CLIs: map[string]string{"docker": "29.7.2"},
+			OS:         "darwin",
+			Arch:       "arm64",
+			CPUs:       10,
+			Go:         "go1.27.0",
+			Host:       "bench-host",
+			Commit:     testCommit,
+			CLIs:       map[string]string{"docker": "29.7.2"},
+			RecordedAt: time.Unix(1, 0).UTC(),
 		},
 		Results: sampleResults(),
 	}
@@ -113,9 +128,180 @@ func TestParseDocRejectsInvalidJSON(t *testing.T) {
 	}
 }
 
+func completeSampleResults() []Result {
+	results := sampleResults()
+	for iteration := 3; iteration <= DefaultIterations; iteration++ {
+		results = append(results, Result{
+			Backend:     "docker",
+			Library:     LibraryContainerGo,
+			Image:       RedisImage,
+			ImageDigest: RedisImageDigest,
+			Scenario:    "run/cold",
+			Iteration:   iteration,
+			Iterations:  DefaultIterations,
+			Commit:      testCommit,
+			DurationNS:  int64(time.Duration(iteration) * time.Second),
+		})
+	}
+	for iteration := 2; iteration <= DefaultIterations; iteration++ {
+		results = append(results, Result{
+			Backend:     "docker",
+			Library:     LibraryTestcontainersGo,
+			Image:       RedisImage,
+			ImageDigest: RedisImageDigest,
+			Scenario:    "tc/single",
+			Iteration:   iteration,
+			Iterations:  DefaultIterations,
+			Commit:      testCommit,
+			DurationNS:  int64(900 * time.Millisecond),
+		})
+	}
+	return results
+}
+
+func TestValidateDocChecksReproducibilityMetadata(t *testing.T) {
+	doc := Doc{
+		Env: Env{
+			OS:         "darwin",
+			Arch:       "arm64",
+			CPUs:       10,
+			Go:         "go1.27.0",
+			Host:       "bench-host",
+			Commit:     testCommit,
+			CLIs:       map[string]string{"docker": "29.7.2"},
+			RecordedAt: time.Unix(1, 0).UTC(),
+		},
+		Results: completeSampleResults(),
+	}
+	if err := ValidateDoc(doc); err != nil {
+		t.Fatalf("ValidateDoc: %v", err)
+	}
+
+	doc.Results[0].Image = "public.ecr.aws/docker/library/redis:7-alpine"
+	if err := ValidateDoc(doc); err == nil {
+		t.Fatal("ValidateDoc accepted a mutable image tag")
+	}
+}
+
+func TestPinnedImagesMatchPolicyDigests(t *testing.T) {
+	for _, test := range []struct {
+		image  string
+		digest string
+	}{
+		{image: RedisImage, digest: RedisImageDigest},
+		{image: NginxImage, digest: NginxImageDigest},
+	} {
+		if got := ImageDigest(test.image); got != test.digest {
+			t.Errorf("ImageDigest(%q) = %q, want %q", test.image, got, test.digest)
+		}
+	}
+}
+
+func TestScenarioPolicyIncludesSessionInitSpecialCase(t *testing.T) {
+	policy, ok := ScenarioPolicyFor("tc/session-init")
+	if !ok {
+		t.Fatal("tc/session-init policy is missing")
+	}
+	if policy.Iterations != SessionInitIterations {
+		t.Fatalf("tc/session-init iterations = %d, want %d", policy.Iterations, SessionInitIterations)
+	}
+	for _, name := range ScenarioNames() {
+		policy, ok := ScenarioPolicyFor(name)
+		if !ok {
+			t.Fatalf("policy for %q is missing", name)
+		}
+		want := DefaultIterations
+		if name == "tc/session-init" {
+			want = SessionInitIterations
+		}
+		if policy.Iterations != want {
+			t.Errorf("%s iterations = %d, want %d", name, policy.Iterations, want)
+		}
+	}
+}
+
+func TestCurrentCommitHonorsExplicitOverride(t *testing.T) {
+	t.Setenv("CONTAINERGO_BENCH_COMMIT", testCommit)
+	commit, err := CurrentCommit()
+	if err != nil {
+		t.Fatalf("CurrentCommit: %v", err)
+	}
+	if commit != testCommit {
+		t.Fatalf("commit = %q, want %q", commit, testCommit)
+	}
+}
+
+func TestValidateScenarioSetChecksAllIterations(t *testing.T) {
+	var results []Result
+	for _, policy := range ScenarioPolicies() {
+		for iteration := 1; iteration <= policy.Iterations; iteration++ {
+			results = append(results, Result{
+				Backend:     "docker",
+				Library:     LibraryContainerGo,
+				Image:       policy.Image,
+				ImageDigest: policy.ImageDigest,
+				Scenario:    policy.Name,
+				Iteration:   iteration,
+				Iterations:  policy.Iterations,
+				Commit:      testCommit,
+				DurationNS:  1,
+			})
+		}
+	}
+	if err := ValidateScenarioSet(results); err != nil {
+		t.Fatalf("ValidateScenarioSet: %v", err)
+	}
+
+	for i, result := range results {
+		if result.Scenario != "tc/session-init" {
+			continue
+		}
+		results[i].Iterations = DefaultIterations
+		break
+	}
+	if err := ValidateScenarioSet(results); err == nil {
+		t.Fatal("ValidateScenarioSet accepted the wrong session-init iteration policy")
+	}
+}
+
+func TestCompareDocsRejectsMetadataChanges(t *testing.T) {
+	baseline := Doc{Env: Env{Commit: testCommit}, Results: sampleResults()}
+	candidate := baseline
+	candidate.Results = append([]Result(nil), baseline.Results...)
+	if err := CompareDocs(baseline, candidate); err != nil {
+		t.Fatalf("same documents: %v", err)
+	}
+
+	candidate.Results[0].ImageDigest = NginxImageDigest
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted a changed image digest")
+	}
+
+	candidate = baseline
+	candidate.Results = append([]Result(nil), baseline.Results...)
+	candidate.Results[0].Image = "public.ecr.aws/docker/library/redis:7-alpine"
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted a mutable image tag")
+	}
+
+	candidate = baseline
+	candidate.Results = append([]Result(nil), baseline.Results...)
+	candidate.Env.Commit = "fedcba9876543210fedcba9876543210fedcba98"
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted a changed commit")
+	}
+
+	candidate = baseline
+	candidate.Results = append([]Result(nil), baseline.Results...)
+	candidate.Env.Go = "go1.26.0"
+	if err := CompareDocs(baseline, candidate); err == nil {
+		t.Fatal("CompareDocs accepted a changed Go environment")
+	}
+}
+
 func TestTableRendersAllColumns(t *testing.T) {
 	table := Table(Summarize(sampleResults()))
-	for _, want := range []string{"BACKEND", "docker", LibraryContainerGo, "redis:7-alpine", "run/warm", "300ms", "3"} {
+	for _, want := range []string{"BACKEND", "docker", LibraryContainerGo, RedisImage, "run/warm", "300ms", "3"} {
 		if !bytes.Contains([]byte(table), []byte(want)) {
 			t.Errorf("table missing %q:\n%s", want, table)
 		}

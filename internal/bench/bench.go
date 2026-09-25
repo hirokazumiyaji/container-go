@@ -26,12 +26,20 @@ type Result struct {
 	Backend string `json:"backend"`
 	// Library is the library under test.
 	Library string `json:"library"`
-	// Image is the image reference the scenario started.
+	// Image is the immutable image reference the scenario started.
 	Image string `json:"image"`
+	// ImageDigest is the content digest resolved for Image.
+	ImageDigest string `json:"image_digest,omitempty"`
 	// Scenario identifies the measurement, e.g. "run/warm".
 	Scenario string `json:"scenario"`
 	// Iteration is the 1-based repetition of the scenario.
 	Iteration int `json:"iteration"`
+	// Iterations is the total number of iterations planned for the
+	// scenario. It is carried on every result so a partial document is
+	// not mistaken for a complete measurement.
+	Iterations int `json:"iterations,omitempty"`
+	// Commit identifies the source revision that produced the result.
+	Commit string `json:"commit,omitempty"`
 	// DurationNS is the wall-clock time of the iteration.
 	DurationNS int64 `json:"duration_ns"`
 	// Subprocesses is the number of CLI child processes spawned, or
@@ -48,6 +56,8 @@ type Env struct {
 	Arch       string            `json:"arch"`
 	CPUs       int               `json:"cpus"`
 	Go         string            `json:"go"`
+	Host       string            `json:"host,omitempty"`
+	Commit     string            `json:"commit,omitempty"`
 	CLIs       map[string]string `json:"clis"`
 	RecordedAt time.Time         `json:"recorded_at"`
 }

@@ -26,11 +26,9 @@ import (
 // runs on both backends; testcontainers-go targets the Docker Engine
 // API. Results use the shared schema; see docs/benchmarks.md.
 
-const iterations = 5
-
 const (
-	redisImage = "public.ecr.aws/docker/library/redis:7-alpine"
-	nginxImage = "public.ecr.aws/docker/library/nginx:alpine"
+	redisImage = ibench.PinnedRedisImage
+	nginxImage = ibench.PinnedNginxImage
 )
 
 func requireDocker(t *testing.T) {
@@ -45,13 +43,20 @@ func requireDocker(t *testing.T) {
 
 // record appends one timed iteration to the doc.
 func record(doc *Doc, backend, library, image, name string, iteration int, elapsed time.Duration) {
+	policy, ok := ibench.ScenarioPolicyFor(name)
+	if !ok {
+		panic("unknown benchmark scenario: " + name)
+	}
 	doc.Results = append(doc.Results, Result{
-		Backend:    backend,
-		Library:    library,
-		Image:      image,
-		Scenario:   name,
-		Iteration:  iteration,
-		DurationNS: int64(elapsed),
+		Backend:     backend,
+		Library:     library,
+		Image:       image,
+		ImageDigest: policy.ImageDigest,
+		Scenario:    name,
+		Iteration:   iteration,
+		Iterations:  policy.Iterations,
+		Commit:      doc.Env.Commit,
+		DurationNS:  int64(elapsed),
 	})
 }
 
@@ -61,7 +66,11 @@ func record(doc *Doc, backend, library, image, name string, iteration int, elaps
 // measurement.
 func runScenario(t *testing.T, doc *Doc, backend, library, image, name string, prep func(*testing.T), fn func(*testing.T) (cleanup func(), err error)) {
 	t.Helper()
-	for i := 1; i <= iterations; i++ {
+	policy, ok := ibench.ScenarioPolicyFor(name)
+	if !ok {
+		t.Fatalf("no benchmark policy for scenario %q", name)
+	}
+	for i := 1; i <= policy.Iterations; i++ {
 		if prep != nil {
 			prep(t)
 		}
@@ -105,17 +114,30 @@ func terminateCleanup(t *testing.T, containers ...*container.Container) func() {
 	}
 }
 
-func benchEnv(b ibench.Backend) Env {
+func benchEnv(t *testing.T, b ibench.Backend) Env {
+	t.Helper()
+	commit, err := ibench.CurrentCommit()
+	if err != nil {
+		t.Fatalf("resolve benchmark commit: %v", err)
+	}
+	host, err := os.Hostname()
+	if err != nil || host == "" {
+		host = "unknown"
+	}
 	env := Env{
 		OS:         runtime.GOOS,
 		Arch:       runtime.GOARCH,
 		CPUs:       runtime.NumCPU(),
 		Go:         runtime.Version(),
+		Host:       host,
+		Commit:     commit,
 		CLIs:       map[string]string{},
 		RecordedAt: time.Now().UTC(),
 	}
 	out, err := exec.Command(b.Bin, b.VersionArgs...).Output()
-	if err == nil {
+	if err != nil {
+		env.CLIs[b.Name] = "unknown"
+	} else {
 		env.CLIs[b.Name] = strings.TrimSpace(string(out))
 	}
 	return env
@@ -149,7 +171,7 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 			// Pin the backend: the public API selects the engine from
 			// CONTAINERGO_BACKEND (or the OS default).
 			t.Setenv("CONTAINERGO_BACKEND", b.Name)
-			doc := Doc{Env: benchEnv(b)}
+			doc := Doc{Env: benchEnv(t, b)}
 
 			// Cold: remove the image so the run includes the pull.
 			runScenario(t, &doc, b.Name, LibraryContainerGo, redisImage, "run/cold",
@@ -188,7 +210,11 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 			// wall-clock until all eight are ready, excluding the
 			// termination of the containers.
 			const n = 8
-			for i := 1; i <= iterations; i++ {
+			parallelPolicy, ok := ibench.ScenarioPolicyFor("run/parallel-8")
+			if !ok {
+				t.Fatal("no benchmark policy for run/parallel-8")
+			}
+			for i := 1; i <= parallelPolicy.Iterations; i++ {
 				errs := make([]error, n)
 				var (
 					mu         sync.Mutex
@@ -228,6 +254,9 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 				}
 			}
 
+			if err := ibench.ValidateDoc(doc); err != nil {
+				t.Fatalf("validate benchmark result: %v", err)
+			}
 			path := writeDoc(t, b.Name, doc)
 			t.Log("\n" + Table(Summarize(doc.Results)))
 			t.Logf("results written to %s", path)
@@ -268,7 +297,7 @@ func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
 // recorded separately as tc/session-init; steady-state values follow.
 func TestIntegrationBenchTestcontainers(t *testing.T) {
 	requireDocker(t)
-	doc := Doc{Env: benchEnv(ibench.DockerBackend())}
+	doc := Doc{Env: benchEnv(t, ibench.DockerBackend())}
 
 	// Session init plus the first container: recorded as its own
 	// scenario so steady-state numbers stay comparable.
@@ -304,6 +333,9 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 			return tcTerminateCleanup(t, containers...), nil
 		})
 
+	if err := ibench.ValidateDoc(doc); err != nil {
+		t.Fatalf("validate benchmark result: %v", err)
+	}
 	path := writeDoc(t, "docker-tc", doc)
 	t.Log("\n" + Table(Summarize(doc.Results)))
 	t.Logf("results written to %s", path)

@@ -4,6 +4,8 @@
     "arch": "arm64",
     "cpus": 10,
     "go": "go1.27.0",
+    "host": "bench-host",
+    "commit": "0123456789abcdef0123456789abcdef01234567",
     "clis": {
       "docker": "29.7.2"
     },
@@ -13,18 +15,72 @@
     {
       "backend": "docker",
       "library": "container-go",
-      "image": "redis:7-alpine",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
       "scenario": "run/warm",
       "iteration": 1,
+      "iterations": 5,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 140000000,
       "subprocesses": 2
     },
     {
       "backend": "docker",
+      "library": "container-go",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "scenario": "run/warm",
+      "iteration": 2,
+      "iterations": 5,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "duration_ns": 150000000,
+      "subprocesses": 2
+    },
+    {
+      "backend": "docker",
+      "library": "container-go",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "scenario": "run/warm",
+      "iteration": 3,
+      "iterations": 5,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "duration_ns": 160000000,
+      "subprocesses": 2
+    },
+    {
+      "backend": "docker",
+      "library": "container-go",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "scenario": "run/warm",
+      "iteration": 4,
+      "iterations": 5,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "duration_ns": 170000000,
+      "subprocesses": 2
+    },
+    {
+      "backend": "docker",
+      "library": "container-go",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "scenario": "run/warm",
+      "iteration": 5,
+      "iterations": 5,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
+      "duration_ns": 180000000,
+      "subprocesses": 2
+    },
+    {
+      "backend": "docker",
       "library": "testcontainers-go",
-      "image": "redis:7-alpine",
-      "scenario": "tc/single",
+      "image": "public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "image_digest": "sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499",
+      "scenario": "tc/session-init",
       "iteration": 1,
+      "iterations": 1,
+      "commit": "0123456789abcdef0123456789abcdef01234567",
       "duration_ns": 900000000,
       "subprocesses": 0
     }

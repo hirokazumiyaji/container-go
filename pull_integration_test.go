@@ -46,7 +46,7 @@ func TestIntegrationPullSingleflight(t *testing.T) {
 			if !ok {
 				t.Fatalf("no engine for backend %s", b.Name)
 			}
-			image := integrationRedis
+			image := bench.PinnedRedisImage
 			if err := b.RemoveImage(image); err != nil {
 				t.Fatalf("remove image: %v", err)
 			}

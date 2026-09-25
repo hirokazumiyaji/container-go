@@ -27,14 +27,71 @@ func isReuseCleanupWarning(err error) bool {
 	return errors.As(err, &warning)
 }
 
+type reuseCreateError struct {
+	operation error
+	cleanup   error
+}
+
+func (e *reuseCreateError) Error() string {
+	return errors.Join(e.operation, e.cleanup).Error()
+}
+
+func (e *reuseCreateError) Unwrap() []error {
+	return []error{e.operation, e.cleanup}
+}
+
+func newReuseCreateError(operation, cleanup error) error {
+	if cleanup == nil {
+		return operation
+	}
+	return &reuseCreateError{operation: operation, cleanup: cleanup}
+}
+
+func reuseCreateOperationError(err error) error {
+	var createErr *reuseCreateError
+	if errors.As(err, &createErr) && createErr.operation != nil {
+		return createErr.operation
+	}
+	return err
+}
+
+func reuseCreateCleanupError(err error) error {
+	var createErr *reuseCreateError
+	if errors.As(err, &createErr) {
+		return createErr.cleanup
+	}
+	return nil
+}
+
+type reuseIncompleteSetupError struct {
+	err error
+}
+
+func (e *reuseIncompleteSetupError) Error() string { return e.err.Error() }
+func (e *reuseIncompleteSetupError) Unwrap() error { return e.err }
+func isReuseIncompleteSetupError(err error) bool {
+	var incomplete *reuseIncompleteSetupError
+	return errors.As(err, &incomplete)
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	key := cfg.eng.name() + "\x00" + cfg.name
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
+		// Do not detach a canceled preflight into a new shared flight.
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		// Shared ensure must not die with the first caller's cancel;
 		// waiters keep waiting on their own contexts.
 		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reuseAttachTimeout)
 		defer cancel()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		ctr, ensureErr := reuseEnsureContainer(flightCtx, image, cfg)
 		if ctr != nil && isReuseCleanupWarning(ensureErr) {
 			// A cleanup warning belongs to the creator's returned handle,
@@ -53,6 +110,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 			return base, err
 		}
 		return nil, err
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
 	}
 	if base == nil {
 		return nil, errors.New("reuse returned an empty container handle")
@@ -139,11 +199,18 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if createErr == nil {
 				return ctr, nil
 			}
+			// A name conflict may be attachable only after the env artifact
+			// has been cleaned. While cleanup ownership is still pending,
+			// preserve both errors and do not enter the attach path.
+			if reuseCreateCleanupError(createErr) != nil {
+				return nil, createErr
+			}
+			operationErr := reuseCreateOperationError(createErr)
 			// nameConflict: another process won create. createRaceMissing
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+			if cfg.eng.nameConflict(operationErr) || createRaceMissing(operationErr) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -234,9 +301,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
 		if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(runErr) || createRaceMissing(classified) {
+			// Keep the backend conflict and cleanup failure as separate
+			// causes. A pending env artifact must not be converted into a
+			// successful attach during the conflict fallback.
+			operationErr := runErr
+			if !cfg.eng.nameConflict(runErr) && cfg.eng.nameConflict(classified) {
+				operationErr = classified
+			}
+			if envCleanupErr != nil {
+				return nil, newReuseCreateError(operationErr, envCleanupErr)
+			}
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
-			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
+			return nil, operationErr
 		}
 		cleanupFailedCreate(ctx, cfg, runErr, classified)
 		return nil, joinEnvFileCleanupError(classified, envCleanupErr)
@@ -251,6 +328,20 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 		reused:    true,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
+	}
+	if envCleanupErr != nil && len(cfg.files) > 0 {
+		// Do not perform required post-create setup while the env artifact
+		// is still owned by a pending cleanup. A successful retry clears
+		// envDir; otherwise the handle is explicitly incomplete and the
+		// flight must not be published as ready.
+		if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+			incomplete := &reuseIncompleteSetupError{err: errors.Join(envCleanupErr, retryErr)}
+			if terminateErr := ctr.Terminate(context.WithoutCancel(ctx)); terminateErr != nil {
+				return ctr, &reuseIncompleteSetupError{err: errors.Join(incomplete.err, terminateErr)}
+			}
+			return nil, incomplete
+		}
+		envCleanupErr = nil
 	}
 	if envCleanupErr != nil && len(cfg.files) == 0 {
 		// The handle is usable, but no further post-create operation may

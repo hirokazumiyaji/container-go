@@ -162,7 +162,10 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		}
 	}
 	if cfg.reuse {
-		return reuseRun(ctx, image, cfg)
+		if err := runCtx.Err(); err != nil {
+			return nil, err
+		}
+		return reuseRun(runCtx, image, cfg)
 	}
 	if cfg.name == "" {
 		cfg.name = newContainerName()

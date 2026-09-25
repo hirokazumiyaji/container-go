@@ -86,48 +86,44 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, wrapContainerNotFound(c.eng, lifecycleExec, c.id, c.classify(ctx, err))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
-	if !isNotFound(err) && !maybeInfraExecErr(err) {
+	if !isContainerNotFound(c.eng, lifecycleExec, c.id, err) && !maybeInfraExecErr(c.eng, c.id, err) {
 		return cliErr.ExitCode, output, nil
 	}
 	if c.execContainerRunning(ctx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, wrapContainerNotFound(c.eng, lifecycleExec, c.id, c.classify(ctx, err))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
-// execution substrate rather than the app process. Generic app output
-// returns false so normal non-zero exits cost no extra probe.
-func maybeInfraExecErr(err error) bool {
-	s, ok := execCLIStderr(err)
-	if !ok {
+// execution substrate rather than the app process. Generic app output,
+// including `command not found`, returns false.
+func maybeInfraExecErr(eng engine, target string, err error) bool {
+	if isContainerNotFound(eng, lifecycleExec, target, err) {
 		return true
 	}
+	cliErr, ok := lifecycleCLIErrorForBackend(err, eng.binary(), lifecycleExec, target)
+	if !ok {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
 	for _, sub := range []string{
 		"daemon", "cannot connect", "connection refused", "xpc",
 		"backend", "socket", "is not running", "not running",
-		"stopped", "paused", "restarting", "removing", "no such",
+		"stopped", "paused", "restarting", "removing",
 	} {
 		if strings.Contains(s, sub) {
 			return true
 		}
 	}
 	return false
-}
-
-func execCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
 }
 
 // execContainerRunning verifies via inspect that the container is still

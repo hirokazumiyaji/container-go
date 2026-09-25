@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"runtime"
 	"strconv"
@@ -82,6 +81,33 @@ func appleHostPlatform() string {
 		architecture = "amd64"
 	}
 	return "linux/" + architecture
+}
+
+// appleImageIdentityMetadataPresent reports whether an Apple identity has
+// usable platform/variant fields, without deciding whether they match the
+// requested platform.
+func appleImageIdentityMetadataPresent(identity imageIdentity, platform string) bool {
+	if platform == "" {
+		return true
+	}
+	if identity.platform == "" || !validImageDigest(identity.variantDigest) {
+		return false
+	}
+	_, ok := parseApplePlatformSelector(identity.platform)
+	return ok
+}
+
+// appleImageIdentityComplete reports whether an Apple identity carries
+// all metadata needed to verify the create and the selected variant. A
+// provisional digest-only identity must not be returned to Run.
+func appleImageIdentityComplete(identity imageIdentity, platform string) bool {
+	if !identity.pinned || identity.repository == "" || !imageIdentityIsVerified(identity) {
+		return false
+	}
+	if !appleImageIdentityMetadataPresent(identity, platform) {
+		return false
+	}
+	return platform == "" || applePlatformMetadataCompatible(platform, identity.platform)
 }
 
 // validateApplePlatform mirrors the platform grammar accepted by Apple
@@ -371,12 +397,85 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 	return []string{"image", "pull", image}
 }
 
-// imageMissing matches the backend's image-absence reason, not an
-// arbitrary occurrence of "not found" in an image name or application
-// message. Apple reports the reason as `image not found: <name>`.
+// imageMissing matches backend-specific image-absence reasons. Apple
+// reports local inspect misses as `image not found: <name>` and registry
+// pull misses as a MANIFEST_UNKNOWN code or an explicit HTTP 404 response.
 func (appleEngine) imageMissing(err error) bool {
 	cliErr, ok := imageCLIErrorForBackend(err, "container")
-	return ok && appleImageMissingStderr(cliErr.Stderr)
+	if !ok || appleImageOperationalFailure(cliErr.Stderr) {
+		return false
+	}
+	if appleImageMissingStderr(cliErr.Stderr) {
+		return true
+	}
+	return appleImagePullManifestMissing(cliErr)
+}
+
+func appleImagePullManifestMissing(cliErr *cli.CLIError) bool {
+	if cliErr == nil || len(cliErr.Args) < 3 ||
+		!strings.EqualFold(cliErr.Args[0], "image") ||
+		!strings.EqualFold(cliErr.Args[1], "pull") {
+		return false
+	}
+	target := strings.TrimSpace(cliErr.Args[len(cliErr.Args)-1])
+	if target == "" || strings.HasPrefix(target, "--") {
+		return false
+	}
+	stderr := strings.ToLower(cliErr.Stderr)
+	if appleManifestUnknownCode(stderr) {
+		return true
+	}
+	for _, marker := range []string{
+		"response: 404", "response 404", "response status 404", "status code: 404", "status: 404", "status 404", "http status 404", "status=404",
+		"http 404", "http/1.1 404", "http/2 404", "404 not found",
+	} {
+		if strings.Contains(stderr, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func appleManifestUnknownCode(stderr string) bool {
+	stderr = strings.ToLower(stderr)
+	const code = "manifest_unknown"
+	for start := 0; ; {
+		index := strings.Index(stderr[start:], code)
+		if index < 0 {
+			return false
+		}
+		index += start
+		end := index + len(code)
+		beforeOK := index == 0 || !isASCIIWordByte(stderr[index-1])
+		afterOK := end == len(stderr) || !isASCIIWordByte(stderr[end])
+		if beforeOK && afterOK {
+			return true
+		}
+		start = end
+	}
+}
+
+func isASCIIWordByte(b byte) bool {
+	return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9' || b == '_'
+}
+
+func appleImageOperationalFailure(stderr string) bool {
+	stderr = strings.ToLower(stderr)
+	for _, marker := range []string{
+		"permission denied", "access denied", "unauthorized", "forbidden", "authentication required",
+		"connection refused", "connection reset", "timed out", "no such host", "network is unreachable",
+		"context deadline exceeded", "deadline exceeded", "i/o timeout", "network error",
+	} {
+		if strings.Contains(stderr, marker) {
+			return true
+		}
+	}
+	for _, marker := range []string{"timeout", "tls", "transport", "xpc"} {
+		if strings.Contains(stderr, marker+" ") || strings.Contains(stderr, marker+":") {
+			return true
+		}
+	}
+	return false
 }
 
 func appleImageMissingStderr(stderr string) bool {
@@ -609,43 +708,27 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	return imageIdentity{}
 }
 
-// appleSyntheticIndex identifies Apple's local index wrapper around one
-// manifest. Such a digest is present in the content store but is not a
-// registry reference that can safely be pulled by name@digest.
-func appleSyntheticIndex(record appleImageInspectRecord, rootDigest, variantDigest string) bool {
-	if len(record.Variants) != 1 {
-		return false
-	}
-	if variantDigest == "" {
-		variantDigest = record.Variants[0].Digest
-	}
-	if !validImageDigest(rootDigest) {
-		return false
-	}
-	if !validImageDigest(variantDigest) {
-		// A single-variant record with an unusable manifest digest is not
-		// evidence that the generated root is registry-addressable.
-		return true
-	}
-	if strings.EqualFold(rootDigest, variantDigest) {
-		return false
-	}
-	descriptor := record.Configuration.Descriptor
-	if descriptor.MediaType != "" {
-		mediaType := strings.ToLower(descriptor.MediaType)
-		if !strings.Contains(mediaType, "index") && !strings.Contains(mediaType, "manifest.list") {
-			return false
+// appleSyntheticIndex identifies Apple's explicitly annotated local index
+// wrapper. A one-entry OCI index is not, by itself, evidence of a
+// synthetic root: platform-scoped inspect responses can legitimately expose
+// only one manifest from a multi-platform index. Callers use the exact-root
+// probe when this reliable signal is absent.
+func appleSyntheticIndex(record appleImageInspectRecord, _, _ string) bool {
+	for _, descriptor := range []appleImageDescriptor{
+		record.Configuration.Descriptor,
+		record.Configuration.Image.Descriptor,
+		record.Descriptor,
+	} {
+		value, ok := descriptor.Annotations["com.apple.containerization.index.indirect"]
+		if !ok {
+			continue
+		}
+		value = strings.TrimSpace(value)
+		if strings.EqualFold(value, "true") || value == "1" {
+			return true
 		}
 	}
-	if descriptor.Annotations != nil {
-		if value, ok := descriptor.Annotations["com.apple.containerization.index.indirect"]; ok {
-			return strings.EqualFold(value, "true") || value == "1"
-		}
-	}
-	// Current Apple releases omit the indirect annotation from the
-	// serialized descriptor. A one-variant root whose digest differs from
-	// that variant is therefore the observable synthetic-index shape.
-	return true
+	return false
 }
 
 // appleRunReferenceBase preserves a backend's canonical custom-registry
@@ -734,34 +817,61 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 	return ids, nil
 }
 
-// nameConflict matches Apple Container's duplicate-name wording.
-func (appleEngine) nameConflict(err error) bool {
-	s, ok := appleCLIStderr(err)
+// nameConflict matches Apple's documented duplicate-container wording,
+// only for the run operation and the requested container name.
+func (appleEngine) nameConflict(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "container", operation, target)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, appleStderrAlready) &&
-		(strings.Contains(s, appleStderrExist) ||
-			strings.Contains(s, appleStderrInUse) ||
-			strings.Contains(s, appleStderrTaken))
-}
-
-// containerMissing matches a CLI failure for an absent container.
-func (appleEngine) containerMissing(err error) bool {
-	return appleStderrContains(err, appleStderrNotFound) ||
-		appleStderrContains(err, appleStderrNoSuchObj) ||
-		appleStderrContains(err, appleStderrNoSuchCtr)
-}
-
-func appleCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if !lifecycleTargetInText(s, target) || !strings.Contains(s, appleStderrAlready) {
+		return false
 	}
-	return strings.ToLower(cliErr.Stderr), true
+	if !strings.Contains(s, "container with id") &&
+		!strings.Contains(s, "container name") &&
+		!strings.Contains(s, "already exists: container") &&
+		!strings.Contains(s, "container already exists") &&
+		!strings.Contains(s, "container \""+target+"\"") {
+		return false
+	}
+	return strings.Contains(s, appleStderrExist) ||
+		strings.Contains(s, appleStderrInUse) ||
+		strings.Contains(s, appleStderrTaken)
 }
 
-func appleStderrContains(err error, substr string) bool {
-	s, ok := appleCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+// createRaceMissing is specific to Apple's concurrent run/create race.
+func (appleEngine) createRaceMissing(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "container", operation, target)
+	if !ok {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	return lifecycleTargetInText(s, target) &&
+		((strings.Contains(s, "container with id") && strings.Contains(s, appleStderrNotFound)) ||
+			strings.Contains(s, "container not found"))
+}
+
+// containerMissing matches an absent Apple container target, not a
+// generic application or image "not found" message.
+func (appleEngine) containerMissing(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "container", operation, target)
+	if !ok {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if lifecycleTargetNotFoundAtStart(s, target) ||
+		(operation != lifecycleExec && lifecycleTargetNotFound(s, target)) {
+		return true
+	}
+	if lifecycleTargetInText(s, target) &&
+		(strings.Contains(s, "container not found") ||
+			(strings.Contains(s, "container") && strings.Contains(s, appleStderrNotFound))) {
+		return true
+	}
+	return lifecycleTargetInText(s, target) &&
+		(strings.Contains(s, appleStderrNoSuchCtr) || strings.Contains(s, appleStderrNoSuchObj))
 }

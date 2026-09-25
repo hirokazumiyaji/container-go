@@ -134,9 +134,14 @@ type engine interface {
 	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
 	// output that carry the given reuse group.
 	parseReuseGroupIDs(data []byte, group string) ([]string, error)
-	// nameConflict reports whether a failed run means the container
-	// name is already taken by another create.
-	nameConflict(err error) bool
+	// nameConflict reports whether a failed run for target means the
+	// container name is already taken by another create.
+	nameConflict(operation, target string, err error) bool
+	// createRaceMissing reports a backend-specific concurrent-create miss.
+	createRaceMissing(operation, target string, err error) bool
+	// containerMissing reports whether a lifecycle operation for target
+	// means that the container does not exist.
+	containerMissing(operation, target string, err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
 	// runs as `<binary> <subcommand> --force <id>`.
 	reaperSubcommand() string
@@ -310,9 +315,6 @@ func imageCLIErrorForBackend(err error, backend string) (*cli.CLIError, bool) {
 	if binary := strings.ToLower(strings.TrimSpace(cliErr.Binary)); binary != "" && binary != backend {
 		return nil, false
 	}
-	if len(cliErr.Args) == 0 {
-		return cliErr, true
-	}
 	if len(cliErr.Args) < 2 {
 		return nil, false
 	}
@@ -328,6 +330,10 @@ func imageCLIErrorForBackend(err error, backend string) (*cli.CLIError, bool) {
 		}
 	case "pull":
 	default:
+		return nil, false
+	}
+	target := strings.ToLower(strings.TrimSpace(cliErr.Args[len(cliErr.Args)-1]))
+	if target == "" || strings.HasPrefix(target, "--") {
 		return nil, false
 	}
 	return cliErr, true

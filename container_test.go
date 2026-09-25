@@ -573,7 +573,7 @@ func TestExposedPortParseErrors(t *testing.T) {
 
 func TestIsNotFoundRecognizesDockerWording(t *testing.T) {
 	err := &cli.CLIError{Binary: "docker", Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "Error: No such object: myctr"}
-	if !isNotFound(err) {
+	if !isContainerNotFound(dockerEngine{}, lifecycleInspect, "myctr", err) {
 		t.Fatal("want isNotFound for docker 'No such object'")
 	}
 	// Matchers read Stderr, not Error(); Binary in the message must not matter.

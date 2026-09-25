@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -337,8 +336,10 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 	return []string{"pull", image}
 }
 
-// imageMissing matches the daemon's image-absence reason, rather than a
-// broad "not found" substring that could be part of the requested name.
+// imageMissing matches exact daemon image-absence reasons. A platform
+// mismatch from `image inspect --platform` and a registry's
+// `manifest unknown` response both mean that this requested variant is
+// absent; arbitrary "not found" text is not an image classifier.
 func (dockerEngine) imageMissing(err error) bool {
 	cliErr, ok := imageCLIErrorForBackend(err, "docker")
 	if !ok {
@@ -361,7 +362,16 @@ func (dockerEngine) imageMissing(err error) bool {
 				break
 			}
 		}
-		if strings.HasPrefix(line, "no such image:") || strings.HasPrefix(line, "manifest unknown:") || strings.HasPrefix(line, "image not found:") {
+		if strings.HasPrefix(line, "no such image:") ||
+			strings.HasPrefix(line, "manifest unknown:") ||
+			line == "manifest unknown" ||
+			strings.Contains(line, `"code":"manifest_unknown"`) ||
+			strings.Contains(line, `"code": "manifest_unknown"`) ||
+			strings.HasPrefix(line, "image not found:") {
+			return true
+		}
+		if strings.HasPrefix(line, "no matching manifest for ") &&
+			strings.Contains(line, " in the manifest list entries") {
 			return true
 		}
 	}
@@ -491,32 +501,41 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 	return splitNonEmptyLines(data), nil
 }
 
-// nameConflict matches Docker's duplicate container name error.
-func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
+// nameConflict matches Docker's documented duplicate-container wording,
+// only for a run targeting the requested name.
+func (dockerEngine) nameConflict(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "docker", operation, target)
 	if !ok {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if !lifecycleTargetInText(s, target) ||
+		(!strings.Contains(s, "container name") && !strings.Contains(s, "container with id")) {
 		return false
 	}
 	return strings.Contains(s, dockerStderrConflict) ||
 		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
 }
 
-// containerMissing matches a CLI failure for an absent container.
-func (dockerEngine) containerMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNotFound) ||
-		dockerStderrContains(err, dockerStderrNoSuchObj) ||
-		dockerStderrContains(err, dockerStderrNoSuchCtr)
-}
+// Docker has no Apple-style concurrent-create missing-container race.
+func (dockerEngine) createRaceMissing(string, string, error) bool { return false }
 
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
+// containerMissing matches an absent Docker container target, not a
+// generic application command's "not found" output.
+func (dockerEngine) containerMissing(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "docker", operation, target)
+	if !ok {
+		return false
 	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if lifecycleTargetNotFoundAtStart(s, target) ||
+		(operation != lifecycleExec && lifecycleTargetNotFound(s, target)) {
+		return true
+	}
+	return lifecycleTargetInText(s, target) &&
+		(strings.Contains(s, dockerStderrNoSuchCtr) ||
+			strings.Contains(s, dockerStderrNoSuchObj) ||
+			(strings.Contains(s, "container") && strings.Contains(s, dockerStderrNotFound)))
 }

@@ -34,7 +34,7 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "` + args[len(args)-1] + `"`}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -522,15 +522,15 @@ func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 }
 
 func TestAppleNameConflict(t *testing.T) {
-	err := &cli.CLIError{Stderr: `Error: already exists: container "x"`}
-	if !(appleEngine{}).nameConflict(err) {
+	err := &cli.CLIError{Binary: "container", Args: []string{"run", "--name", "x", "redis"}, Stderr: `Error: already exists: container "x"`}
+	if !(appleEngine{}).nameConflict(lifecycleRun, "x", err) {
 		t.Error("want nameConflict")
 	}
 }
 
 func TestDockerNameConflict(t *testing.T) {
-	err := &cli.CLIError{Stderr: `Conflict. The container name "/x" is already in use by container`}
-	if !(dockerEngine{}).nameConflict(err) {
+	err := &cli.CLIError{Binary: "docker", Args: []string{"run", "--name", "x", "redis"}, Stderr: `Conflict. The container name "/x" is already in use by container`}
+	if !(dockerEngine{}).nameConflict(lifecycleRun, "x", err) {
 		t.Error("want nameConflict")
 	}
 }

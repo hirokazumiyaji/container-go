@@ -109,7 +109,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if !isContainerNotFound(cfg.eng, lifecycleInspect, cfg.name, err) {
 				return nil, err
 			}
 			// Resolve before create so compatibility is based on the
@@ -128,7 +128,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+			if cfg.eng.nameConflict(lifecycleRun, cfg.name, createErr) || cfg.eng.createRaceMissing(lifecycleRun, cfg.name, createErr) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -210,8 +210,8 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
-			createRaceMissing(err) || createRaceMissing(classified) {
+		if cfg.eng.nameConflict(lifecycleRun, cfg.name, err) || cfg.eng.nameConflict(lifecycleRun, cfg.name, classified) ||
+			cfg.eng.createRaceMissing(lifecycleRun, cfg.name, err) || cfg.eng.createRaceMissing(lifecycleRun, cfg.name, classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
 			// a peer's in-flight container on a not-found race.
 			return nil, err
@@ -300,21 +300,6 @@ func namedContainer(cfg *config, id string) *Container {
 		exposed:   cfg.exposed,
 		published: cfg.published,
 	}
-}
-
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
-func createRaceMissing(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return false
-	}
-	s := strings.ToLower(cliErr.Stderr)
-	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
-		return true
-	}
-	return strings.Contains(s, "container not found")
 }
 
 // imageFromInfo retains the identity reported while inspecting a
@@ -531,7 +516,7 @@ func normalizeImageRef(ref string) string {
 		registry = "docker.io"
 		repo = name
 	case isRegistry(parts[0]):
-		registry = parts[0]
+		registry = canonicalDockerHubRegistry(parts[0])
 		repo = strings.Join(parts[1:], "/")
 		if registry == "docker.io" && !strings.Contains(repo, "/") {
 			repo = "library/" + repo
@@ -548,6 +533,15 @@ func normalizeImageRef(ref string) string {
 
 func isRegistry(s string) bool {
 	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
+}
+
+func canonicalDockerHubRegistry(registry string) string {
+	switch strings.ToLower(registry) {
+	case "docker.io", "registry-1.docker.io", "index.docker.io":
+		return "docker.io"
+	default:
+		return registry
+	}
 }
 
 func isUnqualifiedImageReference(ref string) bool {
@@ -567,12 +561,7 @@ func isDockerRegistryReference(ref string) bool {
 	}
 	base = imageRepositoryBaseWithoutTag(base)
 	first, _, _ := strings.Cut(base, "/")
-	switch strings.ToLower(first) {
-	case "docker.io", "registry-1.docker.io", "index.docker.io":
-		return true
-	default:
-		return false
-	}
+	return canonicalDockerHubRegistry(first) == "docker.io"
 }
 
 func imageRepositoryBaseWithoutTag(base string) string {
@@ -624,7 +613,7 @@ func imageRegistryOf(ref string) string {
 	if !isRegistry(first) {
 		return ""
 	}
-	return first
+	return canonicalDockerHubRegistry(first)
 }
 
 func imageRepositoryParts(ref string) (name, tag string, explicit bool) {
@@ -640,8 +629,9 @@ func imageRepositoryParts(ref string) (name, tag string, explicit bool) {
 	parts := strings.Split(name, "/")
 	if len(parts) > 0 && isRegistry(parts[0]) {
 		explicit = true
+		registry := canonicalDockerHubRegistry(parts[0])
 		name = strings.Join(parts[1:], "/")
-		if strings.EqualFold(parts[0], "docker.io") && !strings.Contains(name, "/") {
+		if registry == "docker.io" && !strings.Contains(name, "/") {
 			name = "library/" + name
 		}
 	}
@@ -674,7 +664,8 @@ func repositoryNameMatches(unqualified, qualified string) bool {
 // once a backend has supplied a registry-qualified identity, another
 // registry is never interchangeable.
 func imageRepositoriesCompatible(a, b string) bool {
-	return a != "" && b != "" && strings.EqualFold(a, b)
+	ak, bk := imageRepository(a), imageRepository(b)
+	return ak != "" && bk != "" && strings.EqualFold(ak, bk)
 }
 
 func imageDigest(ref string) string {

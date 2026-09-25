@@ -236,7 +236,7 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // carrying this process's managed+session labels is removed. When the
 // creation generation is known it must also match.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
-	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
+	if cfg.eng.nameConflict(lifecycleRun, cfg.name, runErr) || cfg.eng.nameConflict(lifecycleRun, cfg.name, classified) {
 		return
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
@@ -311,7 +311,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
-	return c.classify(ctx, err)
+	return wrapContainerNotFound(c.eng, lifecycleStop, c.id, c.classify(ctx, err))
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -337,7 +337,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
+	if isContainerNotFound(c.eng, lifecycleInspect, c.id, err) {
 		return nil
 	}
 	if err != nil {
@@ -358,7 +358,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isContainerNotFound(c.eng, lifecycleDelete, target, err) {
 		return nil
 	}
 	return c.classify(ctx, err)
@@ -478,7 +478,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapContainerNotFound(c.eng, lifecycleInspect, c.id, c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

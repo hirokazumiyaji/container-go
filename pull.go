@@ -227,8 +227,9 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 	if err != nil {
 		return imageIdentity{}, err
 	}
+	complete := c.eng.name() != "apple" || appleImageIdentityComplete(pinned, platform)
 	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) ||
-		(pinned.reference == image && identity.pinned && !pinned.appleSynthetic) {
+		(pinned.reference == image && pinned.pinned && !pinned.appleSynthetic && complete) {
 		return pinned, nil
 	}
 
@@ -301,8 +302,34 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
+	if c.eng.name() == "apple" {
+		if !appleImageIdentityMetadataPresent(checked, platform) {
+			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not return complete Apple platform metadata", ErrImageIdentityUnavailable, pinned.reference)
+		}
+		if platform != "" && !applePlatformMetadataCompatible(platform, checked.platform) {
+			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s resolved for a different platform", ErrImageIdentityMismatch, pinned.reference)
+		}
+		if !appleImageIdentityComplete(checked, platform) {
+			return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not return a complete Apple platform identity", ErrImageIdentityUnavailable, pinned.reference)
+		}
+	}
 	if !requestedImageIdentitiesCompatible(pinned, checked) {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s changed before run", ErrImageIdentityMismatch, pinned.reference)
+	}
+	if c.eng.name() == "apple" {
+		reconciled := checked
+		// The exact inspect is the authoritative identity observation, but
+		// the caller-selected reference is the stable run argument. Keep
+		// that spelling while carrying the verified root, repository,
+		// platform, variant, and synthetic metadata forward.
+		if pinned.reference != "" {
+			reconciled.reference = pinned.reference
+		}
+		if reconciled.rootDigest == "" {
+			reconciled.rootDigest = reconciled.digest
+		}
+		reconciled.appleSynthetic = pinned.appleSynthetic || reconciled.appleSynthetic
+		return reconciled, nil
 	}
 	return pinned, nil
 }

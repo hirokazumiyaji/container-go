@@ -7,6 +7,9 @@
       "descriptor": {
         "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "mediaType": "application/vnd.oci.image.index.v1+json",
+        "annotations": {
+          "com.apple.containerization.index.indirect": "true"
+        },
         "size": 1234
       }
     },

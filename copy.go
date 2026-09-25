@@ -46,7 +46,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return wrapContainerNotFound(c.eng, lifecycleCopy, c.id, c.classify(ctx, err))
 }
 
 // CopyFileFromContainer copies one file out of the running container
@@ -67,7 +67,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, c.classify(ctx, err)
+		return nil, wrapContainerNotFound(c.eng, lifecycleCopy, c.id, c.classify(ctx, err))
 	}
 	info, err := os.Stat(dst)
 	if err != nil {

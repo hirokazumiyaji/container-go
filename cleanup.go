@@ -71,7 +71,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
-		if err != nil && !isNotFound(err) {
+		if err != nil && !isContainerNotFound(eng, lifecycleDelete, id, err) {
 			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
 			continue
 		}

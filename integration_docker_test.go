@@ -25,6 +25,9 @@ import (
 // is set to a non-docker value, Docker integration tests are skipped.
 func requireDocker(t *testing.T) {
 	t.Helper()
+	// Integration tests own their teardown; never inherit a developer's
+	// diagnostic retention switch.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
 		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
 	}

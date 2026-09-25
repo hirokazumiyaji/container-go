@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -170,7 +172,8 @@ func reuseInspectJSON(id, state, image string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": "0123456789abcdef"
       }
     },
     "status": {
@@ -463,6 +466,115 @@ func (c *createdThenRunningRunner) Run(ctx context.Context, args ...string) ([]b
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `already exists`}
 	}
 	return c.fakeRunner.Run(ctx, args...)
+}
+
+type reuseRollbackRunner struct {
+	*fakeRunner
+	created      bool
+	inspectCalls int
+	inspectErr   error
+	copyErr      error
+	deleteErr    error
+}
+
+func (r *reuseRollbackRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "run":
+		r.mu.Lock()
+		r.created = true
+		r.mu.Unlock()
+		return r.fakeRunner.Run(ctx, args...)
+	case "inspect":
+		id := args[len(args)-1]
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.inspectCalls++
+		inspectCalls := r.inspectCalls
+		created := r.created
+		creation := r.creations[id]
+		r.mu.Unlock()
+		if !created {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf("not found: %q", id)}
+		}
+		if inspectCalls == 2 && r.inspectErr != nil {
+			return nil, nil, r.inspectErr
+		}
+		return []byte(fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": %q,
+        "com.github.hirokazumiyaji.container-go.reuse": "true"
+      }
+    },
+    "status": {"state": "running", "networks": []}
+  }
+]`, id, id, sessionID(), creation)), nil, nil
+	case "cp":
+		if r.copyErr != nil {
+			r.mu.Lock()
+			r.calls = append(r.calls, args)
+			r.mu.Unlock()
+			return nil, nil, r.copyErr
+		}
+	case "delete":
+		if r.deleteErr != nil {
+			r.mu.Lock()
+			r.calls = append(r.calls, args)
+			r.mu.Unlock()
+			return nil, nil, r.deleteErr
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestReuseInspectFailurePreservesRollbackCLIError(t *testing.T) {
+	inspectErr := &cli.CLIError{Args: []string{"inspect", "reuse-rollback"}, ExitCode: 1, Stderr: "post-create inspect failed"}
+	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
+	r := &reuseRollbackRunner{
+		fakeRunner: newTestRunner(),
+		inspectErr: inspectErr,
+		deleteErr:  cleanupErr,
+	}
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("reuse-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
+	if got := cliErrorWithStderr(err, inspectErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want original inspect CLIError", err)
+	}
+	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want rollback CLIError", err)
+	}
+}
+
+func TestReuseCopyFailurePreservesRollbackCLIError(t *testing.T) {
+	copyErr := &cli.CLIError{Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
+	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-copy-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
+	r := &reuseRollbackRunner{
+		fakeRunner: newTestRunner(),
+		copyErr:    copyErr,
+		deleteErr:  cleanupErr,
+	}
+	hostPath := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(hostPath, []byte("input"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("reuse-copy-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: hostPath, ContainerPath: "/tmp/input.txt"}))
+	if got := cliErrorWithStderr(err, copyErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want original copy CLIError", err)
+	}
+	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want rollback CLIError", err)
+	}
 }
 
 func TestImagesCompatible(t *testing.T) {

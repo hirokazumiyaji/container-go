@@ -125,34 +125,40 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
-待機に失敗した場合は通常ロールバック削除のうえ、エラーにログ末尾が添付されます。
-`CONTAINERGO_KEEP=1` の場合はコンテナを残します(クリーンアップの契約参照)。
+待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
 
 ## クリーンアップの契約
 
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。
 
-1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で削除を登録します。
-   defer 派には `container.TerminateContainer(ctr)` があります。どちらも
-   nil 安全なので、`Run` のエラーチェックより前に呼べます。
-2. 通常、`Run` が途中で失敗した場合は、作成失敗後のクリーンアップや
-   `WithFiles` のコピー失敗・待機失敗後のロールバックを含め、`Run`
-   自身が作成済みコンテナを削除してから返ります。
+1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で best-effort の削除を
+   登録します。`container.CleanupStrict(t, ctr)` を使うと、削除失敗を
+   テスト失敗として報告します。defer 派には
+   `container.TerminateContainer(ctr)` があります。いずれも nil 安全なので、
+   `Run` のエラーチェックより前に呼べます。
+2. 通常、`Run` が途中で失敗した場合は `Run` 自身が作成済みリソースを
+   削除してから返ります。削除にも失敗した場合は、返された
+   `*CleanupError` から元の error とクリーンアップ error の両方を取得
+   できます。これは作成失敗、コピー、待機、reuse の作成後ロールバック
+   に適用されます。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
    Windows では前 2 層のみでクリーンアップします。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用スイッチです。
-`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピーや
-待機失敗後のロールバックを自動的に削除せず、watchdog の登録も無効に
-します。ロールバックを省略しても操作のエラーは返し、通常のロールバック
-で削除に失敗した場合はコンテナが残ったこともエラーに含めます。明示的な
-`ctr.Terminate`、`Prune`、`PruneReuseGroup` は引き続き削除します。
-`WithReuse` の共有ハンドルと停止済みコンテナの get-or-create の規則は
-変わりません。
+`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピー・
+待機・reuse のロールバックを自動的に行わず、watchdog の登録も無効に
+します。Run がコンテナを作成し、所有ラベルを検証できた場合は、失敗
+エラーとともに非 nil の部分的な `*Container` を返します。自動生成した
+名前や、copy CLI を呼ぶ前の失敗でも同じです。返した handle は
+`State`、`Logs`、`Exec`、`CopyToContainer`、明示的な `Terminate` に
+利用できます。コンテナが存在しない場合、または所有権を検証できない
+場合は nil を返します。明示的な `Container.Terminate`、`Prune`、
+`PruneReuseGroup` は引き続き削除を行います。reuse の停止済みコンテナ
+置き換え規則は変わりません。
 
-その他の補助 API:
+補助 API:
 
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)

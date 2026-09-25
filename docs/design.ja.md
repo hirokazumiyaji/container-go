@@ -94,7 +94,7 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-`Run` はイメージの取得(未取得なら CLI が自動 pull する)、コンテナ作成、起動、待機戦略の完了までを行い、通常は失敗時に作成済みリソースをロールバック削除してからエラーを返す。`CONTAINERGO_KEEP=1` のときは自動削除を行わない(後述)。
+`Run` はイメージの取得(未取得なら CLI が自動 pull する)、コンテナ作成、起動、待機戦略の完了までを行い、通常は失敗時に作成済みリソースをロールバック削除してからエラーを返す。`CONTAINERGO_KEEP=1` のときは、所有ラベルを検証できた残留コンテナを非 nil の部分 handle としてエラーとともに返す(後述)。
 
 オプションは functional options で提供する。
 初期リリースで提供するものを挙げる。
@@ -203,9 +203,14 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 この掃除を行うヘルパー `Prune(ctx)` (自セッション以外も含め、本ライブラリのラベルを持つ停止済みコンテナを削除する)を提供する。
 
 環境変数 `CONTAINERGO_KEEP=1` は診断用にコンテナを残すスイッチである。
-`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピーや
-待機失敗後のロールバックを自動的に削除せず、watchdog の登録も無効にする。
-操作のエラーはそのまま返すが、通常のロールバックで削除に失敗した場合は
+`Cleanup` / `TerminateContainer`、作成失敗後のクリーンアップ、コピー・
+待機・reuse 作成後のロールバックを自動的に削除せず、watchdog の登録も
+無効にする。Run がコンテナを作成し、所有ラベルを検証できた場合は、
+失敗エラーとともに非 nil の部分的な `*Container` を返す。これは自動
+生成した名前や copy CLI を呼ぶ前の失敗にも適用されるため、caller は
+残ったコンテナを照会・Exec・Copy・明示的 Terminate に利用できる。コンテナ
+が存在しない場合、または所有権を検証できない場合は nil を返す。
+操作エラーはそのまま返すが、通常のロールバックで削除に失敗した場合は
 残ったコンテナをエラーに含める。明示的な `Container.Terminate`、`Prune`、
 `PruneReuseGroup` は引き続き削除する。`WithReuse` の get-or-create と
 停止済みコンテナの置き換え規則は変更しない。
@@ -268,10 +273,12 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CleanupError`：操作と自動クリーンアップ、または残留コンテナの検証が失敗した場合の error。`errors.As` で `Err` と `CleanupErr` の両方を取得できる
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を
 含むエラーを返す。通常は続けてロールバック削除を行うが、
-`CONTAINERGO_KEEP=1` の場合はコンテナを残し、ロールバック削除を行わない。
+`CONTAINERGO_KEEP=1` の場合はコンテナを残し、検証済みなら部分 handle を
+エラーとともに返し、ロールバック削除を行わない。
 
 システムサービスの自動起動(`container system start` の代行)は行わない。
 カーネルインストールの対話プロンプトを伴う場合があり、テストライブラリが暗黙に実行してよい操作ではないためである。

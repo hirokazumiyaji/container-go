@@ -136,9 +136,8 @@ wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 
 Every strategy accepts `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
-stops, and a failed wait rolls the container back by default with a tail
-of its logs attached to the error. `CONTAINERGO_KEEP=1` retains the
-container instead, as described in the cleanup contract.
+stops, and a failed wait rolls the container back with a tail of its
+logs attached to the error.
 
 ## Image pulls
 
@@ -161,26 +160,33 @@ container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 
 Three layers make sure containers do not outlive your tests:
 
-1. `container.Cleanup(t, ctr)` registers removal via `t.Cleanup`;
-   `container.TerminateContainer(ctr)` is the deferred-style variant.
-   Both are nil-safe, so call them before checking `Run`'s error.
+1. `container.Cleanup(t, ctr)` registers best-effort removal via
+   `t.Cleanup`; `container.CleanupStrict(t, ctr)` reports a removal
+   failure as a test failure. `container.TerminateContainer(ctr)` is the
+   deferred-style variant. All are nil-safe, so call them before checking
+   `Run`'s error.
 2. By default, if `Run` fails partway, it removes whatever it created
-   before returning. This includes cleanup after a failed create and
-   rollback after a `WithFiles` copy or wait failure.
+   before returning. If that removal also fails, the returned
+   `*CleanupError` exposes both the original and cleanup errors. The
+   same rule covers failed-create, copy, wait, and reuse-create rollback
+   paths.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
    unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
-`CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
-automatic deletion by `Cleanup` / `TerminateContainer`, failed-create
-cleanup, and copy/wait rollback, and skips watchdog registration.
-When a rollback is skipped, the operation's error is still returned; if
-a normal rollback is attempted and deletion fails, the error also says
-that the container was left behind. Explicit `ctr.Terminate`, `Prune`,
-and `PruneReuseGroup` still delete containers. `WithReuse` keeps its
-existing shared-handle and stopped-container get-or-create rules.
+`CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It skips
+`Cleanup` / `TerminateContainer`, failed-create cleanup, copy/wait and
+reuse rollback, and watchdog registration. When a container was created
+and this Run can verify its ownership labels, `Run` returns a non-nil
+partial `*Container` together with the failure, including for generated
+names and failures that happen before the copy CLI call. The handle can
+be used for `State`, `Logs`, `Exec`, `CopyToContainer`, and explicit
+`Terminate`. If no container exists, or ownership cannot be verified,
+the handle is nil. Explicit `Container.Terminate`, `Prune`, and
+`PruneReuseGroup` remain deletion operations. The reuse stopped-container
+replacement rule is unchanged.
 
 Other helpers:
 

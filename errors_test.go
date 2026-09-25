@@ -76,6 +76,44 @@ func TestCLIErrorAliasUsableWithErrorsAs(t *testing.T) {
 	}
 }
 
+func cliErrorWithStderr(err error, stderr string) *CLIError {
+	if err == nil {
+		return nil
+	}
+	var cliErr *CLIError
+	if errors.As(err, &cliErr) && cliErr.Stderr == stderr {
+		return cliErr
+	}
+	switch e := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, child := range e.Unwrap() {
+			if found := cliErrorWithStderr(child, stderr); found != nil {
+				return found
+			}
+		}
+	case interface{ Unwrap() error }:
+		return cliErrorWithStderr(e.Unwrap(), stderr)
+	}
+	return nil
+}
+
+func TestCleanupErrorExposesBothErrors(t *testing.T) {
+	operationErr := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "operation failed"}
+	cleanupErr := &CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: "cleanup failed"}
+	err := withCleanupError(operationErr, cleanupErr)
+
+	var joined *CleanupError
+	if !errors.As(err, &joined) {
+		t.Fatalf("error = %v, want CleanupError", err)
+	}
+	if got := cliErrorWithStderr(err, operationErr.Stderr); got != operationErr {
+		t.Fatalf("operation CLIError = %v, want %v", got, operationErr)
+	}
+	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got != cleanupErr {
+		t.Fatalf("cleanup CLIError = %v, want %v", got, cleanupErr)
+	}
+}
+
 func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

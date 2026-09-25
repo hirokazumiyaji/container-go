@@ -124,7 +124,9 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // container; readiness strategies always re-run against it. Returned
 // handles are shared: Cleanup, TerminateContainer, and the watchdog
 // reaper do not remove them. Explicit Terminate still does — only use
-// it when no other process still needs the container.
+// it when no other process still needs the container. If a new shared
+// container fails after creation under CONTAINERGO_KEEP=1, Run returns
+// its partial handle with the error for explicit diagnostics.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

@@ -183,6 +183,10 @@ func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "container system start") {
 		t.Errorf("Error() = %q, want hint to run 'container system start'", err.Error())
 	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr != orig {
+		t.Fatalf("error = %v, want original CLIError in chain", err)
+	}
 }
 
 func TestClassifyUsesProbeSpecificHint(t *testing.T) {

@@ -16,8 +16,10 @@ import (
 
 func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
-	// another backend; tests opting in use t.Setenv.
+	// another backend or change their default cleanup policy. Tests
+	// that exercise diagnostic retention opt in with t.Setenv.
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv("CONTAINERGO_KEEP")
 	os.Exit(m.Run())
 }
 

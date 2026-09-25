@@ -26,6 +26,9 @@ import (
 // non-apple value, Apple integration tests are skipped.
 func requireSystem(t *testing.T) {
 	t.Helper()
+	// Integration tests own their teardown; never inherit a developer's
+	// diagnostic retention switch.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
 		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple integration", backend)
 	}

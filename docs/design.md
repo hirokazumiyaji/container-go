@@ -127,6 +127,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 `Run` fetches the image (the CLI auto-pulls when missing), creates and
 starts the container, and completes the wait strategy; by default, on
 failure it rolls back whatever it created before returning the error.
+With `CONTAINERGO_KEEP=1`, a verified retained container is returned as
+a non-nil partial handle alongside the error; see the cleanup contract
+below.
 
 Options use the functional options pattern. The initial release
 provides:
@@ -291,9 +294,15 @@ session.
 
 Setting `CONTAINERGO_KEEP=1` makes this diagnostic switch retain
 containers instead of deleting them automatically: `Cleanup` /
-`TerminateContainer`, failed-create cleanup, copy/wait rollback, and
-watchdog registration are all skipped. The operation still returns its
-failure; a rollback that is attempted and cannot delete reports the
+`TerminateContainer`, failed-create cleanup, copy/wait and reuse-create
+rollback, and watchdog registration are all skipped. When the container
+was created and its ownership labels verify, `Run` returns a non-nil
+partial `*Container` together with the failure. This includes generated
+names and copy failures that happen before the CLI copy call, so the
+caller can inspect, execute in, copy to, or explicitly terminate the
+retained container. If the container is absent or ownership cannot be
+verified, the returned handle is nil. The operation error is still
+returned; a rollback that is attempted and cannot delete reports the
 left-behind container in that error. Explicit `Container.Terminate`,
 `Prune`, and `PruneReuseGroup` remain deletion operations. The reuse
 get-or-create rules, including stopped-container replacement, are
@@ -407,11 +416,14 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
+- `*CleanupError`: an operation failed and automatic cleanup or retained-
+  container verification also failed; `errors.As` exposes both `Err` and
+  `CleanupErr`
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail. By default the rollback delete follows; with
-`CONTAINERGO_KEEP=1` the container is retained and no rollback delete is
-issued.
+`CONTAINERGO_KEEP=1` the container is retained, a verified partial handle
+is returned with the error, and no rollback delete is issued.
 
 The library never runs `container system start` itself: the command
 can prompt interactively for a kernel install, which a test library

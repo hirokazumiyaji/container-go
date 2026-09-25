@@ -189,10 +189,13 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   stdin データとしてのみ渡ります。
 - 環境変数はパーミッション 0600 の一時 env ファイル経由で渡すため、秘密が
   プロセス一覧(`ps`)に現れません。
-- `CopyToContainer` は通常ファイルとディレクトリを専用のステージングパスへ
-  スナップショットしてから backend を呼び出します。ソースのシンボリックリンクや
-  特殊ファイルは拒否し、通常ファイルの合計サイズは `MaxCopyToContainerSize`
-  （64 MiB）以下に制限します。
+- `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
+  開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
+  `WithFiles` は通常ファイル専用です。
+  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
+  保持するメタデータは名前、バイト列、Unix パーミッションだけです。
+  タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry
   login`(macOS Keychain 保存)を使ってください。
 

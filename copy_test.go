@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -343,5 +346,307 @@ func TestCopyToContainerRejectsOversizedSource(t *testing.T) {
 	}
 	if runner.callWith("cp") != nil {
 		t.Error("CLI was called for an oversized source")
+	}
+}
+
+func TestCopyToContainerClassifiesDisappearanceAndPreservesCause(t *testing.T) {
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, runner)
+
+	err := ctr.CopyToContainer(context.Background(), filepath.Join(t.TempDir(), "gone"), "/tmp/gone")
+	if !errors.Is(err, ErrCopySourceChanged) {
+		t.Fatalf("error = %v, want ErrCopySourceChanged", err)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error = %v, want preserved fs.ErrNotExist cause", err)
+	}
+	if runner.callWith("cp") != nil {
+		t.Error("CLI was called after the source disappeared")
+	}
+}
+
+func TestWithFilesRejectsDirectory(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "tree")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
+	if !errors.Is(err, ErrCopySourceUnsupported) {
+		t.Fatalf("error = %v, want ErrCopySourceUnsupported", err)
+	}
+	if call := runner.callWith("cp"); call != nil {
+		t.Errorf("CLI was called for a file-only WithFiles source: %v", call)
+	}
+	if runner.callWith("delete") == nil {
+		t.Error("failed WithFiles copy did not roll back the container")
+	}
+}
+
+func TestCopyToContainerCleansNonEmptyReadOnlyDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	source := filepath.Join(t.TempDir(), "readonly-tree")
+	t.Cleanup(func() {
+		_ = os.Chmod(filepath.Join(source, "nested"), 0o700)
+		_ = os.Chmod(source, 0o700)
+	})
+	if err := os.MkdirAll(filepath.Join(source, "nested"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "data.txt"), []byte("tree data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(source, "nested"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(source, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	runner := &directoryCopyRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, runner)
+
+	if err := ctr.CopyToContainer(context.Background(), source, "/tmp/tree"); err != nil {
+		t.Fatalf("CopyToContainer: %v", err)
+	}
+	if _, err := os.Lstat(runner.copiedPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("read-only staged tree %q was not removed: %v", runner.copiedPath, err)
+	}
+}
+
+func TestSnapshotCopySourceUsesOpenedRootAfterSameMetadataReplacement(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openers := defaultCopySourceOpeners
+	openers.open = func(path string) (*os.File, bool, error) {
+		file, reparse, err := openCopySource(path)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := replaceCopyPathWithSameMetadata(t, file, path); err != nil {
+			_ = file.Close()
+			return nil, false, err
+		}
+		return file, reparse, nil
+	}
+
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	if err != nil {
+		t.Fatalf("snapshotCopySourceWith: %v", err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(staged)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "trusted" {
+		t.Fatalf("snapshot opened replacement path: got %q, want trusted", data)
+	}
+}
+
+func TestSnapshotCopyDirectoryUsesOpenedChildAfterSameMetadataReplacement(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "tree")
+	childPath := filepath.Join(source, "data.txt")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(childPath, []byte("trusted"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	parentInfo, err := os.Stat(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	openers := defaultCopySourceOpeners
+	openers.openAt = func(parent *os.File, name string) (*os.File, bool, error) {
+		file, reparse, err := openCopySourceAt(parent, name)
+		if err != nil {
+			return nil, false, err
+		}
+		if name == "data.txt" {
+			if err := replaceCopyPathWithSameMetadata(t, file, childPath); err != nil {
+				_ = file.Close()
+				return nil, false, err
+			}
+			if err := os.Chtimes(source, parentInfo.ModTime(), parentInfo.ModTime()); err != nil {
+				_ = file.Close()
+				return nil, false, err
+			}
+		}
+		return file, reparse, nil
+	}
+
+	staged, cleanup, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	if err != nil {
+		t.Fatalf("snapshotCopySourceWith: %v", err)
+	}
+	defer cleanup()
+	data, err := os.ReadFile(filepath.Join(staged, "data.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "trusted" {
+		t.Fatalf("snapshot opened replacement child: got %q, want trusted", data)
+	}
+}
+
+func replaceCopyPathWithSameMetadata(t *testing.T, opened *os.File, path string) error {
+	t.Helper()
+	before, err := opened.Stat()
+	if err != nil {
+		return err
+	}
+	replacement := path + ".replacement"
+	data := strings.Repeat("x", int(before.Size()))
+	if err := os.WriteFile(replacement, []byte(data), before.Mode().Perm()); err != nil {
+		return err
+	}
+	if err := os.Chtimes(replacement, before.ModTime(), before.ModTime()); err != nil {
+		return err
+	}
+	if err := os.Rename(replacement, path); err != nil {
+		return err
+	}
+	after, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if !sameOpenCopyInfo(before, after) {
+		t.Fatalf("replacement metadata = (%d, %v, %v), want (%d, %v, %v)",
+			after.Size(), after.Mode(), after.ModTime(), before.Size(), before.Mode(), before.ModTime())
+	}
+	return nil
+}
+
+func TestSnapshotCopySourceRejectsTooManyEmptyEntries(t *testing.T) {
+	source := t.TempDir()
+	for _, name := range []string{"a", "b", "c"} {
+		if err := os.WriteFile(filepath.Join(source, name), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	limits := defaultCopySnapshotLimits
+	limits.maxEntries = 3 // source root plus two empty entries
+
+	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	if !errors.Is(err, ErrCopySourceTooManyEntries) {
+		t.Fatalf("error = %v, want ErrCopySourceTooManyEntries", err)
+	}
+}
+
+func TestSnapshotCopySourceRejectsTreeBeyondDepthLimit(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "tree")
+	if err := os.MkdirAll(filepath.Join(source, "one", "two", "three", "four"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	limits := defaultCopySnapshotLimits
+	limits.maxDepth = 3
+
+	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	if !errors.Is(err, ErrCopySourceTooDeep) {
+		t.Fatalf("error = %v, want ErrCopySourceTooDeep", err)
+	}
+}
+
+func TestSnapshotCopySourceRejectsMetadataBudget(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "entry"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	limits := defaultCopySnapshotLimits
+	limits.maxMetadataBytes = int64(len(source)) // admits only the source root path
+
+	_, _, err := snapshotCopySourceWith(context.Background(), source, true, limits, defaultCopySourceOpeners)
+	if !errors.Is(err, ErrCopySourceMetadataTooLarge) {
+		t.Fatalf("error = %v, want ErrCopySourceMetadataTooLarge", err)
+	}
+}
+
+func TestSnapshotCopyDirectoryClassifiesChildDisappearance(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "disappears"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	openers := defaultCopySourceOpeners
+	openers.openAt = func(*os.File, string) (*os.File, bool, error) {
+		return nil, false, fs.ErrNotExist
+	}
+
+	_, _, err := snapshotCopySourceWith(context.Background(), source, true, defaultCopySnapshotLimits, openers)
+	if !errors.Is(err, ErrCopySourceChanged) || !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("error = %v, want ErrCopySourceChanged and fs.ErrNotExist", err)
+	}
+}
+
+type copyDeadlineRunner struct {
+	*fakeRunner
+	deadline time.Time
+	ctxErr   error
+}
+
+func (r *copyDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) >= 3 && args[0] == "cp" && strings.Contains(args[2], ":") {
+		r.deadline, _ = ctx.Deadline()
+		r.ctxErr = ctx.Err()
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestCleanupCopyStagingDirPropagatesFailure(t *testing.T) {
+	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(parentFile, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupCopyStagingDir(filepath.Join(parentFile, "staging")); err == nil {
+		t.Fatal("cleanup error was discarded")
+	}
+}
+
+func TestCopyToContainerUsesSeparateStagingAndCLIBudgets(t *testing.T) {
+	oldTimeout := copyStagingTimeout
+	copyStagingTimeout = 5 * time.Second
+	defer func() { copyStagingTimeout = oldTimeout }()
+
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := &copyDeadlineRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, runner)
+	started := time.Now()
+
+	if err := ctr.CopyToContainer(context.Background(), source, "/tmp/input.txt"); err != nil {
+		t.Fatalf("CopyToContainer: %v", err)
+	}
+	if runner.ctxErr != nil {
+		t.Fatalf("CLI context error = %v", runner.ctxErr)
+	}
+	if remaining := runner.deadline.Sub(started); remaining < queryTimeout/2 {
+		t.Fatalf("CLI deadline has only %v remaining; staging reused its %v budget", remaining, copyStagingTimeout)
+	}
+}
+
+func TestCopyToContainerPreservesCallerDeadlineForCLI(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	wantDeadline, _ := ctx.Deadline()
+	runner := &copyDeadlineRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, runner)
+
+	if err := ctr.CopyToContainer(ctx, source, "/tmp/input.txt"); err != nil {
+		t.Fatalf("CopyToContainer: %v", err)
+	}
+	if !runner.deadline.Equal(wantDeadline) {
+		t.Fatalf("CLI deadline = %v, want caller deadline %v", runner.deadline, wantDeadline)
 	}
 }

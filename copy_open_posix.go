@@ -3,12 +3,38 @@
 package container
 
 import (
+	"errors"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
-// openCopySource prevents a final-component symlink from being followed
-// and keeps a raced FIFO open from blocking the snapshot.
-func openCopySource(path string) (*os.File, error) {
-	return os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+const copySourceOpenFlags = unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NOFOLLOW | unix.O_NONBLOCK
+
+// openCopySource opens the final component without following links. O_NONBLOCK
+// keeps a raced FIFO from blocking before the handle can be validated.
+func openCopySource(path string) (*os.File, bool, error) {
+	fd, err := unix.Open(path, copySourceOpenFlags, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	return os.NewFile(uintptr(fd), path), false, nil
+}
+
+// openCopySourceAt opens one directory entry relative to the already-open
+// parent handle, so a renamed parent cannot redirect the child lookup.
+func openCopySourceAt(parent *os.File, name string) (*os.File, bool, error) {
+	fd, err := unix.Openat(int(parent.Fd()), name, copySourceOpenFlags, 0)
+	if err != nil {
+		return nil, false, err
+	}
+	return os.NewFile(uintptr(fd), filepathJoinHandleName(parent, name)), false, nil
+}
+
+func filepathJoinHandleName(parent *os.File, name string) string {
+	return parent.Name() + string(os.PathSeparator) + name
+}
+
+func isCopySourceLinkError(err error) bool {
+	return errors.Is(err, unix.ELOOP)
 }

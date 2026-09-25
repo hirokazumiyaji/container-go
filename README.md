@@ -225,10 +225,17 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   only as validated stdin data.
 - Environment variables are passed via a temporary `0600` env file, so
   secrets never appear in the process table (`ps`).
-- `CopyToContainer` snapshots regular files and directories into a
-  private staging path before invoking the backend. Source symlinks and
-  special files are rejected, and the aggregate regular-file payload is
-  limited to `MaxCopyToContainerSize` (64 MiB).
+- `CopyToContainer` opens regular files and directories without following
+  final links, then snapshots the opened handles into a per-user private
+  staging path before invoking the backend. `WithFiles` is regular-file-only.
+  Symlinks/reparse points and special files are rejected. Snapshots are
+  bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
+  `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
+  (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source
+  paths). The snapshot intentionally preserves names, bytes, and Unix
+  permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
+  extended attributes, alternate data streams, sparse layout, and hardlink
+  identity are not preserved.
 - Registry credentials are never handled by this library; use
   `container registry login`, which stores them in the macOS Keychain.
 

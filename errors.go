@@ -45,8 +45,21 @@ var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or
 // snapshot size as well as to a single file.
 var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
 
-// ErrCopySourceChanged reports that the host path changed between the
-// type/identity check and opening it for the private snapshot.
+// ErrCopySourceTooManyEntries reports a source tree that exceeds
+// MaxCopyToContainerEntries, including entries whose files are empty.
+var ErrCopySourceTooManyEntries = errors.New("copy source has too many entries")
+
+// ErrCopySourceTooDeep reports a source tree deeper than
+// MaxCopyToContainerDepth.
+var ErrCopySourceTooDeep = errors.New("copy source is too deep")
+
+// ErrCopySourceMetadataTooLarge reports source path metadata that exceeds
+// MaxCopyToContainerMetadataSize while the snapshot tree is traversed.
+var ErrCopySourceMetadataTooLarge = errors.New("copy source metadata exceeds limit")
+
+// ErrCopySourceChanged reports that a source disappeared or its opened
+// handle changed while the private snapshot was being built. The triggering
+// filesystem or context error remains available through errors.Is/errors.As.
 var ErrCopySourceChanged = errors.New("copy source changed while staging")
 
 // isNotFound reports whether a CLI failure means the container does not

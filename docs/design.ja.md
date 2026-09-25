@@ -137,6 +137,15 @@ func (c *Container) Terminate(ctx context.Context) error
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
+`CopyToContainer` は通常ファイルとディレクトリを受け付ける。
+各 source entry は、最終要素のリンクを追わずに一度だけ開く。
+ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
+そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
+`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
+ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
+スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
+
 ## 接続エンドポイントの設計
 
 testcontainers の Docker 実装では、コンテナポートをホストのランダムポートへ publish し、`localhost:<mapped>` へ接続する。

@@ -179,7 +179,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, err
 	}
 	for _, f := range cfg.files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			_ = ctr.Terminate(context.WithoutCancel(ctx))
 			return nil, err
 		}

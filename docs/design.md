@@ -488,11 +488,16 @@ unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
 binding observed on a remote daemon still resolves to the remote host.
 An explicit `WithPublishedPort` loopback bind on a remote daemon is
 rejected by `Run`: Docker would listen on the remote machine's loopback,
-which no client-side rewrite can reach.
-Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected. The daemon assigns ports atomically at start,
-so the free-port race avoided on Apple Container does not reappear.
-The Apple backend's direct-IP default is unchanged.
+which no client-side rewrite can reach. Bind mounts are supported for a
+local Docker daemon, including Windows Docker Desktop. For a non-loopback
+TCP `DOCKER_HOST`, `Run` rejects `MountBind` with
+`ErrUnsupportedCapability` before image pulling or container creation:
+Docker resolves the source on the daemon host, and the library cannot
+verify that a client path exists there or has compatible OS syntax. Only
+`DOCKER_HOST` is honored; a `docker context` pointing at a remote daemon
+is not detected. The daemon assigns ports atomically at start, so the
+free-port race avoided on Apple Container does not reappear. The Apple
+backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for

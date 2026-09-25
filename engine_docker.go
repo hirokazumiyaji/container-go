@@ -42,12 +42,22 @@ func (dockerEngine) name() string   { return "docker" }
 func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
-// checkConfig rejects explicit loopback publish binds on a remote
-// daemon: Docker would listen on the remote machine's loopback, which
-// no rewrite of the client-facing address can make reachable.
+// checkConfig rejects configurations that cannot work against a remote
+// daemon: loopback publish binds are unreachable, and bind sources are
+// resolved on the daemon host rather than the client.
 func (dockerEngine) checkConfig(cfg *config) error {
 	if !isRemoteDockerHost() {
 		return nil
+	}
+	// The CLI does not expose the daemon OS or shared filesystem, so reject
+	// every remote bind mount conservatively.
+	for _, m := range cfg.mounts {
+		if m.Type == MountBind {
+			return fmt.Errorf(
+				"%w: bind mount source %q on a remote Docker daemon is resolved on the daemon host; use a local Docker daemon or copy the data into the container",
+				ErrUnsupportedCapability, m.Source,
+			)
+		}
 	}
 	// hostAddr is validated as an IP literal by parsePublishSpec.
 	for _, p := range cfg.published {

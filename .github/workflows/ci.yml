@@ -31,7 +31,7 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: stable
-      - run: go test . -run TestWindowsBindMountUsesHostPathAndPOSIXTarget -count=1
+      - run: go test . -run 'Test(WindowsBindMount|DockerBindMountPolicy)' -count=1
 
   race:
     runs-on: ubuntu-latest

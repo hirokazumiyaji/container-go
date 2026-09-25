@@ -3,6 +3,8 @@
 package container
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"testing"
 )
@@ -19,11 +21,30 @@ func TestWindowsBindMountUsesHostPathAndPOSIXTarget(t *testing.T) {
 		t.Fatal("Windows path used as container target was accepted")
 	}
 
+	t.Setenv("DOCKER_HOST", "")
 	cfg := dockerTestConfig(t, WithMounts(mount))
+	if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+		t.Fatalf("local Windows bind mount: %v", err)
+	}
 	args := (dockerEngine{}).runArgs(cfg, "redis:7-alpine", "")
 	want := "type=bind,source=" + source + ",target=/data,readonly"
 	i := slices.Index(args, "--mount")
 	if i < 0 || i+1 >= len(args) || args[i+1] != want {
 		t.Errorf("mount argv = %v, want --mount %q", args, want)
+	}
+}
+
+func TestWindowsBindMountRejectsRemoteDocker(t *testing.T) {
+	t.Setenv(backendEnv, "docker")
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(f),
+		WithMounts(Mount{Type: MountBind, Source: `C:\tmp\data`, Target: "/data"}))
+	if !errors.Is(err, ErrUnsupportedCapability) {
+		t.Fatalf("error = %v, want ErrUnsupportedCapability", err)
+	}
+	if len(f.calls) != 0 {
+		t.Errorf("remote bind mount must fail before backend work: %v", f.calls)
 	}
 }

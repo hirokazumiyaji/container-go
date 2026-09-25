@@ -34,6 +34,10 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrUnsupportedCapability reports a configuration that the selected
+// backend cannot support safely.
+var ErrUnsupportedCapability = errors.New("unsupported capability")
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {

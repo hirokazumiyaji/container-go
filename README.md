@@ -102,8 +102,16 @@ in the daemon, so parallel tests do not race over ports here either.
 With a remote daemon, an explicit `WithPublishedPort` bound to loopback
 (`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
 on the remote machine.
-Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected.
+
+Bind mounts are supported with a local Docker daemon, including Windows
+Docker Desktop. When `DOCKER_HOST` selects a non-loopback TCP daemon,
+`Run` rejects `MountBind` with `ErrUnsupportedCapability`: Docker resolves
+the source on the daemon host, and this library cannot verify that a client
+path exists there or has compatible OS syntax. The rejection happens before
+image pulling or container creation. Use a local daemon or copy data into
+the container. Callers can detect it with
+`errors.Is(err, container.ErrUnsupportedCapability)`. Only `DOCKER_HOST` is
+honored; a `docker context` pointing at a remote daemon is not detected.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:

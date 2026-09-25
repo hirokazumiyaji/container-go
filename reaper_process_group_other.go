@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"os/exec"
 )
 
@@ -13,5 +14,5 @@ func killReaperCommand(_ context.Context, cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
-	return cmd.Process.Kill()
+	return errors.New("reaper: process cleanup is unsupported on this platform")
 }

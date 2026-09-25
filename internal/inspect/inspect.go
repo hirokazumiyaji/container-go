@@ -24,8 +24,9 @@ type Configuration struct {
 }
 
 type Image struct {
-	Reference  string     `json:"reference"`
-	Descriptor Descriptor `json:"descriptor"`
+	Reference     string     `json:"reference"`
+	Descriptor    Descriptor `json:"descriptor"`
+	VariantDigest string     `json:"variantDigest"`
 }
 
 // Descriptor is the OCI descriptor reported alongside an image. Apple

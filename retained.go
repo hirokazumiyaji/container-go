@@ -14,7 +14,7 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 	}
 	lookupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(lookupCtx, cfg.name)
+	unlock, err := lockNameForBackend(lookupCtx, cfg.eng, cfg.name)
 	if err != nil {
 		return nil, fmt.Errorf("retained container %s: lock name: %w", cfg.name, err)
 	}

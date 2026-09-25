@@ -72,6 +72,21 @@ case "$stat_bin" in
 esac
 ids=""
 while IFS= read -r line; do
+  case "$line" in
+    R#containergo-retire:*)
+      # A retirement barrier acknowledges that all preceding D records are
+      # in the child's private snapshot. It does not execute that snapshot;
+      # EOF remains the only trigger for backend deletion.
+      printf 'containergo-reaper-ack:%s\n' "${line#R#containergo-retire:}"
+      continue
+      ;;
+    Q#containergo-quiesce:*)
+      # Stop before EOF so an unrelated respawn cannot execute the still-live
+      # entries that the replacement child will replay.
+      printf 'containergo-reaper-ack:%s\n' "${line#Q#containergo-quiesce:}"
+      exit 0
+      ;;
+  esac
   ids="$ids
 $line"
 done
@@ -196,6 +211,12 @@ locked_command='
       inspect_rc=$(printf "%s\n" "$inspect_fields" | sed -n "s/^inspect_rc=//p" | tail -n 1)
       unset inspect_fields
       if [ "$inspect_rc" = 0 ] && [ "$got" = "$creation" ]; then
+        if [ "$sub" = "rm" ]; then
+          case "$uid" in
+            *[!0-9a-f]*) exit 0 ;;
+          esac
+          [ "${#uid}" -eq 64 ] 2>/dev/null || exit 0
+        fi
         [ -n "$uid" ] && target="$uid"
         break
       fi
@@ -364,6 +385,8 @@ done
 
 const (
 	maxReaperSpawnFailures       = 3
+	maxReaperEntries             = 256
+	reaperAckMarker              = "containergo-reaper-ack"
 	defaultReaperTimeoutSeconds  = 30
 	defaultReaperPendingAttempts = 30
 	defaultReaperWriteTimeout    = 250 * time.Millisecond
@@ -407,15 +430,21 @@ type reaper struct {
 	// (Docker); both take --force.
 	subcommand string
 
-	opMu          sync.Mutex
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	exited        chan struct{}
-	entries       []reaperEntry
-	spawnFailures int
-	gaveUp        bool
-	closed        bool
+	opMu            sync.Mutex
+	mu              sync.Mutex
+	lifecycleMu     sync.Mutex
+	reaping         bool
+	stopping        bool
+	cmd             *exec.Cmd
+	stdin           io.WriteCloser
+	exited          chan struct{}
+	ack             io.ReadCloser
+	entries         []reaperEntry
+	retiredPending  bool
+	retirementAcked bool
+	spawnFailures   int
+	gaveUp          bool
+	closed          bool
 	// timeoutSeconds and pendingAttempts are internal test seams; production
 	// reapers use bounded values for a create that may still be settling.
 	timeoutSeconds  int
@@ -447,6 +476,30 @@ func (r *reaper) register(id, creation string) error {
 // gives the reaper a bounded window to observe the eventual generation.
 func (r *reaper) registerPending(id, creation string) error {
 	return r.registerEntry(reaperEntry{id: id, creation: creation, pending: true})
+}
+
+func (r *reaper) makeRoomLocked(needed int) error {
+	excess := len(r.entries) + needed - maxReaperEntries
+	if excess <= 0 {
+		return nil
+	}
+	if excess > len(r.entries) {
+		return errors.New("reaper: entry capacity is exhausted")
+	}
+	if r.stdin != nil && !channelClosed(r.exited) {
+		for i := 0; i < excess; i++ {
+			if err := writeReaperCancellation(r.stdin, r.entries[i]); err != nil {
+				return err
+			}
+		}
+		if err := r.acknowledgeRetirementLocked(); err != nil {
+			return err
+		}
+		r.retiredPending = true
+		r.retirementAcked = true
+	}
+	r.entries = r.entries[excess:]
+	return nil
 }
 
 func (r *reaper) registerEntry(entry reaperEntry) error {
@@ -506,6 +559,9 @@ func (r *reaper) registerEntry(entry reaperEntry) error {
 		}
 	}
 	if !duplicate {
+		if err := r.makeRoomLocked(1); err != nil {
+			return err
+		}
 		r.entries = append(r.entries, entry)
 	}
 	if r.stdin != nil {
@@ -566,6 +622,43 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 	return writeReaperLine(r.stdin, line, r.writeTimeout)
 }
 
+func acknowledgeReaperCommand(_ context.Context, stdin io.Writer, ack io.Reader, prefix string, writeTimeout time.Duration) error {
+	if stdin == nil || ack == nil {
+		return errors.New("reaper: acknowledgement channel is unavailable")
+	}
+	token := newCreationID()
+	command := prefix + token
+	if err := writeReaperLine(stdin, command+"\n", writeTimeout); err != nil {
+		return fmt.Errorf("reaper: write acknowledgement barrier: %w", err)
+	}
+	if deadline, ok := ack.(interface{ SetReadDeadline(time.Time) error }); ok {
+		if err := deadline.SetReadDeadline(time.Now().Add(reaperCleanupTimeout)); err != nil {
+			return fmt.Errorf("reaper: set acknowledgement deadline: %w", err)
+		}
+		defer func() { _ = deadline.SetReadDeadline(time.Time{}) }()
+	}
+	expected := reaperAckMarker + ":" + token + "\n"
+	buf := make([]byte, len(expected))
+	if _, err := io.ReadFull(ack, buf); err != nil {
+		return fmt.Errorf("reaper: command was not acknowledged: %w", err)
+	}
+	if string(buf) != expected {
+		return fmt.Errorf("reaper: invalid acknowledgement %q", buf)
+	}
+	return nil
+}
+
+func (r *reaper) acknowledgeCommandLocked(prefix string) error {
+	if channelClosed(r.exited) {
+		return errors.New("reaper: acknowledgement channel is unavailable")
+	}
+	return acknowledgeReaperCommand(context.Background(), r.stdin, r.ack, prefix, r.writeTimeout)
+}
+
+func (r *reaper) acknowledgeRetirementLocked() error {
+	return r.acknowledgeCommandLocked("R#containergo-retire:")
+}
+
 func (r *reaper) unregisterHandoff(name, uid string) error {
 	validName := nameRE.MatchString(name)
 	validUID := r.subcommand == "rm" && dockerIDRE.MatchString(uid)
@@ -575,48 +668,98 @@ func (r *reaper) unregisterHandoff(name, uid string) error {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.closed {
 		r.entries = nil
-		err := r.stopChildLocked()
-		r.mu.Unlock()
-		return err
-	}
-	removed := r.removeMatchingLocked(func(entry reaperEntry) bool {
-		return entry.id == name || (uid != "" && entry.id == uid)
-	})
-	if len(removed) == 0 {
-		r.mu.Unlock()
+		r.retiredPending = false
+		r.retirementAcked = false
 		return nil
 	}
-	// Do not rely only on a buffered cancellation write: the old child
-	// could reach EOF with its pre-cancellation snapshot still active.
-	// Retire it before replaying any unrelated entries.
-	if err := r.stopChildLocked(); err != nil {
-		r.mu.Unlock()
-		return err
-	}
-	if len(r.entries) == 0 {
-		r.spawnFailures = 0
-		r.gaveUp = false
-		r.mu.Unlock()
-		return nil
-	}
-	defer r.mu.Unlock()
-	return r.respawnAndReplayLocked()
-}
-
-func (r *reaper) removeMatchingLocked(match func(reaperEntry) bool) []reaperEntry {
-	kept := r.entries[:0]
+	kept := make([]reaperEntry, 0, len(r.entries))
 	removed := make([]reaperEntry, 0)
 	for _, entry := range r.entries {
-		if match(entry) {
+		if entry.id == name || (uid != "" && entry.id == uid) {
 			removed = append(removed, entry)
 		} else {
 			kept = append(kept, entry)
 		}
 	}
+	if len(removed) == 0 {
+		return nil
+	}
+	// Write cancellation records and wait for the child to acknowledge that
+	// they are in its private snapshot. EOF remains the only delete trigger;
+	// keeping the pipe open (or waiting for an acknowledged empty child exit)
+	// prevents a stale pre-cancellation snapshot from being replayed.
+	if r.stdin != nil && !channelClosed(r.exited) {
+		for _, entry := range removed {
+			if err := writeReaperCancellation(r.stdin, entry); err != nil {
+				return err
+			}
+		}
+		if err := r.acknowledgeRetirementLocked(); err != nil {
+			return err
+		}
+		r.retiredPending = true
+		r.retirementAcked = true
+	} else {
+		r.retiredPending = false
+		r.retirementAcked = false
+	}
 	r.entries = kept
-	return removed
+	if len(kept) == 0 {
+		return r.retireEmptyChildLocked()
+	}
+	return nil
+}
+
+// retireEmptyChildLocked closes the pipe only after all cancellation records
+// for the last entries have been written. The child reads the complete
+// stream before applying it, so EOF cannot replay a handed-off generation.
+// The caller holds opMu and r.mu.
+func (r *reaper) retireEmptyChildLocked() error {
+	stdin, cmd, exited, ack := r.stdin, r.cmd, r.exited, r.ack
+	if stdin == nil || cmd == nil {
+		r.retiredPending = false
+		r.retirementAcked = false
+		return nil
+	}
+	if exited == nil {
+		return errors.New("reaper: retired child has no exit channel")
+	}
+	r.stdin = nil
+	r.ack = nil
+	_ = stdin.Close()
+	r.mu.Unlock()
+	waitCtx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
+	defer cancel()
+	var waitErr error
+	select {
+	case <-exited:
+	case <-waitCtx.Done():
+		waitErr = fmt.Errorf("reaper: retired child did not exit: %w", waitCtx.Err())
+	}
+	if ack != nil {
+		_ = ack.Close()
+	}
+	r.mu.Lock()
+	if waitErr == nil || r.cmd != cmd {
+		if r.cmd == cmd {
+			r.cmd = nil
+			r.exited = nil
+		}
+		r.retiredPending = false
+		r.retirementAcked = false
+		return waitErr
+	}
+	// Keep the exited child discoverable for a later bounded retry. Its
+	// stdin is already closed, so a caller cannot append new entries to the
+	// stale stream.
+	r.cmd = cmd
+	r.stdin = stdin
+	r.exited = exited
+	r.ack = ack
+	return waitErr
 }
 
 func writeReaperCompletion(stdin io.Writer, e reaperEntry) error {
@@ -726,6 +869,10 @@ func (r *reaper) promotePendingToDockerID(name, creation, uid string) error {
 			r.entries[pendingIndex] = idEntry
 		}
 	} else {
+		if err := r.makeRoomLocked(1); err != nil {
+			r.mu.Unlock()
+			return err
+		}
 		r.entries = append(r.entries, idEntry)
 	}
 	if r.stdin != nil {
@@ -734,6 +881,12 @@ func (r *reaper) promotePendingToDockerID(name, creation, uid string) error {
 			wrote = r.writeLocked(idEntry) == nil
 		}
 		if wrote && writeReaperCancellation(r.stdin, reaperEntry{id: name, creation: creation}) == nil {
+			if err := r.acknowledgeRetirementLocked(); err != nil {
+				r.mu.Unlock()
+				return err
+			}
+			r.retiredPending = true
+			r.retirementAcked = true
 			r.mu.Unlock()
 			return nil
 		}
@@ -775,12 +928,15 @@ func channelClosed(ch <-chan struct{}) bool {
 // short wait is performed with r.mu released so registrations are not
 // held behind a stuck child indefinitely.
 func (r *reaper) stopChildLocked() error {
-	stdin, cmd, exited := r.stdin, r.cmd, r.exited
-	r.stdin, r.cmd, r.exited = nil, nil, nil
-	if stdin != nil {
-		_ = stdin.Close()
-	}
+	stdin, cmd, exited, ack := r.stdin, r.cmd, r.exited, r.ack
+	r.stdin, r.cmd, r.exited, r.ack = nil, nil, nil, nil
 	if cmd == nil || channelClosed(exited) {
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		if ack != nil {
+			_ = ack.Close()
+		}
 		return nil
 	}
 
@@ -788,13 +944,31 @@ func (r *reaper) stopChildLocked() error {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
 	defer cleanupCancel()
 	var cleanupErr error
-	if cmd.Process != nil {
-		// killReaperCommand uses the owned root process (and only
-		// verified positive descendant PIDs); it never signals a group ID.
-		cleanupErr = killReaperCommand(cleanupCtx, cmd)
-		if errors.Is(cleanupErr, os.ErrProcessDone) {
-			cleanupErr = nil
+	quiesceErr := acknowledgeReaperCommand(cleanupCtx, stdin, ack, "Q#containergo-quiesce:", r.writeTimeout)
+	quiesced := quiesceErr == nil
+	canKill := false
+	if !quiesced {
+		// Wait and kill are serialized by the lifecycle state. Once Wait
+		// has begun, the PID is never signaled; a stopper that wins the
+		// state transition signals the still-owned process and lets Wait
+		// reap it.
+		r.lifecycleMu.Lock()
+		canKill = !r.reaping
+		if canKill {
+			r.stopping = true
 		}
+		r.lifecycleMu.Unlock()
+		if canKill && !channelClosed(exited) && cmd.Process != nil {
+			// killReaperCommand uses the owned root process (and only
+			// verified positive descendant PIDs); it never signals a group ID.
+			cleanupErr = killReaperCommand(cleanupCtx, cmd)
+			if errors.Is(cleanupErr, os.ErrProcessDone) {
+				cleanupErr = nil
+			}
+		}
+	}
+	if (quiesced || canKill) && stdin != nil {
+		_ = stdin.Close()
 	}
 	if exited != nil {
 		select {
@@ -803,6 +977,14 @@ func (r *reaper) stopChildLocked() error {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("reaper: old child did not exit: %w", cleanupCtx.Err()))
 		}
 	}
+	if cleanupErr != nil && exited != nil && channelClosed(exited) {
+		// The owned child exited on its own; an ownership error reported
+		// during the final signal attempt is no longer actionable.
+		cleanupErr = nil
+	}
+	if ack != nil {
+		_ = ack.Close()
+	}
 	r.mu.Lock()
 	if cleanupErr != nil {
 		// Keep the old child discoverable so a later retry cannot replay
@@ -810,17 +992,24 @@ func (r *reaper) stopChildLocked() error {
 		r.cmd = cmd
 		r.stdin = stdin
 		r.exited = exited
+		r.ack = ack
 	}
 	return cleanupErr
 }
 
 // respawnAndReplayLocked starts a fresh reaper process and re-registers
-// every known ID with it. Success resets the consecutive-failure count;
-// failures are recorded without exposing backend output.
+// every known ID with it. A retirement must have received the child's
+// acknowledgement before an old child can be stopped; otherwise the
+// existing pipe stays open and this operation fails closed.
 func (r *reaper) respawnAndReplayLocked() error {
+	if r.retiredPending && !r.retirementAcked {
+		return errors.New("reaper: retirement is awaiting the existing child's EOF barrier")
+	}
 	if len(r.entries) == 0 {
 		r.spawnFailures = 0
 		r.gaveUp = false
+		r.retiredPending = false
+		r.retirementAcked = false
 		return nil
 	}
 	if err := r.stopChildLocked(); err != nil {
@@ -896,15 +1085,44 @@ func (r *reaper) spawnLocked() error {
 	if err != nil {
 		return err
 	}
-	if err := cmd.Start(); err != nil {
+	ack, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdin.Close()
 		return err
 	}
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		_ = ack.Close()
+		return err
+	}
+	r.retiredPending = false
+	r.retirementAcked = false
 	exited := make(chan struct{})
+	r.lifecycleMu.Lock()
+	r.reaping = false
+	r.stopping = false
+	r.lifecycleMu.Unlock()
 	go func() {
+		// Mark the hand-off to Wait before blocking on it. Retirement
+		// checks the same state, so it never signals a PID after Wait has
+		// begun reaping it; a concurrent stopper marks stopping first and
+		// the Wait below reaps the owned process after that signal.
+		r.lifecycleMu.Lock()
+		if !r.stopping {
+			r.reaping = true
+		}
+		r.lifecycleMu.Unlock()
 		_ = cmd.Wait()
+		r.lifecycleMu.Lock()
+		// Publish the terminal channel before clearing the ownership state.
+		// A stopper that observes the cleared state can then also observe
+		// the closed channel and will never signal the reaped PID.
 		close(exited)
+		r.reaping = false
+		r.stopping = false
+		r.lifecycleMu.Unlock()
 	}()
-	r.cmd, r.stdin, r.exited = cmd, stdin, exited
+	r.cmd, r.stdin, r.exited, r.ack = cmd, stdin, exited, ack
 	go r.respawnAfterUnexpectedExit(cmd, exited)
 	return nil
 }
@@ -916,9 +1134,18 @@ func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{
 		r.mu.Unlock()
 		return
 	}
+	ack := r.ack
 	r.cmd = nil
 	r.stdin = nil
 	r.exited = nil
+	r.ack = nil
+	// EOF means the child consumed the retirement records before it
+	// exited; a future replay cannot resurrect a handed-off entry.
+	r.retiredPending = false
+	r.retirementAcked = false
+	if ack != nil {
+		_ = ack.Close()
+	}
 	backoff := reaperBackoff
 	if backoff <= 0 {
 		backoff = 100 * time.Millisecond
@@ -963,12 +1190,22 @@ func (r *reaper) killForTest() error {
 	defer r.opMu.Unlock()
 	r.mu.Lock()
 	cmd, exited := r.cmd, r.exited
+	stdin := r.stdin
 	r.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
 	defer cancel()
 	var cleanupErrors []error
-	if cmd != nil && !channelClosed(exited) {
+	r.lifecycleMu.Lock()
+	canKill := cmd != nil && !r.reaping
+	if canKill {
+		r.stopping = true
+	}
+	r.lifecycleMu.Unlock()
+	if canKill && !channelClosed(exited) {
 		if err := killReaperCommand(ctx, cmd); err != nil {
 			log.Printf("container-go: reaper cleanup: %v", err)
 			cleanupErrors = append(cleanupErrors, err)
@@ -1041,6 +1278,12 @@ func promotePendingDockerIDWithGlobalReaper(binary, subcommand, name, creation, 
 		return err
 	}
 	return nil
+}
+
+func retireReaperEntry(binary, subcommand, name, uid string) {
+	if err := unregisterHandoffWithGlobalReaper(binary, subcommand, name, uid); err != nil {
+		log.Printf("container-go: reaper retirement failed (binary=%q): %v", binary, err)
+	}
 }
 
 func unregisterHandoffWithGlobalReaper(binary, subcommand, name, uid string) error {

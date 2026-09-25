@@ -277,8 +277,11 @@ are registered by writing them down a pipe. However the parent dies,
 the pipe reaches EOF, and the reaper runs `container delete --force`
 for every registered ID and exits. While the parent lives the reaper
 does nothing (deletion belongs to the normal path; the reaper is
-insurance). This mirrors container-rs's watchdog and covers SIGKILL,
-which no signal handler can.
+insurance). Retirement first writes cancellation records and waits for
+an acknowledgement from the child; an entry is never removed merely
+because a replay is requested, and the registration table is bounded.
+This mirrors container-rs's watchdog and covers SIGKILL, which no signal
+handler can.
 
 **Session labels**: every created container carries
 
@@ -308,7 +311,11 @@ narrow: image reference and declared/published ports only. `env`,
 container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
-Each creation carries a `creationLabel` generation (16-hex). `Terminate`
+Apple image identity keeps the backend-reported registry/repository,
+tracks a selected manifest separately from a synthetic local root, and
+never downgrades a caller-pinned `name@digest` to a mutable tag. Docker
+identity/cleanup paths use immutable UIDs and do not depend on Apple name
+locks. Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
 Docker the handle keeps the immutable `Id` printed by `docker run` (or
 returned by inspect) and deletes by it, so no generation check is

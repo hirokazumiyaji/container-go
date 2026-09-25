@@ -23,9 +23,19 @@ type imageIdentity struct {
 	// variant. digest remains the root/index identity used for run.
 	platform      string
 	variantDigest string
-	// mutableAlias marks a caller-supplied Apple name@digest. Apple does
-	// not expose an atomic run target for that spelling, so it is usable
-	// only through the explicit mutable-tag compatibility option.
+	// rootDigest is the registry root/index identity. It can differ from
+	// variantDigest when Apple wraps a single manifest in a synthetic
+	// local index.
+	rootDigest string
+	// repository is the canonical registry/repository key captured from a
+	// backend-reported reference, when available.
+	repository string
+	// appleSynthetic marks an Apple-generated local index root that is not
+	// itself registry-addressable by name@digest.
+	appleSynthetic bool
+	// mutableAlias marks an explicitly authorized mutable compatibility
+	// state. Caller-supplied name@digest inputs are never downgraded to this
+	// state.
 	mutableAlias bool
 	// notLocal means the backend returned a record but could not prove
 	// that the requested platform variant is locally addressable.
@@ -45,20 +55,20 @@ func imageReferenceWithDigest(requested, reported, digest, id string) imageIdent
 		}
 		if base == "" {
 			if isImageID(id) && ((isImageID(requested) && strings.EqualFold(requested, id)) || strings.EqualFold(id, digest)) {
-				return imageIdentity{reference: id, id: id, pinned: true}
+				return imageIdentity{reference: id, id: id, pinned: true, rootDigest: digest}
 			}
 			return imageIdentity{}
 		}
 		if !validImageDigest(digest) || !imageRE.MatchString(base+"@"+digest) {
 			return imageIdentity{}
 		}
-		return imageIdentity{reference: base + "@" + digest, digest: digest, id: id, pinned: true}
+		return imageIdentity{reference: base + "@" + digest, digest: digest, rootDigest: digest, repository: imageRepository(base), id: id, pinned: true}
 	}
 	if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) {
 		if imageReferenceBase(requested) == "" {
 			return imageIdentity{}
 		}
-		return imageIdentity{reference: requested, digest: requestedDigest, id: id, pinned: true}
+		return imageIdentity{reference: requested, digest: requestedDigest, rootDigest: requestedDigest, repository: imageRepository(requested), id: id, pinned: true}
 	}
 	if isImageID(id) {
 		return imageIdentity{reference: id, id: id, pinned: true}
@@ -70,25 +80,108 @@ func imageIdentitiesCompatible(a, b imageIdentity) bool {
 	if !a.pinned || !b.pinned {
 		return false
 	}
-	if a.platform != "" && b.platform != "" && a.platform != b.platform {
-		return false
-	}
-	if a.variantDigest != "" && b.variantDigest != "" &&
-		!strings.EqualFold(a.variantDigest, b.variantDigest) {
-		return false
-	}
-	if isImageID(a.id) && isImageID(b.id) && strings.EqualFold(a.id, b.id) {
+	// A matching verified backend image ID is sufficient. When IDs differ,
+	// continue with the descriptor/repository comparison so older Docker
+	// fixtures that expose an image ID separately from the container image
+	// alias remain comparable.
+	aID, aHasID := canonicalDockerImageID(a.id)
+	bID, bHasID := canonicalDockerImageID(b.id)
+	if aHasID && bHasID && strings.EqualFold(aID, bID) {
 		return true
 	}
-	if !validImageDigest(a.digest) || !validImageDigest(b.digest) || a.digest != b.digest {
+	if !applePlatformMetadataCompatible(a.platform, b.platform) {
 		return false
 	}
-	abase := imageReferenceBase(a.reference)
-	bbase := imageReferenceBase(b.reference)
+	if a.variantDigest != "" || b.variantDigest != "" {
+		if !validImageDigest(a.variantDigest) || !validImageDigest(b.variantDigest) ||
+			!strings.EqualFold(a.variantDigest, b.variantDigest) {
+			return false
+		}
+	}
+	aroot, broot := a.rootDigest, b.rootDigest
+	if aroot == "" {
+		aroot = a.digest
+	}
+	if broot == "" {
+		broot = b.digest
+	}
+	if !validImageDigest(aroot) || !validImageDigest(broot) || !strings.EqualFold(aroot, broot) {
+		return false
+	}
+	abase, bbase := imageReferenceBase(a.reference), imageReferenceBase(b.reference)
 	if abase == "" || bbase == "" {
 		return false
 	}
-	return imageRepository(abase) == imageRepository(bbase)
+	if a.repository != "" && b.repository != "" {
+		return imageRepositoriesCompatible(a.repository, b.repository)
+	}
+	if a.repository != "" || b.repository != "" {
+		return imageRepositoryPathsCompatible(abase, bbase)
+	}
+	return imageRepositoriesCompatible(imageRepository(abase), imageRepository(bbase))
+}
+
+// imageRootsCompatible checks the content/root identity independently of
+// optional platform metadata. It is useful when a backend reports the root
+// and selected manifest in separate fields.
+//
+//nolint:unused // retained as a focused identity predicate for backend adapters
+func imageRootsCompatible(a, b imageIdentity) bool {
+	if !a.pinned || !b.pinned {
+		return false
+	}
+	aID, aHasID := canonicalDockerImageID(a.id)
+	bID, bHasID := canonicalDockerImageID(b.id)
+	if aHasID || bHasID {
+		return aHasID && bHasID && strings.EqualFold(aID, bID)
+	}
+	aroot, broot := a.rootDigest, b.rootDigest
+	if aroot == "" {
+		aroot = a.digest
+	}
+	if broot == "" {
+		broot = b.digest
+	}
+	if !validImageDigest(aroot) || !validImageDigest(broot) || !strings.EqualFold(aroot, broot) {
+		return false
+	}
+	if a.repository != "" && b.repository != "" {
+		return imageRepositoriesCompatible(a.repository, b.repository)
+	}
+	abase, bbase := imageReferenceBase(a.reference), imageReferenceBase(b.reference)
+	return abase != "" && bbase != "" && imageRepositoryPathsCompatible(abase, bbase)
+}
+
+// requestedImageIdentitiesCompatible compares a resolved request with an
+// inspected result. Backend-only metadata is additional information when the
+// caller did not select it, while an explicit request must be represented in
+// the inspected result.
+func requestedImageIdentitiesCompatible(requested, actual imageIdentity) bool {
+	requestedForComparison, actualForComparison := requested, actual
+	// Some older backend inspect responses omit optional platform metadata.
+	// Explicit compatibility checks still reject a present mismatch; absent
+	// metadata cannot manufacture a mismatch during post-create verification.
+	if requested.platform == "" || actualForComparison.platform == "" {
+		requestedForComparison.platform = ""
+		actualForComparison.platform = ""
+	}
+	if requested.variantDigest == "" || actualForComparison.variantDigest == "" {
+		requestedForComparison.variantDigest = ""
+		actualForComparison.variantDigest = ""
+	}
+	return imageIdentitiesCompatible(requestedForComparison, actualForComparison)
+}
+
+func applePlatformMetadataCompatible(a, b string) bool {
+	if a == "" && b == "" {
+		return true
+	}
+	if a == "" || b == "" {
+		return false
+	}
+	ap, aok := parseApplePlatformSelector(a)
+	bp, bok := parseApplePlatformSelector(b)
+	return aok && bok && applePlatformsEqual(ap, bp)
 }
 
 func isImageID(ref string) bool {
@@ -190,17 +283,15 @@ func containerImageIdentity(eng engine, info *engineInfo) imageIdentity {
 	if info == nil {
 		return imageIdentity{}
 	}
-	if validImageDigest(info.imageDigest) {
-		id := ""
-		if eng != nil && eng.name() == "docker" {
-			id = info.imageID
-		}
-		return imageReferenceWithDigest(info.image, info.image, info.imageDigest, id)
+	id := ""
+	if eng != nil && eng.name() == "docker" {
+		id = info.imageID
 	}
-	if eng != nil && eng.name() == "docker" && isImageID(info.imageID) {
-		return imageReferenceWithDigest(info.image, info.image, "", info.imageID)
+	identity := imageFromInfo(info)
+	if identity.pinned {
+		identity.id = id
 	}
-	return imageIdentity{}
+	return identity
 }
 
 func verifyContainerImageIdentity(c *Container, info *engineInfo) error {
@@ -218,7 +309,7 @@ func verifyContainerImageIdentity(c *Container, info *engineInfo) error {
 	if !observed.pinned {
 		return fmt.Errorf("%w: container %s did not report its pinned image identity", ErrImageIdentityUnavailable, c.id)
 	}
-	if !imageIdentitiesCompatible(expected, observed) {
+	if !requestedImageIdentitiesCompatible(expected, observed) {
 		return fmt.Errorf("%w: container %s image identity changed after create", ErrImageIdentityMismatch, c.id)
 	}
 	return nil

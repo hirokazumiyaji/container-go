@@ -213,10 +213,9 @@ func TestReuseHandoffDoesNotLeaveReaperOwnership(t *testing.T) {
 	if r != nil {
 		r.mu.Lock()
 		entries := len(r.entries)
-		activeChild := r.cmd != nil
 		r.mu.Unlock()
-		if entries != 0 || activeChild {
-			t.Fatalf("reaper retained %d entries/active=%v after handoff", entries, activeChild)
+		if entries != 0 {
+			t.Fatalf("reaper retained %d entries after handoff", entries)
 		}
 	}
 }

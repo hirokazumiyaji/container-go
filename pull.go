@@ -272,7 +272,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		return imageIdentity{}, err
 	}
 	if !imageIdentityNeedsLocalAddressCheck(c.eng, pinned, c.pullPolicy) ||
-		(pinned.reference == image && identity.pinned) {
+		(pinned.reference == image && identity.pinned && !pinned.appleSynthetic) {
 		return pinned, nil
 	}
 
@@ -292,6 +292,17 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		return imageIdentity{}, fmt.Errorf("inspect locally addressable image %s: %w", pinned.reference, err)
 	}
 	if !pinnedExists && c.pullPolicy != PullNever {
+		// Apple creates a local synthetic index around a single manifest.
+		// Pulling that generated root by name@digest asks the registry for
+		// an object it cannot name. Do not downgrade a caller-pinned digest;
+		// only an explicitly allowed mutable tag may use the compatibility
+		// path.
+		if pinned.appleSynthetic {
+			if c.canUseMutableFallback(image) {
+				return mutableImageReference(image, pinned), nil
+			}
+			return imageIdentity{}, fmt.Errorf("%w: Apple synthetic index %s is not locally addressable", ErrImageIdentityNotLocal, pinned.reference)
+		}
 		pullErr := pullImage(ctx, c.runner, c.eng, pinned.reference, platform)
 		if pullErr != nil {
 			// A known not-found result means the exact reference is not
@@ -334,7 +345,7 @@ func (c *config) resolveInspectedImage(ctx context.Context, image, platform stri
 		}
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s did not report an immutable identity", ErrImageIdentityUnavailable, pinned.reference)
 	}
-	if !imageIdentitiesCompatible(pinned, checked) {
+	if !requestedImageIdentitiesCompatible(pinned, checked) {
 		return imageIdentity{}, fmt.Errorf("%w: pinned reference %s changed before run", ErrImageIdentityMismatch, pinned.reference)
 	}
 	return pinned, nil
@@ -384,24 +395,28 @@ func (c *config) pinImage(image string, identity imageIdentity) (imageIdentity, 
 	}
 	requestedDigest := imageDigest(image)
 	if identity.mutableAlias {
-		if validImageDigest(requestedDigest) && identity.digest != "" &&
-			!strings.EqualFold(requestedDigest, identity.digest) {
-			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected %s", ErrImageIdentityMismatch, image, requestedDigest, identity.digest)
+		if validImageDigest(requestedDigest) && !identityHasDigest(identity, requestedDigest) {
+			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected root/variant identity", ErrImageIdentityMismatch, image, requestedDigest)
 		}
 		if c.eng.name() == "apple" {
+			// A caller-pinned name@digest is never a mutable-tag
+			// compatibility request, even if an older backend adapter
+			// marked the identity as an alias.
+			if isRepositoryDigestReference(image) {
+				return imageIdentity{}, fmt.Errorf("%w: %s (Apple name@digest must retain its pinned identity)", ErrImageIdentityUnavailable, image)
+			}
 			if c.allowMutableImageTag {
 				return mutableImageReference(image, identity), nil
 			}
-			return imageIdentity{}, fmt.Errorf("%w: %s (Apple name@digest is a mutable alias; use WithAllowMutableImageTag to opt into running it)", ErrImageIdentityUnavailable, image)
+			return imageIdentity{}, fmt.Errorf("%w: %s (Apple image identity is only a mutable alias; use WithAllowMutableImageTag to opt into running it)", ErrImageIdentityUnavailable, image)
 		}
 	}
 	if identity.pinned {
 		if !imageIdentityIsVerified(identity) {
 			return imageIdentity{}, fmt.Errorf("%w: %s (%s returned an identity without repository provenance or a verified local ID)", ErrImageIdentityUnavailable, image, c.eng.name())
 		}
-		if validImageDigest(requestedDigest) && identity.digest != "" &&
-			!strings.EqualFold(requestedDigest, identity.digest) {
-			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected %s", ErrImageIdentityMismatch, image, requestedDigest, identity.digest)
+		if validImageDigest(requestedDigest) && !identityHasDigest(identity, requestedDigest) {
+			return imageIdentity{}, fmt.Errorf("%w: %q changed during resolution: requested %s, inspected root/variant identity", ErrImageIdentityMismatch, image, requestedDigest)
 		}
 		return identity, nil
 	}
@@ -435,10 +450,26 @@ func imageIdentityIsVerified(identity imageIdentity) bool {
 	if identity.mutableAlias || !identity.pinned || !imageRE.MatchString(identity.reference) {
 		return false
 	}
-	if isImageID(identity.id) {
-		return strings.EqualFold(identity.reference, identity.id) || imageReferenceBase(identity.reference) != ""
+	if imageID, ok := canonicalDockerImageID(identity.id); ok {
+		return strings.EqualFold(identity.reference, imageID) || imageReferenceBase(identity.reference) != ""
 	}
-	return validImageDigest(identity.digest) && imageReferenceBase(identity.reference) != ""
+	root := identity.rootDigest
+	if root == "" {
+		root = identity.digest
+	}
+	return validImageDigest(root) && imageReferenceBase(identity.reference) != ""
+}
+
+func identityHasDigest(identity imageIdentity, requested string) bool {
+	if !validImageDigest(requested) {
+		return true
+	}
+	for _, candidate := range []string{identity.digest, identity.rootDigest, identity.variantDigest} {
+		if validImageDigest(candidate) && strings.EqualFold(candidate, requested) {
+			return true
+		}
+	}
+	return false
 }
 
 func (c *config) canUseMutableFallback(image string) bool {

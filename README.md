@@ -156,6 +156,12 @@ container.Run(ctx, "redis:7-alpine",
 container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 ```
 
+Apple image inspection keeps the registry/repository reported by the
+backend, canonicalizes custom default registries, and tracks a selected
+manifest separately from a synthetic local root index. Caller-pinned
+`name@digest` references are never silently changed to mutable tags; the
+explicit `WithAllowMutableImageTag` escape hatch does not apply to a digest.
+
 ## Cleanup contract
 
 Three layers make sure containers do not outlive your tests:
@@ -165,12 +171,16 @@ Three layers make sure containers do not outlive your tests:
    Both are nil-safe, so call them before checking `Run`'s error.
 2. If `Run` fails partway, it removes an owned, stopped/created
    generation before returning. Ambiguous, running, or foreign reusable
-   generations are retained for inspection.
+   generations are retained for inspection. `CONTAINERGO_KEEP=1` suppresses
+   automatic deletion and returns a handle only after fresh ownership and
+   generation checks; shared copy/wait failures likewise retain a verified
+   handle rather than dropping it.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+   SIGKILL and panics included. Retirement uses an acknowledged cancellation
+   barrier (or keeps the pipe open), and its registration table is bounded.
+   The reaper needs `/bin/sh`, so it is unavailable on Windows — there,
+   cleanup relies on the first two layers only.
 
 Extras:
 
@@ -213,7 +223,8 @@ Contract:
   handles so other packages keep working. A successful reuse handoff also
   removes any inherited watchdog entry for that name/UID. Explicit
   `ctr.Terminate` still removes the shared container — only do that when
-  nothing else needs it.
+  nothing else needs it. Docker cleanup and reuse use immutable UIDs and
+  do not require the Apple name-lock files.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). Ordinary `Prune` still
   only deletes stopped managed containers.

@@ -204,6 +204,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, runImage, envFile)...)
 	if err != nil {
 		if !attempted {
+			if reaperBin != "" {
+				retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+			}
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -212,6 +215,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return retained, withCleanupError(classified, retainedErr)
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr == nil && reaperBin != "" {
+			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+		}
 		return nil, withCleanupError(classified, cleanupErr)
 	}
 
@@ -228,6 +234,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if cfg.eng.name() == "docker" && !validDockerUID(uid) {
 		identityErr := fmt.Errorf("run %s: Docker run returned no valid immutable container ID", cfg.name)
 		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
+		if cleanupErr == nil && reaperBin != "" {
+			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, "")
+		}
 		return nil, withCleanupError(identityErr, cleanupErr)
 	}
 	c := &Container{
@@ -313,7 +322,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
+	unlock, err := lockNameForBackend(cleanupCtx, cfg.eng, cfg.name)
 	if err != nil {
 		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
 	}
@@ -549,7 +558,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 				info, err := c.inspectFresh(ctx)
 				if err != nil {
 					if isNotFound(err) {
-						return nil
+						return retireContainerReaper(c)
 					}
 					return fmt.Errorf("terminate %s: verify reused Docker identity: %w", c.id, err)
 				}
@@ -560,7 +569,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 					return generationReplaced(c.id)
 				}
 			}
-			return c.delete(ctx, uid)
+			return c.deleteAndRetire(ctx, uid)
 		}
 		// A just-created handle may resolve a missing run ID once, but
 		// only through a generation-verified inspect. Never fall back to
@@ -568,14 +577,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if !bootstrap || !validCreationGeneration(creation) {
 			return fmt.Errorf("terminate %s: %w: handle has no valid immutable ID", c.id, ErrGenerationReplaced)
 		}
-		unlock, err := lockName(ctx, c.id)
-		if err != nil {
-			return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
-		}
-		defer unlock()
-		if _, err := c.inspectFreshLocked(ctx); err != nil {
+		verifyCtx, verifyCancel := withDefaultTimeout(ctx, queryTimeout)
+		defer verifyCancel()
+		if _, err := c.inspectFresh(verifyCtx); err != nil {
 			if isNotFound(err) {
-				return nil
+				return retireContainerReaper(c)
 			}
 			return fmt.Errorf("terminate %s: verify immutable ID: %w", c.id, err)
 		}
@@ -585,7 +591,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if !validDockerUID(uid) {
 			return fmt.Errorf("terminate %s: %w: inspect returned no valid immutable ID", c.id, ErrGenerationReplaced)
 		}
-		return c.delete(ctx, uid)
+		return c.deleteAndRetire(ctx, uid)
 	}
 	if c.eng.name() != "apple" {
 		return errIdentity("unknown backend cannot terminate a container")
@@ -603,7 +609,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	defer unlock()
 	info, err := c.inspectFreshLocked(ctx)
 	if isNotFound(err) {
-		return nil
+		return retireContainerReaper(c)
 	}
 	if err != nil {
 		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
@@ -620,7 +626,36 @@ func (c *Container) Terminate(ctx context.Context) error {
 	// The locked, identity-bound inspect has already rejected a missing,
 	// malformed, or different Apple generation. The only safe target is
 	// the name under this lock.
-	return c.delete(ctx, c.id)
+	return c.deleteAndRetire(ctx, c.id)
+}
+
+func (c *Container) deleteAndRetire(ctx context.Context, target string) error {
+	err := c.delete(ctx, target)
+	if err != nil {
+		return err
+	}
+	if retireErr := retireContainerReaper(c); retireErr != nil {
+		return retireErr
+	}
+	return nil
+}
+
+func retireContainerReaper(c *Container) error {
+	if c == nil {
+		return nil
+	}
+	er, ok := c.runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return nil
+	}
+	binary := er.ExternalBinary()
+	if binary == "" {
+		binary = c.eng.binary()
+	}
+	c.inspectMu.RLock()
+	uid := c.uid
+	c.inspectMu.RUnlock()
+	return unregisterHandoffWithGlobalReaper(binary, c.eng.reaperSubcommand(), c.id, uid)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
@@ -790,7 +825,7 @@ func (c *Container) validateHandleInfo(info *engineInfo) error {
 	}
 	if expected.pinned {
 		observed := containerImageIdentity(c.eng, info)
-		if !observed.pinned || !imageIdentitiesCompatible(expected, observed) {
+		if !observed.pinned || !requestedImageIdentitiesCompatible(expected, observed) {
 			return generationReplaced(c.id)
 		}
 	}

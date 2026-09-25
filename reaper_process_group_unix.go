@@ -37,18 +37,58 @@ func killReaperCommand(ctx context.Context, cmd *exec.Cmd) error {
 	cleanupCtx, cancel := context.WithTimeout(ctx, reaperCleanupTimeout)
 	defer cancel()
 
+	// Capture and recheck the root's process start identity around the
+	// traversal and kill. A numeric PID can be recycled after Wait; an
+	// unverifiable or changed identity is left alone rather than signaled.
+	rootPID := cmd.Process.Pid
+	rootOwner, owned := reaperProcessStartIdentity(cleanupCtx, rootPID)
+	if !owned {
+		return fmt.Errorf("reaper: root process %d ownership could not be verified", rootPID)
+	}
+	if current, ok := reaperProcessStartIdentity(cleanupCtx, rootPID); !ok || current != rootOwner {
+		return fmt.Errorf("reaper: root process %d changed before cleanup", rootPID)
+	}
+
 	// Enumerate and stop descendants while the owned root is still alive,
 	// but signal only positive PIDs whose start identity is verified twice.
 	// The traversal records each PID before signaling it and never
 	// re-expands a successfully signaled branch.
-	traversalErr := reaperDescendants(cleanupCtx, cmd.Process.Pid, func(pid int) error {
+	traversalErr := reaperDescendants(cleanupCtx, rootPID, func(pid int) error {
 		return killReaperProcessVerified(cleanupCtx, pid)
 	})
-	rootErr := killReaperRoot(cmd)
+	if current, ok := reaperProcessStartIdentity(cleanupCtx, rootPID); !ok || current != rootOwner {
+		return errors.Join(traversalErr, fmt.Errorf("reaper: root process %d changed before root kill", rootPID))
+	}
+	rootErr := killReaperRootOwned(cleanupCtx, cmd, rootOwner)
 	return errors.Join(traversalErr, rootErr)
 }
 
+func killReaperRootOwned(ctx context.Context, cmd *exec.Cmd, owner string) error {
+	if cmd == nil || cmd.Process == nil {
+		return nil
+	}
+	if owner == "" {
+		var ok bool
+		owner, ok = reaperProcessStartIdentity(ctx, cmd.Process.Pid)
+		if !ok {
+			return fmt.Errorf("reaper: root process %d ownership could not be verified", cmd.Process.Pid)
+		}
+	}
+	current, ok := reaperProcessStartIdentity(ctx, cmd.Process.Pid)
+	if !ok || current != owner {
+		return fmt.Errorf("reaper: root process %d ownership changed", cmd.Process.Pid)
+	}
+	return signalReaperRoot(cmd)
+}
+
+//nolint:unused // retained as a safe compatibility entry point for diagnostics
 func killReaperRoot(cmd *exec.Cmd) error {
+	ctx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
+	defer cancel()
+	return killReaperRootOwned(ctx, cmd, "")
+}
+
+func signalReaperRoot(cmd *exec.Cmd) error {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}

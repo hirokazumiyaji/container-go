@@ -22,6 +22,9 @@ type engineInfo struct {
 	imageID string
 	// imageDigest is the OCI descriptor digest reported for the image.
 	imageDigest string
+	// imageVariantDigest is the selected manifest digest when the backend
+	// reports it separately from the root index descriptor.
+	imageVariantDigest string
 	// created is Docker's creation timestamp. It is an additional
 	// identity witness when a backend reuses a name during inspection.
 	created string

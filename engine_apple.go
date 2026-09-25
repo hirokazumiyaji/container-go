@@ -63,15 +63,17 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		platform := c.Configuration.Platform
 		image := c.Configuration.Image.Reference
 		imageDigest := c.Configuration.Image.Descriptor.Digest
+		imageVariantDigest := c.Configuration.Image.VariantDigest
 		if image != "" && validImageDigest(imageDigest) {
 			image = stripImageDigest(image) + "@" + imageDigest
 		}
 		info := &engineInfo{
-			state:       State(c.Status.State),
-			labels:      c.Configuration.Labels,
-			image:       image,
-			imageDigest: imageDigest,
-			platform:    formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
+			state:              State(c.Status.State),
+			labels:             c.Configuration.Labels,
+			image:              image,
+			imageDigest:        imageDigest,
+			imageVariantDigest: imageVariantDigest,
+			platform:           formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -192,7 +194,9 @@ func (appleEngine) imageMissing(err error) bool {
 }
 
 type appleImageDescriptor struct {
-	Digest string `json:"digest"`
+	Digest      string            `json:"digest"`
+	MediaType   string            `json:"mediaType"`
+	Annotations map[string]string `json:"annotations"`
 }
 
 type appleImageVariant struct {
@@ -213,9 +217,15 @@ type appleImageInspectRecord struct {
 		Name       string               `json:"name"`
 		Reference  string               `json:"reference"`
 		Descriptor appleImageDescriptor `json:"descriptor"`
-		Image      struct {
-			Reference  string               `json:"reference"`
-			Descriptor appleImageDescriptor `json:"descriptor"`
+		Platform   struct {
+			OS           string `json:"os"`
+			Architecture string `json:"architecture"`
+			Variant      string `json:"variant"`
+		} `json:"platform"`
+		Image struct {
+			Reference     string               `json:"reference"`
+			Descriptor    appleImageDescriptor `json:"descriptor"`
+			VariantDigest string               `json:"variantDigest"`
 		} `json:"image"`
 	} `json:"configuration"`
 	Variants []appleImageVariant `json:"variants"`
@@ -241,6 +251,17 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		return imageIdentity{}, false
 	}
 	record := records[0]
+	if platform == "" && (record.Configuration.Platform.OS != "" || record.Configuration.Platform.Architecture != "" || record.Configuration.Platform.Variant != "") {
+		candidate := record.Configuration.Platform.OS + "/" + record.Configuration.Platform.Architecture
+		if record.Configuration.Platform.Variant != "" {
+			candidate += "/" + record.Configuration.Platform.Variant
+		}
+		parsed, ok := parseApplePlatformSelector(candidate)
+		if !ok {
+			return imageIdentity{}, true
+		}
+		platform = formatInspectPlatform(parsed.os, parsed.architecture, parsed.variant)
+	}
 	rootDigest, rootOK := appleRootDescriptorDigest(record)
 	if platform != "" {
 		variantDigest, variantOK := applePlatformVariantDigest(record, platform)
@@ -306,8 +327,10 @@ func parseApplePlatformSelector(platform string) (applePlatform, bool) {
 		variant = parts[2]
 	} else {
 		switch parts[1] {
-		case "arm", "armhf", "armel":
+		case "arm", "armhf":
 			variant = "v7"
+		case "armel":
+			variant = "v6"
 		case "aarch64", "arm64":
 			variant = "v8"
 		}
@@ -353,8 +376,10 @@ func applePlatformVariantDigest(record appleImageInspectRecord, platform string)
 		}
 		have := canonicalApplePlatform(variant.Platform.OS, variant.Platform.Architecture, variant.Platform.Variant)
 		if applePlatformsEqual(want, have) {
+			if selected != "" && !strings.EqualFold(selected, variant.Digest) {
+				return "", false
+			}
 			selected = variant.Digest
-			break
 		}
 	}
 	return selected, selected != ""
@@ -374,6 +399,11 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 	if reference == "" {
 		reference = record.Name
 	}
+
+	// A bare sha256:... is Docker's image-ID syntax, not an Apple
+	// repository reference. It is safe to handle only when the inspected
+	// Apple record proves the same identity through its descriptor and
+	// gives us a repository base for the normalized run reference.
 	if isImageID(requested) || isBareImageID(requested) {
 		if imageReferenceBase(reference) == "" || !validImageDigest(digest) {
 			return imageIdentity{}
@@ -381,30 +411,139 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		if !appleImageIDMatchesDescriptor(requested, record.ID, digest) {
 			return imageIdentity{mismatch: true}
 		}
-	} else if requested != "" && reference != "" && !imagesCompatible(requested, reference) {
-		requestedDigest := imageDigest(requested)
-		if requestedDigest == "" || imageDigest(reference) != "" || imageRepository(requested) != imageRepository(reference) {
-			return imageIdentity{mismatch: true}
-		}
+	} else if requested != "" && reference != "" && !appleImageReferencesCompatible(requested, reference) {
+		return imageIdentity{mismatch: true}
 	}
 	if validImageDigest(digest) {
-		identity := imageReferenceWithDigest(requested, reference, digest, "")
+		// The descriptor is authoritative. Do not copy an ID-shaped field
+		// into imageIdentity.id: that field is a Docker-only local-ID ABI.
+		runReference := appleRunReferenceBase(requested, reference)
+		identity := imageReferenceWithDigest(runReference, reference, digest, "")
+		identity.rootDigest = digest
 		identity.platform = platform
 		identity.variantDigest = variantDigest
-		identity.mutableAlias = isRepositoryDigestReference(requested)
+		identity.repository = imageRepository(runReference)
+		identity.appleSynthetic = appleSyntheticIndex(record, digest, variantDigest)
+		// A caller may pin the actual manifest of a single-manifest image.
+		// That digest is registry-addressable even though Apple's synthetic
+		// root index digest is not, so retain the caller's tag plus digest.
+		if requestedDigest := imageDigest(requested); validImageDigest(requestedDigest) && validImageDigest(variantDigest) && strings.EqualFold(requestedDigest, variantDigest) {
+			if base := imageReferenceBase(requested); base != "" {
+				identity.reference = base + "@" + variantDigest
+				identity.repository = imageRepository(base)
+				identity.appleSynthetic = false
+			}
+		}
 		return identity
 	}
 	if isImageID(record.ID) {
+		// Apple must not treat a Docker-style ID field as an immutable
+		// run target without a descriptor proving what that ID names.
 		return imageIdentity{}
 	}
 	if len(record.ID) == 64 && isHex(record.ID) {
-		identity := imageReferenceWithDigest(requested, reference, "sha256:"+record.ID, "")
+		// Older Apple image-inspect responses exposed the local content ID
+		// without a descriptor. Keep the compatibility fallback, but do
+		// not classify it as a Docker image ID.
+		digest := "sha256:" + record.ID
+		identity := imageReferenceWithDigest(appleRunReferenceBase(requested, reference), reference, digest, "")
+		identity.rootDigest = digest
 		identity.platform = platform
 		identity.variantDigest = variantDigest
-		identity.mutableAlias = isRepositoryDigestReference(requested)
+		identity.repository = imageRepository(identity.reference)
 		return identity
 	}
 	return imageIdentity{}
+}
+
+// appleSyntheticIndex identifies Apple's local index wrapper around one
+// manifest. Such a digest is present in the content store but is not a
+// registry reference that can safely be pulled by name@digest.
+func appleSyntheticIndex(record appleImageInspectRecord, rootDigest, variantDigest string) bool {
+	if len(record.Variants) != 1 {
+		return false
+	}
+	if variantDigest == "" {
+		variantDigest = record.Variants[0].Digest
+	}
+	if !validImageDigest(rootDigest) {
+		return false
+	}
+	if !validImageDigest(variantDigest) {
+		// A single-variant record with an unusable manifest digest is not
+		// evidence that the generated root is registry-addressable.
+		return true
+	}
+	if strings.EqualFold(rootDigest, variantDigest) {
+		return false
+	}
+	descriptor := record.Configuration.Descriptor
+	if descriptor.Digest == "" {
+		descriptor = record.Configuration.Image.Descriptor
+	}
+	if descriptor.MediaType != "" {
+		mediaType := strings.ToLower(descriptor.MediaType)
+		if !strings.Contains(mediaType, "index") && !strings.Contains(mediaType, "manifest.list") {
+			return false
+		}
+	}
+	if descriptor.Annotations != nil {
+		if value, ok := descriptor.Annotations["com.apple.containerization.index.indirect"]; ok {
+			return strings.EqualFold(value, "true") || value == "1"
+		}
+	}
+	// Current Apple releases omit the indirect annotation from the
+	// serialized descriptor. A one-variant root whose digest differs from
+	// that variant is therefore the observable synthetic-index shape.
+	return true
+}
+
+// appleRunReferenceBase preserves a backend's canonical custom-registry
+// name when the caller used an unqualified reference. Docker Hub's familiar
+// short form remains unchanged for compatibility.
+func appleRunReferenceBase(requested, reported string) string {
+	requestedBase := imageReferenceBase(requested)
+	reportedBase := imageReferenceBase(reported)
+	if requestedBase == "" {
+		return reportedBase
+	}
+	if isUnqualifiedImageReference(requestedBase) && reportedBase != "" && !isDockerRegistryReference(reportedBase) {
+		return reportedBase
+	}
+	return requestedBase
+}
+
+func appleImageReferencesCompatible(requested, actual string) bool {
+	requestedDigest := imageDigest(requested)
+	actualDigest := imageDigest(actual)
+	if requestedDigest != "" && !validImageDigest(requestedDigest) {
+		return false
+	}
+	if actualDigest != "" && !validImageDigest(actualDigest) {
+		return false
+	}
+	if imagesCompatible(requested, actual) {
+		return true
+	}
+	// A custom default registry is reported canonically by Apple, while the
+	// caller may have supplied an unqualified name. When a digest is
+	// present, the tag is only a mutable alias spelling: content and
+	// repository provenance, not the tag, determine compatibility. If both
+	// sides carry digests, their claims must agree; descriptor-backed
+	// identity is checked separately against the selected root/variant.
+	if requestedDigest != "" && actualDigest != "" && !strings.EqualFold(requestedDigest, actualDigest) {
+		return false
+	}
+	if requestedDigest != "" || actualDigest != "" {
+		return imageRepositoryPathsCompatibleIgnoringTags(requested, actual)
+	}
+	return imageRepositoryPathsCompatible(requested, actual)
+}
+
+func imageRepositoryPathsCompatibleIgnoringTags(a, b string) bool {
+	abase := imageRepositoryBaseWithoutTag(imageReferenceBase(a))
+	bbase := imageRepositoryBaseWithoutTag(imageReferenceBase(b))
+	return imageRepositoryPathsCompatible(abase, bbase)
 }
 
 func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {

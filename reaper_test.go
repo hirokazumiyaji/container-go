@@ -4,6 +4,7 @@ package container
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -164,6 +165,138 @@ func TestReaperRegistrationWritesAreBounded(t *testing.T) {
 	}
 }
 
+func TestReaperEntryMemoryIsBounded(t *testing.T) {
+	r := newReaper("unused", "rm")
+	r.command = func() *exec.Cmd {
+		return exec.Command("/bin/sh", "-c", "while IFS= read -r line; do case \"$line\" in R#containergo-retire:*) echo \"containergo-reaper-ack:${line#R#containergo-retire:}\";; esac; done")
+	}
+	for i := 0; i < maxReaperEntries+20; i++ {
+		if err := r.register(fmt.Sprintf("%064x", i+1), ""); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+	}
+	r.mu.Lock()
+	entries := len(r.entries)
+	r.mu.Unlock()
+	if entries > maxReaperEntries {
+		t.Fatalf("reaper retained %d entries, cap is %d", entries, maxReaperEntries)
+	}
+	r.closeStdin()
+}
+
+func TestReaperRetirementDoesNotDeleteAtEOF(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	uid := strings.Repeat("7", 64)
+	if err := r.register(uid, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.unregisterHandoff(uid, uid); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.Lock()
+	entries, active, exited := len(r.entries), r.cmd != nil, r.exited
+	r.mu.Unlock()
+	if entries != 0 {
+		t.Fatalf("retirement left %d entries", entries)
+	}
+	if active {
+		r.closeStdin()
+	}
+	if exited != nil {
+		select {
+		case <-exited:
+		case <-time.After(2 * time.Second):
+			t.Fatal("retired reaper child did not exit")
+		}
+	}
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "rm --force "+uid) {
+		t.Fatalf("retired entry was deleted at EOF: %q", data)
+	}
+}
+
+func TestReaperRetirementDoesNotDeleteHandedOffEntryDuringReplay(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	handedOff := strings.Repeat("7", 64)
+	remaining := strings.Repeat("8", 64)
+	if err := r.register(handedOff, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.register(remaining, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.unregisterHandoff(handedOff, handedOff); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+remaining)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "rm --force "+handedOff) {
+		t.Fatalf("handed-off entry was deleted during replay: %q", data)
+	}
+}
+
+func TestReaperCanReplayAfterAcknowledgedRetirement(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	handedOff := strings.Repeat("5", 64)
+	remaining := strings.Repeat("6", 64)
+	if err := r.register(handedOff, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.register(remaining, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.unregisterHandoff(handedOff, handedOff); err != nil {
+		t.Fatal(err)
+	}
+	r.opMu.Lock()
+	r.mu.Lock()
+	err := r.respawnAndReplayLocked()
+	r.mu.Unlock()
+	r.opMu.Unlock()
+	if err != nil {
+		t.Fatalf("replay after acknowledged retirement: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+remaining)
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "rm --force "+handedOff) {
+		t.Fatalf("handed-off entry was deleted during replay: %q", data)
+	}
+	if count := strings.Count(string(data), "rm --force "+remaining); count != 1 {
+		t.Fatalf("remaining entry delete count = %d, want one after replay: %q", count, data)
+	}
+}
+
+func TestReaperDockerGenerationRequiresImmutableID(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "docker")
+	creation := "0123456789abcdef"
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = \"inspect\" ]; then echo '      \"" + creationLabel + "\": \"" + creation + "\"'; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "rm")
+	if err := r.register("generation-guard", creation); err != nil {
+		t.Fatal(err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect generation-guard")
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		data, _ := os.ReadFile(logPath)
+		if strings.Contains(string(data), "rm --force") {
+			t.Fatalf("generation-guarded entry fell back to name: %q", data)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 func TestReaperFailsClosedWhenLockInodeIsReplaced(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
@@ -238,7 +371,7 @@ func TestReaperStopsOldChildBeforeReplay(t *testing.T) {
 	var firstPID int
 	r.command = func() *exec.Cmd {
 		starts.Add(1)
-		return exec.Command("/bin/sh", "-c", "cat >/dev/null")
+		return exec.Command("/bin/sh", "-c", "while IFS= read -r line; do case \"$line\" in R#containergo-retire:*|Q#containergo-quiesce:*) echo \"containergo-reaper-ack:${line#*:}\";; esac; done")
 	}
 	uid := strings.Repeat("9", 64)
 	if err := r.register(uid, ""); err != nil {

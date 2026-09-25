@@ -459,7 +459,7 @@ func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdent
 		if requestedID {
 			if (isImageID(img.ID) && strings.EqualFold(img.ID, requestedIDRef)) ||
 				(isBareImageID(img.ID) && "sha256:"+img.ID == requestedIDRef) {
-				return imageIdentity{reference: requestedIDRef, id: requestedIDRef, pinned: true}, true
+				return imageIdentity{reference: requestedIDRef, id: requestedIDRef, pinned: true, rootDigest: requestedIDRef}, true
 			}
 			continue
 		}

@@ -98,7 +98,7 @@ func TestRunFailurePreservesNameConflict(t *testing.T) {
 	r := &failRunRunner{
 		fakeRunner: base,
 		runErr: &cli.CLIError{Args: []string{"run"}, ExitCode: 1,
-			Stderr: `Error: already exists: container "myctr"`},
+			Stderr: `Error: container with id myctr already exists`},
 		inspectJSON: ownedInspectJSON("myctr"),
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -183,7 +183,7 @@ func (w *reuseFailWrapper) Run(ctx context.Context, args ...string) ([]byte, []b
 	if args[0] == "inspect" {
 		*w.calls++
 		if *w.calls == 1 {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `container not found: "myctr"`}
 		}
 	}
 	return w.failRunRunner.Run(ctx, args...)

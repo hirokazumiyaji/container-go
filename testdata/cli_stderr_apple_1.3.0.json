@@ -1,0 +1,23 @@
+[
+  {
+    "name": "name_conflict",
+    "stderr": "Error: container with id myctr already exists",
+    "nameConflict": true,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "image_missing",
+    "stderr": "Error: image not found: redis:7-alpine",
+    "nameConflict": false,
+    "imageMissing": true,
+    "containerMissing": false
+  },
+  {
+    "name": "container_missing",
+    "stderr": "Error: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  }
+]

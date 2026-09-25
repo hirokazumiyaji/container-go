@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -22,20 +21,21 @@ import (
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// The matchers below require the verified error-kind phrase at the start
+// of a normalized stderr line. Generic words such as "not found",
+// "already in use", or "conflict" are application/configuration text,
+// not evidence of a backend object error.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
 //   - image missing: "Error response from daemon: No such image: …"
 //   - container missing: "error: no such object: …" (also historically
-//     "No such container" / "not found")
+//     "No such container")
 const (
-	dockerStderrConflict     = "conflict"
-	dockerStderrAlreadyInUse = "already in use"
-	dockerStderrName         = "name"
-	dockerStderrNoSuchImage  = "no such image"
-	dockerStderrNotFound     = "not found"
-	dockerStderrNoSuchObj    = "no such object"
-	dockerStderrNoSuchCtr    = "no such container"
+	dockerStderrConflict     = "conflict. the container name "
+	dockerStderrAlreadyInUse = "already in use by container"
+	dockerStderrNoSuchImage  = "no such image:"
+	dockerStderrNoSuchObj    = "no such object:"
+	dockerStderrNoSuchCtr    = "no such container:"
 )
 
 func (dockerEngine) name() string   { return "docker" }
@@ -328,7 +328,7 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 
 // imageMissing matches the daemon's response for an absent image.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
+	return hasCLIErrorPrefix(err, dockerStderrNoSuchImage)
 }
 
 func (dockerEngine) parseImageExists(data []byte, _ string) bool {
@@ -353,34 +353,13 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, dockerStderrConflict) ||
-		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
+	return hasCLIErrorLine(err, func(line string) bool {
+		return strings.HasPrefix(line, dockerStderrConflict) &&
+			strings.Contains(line, dockerStderrAlreadyInUse)
+	})
 }
 
 // containerMissing matches a CLI failure for an absent container.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
-		return false
-	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
-}
-
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	return hasCLIErrorPrefix(err, dockerStderrNoSuchObj, dockerStderrNoSuchCtr)
 }

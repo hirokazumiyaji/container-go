@@ -70,9 +70,13 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		if f.imagePresent {
 			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
 		}
-		// The message carries both backends' not-found wording so one
-		// fake serves the docker and apple classifiers.
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine (No such image)"}
+		// The message carries both backends' verified not-found lines
+		// so one fake serves the Docker and Apple classifiers.
+		return nil, nil, &cli.CLIError{
+			Args:     args,
+			ExitCode: 1,
+			Stderr:   "image not found: redis:7-alpine\nError response from daemon: No such image: redis:7-alpine",
+		}
 	}
 	if (args[0] == "image" && len(args) > 1 && args[1] == "pull") || args[0] == "pull" {
 		if !f.systemUp {
@@ -388,7 +392,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

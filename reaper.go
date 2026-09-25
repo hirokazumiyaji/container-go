@@ -162,7 +162,13 @@ run_with_timeout() {
   timeout_seconds="$1"
   shift
   group_file=$(mktemp "${TMPDIR:-/tmp}/containergo-reaper-group.XXXXXX") || return 1
-  group_value="$group_file.value"
+  # The staging file is allocated with mktemp as well. A predictable sibling
+  # of the handshake file would let another local user in a shared TMPDIR
+  # substitute a symlink and make this write land on one of its own targets.
+  group_value=$(mktemp "${TMPDIR:-/tmp}/containergo-reaper-group-value.XXXXXX") || {
+    rm -f "$group_file" 2>/dev/null || true
+    return 1
+  }
   trap 'rm -f "$group_file" "$group_value" 2>/dev/null || true' 0 1 2 15
   # With monitor mode enabled only for this launch, the supervisor is a
   # process-group leader. It remains alive while the command is reaped and
@@ -1126,6 +1132,10 @@ func (r *reaper) respawnAndReplay(ctx context.Context) (err error) {
 		return err
 	}
 	entries := slices.Clone(r.entries)
+	// A durable intent recorded from here on cannot be part of the records
+	// this replay writes, so its reconciliation request must survive a
+	// successful cycle.
+	snapshotGeneration := r.stateGeneration
 	r.mu.Unlock()
 
 	var lastErr error
@@ -1163,7 +1173,13 @@ func (r *reaper) respawnAndReplay(ctx context.Context) (err error) {
 			r.mu.Lock()
 			if r.process == process {
 				r.clearSpawnFailureLocked()
-				r.clearReconcileRequestLocked()
+				// The live child only knows the snapshot above. An intent
+				// recorded while it was written still needs a cycle of its
+				// own, so the request stays pending and the reconciliation
+				// loop installs the state that is current now.
+				if r.stateGeneration == snapshotGeneration {
+					r.clearReconcileRequestLocked()
+				}
 			}
 			r.mu.Unlock()
 			return nil

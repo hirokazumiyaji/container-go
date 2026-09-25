@@ -623,6 +623,18 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	}
 }
 
+// The handshake file the supervisor waits for is published through a staging
+// file. Both names must come from mktemp: a predictable sibling path can be
+// replaced with a symlink by another local user in a shared TMPDIR.
+func TestReaperScriptAllocatesHandshakeFilesSecurely(t *testing.T) {
+	if strings.Contains(reaperScript, `group_value="$group_file`) {
+		t.Error("reaper script must not stage the handshake through a predictable sibling path")
+	}
+	if !strings.Contains(reaperScript, `group_value=$(mktemp `) {
+		t.Error("reaper script must allocate the handshake staging file with mktemp")
+	}
+}
+
 func TestReaperDisablesMonitorMode(t *testing.T) {
 	if _, err := os.Stat("/bin/sh"); err != nil {
 		t.Skipf("/bin/sh unavailable: %v", err)
@@ -1097,6 +1109,87 @@ func TestReaperReconciliationBackoffEscalatesAndBounds(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatal("reconciliation did not recover after bounded gate retries")
+}
+
+func waitForReaperSpawnCount(t *testing.T, spawns *atomic.Int32, want int32) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if spawns.Load() >= want {
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("reaper spawns = %d, want at least %d", spawns.Load(), want)
+}
+
+func waitForReaperReconcileSettled(t *testing.T, r *reaper, entries int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		r.mu.Lock()
+		pending, running, active := r.reconcilePending, r.reconcileRunning, len(r.entries)
+		r.mu.Unlock()
+		if !pending && !running && active == entries {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	r.mu.Lock()
+	pending, running, active := r.reconcilePending, r.reconcileRunning, len(r.entries)
+	r.mu.Unlock()
+	t.Fatalf("reconciliation did not settle: pending=%v running=%v active=%d, want false/false/%d", pending, running, active, entries)
+}
+
+// A durable intent recorded while the worker replays a snapshot is not part of
+// the records that snapshot writes. The successful cycle must therefore leave
+// the request pending, or the live reaper never learns about the new entry and
+// still deletes the completed one on parent EOF.
+func TestReaperReconcileAppliesIntentRecordedDuringReplay(t *testing.T) {
+	oldWriteTimeout := reaperWriteTimeout
+	reaperWriteTimeout = 2 * time.Second
+	t.Cleanup(func() { reaperWriteTimeout = oldWriteTimeout })
+
+	const entries = 8000
+	dir := t.TempDir()
+	var spawns atomic.Int32
+	r := newReaper("unused", "delete")
+	r.backoff = func(int) time.Duration { return 10 * time.Millisecond }
+	// The child leaves stdin alone long enough for the snapshot to overrun the
+	// pipe buffer, so the first cycle is still replaying when the intents below
+	// are recorded. Each spawn appends to its own log.
+	r.command = func() *exec.Cmd {
+		logPath := filepath.Join(dir, fmt.Sprintf("replay-%d.log", spawns.Add(1)))
+		return exec.Command("/bin/sh", "-c", "/bin/sleep 0.15; cat >> "+reaperShellQuote(logPath))
+	}
+	t.Cleanup(func() {
+		r.closeStdin()
+		waitForReaperExit(t, r)
+	})
+
+	for i := 0; i < entries; i++ {
+		r.recordRegisterIntent(reaperEntry{id: fmt.Sprintf("entry-%04d", i)})
+	}
+	r.requestReconcile()
+
+	// The snapshot is cloned before the child is spawned, so an observed spawn
+	// means the running cycle already replayed the older state.
+	waitForReaperSpawnCount(t, &spawns, 1)
+	time.Sleep(50 * time.Millisecond)
+	r.recordUnregisterIntent(reaperEntry{id: "entry-0000"})
+	r.requestReconcile()
+	r.recordRegisterIntent(reaperEntry{id: "late"})
+	r.requestReconcile()
+
+	waitForReaperReconcileSettled(t, r, entries)
+	firstLog := filepath.Join(dir, "replay-1.log")
+	waitForLogLines(t, firstLog, "+ entry-0000")
+	secondLog := filepath.Join(dir, "replay-2.log")
+	waitForLogLines(t, secondLog, "+ late")
+	second, _ := os.ReadFile(secondLog)
+	if strings.Contains(string(second), "+ entry-0000") {
+		t.Errorf("replay after a mid-cycle cancellation = %q, want no completed entry", second)
+	}
 }
 
 func TestReaperSpawnFailuresRetryAfterBackoff(t *testing.T) {

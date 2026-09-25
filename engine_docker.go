@@ -266,6 +266,17 @@ func dockerNetworkModesMatchDefault(requested, actual string, actualNames []stri
 		}
 		return requested == defaultNetwork
 	}
+	// Docker creates no endpoint for "none" networking, so inspect
+	// reports an empty NetworkSettings.Networks map. Membership proves
+	// nothing there, and the mode string is the only identity Docker
+	// reports; the none-specific errors come from
+	// dockerNetworkEndpointError.
+	if actual == dockerNetworkNone {
+		if requested == "" || requested == dockerNetworkDefault {
+			return defaultNetwork != "" && actual == defaultNetwork
+		}
+		return requested == actual
+	}
 	if !containsNetworkName(actualNames, actual) {
 		return false
 	}

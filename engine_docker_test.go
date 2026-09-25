@@ -812,10 +812,6 @@ func TestDockerEndpointDoesNotTrustRequestedBinding(t *testing.T) {
 }
 
 func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
-	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
-	if err != nil {
-		t.Fatal(err)
-	}
 	cases := []struct {
 		mode         string
 		wantEndpoint string
@@ -828,8 +824,20 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.mode, func(t *testing.T) {
 			d := &dockerRunner{fakeRunner: newTestRunner()}
-			inspectJSON := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1)
-			inspectJSON = strings.Replace(inspectJSON, `"bridge": {`, `"`+tc.mode+`": {`, 1)
+			inspectJSON := ""
+			if tc.mode == dockerNetworkNone {
+				// Docker creates no endpoint for none networking, so the
+				// reported network map is empty. A synthetic "none"
+				// entry would hide mode-check regressions.
+				inspectJSON = string(dockerNoneNetworkInspect(t))
+			} else {
+				data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+				if err != nil {
+					t.Fatal(err)
+				}
+				inspectJSON = strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "`+tc.mode+`"`, 1)
+				inspectJSON = strings.Replace(inspectJSON, `"bridge": {`, `"`+tc.mode+`": {`, 1)
+			}
 			d.inspectJSON = []byte(inspectJSON)
 			opts := []Option{WithName("myctr"), WithNetwork(tc.mode), withRunner(d), withEngine(dockerEngine{})}
 			if tc.mode == "bridge" {
@@ -869,6 +877,59 @@ func TestDockerEndpointNetworkModeMatrix(t *testing.T) {
 				t.Errorf("Endpoint = %q, err = %v; want %q", endpoint, err, tc.wantEndpoint)
 			}
 		})
+	}
+}
+
+// dockerNoneNetworkInspect mirrors what a real Docker daemon reports for
+// a --network none container: no endpoint exists, so the reported network
+// map and port table are empty and only HostConfig.NetworkMode names the
+// mode.
+func dockerNoneNetworkInspect(t *testing.T) []byte {
+	t.Helper()
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspect := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "none"`, 1)
+	inspect = strings.Replace(inspect, `"IPAddress": "172.17.0.2"`, `"IPAddress": ""`, 1)
+	inspect = strings.Replace(inspect, `"Networks": {
+        "bridge": {
+          "IPAddress": "172.17.0.2",
+          "Gateway": "172.17.0.1"
+        }
+      }`, `"Networks": {}`, 1)
+	inspect = strings.Replace(inspect, `"Ports": {
+        "6379/tcp": [
+          { "HostIp": "127.0.0.1", "HostPort": "49153" }
+        ],
+        "8080/tcp": null
+      }`, `"Ports": {}`, 1)
+	if strings.Contains(inspect, `"bridge"`) || strings.Contains(inspect, "49153") {
+		t.Fatal("none-network fixture still carries a bridge endpoint or binding")
+	}
+	return []byte(inspect)
+}
+
+func TestDockerNoneNetworkReportsModeSpecificErrors(t *testing.T) {
+	d := &dockerRunner{
+		fakeRunner:       newTestRunner(),
+		serverOS:         "linux",
+		inspectResponses: [][]byte{dockerNoneNetworkInspect(t)},
+	}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithNetwork(dockerNetworkNone), withRunner(d), withEngine(dockerEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if _, err := ctr.Host(context.Background()); !errors.Is(err, ErrNoReachableHost) || errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("none-mode Host error = %v, want ErrNoReachableHost without ErrNetworkMismatch", err)
+	}
+	// The public API rejects declarations in none mode; add one only to
+	// exercise the defensive endpoint resolver.
+	ctr.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+	_, err = ctr.Endpoint(context.Background(), "6379/tcp")
+	if !errors.Is(err, ErrNoReachableHost) || !errors.Is(err, ErrPortNotExposed) {
+		t.Fatalf("none-mode Endpoint error = %v, want port and host sentinels", err)
 	}
 }
 

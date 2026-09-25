@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -74,6 +75,23 @@ func foreignInspectJSON(name string) string {
 ]`, name, name)
 }
 
+func ownedDockerInspectJSON(name, id string) string {
+	return fmt.Sprintf(`[
+  {
+    "Id": %q,
+    "Name": %q,
+    "State": {"Status": "created"},
+    "Config": {
+      "Image": "redis:7-alpine",
+      "Labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q
+      }
+    }
+  }
+]`, id, "/"+name, sessionID())
+}
+
 func TestRunFailureCleansUpOwnedContainer(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
@@ -89,6 +107,25 @@ func TestRunFailureCleansUpOwnedContainer(t *testing.T) {
 	}
 	if len(r.deleted) != 1 || r.deleted[0] != "myctr" {
 		t.Fatalf("deleted = %v, want [myctr]", r.deleted)
+	}
+}
+
+func TestDockerRunFailureCleansUpOwnedContainerWithVolumePolicy(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	id := strings.Repeat("ab", 32)
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectJSON: ownedDockerInspectJSON("myctr", id),
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(dockerEngine{}))
+	if err == nil {
+		t.Fatal("want error for failed run")
+	}
+	if want := []string{"rm", "--force", "--volumes", id}; !slices.Equal(r.callWith("rm"), want) {
+		t.Fatalf("rm = %v, want %v", r.callWith("rm"), want)
 	}
 }
 

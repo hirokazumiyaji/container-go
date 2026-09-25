@@ -156,8 +156,9 @@ func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
 				t.Fatalf("rm calls = %v, want 2", deletes)
 			}
 			for _, call := range deletes {
-				if len(call) < 3 || !slices.Equal(call[:3], []string{"rm", "--force", "--volumes"}) {
-					t.Errorf("rm call = %v, want volume cleanup flag", call)
+				want := []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				if !slices.Equal(call, want) {
+					t.Errorf("rm call = %v, want %v", call, want)
 				}
 			}
 		})

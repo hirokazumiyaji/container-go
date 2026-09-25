@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os/exec"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -56,6 +57,63 @@ func (t *issue90Target) FollowLogs(context.Context) (io.ReadCloser, error) {
 func (t *issue90Target) ExecCommand(context.Context, []string) (int, error) {
 	t.execCalls.Add(1)
 	return 1, t.execErr
+}
+
+type issue90SuccessfulExecTarget struct {
+	*issue90Target
+}
+
+func (*issue90SuccessfulExecTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+func TestEndpointLaunchErrorIsPermanentForPortAndHTTP(t *testing.T) {
+	launchErr := &exec.Error{Name: "container", Err: errors.New("backend binary not found")}
+	strategies := map[string]func(*issue90Target) error{
+		"port": func(target *issue90Target) error {
+			return ForListeningPort("6379/tcp").
+				WithStartupTimeout(100*time.Millisecond).
+				WithPollInterval(time.Millisecond).
+				WaitUntilReady(context.Background(), target)
+		},
+		"http": func(target *issue90Target) error {
+			return ForHTTP("/ready").
+				WithStartupTimeout(100*time.Millisecond).
+				WithPollInterval(time.Millisecond).
+				WaitUntilReady(context.Background(), target)
+		},
+	}
+	for name, wait := range strategies {
+		t.Run(name, func(t *testing.T) {
+			target := &issue90Target{endpointErr: launchErr}
+			err := wait(target)
+			var got *exec.Error
+			if !errors.As(err, &got) || got != launchErr {
+				t.Fatalf("error = %v, want permanent *exec.Error", err)
+			}
+			if got := target.endpointCalls.Load(); got != 1 {
+				t.Fatalf("Endpoint calls = %d, want one fail-fast launch attempt", got)
+			}
+		})
+	}
+}
+
+func TestStateLaunchErrorIsPermanentAfterSuccessfulCheck(t *testing.T) {
+	launchErr := &exec.Error{Name: "container", Err: errors.New("backend binary not found")}
+	target := &issue90SuccessfulExecTarget{issue90Target: &issue90Target{
+		runningErrs: []error{launchErr},
+	}}
+	err := ForExec([]string{"true"}).
+		WithStartupTimeout(100*time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	var got *exec.Error
+	if !errors.As(err, &got) || got != launchErr {
+		t.Fatalf("error = %v, want permanent state launch error", err)
+	}
+	if got := target.runningCalls.Load(); got != 1 {
+		t.Fatalf("Running calls = %d, want one final state launch attempt", got)
+	}
 }
 
 func TestWaitRejectsInvalidConfigurationBeforeTargetCalls(t *testing.T) {

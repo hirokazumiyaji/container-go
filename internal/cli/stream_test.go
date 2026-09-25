@@ -150,12 +150,22 @@ func TestStreamRetainsTerminalStderrTail(t *testing.T) {
 	}
 }
 
-const terminalErrorExitHelperEnv = "CONTAINER_GO_TERMINAL_ERROR_EXIT_HELPER"
+const (
+	terminalErrorExitHelperEnv     = "CONTAINER_GO_TERMINAL_ERROR_EXIT_HELPER"
+	terminalErrorExitCodeHelperEnv = "CONTAINER_GO_TERMINAL_ERROR_EXIT_CODE"
+)
 
 func terminalErrorExitError(t *testing.T) *exec.ExitError {
+	return terminalErrorExitErrorWithCode(t, 17)
+}
+
+func terminalErrorExitErrorWithCode(t *testing.T, code int) *exec.ExitError {
 	t.Helper()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestTerminalErrorExitHelper$")
-	cmd.Env = append(os.Environ(), terminalErrorExitHelperEnv+"=1")
+	cmd.Env = append(os.Environ(),
+		terminalErrorExitHelperEnv+"=1",
+		terminalErrorExitCodeHelperEnv+"="+strconv.Itoa(code),
+	)
 	err := cmd.Run()
 	var exitErr *exec.ExitError
 	if !errors.As(err, &exitErr) {
@@ -166,7 +176,15 @@ func terminalErrorExitError(t *testing.T) *exec.ExitError {
 
 func TestTerminalErrorExitHelper(t *testing.T) {
 	if os.Getenv(terminalErrorExitHelperEnv) == "1" {
-		os.Exit(17)
+		code := 17
+		if value := os.Getenv(terminalErrorExitCodeHelperEnv); value != "" {
+			var err error
+			code, err = strconv.Atoi(value)
+			if err != nil {
+				os.Exit(2)
+			}
+		}
+		os.Exit(code)
 	}
 }
 

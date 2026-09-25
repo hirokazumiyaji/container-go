@@ -96,7 +96,8 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
-	cmd.Cancel = func() error { return terminateProcessTree(cmd) }
+	tree := &lazyProcessTree{}
+	cmd.Cancel = func() error { return tree.terminate(cmd).err }
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -105,6 +106,7 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	cmd.WaitDelay = 3 * time.Second
 
 	err := cmd.Run()
+	tree.close()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.

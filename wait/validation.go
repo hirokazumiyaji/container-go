@@ -3,6 +3,7 @@ package wait
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"reflect"
 	"strconv"
 	"strings"
@@ -69,10 +70,14 @@ func isPermanentCheckError(err error) bool {
 	if errors.As(err, &fatalPointer) && fatalPointer != nil {
 		return true
 	}
-	return errors.Is(err, ErrPortNotExposed) ||
+	if errors.Is(err, ErrPortNotExposed) ||
 		errors.Is(err, ErrContainerNotFound) ||
 		errors.Is(err, ErrInvalidConfiguration) ||
-		errors.Is(err, errLogLineTooLong)
+		errors.Is(err, errLogLineTooLong) {
+		return true
+	}
+	var launchErr *exec.Error
+	return errors.As(err, &launchErr)
 }
 
 // isTerminalStreamError identifies a backend process that has already

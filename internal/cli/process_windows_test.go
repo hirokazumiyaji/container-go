@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -100,6 +101,42 @@ func TestTerminateProcessTreeUsesRetainedProcessHandle(t *testing.T) {
 	}
 	if err := waitProcessHelper(waitDone); err != nil {
 		t.Fatalf("%v (cleanup: %v)", err, stopProcessHelper(cmd, waitDone))
+	}
+}
+
+func TestCancellationEvidenceSuppressesWindowsKillExitOneOnly(t *testing.T) {
+	exitErr := terminalErrorExitErrorWithCode(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:                      ctx,
+		binary:                   "docker",
+		args:                     []string{"logs", "--follow", "x"},
+		stderr:                   &tailBuffer{},
+		cancelled:                true,
+		terminatedByCancellation: true,
+	}
+	ps.drainCompleted.Store(true)
+	err := ps.terminalError(exitErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled kill result = %v, want context cancellation", err)
+	}
+	var suppressed *CLIError
+	if errors.As(err, &suppressed) {
+		t.Fatalf("cancelled kill result = %v, unexpectedly retained CLIError", err)
+	}
+
+	genuine := &processStream{
+		ctx:    ctx,
+		binary: "docker",
+		args:   []string{"logs", "--follow", "x"},
+		stderr: &tailBuffer{},
+	}
+	genuine.drainCompleted.Store(true)
+	err = genuine.terminalError(exitErr)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 1 {
+		t.Fatalf("genuine exit result = %v, want exit-1 CLIError", err)
 	}
 }
 

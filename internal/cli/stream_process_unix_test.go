@@ -9,9 +9,68 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
+
+func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
+	cmd := exec.Command("sleep", "5")
+	configureProcessTree(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	groupReached := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseNow := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		releaseNow()
+	})
+
+	ops := unixProcessOps{
+		signal:  (*os.Process).Signal,
+		getpgid: syscall.Getpgid,
+		killGroup: func(pid int, sig syscall.Signal) error {
+			close(groupReached)
+			<-release
+			return syscall.Kill(pid, sig)
+		},
+		kill: cmd.Process.Kill,
+	}
+	resultDone := make(chan terminationResult, 1)
+	go func() { resultDone <- terminateProcessTreeWithOps(cmd, ops) }()
+	select {
+	case <-groupReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("termination did not reach the group signal")
+	}
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case <-waitDone:
+		t.Fatal("waiter completed while the pinned child awaited group termination")
+	case <-time.After(50 * time.Millisecond):
+	}
+	releaseNow()
+
+	select {
+	case result := <-resultDone:
+		if !result.active || result.err != nil {
+			t.Fatalf("termination result = %+v, want active successful signal", result)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("termination did not complete after group release")
+	}
+	select {
+	case <-waitDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("waiter did not observe group termination")
+	}
+}
 
 func TestStreamCloseTerminatesDescendants(t *testing.T) {
 	pidFile := filepath.Join(t.TempDir(), "descendant.pid")

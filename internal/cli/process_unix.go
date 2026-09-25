@@ -11,37 +11,108 @@ import (
 
 // configureProcessTree gives each CLI invocation its own process group.
 // The group is a termination boundary only: signaling it can terminate
-// descendants that remain in the group, but it does not reap them. Once
-// the direct child is gone, the platform init/subreaper owns descendant
-// zombies; descendants that deliberately detach are outside the boundary.
+// descendants that remain in the group, but it does not reap them.
 func configureProcessTree(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// terminateProcessTree is called while the stream still owns the direct
-// child. It never uses the process-group ID after the direct child has been
-// waited, because that ID can be reused by an unrelated process.
-func terminateProcessTree(cmd *exec.Cmd) error {
+type unixProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) {
+	return unixProcessTree{}, nil
+}
+
+func (unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
+	return terminateProcessTreeResult(cmd)
+}
+
+func (unixProcessTree) close() {}
+
+func terminateDirectProcessResult(cmd *exec.Cmd) terminationResult {
 	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
+		return terminationResult{err: os.ErrProcessDone}
 	}
-	// os.Process retains its own done state. In particular, signal 0
-	// returns os.ErrProcessDone after the direct child has been waited even
-	// if the numeric PID has already been reused.
-	if err := cmd.Process.Signal(syscall.Signal(0)); err != nil {
+	if err := cmd.Process.Kill(); err != nil {
+		return terminationResult{err: err}
+	}
+	return terminationResult{active: true}
+}
+
+type unixProcessOps struct {
+	signal    func(*os.Process, os.Signal) error
+	getpgid   func(int) (int, error)
+	killGroup func(int, syscall.Signal) error
+	kill      func() error
+}
+
+func defaultUnixProcessOps(cmd *exec.Cmd) unixProcessOps {
+	return unixProcessOps{
+		signal:    (*os.Process).Signal,
+		getpgid:   syscall.Getpgid,
+		killGroup: syscall.Kill,
+		kill:      cmd.Process.Kill,
+	}
+}
+
+// terminateProcessTree pins the direct child with SIGSTOP before addressing
+// its numeric process group. os.Process serializes Signal with Wait: if Wait
+// has already released the child, Signal returns os.ErrProcessDone; if the
+// signal succeeds, the child cannot exit and be reaped before the group
+// signal. Getpgid then prevents signaling a recycled group if the child
+// changed groups after Start.
+func terminateProcessTreeResult(cmd *exec.Cmd) terminationResult {
+	return terminateProcessTreeWithOps(cmd, defaultUnixProcessOps(cmd))
+}
+
+func terminateProcessTreeWithOps(cmd *exec.Cmd, ops unixProcessOps) terminationResult {
+	if cmd == nil || cmd.Process == nil {
+		return terminationResult{err: os.ErrProcessDone}
+	}
+	if err := ops.signal(cmd.Process, syscall.SIGSTOP); err != nil {
 		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
+			return terminationResult{err: os.ErrProcessDone}
 		}
-		// EPERM (and unusual platform-specific errors) still mean that a
-		// process handle exists; retain the best-effort group signal.
+		// A failed pin cannot make a numeric group signal safe. The
+		// retained direct process handle is still safe to terminate.
+		if killErr := ops.kill(); killErr != nil {
+			if errors.Is(killErr, os.ErrProcessDone) {
+				return terminationResult{err: os.ErrProcessDone}
+			}
+			return terminationResult{err: errors.Join(err, killErr)}
+		}
+		return terminationResult{}
 	}
-	if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err == nil {
-		return nil
-	} else if !errors.Is(err, syscall.ESRCH) {
-		return err
+
+	var groupErr error
+	groupSignaled := false
+	if pgid, err := ops.getpgid(cmd.Process.Pid); err == nil && pgid == cmd.Process.Pid {
+		groupErr = ops.killGroup(-cmd.Process.Pid, syscall.SIGKILL)
+		groupSignaled = groupErr == nil
 	}
-	// A process group can disappear between the liveness check and the
-	// signal. The direct child is still owned here, so this fallback does
-	// not target a reused PID.
-	return cmd.Process.Kill()
+
+	if errors.Is(groupErr, syscall.ESRCH) {
+		groupErr = nil
+		groupSignaled = false
+	}
+	killErr := ops.kill()
+	switch {
+	case killErr == nil:
+		if groupErr != nil {
+			return terminationResult{active: true, err: groupErr}
+		}
+		return terminationResult{active: true}
+	case errors.Is(killErr, os.ErrProcessDone):
+		if groupSignaled {
+			return terminationResult{active: true}
+		}
+		return terminationResult{err: killErr}
+	case groupErr != nil:
+		return terminationResult{err: errors.Join(groupErr, killErr)}
+	default:
+		return terminationResult{err: killErr}
+	}
+}
+
+func terminateProcessTree(cmd *exec.Cmd) error {
+	return terminateProcessTreeResult(cmd).err
 }

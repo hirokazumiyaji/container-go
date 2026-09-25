@@ -57,24 +57,19 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 	pr, pw := io.Pipe()
-	terminateTree := hooks.terminate
-	if terminateTree == nil {
-		terminateTree = terminateProcessTree
-	}
 	stream := &processStream{
-		ReadCloser:    pr,
-		cmd:           cmd,
-		ctx:           ctx,
-		binary:        bin,
-		args:          append([]string(nil), args...),
-		output:        pw,
-		stderr:        &tailBuffer{},
-		stdoutRead:    stdoutRead,
-		stderrRead:    stderrRead,
-		startDone:     make(chan struct{}),
-		waitDone:      make(chan struct{}),
-		pumpsDone:     make(chan struct{}),
-		terminateTree: terminateTree,
+		ReadCloser: pr,
+		cmd:        cmd,
+		ctx:        ctx,
+		binary:     bin,
+		args:       append([]string(nil), args...),
+		output:     pw,
+		stderr:     &tailBuffer{},
+		stdoutRead: stdoutRead,
+		stderrRead: stderrRead,
+		startDone:  make(chan struct{}),
+		waitDone:   make(chan struct{}),
+		pumpsDone:  make(chan struct{}),
 	}
 	cmd.Stdout = stdoutWrite
 	cmd.Stderr = stderrWrite
@@ -99,6 +94,18 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	// race ownership of them.
 	_ = stdoutWrite.Close()
 	_ = stderrWrite.Close()
+
+	var tree processTree
+	if hooks.terminate != nil {
+		tree = processTreeFunc(hooks.terminate)
+	} else {
+		tree, err = newProcessTree(cmd)
+		if err != nil {
+			tree = directProcessTree{}
+		}
+	}
+	stream.terminateTree = tree.terminate
+	stream.closeTree = tree.close
 
 	// Publish ownership only after Start has returned successfully. A
 	// context cancellation delivered by os/exec waits on startDone before
@@ -169,9 +176,11 @@ type processStream struct {
 	terminalDrain   atomic.Bool
 	drainCompleted  atomic.Bool
 
-	terminateOnce sync.Once
-	terminateErr  error
-	terminateTree func(*exec.Cmd) error
+	terminateOnce            sync.Once
+	terminateErr             error
+	terminateTree            func(*exec.Cmd) terminationResult
+	closeTree                func()
+	terminatedByCancellation bool
 
 	closeOnce sync.Once
 	stateMu   sync.Mutex
@@ -228,6 +237,12 @@ func (s *processStream) wait() {
 		s.stateMu.Lock()
 		s.waitErr = err
 		s.ctxErr = ctxErr
+		// Close the platform ownership handle while holding stateMu. A
+		// termination request holds the same lock through its signaling
+		// decision, so the handle cannot be closed underneath it.
+		if s.closeTree != nil {
+			s.closeTree()
+		}
 		// Cmd.Wait has returned, so this process is no longer ours to
 		// signal. In particular, never use its PID/PGID after this point:
 		// the kernel may immediately reuse either identifier.
@@ -263,7 +278,14 @@ func (s *processStream) requestTermination(cancelled bool) error {
 	// the child reaped, a delayed Close or context callback observes the
 	// reaped flag and cannot signal a stale PID/PGID.
 	s.terminateOnce.Do(func() {
-		s.terminateErr = s.terminateTree(s.cmd)
+		result := terminationResult{err: os.ErrProcessDone}
+		if s.terminateTree != nil {
+			result = s.terminateTree(s.cmd)
+		}
+		s.terminateErr = result.err
+		if cancelled && result.active {
+			s.terminatedByCancellation = true
+		}
 	})
 	terminateErr := s.terminateErr
 	s.stateMu.Unlock()
@@ -353,6 +375,7 @@ func (s *processStream) terminalError(waitErr error) error {
 	s.stateMu.Lock()
 	closed := s.closed
 	cancelled := s.cancelled
+	terminatedByCancellation := s.terminatedByCancellation
 	ctxErr := s.ctxErr
 	s.stateMu.Unlock()
 	if closed {
@@ -360,6 +383,9 @@ func (s *processStream) terminalError(waitErr error) error {
 	}
 	var exitErr *exec.ExitError
 	hasExit := errors.As(waitErr, &exitErr)
+	if cancelled && terminatedByCancellation {
+		return s.contextError()
+	}
 	if cancelled && (!hasExit || exitErr.ExitCode() < 0) {
 		return s.contextError()
 	}

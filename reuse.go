@@ -476,7 +476,8 @@ func reusePortsReady(info *engineInfo, cfg *config) bool {
 // deleteStoppedReuse removes a stopped reuse container only after
 // verifying the managed, reuse, and creation labels on the inspected
 // container. The image-aware production path additionally verifies the
-// requested image. A fresh inspect must still be StateStopped; a
+// requested image. A fresh inspect must still be StateStopped; Docker
+// binds that inspect and deletion to the original immutable UID, while a
 // same-generation running replacement is therefore never deleted.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	return deleteStoppedReuseWithImage(ctx, cfg, info, "")
@@ -488,6 +489,12 @@ func deleteStoppedReuseWithImage(ctx context.Context, cfg *config, info *engineI
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+	if requiresImmutableID(cfg.eng) {
+		if !validImmutableID(cfg.eng, info.uid) {
+			return fmt.Errorf("reuse %s: stopped generation has no valid immutable ID", cfg.name)
+		}
+		ctr.uid = info.uid
+	}
 	if image != "" {
 		if err := checkReuseOwned(info, image, cfg); err != nil {
 			return err

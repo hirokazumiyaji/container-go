@@ -323,6 +323,16 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	return nil
 }
 
+// lockNameForBackend acquires the cross-process name barrier only for the
+// name-addressed Apple backend. Docker operations are bound to an immutable
+// container ID and must not depend on account cache state.
+func lockNameForBackend(ctx context.Context, eng engine, name string) (func(), error) {
+	if eng.name() != "apple" {
+		return func() {}, nil
+	}
+	return lockName(ctx, name)
+}
+
 // cleanupFailedCreate best-effort removes the container this Run left
 // behind after a failed create. It never deletes a pre-existing
 // same-name container: name conflicts are skipped, and only a container
@@ -340,7 +350,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
+	unlock, err := lockNameForBackend(cleanupCtx, cfg.eng, cfg.name)
 	if err != nil {
 		return fmt.Errorf("cleanup container %s: lock name: %w", cfg.name, err)
 	}
@@ -546,10 +556,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 	return err
 }
 
-// terminateByName performs the locked inspect/delete critical section for
-// a name-addressed operation. expected is the generation/identity seen by
-// the caller before this fresh inspect; a nil expected value uses c's
-// creation generation. stoppedOnly prevents deletion unless the fresh
+// terminateByName performs a generation-checked inspect/delete operation.
+// Apple holds its cross-process name lock for the critical section; Docker
+// uses the verified immutable ID directly. expected is the generation/identity
+// seen by the caller before this fresh inspect; a nil expected value uses
+// c's creation generation. stoppedOnly prevents deletion unless the fresh
 // object is actually stopped.
 func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, stoppedOnly bool) (bool, error) {
 	return c.terminateByNameWithImage(ctx, expected, stoppedOnly, "")
@@ -558,7 +569,7 @@ func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, s
 func (c *Container) terminateByNameWithImage(ctx context.Context, expected *engineInfo, stoppedOnly bool, image string) (bool, error) {
 	ctx, cancel := withMaxTimeout(ctx, terminateTimeout)
 	defer cancel()
-	unlock, err := lockName(ctx, c.id)
+	unlock, err := lockNameForBackend(ctx, c.eng, c.id)
 	if err != nil {
 		return false, fmt.Errorf("terminate %s: lock name: %w", c.id, err)
 	}

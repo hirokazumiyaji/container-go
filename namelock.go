@@ -7,8 +7,9 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // lockName serializes generation-checked, name-addressed deletes of one
@@ -29,14 +30,14 @@ func lockName(ctx context.Context, name string) (unlock func(), err error) {
 		return nil, err
 	}
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB)
 		if err == nil {
 			return func() {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !errors.Is(err, unix.EWOULDBLOCK) {
 			_ = f.Close()
 			return nil, err
 		}

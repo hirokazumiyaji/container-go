@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"sync"
@@ -96,8 +97,18 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
-	tree := &lazyProcessTree{}
-	cmd.Cancel = func() error { return tree.terminate(cmd).err }
+	startDone := make(chan struct{})
+	var treeMu sync.Mutex
+	var tree processTree
+	cmd.Cancel = func() error {
+		<-startDone
+		treeMu.Lock()
+		defer treeMu.Unlock()
+		if tree == nil {
+			return os.ErrProcessDone
+		}
+		return tree.terminate(cmd).err
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -105,8 +116,25 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
-	tree.close()
+	if err := cmd.Start(); err != nil {
+		close(startDone)
+		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	ownedTree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		ownedTree = directProcessTree{}
+	}
+	treeMu.Lock()
+	tree = ownedTree
+	treeMu.Unlock()
+	close(startDone)
+
+	err := cmd.Wait()
+	treeMu.Lock()
+	if tree != nil {
+		tree.close()
+	}
+	treeMu.Unlock()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.

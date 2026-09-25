@@ -1,4 +1,4 @@
-//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || illumos
 
 package cli
 
@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 // configureProcessTree gives each CLI invocation its own process group.
@@ -48,8 +50,8 @@ type unixProcessOps struct {
 func defaultUnixProcessOps(cmd *exec.Cmd) unixProcessOps {
 	return unixProcessOps{
 		signal:    (*os.Process).Signal,
-		getpgid:   syscall.Getpgid,
-		killGroup: syscall.Kill,
+		getpgid:   unix.Getpgid,
+		killGroup: unix.Kill,
 		kill:      cmd.Process.Kill,
 	}
 }

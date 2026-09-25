@@ -1,17 +1,15 @@
 package cli
 
-import (
-	"os/exec"
-	"sync"
-)
+import "os/exec"
 
 // terminationResult records whether termination was actually signaled to
-// the direct child. Exit status alone is not enough to distinguish a
-// genuine backend failure from a platform kill during intentional
-// cancellation.
+// the direct child. syntheticExit is reserved for platforms whose kill API
+// reports a synthetic positive exit status, such as Windows
+// TerminateProcess; it must not suppress a genuine positive Unix exit.
 type terminationResult struct {
-	active bool
-	err    error
+	active        bool
+	syntheticExit bool
+	err           error
 }
 
 // processTree is the platform-owned termination boundary for one command.
@@ -38,29 +36,3 @@ func (directProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 }
 
 func (directProcessTree) close() {}
-
-type lazyProcessTree struct {
-	mu   sync.Mutex
-	tree processTree
-}
-
-func (l *lazyProcessTree) terminate(cmd *exec.Cmd) terminationResult {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.tree == nil {
-		tree, err := newProcessTree(cmd)
-		if err != nil {
-			tree = directProcessTree{}
-		}
-		l.tree = tree
-	}
-	return l.tree.terminate(cmd)
-}
-
-func (l *lazyProcessTree) close() {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	if l.tree != nil {
-		l.tree.close()
-	}
-}

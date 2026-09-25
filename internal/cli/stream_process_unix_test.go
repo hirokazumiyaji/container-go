@@ -1,9 +1,10 @@
-//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris || illumos
 
 package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,6 +14,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
@@ -32,11 +35,11 @@ func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
 
 	ops := unixProcessOps{
 		signal:  (*os.Process).Signal,
-		getpgid: syscall.Getpgid,
+		getpgid: unix.Getpgid,
 		killGroup: func(pid int, sig syscall.Signal) error {
 			close(groupReached)
 			<-release
-			return syscall.Kill(pid, sig)
+			return unix.Kill(pid, sig)
 		},
 		kill: cmd.Process.Kill,
 	}
@@ -69,6 +72,28 @@ func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
 	case <-waitDone:
 	case <-time.After(2 * time.Second):
 		t.Fatal("waiter did not observe group termination")
+	}
+}
+
+func TestUnixCancellationPreservesGenuinePositiveExit(t *testing.T) {
+	exitErr := terminalErrorExitErrorWithCode(t, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ps := &processStream{
+		ctx:       ctx,
+		binary:    "docker",
+		args:      []string{"logs", "--follow", "x"},
+		stderr:    &tailBuffer{},
+		cancelled: true,
+	}
+	ps.drainCompleted.Store(true)
+	err := ps.terminalError(exitErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("terminal error = %v, want context cancellation", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 1 {
+		t.Fatalf("terminal error = %v, want genuine exit-1 CLIError", err)
 	}
 }
 

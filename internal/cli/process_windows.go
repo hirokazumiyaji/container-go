@@ -22,6 +22,9 @@ type windowsProcessTree struct {
 	process windows.Handle
 }
 
+// newProcessTree is called after Start and before the sole Wait. The handle
+// opened here is retained for all later cancellation attempts; no later path
+// looks up the process by its numeric PID.
 func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 	if cmd == nil || cmd.Process == nil {
 		return nil, os.ErrProcessDone
@@ -47,7 +50,7 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 	}
 	terminateErr := windows.TerminateProcess(t.process, 1)
 	if terminateErr == nil {
-		return terminationResult{active: true}
+		return terminationResult{active: true, syntheticExit: true}
 	}
 	if cmd == nil || cmd.Process == nil {
 		return terminationResult{err: terminateErr}
@@ -56,7 +59,7 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		if activeErr != nil {
 			terminateErr = errors.Join(terminateErr, activeErr)
 		}
-		return terminationResult{active: true, err: terminateErr}
+		return terminationResult{active: true, syntheticExit: true, err: terminateErr}
 	} else if errors.Is(killErr, os.ErrProcessDone) {
 		return terminationResult{err: errors.Join(terminateErr, killErr)}
 	} else {
@@ -83,28 +86,10 @@ func terminateDirectProcessResult(cmd *exec.Cmd) terminationResult {
 	if cmd == nil || cmd.Process == nil {
 		return terminationResult{err: os.ErrProcessDone}
 	}
-	active := false
-	known := false
-	process, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
-		false,
-		uint32(cmd.Process.Pid),
-	)
-	if err == nil {
-		active, err = windowsProcessActive(process)
-		_ = windows.CloseHandle(process)
-		known = err == nil
+	if err := cmd.Process.Kill(); err != nil {
+		return terminationResult{err: err}
 	}
-	if known && !active {
-		return terminationResult{err: os.ErrProcessDone}
-	}
-	if killErr := cmd.Process.Kill(); killErr == nil {
-		return terminationResult{active: known && active}
-	} else if errors.Is(killErr, os.ErrProcessDone) {
-		return terminationResult{err: killErr}
-	} else {
-		return terminationResult{err: killErr}
-	}
+	return terminationResult{active: true, syntheticExit: true}
 }
 
 func terminateProcessTreeResult(cmd *exec.Cmd) terminationResult {

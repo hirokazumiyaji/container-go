@@ -176,11 +176,11 @@ type processStream struct {
 	terminalDrain   atomic.Bool
 	drainCompleted  atomic.Bool
 
-	terminateOnce            sync.Once
-	terminateErr             error
-	terminateTree            func(*exec.Cmd) terminationResult
-	closeTree                func()
-	terminatedByCancellation bool
+	terminateOnce        sync.Once
+	terminateErr         error
+	terminateTree        func(*exec.Cmd) terminationResult
+	closeTree            func()
+	syntheticTermination bool
 
 	closeOnce sync.Once
 	stateMu   sync.Mutex
@@ -283,8 +283,8 @@ func (s *processStream) requestTermination(cancelled bool) error {
 			result = s.terminateTree(s.cmd)
 		}
 		s.terminateErr = result.err
-		if cancelled && result.active {
-			s.terminatedByCancellation = true
+		if cancelled && result.active && result.syntheticExit {
+			s.syntheticTermination = true
 		}
 	})
 	terminateErr := s.terminateErr
@@ -375,7 +375,7 @@ func (s *processStream) terminalError(waitErr error) error {
 	s.stateMu.Lock()
 	closed := s.closed
 	cancelled := s.cancelled
-	terminatedByCancellation := s.terminatedByCancellation
+	syntheticTermination := s.syntheticTermination
 	ctxErr := s.ctxErr
 	s.stateMu.Unlock()
 	if closed {
@@ -383,7 +383,7 @@ func (s *processStream) terminalError(waitErr error) error {
 	}
 	var exitErr *exec.ExitError
 	hasExit := errors.As(waitErr, &exitErr)
-	if cancelled && terminatedByCancellation {
+	if cancelled && syntheticTermination {
 		return s.contextError()
 	}
 	if cancelled && (!hasExit || exitErr.ExitCode() < 0) {

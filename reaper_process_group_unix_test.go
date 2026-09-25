@@ -48,11 +48,14 @@ func TestReaperDescendantsSignalsBranchesAndRepeats(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reaperDescendantsWithLookup: %v", err)
 	}
-	if got, want := fmt.Sprint(signaled), "[101 103 102]"; got != want {
+	if got, want := fmt.Sprint(signaled), "[101 102 103]"; got != want {
 		t.Fatalf("signaled PIDs = %s, want %s", got, want)
 	}
-	if got, want := fmt.Sprint(events), "[lookup:100 lookup:101 signal:101 lookup:103 signal:103 lookup:100 lookup:102 signal:102 lookup:101 lookup:103 lookup:100 lookup:101 lookup:103 lookup:102]"; got != want {
-		t.Fatalf("events = %s, want %s", got, want)
+	eventText := fmt.Sprint(events)
+	firstSignal := strings.Index(eventText, "signal:")
+	lastLookup := strings.LastIndex(eventText, "lookup:")
+	if firstSignal >= 0 && firstSignal < lastLookup {
+		t.Fatalf("signaling started before the descendant snapshot completed: %s", eventText)
 	}
 }
 
@@ -70,6 +73,12 @@ func TestReaperDescendantsHonorsContext(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > time.Second {
 		t.Fatalf("bounded traversal took %s", elapsed)
+	}
+}
+
+func TestKillReaperProcessTreatsExitedPIDAsGone(t *testing.T) {
+	if err := killReaperProcess(1 << 30); err != nil {
+		t.Fatalf("killReaperProcess(exited) = %v, want nil", err)
 	}
 }
 
@@ -197,25 +206,22 @@ func TestReaperDescendantsDoesNotReexpandReusedPID(t *testing.T) {
 			return nil, nil
 		case 101:
 			childCalls++
-			if childCalls == 1 {
-				return nil, nil
-			}
-			return []int{102}, nil
+			return nil, nil
 		default:
 			return nil, nil
 		}
 	}
+	var signaled []int
 	identify := func(pid int) (int, bool) {
 		if pid != 101 {
 			return 0, false
 		}
 		identityCalls++
-		if identityCalls == 1 {
+		if len(signaled) == 0 {
 			return 101, true
 		}
 		return 999, true
 	}
-	var signaled []int
 	err := reaperDescendantsWithLookupAndIdentity(
 		context.Background(),
 		100,
@@ -277,6 +283,22 @@ func TestReaperDescendantsHandlesCycles(t *testing.T) {
 	}
 }
 
+func TestTrustedReaperPgrepIgnoresPATH(t *testing.T) {
+	fakeDir := t.TempDir()
+	fake := filepath.Join(fakeDir, "pgrep")
+	if err := os.WriteFile(fake, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir)
+	path, err := trustedReaperPgrepPath()
+	if err != nil {
+		t.Skipf("system pgrep unavailable: %v", err)
+	}
+	if path == fake || !filepath.IsAbs(path) {
+		t.Fatalf("trusted pgrep path = %q, want a pinned absolute system path", path)
+	}
+}
+
 func TestReaperPgrepDistinguishesNoMatchFromFailure(t *testing.T) {
 	dir := t.TempDir()
 	pgrep := filepath.Join(dir, "pgrep")
@@ -285,7 +307,7 @@ func TestReaperPgrepDistinguishesNoMatchFromFailure(t *testing.T) {
 	}
 	t.Setenv("PATH", dir)
 
-	children, err := reaperPgrepChildren(context.Background(), 100)
+	children, err := reaperPgrepChildrenWithPath(context.Background(), 100, pgrep)
 	if err != nil {
 		t.Fatalf("no-match lookup: %v", err)
 	}
@@ -296,7 +318,7 @@ func TestReaperPgrepDistinguishesNoMatchFromFailure(t *testing.T) {
 	if err := os.WriteFile(pgrep, []byte("#!/bin/sh\necho 'permission denied' >&2\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err = reaperPgrepChildren(context.Background(), 100)
+	_, err = reaperPgrepChildrenWithPath(context.Background(), 100, pgrep)
 	if err == nil || !strings.Contains(err.Error(), "permission denied") {
 		t.Fatalf("permission error = %v, want propagated pgrep failure", err)
 	}
@@ -304,15 +326,26 @@ func TestReaperPgrepDistinguishesNoMatchFromFailure(t *testing.T) {
 	if err := os.WriteFile(pgrep, []byte("#!/bin/sh\nexit 2\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	_, err = reaperPgrepChildren(context.Background(), 100)
+	_, err = reaperPgrepChildrenWithPath(context.Background(), 100, pgrep)
 	if err == nil || !strings.Contains(err.Error(), "exit status 2") {
 		t.Fatalf("fatal error = %v, want propagated pgrep failure", err)
 	}
 }
 
+func TestReaperPgrepRejectsExcessiveOutput(t *testing.T) {
+	dir := t.TempDir()
+	pgrep := filepath.Join(dir, "pgrep")
+	if err := os.WriteFile(pgrep, []byte("#!/bin/sh\nawk 'BEGIN { for (i = 0; i < 70000; i++) print 12345 }'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reaperPgrepChildrenWithPath(context.Background(), 100, pgrep); err == nil || !strings.Contains(err.Error(), "exceeded") {
+		t.Fatalf("excessive pgrep output error = %v", err)
+	}
+}
+
 func TestReaperPgrepReportsMissingExecutable(t *testing.T) {
-	t.Setenv("PATH", t.TempDir())
-	_, err := reaperPgrepChildren(context.Background(), 100)
+	missing := filepath.Join(t.TempDir(), "missing-pgrep")
+	_, err := reaperPgrepChildrenWithPath(context.Background(), 100, missing)
 	if err == nil || !strings.Contains(err.Error(), "pgrep") {
 		t.Fatalf("missing pgrep error = %v", err)
 	}

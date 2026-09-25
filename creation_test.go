@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -105,6 +106,9 @@ func TestRunAddsCreationLabel(t *testing.T) {
 }
 
 func TestReaperSkipsReplacedGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the watchdog reaper requires a POSIX shell")
+	}
 	// Stub binary: inspect prints the *current* creation, delete logs.
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -133,6 +137,9 @@ func TestReaperSkipsReplacedGeneration(t *testing.T) {
 }
 
 func TestReaperDeletesMatchingGeneration(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the watchdog reaper requires a POSIX shell")
+	}
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/ctr"

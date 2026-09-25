@@ -8,15 +8,22 @@ import (
 )
 
 // Solaris exposes Setpgid and negative-PID kill, but its Go syscall
-// package does not expose Getpgid. Probe the group before signaling it;
-// a missing group is handled as a direct-process kill by the caller.
+// package does not expose Getpgid. Probe the group first. ESRCH for the
+// negative probe can also mean that this PID is a live non-leader, so use a
+// positive liveness probe before reporting that the process is gone.
 func reaperProcessGroupID(pid int) (int, error) {
 	err := syscall.Kill(-pid, syscall.Signal(0))
 	if err == nil {
 		return pid, nil
 	}
-	if errors.Is(err, syscall.ESRCH) {
-		return 0, nil
+	if !errors.Is(err, syscall.ESRCH) {
+		return 0, err
 	}
-	return 0, err
+	if err := syscall.Kill(pid, syscall.Signal(0)); err == nil {
+		return 0, nil
+	} else if errors.Is(err, syscall.ESRCH) {
+		return 0, err
+	} else {
+		return 0, err
+	}
 }

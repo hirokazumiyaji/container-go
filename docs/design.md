@@ -320,16 +320,21 @@ immutable ID or an atomic conditional delete that Apple Container does
 not provide. An inspect
 failure other than not-found aborts the delete (fail closed); `Run`'s
 rollback reports a container left behind that way in its error rather
-than hiding it. The watchdog reaper registers Docker containers by
-`Id`; for Apple it stores the generation, reads the label as a
-line-anchored JSON field (`"key": "value"`, never a substring), and
-skips deletion on mismatch. Each reaper entry's complete
-inspect/status-marker/filter/delete pipeline carries a bounded 30s timeout
-via POSIX `sleep`/`kill` (no `timeout(1)` dependency), and the timeout kills
-and reaps the local pipeline and descendants so one hung daemon call cannot
-wedge the rest. The leader's own pull/create uses an
-independent `runTimeout` budget; `reuseAttachTimeout` bounds only
-attach polling for another process's container.
+than hiding it. The watchdog reaper accepts a full 64-character lowercase
+Docker ID as an immutable identity. A Docker entry that is generation-bound
+may start from a name, but cleanup inspects it and requires the same full ID
+before deleting; it never falls back to the name. Generationless Docker name
+entries are rejected and logged. For Apple, the reaper stores the generation,
+reads the label as a line-anchored JSON field (`"key": "value"`, never a
+substring), and skips deletion on mismatch. Each reaper entry's complete
+inspect/status-marker/filter/delete pipeline carries a bounded 30s timeout via
+pinned POSIX helpers, and the timeout snapshots and validates descendants
+before signaling their process groups. On Unix, descendant cleanup retains
+pidfd or process-start-time identity and tombstones exited PIDs before every
+retry. Helper output is capped, and helper process groups are killed and reaped.
+The leader's own pull/create uses an independent `runTimeout` budget;
+`reuseAttachTimeout` bounds only attach polling
+for another process's container.
 
 ## Security design
 
@@ -338,12 +343,15 @@ As a library that spawns subprocesses, these rules hold.
 **No shell involvement**. Every CLI call passes an argv array to
 `exec.Command`; no shell string is ever assembled. The single
 exception is the watchdog reaper's shell script. Its body is a fixed
-string; container IDs enter only as stdin data. The script defeats
-word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
-writing it to the pipe. The two layers together leave no command
-injection through IDs.
+string; container IDs enter only as stdin data. The script defeats word
+splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted expansions), and
+the library validates each entry as an Apple Container name or a full
+64-character lowercase Docker ID. Docker generation-bound entries are
+inspected and must resolve to a full valid ID before deletion; a name is never
+used as their fallback. A generationless Docker name is rejected and logged.
+The reaper resolves its helper executables from pinned system paths, caps
+their output, and bounds each helper process group. These layers leave no
+command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main

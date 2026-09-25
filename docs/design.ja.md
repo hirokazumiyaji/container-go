@@ -192,9 +192,15 @@ type Strategy interface {
 親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へ `container delete --force` を実行して自身も終了する。
 テストプロセス生存中はリーパーは何もしない(削除は通常経路が担い、リーパーは保険である)。
 この方式は container-rs の watchdog と同じで、シグナルハンドラでは捕捉できない SIGKILL にも対応できる。
-各登録エントリの inspect・status marker・filter・delete 全体は 30 秒の
-タイムアウトで囲み、タイムアウト時はローカルの pipeline とその子孫を
-kill して回収するため、1 つの daemon 呼び出しが後続を止めない。
+各登録エントリの inspect・status marker・filter・delete 全体は 30 秒のタイムアウトで囲む。
+watchdog リーパーは 64 文字の小文字 16 進 Docker ID を不変な ID として受け入れる。
+generation を持つ Docker エントリは名前から inspect を使って ID を取り出すが、削除前に同じ 64 文字の ID が取得できた場合だけ削除する。
+generation を持たない Docker の名前エントリは拒否してログに残す。
+Apple の場合は generation を保存し、JSON の行頭にある `"key": "value"` 形式のフィールドだけを読み取る。
+一致しない場合は削除しない。
+タイムアウト時は子孫を snapshot して検証してから process group を signal する。
+Unix では pidfd または process の開始時刻を ID として保持し、再試行ごとに検証して終了済み PID を tombstone にする。
+補助 executable は固定したシステムパスから解決し、出力を制限し、process group を kill して回収する。
 
 **セッションラベル**：作成する全コンテナに次のラベルを付与する。
 
@@ -216,9 +222,13 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じ、ライブラリ側は ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証してからパイプへ書く。
-二重の防御により、ID 経由のコマンド注入を成立させない。
+スクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
+スクリプト側は `set -f`（グロブ無効）、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+ライブラリ側は各 ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または 64 文字の小文字 16 進 Docker ID として検証する。
+Docker の generation 付きエントリは inspect で ID を取得して検証し、名前にはフォールバックしない。
+generation なしの Docker 名は拒否してログに残す。
+リーパー補助処理の executable は固定したシステムパスから解決し、出力を制限して process group を回収する。
+これらの層により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。
 `--env key=value` を使うと、値がプロセス一覧(`ps`)から他ユーザーにも見える。

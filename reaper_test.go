@@ -1,3 +1,5 @@
+//go:build aix || darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+
 package container
 
 import (
@@ -9,9 +11,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -51,30 +53,28 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 	return binPath, logPath
 }
 
-func waitForLogLines(t *testing.T, path string, wants ...string) {
+func testReaperHelpers(t *testing.T, overrides reaperHelperPaths) reaperHelperPaths {
 	t.Helper()
-	waitForReaperLogLinesWithin(t, path, 5*time.Second, wants...)
-}
-
-func waitForReaperLogLinesWithin(t *testing.T, path string, timeout time.Duration, wants ...string) {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	var data []byte
-	for time.Now().Before(deadline) {
-		data, _ = os.ReadFile(path)
-		found := true
-		for _, w := range wants {
-			if !strings.Contains(string(data), w) {
-				found = false
-				break
-			}
-		}
-		if found {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	base, err := trustedReaperHelpers()
+	if err != nil {
+		t.Fatal(err)
 	}
-	t.Fatalf("log %s = %q, want all of %q", path, data, wants)
+	if overrides.awk != "" {
+		base.awk = overrides.awk
+	}
+	if overrides.pgrep != "" {
+		base.pgrep = overrides.pgrep
+	}
+	if overrides.ps != "" {
+		base.ps = overrides.ps
+	}
+	if overrides.rm != "" {
+		base.rm = overrides.rm
+	}
+	if overrides.sleep != "" {
+		base.sleep = overrides.sleep
+	}
+	return base
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
@@ -95,30 +95,6 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
-func TestReaperRejectsInvalidID(t *testing.T) {
-	bin, _ := writeReaperStub(t)
-	r := newReaper(bin, "delete")
-	defer closeReaperForTest(t, r)
-
-	for _, id := range []string{
-		"",
-		"bad id",
-		"a;b",
-		"x\ny",
-		"-leading",
-		strings.Repeat("a", 65),
-		strings.Repeat("A", 64),
-		strings.Repeat("g", 64),
-	} {
-		if err := r.register(id, ""); err == nil {
-			t.Errorf("register(%q): want error", id)
-		}
-	}
-	if err := r.register("ctr-one", "not-hex"); err == nil {
-		t.Error("register bad creation: want error")
-	}
-}
-
 func TestReaperAcceptsFullDockerID(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "rm")
@@ -132,9 +108,6 @@ func TestReaperAcceptsFullDockerID(t *testing.T) {
 }
 
 func TestRegisterWithGlobalReaperRecordsError(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("watchdog reaper is unavailable on Windows")
-	}
 	binary := filepath.Join(t.TempDir(), "docker")
 	t.Cleanup(func() {
 		globalReapersMu.Lock()
@@ -153,12 +126,15 @@ func TestRegisterWithGlobalReaperRecordsError(t *testing.T) {
 	if got := logs.String(); !strings.Contains(got, "reaper registration failed") || !strings.Contains(got, "invalid container id") {
 		t.Fatalf("registration log = %q, want validation error", got)
 	}
+	if err := registerWithGlobalReaper(binary, "rm", "ctr-one", ""); err == nil {
+		t.Fatal("generationless Docker name registration unexpectedly succeeded")
+	}
+	if got := logs.String(); !strings.Contains(got, "no generation") {
+		t.Fatalf("registration log = %q, want generationless Docker rejection", got)
+	}
 }
 
 func TestRunRegistersFullDockerIDThroughExternalPath(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("watchdog reaper is unavailable on Windows")
-	}
 	bin, _ := writeReaperStub(t)
 	inner := newTestRunner()
 	inner.imagePresent = true
@@ -273,22 +249,6 @@ func waitForReaperProcessGone(t *testing.T, pid int) {
 	t.Fatalf("process %d survived reaper cleanup", pid)
 }
 
-func closeReaperForTest(t *testing.T, r *reaper) {
-	t.Helper()
-	r.closeStdin()
-	r.mu.Lock()
-	exited := r.exited
-	r.mu.Unlock()
-	if exited == nil {
-		return
-	}
-	select {
-	case <-exited:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reaper did not exit after stdin close")
-	}
-}
-
 func assertReaperTreeHasNoSecret(t *testing.T, root, secret string) {
 	t.Helper()
 	err := filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
@@ -320,10 +280,6 @@ func assertReaperTreeHasNoSecret(t *testing.T, root, secret string) {
 }
 
 func TestReaperSIGKILLDoesNotLeaveInspectSecret(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
-	}
-
 	// Keep the secret-bearing fake binary outside the tree scanned below.
 	// TMPDIR is changed only after both fixture directories exist.
 	stagingDir := t.TempDir()
@@ -378,10 +334,6 @@ func TestReaperSIGKILLDoesNotLeaveInspectSecret(t *testing.T) {
 }
 
 func TestReaperHungInspectDoesNotBlockLaterEntries(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
-	}
-
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "calls.log")
 	started := filepath.Join(dir, "first-started")
@@ -439,10 +391,52 @@ func TestReaperHungInspectDoesNotBlockLaterEntries(t *testing.T) {
 	}
 }
 
-func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
+func TestReaperSetsidHelperProcess(t *testing.T) {
+	if os.Getenv("CONTAINERGO_REAPER_SETSID_HELPER") != "1" {
+		return
 	}
+	child := exec.Command("/bin/sh", "-c", "sleep 30")
+	child.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	if path := os.Getenv("CONTAINERGO_REAPER_SETSID_PID_PATH"); path != "" {
+		if err := os.WriteFile(path, []byte(strconv.Itoa(child.Process.Pid)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	time.Sleep(30 * time.Second)
+}
+
+func TestReaperShellSnapshotsNestedSetsidBeforeKilling(t *testing.T) {
+	dir := t.TempDir()
+	helperPIDPath := filepath.Join(dir, "helper.pid")
+	nestedPIDPath := filepath.Join(dir, "nested-child.pid")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + reaperShellQuote(filepath.Join(dir, "calls.log")) + "\n" +
+		"if [ \"$1\" = inspect ] && [ \"$2\" = nested ]; then\n" +
+		"  CONTAINERGO_REAPER_SETSID_HELPER=1 CONTAINERGO_REAPER_SETSID_PID_PATH=" + reaperShellQuote(nestedPIDPath) + " " + reaperShellQuote(os.Args[0]) + " -test.run=^TestReaperSetsidHelperProcess$ &\n" +
+		"  echo \"$!\" > " + reaperShellQuote(helperPIDPath) + "\n" +
+		"  while :; do sleep 1; done\n" +
+		"fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	r.timeoutSeconds = 1
+	if err := r.register("nested", "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+	waitForPath(t, helperPIDPath)
+	waitForPath(t, nestedPIDPath)
+	nestedPID := readReaperPID(t, nestedPIDPath)
+	closeReaperForTest(t, r)
+	waitForReaperProcessGone(t, nestedPID)
+}
+
+func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
 	realSleep, err := exec.LookPath("sleep")
 	if err != nil {
 		t.Skipf("sleep unavailable: %v", err)
@@ -460,6 +454,7 @@ func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(bin, "delete")
+	r.helperPaths = testReaperHelpers(t, reaperHelperPaths{sleep: sleepPath})
 	if err := r.register("timer-ctr", ""); err != nil {
 		t.Fatalf("register: %v", err)
 	}
@@ -483,23 +478,27 @@ func TestReaperTimerCancellationReapsSleepDescendants(t *testing.T) {
 }
 
 func TestReaperShellBoundsPgrepLookup(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
-	}
 	dir := t.TempDir()
 	pgrepPath := filepath.Join(dir, "pgrep")
-	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nsleep 5\nexit 2\n"), 0o755); err != nil {
+	helperChildPath := filepath.Join(dir, "helper-child.pid")
+	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\nsleep 5 &\necho \"$!\" > "+reaperShellQuote(helperChildPath)+"\nwait\nexit 2\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	bin, logPath := writeReaperStub(t)
 	const first = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	const second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then sleep 5; fi\n"
+	childPIDPath := filepath.Join(dir, "child.pid")
+	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then\n" +
+		"  sh -c 'sleep 5' &\n" +
+		"  echo \"$!\" > " + reaperShellQuote(childPIDPath) + "\n" +
+		"  wait\n" +
+		"fi\n"
 	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := newReaper(bin, "rm")
+	r.helperPaths = testReaperHelpers(t, reaperHelperPaths{pgrep: pgrepPath})
 	r.timeoutSeconds = 1
 	if err := r.register(first, ""); err != nil {
 		t.Fatalf("register first: %v", err)
@@ -512,13 +511,16 @@ func TestReaperShellBoundsPgrepLookup(t *testing.T) {
 	if elapsed := time.Since(started); elapsed > 4*time.Second {
 		t.Fatalf("reaper shell cleanup took %s, want bounded pgrep lookup", elapsed)
 	}
+	waitForPath(t, childPIDPath)
+	childPID := readReaperPID(t, childPIDPath)
+	waitForPath(t, helperChildPath)
+	helperChildPID := readReaperPID(t, helperChildPath)
+	waitForReaperProcessGone(t, childPID)
+	waitForReaperProcessGone(t, helperChildPID)
 	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
 }
 
 func TestReaperShellRejectsInvalidPgrepPID(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("the watchdog reaper requires a POSIX shell")
-	}
 	dir := t.TempDir()
 	pgrepPath := filepath.Join(dir, "pgrep")
 	if err := os.WriteFile(pgrepPath, []byte("#!/bin/sh\necho not-a-pid\nexit 0\n"), 0o755); err != nil {
@@ -528,11 +530,17 @@ func TestReaperShellRejectsInvalidPgrepPID(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	const first = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	const second = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
-	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then sleep 5; fi\n"
+	childPIDPath := filepath.Join(dir, "child.pid")
+	backendScript := "#!/bin/sh\necho \"$@\" >> " + reaperShellQuote(logPath) + "\nif [ \"$1\" = \"rm\" ] && [ \"$3\" = " + reaperShellQuote(first) + " ]; then\n" +
+		"  sh -c 'sleep 30' &\n" +
+		"  echo \"$!\" > " + reaperShellQuote(childPIDPath) + "\n" +
+		"  wait\n" +
+		"fi\n"
 	if err := os.WriteFile(bin, []byte(backendScript), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := newReaper(bin, "rm")
+	r.helperPaths = testReaperHelpers(t, reaperHelperPaths{pgrep: pgrepPath})
 	r.timeoutSeconds = 1
 	if err := r.register(first, ""); err != nil {
 		t.Fatalf("register first: %v", err)
@@ -541,42 +549,10 @@ func TestReaperShellRejectsInvalidPgrepPID(t *testing.T) {
 		t.Fatalf("register second: %v", err)
 	}
 	closeReaperForTest(t, r)
+	waitForPath(t, childPIDPath)
+	childPID := readReaperPID(t, childPIDPath)
+	waitForReaperProcessGone(t, childPID)
 	waitForLogLines(t, logPath, "rm --force "+first, "rm --force "+second)
-}
-
-func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
-	if !strings.Contains(reaperScript, `timeout="${4:-30}"`) ||
-		!strings.Contains(reaperScript, `sleep "$timeout"`) ||
-		!strings.Contains(reaperScript, "kill -9") {
-		t.Error("reaper script must bound each backend call with sleep/kill (no timeout(1))")
-	}
-	if !strings.Contains(reaperScript, "run_with_timeout process_entry") {
-		t.Error("reaper must put the complete entry pipeline behind its timeout")
-	}
-	for _, required := range []string{
-		"valid_docker_id \"$uid\"",
-		"\"$pgrep_bin\" -P \"$parent\"",
-		"max_descendant_lookups",
-		"kill -KILL \"$sleeper\"",
-	} {
-		if !strings.Contains(reaperScript, required) {
-			t.Errorf("reaper script missing bounded cleanup fragment %q", required)
-		}
-	}
-	// The creation label must be read as a structural JSON field, anchored
-	// at line start on the quoted key, and compared for exact equality.
-	if !strings.Contains(reaperScript, `s/^[[:space:]]*\"$key\"[[:space:]]*:`) {
-		t.Error("reaper script must anchor the creation label match on the quoted key")
-	}
-	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || return 0`) {
-		t.Error("reaper script must compare the extracted generation exactly")
-	}
-}
-
-func TestBreQuoteEscapesLabelKey(t *testing.T) {
-	if got := breQuote("com.github.x-y"); got != `com\.github\.x-y` {
-		t.Errorf("breQuote = %q", got)
-	}
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {

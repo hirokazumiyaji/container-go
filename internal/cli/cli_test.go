@@ -538,6 +538,34 @@ func TestClassifyOnlyTreatsPureReturnedTimeoutAsProbeTimeout(t *testing.T) {
 	}
 }
 
+func TestClassifyTimeoutTextVetoesConfigurationAndPermission(t *testing.T) {
+	diagnostics := []string{
+		"configuration load failed",
+		"permission denied",
+		"proxy connection failed",
+		"tls certificate verification failed",
+	}
+	for _, diagnostic := range diagnostics {
+		t.Run(diagnostic, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+			probeErr := fmt.Errorf("%s: %w", diagnostic, context.DeadlineExceeded)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, timeout text was ignored", got)
+			}
+			if !errors.Is(got, context.DeadlineExceeded) || !strings.Contains(got.Error(), diagnostic) {
+				t.Fatalf("classified error = %v, want timeout and diagnostic", got)
+			}
+		})
+	}
+}
+
 func TestClassifyPreservesCallerCancellationDuringPredicate(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
 	probeErr := &CLIError{
@@ -581,6 +609,27 @@ func TestClassifyRespectsCallerCancel(t *testing.T) {
 	case <-r.started:
 		t.Fatal("probe ran for an already-canceled caller")
 	default:
+	}
+}
+
+type successfulCancelingProbeRunner struct {
+	cancel context.CancelFunc
+}
+
+func (r *successfulCancelingProbeRunner) Run(context.Context, ...string) ([]byte, []byte, error) {
+	r.cancel()
+	return nil, nil, nil
+}
+
+func TestClassifyCallerCancellationAfterSuccessfulProbeWins(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := Classify(ctx, &successfulCancelingProbeRunner{cancel: cancel}, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, context.Canceled) {
+		t.Fatalf("error = %v, want original and caller cancellation", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, successful probe was relabeled as daemon down", got)
 	}
 }
 

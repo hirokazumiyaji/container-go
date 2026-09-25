@@ -1,0 +1,42 @@
+[
+  {
+    "name": "apple_apiserver_unregistered",
+    "backend": "apple",
+    "operation": "system",
+    "stream": "stdout",
+    "output": "apiserver is not running and not registered with launchd",
+    "unavailable": true
+  },
+  {
+    "name": "apple_apiserver_running",
+    "backend": "apple",
+    "operation": "system",
+    "stream": "stdout",
+    "output": "apiserver is running and registered with launchd",
+    "unavailable": false
+  },
+  {
+    "name": "docker_desktop_unavailable",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stdout",
+    "output": "unable to start Docker Desktop",
+    "unavailable": true
+  },
+  {
+    "name": "docker_desktop_near_miss",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stdout",
+    "output": "Docker Desktop is still starting",
+    "unavailable": false
+  },
+  {
+    "name": "docker_desktop_configuration_veto",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "unable to start Docker Desktop: proxy configuration is invalid",
+    "unavailable": false
+  }
+]

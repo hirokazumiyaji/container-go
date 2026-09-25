@@ -65,10 +65,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 	for {
 		if err := ctx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, reuseContextError(cfg.name, err)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
@@ -88,7 +85,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
-				time.Sleep(reusePollInterval)
+				if err := waitReusePoll(ctx); err != nil {
+					return nil, reuseContextError(cfg.name, err)
+				}
 				continue
 			}
 			return nil, createErr
@@ -96,7 +95,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, reuseContextError(cfg.name, err)
+			}
 			continue
 		case StateStopped:
 			if recreated {
@@ -125,8 +126,28 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				uid:       info.uid,
 			}, nil
 		default:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, reuseContextError(cfg.name, err)
+			}
 		}
+	}
+}
+
+func reuseContextError(name string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, err)
+	}
+	return err
+}
+
+func waitReusePoll(ctx context.Context) error {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -152,6 +173,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, err
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if contextErr := commandContextError(runCtx, err); contextErr != nil {
+		if err == nil {
+			cleanupFailedCreate(ctx, cfg, nil, contextErr)
+		}
+		return nil, contextErr
+	}
 	if err != nil {
 		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
@@ -183,6 +210,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			_ = ctr.Terminate(context.WithoutCancel(ctx))
 			return nil, err
 		}
+	}
+	if contextErr := commandContextError(runCtx, nil); contextErr != nil {
+		if cleanupErr := ctr.Terminate(context.WithoutCancel(ctx)); cleanupErr != nil {
+			return nil, errors.Join(contextErr, fmt.Errorf("cleanup reused failed create: %w", cleanupErr))
+		}
+		return nil, contextErr
 	}
 	return ctr, nil
 }
@@ -237,7 +270,7 @@ func namedContainer(cfg *config, id string) *Container {
 // ordinary original error.
 func createRaceMissing(err error) bool {
 	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "run" {
+	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {

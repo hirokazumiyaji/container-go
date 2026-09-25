@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -159,6 +160,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, err
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if contextErr := commandContextError(runCtx, err); contextErr != nil {
+		cleanupFailedCreate(ctx, cfg, err, contextErr)
+		return nil, contextErr
+	}
 	if err != nil {
 		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
 		cleanupFailedCreate(ctx, cfg, err, classified)
@@ -300,6 +305,9 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	if contextErr := commandContextError(stopCtx, err); contextErr != nil {
+		return contextErr
+	}
 	return c.classify(ctx, err)
 }
 
@@ -326,8 +334,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return contextErr
+	}
 	if isNotFoundFor(c.eng, err) {
-		return nil
+		return commandContextError(ctx, err)
 	}
 	if err != nil {
 		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
@@ -347,8 +358,11 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
+	if contextErr := commandContextError(delCtx, err); contextErr != nil {
+		return contextErr
+	}
 	if err == nil || isNotFoundFor(c.eng, err) {
-		return nil
+		return commandContextError(delCtx, err)
 	}
 	return c.classify(ctx, err)
 }
@@ -463,10 +477,21 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
 		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, c.id)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
+	var missing *inspectTargetNotFoundError
+	if errors.As(err, &missing) {
+		return nil, fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+	}
+	return info, err
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

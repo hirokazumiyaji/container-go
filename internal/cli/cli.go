@@ -167,21 +167,31 @@ const probeTimeout = 5 * time.Second
 // ErrSystemNotRunning. The original and probe errors remain in the
 // result's error chain in every probe-failure case.
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// The caller already gave up. Keep both the original failure and
+		// the context cause so cancellation remains observable.
+		if err == nil {
+			return ctxErr
+		}
+		if errors.Is(err, ctxErr) {
+			return err
+		}
+		return errors.Join(err, ctxErr)
+	}
 	if err == nil {
 		return nil
+	}
+	if isContextError(err) {
+		return err
 	}
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		// The caller already gave up. Keep both the original failure and
-		// the context cause so cancellation remains observable.
-		return errors.Join(err, ctxErr)
-	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
+	if stdout, stderr, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
+		probeErr = withProbeOutput(probeErr, stdout, stderr)
 		// A caller cancellation must not be relabeled as a stopped
 		// backend. Keep the probe result and context as diagnostic context.
 		if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
@@ -195,6 +205,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		// veto the sentinel.
 		if isNonLivenessError(err) &&
 			(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err)) {
+			if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+				return classified
+			}
 			return errors.Join(err, probeErr)
 		}
 		// A returned timeout is liveness evidence only when every reachable
@@ -202,6 +215,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		// configuration failure must veto classification.
 		if errors.Is(probeErr, context.DeadlineExceeded) {
 			if !isPureProbeTimeout(probeErr) {
+				if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+					return classified
+				}
 				return errors.Join(err, probeErr)
 			}
 			if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
@@ -217,6 +233,9 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		// not proof that the backend is down. This check includes every
 		// joined/wrapped cause.
 		if isNonLivenessError(probeErr) {
+			if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+				return classified
+			}
 			return errors.Join(err, probeErr)
 		}
 		// Recheck immediately before invoking backend code: predicates may
@@ -243,7 +262,13 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		// A failed probe is not proof that the backend is down. Keep both
 		// errors so callers can inspect the original command and probe
 		// diagnostics without losing either chain.
+		if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+			return classified
+		}
 		return errors.Join(err, probeErr)
+	}
+	if classified, canceled := joinCallerCancellation(ctx, err, nil); canceled {
+		return classified
 	}
 	return err
 }
@@ -254,6 +279,40 @@ func joinCallerCancellation(ctx context.Context, original, probeErr error) (erro
 		return nil, false
 	}
 	return errors.Join(original, probeErr, ctxErr), true
+}
+
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+type probeOutputError struct {
+	err    error
+	output string
+}
+
+func (e *probeOutputError) Error() string {
+	return e.err.Error() + "\n" + e.output
+}
+
+func (e *probeOutputError) Unwrap() error { return e.err }
+
+// withProbeOutput makes successful probe output available to the
+// backend-specific liveness predicates. Some CLIs report status on stdout
+// while still exiting non-zero. The original error remains the unwrap target,
+// so wrapping output does not discard the probe chain.
+func withProbeOutput(err error, stdout, stderr []byte) error {
+	diagnostic := err.Error()
+	var output []string
+	for _, stream := range [][]byte{stdout, stderr} {
+		text := strings.TrimSpace(string(truncateStderr(string(stream))))
+		if text != "" && !strings.Contains(diagnostic, text) {
+			output = append(output, text)
+		}
+	}
+	if len(output) == 0 {
+		return err
+	}
+	return &probeOutputError{err: err, output: strings.Join(output, "\n")}
 }
 
 func probeUnavailable(probe Probe, err error) bool {
@@ -276,6 +335,9 @@ func defaultProbeUnavailable(err error) bool {
 
 func isPureProbeTimeout(err error) bool {
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if IsProbeConfigurationError(err) || containsDefinitiveNonLivenessText(err.Error()) {
 		return false
 	}
 	return errorTreeIsOnly(err, context.DeadlineExceeded)
@@ -367,7 +429,11 @@ func isDefinitiveNonLivenessError(err error) bool {
 	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
 		return true
 	}
-	s := strings.ToLower(err.Error())
+	return containsDefinitiveNonLivenessText(err.Error())
+}
+
+func containsDefinitiveNonLivenessText(text string) bool {
+	s := strings.ToLower(text)
 	for _, fragment := range []string{
 		"permission denied",
 		"operation not permitted",

@@ -97,7 +97,7 @@ func TestRunFailurePreservesNameConflict(t *testing.T) {
 	base.imagePresent = true
 	r := &failRunRunner{
 		fakeRunner: base,
-		runErr: &cli.CLIError{Args: []string{"run"}, ExitCode: 1,
+		runErr: &cli.CLIError{Args: []string{"run", "--name", "myctr"}, ExitCode: 1,
 			Stderr: `Error: container with id myctr already exists`},
 		inspectJSON: ownedInspectJSON("myctr"),
 	}

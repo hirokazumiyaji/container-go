@@ -81,6 +81,7 @@ func dockerProbeUnavailable(err error) bool {
 	for _, fragment := range []string{
 		"cannot connect to the docker daemon",
 		"is the docker daemon running",
+		"unable to start docker desktop",
 		"connection refused",
 	} {
 		if strings.Contains(text, fragment) {
@@ -353,7 +354,7 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 // and arbitrary application output are not local-store absence evidence.
 func (dockerEngine) imageMissing(err error) bool {
 	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "image inspect" {
+	if !ok || ctx.operation != "image inspect" || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
@@ -387,7 +388,7 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 // words is not evidence that this library lost a name race.
 func (dockerEngine) nameConflict(err error) bool {
 	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "run" {
+	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
@@ -396,12 +397,9 @@ func (dockerEngine) nameConflict(err error) bool {
 }
 
 func dockerNameConflictLine(line, target string) bool {
-	if !strings.HasPrefix(line, dockerStderrConflict) ||
+	if strings.TrimSpace(target) == "" || !strings.HasPrefix(line, dockerStderrConflict) ||
 		!strings.Contains(line, dockerStderrAlreadyInUse) {
 		return false
-	}
-	if target == "" {
-		return true
 	}
 	rest := strings.TrimSpace(strings.TrimPrefix(line, dockerStderrConflict))
 	if len(rest) < 2 || rest[0] != '"' {
@@ -425,7 +423,7 @@ func sameDockerContainerName(got, want string) bool {
 // container" for the lifecycle/stream commands.
 func (dockerEngine) containerMissing(err error) bool {
 	ctx, ok := backendCLIError(err, "docker")
-	if !ok {
+	if !ok || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	prefix := ""

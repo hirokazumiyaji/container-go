@@ -82,18 +82,15 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
-	if err == nil {
-		return 0, output, nil
-	}
 	// A canceled ExecRunner can join a command exit with the caller
 	// context. Preserve both but prioritize cancellation as an API error;
 	// otherwise the exit code could be mistaken for a workload result or
 	// an object-absence diagnostic.
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return 0, nil, errors.Join(err, ctxErr)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return 0, nil, contextErr
 	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return 0, nil, err
+	if err == nil {
+		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
 		return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
@@ -104,16 +101,22 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFoundFor(c.eng, err) && !maybeInfraExecErr(c.eng, err) {
+		if contextErr := commandContextError(ctx, nil); contextErr != nil {
+			return 0, nil, errors.Join(err, contextErr)
+		}
 		return cliErr.ExitCode, output, nil
 	}
 	inspection := c.inspectExecTarget(ctx)
-	// Verification uses a derived timeout. Recheck the caller afterward so
-	// a cancellation racing a definite inspect result remains authoritative.
-	if ctxErr := ctx.Err(); ctxErr != nil {
-		return 0, nil, errors.Join(err, inspection.err, ctxErr)
+	// Verification uses a derived timeout. Recheck the caller and returned
+	// inspection chain so cancellation remains authoritative at this boundary.
+	if contextErr := commandContextError(ctx, inspection.err); contextErr != nil {
+		return 0, nil, errors.Join(err, contextErr)
 	}
 	switch inspection.state {
 	case execTargetRunning:
+		if contextErr := commandContextError(ctx, nil); contextErr != nil {
+			return 0, nil, errors.Join(err, contextErr)
+		}
 		return cliErr.ExitCode, output, nil
 	case execTargetNotFound:
 		cause := error(err)
@@ -208,14 +211,19 @@ func (c *Container) inspectExecTarget(ctx context.Context) execTargetInspection 
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return execTargetInspection{state: execTargetInspectionFailed, err: contextErr}
+	}
 	if err != nil {
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
-			!cli.IsProbeConfigurationError(err) && isNotFoundFor(c.eng, err) {
+		if !cli.IsProbeConfigurationError(err) && isNotFoundFor(c.eng, err) {
 			return execTargetInspection{state: execTargetNotFound, err: err}
 		}
 		return execTargetInspection{state: execTargetInspectionFailed, err: err}
 	}
 	info, err := c.eng.parseInspect(stdout, c.id)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return execTargetInspection{state: execTargetInspectionFailed, err: contextErr}
+	}
 	if err != nil {
 		var missing *inspectTargetNotFoundError
 		if errors.As(err, &missing) && missing.id == c.id {

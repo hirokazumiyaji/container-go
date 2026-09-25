@@ -58,6 +58,84 @@ func fixtureArgs(operation string) []string {
 	}
 }
 
+type probeOutputFixture struct {
+	Name        string `json:"name"`
+	Backend     string `json:"backend"`
+	Operation   string `json:"operation"`
+	Stream      string `json:"stream"`
+	Output      string `json:"output"`
+	Unavailable bool   `json:"unavailable"`
+}
+
+func loadProbeOutputFixtures(t *testing.T) []probeOutputFixture {
+	t.Helper()
+	data, err := os.ReadFile("testdata/probe_output_fixtures.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures []probeOutputFixture
+	if err := json.Unmarshal(data, &fixtures); err != nil {
+		t.Fatalf("decode probe fixtures: %v", err)
+	}
+	if len(fixtures) == 0 {
+		t.Fatal("probe fixture file is empty")
+	}
+	return fixtures
+}
+
+type fixtureProbeRunner struct {
+	stdout string
+	stderr string
+	err    error
+}
+
+func (r *fixtureProbeRunner) Run(context.Context, ...string) ([]byte, []byte, error) {
+	return []byte(r.stdout), []byte(r.stderr), r.err
+}
+
+func TestProductionProbeFixtures(t *testing.T) {
+	for _, fixture := range loadProbeOutputFixtures(t) {
+		t.Run(fixture.Name, func(t *testing.T) {
+			var eng engine
+			switch fixture.Backend {
+			case "apple":
+				eng = appleEngine{}
+			case "docker":
+				eng = dockerEngine{}
+			default:
+				t.Fatalf("unknown fixture backend %q", fixture.Backend)
+			}
+			probe := eng.probe()
+			if commandOperation(probe.Args) != fixture.Operation {
+				t.Fatalf("probe operation = %q, want fixture %q", commandOperation(probe.Args), fixture.Operation)
+			}
+			original := &cli.CLIError{
+				Binary: eng.binary(), Args: []string{"run"}, ExitCode: 1, Stderr: "command failed",
+			}
+			probeErr := &cli.CLIError{
+				Binary: eng.binary(), Args: probe.Args, ExitCode: 1, Stderr: "probe command failed",
+			}
+			runner := &fixtureProbeRunner{err: probeErr}
+			switch fixture.Stream {
+			case "stdout":
+				runner.stdout = fixture.Output
+			case "stderr":
+				runner.stderr = fixture.Output
+			default:
+				t.Fatalf("unknown fixture stream %q", fixture.Stream)
+			}
+
+			got := cli.Classify(context.Background(), runner, original, probe)
+			if errors.Is(got, ErrSystemNotRunning) != fixture.Unavailable {
+				t.Fatalf("Classify(%q) unavailable = %v, want %v; error = %v", fixture.Output, errors.Is(got, ErrSystemNotRunning), fixture.Unavailable, got)
+			}
+			if !errors.Is(got, original) || !errors.Is(got, probeErr) {
+				t.Fatalf("Classify error = %v, want original and probe chains", got)
+			}
+		})
+	}
+}
+
 // The fixture files contain the verified stderr shapes from the supported
 // CLI versions; the table keeps each classifier's positive and negative
 // contract together.
@@ -392,10 +470,24 @@ func TestClassifiersRejectCrossBackendOperationAndTarget(t *testing.T) {
 			}),
 		},
 		{
-			name: "wrong target",
+			name: "wrong container target",
 			got: (appleEngine{}).containerMissing(&cli.CLIError{
 				Binary: "container", Args: []string{"inspect", "myctr"},
 				Stderr: "Error: container not found: other",
+			}),
+		},
+		{
+			name: "wrong image target",
+			got: (dockerEngine{}).imageMissing(&cli.CLIError{
+				Binary: "docker", Args: []string{"image", "inspect", "redis:7-alpine"},
+				Stderr: "Error response from daemon: No such image: other:tag",
+			}),
+		},
+		{
+			name: "wrong conflict target",
+			got: (dockerEngine{}).nameConflict(&cli.CLIError{
+				Binary: "docker", Args: []string{"run", "--name", "myctr"},
+				Stderr: `Conflict. The container name "/other" is already in use by container abc`,
 			}),
 		},
 		{

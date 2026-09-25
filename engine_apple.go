@@ -61,6 +61,7 @@ func appleProbeUnavailable(err error) bool {
 		"start the container system services",
 		"system is not running",
 		"system service is not running",
+		"apiserver is not running and not registered with launchd",
 		"connection refused",
 	} {
 		if strings.Contains(text, fragment) {
@@ -192,7 +193,7 @@ func (appleEngine) pullImageArgs(image, platform string) []string {
 // with similar text is not evidence that the local image check was missing.
 func (appleEngine) imageMissing(err error) bool {
 	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "image inspect" {
+	if !ok || ctx.operation != "image inspect" || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
@@ -279,7 +280,7 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, erro
 // "already" or "exists" in application/configuration diagnostics.
 func (appleEngine) nameConflict(err error) bool {
 	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "run" {
+	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
@@ -288,6 +289,9 @@ func (appleEngine) nameConflict(err error) bool {
 }
 
 func appleNameConflictLine(line, target string) bool {
+	if strings.TrimSpace(target) == "" {
+		return false
+	}
 	rest, ok := strings.CutPrefix(line, appleStderrNameConflict)
 	if !ok {
 		return false
@@ -307,7 +311,7 @@ func appleNameConflictLine(line, target string) bool {
 // prints "container not found" cannot be mistaken for a backend result.
 func (appleEngine) containerMissing(err error) bool {
 	ctx, ok := backendCLIError(err, "container")
-	if !ok {
+	if !ok || !hasParsedCLITarget(ctx) {
 		return false
 	}
 	switch ctx.operation {

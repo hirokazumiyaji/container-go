@@ -33,6 +33,9 @@ type cliErrorContext struct {
 // executable, so a Docker classifier never accepts an error without an
 // explicit Docker binary. ExecRunner always records the executable name.
 func backendCLIError(err error, backend string) (cliErrorContext, bool) {
+	if isContextError(err) {
+		return cliErrorContext{}, false
+	}
 	var cliErr *cli.CLIError
 	if !errors.As(err, &cliErr) {
 		return cliErrorContext{}, false
@@ -58,6 +61,10 @@ func backendCLIErrorText(err error, backend, operation string) (string, bool) {
 		return "", false
 	}
 	return strings.ToLower(err.Error()), true
+}
+
+func hasParsedCLITarget(ctx cliErrorContext) bool {
+	return strings.TrimSpace(ctx.target) != ""
 }
 
 func cliBinaryMatches(got, want string) bool {
@@ -215,8 +222,8 @@ func hasCLIErrorLine(err error, match func(string) bool) bool {
 func sameCLITarget(got, want string) bool {
 	got = strings.Trim(strings.TrimSpace(got), `"'`)
 	want = strings.Trim(strings.TrimSpace(want), `"'`)
-	if want == "" {
-		return got != ""
+	if got == "" || want == "" {
+		return false
 	}
 	return strings.EqualFold(got, want)
 }
@@ -227,7 +234,8 @@ func sameCLITarget(got, want string) bool {
 // backend error.
 func cliTargetListMatches(rest, want string) bool {
 	rest = strings.TrimSpace(rest)
-	if rest == "" {
+	want = strings.Trim(strings.TrimSpace(want), `"'`)
+	if rest == "" || want == "" {
 		return false
 	}
 	found := false

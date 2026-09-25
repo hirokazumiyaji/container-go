@@ -375,14 +375,7 @@ func (w *countingWriter) Write(p []byte) (int, error) {
 		err = io.ErrShortWrite
 	}
 	if err != nil {
-		w.mu.Lock()
-		switch {
-		case w.err == nil:
-			w.err = err
-		case !errors.Is(w.err, err):
-			w.err = errors.Join(w.err, err)
-		}
-		w.mu.Unlock()
+		w.recordError(err)
 	}
 	// Returning the full input count is intentional: a sink failure must
 	// not stop os/exec's copy pump and leave a child blocked on a pipe.
@@ -416,11 +409,10 @@ func (w *countingWriter) recordError(err error) {
 		return
 	}
 	w.mu.Lock()
-	switch {
-	case w.err == nil:
+	// A failing writer may return a fresh wrapper for every Write. Keep
+	// the first representative so repeated output cannot grow the error.
+	if w.err == nil {
 		w.err = err
-	case !errors.Is(w.err, err):
-		w.err = errors.Join(w.err, err)
 	}
 	w.mu.Unlock()
 }

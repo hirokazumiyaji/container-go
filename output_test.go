@@ -91,6 +91,21 @@ func (w *failingOutputWriter) Write([]byte) (int, error) {
 	return 0, w.err
 }
 
+type freshOutputWriterError struct {
+	cause error
+}
+
+func (e *freshOutputWriterError) Error() string { return "fresh writer failure: " + e.cause.Error() }
+func (e *freshOutputWriterError) Unwrap() error { return e.cause }
+
+type repeatedlyFailingOutputWriter struct {
+	cause error
+}
+
+func (w *repeatedlyFailingOutputWriter) Write([]byte) (int, error) {
+	return 0, &freshOutputWriterError{cause: w.cause}
+}
+
 func resetOutputTestCalls(r *outputTestRunner) {
 	r.runCalls = 0
 	r.runToCalls = 0
@@ -566,6 +581,24 @@ func TestLimitedWriterDoesNotCallSinkFailureTruncation(t *testing.T) {
 	}
 	if writer.Truncated() {
 		t.Fatal("sink failure was reported as configured-limit truncation")
+	}
+}
+
+func TestOutputTrackingWriterRetainsOneRepeatedWriterError(t *testing.T) {
+	cause := errors.New("sink is closed")
+	writer := newOutputTrackingWriter(&repeatedlyFailingOutputWriter{cause: cause})
+	for range 4096 {
+		if _, err := writer.Write([]byte("output")); !errors.Is(err, cause) {
+			t.Fatalf("Write error = %v, want writer cause", err)
+		}
+	}
+
+	err := writer.Err()
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want writer cause", err)
+	}
+	if count := strings.Count(err.Error(), "fresh writer failure"); count != 1 {
+		t.Fatalf("repeated writer failures in error = %d, want one representative", count)
 	}
 }
 

@@ -18,8 +18,8 @@ import (
 // caps the combined stdout+stderr response; zero preserves the
 // historical unbounded snapshot behavior.
 //
-// Tail is a backend line-based tail. MaxBytes is a separate byte cap
-// applied after the CLI returns: it retains the prefix of the combined
+// Tail is a backend line-based tail. After backend selection, MaxBytes is
+// applied during CLI execution: it retains the prefix of the combined
 // output, not the trailing bytes. The added field intentionally makes
 // keyed literals the required form; old two-field unkeyed literals no
 // longer compile, which is the explicit pre-1.0 compatibility tradeoff.

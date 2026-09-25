@@ -51,6 +51,21 @@ func (w *failingTestWriter) Write([]byte) (int, error) {
 	return 0, w.err
 }
 
+type freshWriterError struct {
+	cause error
+}
+
+func (e *freshWriterError) Error() string { return "fresh writer failure: " + e.cause.Error() }
+func (e *freshWriterError) Unwrap() error { return e.cause }
+
+type repeatedlyFailingTestWriter struct {
+	cause error
+}
+
+func (w *repeatedlyFailingTestWriter) Write([]byte) (int, error) {
+	return 0, &freshWriterError{cause: w.cause}
+}
+
 func TestRunToAdaptsLegacyRunner(t *testing.T) {
 	runner := &legacyOutputRunner{stdout: []byte("out-data"), stderr: []byte("err-data")}
 	stdout := &cappedTestWriter{max: 3}
@@ -151,6 +166,25 @@ func TestExecRunnerRunToReportsWriterErrorAfterSuccess(t *testing.T) {
 	var cliErr *CLIError
 	if errors.As(err, &cliErr) {
 		t.Fatalf("successful command was reported as CLI exit: %v", cliErr)
+	}
+}
+
+func TestCountingWriterRetainsOneRepeatedWriterError(t *testing.T) {
+	cause := errors.New("sink is closed")
+	writer := &countingWriter{dst: &repeatedlyFailingTestWriter{cause: cause}}
+	for range 4096 {
+		n, err := writer.Write([]byte("output"))
+		if n != len("output") || err != nil {
+			t.Fatalf("Write = %d/%v, want %d/nil", n, err, len("output"))
+		}
+	}
+
+	_, err := writer.snapshot()
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want writer cause", err)
+	}
+	if count := strings.Count(err.Error(), "fresh writer failure"); count != 1 {
+		t.Fatalf("repeated writer failures in error = %d, want one representative", count)
 	}
 }
 

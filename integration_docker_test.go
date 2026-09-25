@@ -38,6 +38,15 @@ func requireDocker(t *testing.T) {
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 }
 
+type countOnlyWriter struct {
+	bytes int64
+}
+
+func (w *countOnlyWriter) Write(p []byte) (int, error) {
+	w.bytes += int64(len(p))
+	return len(p), nil
+}
+
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -514,29 +523,28 @@ func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 }
 
 // TestIntegrationDockerExecStreamsLargeOutputBounded exercises the
-// direct RunTo path with a finite, deadline-bounded amount of CLI output.
-// The host retains only the configured prefix while the child is fully
-// drained. This verifies forwarding and draining, not peak host memory:
-// measuring RSS would require an external sampler and is intentionally
-// outside this integration test.
+// direct RunTo path with at least 256 MiB of CLI output. The count-only
+// sink retains no emitted bytes, while the child is fully drained. Cleanup
+// is registered before the error check so a deadline failure also removes
+// the container and any still-running exec process.
 func TestIntegrationDockerExecStreamsLargeOutputBounded(t *testing.T) {
 	requireDocker(t)
 	runCtx, cancelRun := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelRun()
 	ctr, err := container.Run(runCtx, integrationAlpine,
-		container.WithCmd("sleep", "60"),
+		container.WithCmd("sleep", "300"),
 	)
 	container.Cleanup(t, ctr)
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 
-	var output bytes.Buffer
+	var output countOnlyWriter
 	const (
 		maxBytes     = 1024
-		emittedBytes = 16 * 1024 * 1024
+		emittedBytes = 256 * 1024 * 1024
 	)
-	execCtx, cancelExec := context.WithTimeout(context.Background(), 30*time.Second)
+	execCtx, cancelExec := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelExec()
 	code, stats, err := ctr.ExecTo(execCtx,
 		[]string{"sh", "-c", fmt.Sprintf("head -c %d /dev/zero", emittedBytes)},
@@ -549,11 +557,11 @@ func TestIntegrationDockerExecStreamsLargeOutputBounded(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("code = %d, want 0", code)
 	}
-	if output.Len() != maxBytes {
-		t.Fatalf("retained bytes = %d, want %d", output.Len(), maxBytes)
+	if output.bytes != maxBytes {
+		t.Fatalf("forwarded bytes = %d, want %d", output.bytes, maxBytes)
 	}
 	if stats.Bytes < emittedBytes || !stats.Truncated {
-		t.Fatalf("stats = %+v, want >=%d observed and truncation", stats, emittedBytes)
+		t.Fatalf("stats = %+v, want >=%d bytes observed and truncation", stats, emittedBytes)
 	}
 }
 

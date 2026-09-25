@@ -13,6 +13,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
+// A zero timeout should complete well before the 1.5-second round-up case's
+// two-second grace period. The one-second ceiling leaves room for normal CLI
+// and scheduler overhead without turning this into a hardware benchmark.
+const stopImmediateMaxElapsed = time.Second
+
 // runStopTimingIntegration checks the externally visible stop grace period.
 // The process ignores SIGTERM, so a 1.5-second request must not complete at
 // the floor-converted one second. The bounds allow normal CLI and scheduler

@@ -276,6 +276,24 @@ func (e *SystemNotRunningError) Error() string {
 	return msg
 }
 
+// Is preserves classification identity across a safe redacted clone, matching
+// CLIError.Is semantics. The ordinary unwrap chain handles sentinel and child
+// errors.
+func (e *SystemNotRunningError) Is(target error) bool {
+	other, ok := target.(*SystemNotRunningError)
+	return ok && e != nil && other != nil && e.originalSystem() == other.originalSystem()
+}
+
+func (e *SystemNotRunningError) originalSystem() *SystemNotRunningError {
+	if e == nil {
+		return nil
+	}
+	if e.rawSystem != nil {
+		return e.rawSystem.originalSystem()
+	}
+	return e
+}
+
 // Unwrap exposes only the safe children of a redacted clone. A raw
 // classification returned directly by Classify retains its historical chain;
 // callers must explicitly use UnwrapRaw when they need that raw object.

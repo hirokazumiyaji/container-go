@@ -137,6 +137,35 @@ func TestForLogCountsOccurrences(t *testing.T) {
 	}
 }
 
+func TestStreamingLogMatcherCountsGlobalOccurrencesAcrossChunks(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		pattern     string
+		regexp      bool
+		chunks      []string
+		occurrences int
+	}{
+		{name: "literal overlap", pattern: "aba", chunks: []string{"ababa", "aba"}, occurrences: 2},
+		{name: "regexp overlap", pattern: "aba", regexp: true, chunks: []string{"ababa", "aba"}, occurrences: 2},
+		{name: "regexp end anchor", pattern: "$", regexp: true, chunks: []string{"a", "a"}, occurrences: 1},
+		{name: "empty literal boundaries", pattern: "", chunks: []string{"a", "b"}, occurrences: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			matcher, err := newStreamingLogMatcher(tc.pattern, tc.regexp, tc.occurrences)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, chunk := range tc.chunks {
+				matcher.write([]byte(chunk))
+			}
+			matcher.finishLine()
+			if matcher.count != tc.occurrences {
+				t.Fatalf("count = %d, want %d", matcher.count, tc.occurrences)
+			}
+		})
+	}
+}
+
 func TestForLogAsRegexp(t *testing.T) {
 	target := newFakeTarget()
 	pr, pw := io.Pipe()

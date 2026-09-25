@@ -1,11 +1,11 @@
 package wait
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"regexp"
-	"strings"
 	"time"
 )
 
@@ -54,13 +54,16 @@ func (s *LogStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues()
 const maxLogMatchOverlap = 64 * 1024
 
 type streamingLogMatcher struct {
-	pattern     string
-	re          *regexp.Regexp
-	occurrences int
-	count       int
-	carry       []byte
-	position    int
-	countedEnd  int
+	pattern      string
+	re           *regexp.Regexp
+	occurrences  int
+	count        int
+	carry        []byte
+	position     int
+	countedStart int
+	countedEnd   int
+	haveMatch    bool
+	lineOpen     bool
 }
 
 func newStreamingLogMatcher(pattern string, isRegexp bool, occurrences int) (*streamingLogMatcher, error) {
@@ -80,12 +83,16 @@ func newStreamingLogMatcher(pattern string, isRegexp bool, occurrences int) (*st
 
 func (m *streamingLogMatcher) write(data []byte) {
 	for len(data) > 0 {
-		if i := indexByte(data, '\n'); i >= 0 {
+		if i := bytes.IndexByte(data, '\n'); i >= 0 {
+			m.lineOpen = true
 			m.writeSegment(data[:i])
+			m.finishLine()
 			data = data[i+1:]
 			m.position++
 			m.carry = m.carry[:0]
+			m.countedStart = m.position
 			m.countedEnd = m.position
+			m.haveMatch = false
 			continue
 		}
 		m.writeSegment(data)
@@ -97,6 +104,7 @@ func (m *streamingLogMatcher) writeSegment(segment []byte) {
 	if len(segment) == 0 {
 		return
 	}
+	m.lineOpen = true
 	if m.re == nil {
 		overlap := len(m.pattern) - 1
 		if overlap < 0 {
@@ -108,7 +116,20 @@ func (m *streamingLogMatcher) writeSegment(segment []byte) {
 		combined := make([]byte, 0, len(m.carry)+len(segment))
 		combined = append(combined, m.carry...)
 		combined = append(combined, segment...)
-		m.count += strings.Count(string(combined), m.pattern)
+		base := m.position - len(m.carry)
+		for searchFrom := 0; searchFrom <= len(combined); {
+			index := bytes.Index(combined[searchFrom:], []byte(m.pattern))
+			if index < 0 {
+				break
+			}
+			index += searchFrom
+			m.recordMatch(base+index, base+index+len(m.pattern))
+			if m.pattern == "" {
+				searchFrom = index + 1
+			} else {
+				searchFrom = index + len(m.pattern)
+			}
+		}
 		m.position += len(segment)
 		if overlap == 0 {
 			m.carry = m.carry[:0]
@@ -129,11 +150,12 @@ func (m *streamingLogMatcher) writeSegment(segment []byte) {
 	combined = append(combined, segment...)
 	base := m.position - len(m.carry)
 	for _, match := range m.re.FindAllIndex(combined, -1) {
-		end := base + match[1]
-		if end > m.countedEnd {
-			m.count++
-			m.countedEnd = end
+		if match[1] == len(combined) {
+			// An end-anchored or extensible match is not stable until more
+			// line data arrives or the line is known to have ended.
+			continue
 		}
+		m.recordMatch(base+match[0], base+match[1])
 	}
 	m.position += len(segment)
 	if len(combined) > overlap {
@@ -143,16 +165,30 @@ func (m *streamingLogMatcher) writeSegment(segment []byte) {
 	}
 }
 
-func (m *streamingLogMatcher) found() bool { return m.count >= m.occurrences }
-
-func indexByte(data []byte, target byte) int {
-	for i, b := range data {
-		if b == target {
-			return i
+func (m *streamingLogMatcher) finishLine() {
+	if !m.lineOpen {
+		return
+	}
+	if m.re != nil {
+		base := m.position - len(m.carry)
+		for _, match := range m.re.FindAllIndex(m.carry, -1) {
+			m.recordMatch(base+match[0], base+match[1])
 		}
 	}
-	return -1
+	m.lineOpen = false
 }
+
+func (m *streamingLogMatcher) recordMatch(start, end int) {
+	if m.haveMatch && (start <= m.countedStart || end <= m.countedEnd) {
+		return
+	}
+	m.count++
+	m.countedStart = start
+	m.countedEnd = end
+	m.haveMatch = true
+}
+
+func (m *streamingLogMatcher) found() bool { return m.count >= m.occurrences }
 
 func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	timeout, _ := s.effective()
@@ -185,6 +221,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				}
 			}
 			if readErr != nil {
+				matcher.finishLine()
+				if matcher.found() {
+					close(found)
+					return
+				}
 				scanDone <- readErr
 				return
 			}

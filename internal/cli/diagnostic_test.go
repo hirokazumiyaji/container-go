@@ -212,6 +212,27 @@ func TestSafeSystemNotRunningCloneRedactsBothChildren(t *testing.T) {
 	}
 }
 
+func TestSafeSystemNotRunningCloneMatchesRawClassificationIdentity(t *testing.T) {
+	original := &CLIError{Args: []string{"run"}, ExitCode: 1}
+	probe := &CLIError{Args: []string{"system", "status"}, ExitCode: 1}
+	classified := &SystemNotRunningError{hint: "start the service", original: original, probe: probe}
+	safe := WithRedactor(classified, NewRedactor("diagnostic-secret"))
+
+	var clone *SystemNotRunningError
+	if !errors.As(safe, &clone) {
+		t.Fatal("errors.As did not find *SystemNotRunningError")
+	}
+	if clone == classified {
+		t.Fatal("errors.As returned the raw classification")
+	}
+	if !errors.Is(clone, classified) {
+		t.Fatal("safe clone does not match the raw SystemNotRunningError identity")
+	}
+	if !errors.Is(clone, original) || !errors.Is(clone, probe) || !errors.Is(clone, ErrSystemNotRunning) {
+		t.Fatal("safe clone lost an intended errors.Is chain link")
+	}
+}
+
 func TestClassifyPreservesOriginalAndProbeChains(t *testing.T) {
 	original := &CLIError{Args: []string{"run", "image"}, Stderr: "original-secret", ExitCode: 1}
 	probe := &CLIError{Args: []string{"system", "status"}, Stderr: "probe-secret", ExitCode: 1}

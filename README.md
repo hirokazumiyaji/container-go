@@ -171,8 +171,8 @@ Three layers make sure containers do not outlive your tests:
    SIGKILL and panics included. On Apple Container its name-addressed
    delete requires a creation generation and takes the same ordered,
    user-scoped lock barriers as prune and create; if any lock or the
-   required `lockf` helper is unavailable, the reaper skips the entry
-   (fail closed). The reaper needs `/bin/sh`, so
+   platform lock helper (`lockf` on macOS, `flock` elsewhere) is
+   unavailable, the reaper skips the entry (fail closed). The reaper needs `/bin/sh`, so
    it is unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
@@ -183,8 +183,9 @@ Extras:
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label). On Apple Container,
   pruning re-inspects each candidate under a stable per-name lock and
-  requires its generation, managed label, and state to still match at
-  that inspect. Its canonical lock lives in a private, account-derived
+  requires valid list-time generation/session IDs plus matching
+  managed/reuse/group labels and lifecycle state. Missing metadata and
+  transitional states fail closed. Its canonical lock lives in a private, account-derived
   durable state namespace, independent of `HOME`, XDG, and the process
   `TMPDIR`; transitional legacy and cache lock barriers are retained for
   compatibility with older cooperating revisions. The lock coordinates
@@ -234,9 +235,10 @@ Contract:
   removes the shared container — only do that when nothing else needs it.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). On Apple Container it
-  applies the same fresh generation, managed/group-label, state, and
-  per-name lock checks as `Prune`. Ordinary `Prune` still only deletes
-  stopped managed containers.
+  applies the same fresh generation/session, managed/reuse/group-label,
+  state, and per-name lock checks as `Prune`; only running or stopped
+  states are eligible. Ordinary `Prune` still only deletes stopped
+  managed containers.
 
 This library does not reset application data between tests. Prefer a
 per-test key prefix, separate DB schemas/namespaces, or an `Exec` setup

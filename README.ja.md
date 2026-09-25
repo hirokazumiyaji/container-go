@@ -141,7 +141,8 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。Apple Container では、名前指定の削除に作成世代を必須とし、
    Prune や作成と同じ順序のユーザー単位ロックを取得します。いずれかのロックや
-   必要な `lockf` が利用できない場合は、該当エントリを削除せず fail closed にします。
+   必要なロック補助コマンド(macOS では `lockf`、その他では `flock`)が利用できない場合は、
+   該当エントリを削除せず fail closed にします。
    リーパーは `/bin/sh` を必要とするため Windows では動かず、Windows では
    前 2 層のみでクリーンアップします。
 
@@ -151,8 +152,9 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。
-  Apple Container では、安定した名前ごとのロックを保持したまま各候補を再検査し、
-  その検査時点で世代、managed ラベル、状態が一致する場合だけ削除します。
+  Apple Container では、安定した名前ごとのロックを保持したまま各候補を再検査します。
+  一覧時と再検査時の世代、セッション、managed、reuse、group ラベル、状態がすべて一致し、
+  状態または識別子が遷移中の場合は削除しません。
   正規のロックは `HOME`、XDG、プロセス固有の `TMPDIR` に依存しない、
   OS アカウントから導いた非公開の永続状態領域にあります。旧バージョンとの
   互換性のため、旧 `TMPDIR` とユーザーキャッシュ領域の移行用ロックも維持します。
@@ -191,8 +193,9 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
   コンテナを強制削除する(CI 終了時)。
-  Apple Container では `Prune` と同じ世代、managed ラベル、グループ、
-  状態の再検査と名前ロックを適用する。通常の `Prune` は stopped のみ。
+  Apple Container では `Prune` と同じ世代、セッション、managed、reuse、group ラベル、
+  状態の再検査と名前ロックを適用します。running と stopped だけを削除し、
+  作成中や停止中などの遷移状態は削除しません。通常の `Prune` は stopped のみです。
 
 ライブラリはテスト間のアプリケーションデータを自動初期化しません。
 キー接頭辞、スキーマ分離、`Exec` による reset(`FLUSHALL` 等)を使って

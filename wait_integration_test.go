@@ -99,19 +99,20 @@ func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	}
 }
 
-func TestRunRollbackDeletesByImmutableIDWhenInspectFails(t *testing.T) {
+func TestRunRollbackFailsClosedWhenImmutableInspectionFails(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner(), failInspect: true}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(d), withEngine(dockerEngine{}),
 		WithExposedPorts("6379/tcp"),
 		WithWaitStrategy(endpointInspectStrategy{}),
 	)
-	if err == nil || strings.Contains(err.Error(), "left behind") {
-		t.Fatalf("err = %v, want wait failure with successful rollback", err)
+	if err == nil || !strings.Contains(err.Error(), "left behind") {
+		t.Fatalf("err = %v, want a fail-closed cleanup report", err)
 	}
-	// docker run printed the container ID; rollback needs no inspect.
-	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
-		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	// The run ID is not trusted for deletion until inspect has verified
+	// both its identity and generation.
+	if rm := d.callWith("rm"); rm != nil {
+		t.Errorf("rm = %v, want no delete without verified identity", rm)
 	}
 }
 

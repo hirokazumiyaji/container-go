@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -248,6 +251,62 @@ func TestRunFailureCleansUpAfterCancel(t *testing.T) {
 	}
 	if len(r.deleted) != 1 {
 		t.Fatalf("deleted = %v, want cleanup even after cancel", r.deleted)
+	}
+}
+
+type postCreateFailureRunner struct {
+	*fakeRunner
+	mu       sync.Mutex
+	seenRun  bool
+	creation string
+}
+
+func (r *postCreateFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, args)
+	seenRun := r.seenRun
+	r.mu.Unlock()
+	switch args[0] {
+	case "inspect":
+		if !seenRun {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "published-reuse"`}
+		}
+		r.mu.Lock()
+		creation := r.creation
+		r.mu.Unlock()
+		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
+	case "run":
+		r.mu.Lock()
+		r.seenRun = true
+		for _, arg := range args {
+			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
+				r.creation = creation
+			}
+		}
+		r.mu.Unlock()
+		return []byte("published-reuse\n"), nil, nil
+	default:
+		return r.fakeRunner.Run(ctx, args...)
+	}
+}
+
+func TestReusePostCreateFileFailureDoesNotDeletePublishedGeneration(t *testing.T) {
+	f := newReuseCreateRunner()
+	f.failPrefix = "cp"
+	r := &postCreateFailureRunner{fakeRunner: f.fakeRunner}
+	host := filepath.Join(t.TempDir(), "input")
+	if err := os.WriteFile(host, []byte("payload"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("published-reuse"), WithReuse(),
+		WithFiles(File{HostPath: host, ContainerPath: "/input"}),
+		withRunner(r), withEngine(appleEngine{}))
+	if err == nil || !strings.Contains(err.Error(), "cp") {
+		t.Fatalf("Run error = %v, want post-create copy failure", err)
+	}
+	if del := f.callWith("delete"); del != nil {
+		t.Fatalf("post-create failure deleted published generation: %v", del)
 	}
 }
 

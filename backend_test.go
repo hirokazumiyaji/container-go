@@ -51,6 +51,7 @@ func TestRunSelectsBackendFromEnv(t *testing.T) {
 		t.Fatal(err)
 	}
 	d.inspectJSON = data
+	d.bindRunIdentity = true
 
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(d))

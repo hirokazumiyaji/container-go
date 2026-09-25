@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,8 +9,10 @@ import (
 	"os/exec"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -22,156 +25,218 @@ import (
 // paths enter it only as stdin data validated before registration, and
 // the script itself disables globbing and quotes every expansion.
 // Name-addressed entries require a creation generation and carry the
-// legacy TMPDIR, transitional UserCacheDir, and durable account-state
-// lock paths in that fixed order. The reaper uses the standard lockf(1)
-// default-wait behavior to hold all three across inspect and delete, so
-// old and new cooperating library revisions cannot replace a name in the
-// middle of the operation. If lockf or any lock file is unavailable, the
-// entry is skipped rather than deleted without coordination. Each backend
-// call runs with a per-entry timeout implemented with background jobs and
-// kill (timeout(1)
-// is not standard on macOS), so a hung daemon cannot wedge deletion of
-// later entries. Failures stay silent (|| true) by design: the reaper is
-// last-resort insurance.
+// unique legacy TMPDIR, transitional UserCacheDir, and durable
+// account-state lock paths in that order. The reaper uses lockf(1) on
+// macOS and flock(1) elsewhere to hold every barrier across inspect and
+// delete, so old and new cooperating library revisions cannot replace a
+// name in the middle of the operation. If that helper or any lock file
+// is unavailable, the Apple entry is skipped rather than deleted without
+// coordination. Each backend call runs with a per-entry timeout
+// implemented with background jobs and kill (timeout(1) is not standard
+// on macOS), so a hung daemon cannot wedge deletion of later entries.
+// Failures stay silent (|| true) by design: the reaper is last-resort
+// insurance.
 //
 // When a creation generation is known, the script inspects first and
 // reads the creation label as a structural JSON field: the match is
 // anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name.
+// text containing the same characters cannot satisfy it. Apple Container
+// has no immutable ID, so its guarded delete necessarily goes by name.
+// Full Docker IDs never acquire Apple name locks; when a generation is
+// supplied, the script verifies it and still deletes by the immutable ID.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
+lock_helper="$4"
+timeout="${5:-30}"
+inspect_timeout="${6:-10}"
+delete_timeout="${7:-30}"
+case "$inspect_timeout" in
+  ''|*[!0-9]*) inspect_timeout=10 ;;
+esac
+case "$delete_timeout" in
+  ''|*[!0-9]*) delete_timeout=30 ;;
+esac
 ids=""
 tab=$(printf '\t')
 while IFS= read -r line; do
   ids="$ids
 $line"
 done
-run_with_timeout() {
-  "$@" >/dev/null 2>&1 & pid=$!
-  (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!
-  wait "$pid" 2>/dev/null
-  rc=$?
-  kill "$killer" 2>/dev/null
-  wait "$killer" 2>/dev/null
-  return $rc
-}
 locked_command='
+  inspect_timeout="${REAPER_INSPECT_TIMEOUT:-10}"
+  delete_timeout="${REAPER_DELETE_TIMEOUT:-30}"
+  kill_backend_tree() {
+    kill_root=$1
+    kill_depth=${2:-0}
+    [ "$kill_depth" -lt 32 ] || return 0
+    kill_children=$(pgrep -P "$kill_root" 2>/dev/null || true)
+    for kill_child in $kill_children; do
+      case "$kill_child" in
+        ""|*[!0-9]*) continue ;;
+      esac
+      kill_backend_tree "$kill_child" "$((kill_depth + 1))"
+    done
+    kill -KILL "$kill_root" 2>/dev/null || true
+  }
   lockpath=$1
-  id=$2
-  creation=$3
-  [ -n "$lockpath" ] || exit 0
-  [ -L "$lockpath" ] && exit 0
-  [ -f "$lockpath" ] || exit 0
-  bin=$REAPER_BIN
-  sub=$REAPER_SUB
-  key=$REAPER_KEY
+  expected=$2
+  shift 2
+  if [ "$lockpath" != "-" ]; then
+    [ -n "$lockpath" ] || exit 0
+    [ -L "$lockpath" ] && exit 0
+    [ -f "$lockpath" ] || exit 0
+    lock_identity() {
+      case "$REAPER_LOCK_HELPER" in
+        lockf) stat -f "%d:%i" "$1" 2>/dev/null ;;
+        flock) stat -c "%d:%i" "$1" 2>/dev/null ;;
+        *) return 1 ;;
+      esac
+    }
+    [ "$(lock_identity "$lockpath")" = "$expected" ] || exit 0
+    while [ "$#" -gt 5 ] && { [ -z "$1" ] || [ "$1" = "-" ]; }; do
+      shift 2
+    done
+    if [ "$#" -gt 5 ]; then
+      next_lock=$1
+      next_identity=$2
+      shift 2
+      REAPER_LOCK_HELPER="$REAPER_LOCK_HELPER" \
+      REAPER_LOCK_BIN="$REAPER_LOCK_BIN" \
+      REAPER_LOCK_FLAG1="$REAPER_LOCK_FLAG1" \
+      REAPER_LOCK_FLAG2="$REAPER_LOCK_FLAG2" \
+      REAPER_LOCK_TIMEOUT="$REAPER_LOCK_TIMEOUT" \
+      REAPER_INSPECT_TIMEOUT="$REAPER_INSPECT_TIMEOUT" \
+      REAPER_DELETE_TIMEOUT="$REAPER_DELETE_TIMEOUT" \
+      REAPER_LOCKED_COMMAND="$REAPER_LOCKED_COMMAND" \
+        "$REAPER_LOCK_BIN" "$REAPER_LOCK_FLAG1" "$REAPER_LOCK_FLAG2" "$REAPER_LOCK_TIMEOUT" \
+        "$next_lock" sh -c "$REAPER_LOCKED_COMMAND" reaper-locked "$next_lock" "$next_identity" "$@"
+      exit $?
+    fi
+  fi
+  id=$1
+  creation=$2
+  bin=$3
+  sub=$4
+  key=$5
   target="$id"
   if [ -n "$creation" ]; then
-    tmp=$(mktemp 2>/dev/null) || exit 0
-    ("$bin" inspect "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; exit 0; }
-    got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    rm -f "$tmp"
+    inspect_fields=$(
+      {
+        "$bin" inspect "$id" 2>/dev/null & inspect_pid=$!
+        (sleep "$inspect_timeout"; kill_backend_tree "$inspect_pid") >/dev/null 2>&1 & killer=$!
+        wait "$inspect_pid" 2>/dev/null
+        inspect_rc=$?
+        kill "$killer" 2>/dev/null || true
+        printf "\n__containergo_inspect_rc__%s\n" "$inspect_rc"
+      } | sed -n \
+        -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
+        -e "s/^[[:space:]]*\"Id\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{64\}\)\".*/id=\1/p" \
+        -e "s/^__containergo_inspect_rc__\([0-9][0-9]*\)$/inspect_rc=\1/p"
+    )
+    got=$(printf "%s\n" "$inspect_fields" | sed -n "s/^creation=//p" | head -n 1)
+    uid=$(printf "%s\n" "$inspect_fields" | sed -n "s/^id=//p" | head -n 1)
+    inspect_rc=$(printf "%s\n" "$inspect_fields" | sed -n "s/^inspect_rc=//p" | tail -n 1)
+    unset inspect_fields
+    [ "$inspect_rc" = 0 ] || exit 0
     [ "$got" = "$creation" ] || exit 0
-    [ -n "$uid" ] && target="$uid"
+    case "$sub" in
+      delete) ;;
+      rm)
+        [ "$uid" = "$id" ] || exit 0
+        target="$uid"
+        ;;
+      *) exit 0 ;;
+    esac
   fi
-  ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep 30; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || true
+  ("$bin" "$sub" --force "$target" >/dev/null 2>&1 & pid=$!; (sleep "$delete_timeout"; kill_backend_tree "$pid") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null || true; exit "$rc") || true
 '
-lock_three_command='
-  lockf_bin=${1}
-  lock3=${2}
-  shift 2
-  [ -n "$lock3" ] || exit 0
-  [ -L "$lock3" ] && exit 0
-  [ -f "$lock3" ] || exit 0
-  "$lockf_bin" -k -t 30 "$lock3" sh -c "$REAPER_LOCKED_COMMAND" \
-    reaper-locked "$lock3" "$@"
-'
-valid_lock_path() {
-  [ -n "$1" ] || return 1
-  [ -L "$1" ] && return 1
-  [ -f "$1" ] || return 1
-  return 0
-}
+lock_bin=""
+lock_flag1=""
+lock_flag2=""
+case "$lock_helper" in
+  lockf)
+    lock_bin=$(command -v lockf 2>/dev/null || true)
+    lock_flag1=-k
+    lock_flag2=-t
+    ;;
+  flock)
+    lock_bin=$(command -v flock 2>/dev/null || true)
+    lock_flag1=-x
+    lock_flag2=-w
+    ;;
+  *)
+    exit 0
+    ;;
+esac
 run_locked() {
-  id="$1"
-  creation="$2"
-  lock1="$3"
-  lock2="$4"
-  lock3="$5"
-  valid_lock_path "$lock1" || return 0
-  valid_lock_path "$lock2" || return 0
-  valid_lock_path "$lock3" || return 0
-  lockf_bin=$(command -v lockf 2>/dev/null) || return 0
-  [ -n "$lockf_bin" ] || return 0
-  REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
-    REAPER_LOCKED_COMMAND="$locked_command" REAPER_LOCK_THREE_COMMAND="$lock_three_command" \
-    "$lockf_bin" -k -t 30 "$lock1" sh -c '
-      lockf_bin=${1}
-      lock2=${2}
-      lock3=${3}
-      shift 3
-      [ -n "$lock2" ] || exit 0
-      [ -L "$lock2" ] && exit 0
-      [ -f "$lock2" ] || exit 0
-      [ -n "$lock3" ] || exit 0
-      [ -L "$lock3" ] && exit 0
-      [ -f "$lock3" ] || exit 0
-      "$lockf_bin" -k -t 30 "$lock2" sh -c "$REAPER_LOCK_THREE_COMMAND" \
-        reaper-lock-two "$lockf_bin" "$lock3" "$@"
-    ' reaper-lock "$lockf_bin" "$lock2" "$lock3" "$id" "$creation" >/dev/null 2>&1 || true
+  [ -n "$lock_bin" ] || return 0
+  id=$1
+  creation=$2
+  shift 2
+  set -- "$@" "$id" "$creation" "$bin" "$sub" "$key"
+  while [ "$#" -gt 5 ] && { [ -z "$1" ] || [ "$1" = "-" ]; }; do
+    shift 2
+  done
+  [ "$#" -ge 7 ] || return 0
+  lock=$1
+  identity=$2
+  shift 2
+  REAPER_LOCK_HELPER="$lock_helper" \
+  REAPER_LOCK_BIN="$lock_bin" \
+  REAPER_LOCK_FLAG1="$lock_flag1" \
+  REAPER_LOCK_FLAG2="$lock_flag2" \
+  REAPER_LOCK_TIMEOUT="$timeout" \
+  REAPER_INSPECT_TIMEOUT="$inspect_timeout" \
+  REAPER_DELETE_TIMEOUT="$delete_timeout" \
+  REAPER_LOCKED_COMMAND="$locked_command" \
+    "$lock_bin" "$lock_flag1" "$lock_flag2" "$timeout" "$lock" \
+    sh -c "$locked_command" reaper-locked "$lock" "$identity" "$@" >/dev/null 2>&1 || true
 }
-printf '%s\n' "$ids" | while IFS= read -r line; do
+run_guarded() {
+  id=$1
+  creation=$2
+  REAPER_INSPECT_TIMEOUT="$inspect_timeout" \
+  REAPER_DELETE_TIMEOUT="$delete_timeout" \
+    sh -c "$locked_command" reaper-locked - - "$id" "$creation" "$bin" "$sub" "$key" >/dev/null 2>&1 || true
+}
+run_unlocked() {
+  ("$@" >/dev/null 2>&1 & pid=$!; (sleep "$delete_timeout"; kill_backend_tree "$pid") >/dev/null 2>&1 & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null || true; exit "$rc") || true
+}
+printf "%s\n" "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
-  case "$line" in
-    *"$tab"*)
-      id=${line%%"$tab"*}
-      rest=${line#*"$tab"}
-      creation=${rest%%"$tab"*}
-      rest=${rest#*"$tab"}
-      lock1=${rest%%"$tab"*}
-      rest=${rest#*"$tab"}
-      lock2=${rest%%"$tab"*}
-      lock3=${rest#*"$tab"}
-      case "$lock3" in *"$tab"*) continue ;; esac
-      ;;
-    *)
-      id=$line
-      creation=""
-      lock1=""
-      lock2=""
-      lock3=""
-      ;;
-  esac
-  [ -n "$id" ] || continue
+  old_ifs=$IFS
+  IFS=$tab
+  set -f
+  set -- $line
+  IFS=$old_ifs
+  [ "$#" -eq 8 ] || continue
+  id=$1
+  creation=$2
+  [ "$creation" = "-" ] && creation=""
+  shift 2
+  if [ -n "$1" ] && [ "$1" != "-" ]; then
+    run_locked "$id" "$creation" "$@"
+    continue
+  fi
+  if [ -n "$creation" ]; then
+    [ "$sub" = rm ] && run_guarded "$id" "$creation"
+    continue
+  fi
   case "$sub" in
-    delete)
-      [ -n "$lock1" ] && [ -n "$lock2" ] && [ -n "$lock3" ] || continue
-      run_locked "$id" "$creation" "$lock1" "$lock2" "$lock3"
-      ;;
-    rm)
-      if [ -n "$creation" ]; then
-        [ -n "$lock1" ] && [ -n "$lock2" ] && [ -n "$lock3" ] || continue
-        run_locked "$id" "$creation" "$lock1" "$lock2" "$lock3"
-      else
-        [ -n "$lock1" ] && continue
-        run_with_timeout "$bin" "$sub" --force "$id" || true
-      fi
-      ;;
-    *)
-      continue
-      ;;
+    rm) run_unlocked "$bin" "$sub" --force "$id" ;;
+    *) ;;
   esac
 done
 `
 
-const maxReaperSpawnFailures = 3
+const (
+	maxReaperSpawnFailures             = 3
+	reaperRegistrationTimeout          = 500 * time.Millisecond
+	defaultReaperTimeoutSeconds        = 30
+	defaultReaperInspectTimeoutSeconds = 10
+)
 
 // breQuote escapes a literal for use inside the reaper's sed basic
 // regular expression, so the label key's dots match only dots.
@@ -189,13 +254,18 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
+type nameLockTarget struct {
+	path     string
+	identity string
+}
+
 type reaperEntry struct {
 	id       string
 	creation string
 	// lockPaths contains the legacy, transitional, and durable barriers
 	// in acquisition order for name-addressed entries. Immutable-ID
 	// entries leave it empty and do not need a name lock.
-	lockPaths []string
+	lockPaths []nameLockTarget
 }
 
 type reaper struct {
@@ -204,86 +274,172 @@ type reaper struct {
 	// (Docker); both take --force.
 	subcommand string
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	exited        chan struct{}
-	entries       []reaperEntry
-	spawnFailures int
-	gaveUp        bool
+	mu                    sync.Mutex
+	cmd                   *exec.Cmd
+	stdin                 io.WriteCloser
+	exited                chan struct{}
+	entries               []reaperEntry
+	spawnFailures         int
+	gaveUp                bool
+	timeoutSeconds        int
+	inspectTimeoutSeconds int
 }
 
 func newReaper(binary, subcommand string) *reaper {
-	return &reaper{binary: binary, subcommand: subcommand}
+	return &reaper{
+		binary:                binary,
+		subcommand:            subcommand,
+		timeoutSeconds:        defaultReaperTimeoutSeconds,
+		inspectTimeoutSeconds: defaultReaperInspectTimeoutSeconds,
+	}
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. Name-addressed entries require
-// a valid creation generation and carry all compatibility lock barriers.
-// A generation-less entry is accepted only for a full immutable Docker ID.
+// respawning the reaper process as needed. Docker entries are always full
+// immutable IDs, with or without a generation. Apple name-addressed
+// entries require a generation and carry all unique compatibility locks.
 func (r *reaper) register(id, creation string) error {
-	immutableID := r.subcommand == "rm" && dockerIDRE.MatchString(id)
-	if !nameRE.MatchString(id) && !immutableID {
-		return fmt.Errorf("reaper: invalid container id %q", id)
+	return r.registerContext(context.Background(), id, creation)
+}
+
+func (r *reaper) registerContext(ctx context.Context, id, creation string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
-	if immutableID {
-		creation = ""
-	} else if creation == "" {
-		return fmt.Errorf("reaper: name-addressed entry %q requires a creation generation", id)
-	}
 
-	var lockPaths []string
-	if r.subcommand == "delete" || creation != "" {
+	var lockPaths []nameLockTarget
+	switch r.subcommand {
+	case "rm":
+		if !dockerIDRE.MatchString(id) {
+			return fmt.Errorf("reaper: Docker entry %q requires a full immutable ID", id)
+		}
+	case "delete":
+		if !nameRE.MatchString(id) {
+			return fmt.Errorf("reaper: invalid container name %q", id)
+		}
+		if creation == "" {
+			return fmt.Errorf("reaper: name-addressed entry %q requires a creation generation", id)
+		}
 		var err error
 		lockPaths, err = reaperNameLockPaths(id)
 		if err != nil {
 			return fmt.Errorf("reaper: prepare name locks for %q: %w", id, err)
 		}
-		if len(lockPaths) != 3 {
-			return fmt.Errorf("reaper: got %d name lock barriers for %q, want 3", len(lockPaths), id)
+		if len(lockPaths) == 0 || len(lockPaths) > 3 {
+			return fmt.Errorf("reaper: got %d name lock barriers for %q", len(lockPaths), id)
 		}
-		for _, path := range lockPaths {
-			if !validNameLockProtocolPath(path) {
-				return fmt.Errorf("reaper: invalid name lock path %q", path)
+		seen := make(map[string]struct{}, len(lockPaths))
+		for _, target := range lockPaths {
+			if !validNameLockProtocolPath(target.path) {
+				return fmt.Errorf("reaper: invalid name lock path %q", target.path)
 			}
+			if !nameLockIdentityRE.MatchString(target.identity) {
+				return fmt.Errorf("reaper: invalid name lock identity %q", target.identity)
+			}
+			if _, ok := seen[target.path]; ok {
+				return fmt.Errorf("reaper: duplicate name lock path %q", target.path)
+			}
+			seen[target.path] = struct{}{}
 		}
+	default:
+		return fmt.Errorf("reaper: unsupported delete subcommand %q", r.subcommand)
 	}
 
-	r.mu.Lock()
+	if err := lockMutex(ctx, &r.mu); err != nil {
+		return fmt.Errorf("reaper: register %s: %w", id, err)
+	}
 	defer r.mu.Unlock()
 	entry := reaperEntry{id: id, creation: creation, lockPaths: lockPaths}
 	r.entries = append(r.entries, entry)
-	if r.stdin != nil {
-		if r.writeLocked(entry) == nil {
+	if r.stdin != nil && r.writeLockedContext(ctx, entry) == nil {
+		return nil
+	}
+	return r.respawnAndReplayLocked(ctx)
+}
+
+func lockMutex(ctx context.Context, mu *sync.Mutex) error {
+	for {
+		if mu.TryLock() {
 			return nil
 		}
+		timer := time.NewTimer(time.Millisecond)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return ctx.Err()
+		case <-timer.C:
+		}
 	}
-	return r.respawnAndReplayLocked()
+}
+
+var nameLockIdentityRE = regexp.MustCompile(`^[0-9]+:[0-9]+$`)
+
+func (r *reaper) writeLockedContext(ctx context.Context, e reaperEntry) error {
+	if deadline, ok := ctx.Deadline(); ok {
+		if writer, ok := r.stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+			if err := writer.SetWriteDeadline(deadline); err != nil {
+				return err
+			}
+			defer func() { _ = writer.SetWriteDeadline(time.Time{}) }()
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return r.writeLocked(e)
+		}
+	}
+
+	// Test and alternate runners may provide a writer without pipe
+	// deadlines. Do not let such a writer hold the registration mutex past
+	// the caller's bounded context. Production StdinPipe is an *os.File and
+	// takes the deadline path above; this fallback is intentionally isolated
+	// to non-file writers.
+	if _, ok := r.stdin.(interface{ SetWriteDeadline(time.Time) error }); !ok {
+		result := make(chan error, 1)
+		go func() { result <- r.writeLocked(e) }()
+		select {
+		case err := <-result:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return r.writeLocked(e)
 }
 
 func (r *reaper) writeLocked(e reaperEntry) error {
 	if r.stdin == nil {
 		return io.ErrClosedPipe
 	}
-	line := e.id
-	if len(e.lockPaths) > 0 {
-		if len(e.lockPaths) != 3 {
-			return fmt.Errorf("reaper: got %d name lock barriers for %q, want 3", len(e.lockPaths), e.id)
-		}
-		line += "\t" + e.creation
-		for _, path := range e.lockPaths {
-			if !validNameLockProtocolPath(path) {
-				return fmt.Errorf("reaper: invalid stable name lock for %q", e.id)
-			}
-			line += "\t" + path
-		}
-	} else if e.creation != "" {
-		return fmt.Errorf("reaper: missing stable name locks for %q", e.id)
+	creation := e.creation
+	if creation == "" {
+		creation = "-"
 	}
-	line += "\n"
+	fields := []string{e.id, creation}
+	if len(e.lockPaths) > 3 {
+		return fmt.Errorf("reaper: too many name lock barriers for %q", e.id)
+	}
+	seen := make(map[string]struct{}, len(e.lockPaths))
+	for i := 0; i < 3; i++ {
+		if i >= len(e.lockPaths) {
+			fields = append(fields, "-", "-")
+			continue
+		}
+		target := e.lockPaths[i]
+		if !validNameLockProtocolPath(target.path) || !nameLockIdentityRE.MatchString(target.identity) {
+			return fmt.Errorf("reaper: invalid stable name lock for %q", e.id)
+		}
+		if _, ok := seen[target.path]; ok {
+			return fmt.Errorf("reaper: duplicate stable name lock for %q", e.id)
+		}
+		seen[target.path] = struct{}{}
+		fields = append(fields, target.path, target.identity)
+	}
+	line := strings.Join(fields, "\t") + "\n"
 	n, err := io.WriteString(r.stdin, line)
 	if err == nil && n != len(line) {
 		return io.ErrShortWrite
@@ -294,15 +450,18 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 // respawnAndReplayLocked starts a fresh reaper process and re-registers
 // every known ID with it. Success resets the consecutive-failure count;
 // giving up logs once so a permanently broken reaper is visible.
-func (r *reaper) respawnAndReplayLocked() error {
+func (r *reaper) respawnAndReplayLocked(ctx context.Context) error {
 	for r.spawnFailures < maxReaperSpawnFailures {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if err := r.spawnLocked(); err != nil {
 			r.spawnFailures++
 			continue
 		}
 		replayed := true
 		for _, e := range r.entries {
-			if r.writeLocked(e) != nil {
+			if r.writeLockedContext(ctx, e) != nil {
 				replayed = false
 				break
 			}
@@ -320,8 +479,31 @@ func (r *reaper) respawnAndReplayLocked() error {
 	return errors.New("reaper: giving up after repeated spawn failures")
 }
 
+func reaperLockHelperForOS(goos string) string {
+	if goos == "darwin" {
+		return "lockf"
+	}
+	return "flock"
+}
+
+func reaperLockHelper() string {
+	return reaperLockHelperForOS(runtime.GOOS)
+}
+
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	timeout := r.timeoutSeconds
+	if timeout <= 0 {
+		timeout = defaultReaperTimeoutSeconds
+	}
+	inspectTimeout := r.inspectTimeoutSeconds
+	if inspectTimeout <= 0 {
+		inspectTimeout = defaultReaperInspectTimeoutSeconds
+	}
+	cmd := exec.Command(
+		"/bin/sh", "-c", reaperScript, "containergo-reaper",
+		r.binary, r.subcommand, breQuote(creationLabel), reaperLockHelper(), strconv.Itoa(timeout), strconv.Itoa(inspectTimeout), strconv.Itoa(timeout),
+	)
+	prepareReaperCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err
@@ -348,14 +530,27 @@ func (r *reaper) closeStdin() {
 	}
 }
 
-// killForTest kills the reaper child and waits until it is reaped, so
-// the next write deterministically fails.
-func (r *reaper) killForTest() {
+// killForTest kills the isolated reaper process group and waits until it
+// is reaped, so the next write deterministically fails without leaving
+// helper descendants behind.
+func (r *reaper) killForTest() error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.cmd != nil {
-		_ = r.cmd.Process.Kill()
-		<-r.exited
+	cmd, exited := r.cmd, r.exited
+	r.mu.Unlock()
+	if cmd == nil {
+		return nil
+	}
+	if err := killReaperProcess(cmd); err != nil {
+		return err
+	}
+	if exited == nil {
+		return nil
+	}
+	select {
+	case <-exited:
+		return nil
+	case <-time.After(2 * time.Second):
+		return errors.New("reaper: timed out waiting for killed child")
 	}
 }
 
@@ -368,18 +563,23 @@ var (
 // process-wide reaper for its backend binary. Reaper trouble never
 // fails container startup. The reaper needs /bin/sh, so on Windows
 // this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+func registerWithGlobalReaper(ctx context.Context, binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
 	}
-	globalReapersMu.Lock()
+	registrationCtx, cancel := context.WithTimeout(ctx, reaperRegistrationTimeout)
+	defer cancel()
+	if err := lockMutex(registrationCtx, &globalReapersMu); err != nil {
+		log.Printf("container-go: reaper registration %s: %v", id, err)
+		return
+	}
 	r, ok := globalReapers[binary]
 	if !ok {
 		r = newReaper(binary, subcommand)
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	if err := r.register(id, creation); err != nil {
+	if err := r.registerContext(registrationCtx, id, creation); err != nil {
 		// A name-addressed entry is not safe without its stable lock
 		// file, so registration failure is deliberately fail-closed. The
 		// best-effort reaper contract still leaves normal Run/Cleanup

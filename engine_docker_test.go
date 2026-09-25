@@ -2,12 +2,14 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"encoding/json"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -245,8 +247,10 @@ const dockerFixtureID = "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b
 
 type dockerRunner struct {
 	*fakeRunner
-	inspectJSON []byte
-	failInspect bool
+	inspectJSON     []byte
+	failInspect     bool
+	bindRunIdentity bool
+	creation        string
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -255,18 +259,42 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
+		for _, arg := range args {
+			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
+				d.creation = creation
+			}
+		}
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
-		return d.inspectJSON, nil, nil
+		if !d.bindRunIdentity || d.creation == "" {
+			return d.inspectJSON, nil, nil
+		}
+		var containers []map[string]any
+		if err := json.Unmarshal(d.inspectJSON, &containers); err != nil {
+			return nil, nil, err
+		}
+		for _, container := range containers {
+			config, _ := container["Config"].(map[string]any)
+			labels, _ := config["Labels"].(map[string]any)
+			if labels == nil {
+				labels = make(map[string]any)
+				config["Labels"] = labels
+			}
+			labels[creationLabel] = d.creation
+			labels[sessionLabel] = sessionID()
+			labels[managedLabel] = "true"
+		}
+		data, err := json.Marshal(containers)
+		return data, nil, err
 	default:
 		return nil, nil, nil
 	}
 }
 
-func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
+func TestDockerTerminateVerifiesImmutableIDBeforeDelete(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d)
 	if ctr.uid != dockerFixtureID {
@@ -276,9 +304,13 @@ func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}
-	// Delete by immutable ID needs no inspect: exactly one call follows.
-	if extra := d.calls[inspects:]; len(extra) != 1 || extra[0][0] != "rm" {
-		t.Errorf("Terminate issued %v, want a single rm", extra)
+	// The final delete is preceded by a fresh immutable-ID and generation check.
+	extra := d.calls[inspects:]
+	if len(extra) != 2 || extra[0][0] != "inspect" || extra[1][0] != "rm" {
+		t.Errorf("Terminate issued %v, want one verify followed by rm", extra)
+	}
+	if extra[0][len(extra[0])-1] != dockerFixtureID {
+		t.Errorf("verify target = %v, want immutable ID %s", extra[0], dockerFixtureID)
 	}
 	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
 		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
@@ -304,6 +336,7 @@ func runDockerTestContainer(t *testing.T, d *dockerRunner, opts ...Option) *Cont
 		t.Fatal(err)
 	}
 	d.inspectJSON = data
+	d.bindRunIdentity = true
 	opts = append([]Option{WithName("myctr"), withRunner(d), withEngine(dockerEngine{})}, opts...)
 	ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err != nil {

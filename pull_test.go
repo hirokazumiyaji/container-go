@@ -13,31 +13,28 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// runParallelRuns starts n Runs of the same image concurrently and
-// returns the errors indexed by goroutine.
-func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
-	t.Helper()
-	errs := make([]error, n)
+func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
+	f := newTestRunner()
+	f.immutableInspect = true
+	opts := make([][]Option, 10)
+	for i := range opts {
+		opts[i] = []Option{WithName(fmt.Sprintf("parallel-%d", i)), withRunner(f), withEngine(dockerEngine{})}
+	}
+	errs := make([]error, len(opts))
 	var wg sync.WaitGroup
-	for i := range n {
+	for i := range opts {
 		wg.Add(1)
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
+			ctr, err := Run(context.Background(), "redis:7-alpine", opts[i]...)
 			if err != nil {
 				errs[i] = err
 				return
 			}
 			_ = ctr.Terminate(context.Background())
-		}()
+		}(i)
 	}
 	wg.Wait()
-	return errs
-}
-
-func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-	f := newTestRunner()
-	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
@@ -65,6 +62,7 @@ func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
 func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 	f := newTestRunner()
 	f.imagePresent = true
+	f.immutableInspect = true
 	opts := []Option{WithName("myctr"), WithPullPolicy(PullAlways), withRunner(f), withEngine(dockerEngine{})}
 	for i := range 2 {
 		if _, err := Run(context.Background(), "redis:7-alpine", opts...); err != nil {

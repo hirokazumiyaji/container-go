@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -30,9 +32,12 @@ type fakeRunner struct {
 	failPrefix  string // fail calls whose first arg matches
 	systemUp    bool
 
-	imagePresent bool // image in the local store (image inspect/pull)
-	pullCalls    int
-	creations    map[string]string // container name -> creation generation from run args
+	imagePresent     bool // image in the local store (image inspect/pull)
+	pullCalls        int
+	creations        map[string]string // container name -> creation generation from run args
+	reuseNames       map[string]bool   // container name -> WithReuse label from run args
+	immutableInspect bool
+	ids              map[string]string // container name -> synthetic immutable ID
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -101,18 +106,84 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 							f.creations = map[string]string{}
 						}
 						f.creations[name] = v
+						if f.immutableInspect {
+							if f.ids == nil {
+								f.ids = map[string]string{}
+							}
+							digest := sha256.Sum256([]byte(name))
+							f.ids[name] = hex.EncodeToString(digest[:])
+						}
 					}
+				}
+			}
+		}
+		for i, a := range args {
+			if a != "--label" || i+1 >= len(args) {
+				continue
+			}
+			if value, ok := strings.CutPrefix(args[i+1], reuseLabel+"="); ok {
+				name := ""
+				for j, b := range args {
+					if b == "--name" && j+1 < len(args) {
+						name = args[j+1]
+					}
+				}
+				if name != "" {
+					if f.reuseNames == nil {
+						f.reuseNames = map[string]bool{}
+					}
+					f.reuseNames[name] = value == "true"
 				}
 			}
 		}
 		return []byte(args[len(args)-1] + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
+		target := args[len(args)-1]
+		if f.immutableInspect && json == "" {
+			name := target
+			uid := ""
+			for logicalName, id := range f.ids {
+				if target == logicalName || target == id {
+					name, uid = logicalName, id
+					break
+				}
+			}
+			if uid == "" {
+				digest := sha256.Sum256([]byte(name))
+				uid = hex.EncodeToString(digest[:])
+			}
+			reuseJSON := ""
+			if f.reuseNames[name] {
+				reuseJSON = fmt.Sprintf(`,"%s":"true"`, reuseLabel)
+			}
+			json = fmt.Sprintf(`[
+  {
+    "Id": %q,
+    "Name": %q,
+    "State": {"Status": "running"},
+    "Config": {
+      "Image": "docker.io/library/redis:7-alpine",
+      "Labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": %q%s
+      }
+    },
+    "NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
+  }
+]`, uid, "/"+name, sessionID(), f.creations[name], reuseJSON)
+			return []byte(json), nil, nil
+		}
 		if json == "" {
 			// Answer for whatever id was asked, echoing back the
 			// creation generation captured at run time so
 			// generation-verified deletes succeed.
 			name := args[len(args)-1]
+			reuseJSON := ""
+			if f.reuseNames[name] {
+				reuseJSON = fmt.Sprintf(`,"%s":"true"`, reuseLabel)
+			}
 			json = fmt.Sprintf(`[
   {
     "id": %q,
@@ -120,14 +191,14 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "id": %q,
       "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q%s}
     },
     "status": {
       "state": "running",
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, name, name, sessionID(), f.creations[name])
+]`, name, name, sessionID(), f.creations[name], reuseJSON)
 		}
 		return []byte(json), nil, nil
 	default:
@@ -153,6 +224,15 @@ func runTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
 	// Pin the apple engine so a CONTAINERGO_BACKEND in the developer's
 	// environment cannot redirect the apple-shaped fixtures.
 	opts = append([]Option{WithName("myctr"), withRunner(f), withEngine(appleEngine{})}, opts...)
+	if base, ok := f.(*fakeRunner); ok {
+		cfg := newConfig()
+		for _, opt := range opts {
+			if err := opt(cfg); err != nil {
+				t.Fatal(err)
+			}
+		}
+		base.immutableInspect = cfg.eng.immutableID()
+	}
 	ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err != nil {
 		t.Fatalf("Run: %v", err)

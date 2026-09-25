@@ -1,56 +1,14 @@
+//go:build !windows
+
 package container
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 )
-
-func creationInspectJSON(name, creation string) string {
-	return fmt.Sprintf(`[
-  {
-    "id": %q,
-    "configuration": {
-      "id": %q,
-      "image": {"reference": "redis:7-alpine"},
-      "publishedPorts": [],
-      "labels": {
-        "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q,
-        "com.github.hirokazumiyaji.container-go.creation": %q
-      }
-    },
-    "status": {"state": "running", "networks": []}
-  }
-]`, name, name, sessionID(), creation)
-}
-
-type genRunner struct {
-	*fakeRunner
-	inspectJSON string
-	deleted     []string
-}
-
-func (g *genRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "inspect":
-		g.mu.Lock()
-		g.calls = append(g.calls, args)
-		g.mu.Unlock()
-		return []byte(g.inspectJSON), nil, nil
-	case "delete", "rm":
-		g.mu.Lock()
-		g.calls = append(g.calls, args)
-		g.deleted = append(g.deleted, args[len(args)-1])
-		g.mu.Unlock()
-		return nil, nil, nil
-	default:
-		return g.fakeRunner.Run(ctx, args...)
-	}
-}
 
 func TestTerminateRefusesReplacedContainer(t *testing.T) {
 	base := newTestRunner()
@@ -117,17 +75,19 @@ func TestReaperSkipsReplacedGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "delete")
+	name := "reaper-skip-" + newContainerName()
 	oldCreation := "eeeeeeeeeeeeeeee"
-	if err := r.register("myctr", oldCreation); err != nil {
+	if err := r.register(name, oldCreation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
+	waitForReaperExitForTest(t, r)
 	// Give the reaper a moment to run; it must NOT delete.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(50 * time.Millisecond)
 	}
-	if data, _ := os.ReadFile(logPath); len(data) != 0 && strings.Contains(string(data), "myctr") {
+	if data, _ := os.ReadFile(logPath); len(data) != 0 && strings.Contains(string(data), name) {
 		t.Fatalf("reaper deleted replaced container: %q", data)
 	}
 }
@@ -144,9 +104,11 @@ func TestReaperDeletesMatchingGeneration(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "delete")
-	if err := r.register("myctr", creation); err != nil {
+	name := "reaper-match-" + newContainerName()
+	if err := r.register(name, creation); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
-	waitForLogLines(t, logPath, "delete --force myctr")
+	waitForReaperExitForTest(t, r)
+	waitForLogLines(t, logPath, "delete --force "+name)
 }

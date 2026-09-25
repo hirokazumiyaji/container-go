@@ -51,6 +51,9 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 
 func (appleEngine) parseRunID([]byte) string { return "" }
 
+func (appleEngine) immutableID() bool          { return false }
+func (appleEngine) nameAddressedDeletes() bool { return true }
+
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
@@ -136,8 +139,9 @@ func (appleEngine) listArgs() []string {
 }
 
 // parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter. The list-time generation and state are kept so
-// a later name-based delete can be checked against a fresh inspect.
+// label or status filter. It retains the complete list-time ownership
+// metadata so a later name-based delete can be checked against a fresh
+// inspect without trusting stale name-only output.
 func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
@@ -152,8 +156,10 @@ func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
 		candidates = append(candidates, pruneCandidate{
 			id:         c.ID,
 			creation:   labels[creationLabel],
+			session:    labels[sessionLabel],
 			state:      State(c.Status.State),
 			managed:    true,
+			reuse:      labels[reuseLabel] == "true",
 			reuseGroup: labels[reuseGroupLabel],
 		})
 	}
@@ -249,15 +255,15 @@ func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandida
 		candidates = append(candidates, pruneCandidate{
 			id:         c.ID,
 			creation:   labels[creationLabel],
+			session:    labels[sessionLabel],
 			state:      State(c.Status.State),
 			managed:    labels[managedLabel] == "true",
+			reuse:      labels[reuseLabel] == "true",
 			reuseGroup: labels[reuseGroupLabel],
 		})
 	}
 	return candidates, nil
 }
-
-func (appleEngine) nameAddressedDeletes() bool { return true }
 
 // nameConflict matches Apple Container's duplicate-name wording.
 func (appleEngine) nameConflict(err error) bool {

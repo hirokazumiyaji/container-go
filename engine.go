@@ -26,14 +26,20 @@ type engineInfo struct {
 
 // pruneCandidate is the identity-bearing subset of a list result. Apple
 // Container addresses containers by name, so a later inspect must be able
-// to prove that the same generation and lifecycle state is still present
-// before a name-based delete is attempted.
+// to prove that every ownership field and the lifecycle state are still the
+// same before a name-based delete is attempted.
 type pruneCandidate struct {
 	id         string
 	creation   string
+	session    string
 	state      State
 	managed    bool
+	reuse      bool
 	reuseGroup string
+}
+
+func verifiedImmutableID(eng engine, id string) bool {
+	return eng.immutableID() && dockerIDRE.MatchString(id)
 }
 
 type boundPort struct {
@@ -57,6 +63,9 @@ type engine interface {
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).
 	parseRunID(stdout []byte) string
+	// immutableID reports whether verified full IDs can address one
+	// Docker generation without a name lock.
+	immutableID() bool
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
 	stopArgs(id string, timeout *time.Duration) []string

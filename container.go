@@ -101,12 +101,14 @@ type Container struct {
 	// library; see Terminate for the limits of the name-based path.
 	creation string
 	// uid is the backend's immutable container ID when it has one
-	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it.
-	uid string
+	// (Docker). It is not trusted until inspectFresh has bound and
+	// verified it under inspectMu.
+	uid      string
+	uidBound bool
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; immutable fields only
+	mu        sync.Mutex
+	info      *engineInfo // cached first inspect; immutable fields only
+	inspectMu sync.Mutex  // serializes target selection and UID binding
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -177,6 +179,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		return nil, errors.Join(classified, cleanupErr)
 	}
 
+	uid := cfg.eng.parseRunID(stdout)
 	c := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,
@@ -184,21 +187,30 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
+		// parseRunID only proves the output shape; inspectFresh binds it.
+		uidBound: false,
 	}
-	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
+	var initialInfo *engineInfo
+	if c.eng.immutableID() {
+		initialInfo, err = c.cachedInfo(runCtx)
+		if err != nil {
+			return nil, c.rollback(context.WithoutCancel(runCtx), fmt.Errorf("verify created container: %w", err))
+		}
+	}
+	// Register only after the backend has returned and an immutable backend
+	// has verified its UID/generation binding. Reaper trouble is best-effort,
+	// and normal Run/Cleanup paths remain available if registration fails.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
 		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
-		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+		target := c.id
+		if c.eng.immutableID() {
+			target = c.uid
 		}
+		registerWithGlobalReaper(runCtx, bin, cfg.eng.reaperSubcommand(), target, cfg.creation)
 	}
 
 	for _, f := range cfg.files {
@@ -215,6 +227,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
 			return nil, c.rollback(ctx, err)
+		}
+	}
+	if cfg.waitStrategy != nil || (c.eng.immutableID() && c.uidBound) {
+		if _, err := c.verifyHandleIdentity(runCtx, initialInfo, true, false); err != nil {
+			return nil, c.rollback(context.WithoutCancel(runCtx), fmt.Errorf("verify before return: %w", err))
 		}
 	}
 	return c, nil
@@ -272,7 +289,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 		defer unlock()
 	}
-	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	cleanupContainer := namedContainer(cfg, cfg.name)
+	cleanupContainer.creation = cfg.creation
+	info, err := cleanupContainer.inspectFresh(cleanupCtx)
 	if isNotFound(err) {
 		return nil
 	}
@@ -316,7 +335,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), target, reaperCreation)
+		registerWithGlobalReaper(cleanupCtx, bin, cfg.eng.reaperSubcommand(), target, reaperCreation)
 	}
 
 	_, _, err = cfg.runner.Run(cleanupCtx, cfg.eng.deleteArgs(target)...)
@@ -365,9 +384,13 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	target, err := c.operationTarget(ctx)
+	if err != nil {
+		return err
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
 	return c.classify(ctx, err)
 }
 
@@ -388,8 +411,25 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
-	if isImmutableContainerID(c.eng, c.uid) {
-		return c.delete(ctx, c.uid)
+	if c.eng.immutableID() {
+		// Even an ID printed by `run` is bound only after a fresh
+		// generation-checked inspect. This keeps a stale or forged handle
+		// from turning an immutable-looking string into an unchecked delete.
+		fresh, err := c.inspectFresh(ctx)
+		if isNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("terminate %s: verify immutable identity: %w", c.id, err)
+		}
+		c.inspectMu.Lock()
+		target := c.uid
+		bound := c.uidBound && verifiedImmutableID(c.eng, target)
+		c.inspectMu.Unlock()
+		if !bound || fresh.uid != target {
+			return fmt.Errorf("%w: %s changed immutable ID", ErrGenerationReplaced, c.id)
+		}
+		return c.delete(ctx, target)
 	}
 	if !creationRE.MatchString(c.creation) {
 		if c.eng.nameAddressedDeletes() {
@@ -433,7 +473,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 }
 
 func isImmutableContainerID(eng engine, id string) bool {
-	return eng.name() == "docker" && dockerIDRE.MatchString(id)
+	return verifiedImmutableID(eng, id)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
@@ -546,20 +586,101 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
 	return info, nil
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.inspectTargetLocked()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return nil, err
+	}
+	if c.eng.immutableID() {
+		if !verifiedImmutableID(c.eng, info.uid) {
+			return nil, fmt.Errorf("%w: %s inspect returned invalid immutable ID", ErrGenerationReplaced, c.id)
+		}
+		if c.uid != "" && c.uid != info.uid {
+			return nil, fmt.Errorf("%w: %s changed immutable ID", ErrGenerationReplaced, c.id)
+		}
+		if c.creation != "" && (!creationRE.MatchString(c.creation) || info.labels[creationLabel] != c.creation) {
+			return nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		c.uid = info.uid
+		c.uidBound = true
+	}
+	return info, nil
+}
+
+func (c *Container) verifyHandleIdentity(ctx context.Context, expected *engineInfo, requireSession, requireRunning bool) (*engineInfo, error) {
+	fresh, err := c.inspectFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if fresh.labels[managedLabel] != "true" {
+		return nil, fmt.Errorf("%w: %s is no longer managed", ErrGenerationReplaced, c.id)
+	}
+	if requireSession && (fresh.labels[sessionLabel] == "" || fresh.labels[sessionLabel] != sessionID()) {
+		return nil, fmt.Errorf("%w: %s session changed", ErrGenerationReplaced, c.id)
+	}
+	if c.eng.nameAddressedDeletes() &&
+		(!creationRE.MatchString(c.creation) || fresh.labels[creationLabel] != c.creation) {
+		return nil, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.reused && fresh.labels[reuseLabel] != "true" {
+		return nil, fmt.Errorf("%w: %s reuse ownership changed", ErrGenerationReplaced, c.id)
+	}
+	if c.eng.immutableID() && (!verifiedImmutableID(c.eng, fresh.uid) || (expected != nil && fresh.uid != expected.uid)) {
+		return nil, fmt.Errorf("%w: %s immutable identity changed", ErrGenerationReplaced, c.id)
+	}
+	if expected != nil {
+		for _, label := range []string{managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel} {
+			if expected.labels[label] != fresh.labels[label] {
+				return nil, fmt.Errorf("%w: %s ownership label %s changed", ErrGenerationReplaced, c.id, label)
+			}
+		}
+	}
+	if requireRunning && fresh.state != StateRunning {
+		return nil, fmt.Errorf("container %s state changed to %s before return", c.id, fresh.state)
+	}
+	return fresh, nil
+}
+
+func (c *Container) operationTarget(ctx context.Context) (string, error) {
+	if !c.eng.immutableID() {
+		return c.id, nil
+	}
+	c.inspectMu.Lock()
+	if c.uidBound && verifiedImmutableID(c.eng, c.uid) {
+		target := c.uid
+		c.inspectMu.Unlock()
+		return target, nil
+	}
+	c.inspectMu.Unlock()
+	if _, err := c.inspectFresh(ctx); err != nil {
+		return "", err
+	}
+	c.inspectMu.Lock()
+	defer c.inspectMu.Unlock()
+	if !c.uidBound || !verifiedImmutableID(c.eng, c.uid) {
+		return "", fmt.Errorf("%w: %s has no verified immutable ID", ErrGenerationReplaced, c.id)
+	}
+	return c.uid, nil
+}
+
+func (c *Container) inspectTargetLocked() string {
+	if c.eng.immutableID() && verifiedImmutableID(c.eng, c.uid) {
+		return c.uid
+	}
+	return c.id
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

@@ -87,6 +87,10 @@ func transitionalNameLockPath(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("find transitional user cache directory: %w", err)
 	}
+	cacheDir, err = filepath.Abs(cacheDir)
+	if err != nil {
+		return "", fmt.Errorf("make transitional user cache directory absolute: %w", err)
+	}
 	appDir := filepath.Join(cacheDir, "container-go")
 	lockDir := filepath.Join(appDir, "locks")
 	for _, dir := range []string{appDir, lockDir} {
@@ -104,9 +108,9 @@ func legacyNameLockPath(name string) (string, error) {
 	if !nameRE.MatchString(name) {
 		return "", fmt.Errorf("invalid container name %q", name)
 	}
-	tempDir := os.TempDir()
-	if !filepath.IsAbs(tempDir) {
-		return "", fmt.Errorf("temporary directory %q is not absolute", tempDir)
+	tempDir, err := filepath.Abs(os.TempDir())
+	if err != nil {
+		return "", fmt.Errorf("make temporary lock directory absolute: %w", err)
 	}
 	return filepath.Join(tempDir, "containergo-"+name+".lock"), nil
 }
@@ -210,7 +214,29 @@ type resolvedNameLocks struct {
 }
 
 func (l resolvedNameLocks) ordered() []string {
-	return []string{l.legacy, l.transitional, l.state}
+	paths := make([]string, 0, 3)
+	seen := make(map[string]struct{}, 3)
+	for _, path := range []string{l.legacy, l.transitional, l.state} {
+		if _, ok := seen[path]; ok {
+			continue
+		}
+		seen[path] = struct{}{}
+		paths = append(paths, path)
+	}
+	return paths
+}
+
+func canonicalLockPath(path string) (string, error) {
+	path, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("make lock path absolute: %w", err)
+	}
+	dir, base := filepath.Split(filepath.Clean(path))
+	resolvedDir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("resolve lock directory %s: %w", dir, err)
+	}
+	return filepath.Join(resolvedDir, base), nil
 }
 
 func resolveNameLocks(name string) (resolvedNameLocks, error) {
@@ -226,28 +252,55 @@ func resolveNameLocks(name string) (resolvedNameLocks, error) {
 	if err != nil {
 		return resolvedNameLocks{}, fmt.Errorf("resolve durable lock: %w", err)
 	}
-	return resolvedNameLocks{legacy: legacy, transitional: transitional, state: state}, nil
+	paths := []string{legacy, transitional, state}
+	for i, path := range paths {
+		canonical, err := canonicalLockPath(path)
+		if err != nil {
+			return resolvedNameLocks{}, err
+		}
+		paths[i] = canonical
+	}
+	return resolvedNameLocks{legacy: paths[0], transitional: paths[1], state: paths[2]}, nil
 }
 
-// reaperNameLockPaths prepares every lock inode before the shell reaper
-// receives it. The reaper protocol is fail-closed and acquires the paths
-// in the same legacy-to-durable order as lockName.
-func reaperNameLockPaths(name string) ([]string, error) {
+// reaperNameLockPaths prepares every unique lock inode before the shell
+// reaper receives it. The reaper acquires the same canonical paths in
+// the same legacy-to-durable order as lockName.
+func reaperNameLockPaths(name string) ([]nameLockTarget, error) {
 	resolved, err := resolveNameLocks(name)
 	if err != nil {
 		return nil, err
 	}
 	paths := resolved.ordered()
+	targets := make([]nameLockTarget, 0, len(paths))
 	for _, path := range paths {
 		f, err := openNameLockPath(path)
 		if err != nil {
 			return nil, err
 		}
-		if err := f.Close(); err != nil {
-			return nil, err
+		identity, identityErr := nameLockTargetIdentity(f, path)
+		closeErr := f.Close()
+		if identityErr != nil {
+			return nil, identityErr
 		}
+		if closeErr != nil {
+			return nil, closeErr
+		}
+		targets = append(targets, nameLockTarget{path: path, identity: identity})
 	}
-	return paths, nil
+	return targets, nil
+}
+
+func nameLockTargetIdentity(f *os.File, path string) (string, error) {
+	info, err := f.Stat()
+	if err != nil {
+		return "", fmt.Errorf("stat reaper lock file %s: %w", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return "", fmt.Errorf("lock file %s identity is unavailable", path)
+	}
+	return fmt.Sprintf("%d:%d", stat.Dev, stat.Ino), nil
 }
 
 type nameLockHooks struct {
@@ -393,19 +446,23 @@ func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (
 	}
 
 	paths := resolved.ordered()
-	stages := []string{"legacy", "transitional", "durable"}
+	stageForPath := map[string]string{
+		resolved.legacy:       "legacy",
+		resolved.transitional: "transitional",
+		resolved.state:        "durable",
+	}
 	acquired := make([]func(), 0, len(paths))
 	release := func() {
 		for i := len(acquired) - 1; i >= 0; i-- {
 			acquired[i]()
 		}
 	}
-	for i, path := range paths {
+	for _, path := range paths {
 		unlock, err := acquireNameLockFile(ctx, path, hooks)
 		if err != nil {
 			release()
 			unlockProcess()
-			return nil, fmt.Errorf("acquire %s name lock: %w", stages[i], err)
+			return nil, fmt.Errorf("acquire %s name lock: %w", stageForPath[path], err)
 		}
 		acquired = append(acquired, unlock)
 	}

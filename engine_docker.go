@@ -159,6 +159,9 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
+func (dockerEngine) immutableID() bool          { return true }
+func (dockerEngine) nameAddressedDeletes() bool { return false }
+
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 // dockerInspect mirrors the fields of `docker inspect` output this
@@ -185,15 +188,33 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
-func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
+func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
-	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+	match := -1
+	for i, container := range containers {
+		if dockerIDRE.MatchString(container.ID) && container.ID == target {
+			match = i
+			break
+		}
 	}
-	c := containers[0]
+	if match < 0 && !dockerIDRE.MatchString(target) {
+		for i, container := range containers {
+			if dockerIDRE.MatchString(container.ID) && strings.TrimPrefix(container.Name, "/") == target {
+				match = i
+				break
+			}
+		}
+	}
+	if match < 0 {
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
+	}
+	c := containers[match]
+	if !dockerIDRE.MatchString(c.ID) {
+		return nil, fmt.Errorf("docker inspect returned invalid container ID %q", c.ID)
+	}
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),
@@ -359,8 +380,6 @@ func (dockerEngine) listReuseGroupArgs(group string) []string {
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
 	return parseDockerPruneIDs(data)
 }
-
-func (dockerEngine) nameAddressedDeletes() bool { return false }
 
 // nameConflict matches Docker's duplicate container name error.
 func (dockerEngine) nameConflict(err error) bool {

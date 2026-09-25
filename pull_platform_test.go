@@ -70,13 +70,14 @@ func TestPullNeverWithPlatformReportsMissing(t *testing.T) {
 func TestPlatformEmptyPreservesCallCounts(t *testing.T) {
 	f := newTestRunner()
 	f.imagePresent = true
+	f.immutableInspect = true
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	_ = ctr
-	// image inspect + run, no platform flags.
+	// image inspect + run + identity inspect, no platform flags.
 	for _, c := range f.calls {
 		for _, a := range c {
 			if a == "--platform" {

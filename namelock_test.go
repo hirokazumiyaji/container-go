@@ -17,6 +17,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func TestNameLockPathIsStableAcrossLaunchEnvironments(t *testing.T) {
@@ -253,6 +255,30 @@ func TestLockNameHoldsProcessLocalBarrier(t *testing.T) {
 	}
 }
 
+func TestCanonicalLockPathIsAbsoluteAndMigrationPathsDeduplicate(t *testing.T) {
+	dir := t.TempDir()
+	alias := filepath.Join(dir, "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	canonical, err := canonicalLockPath(filepath.Join(alias, "lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(canonical) {
+		t.Fatalf("canonical path = %q, want absolute", canonical)
+	}
+	resolved := resolvedNameLocks{
+		legacy:       canonical,
+		transitional: canonical,
+		state:        filepath.Join(dir, "durable.lock"),
+	}
+	paths := resolved.ordered()
+	if len(paths) != 2 || paths[0] != canonical || paths[1] != resolved.state {
+		t.Fatalf("ordered paths = %q, want two canonical unique barriers", paths)
+	}
+}
+
 func TestProcessNameLockIsContextAwareAndPerName(t *testing.T) {
 	firstName := "lock-" + newContainerName()
 	secondName := "lock-" + newContainerName()
@@ -374,6 +400,73 @@ func TestRunAppleCreateTakesNameLock(t *testing.T) {
 	}
 	if f.callWith("run") != nil {
 		t.Error("run was issued while name lock was held")
+	}
+}
+
+func TestDockerCreateDoesNotWaitForAppleNameLock(t *testing.T) {
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	f := newTestRunner()
+	cfg := &config{name: name, runner: f, eng: dockerEngine{}}
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	if _, attempted, err := runCreateLocked(ctx, cfg, "run"); err != nil || !attempted {
+		t.Fatalf("Docker create = attempted:%v err:%v", attempted, err)
+	}
+	if f.callWith("run") == nil {
+		t.Fatal("Docker run was incorrectly coupled to the Apple name lock")
+	}
+}
+
+func TestDockerFailedCreateCleanupDoesNotWaitForAppleNameLock(t *testing.T) {
+	name := "myctr"
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+
+	oldTimeout := cleanupFailedCreateTimeout
+	cleanupFailedCreateTimeout = 250 * time.Millisecond
+	t.Cleanup(func() { cleanupFailedCreateTimeout = oldTimeout })
+
+	const creation = "aaaaaaaaaaaaaaaa"
+	inspectJSON, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fakeLockDir := t.TempDir()
+	fakeLock := filepath.Join(fakeLockDir, "lockf")
+	if err := os.WriteFile(fakeLock, []byte("#!/bin/sh\nexit 97\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeLockDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	d := &dockerRunner{
+		fakeRunner:      newTestRunner(),
+		inspectJSON:     inspectJSON,
+		bindRunIdentity: true,
+		creation:        creation,
+	}
+	cfg := &config{name: name, runner: d, eng: dockerEngine{}, creation: creation}
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "entrypoint failed"}
+	if err := cleanupFailedCreate(context.Background(), cfg, runErr, runErr); err != nil {
+		t.Fatalf("Docker cleanup waited for Apple lock: %v", err)
+	}
+	var rm []string
+	for _, call := range d.calls {
+		if len(call) > 0 && call[0] == "rm" {
+			rm = call
+			break
+		}
+	}
+	if rm == nil || rm[len(rm)-1] != dockerFixtureID {
+		t.Fatalf("rm = %v, want immutable ID %s", rm, dockerFixtureID)
 	}
 }
 

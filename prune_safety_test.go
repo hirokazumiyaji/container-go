@@ -3,9 +3,11 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -81,8 +83,12 @@ func mustPruneJSON(v any) []byte {
 	return data
 }
 
+const pruneFixtureSession = "0123456789abcdef"
+
 func pruneFixture(name, creation, state, group string, managed bool) pruneFixtureContainer {
-	labels := map[string]string{}
+	labels := map[string]string{
+		sessionLabel: pruneFixtureSession,
+	}
 	if managed {
 		labels[managedLabel] = "true"
 	}
@@ -90,6 +96,7 @@ func pruneFixture(name, creation, state, group string, managed bool) pruneFixtur
 		labels[creationLabel] = creation
 	}
 	if group != "" {
+		labels[reuseLabel] = "true"
 		labels[reuseGroupLabel] = group
 	}
 	return pruneFixtureContainer{
@@ -111,6 +118,39 @@ func (r *pruneSafetyRunner) callCount(subcommand string) int {
 		}
 	}
 	return n
+}
+
+func TestApplePruneParsersCaptureIdentityMetadata(t *testing.T) {
+	const creation = "aaaaaaaaaaaaaaaa"
+	fixture := pruneFixture("shared", creation, string(StateStopped), "integration", true)
+	data := mustPruneJSON([]pruneFixtureContainer{fixture})
+	eng := appleEngine{}
+
+	for _, tc := range []struct {
+		name  string
+		parse func([]byte) ([]pruneCandidate, error)
+	}{
+		{name: "stopped managed", parse: eng.parseStoppedManaged},
+		{name: "reuse group", parse: func(data []byte) ([]pruneCandidate, error) {
+			return eng.parseReuseGroupIDs(data, "integration")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidates, err := tc.parse(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(candidates) != 1 {
+				t.Fatalf("candidates = %+v, want one", candidates)
+			}
+			candidate := candidates[0]
+			if candidate.id != "shared" || candidate.creation != creation ||
+				candidate.session != pruneFixtureSession || candidate.state != StateStopped ||
+				!candidate.managed || !candidate.reuse || candidate.reuseGroup != "integration" {
+				t.Fatalf("candidate = %+v, want complete Apple identity metadata", candidate)
+			}
+		})
+	}
 }
 
 func TestPruneAppleDoesNotDeleteReplacement(t *testing.T) {
@@ -136,6 +176,20 @@ func TestPruneAppleDoesNotDeleteReplacement(t *testing.T) {
 
 func TestPruneAppleFailsClosedOnUnverifiedCandidate(t *testing.T) {
 	const listedCreation = "aaaaaaaaaaaaaaaa"
+	matching := func() pruneFixtureContainer {
+		return pruneFixture("shared", listedCreation, string(StateStopped), "", true)
+	}
+	running := matching()
+	running.Status.State = string(StateRunning)
+	withLabel := func(container pruneFixtureContainer, key, value string) pruneFixtureContainer {
+		if value == "" {
+			delete(container.Config.Labels, key)
+		} else {
+			container.Config.Labels[key] = value
+		}
+		return container
+	}
+
 	cases := []struct {
 		name   string
 		listed pruneFixtureContainer
@@ -143,28 +197,58 @@ func TestPruneAppleFailsClosedOnUnverifiedCandidate(t *testing.T) {
 	}{
 		{
 			name:   "list generation missing",
-			listed: pruneFixture("shared", "", string(StateStopped), "", true),
-			fresh:  pruneFixture("shared", "", string(StateStopped), "", true),
+			listed: withLabel(matching(), creationLabel, ""),
+			fresh:  matching(),
+		},
+		{
+			name:   "list generation malformed",
+			listed: withLabel(matching(), creationLabel, "not-a-generation"),
+			fresh:  matching(),
 		},
 		{
 			name:   "fresh generation missing",
-			listed: pruneFixture("shared", listedCreation, string(StateStopped), "", true),
-			fresh:  pruneFixture("shared", "", string(StateStopped), "", true),
+			listed: matching(),
+			fresh:  withLabel(matching(), creationLabel, ""),
 		},
 		{
 			name:   "generation mismatch",
-			listed: pruneFixture("shared", listedCreation, string(StateStopped), "", true),
-			fresh:  pruneFixture("shared", "bbbbbbbbbbbbbbbb", string(StateStopped), "", true),
+			listed: matching(),
+			fresh:  withLabel(matching(), creationLabel, "bbbbbbbbbbbbbbbb"),
+		},
+		{
+			name:   "list session missing",
+			listed: withLabel(matching(), sessionLabel, ""),
+			fresh:  matching(),
+		},
+		{
+			name:   "fresh session missing",
+			listed: matching(),
+			fresh:  withLabel(matching(), sessionLabel, ""),
+		},
+		{
+			name:   "session mismatch",
+			listed: matching(),
+			fresh:  withLabel(matching(), sessionLabel, "bbbbbbbbbbbbbbbb"),
 		},
 		{
 			name:   "state changed",
-			listed: pruneFixture("shared", listedCreation, string(StateStopped), "", true),
-			fresh:  pruneFixture("shared", listedCreation, string(StateRunning), "", true),
+			listed: matching(),
+			fresh:  running,
+		},
+		{
+			name:   "reuse marker changed",
+			listed: withLabel(matching(), reuseLabel, "true"),
+			fresh:  withLabel(matching(), reuseLabel, ""),
+		},
+		{
+			name:   "group changed",
+			listed: withLabel(withLabel(matching(), reuseGroupLabel, "old"), reuseLabel, "true"),
+			fresh:  withLabel(withLabel(matching(), reuseGroupLabel, "new"), reuseLabel, "true"),
 		},
 		{
 			name:   "managed marker changed",
-			listed: pruneFixture("shared", listedCreation, string(StateStopped), "", true),
-			fresh:  pruneFixture("shared", listedCreation, string(StateStopped), "", false),
+			listed: matching(),
+			fresh:  withLabel(matching(), managedLabel, ""),
 		},
 	}
 
@@ -209,38 +293,102 @@ func TestPruneAppleDeletesOnlyWhenCandidateStillCurrent(t *testing.T) {
 
 func TestPruneReuseGroupAppleUsesSameCandidateGuard(t *testing.T) {
 	const creation = "aaaaaaaaaaaaaaaa"
+	matching := func(state State) pruneFixtureContainer {
+		return pruneFixture("shared", creation, string(state), "integration", true)
+	}
+	withLabel := func(container pruneFixtureContainer, key, value string) pruneFixtureContainer {
+		if value == "" {
+			delete(container.Config.Labels, key)
+		} else {
+			container.Config.Labels[key] = value
+		}
+		return container
+	}
+
 	cases := []struct {
 		name   string
+		listed pruneFixtureContainer
 		fresh  pruneFixtureContainer
 		remove bool
 	}{
 		{
-			name:   "matching candidate",
-			fresh:  pruneFixture("shared", creation, string(StateRunning), "integration", true),
+			name:   "matching running candidate",
+			listed: matching(StateRunning),
+			fresh:  matching(StateRunning),
 			remove: true,
 		},
 		{
-			name:  "replacement generation",
-			fresh: pruneFixture("shared", "bbbbbbbbbbbbbbbb", string(StateRunning), "integration", true),
+			name:   "matching stopped candidate",
+			listed: matching(StateStopped),
+			fresh:  matching(StateStopped),
+			remove: true,
 		},
 		{
-			name:  "state changed",
-			fresh: pruneFixture("shared", creation, string(StateStopped), "integration", true),
+			name:   "replacement generation",
+			listed: matching(StateRunning),
+			fresh:  withLabel(matching(StateRunning), creationLabel, "bbbbbbbbbbbbbbbb"),
 		},
 		{
-			name:  "group changed",
-			fresh: pruneFixture("shared", creation, string(StateRunning), "other", true),
+			name:   "state changed",
+			listed: matching(StateRunning),
+			fresh:  matching(StateStopped),
 		},
 		{
-			name:  "managed marker missing",
-			fresh: pruneFixture("shared", creation, string(StateRunning), "integration", false),
+			name:   "group changed",
+			listed: matching(StateRunning),
+			fresh:  withLabel(matching(StateRunning), reuseGroupLabel, "other"),
+		},
+		{
+			name:   "list reuse marker missing",
+			listed: withLabel(matching(StateRunning), reuseLabel, ""),
+			fresh:  matching(StateRunning),
+		},
+		{
+			name:   "fresh reuse marker missing",
+			listed: matching(StateRunning),
+			fresh:  withLabel(matching(StateRunning), reuseLabel, ""),
+		},
+		{
+			name:   "list session missing",
+			listed: withLabel(matching(StateRunning), sessionLabel, ""),
+			fresh:  matching(StateRunning),
+		},
+		{
+			name:   "fresh session changed",
+			listed: matching(StateRunning),
+			fresh:  withLabel(matching(StateRunning), sessionLabel, "bbbbbbbbbbbbbbbb"),
+		},
+		{
+			name:   "list managed marker missing",
+			listed: withLabel(matching(StateRunning), managedLabel, ""),
+			fresh:  matching(StateRunning),
+		},
+		{
+			name:   "fresh managed marker missing",
+			listed: matching(StateRunning),
+			fresh:  withLabel(matching(StateRunning), managedLabel, ""),
+		},
+		{
+			name:   "created transitional state",
+			listed: matching(StateCreated),
+			fresh:  matching(StateCreated),
+		},
+		{
+			name:   "stopping transitional state",
+			listed: matching(StateStopping),
+			fresh:  matching(StateStopping),
+		},
+		{
+			name:   "unknown state",
+			listed: matching(StateUnknown),
+			fresh:  matching(StateUnknown),
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := &pruneSafetyRunner{
-				list:     []pruneFixtureContainer{pruneFixture("shared", creation, string(StateRunning), "integration", true)},
+				list:     []pruneFixtureContainer{tc.listed},
 				inspects: []pruneFixtureContainer{tc.fresh},
 			}
 			removed, err := pruneReuseGroupWith(context.Background(), r, appleEngine{}, "integration")
@@ -273,5 +421,115 @@ func TestPruneAppleReturnsInspectFailureWithoutDeleting(t *testing.T) {
 	}
 	if len(removed) != 0 || len(r.deleted) != 0 {
 		t.Fatalf("removed = %v, deleted = %v; want fail closed", removed, r.deleted)
+	}
+}
+
+type pruneLockScopeRunner struct {
+	mu             sync.Mutex
+	name           string
+	inspectStarted chan struct{}
+	releaseInspect chan struct{}
+	deleteObserved chan struct{}
+	inspectOnce    sync.Once
+	deleteOnce     sync.Once
+	calls          []string
+}
+
+func (r *pruneLockScopeRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.mu.Lock()
+	r.calls = append(r.calls, strings.Join(args, " "))
+	r.mu.Unlock()
+
+	switch args[0] {
+	case "ls":
+		return mustPruneJSON([]pruneFixtureContainer{
+			pruneFixture(r.name, "aaaaaaaaaaaaaaaa", string(StateStopped), "", true),
+		}), nil, nil
+	case "inspect":
+		r.inspectOnce.Do(func() { close(r.inspectStarted) })
+		select {
+		case <-r.releaseInspect:
+			return mustPruneJSON([]pruneFixtureContainer{
+				pruneFixture(r.name, "aaaaaaaaaaaaaaaa", string(StateStopped), "", true),
+			}), nil, nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	case "delete":
+		r.deleteOnce.Do(func() { close(r.deleteObserved) })
+		return nil, nil, nil
+	case "run":
+		return []byte(r.name + "\n"), nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func (r *pruneLockScopeRunner) callSnapshot() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.calls...)
+}
+
+func TestPruneAppleHoldsNameLockThroughInspectAndDelete(t *testing.T) {
+	name := "prune-lock-scope-" + newContainerName()
+	runner := &pruneLockScopeRunner{
+		name:           name,
+		inspectStarted: make(chan struct{}),
+		releaseInspect: make(chan struct{}),
+		deleteObserved: make(chan struct{}),
+	}
+	pruneDone := make(chan error, 1)
+	go func() {
+		_, err := pruneWith(context.Background(), runner, appleEngine{})
+		pruneDone <- err
+	}()
+	select {
+	case <-runner.inspectStarted:
+	case <-time.After(time.Second):
+		t.Fatal("prune did not reach fresh inspect")
+	}
+
+	createDone := make(chan error, 1)
+	go func() {
+		cfg := &config{name: name, runner: runner, eng: appleEngine{}}
+		_, attempted, err := runCreateLocked(context.Background(), cfg, "run")
+		if err == nil && !attempted {
+			err = errors.New("create was not attempted")
+		}
+		createDone <- err
+	}()
+	select {
+	case err := <-createDone:
+		t.Fatalf("create escaped the prune critical section: %v", err)
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	close(runner.releaseInspect)
+	select {
+	case err := <-pruneDone:
+		if err != nil {
+			t.Fatalf("prune: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("prune did not finish after inspect release")
+	}
+	select {
+	case <-runner.deleteObserved:
+	case <-time.After(time.Second):
+		t.Fatal("prune did not issue delete")
+	}
+	select {
+	case err := <-createDone:
+		if err != nil {
+			t.Fatalf("create after prune: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("create remained blocked after prune delete")
+	}
+
+	calls := runner.callSnapshot()
+	if len(calls) < 4 || calls[len(calls)-1] != "run" {
+		t.Fatalf("calls = %v, want inspect then delete before create", calls)
 	}
 }

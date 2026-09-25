@@ -17,7 +17,7 @@ func lockName(context.Context, string) (func(), error) {
 // reaper registration is already a no-op there; keeping this helper
 // fail-closed prevents a future caller from accidentally treating a
 // name-addressed entry as safe on a platform without the lock protocol.
-func reaperNameLockPaths(string) ([]string, error) {
+func reaperNameLockPaths(string) ([]nameLockTarget, error) {
 	return nil, errors.New("reaper: name locks are unavailable on windows")
 }
 

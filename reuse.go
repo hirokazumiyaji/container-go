@@ -50,8 +50,16 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		info:      info,
 		creation:  info.labels[creationLabel],
 		uid:       info.uid,
+		uidBound:  verifiedImmutableID(cfg.eng, info.uid),
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		return nil, err
+	}
+	fresh, err := ctr.verifyHandleIdentity(ctx, info, false, true)
+	if err != nil {
+		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+	}
+	if err := checkReuseCompat(fresh, image, cfg); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -113,6 +121,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := checkReuseOwned(info, image, cfg); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,
@@ -123,6 +134,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				info:      info,
 				creation:  info.labels[creationLabel],
 				uid:       info.uid,
+				uidBound:  verifiedImmutableID(cfg.eng, info.uid),
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -167,6 +179,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, errors.Join(classified, cleanupErr)
 	}
 
+	uid := cfg.eng.parseRunID(stdout)
 	ctr := &Container{
 		id:        cfg.name,
 		runner:    cfg.runner,
@@ -175,35 +188,127 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
+		// parseRunID only proves the output shape; inspectFresh binds it.
+		uidBound: false,
 	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+	info, err := ctr.cachedInfo(runCtx)
+	if err != nil {
+		// A successful name-addressed create publishes the generation to
+		// peers immediately. Never remove it on a caller-local post-create
+		// failure; return the operational error for the caller to inspect.
+		return nil, fmt.Errorf("reuse %s: published generation inspect: %w", cfg.name, err)
+	}
+	if err := checkCreatedReuseIdentity(info, cfg); err != nil {
+		return nil, fmt.Errorf("reuse %s: verify published generation: %w", cfg.name, err)
 	}
 	for _, f := range cfg.files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
+		if err := ctr.CopyToContainer(runCtx, f.HostPath, f.ContainerPath); err != nil {
+			_, identityErr := ctr.verifyHandleIdentity(runCtx, nil, false, false)
+			if identityErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("reuse %s: identity after file failure: %w", cfg.name, identityErr))
+			}
 			return nil, err
 		}
 	}
 	return ctr, nil
 }
 
-// deleteStoppedReuse removes a stopped reuse container through a
-// handle bound to its inspected generation and immutable ID, when the
-// backend has one. A replaced generation means another process already
-// recreated the name; the caller loops and attaches to the fresh
-// generation instead of deleting it.
+// deleteStoppedReuse rechecks every ownership and identity field before
+// deleting. A state, generation, label, or immutable-ID change means a
+// peer may already have adopted the container, so the old snapshot is
+// left untouched and the caller re-inspects.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
+	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
 	ctr.uid = info.uid
-	err := ctr.Terminate(ctx)
-	if errors.Is(err, ErrGenerationReplaced) {
+	ctr.uidBound = verifiedImmutableID(cfg.eng, info.uid)
+
+	if cfg.eng.nameAddressedDeletes() {
+		guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
+		defer guardCancel()
+		unlock, err := lockName(guardCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("reuse %s: lock stopped generation: %w", cfg.name, err)
+		}
+		defer unlock()
+		fresh, err := ctr.inspectFresh(guardCtx)
+		if isNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+		}
+		if checkReuseIdentity(fresh, cfg) != nil || !sameStoppedReuseIdentity(info, fresh) || fresh.state != StateStopped {
+			return nil
+		}
+		return ctr.delete(guardCtx, ctr.id)
+	}
+
+	fresh, err := ctr.inspectFresh(ctx)
+	if isNotFound(err) {
 		return nil
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+	}
+	if checkReuseIdentity(fresh, cfg) != nil || !sameStoppedReuseIdentity(info, fresh) || fresh.state != StateStopped {
+		return nil
+	}
+	return ctr.delete(ctx, fresh.uid)
+}
+
+func checkCreatedReuseIdentity(info *engineInfo, cfg *config) error {
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
+	}
+	if info.labels[sessionLabel] != sessionID() {
+		return fmt.Errorf("reuse %s: %w: published session changed", cfg.name, ErrGenerationReplaced)
+	}
+	if info.labels[creationLabel] != cfg.creation {
+		return fmt.Errorf("reuse %s: %w: published generation changed", cfg.name, ErrGenerationReplaced)
+	}
+	if info.labels[reuseGroupLabel] != cfg.reuseGroup {
+		return fmt.Errorf("reuse %s: %w: published reuse group changed", cfg.name, ErrGenerationReplaced)
+	}
+	return nil
+}
+
+func checkReuseIdentity(info *engineInfo, cfg *config) error {
+	if info == nil {
+		return fmt.Errorf("reuse %s: existing container was not found", cfg.name)
+	}
+	if info.labels[managedLabel] != "true" || info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: %w: existing container was not created with WithReuse", cfg.name, ErrGenerationReplaced)
+	}
+	if !creationRE.MatchString(info.labels[creationLabel]) {
+		return fmt.Errorf("reuse %s: %w: existing container has no valid creation generation", cfg.name, ErrGenerationReplaced)
+	}
+	if !creationRE.MatchString(info.labels[sessionLabel]) {
+		return fmt.Errorf("reuse %s: %w: existing container has no valid session", cfg.name, ErrGenerationReplaced)
+	}
+	if cfg.eng.immutableID() && !verifiedImmutableID(cfg.eng, info.uid) {
+		return fmt.Errorf("reuse %s: %w: backend did not return a verified immutable ID", cfg.name, ErrGenerationReplaced)
+	}
+	return nil
+}
+
+func sameStoppedReuseIdentity(before, fresh *engineInfo) bool {
+	if before == nil || fresh == nil {
+		return false
+	}
+	creation := before.labels[creationLabel]
+	return creationRE.MatchString(creation) &&
+		creationRE.MatchString(before.labels[sessionLabel]) &&
+		fresh.labels[creationLabel] == creation &&
+		before.labels[sessionLabel] == fresh.labels[sessionLabel] &&
+		before.labels[reuseGroupLabel] == fresh.labels[reuseGroupLabel] &&
+		before.image == fresh.image &&
+		(before.uid == "" || before.uid == fresh.uid) &&
+		fresh.labels[managedLabel] == "true" && fresh.labels[reuseLabel] == "true"
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -252,11 +357,8 @@ func createRaceMissing(err error) bool {
 // checkReuseOwned reports whether an existing container may be attached
 // to or, when stopped, deleted and recreated for this reuse request.
 func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
-	}
-	if cfg.eng.nameAddressedDeletes() && !creationRE.MatchString(info.labels[creationLabel]) {
-		return fmt.Errorf("reuse %s: %w: existing container has no valid creation generation", cfg.name, ErrGenerationReplaced)
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
@@ -396,8 +498,9 @@ func stripImageDigest(ref string) string {
 
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. On Apple Container, the
-// list-time generation, managed label, group, and state are rechecked at
-// that instant under the stable per-name lock before a name-based delete.
+// list-time generation and session, managed/reuse/group labels, and state
+// are rechecked at that instant under the stable per-name lock before a
+// name-based delete. Transitional states are never deleted.
 // Use it as a CI teardown step; ordinary Prune still only removes stopped
 // managed containers. Direct Apple Container CLI calls, unguarded library
 // operations, and other external state mutations after the inspect are

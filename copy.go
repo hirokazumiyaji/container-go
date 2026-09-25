@@ -43,9 +43,13 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	if _, err := os.Stat(abs); err != nil {
 		return fmt.Errorf("copy to container: %w", err)
 	}
+	target, err := c.operationTarget(ctx)
+	if err != nil {
+		return err
+	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
+	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
 	return c.classify(ctx, err)
 }
 
@@ -58,6 +62,10 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
 		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
 	}
+	target, err := c.operationTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
 		return nil, err
@@ -65,7 +73,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	dst := filepath.Join(dir, filepath.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
+	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, c.classify(ctx, err)
 	}

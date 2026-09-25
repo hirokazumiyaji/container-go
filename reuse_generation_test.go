@@ -84,8 +84,13 @@ func TestTerminateAllowsMatchingGeneration(t *testing.T) {
 func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	cfg := &config{runner: &generationRunner{creation: "bbbbbbbbbbbbbbbb"}, eng: appleEngine{}, name: "shared"}
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			sessionLabel:  sessionID(),
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
 	}
 	// Fresh inspect reports a different generation in running state, so
 	// there is nothing stopped to delete.
@@ -101,8 +106,13 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 
 func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			sessionLabel:  sessionID(),
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
 	}
 	r := &generationStateRunner{creation: "", state: "stopped"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
@@ -117,9 +127,15 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	uid := strings.Repeat("0f", 32)
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{},
-		uid:    uid,
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			sessionLabel:  sessionID(),
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+		image: "redis",
+		uid:   uid,
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
@@ -188,7 +204,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":
@@ -280,7 +296,7 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 	r := &slowPullRunner{pullDelay: 400 * time.Millisecond}
 	cfg := &config{
 		runner: r, eng: appleEngine{}, name: "shared-reuse",
-		pullPolicy: PullAlways,
+		reuse: true, pullPolicy: PullAlways,
 	}
 	ctx := context.Background()
 	ctr, err := reuseCreate(ctx, "redis:7-alpine", cfg)
@@ -295,6 +311,7 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 type slowPullRunner struct {
 	*fakeRunner
 	pullDelay time.Duration
+	creation  string
 }
 
 func (s *slowPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -307,6 +324,20 @@ func (s *slowPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 			return nil, nil, ctx.Err()
 		case <-time.After(s.pullDelay):
 		}
+	}
+	if args[0] == "run" {
+		for _, arg := range args {
+			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
+				s.creation = creation
+			}
+		}
+	}
+	if args[0] == "inspect" {
+		s.mu.Lock()
+		s.calls = append(s.calls, args)
+		creation := s.creation
+		s.mu.Unlock()
+		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	return s.fakeRunner.Run(ctx, args...)
 }

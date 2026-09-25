@@ -43,9 +43,10 @@ func Cleanup(tb testing.TB, ctr *Container) {
 
 // Prune removes stopped containers created by this library, from any
 // session. On Apple Container, each list candidate is re-inspected and
-// its generation, managed label, and state must still match at that
-// instant before the name is deleted under the stable per-name lock. It
-// returns the IDs it removed. The lock coordinates library operations
+// its valid generation and session, managed/reuse/group labels, and
+// stopped state must still match at that instant before the name is
+// deleted under the stable per-name lock. It returns the IDs it removed.
+// The lock coordinates library operations
 // that use the guarded name-lock protocol, but a direct Apple Container
 // CLI call, an unguarded operation such as Stop, or another external
 // actor can mutate the name after inspect; such state changes are
@@ -142,30 +143,42 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 		return false, nil
 	}
 
-	target := candidate.id
-	if fresh.uid != "" {
-		// This is normally empty for Apple, but use an immutable ID if
-		// a backend supplies one rather than falling back to the name.
-		target = fresh.uid
-	}
-	return deletePruneCandidate(guardCtx, r, eng, target, errKind)
+	// Apple exposes no immutable ID, so the only safe target is the name
+	// whose complete list-time identity was revalidated above.
+	return deletePruneCandidate(guardCtx, r, eng, candidate.id, errKind)
 }
 
 func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
-	if !candidate.managed || candidate.creation == "" || candidate.state == "" || candidate.state == StateUnknown {
+	if fresh == nil || !nameRE.MatchString(candidate.id) || !candidate.managed ||
+		!creationRE.MatchString(candidate.creation) || !creationRE.MatchString(candidate.session) ||
+		!pruneCandidateStateAllowed(candidate.state, reuseGroup) {
 		return false
 	}
-	if fresh.labels[managedLabel] != "true" {
+	if candidate.reuseGroup != "" &&
+		(len(candidate.reuseGroup) > 128 || !labelKeyRE.MatchString(candidate.reuseGroup)) {
 		return false
 	}
-	if fresh.labels[creationLabel] == "" || fresh.labels[creationLabel] != candidate.creation {
+	if !candidate.reuse && candidate.reuseGroup != "" {
 		return false
 	}
-	if fresh.state != candidate.state {
+	if reuseGroup != "" && (!candidate.reuse || candidate.reuseGroup != reuseGroup) {
 		return false
 	}
-	if reuseGroup != "" {
-		return candidate.reuseGroup == reuseGroup && fresh.labels[reuseGroupLabel] == reuseGroup
+
+	if fresh.labels[managedLabel] != "true" ||
+		fresh.labels[creationLabel] != candidate.creation ||
+		fresh.labels[sessionLabel] != candidate.session ||
+		(fresh.labels[reuseLabel] == "true") != candidate.reuse ||
+		fresh.labels[reuseGroupLabel] != candidate.reuseGroup ||
+		fresh.state != candidate.state {
+		return false
 	}
-	return true
+	return pruneCandidateStateAllowed(fresh.state, reuseGroup)
+}
+
+func pruneCandidateStateAllowed(state State, reuseGroup string) bool {
+	if reuseGroup == "" {
+		return state == StateStopped
+	}
+	return state == StateRunning || state == StateStopped
 }

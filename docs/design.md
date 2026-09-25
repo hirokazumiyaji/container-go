@@ -276,7 +276,8 @@ registered by writing them down a pipe. When the parent dies, the pipe
 reaches EOF. Apple entries require a generation, verify it, and run
 `container delete --force` while holding the same legacy,
 transitional, and durable account-state locks as `Prune` and create. A
-missing lock or `lockf` helper makes that entry fail closed. Full
+missing lock or platform lock helper (`lockf` on macOS, `flock` elsewhere)
+makes that entry fail closed. Full
 immutable Docker IDs are the only generation-less entries. While the
 parent lives the reaper does nothing
 (deletion belongs to the normal path; the reaper is insurance). This
@@ -292,10 +293,11 @@ handler can.
 The CLI has no label filter, so orphan sweeps filter
 `container ls -a --format json` client-side. A helper `Prune(ctx)`
 removes stopped containers carrying the managed label from any
-session. On Apple Container the list-time creation generation, managed
-label, and state are rechecked with a fresh inspect while the stable
-per-name flock is held; a stale or foreign candidate is skipped rather
-than name-deleted. The flock coordinates library peers that use the
+session. On Apple Container the list-time creation generation and
+session, managed/reuse/group labels, and lifecycle state are rechecked
+with a fresh inspect while the stable per-name flock is held. Missing or
+mismatched metadata and transitional states are skipped rather than
+name-deleted. The flock coordinates library peers that use the
 guarded name-lock protocol (including the watchdog reaper), but it
 cannot serialize a direct `container` CLI invocation, an unguarded
 library operation such as `Stop`, or another external tool. Any state
@@ -338,8 +340,8 @@ checked, and the opened inode must still be the file named by the path
 after flock acquisition. The create path takes the same locks around
 `run`, so a cooperating library peer cannot replace a name between a
 prune's checks and delete. `Prune` and `PruneReuseGroup` retain the list-time generation,
-managed/group labels, and state, and skip a candidate when any of them
-no longer match. That guarantee is limited to cooperating processes
+session, managed/reuse/group labels, and state, and skip a candidate when any of them
+is missing, malformed, transitional, or no longer matches. That guarantee is limited to cooperating processes
 using this guarded name-lock protocol on the same host. A direct
 `container` mutation or an unguarded library operation after the fresh
 inspect (including stop/start, label or generation changes, and
@@ -351,8 +353,8 @@ Failed-create cleanup uses one bounded context for lock, exact ownership
 inspection, optional reaper registration, and delete; operational errors
 are joined to the original `Run` or reuse-create error rather than hidden.
 The watchdog reaper takes the same ordered barriers for Apple name entries;
-if `lockf` or any prepared lock file is unavailable, it skips that entry
-rather than performing an unlocked delete. Generation-less reaper entries
+if the platform lock helper or any prepared lock file is unavailable, it
+skips that entry rather than performing an unlocked delete. Generation-less reaper entries
 are accepted only for full immutable Docker IDs. It registers Docker
 containers by `Id`; for Apple it stores
 the generation, reads the label as a line-anchored JSON field

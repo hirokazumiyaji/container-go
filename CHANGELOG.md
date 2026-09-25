@@ -31,6 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Windows file flags. On supported hosts, Docker retains the host-side
   regular-file and no-follow checks; unsupported host open APIs also
   fail closed.
+- Reject backslashes in container paths so Windows Docker path
+  normalization cannot reinterpret a literal path component.
 
 ## [0.2.0] - 2026-09-02
 

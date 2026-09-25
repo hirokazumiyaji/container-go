@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
 	"runtime"
 	"testing"
 	"time"
@@ -20,6 +21,10 @@ import (
 func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Context, ctr *container.Container) {
 	t.Helper()
 
+	// Unix socket and device-node behavior is covered by the Unix-only
+	// copy_security_unix_test.go tests. Device creation is intentionally not
+	// added to the image integration table because mknod permissions and
+	// Windows representation vary by host.
 	setup := []struct {
 		name string
 		cmd  string
@@ -40,9 +45,6 @@ func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Conte
 					data, _ = io.ReadAll(out)
 				}
 				setupCancel()
-				if runtime.GOOS == "windows" {
-					t.Skipf("Windows host rejected special-file setup for %s: code=%d err=%v output=%q", tc.name, code, err, data)
-				}
 				t.Fatalf("create %s: code=%d err=%v output=%q", tc.name, code, err, data)
 			}
 			setupCancel()
@@ -65,20 +67,29 @@ func assertIntegrationCopyOutRejectsSpecialFiles(t *testing.T, ctx context.Conte
 			case got := <-result:
 				if got.rc != nil {
 					_ = got.rc.Close()
+					if got.err == nil {
+						t.Fatalf("CopyFileFromContainer accepted %s", tc.name)
+					}
+					t.Fatalf("CopyFileFromContainer returned a reader with an error for %s: %v", tc.name, got.err)
 				}
 				if got.err == nil {
 					t.Fatalf("CopyFileFromContainer accepted %s", tc.name)
 				}
-				if errors.Is(got.err, container.ErrCopyFileNotRegular) {
-					return
+				if copyOutUnsupportedOnThisToolchain {
+					if !errors.Is(got.err, container.ErrCopyFileFromContainerUnsupported) {
+						t.Fatalf("%s error = %v, want documented unsupported error", tc.name, got.err)
+					}
+					t.Skipf("%s is intentionally unsupported on this Windows toolchain: %v", tc.name, got.err)
 				}
-				if runtime.GOOS == "windows" {
-					// Windows Go 1.23-1.25 intentionally fail closed before
-					// invoking docker cp; newer hosts may also reject a special
-					// file while materializing it.
-					t.Skipf("Windows host cannot represent or inspect %s: %v", tc.name, got.err)
+				// Docker's Windows archive extractor can omit a Unix
+				// link/FIFO instead of materializing it. This is the only
+				// copy-stage platform skip; all other errors must be typed.
+				if runtime.GOOS == "windows" && (tc.name == "symlink" || tc.name == "fifo") && errors.Is(got.err, os.ErrNotExist) {
+					t.Skipf("Windows host cannot represent or inspect Unix %s: %v", tc.name, got.err)
 				}
-				t.Errorf("%s error = %v, want ErrCopyFileNotRegular", tc.name, got.err)
+				if !errors.Is(got.err, container.ErrCopyFileNotRegular) {
+					t.Errorf("%s error = %v, want ErrCopyFileNotRegular", tc.name, got.err)
+				}
 			case <-time.After(5 * time.Second):
 				t.Fatalf("CopyFileFromContainer blocked on %s", tc.name)
 			}

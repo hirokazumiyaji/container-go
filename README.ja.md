@@ -68,7 +68,8 @@ container file type を表現できるとは主張しません。Apple Container
 では必要な Windows file flag を `os.OpenFile` が伝播しない Go 1.23 から
 1.25 が該当するため、Docker の copy-out には Go 1.26 以降を使ってください。
 macOS で安全な copy-out が必要な場合は `CONTAINERGO_BACKEND=docker` を
-使ってください。
+使ってください。コピー API に渡すコンテナパスは `/` 区切りの POSIX 絶対パス
+であり、バックスラッシュは拒否されます。
 
 ## インストール
 

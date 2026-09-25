@@ -93,16 +93,54 @@ func TestCopyFileFromContainerRejectsUnixSocket(t *testing.T) {
 		defer listener.Close()
 	}
 	if socketErr != nil {
-		t.Skipf("Unix socket creation unavailable: %v", socketErr)
-	}
-	if err == nil {
 		if rc != nil {
 			_ = rc.Close()
 		}
+		t.Skipf("Unix socket creation unavailable: %v", socketErr)
+	}
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("Unix socket returned a reader")
+	}
+	if err == nil {
 		t.Fatal("Unix socket was accepted")
 	}
 	if !errors.Is(err, ErrCopyFileNotRegular) {
 		t.Errorf("Unix socket error = %v, want ErrCopyFileNotRegular", err)
+	}
+}
+
+// Device nodes require a privileged or otherwise capable host to
+// materialize, so this test skips explicitly when a hard link cannot be
+// created for the fake runner.
+func TestCopyFileFromContainerRejectsDeviceWhenHostAllowsIt(t *testing.T) {
+	const devicePath = "/dev/null"
+	probe := filepath.Join(t.TempDir(), "device")
+	if err := os.Link(devicePath, probe); err != nil {
+		t.Skipf("device-node materialization unavailable: %v", err)
+	}
+	if err := os.Remove(probe); err != nil {
+		t.Fatalf("remove device probe: %v", err)
+	}
+
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(dst string) error {
+			return os.Link(devicePath, dst)
+		},
+	}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/container/device")
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("device node returned a reader")
+	}
+	if err == nil {
+		t.Fatal("device node was accepted")
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Errorf("device error = %v, want ErrCopyFileNotRegular", err)
 	}
 }
 

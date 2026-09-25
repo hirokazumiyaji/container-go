@@ -369,8 +369,9 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
-environment keys (no `=`, no NUL), and copy paths (absolute, valid
-UTF-8) are all validated before reaching the CLI. The CLI validates
+environment keys (no `=`, no NUL), and copy paths (absolute POSIX
+paths with `/` separators, no backslashes, valid UTF-8) are all
+validated before reaching the CLI. The CLI validates
 too, but validating first gives clearer errors and independence from
 future CLI changes.
 

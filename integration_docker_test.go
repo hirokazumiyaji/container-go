@@ -90,13 +90,21 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
 	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if runtime.GOOS == "windows" && errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
-		// Go 1.23-1.25 on Windows cannot pass no-follow/overlapped flags
-		// through os.OpenFile, so the method intentionally fails closed.
-		t.Logf("CopyFileFromContainer is unsupported on this Windows toolchain: %v", err)
+	if err != nil && copyOutUnsupportedOnThisToolchain {
+		if rc != nil {
+			_ = rc.Close()
+			t.Fatalf("CopyFileFromContainer returned a reader with unsupported error: %v", err)
+		}
+		if !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+			t.Fatalf("CopyFileFromContainer: got %v, want documented unsupported error", err)
+		}
+		t.Logf("CopyFileFromContainer is intentionally unsupported on this Windows toolchain: %v", err)
 	} else {
 		if err != nil {
 			t.Fatalf("CopyFileFromContainer: %v", err)
+		}
+		if rc == nil {
+			t.Fatal("CopyFileFromContainer returned a nil reader")
 		}
 		defer rc.Close()
 		round, readErr := io.ReadAll(rc)
@@ -155,6 +163,9 @@ func TestIntegrationDockerParallelStarts(t *testing.T) {
 }
 
 func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		// The child's TestMain unsets CONTAINERGO_BACKEND, so the
 		// env-passed selection never reaches Run; pin it here.
@@ -227,6 +238,33 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 		time.Sleep(time.Second)
 	}
 	t.Fatalf("container %s still present 60s after SIGKILL; reaper did not fire", name)
+}
+
+func TestIntegrationDockerExplicitCleanup(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-cleanup-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+
+	out, err := exec.Command("docker", "ps", "--all", "--format", "{{.Names}}").Output()
+	if err != nil {
+		t.Fatalf("docker ps: %v", err)
+	}
+	if strings.Contains(string(out), name) {
+		t.Fatalf("container %s still exists after explicit cleanup: %s", name, out)
+	}
 }
 
 // TestIntegrationDockerLazyInspectStateAndWaitRollback covers #20 for

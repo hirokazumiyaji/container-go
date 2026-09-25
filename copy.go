@@ -159,10 +159,14 @@ func (r *tempFileReader) Close() error {
 }
 
 // validateContainerPath enforces the invariants the copy protocol
-// relies on: absolute, valid UTF-8, and free of NUL bytes.
+// relies on: absolute POSIX paths with '/' separators, valid UTF-8,
+// and no NUL or backslash characters.
 func validateContainerPath(p string) error {
 	if !path.IsAbs(p) {
 		return fmt.Errorf("container path %q must be absolute", p)
+	}
+	if strings.ContainsRune(p, '\\') {
+		return fmt.Errorf("container path %q must use '/' as the path separator", p)
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
 		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)

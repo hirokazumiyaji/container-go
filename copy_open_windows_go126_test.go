@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -28,6 +29,28 @@ func TestWindowsCopyFileOpenIsAvailableFromGo126(t *testing.T) {
 	}
 	if string(data) != "copied safely" {
 		t.Errorf("copied content = %q, want %q", data, "copied safely")
+	}
+}
+
+func TestWindowsCopyFileFromContainerRejectsBackslashPathsFromGo126(t *testing.T) {
+	runner := &cpRunner{fakeRunner: newTestRunner(), fileContent: "must not be copied"}
+	ctr := runCopyDockerTestContainer(t, runner)
+
+	for _, containerPath := range []string{
+		"/out/literal\\name",
+		"/out/dir\\..\\secret",
+	} {
+		rc, err := ctr.CopyFileFromContainer(context.Background(), containerPath)
+		if rc != nil {
+			_ = rc.Close()
+			t.Fatalf("CopyFileFromContainer(%q) returned a reader with error %v", containerPath, err)
+		}
+		if err == nil || !strings.Contains(err.Error(), "path separator") {
+			t.Errorf("CopyFileFromContainer(%q) = %v, want separator error", containerPath, err)
+		}
+		if call := runner.callWith("cp"); call != nil {
+			t.Fatalf("backslash container path invoked copy-out CLI: %v", call)
+		}
 	}
 }
 

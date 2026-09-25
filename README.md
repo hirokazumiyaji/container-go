@@ -89,6 +89,8 @@ same error. On Windows, this includes Go 1.23 through 1.25, whose
 `os.OpenFile` does not propagate the required Windows file flags; use Go
 1.26 or newer for Docker copy-out there. Use
 `CONTAINERGO_BACKEND=docker` on macOS when a safe copy-out is required.
+Container paths passed to the copy APIs are absolute POSIX paths using `/`;
+backslashes are rejected.
 
 ## Connection endpoints
 

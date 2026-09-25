@@ -129,6 +129,15 @@ func TestCopyToContainerRejectsRelativeContainerPath(t *testing.T) {
 	}
 }
 
+func TestValidateContainerPathRejectsBackslash(t *testing.T) {
+	for _, p := range []string{"/out/literal\\name", "/out/dir\\..\\secret"} {
+		err := validateContainerPath(p)
+		if err == nil || !strings.Contains(err.Error(), "path separator") {
+			t.Errorf("validateContainerPath(%q) = %v, want separator error", p, err)
+		}
+	}
+}
+
 func TestCopyToContainerRejectsMissingHostPath(t *testing.T) {
 	f := &cpRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)

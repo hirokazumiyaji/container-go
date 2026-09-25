@@ -489,14 +489,27 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 }
 
 func TestForExecRejectsEmptyCommand(t *testing.T) {
-	target := newFakeTarget()
-	s := ForExec(nil).WithStartupTimeout(60 * time.Second)
-	start := time.Now()
-	err := s.WaitUntilReady(context.Background(), target)
-	if err == nil {
-		t.Fatal("want error for empty command")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("took %v, want immediate error", elapsed)
+	for _, tc := range []struct {
+		name string
+		cmd  []string
+	}{
+		{name: "empty command", cmd: nil},
+		{name: "empty executable", cmd: []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := newFakeTarget()
+			s := ForExec(tc.cmd).WithStartupTimeout(60 * time.Second)
+			start := time.Now()
+			err := s.WaitUntilReady(context.Background(), target)
+			if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Errorf("took %v, want immediate error", elapsed)
+			}
+			if got := target.execCalls.Load(); got != 0 {
+				t.Fatalf("exec calls = %d, want 0", got)
+			}
+		})
 	}
 }

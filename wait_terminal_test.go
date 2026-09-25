@@ -1,3 +1,5 @@
+//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+
 package container
 
 import (
@@ -53,6 +55,46 @@ exit 17
 	}
 	if errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("error = %v, generic CLI failure was misclassified as not-found", err)
+	}
+}
+
+func TestIssue90ForLogRetainsTerminalStderrBeforeNotFoundClassification(t *testing.T) {
+	script := filepath.Join(t.TempDir(), "docker")
+	contents := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '29.7\n'
+  exit 0
+fi
+printf 'ready\n'
+head -c 70000 /dev/zero >&2
+printf 'Error response from daemon: No such container: myctr\n' >&2
+exit 1
+`
+	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	ctr := &Container{
+		id:     "myctr",
+		runner: &cli.ExecRunner{Binary: script},
+		eng:    dockerEngine{},
+	}
+	err := wait.ForLog("ready").
+		WithStartupTimeout(5*time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if err == nil {
+		t.Fatal("terminal not-found error unexpectedly satisfied the log pattern")
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *cli.CLIError", err)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+		t.Fatalf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
+	}
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want ErrContainerNotFound", err)
 	}
 }
 

@@ -205,7 +205,7 @@ func validateStrategyPorts(strategy Strategy, allowed map[string]struct{}) error
 		}
 		return requireWaitTCPPort(allowed)
 	case *HTTPStrategy:
-		if s.port == "" {
+		if !s.portSet {
 			return requireWaitTCPPort(allowed)
 		}
 		return requireWaitPort(allowed, s.port)

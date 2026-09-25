@@ -410,6 +410,15 @@ func terminalErrorIfSettled(ctx context.Context, stream io.ReadCloser) error {
 	defer timer.Stop()
 	select {
 	case <-status.Done():
+		// A process stream can report the child exit before its output
+		// pumps have finished. Drain within the same wait budget before
+		// asking for TerminalError, otherwise the stderr tail can be a
+		// snapshot taken before the final diagnostic was read.
+		if drainer, ok := stream.(interface{ Drain(context.Context) error }); ok {
+			if err := drainer.Drain(ctx); err != nil {
+				return err
+			}
+		}
 		return status.TerminalError()
 	case <-timer.C:
 		// A live follow stream is expected to remain open. The caller

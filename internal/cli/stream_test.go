@@ -150,6 +150,44 @@ func TestStreamRetainsTerminalStderrTail(t *testing.T) {
 	}
 }
 
+func TestTerminalErrorDrainsStderrWhenPublicReaderIsBlocked(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'ready\n'; head -c 70000 /dev/zero >&2; printf 'TERMINAL_STDERR_MARKER\n' >&2; exit 17`)}
+
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- ps.TerminalError() }()
+	var cliErr *CLIError
+	select {
+	case err = <-errCh:
+		if !errors.As(err, &cliErr) {
+			t.Fatalf("TerminalError = %v, want *CLIError", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("TerminalError blocked on a public-stream backpressure pump")
+	}
+	if !strings.Contains(cliErr.Stderr, "TERMINAL_STDERR_MARKER") {
+		t.Fatalf("Stderr = %q, want final terminal marker", cliErr.Stderr)
+	}
+	select {
+	case <-ps.pumpsDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("output pumps did not finish after TerminalError drain")
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
 func TestStreamReturnsTerminalSignalError(t *testing.T) {
 	r := &ExecRunner{Binary: writeStub(t, `printf 'signal stderr\n' >&2; kill -TERM $$`)}
 

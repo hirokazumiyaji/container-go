@@ -111,6 +111,16 @@ func TestWaitRejectsInvalidConfigurationBeforeTargetCalls(t *testing.T) {
 			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
 		},
 		{
+			name:     "empty explicit HTTP port",
+			strategy: ForHTTP("/").WithPort(""),
+			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+		},
+		{
+			name:     "empty exec executable",
+			strategy: ForExec([]string{""}),
+			calls:    func(target *issue90Target) int32 { return target.execCalls.Load() },
+		},
+		{
 			name:     "empty log pattern",
 			strategy: ForLog(""),
 			calls:    func(target *issue90Target) int32 { return target.followCalls.Load() },

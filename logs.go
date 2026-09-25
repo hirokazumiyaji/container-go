@@ -110,6 +110,15 @@ func (s *classifyingStream) TerminalError() error {
 	return nil
 }
 
+// Drain forwards the optional process-stream drain operation so wait.ForLog
+// can finish stderr capture before classifying a terminal CLI error.
+func (s *classifyingStream) Drain(ctx context.Context) error {
+	if drainer, ok := s.ReadCloser.(interface{ Drain(context.Context) error }); ok {
+		return drainer.Drain(ctx)
+	}
+	return nil
+}
+
 func (s *classifyingStream) wrap(err error) error {
 	if err == nil || errors.Is(err, io.EOF) {
 		return err

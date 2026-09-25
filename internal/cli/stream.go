@@ -162,6 +162,7 @@ type processStream struct {
 	outputCloseOnce sync.Once
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
+	terminalDrain   atomic.Bool
 
 	terminateOnce sync.Once
 	terminateErr  error
@@ -177,17 +178,27 @@ type processStream struct {
 }
 
 // streamOutput retains a rolling stderr diagnostic while forwarding the
-// bytes to the public stream.
+// bytes to the public stream. Once terminalDrain is set, a closed public
+// writer is an intentional signal to stop forwarding and continue reading
+// stderr so the diagnostic tail can be completed.
 type streamOutput struct {
-	output io.Writer
-	stderr *tailBuffer
+	output        io.Writer
+	stderr        *tailBuffer
+	terminalDrain *atomic.Bool
 }
 
 func (w *streamOutput) Write(p []byte) (int, error) {
 	if _, err := w.stderr.Write(p); err != nil {
 		return 0, err
 	}
-	return w.output.Write(p)
+	n, err := w.output.Write(p)
+	if err != nil && w.terminalDrain.Load() {
+		// The terminal process has already exited. The public reader is
+		// no longer part of the diagnostic path, so a closed io.Pipe must
+		// not make io.Copy stop before the remaining stderr is captured.
+		return len(p), nil
+	}
+	return n, err
 }
 
 func (s *processStream) pump(r *os.File, stderr bool) {
@@ -195,7 +206,11 @@ func (s *processStream) pump(r *os.File, stderr bool) {
 	defer func() { _ = r.Close() }()
 	var output io.Writer = s.output
 	if stderr {
-		output = &streamOutput{output: s.output, stderr: s.stderr}
+		output = &streamOutput{
+			output:        s.output,
+			stderr:        s.stderr,
+			terminalDrain: &s.terminalDrain,
+		}
 	}
 	_, _ = io.Copy(output, r)
 }
@@ -281,14 +296,44 @@ func (s *processStream) waitResult() error {
 	return s.waitErr
 }
 
+const terminalDrainTimeout = 100 * time.Millisecond
+
+// Drain completes the output pumps after the child has exited. It closes
+// the public pipe to release a pump blocked on backpressure, then lets the
+// stderr pump consume the remaining child output for its diagnostic tail.
+// The wait is bounded by both ctx and a short safety limit; source files
+// are closed on the safety timeout so a descendant holding an inherited
+// descriptor cannot deadlock the caller. A caller cancellation is returned;
+// the safety timeout is a best-effort diagnostic fallback.
+func (s *processStream) Drain(ctx context.Context) error {
+	drainCtx, cancel := context.WithTimeout(ctx, terminalDrainTimeout)
+	defer cancel()
+
+	s.terminalDrain.Store(true)
+	s.outputCloseOnce.Do(func() { _ = s.output.Close() })
+	select {
+	case <-s.pumpsDone:
+		return nil
+	case <-drainCtx.Done():
+		s.closeSourceFiles()
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return nil
+	}
+}
+
 // Done is closed after the child has been reaped. It is intentionally
 // optional on the public Streamer interface so existing test and adapter
-// runners remain source-compatible.
+// runners remain source-compatible. TerminalError drains any output pumps
+// that are still finishing before it snapshots stderr.
 func (s *processStream) Done() <-chan struct{} { return s.waitDone }
 
-// TerminalError reports the process result without consuming another
-// chunk of stream data. wait.ForLog uses it to avoid accepting a match
-// from a process that has already exited unsuccessfully.
+// TerminalError reports the process result. On a terminal failure it first
+// finishes the output pumps so the diagnostic tail is complete; callers
+// should treat the stream as terminal and close it afterward. wait.ForLog
+// uses it to avoid accepting a match from a process that has already
+// exited unsuccessfully.
 func (s *processStream) TerminalError() error {
 	waitErr := s.waitResult()
 	s.stateMu.Lock()
@@ -304,6 +349,15 @@ func (s *processStream) TerminalError() error {
 	}
 	if waitErr == nil {
 		return nil
+	}
+	// cmd.Wait only proves that the direct child was reaped. A pump can
+	// still be blocked trying to hand a chunk to the public reader, so
+	// drain it before constructing the diagnostic error. The stream
+	// context bounds this work and Drain also has a short safety limit for
+	// an inherited descriptor held by a descendant. wait/log may already
+	// have started the drain; in that case do not extend its budget here.
+	if !s.terminalDrain.Load() {
+		_ = s.Drain(s.ctx)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {

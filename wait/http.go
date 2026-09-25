@@ -15,6 +15,7 @@ type HTTPStrategy struct {
 	options
 	path          string
 	port          string
+	portSet       bool
 	method        string
 	statusMatcher func(int) bool
 	headers       map[string]string
@@ -32,9 +33,12 @@ func ForHTTP(path string) *HTTPStrategy {
 	return &HTTPStrategy{path: path, method: http.MethodGet}
 }
 
-// WithPort probes a specific declared port instead of the first one.
+// WithPort probes a specific declared port instead of the first one. An
+// empty value is invalid; omit WithPort to select the first declared TCP
+// port.
 func (s *HTTPStrategy) WithPort(port string) *HTTPStrategy {
 	s.port = port
+	s.portSet = true
 	return s
 }
 
@@ -108,7 +112,7 @@ func (s *HTTPStrategy) validate() error {
 	if err := s.options.validate(); err != nil {
 		return err
 	}
-	if err := validateTCPPortSpec(s.port, true); err != nil {
+	if err := validateTCPPortSpec(s.port, !s.portSet); err != nil {
 		return err
 	}
 	if s.method == "" {

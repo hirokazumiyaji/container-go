@@ -145,6 +145,9 @@ func parsePlatform(value string) (platformParts, bool) {
 // unconstrained. Actual platforms must report every selected component;
 // an omitted or malformed component never becomes an implicit wildcard.
 func platformSelectorMatches(selector, actual string) bool {
+	if selector == "" {
+		return true
+	}
 	return platformMetadataMatches(selector, platformMetadataFromString(actual))
 }
 

@@ -76,6 +76,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		uid:       base.uid,
 	}
 	info := base.info
+	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, ctr.uid) {
+		return nil, fmt.Errorf("reuse %s: refusing unverified Docker handle without an immutable ID", cfg.name)
+	}
 	if info == nil {
 		info, err = ctr.inspectFresh(ctx)
 		if err != nil {
@@ -101,7 +104,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	ctr.mu.Unlock()
 	ctr.inspectMu.Lock()
 	ctr.creation = info.labels[creationLabel]
-	ctr.uid = info.uid
+	// Do not bind info.uid from a name-addressed inspect here. A base
+	// handle with no verified UID (for example, after malformed run
+	// output) must not acquire a replacement UID merely because this
+	// inspect passed compatibility checks. A UID already verified by the
+	// ensure path remains on ctr.uid; otherwise keep the handle unbound
+	// and fail closed for backend operations.
 	ctr.inspectMu.Unlock()
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err

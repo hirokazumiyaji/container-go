@@ -140,10 +140,14 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。Apple では legacy、transitional、maintenance、durable の
    4 つの name-lock barrier を順番に保持します。登録済み lock inode は
-   age/cap cleanup から保護する durable hard-link lease を使い、lease、
+   entry ごとの ownership hold を持つ durable hard-link lease を使い、
+   active entry を保護しながら古い orphan link を GC します。lease、
    identity、lockf のいずれかが欠ければ fail closed してスキップします。
-   リーパーは `/bin/sh` を必要とするため Windows では動かず、Windows では
-   前 2 層のみでクリーンアップします。
+   これは同じ revision のリーパープロトコルです。古い、barrier を取得
+   しないリーパーとは協調できず、mixed-version のリーパー安全性は保証
+   しません。アップグレード前に古いリーパーを終了してください。リーパーは
+   `/bin/sh` を必要とするため Windows では動かず、Windows では前 2 層のみで
+   クリーンアップします。
 
 補足:
 
@@ -151,8 +155,13 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 - `container.Prune(ctx)` は過去セッションを含め、本ライブラリが作成した
   停止済みコンテナ(`com.github.hirokazumiyaji.container-go` ラベル付き)
   を削除します。Apple では name lock 内で fresh inspect してから削除します。
-  rolling upgrade 中は、異なる historical `TMPDIR` を使う旧 binary を
-  新しい state-only barrier で協調できないため、段階的に更新します。
+  Docker の `Prune` と `PruneReuseGroup` は `--no-trunc` の full ID を
+  一覧し、64 hex 以外を拒否して、置換可能な名前ではなく検証済み ID を
+  削除します。rolling upgrade 中は、異なる historical `TMPDIR` を使う旧
+  binary を新しい state-only barrier で協調できないため、段階的に更新します。
+  watchdog についても同じ制約があり、旧 barrier 非使用リーパーは現在の
+  4-barrier プロトコルには参加しません。旧 binary と新 binary のリーパーを
+  同じ Apple name に対して並行稼働させないでください。
 
 ## Reuse(テスト / プロセス間でのコンテナ共有)
 

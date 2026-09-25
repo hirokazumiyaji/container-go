@@ -106,6 +106,25 @@ type Container struct {
 	info *engineInfo // cached first inspect; immutable fields only
 }
 
+func (c *Container) unregisterReaper(barriersHeld bool) {
+	if c == nil || keepContainers() {
+		return
+	}
+	er, ok := c.runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return
+	}
+	binary := er.ExternalBinary()
+	if binary == "" && c.eng != nil {
+		binary = c.eng.binary()
+	}
+	id, creation := c.id, c.creation
+	if c.eng != nil && c.eng.immutableID() {
+		id, creation = c.uid, ""
+	}
+	unregisterFromGlobalReaper(binary, c.eng.reaperSubcommand(), id, creation, barriersHeld)
+}
+
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
 // removed before returning. WithReuse switches to get-or-create; see
@@ -368,7 +387,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 		if !verifiedImmutableID(c.eng, c.uid) {
 			return fmt.Errorf("terminate %s: backend did not return a verified immutable ID", c.id)
 		}
-		return c.delete(ctx, c.uid)
+		err := c.delete(ctx, c.uid)
+		if err == nil {
+			c.unregisterReaper(false)
+		}
+		return err
 	}
 	if !creationRE.MatchString(c.creation) {
 		return fmt.Errorf("terminate %s: missing or invalid creation generation; refusing name-addressed delete", c.id)
@@ -380,6 +403,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
 	if isNotFound(err) {
+		c.unregisterReaper(true)
 		return nil
 	}
 	if err != nil {
@@ -388,12 +412,17 @@ func (c *Container) Terminate(ctx context.Context) error {
 	// An absent generation cannot prove ownership of this handle, so
 	// it counts as a replacement too.
 	if info.labels[creationLabel] != c.creation {
+		c.unregisterReaper(true)
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	// Name-addressed engines must not switch to an ID merely because an
 	// inspect response happens to contain one. Only the engine's verified
 	// immutable-ID path may do that.
-	return c.delete(ctx, c.id)
+	if err := c.delete(ctx, c.id); err != nil {
+		return err
+	}
+	c.unregisterReaper(true)
+	return nil
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {

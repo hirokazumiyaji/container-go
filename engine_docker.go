@@ -301,25 +301,33 @@ func (dockerEngine) logsTailArgs(id string) []string {
 }
 
 // listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// status filters directly. The explicit no-trunc ID format is part of
+// the prune contract: a name or a short ID is not an immutable target.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
+}
+
+func parseDockerPruneIDs(data []byte) ([]pruneCandidate, error) {
+	ids := splitNonEmptyLines(data)
+	candidates := make([]pruneCandidate, 0, len(ids))
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker list returned invalid immutable container ID %q", id)
+		}
+		candidates = append(candidates, pruneCandidate{id: id})
+	}
+	return candidates, nil
 }
 
 // parseStoppedManaged extracts stopped managed container IDs. Docker
 // deletes by immutable ID, so list-time identity metadata is unnecessary.
 func (dockerEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
-	ids := splitNonEmptyLines(data)
-	candidates := make([]pruneCandidate, 0, len(ids))
-	for _, id := range ids {
-		candidates = append(candidates, pruneCandidate{id: id})
-	}
-	return candidates, nil
+	return parseDockerPruneIDs(data)
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -351,19 +359,14 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
+		"--format", "{{.ID}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]pruneCandidate, error) {
-	ids := splitNonEmptyLines(data)
-	candidates := make([]pruneCandidate, 0, len(ids))
-	for _, id := range ids {
-		candidates = append(candidates, pruneCandidate{id: id})
-	}
-	return candidates, nil
+	return parseDockerPruneIDs(data)
 }
 
 // nameConflict matches Docker's duplicate container name error.

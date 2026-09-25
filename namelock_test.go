@@ -416,6 +416,55 @@ func TestCleanupNameLockFilesHonorsRetentionCap(t *testing.T) {
 	}
 }
 
+func TestCleanupReclaimsOrphanedReaperLeasesWithCap(t *testing.T) {
+	dir := t.TempDir()
+	old := time.Now().Add(-2 * nameLockRetention)
+	initial := nameLockMaxLeases + 5
+	for i := 0; i < initial; i++ {
+		raw := filepath.Join(dir, fmt.Sprintf("%064x.lock", i))
+		if err := os.WriteFile(raw, nil, nameLockFilePerm); err != nil {
+			t.Fatal(err)
+		}
+		lease, err := ensureReaperLease(raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(raw, old, old); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Remove(raw); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Lstat(lease); err != nil {
+			t.Fatalf("orphan lease was not created: %v", err)
+		}
+	}
+	remaining := func() int {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, entry := range entries {
+			if _, _, ok := reaperLeaseRawName(entry.Name()); ok {
+				count++
+			}
+		}
+		return count
+	}
+	before := remaining()
+	for pass := 0; pass < 2; pass++ {
+		if err := cleanupNameLockFilesAt(context.Background(), dir, "", time.Now(), initial+8, nameLockCleanupDelete); err != nil {
+			t.Fatalf("cleanup pass %d: %v", pass, err)
+		}
+	}
+	after := remaining()
+	removed := before - after
+	if removed <= 0 || removed > 2*nameLockCleanupDelete {
+		t.Fatalf("orphan lease GC removed %d files, want bounded progress", removed)
+	}
+}
+
 func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 	name := "lock-" + newContainerName()
 	unlock, err := lockName(context.Background(), name)
@@ -551,8 +600,8 @@ func TestReaperUsesLeaseAfterOriginalStateReplacement(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force "+name)
 	waitReaperExitForTest(t, r)
 	replacementUnlock()
-	if _, err := os.Stat(paths[3]); err != nil {
-		t.Fatalf("original replacement removed the durable lease: %v", err)
+	if _, err := os.Stat(paths[3]); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("completed reaper lease remains after exit: %v", err)
 	}
 }
 

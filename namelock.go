@@ -4,6 +4,7 @@ package container
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -27,10 +28,12 @@ const (
 	nameLockPoll            = 10 * time.Millisecond
 	nameLockRetention       = 7 * 24 * time.Hour
 	nameLockMaxFiles        = 256
+	nameLockMaxLeases       = 256
 	nameLockCleanupScan     = nameLockMaxFiles + 2
 	nameLockCleanupDelete   = 32
 	nameLockMaintenanceFile = ".maintenance.lock"
 	nameLockLeaseSuffix     = ".reaper-lease"
+	nameLockLeaseHoldSuffix = nameLockLeaseSuffix + "."
 )
 
 type nameLockStage string
@@ -78,50 +81,124 @@ func rawNameLockPath(name string) (string, error) {
 // canonicalNameLockPath returns a durable reaper lease when one is
 // present. A lease is a hard link to the original lock inode, so cleanup
 // may retain the lease while the replaceable original path is recreated.
+// The fixed lease name is retained for the shell protocol; per-entry
+// hold links make ownership and reclamation safe when several reapers
+// use the same name.
 func canonicalNameLockPath(path string) (string, error) {
-	leasePath := path + nameLockLeaseSuffix
-	leaseInfo, err := os.Lstat(leasePath)
-	if errors.Is(err, fs.ErrNotExist) {
-		return path, nil
-	}
+	leases, err := reaperLeasePaths(path)
 	if err != nil {
-		return "", fmt.Errorf("stat reaper lease %s: %w", leasePath, err)
+		return "", err
 	}
-	if err := checkLockFile(leaseInfo, leasePath); err != nil {
-		return "", fmt.Errorf("validate reaper lease %s: %w", leasePath, err)
+	if len(leases) != 0 {
+		return leases[0], nil
 	}
-	originalInfo, err := os.Lstat(path)
-	if err == nil {
-		if err := checkLockFile(originalInfo, path); err != nil {
-			return "", fmt.Errorf("validate leased lock %s: %w", path, err)
-		}
-		if !os.SameFile(originalInfo, leaseInfo) {
-			return "", fmt.Errorf("reaper lease %s does not match lock inode %s", leasePath, path)
-		}
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return "", fmt.Errorf("stat leased lock %s: %w", path, err)
-	}
-	return leasePath, nil
+	return path, nil
 }
 
-// reaperNameLockSet prepares all four compatibility barriers in the
-// same order used by lockName. Each path is pinned with a hard-link lease
-// so cleanup cannot unlink the inode before the shell reaper locks it.
+func validReaperLeaseToken(token string) bool {
+	if len(token) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(token)
+	return err == nil
+}
+
+func reaperLeasePaths(rawPath string) ([]string, error) {
+	dir := filepath.Dir(rawPath)
+	base := filepath.Base(rawPath)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	fixedName := base + nameLockLeaseSuffix
+	holdPrefix := base + nameLockLeaseHoldSuffix
+	var paths []string
+	originalInfo, originalErr := os.Lstat(rawPath)
+	if originalErr == nil {
+		if err := checkLockFile(originalInfo, rawPath); err != nil {
+			return nil, err
+		}
+	} else if !errors.Is(originalErr, fs.ErrNotExist) {
+		return nil, originalErr
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		var candidate string
+		switch {
+		case name == fixedName:
+			candidate = filepath.Join(dir, name)
+		case strings.HasPrefix(name, holdPrefix):
+			token := strings.TrimPrefix(name, holdPrefix)
+			if !validReaperLeaseToken(token) {
+				return nil, fmt.Errorf("invalid reaper lease hold name %s", name)
+			}
+			candidate = filepath.Join(dir, name)
+		default:
+			continue
+		}
+		leaseInfo, statErr := os.Lstat(candidate)
+		if errors.Is(statErr, fs.ErrNotExist) {
+			continue
+		}
+		if statErr != nil {
+			return nil, fmt.Errorf("stat reaper lease %s: %w", candidate, statErr)
+		}
+		if err := checkLockFile(leaseInfo, candidate); err != nil {
+			return nil, fmt.Errorf("validate reaper lease %s: %w", candidate, err)
+		}
+		if originalInfo != nil && !os.SameFile(originalInfo, leaseInfo) {
+			return nil, fmt.Errorf("reaper lease %s does not match lock inode %s", candidate, rawPath)
+		}
+		paths = append(paths, candidate)
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+// reaperNameLockSet preserves the package helper shape. It prepares the
+// shared fixed lease but does not claim an ownership hold; the reaper
+// registration path below adds one hold per entry so reclamation can be
+// reference-counted across processes.
 func reaperNameLockSet(name string) ([]string, []string, error) {
+	paths, identities, _, err := reaperNameLockSetWithOwnership(name, false)
+	return paths, identities, err
+}
+
+func reaperNameLockSetForReaper(name string) ([]string, []string, []string, error) {
+	return reaperNameLockSetWithOwnership(name, true)
+}
+
+func newReaperLeaseToken() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", fmt.Errorf("generate reaper lease token: %w", err)
+	}
+	return hex.EncodeToString(token[:]), nil
+}
+
+func reaperNameLockSetWithOwnership(name string, owned bool) ([]string, []string, []string, error) {
 	legacyPath, err := rawLegacyNameLockPath(name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	transitionalPath, err := rawTransitionalNameLockPath(name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	statePath, err := rawNameLockPath(name)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	maintenancePath := filepath.Join(filepath.Dir(statePath), nameLockMaintenanceFile)
 	rawPaths := []string{legacyPath, transitionalPath, maintenancePath, statePath}
+
+	var token string
+	if owned {
+		token, err = newReaperLeaseToken()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
 
 	// Cleanup takes this maintenance lock before unlinking any state lock.
 	// Holding it while leases are created closes the registration/cleanup
@@ -130,40 +207,85 @@ func reaperNameLockSet(name string) ([]string, []string, error) {
 	defer cancel()
 	maintenanceUnlock, err := acquireLockFile(leaseCtx, maintenanceNameLockStage, maintenancePath, false, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	defer maintenanceUnlock()
 
 	paths := make([]string, 0, len(rawPaths))
+	createdFixed := make([]bool, 0, len(rawPaths))
+	holds := make([]string, 0, len(rawPaths))
+	fail := func(err error) ([]string, []string, []string, error) {
+		maintenanceUnlock()
+		if owned {
+			_ = releaseReaperLeaseFilesInternal(paths, identitiesForLeasePaths(paths), holds, false, createdFixed)
+		}
+		return nil, nil, nil, err
+	}
 	for _, rawPath := range rawPaths {
-		leasePath, err := ensureReaperLease(rawPath)
-		if err != nil {
-			return nil, nil, err
+		existing, existingErr := reaperLeasePaths(rawPath)
+		if existingErr != nil {
+			return fail(existingErr)
+		}
+		leasePath, leaseErr := ensureReaperLease(rawPath)
+		if leaseErr != nil {
+			return fail(leaseErr)
 		}
 		paths = append(paths, leasePath)
+		createdFixed = append(createdFixed, len(existing) == 0)
+		if owned {
+			hold, holdErr := ensureReaperLeaseHold(rawPath, leasePath, token)
+			if holdErr != nil {
+				return fail(holdErr)
+			}
+			holds = append(holds, hold)
+		}
 	}
 	identities := make([]string, 0, len(paths))
 	for _, path := range paths {
-		f, err := openLockFile(path, true, stateNameLockStage, nil)
-		if err != nil {
-			return nil, nil, err
+		f, openErr := openLockFile(path, false, stateNameLockStage, nil)
+		if openErr != nil {
+			return fail(openErr)
 		}
 		info, statErr := f.Stat()
 		if statErr != nil {
 			_ = f.Close()
-			return nil, nil, statErr
+			return fail(statErr)
 		}
 		identity, identityErr := lockFileIdentity(info)
 		closeErr := f.Close()
 		if identityErr != nil {
-			return nil, nil, identityErr
+			return fail(identityErr)
 		}
 		if closeErr != nil {
-			return nil, nil, closeErr
+			return fail(closeErr)
 		}
 		identities = append(identities, identity)
 	}
-	return paths, identities, nil
+	maintenanceUnlock()
+	return paths, identities, holds, nil
+}
+
+func identitiesForLeasePaths(paths []string) []string {
+	identities := make([]string, 0, len(paths))
+	for _, path := range paths {
+		f, err := openLockFile(path, false, stateNameLockStage, nil)
+		if err != nil {
+			identities = append(identities, "")
+			continue
+		}
+		info, statErr := f.Stat()
+		if statErr == nil {
+			identity, identityErr := lockFileIdentity(info)
+			if identityErr == nil {
+				identities = append(identities, identity)
+			} else {
+				identities = append(identities, "")
+			}
+		} else {
+			identities = append(identities, "")
+		}
+		_ = f.Close()
+	}
+	return identities
 }
 
 // reaperNameLockPaths preserves the pre-lease helper shape for package
@@ -181,10 +303,17 @@ func reaperNameLockPaths(name string) (statePath, maintenancePath string, err er
 
 func ensureReaperLease(rawPath string) (string, error) {
 	leasePath := rawPath + nameLockLeaseSuffix
-	if existing, err := canonicalNameLockPath(rawPath); err != nil {
+	existing, err := canonicalNameLockPath(rawPath)
+	if err != nil {
 		return "", err
-	} else if existing != rawPath {
-		return existing, nil
+	}
+	if existing != rawPath {
+		if existing == leasePath {
+			return existing, nil
+		}
+		// A previous owner left a hold but its fixed lease was collected.
+		// Recreate the fixed name from the still-validated hard link.
+		return createReaperLeaseFromSource(existing, leasePath)
 	}
 
 	f, err := openLockFile(rawPath, true, stateNameLockStage, nil)
@@ -205,14 +334,14 @@ func ensureReaperLease(rawPath string) (string, error) {
 		_ = f.Close()
 		return "", err
 	}
-	leaseInfo, err := leaseFile.Stat()
-	if err == nil && !os.SameFile(openedInfo, leaseInfo) {
-		err = fmt.Errorf("reaper lease %s does not match lock inode %s", leasePath, rawPath)
+	leaseInfo, statErr := leaseFile.Stat()
+	if statErr == nil && !os.SameFile(openedInfo, leaseInfo) {
+		statErr = fmt.Errorf("reaper lease %s does not match lock inode %s", leasePath, rawPath)
 	}
 	closeErr := leaseFile.Close()
 	rawCloseErr := f.Close()
-	if err != nil {
-		return "", err
+	if statErr != nil {
+		return "", statErr
 	}
 	if closeErr != nil {
 		return "", closeErr
@@ -221,6 +350,250 @@ func ensureReaperLease(rawPath string) (string, error) {
 		return "", rawCloseErr
 	}
 	return leasePath, nil
+}
+
+func createReaperLeaseFromSource(source, leasePath string) (string, error) {
+	f, err := openLockFile(source, false, stateNameLockStage, nil)
+	if err != nil {
+		return "", err
+	}
+	sourceInfo, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return "", statErr
+	}
+	if err := os.Link(source, leasePath); err != nil && !errors.Is(err, fs.ErrExist) {
+		_ = f.Close()
+		return "", fmt.Errorf("create reaper lease %s: %w", leasePath, err)
+	}
+	leaseFile, err := openLockFile(leasePath, true, stateNameLockStage, nil)
+	if err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	leaseInfo, leaseStatErr := leaseFile.Stat()
+	if leaseStatErr == nil && !os.SameFile(sourceInfo, leaseInfo) {
+		leaseStatErr = fmt.Errorf("reaper lease %s does not match source inode %s", leasePath, source)
+	}
+	closeErr := leaseFile.Close()
+	sourceCloseErr := f.Close()
+	if leaseStatErr != nil {
+		return "", leaseStatErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if sourceCloseErr != nil {
+		return "", sourceCloseErr
+	}
+	return leasePath, nil
+}
+
+func ensureReaperLeaseHold(rawPath, fixedPath, token string) (string, error) {
+	if !validReaperLeaseToken(token) {
+		return "", fmt.Errorf("invalid reaper lease token")
+	}
+	holdPath := rawPath + nameLockLeaseHoldSuffix + token
+	source := fixedPath
+	if _, err := os.Lstat(source); errors.Is(err, fs.ErrNotExist) {
+		source = rawPath
+	} else if err != nil {
+		return "", err
+	}
+	f, err := openLockFile(source, !isReaperLeasePath(source), stateNameLockStage, nil)
+	if err != nil {
+		return "", err
+	}
+	sourceInfo, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return "", statErr
+	}
+	if err := os.Link(source, holdPath); err != nil && !errors.Is(err, fs.ErrExist) {
+		_ = f.Close()
+		return "", fmt.Errorf("create reaper lease hold %s: %w", holdPath, err)
+	}
+	holdFile, err := openLockFile(holdPath, true, stateNameLockStage, nil)
+	if err != nil {
+		_ = f.Close()
+		return "", err
+	}
+	holdInfo, holdStatErr := holdFile.Stat()
+	if holdStatErr == nil && !os.SameFile(sourceInfo, holdInfo) {
+		holdStatErr = fmt.Errorf("reaper lease hold %s does not match source inode %s", holdPath, source)
+	}
+	closeErr := holdFile.Close()
+	sourceCloseErr := f.Close()
+	if holdStatErr != nil {
+		return "", holdStatErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	if sourceCloseErr != nil {
+		return "", sourceCloseErr
+	}
+	return holdPath, nil
+}
+
+func rawPathFromLease(path string) (string, bool) {
+	if strings.HasSuffix(path, nameLockLeaseSuffix) {
+		return strings.TrimSuffix(path, nameLockLeaseSuffix), true
+	}
+	marker := nameLockLeaseHoldSuffix
+	if i := strings.LastIndex(path, marker); i >= 0 && validReaperLeaseToken(path[i+len(marker):]) {
+		return path[:i], true
+	}
+	return "", false
+}
+
+func removeReaperLeaseFile(path, expectedIdentity string, barriersHeld bool) error {
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("stat reaper lease %s: %w", path, err)
+	}
+	if err := checkLockFile(info, path); err != nil {
+		return fmt.Errorf("validate reaper lease %s: %w", path, err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("open reaper lease %s: %w", path, err)
+	}
+	opened, statErr := f.Stat()
+	if statErr == nil {
+		statErr = checkOpenedLockFile(f, path)
+	}
+	var identity string
+	if statErr == nil {
+		identity, statErr = lockFileIdentity(opened)
+	}
+	if statErr == nil && expectedIdentity != "" && identity != expectedIdentity {
+		statErr = fmt.Errorf("reaper lease %s changed inode", path)
+	}
+	if statErr == nil && !barriersHeld {
+		lockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if errors.Is(lockErr, syscall.EWOULDBLOCK) || errors.Is(lockErr, syscall.EAGAIN) {
+			statErr = fmt.Errorf("reaper lease %s is busy", path)
+		} else if lockErr != nil {
+			statErr = fmt.Errorf("probe reaper lease %s: %w", path, lockErr)
+		}
+	}
+	if statErr == nil {
+		current, currentErr := os.Lstat(path)
+		if currentErr != nil {
+			statErr = currentErr
+		} else if !os.SameFile(opened, current) {
+			statErr = fmt.Errorf("reaper lease %s changed while releasing", path)
+		} else if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			statErr = err
+		}
+	}
+	_ = f.Close()
+	if statErr != nil {
+		return statErr
+	}
+	return nil
+}
+
+// releaseReaperLeaseFiles releases one registration's ownership holds and
+// then removes the shared fixed lease when no other hold remains. Unless
+// barriersHeld is true, it acquires the maintenance barrier first; that
+// barrier serializes lease creation/removal. The skip-lock flag avoids a
+// self-deadlock on the maintenance lease while still checking path identity.
+func releaseReaperLeaseFiles(fixedPaths, identities, holds []string, barriersHeld bool) error {
+	return releaseReaperLeaseFilesInternal(fixedPaths, identities, holds, barriersHeld, nil)
+}
+
+func releaseReaperLeaseFilesInternal(fixedPaths, identities, holds []string, barriersHeld bool, removeUnowned []bool) error {
+	if len(fixedPaths) == 0 {
+		return nil
+	}
+	if len(identities) != len(fixedPaths) {
+		return fmt.Errorf("reaper lease identity count = %d, want %d", len(identities), len(fixedPaths))
+	}
+	if len(holds) > len(fixedPaths) {
+		return fmt.Errorf("reaper lease hold count = %d, exceeds %d barriers", len(holds), len(fixedPaths))
+	}
+	if !barriersHeld {
+		statePath, ok := rawPathFromLease(fixedPaths[len(fixedPaths)-1])
+		if !ok {
+			return fmt.Errorf("invalid reaper state lease %q", fixedPaths[len(fixedPaths)-1])
+		}
+		maintenancePath, pathErr := maintenanceNameLockPath(filepath.Dir(statePath))
+		if pathErr != nil {
+			return pathErr
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
+		maintenanceUnlock, lockErr := acquireLockFile(ctx, maintenanceNameLockStage, maintenancePath, false, nil)
+		cancel()
+		if lockErr != nil {
+			return lockErr
+		}
+		defer maintenanceUnlock()
+	}
+
+	var errs []error
+	for i, hold := range holds {
+		expected := ""
+		if i < len(identities) {
+			expected = identities[i]
+		}
+		if expected == "" {
+			errs = append(errs, fmt.Errorf("missing identity for reaper lease hold %s", hold))
+			continue
+		}
+		if err := removeReaperLeaseFile(hold, expected, true); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if len(holds) == 0 && len(removeUnowned) == 0 {
+		// Entries made by the lease-aware registration path always carry
+		// holds. Do not unlink an unowned fixed lease: an older process may
+		// still be using the shared name.
+		return errors.Join(errs...)
+	}
+	seen := make(map[string]struct{}, len(fixedPaths))
+	for i, fixed := range fixedPaths {
+		if _, ok := seen[fixed]; ok {
+			continue
+		}
+		seen[fixed] = struct{}{}
+		raw, ok := rawPathFromLease(fixed)
+		if !ok {
+			errs = append(errs, fmt.Errorf("invalid reaper lease path %q", fixed))
+			continue
+		}
+		leases, err := reaperLeasePaths(raw)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		other := false
+		for _, lease := range leases {
+			if lease != fixed {
+				other = true
+				break
+			}
+		}
+		if other {
+			continue
+		}
+		ownedByCall := i < len(holds) || (i < len(removeUnowned) && removeUnowned[i])
+		if !ownedByCall {
+			continue
+		}
+		if identities[i] == "" {
+			errs = append(errs, fmt.Errorf("missing identity for reaper lease %s", fixed))
+			continue
+		}
+		if err := removeReaperLeaseFile(fixed, identities[i], true); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func lockFileIdentity(info os.FileInfo) (string, error) {
@@ -540,15 +913,35 @@ func checkLockFile(info os.FileInfo, path string) error {
 // deletes across cooperating processes on this host. Every new caller
 // takes the parent revision's TMPDIR flock, the UserCacheDir flock
 // introduced by the first hardened revision, namespace maintenance, and
-// the durable state flock, in that order. An old caller takes only its
-// historical barrier, so coordination with an old binary is guaranteed
-// only when its historical path is the same. Failure to establish a
-// historical namespace is a fail-closed compatibility error.
+// the durable state flock, in that order. A cooperating caller from an
+// older revision can be serialized only when it uses the same historical
+// barrier; an older reaper that does not take these barriers is outside
+// this protocol. Failure to establish a historical namespace is a
+// fail-closed compatibility error.
+var errNameLockPathChanged = errors.New("name lock lease changed while acquiring")
+
+const nameLockLeaseRetryLimit = 8
+
 func lockName(ctx context.Context, name string) (func(), error) {
 	return lockNameWithHooks(ctx, name, nil)
 }
 
 func lockNameWithHooks(ctx context.Context, name string, hooks *nameLockHooks) (func(), error) {
+	var last error
+	for attempt := 0; attempt < nameLockLeaseRetryLimit; attempt++ {
+		unlock, err := lockNameWithHooksOnce(ctx, name, hooks)
+		if err == nil {
+			return unlock, nil
+		}
+		if !errors.Is(err, errNameLockPathChanged) {
+			return nil, err
+		}
+		last = err
+	}
+	return nil, last
+}
+
+func lockNameWithHooksOnce(ctx context.Context, name string, hooks *nameLockHooks) (func(), error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -652,9 +1045,25 @@ func wrapNameLockMaintenanceError(err error) error {
 	return fmt.Errorf("%w: lock maintenance: %w", ErrNameLockCompatibility, err)
 }
 
+func isReaperLeasePath(path string) bool {
+	name := filepath.Base(path)
+	if strings.HasSuffix(name, nameLockLeaseSuffix) {
+		return true
+	}
+	marker := nameLockLeaseHoldSuffix
+	if i := strings.Index(name, marker); i >= 0 {
+		return validReaperLeaseToken(name[i+len(marker):])
+	}
+	return false
+}
+
 func acquireLockFile(ctx context.Context, stage nameLockStage, path string, touch bool, hooks *nameLockHooks) (func(), error) {
-	f, err := openLockFile(path, true, stage, hooks)
+	create := !isReaperLeasePath(path)
+	f, err := openLockFile(path, create, stage, hooks)
 	if err != nil {
+		if isReaperLeasePath(path) && errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %v", errNameLockPathChanged, err)
+		}
 		return nil, err
 	}
 	if err := flockWithContext(ctx, f); err != nil {
@@ -662,7 +1071,10 @@ func acquireLockFile(ctx context.Context, stage nameLockStage, path string, touc
 		return nil, err
 	}
 	if err := checkOpenedLockFile(f, path); err != nil {
-		closeFileLock(f)
+		closeFileLock(f)()
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("%w: %v", errNameLockPathChanged, err)
+		}
 		return nil, err
 	}
 	if touch {
@@ -822,14 +1234,37 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 	}
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	validNames := 0
+	leaseProtected := make(map[string]bool)
+	leaseCount := 0
 	for _, entry := range entries {
 		if isNameLockFile(entry.Name()) {
 			validNames++
 		}
+		if raw, _, ok := reaperLeaseRawName(entry.Name()); ok {
+			leaseCount++
+			leaseProtected[raw] = true
+		}
 	}
 	overLimit := len(entries) >= scanLimit || validNames > nameLockMaxFiles
+	leaseOverLimit := leaseCount > nameLockMaxLeases
 
+	// Collect lease names before removing any of them. The original raw
+	// path remains protected for this whole sweep even if its stale lease
+	// is reclaimed; otherwise a reaper could still be holding the old
+	// inode while a new caller creates a replacement raw path.
+	leaseEntries := make([]string, 0, leaseCount)
+	for _, entry := range entries {
+		if _, _, ok := reaperLeaseRawName(entry.Name()); ok {
+			leaseEntries = append(leaseEntries, filepath.Join(dir, entry.Name()))
+		}
+	}
 	removed := 0
+	leaseRemoved, err := cleanupReaperLeaseFilesLocked(ctx, dir, keep, leaseEntries, now, leaseOverLimit, deleteLimit)
+	if err != nil {
+		return err
+	}
+	removed += leaseRemoved
+
 	for _, entry := range entries {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -842,6 +1277,9 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 			continue
 		}
 		path := filepath.Join(dir, name)
+		if leaseProtected[name] || reaperLeaseExists(path) {
+			continue
+		}
 		f, err := openLockFile(path, false, stateNameLockStage, nil)
 		if err != nil {
 			// Invalid, replaced, or concurrently removed entries are not
@@ -860,13 +1298,6 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 			return fmt.Errorf("probe stale lock file %s: %w", path, flockErr)
 		}
 		if err := checkOpenedLockFile(f, path); err != nil {
-			unlock()
-			continue
-		}
-		// A reaper lease is a durable hard-link reference to this exact
-		// inode. It is never removed by age/cap cleanup while the entry is
-		// registered, even if the original path is old.
-		if reaperLeaseExists(path) {
 			unlock()
 			continue
 		}
@@ -897,9 +1328,105 @@ func cleanupNameLockFilesLocked(ctx context.Context, dir, keep string, now time.
 	return nil
 }
 
+func reaperLeaseRawName(name string) (raw string, fixed bool, ok bool) {
+	if strings.HasSuffix(name, nameLockLeaseSuffix) {
+		raw = strings.TrimSuffix(name, nameLockLeaseSuffix)
+		if strings.HasSuffix(raw, ".lock") {
+			return raw, true, true
+		}
+	}
+	marker := nameLockLeaseHoldSuffix
+	if i := strings.Index(name, marker); i > 0 && validReaperLeaseToken(name[i+len(marker):]) {
+		raw = name[:i]
+		if strings.HasSuffix(raw, ".lock") {
+			return raw, false, true
+		}
+	}
+	return "", false, false
+}
+
+func cleanupReaperLeaseFilesLocked(ctx context.Context, dir, keep string, paths []string, now time.Time, overLimit bool, deleteLimit int) (int, error) {
+	removed := 0
+	ownedRaws := make(map[string]bool)
+	for _, path := range paths {
+		if raw, fixed, ok := reaperLeaseRawName(filepath.Base(path)); ok && !fixed {
+			ownedRaws[raw] = true
+		}
+	}
+	// Remove ownership holds first. A fixed lease is retained while any
+	// hold remains, which makes concurrent reapers independent.
+	for _, pass := range []bool{false, true} {
+		for _, path := range paths {
+			if err := ctx.Err(); err != nil {
+				return removed, err
+			}
+			if removed >= deleteLimit {
+				return removed, nil
+			}
+			raw, fixed, ok := reaperLeaseRawName(filepath.Base(path))
+			if !ok || fixed != pass {
+				continue
+			}
+			if path == keep || filepath.Base(path) == filepath.Base(keep) {
+				continue
+			}
+			info, err := os.Lstat(path)
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			if err != nil {
+				continue
+			}
+			if err := checkLockFile(info, path); err != nil {
+				continue
+			}
+			// A lease is a live safety reference, not an ordinary stale
+			// cache entry. Age controls reclamation; the cap may accelerate
+			// only an orphaned fixed link, never a recent ownership hold.
+			recent := now.Sub(info.ModTime()) < nameLockRetention
+			if recent && (!overLimit || !fixed) {
+				continue
+			}
+			// Validate the complete lease set before unlinking. A malformed
+			// or replaced sibling keeps the raw inode fail-closed.
+			leases, err := reaperLeasePaths(filepath.Join(dir, raw))
+			if err != nil {
+				continue
+			}
+			if pass {
+				other := false
+				for _, lease := range leases {
+					if lease != path {
+						other = true
+						break
+					}
+				}
+				if other {
+					continue
+				}
+				// A fixed lease with no ownership hold may belong to a
+				// package-level preparation helper or an older process.
+				// Keep it while the raw coordination inode still exists;
+				// explicit reaper unregister/exit owns the normal removal
+				// path. A fixed link that did have an ownership hold is
+				// collectible after that hold ages out, which prevents a
+				// crashed reaper from pinning the namespace forever.
+				if _, rawErr := os.Lstat(filepath.Join(dir, raw)); !errors.Is(rawErr, fs.ErrNotExist) && !ownedRaws[raw] {
+					continue
+				}
+			}
+			if err := removeReaperLeaseFile(path, "", false); err != nil {
+				continue
+			}
+			removed++
+		}
+	}
+	return removed, nil
+}
+
 func reaperLeaseExists(path string) bool {
-	_, err := os.Lstat(path + nameLockLeaseSuffix)
-	return err == nil || !errors.Is(err, fs.ErrNotExist)
+	leases, err := reaperLeasePaths(path)
+	return err != nil || len(leases) != 0
 }
 
 func isNameLockFile(name string) bool {

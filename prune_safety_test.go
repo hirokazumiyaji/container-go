@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -271,5 +272,81 @@ func TestPruneAppleReturnsInspectFailureWithoutDeleting(t *testing.T) {
 	}
 	if len(removed) != 0 || len(r.deleted) != 0 {
 		t.Fatalf("removed = %v, deleted = %v; want fail closed", removed, r.deleted)
+	}
+}
+
+type dockerPruneIDRunner struct {
+	mu      sync.Mutex
+	list    string
+	deleted []string
+	calls   [][]string
+}
+
+func (r *dockerPruneIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, append([]string(nil), args...))
+	switch args[0] {
+	case "ps":
+		return []byte(r.list), nil, nil
+	case "rm":
+		r.deleted = append(r.deleted, args[len(args)-1])
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func assertDockerFullIDListArgs(t *testing.T, args []string) {
+	t.Helper()
+	if !slices.Contains(args, "--no-trunc") || !slices.Contains(args, "{{.ID}}") {
+		t.Fatalf("Docker list args = %v, want --no-trunc and {{.ID}}", args)
+	}
+	if slices.Contains(args, "{{.Names}}") {
+		t.Fatalf("Docker list args use replaceable names: %v", args)
+	}
+}
+
+func TestDockerPruneDeletesListedIDAfterNameReplacement(t *testing.T) {
+	id := strings.Repeat("a", 64)
+	r := &dockerPruneIDRunner{list: id + "\n"}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if !slices.Equal(removed, []string{id}) {
+		t.Fatalf("removed = %v, want full ID %q", removed, id)
+	}
+	if !slices.Equal(r.deleted, []string{id}) {
+		t.Fatalf("deleted = %v, want the listed immutable ID", r.deleted)
+	}
+	assertDockerFullIDListArgs(t, r.calls[0])
+}
+
+func TestDockerPruneReuseGroupDeletesListedIDAfterNameReplacement(t *testing.T) {
+	first := strings.Repeat("b", 64)
+	second := strings.Repeat("c", 64)
+	r := &dockerPruneIDRunner{list: first + "\n" + second + "\n"}
+	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
+	if err != nil {
+		t.Fatalf("PruneReuseGroup: %v", err)
+	}
+	if !slices.Equal(removed, []string{first, second}) {
+		t.Fatalf("removed = %v, want full IDs", removed)
+	}
+	if !slices.Equal(r.deleted, []string{first, second}) {
+		t.Fatalf("deleted = %v, want listed immutable IDs", r.deleted)
+	}
+	assertDockerFullIDListArgs(t, r.calls[0])
+}
+
+func TestDockerPruneRejectsTruncatedListedID(t *testing.T) {
+	short := strings.Repeat("a", 12)
+	r := &dockerPruneIDRunner{list: short + "\n"}
+	if _, err := pruneWith(context.Background(), r, dockerEngine{}); err == nil {
+		t.Fatal("Prune accepted a truncated Docker ID")
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete after invalid list identity", r.deleted)
 	}
 }

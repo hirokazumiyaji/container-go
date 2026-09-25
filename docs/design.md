@@ -325,12 +325,18 @@ entering the critical section. The state filename is a SHA-256 digest of the
 name, so different process environment values do not split new state callers.
 Every historical and state file is opened with `O_NOFOLLOW`; its type, owner,
 `0600` mode, and path-to-open-file inode identity are checked before and after
-`flock`. A registered reaper entry creates durable hard-link leases for all
-four barriers; cleanup skips leased inodes even when they are old or over the
-retention cap, and the shell locks those validated lease paths rather than
-reopening a cleanup-replaceable path. The state directory and its parents
-reject paths that another user could replace; a standard sticky temporary
-root is accepted because its sticky rule protects entries owned by this user.
+`flock`. A registered reaper entry creates a fixed hard-link lease for each
+barrier plus per-entry ownership holds. Normal lock callers use the fixed
+lease inode, while independent reapers can be reference-counted safely. A
+successful termination, failed registration, or reaper-child exit removes the
+entry's holds; the shell also performs cleanup after EOF, including when the
+parent was killed. The bounded maintenance sweep removes old orphan lease
+links, keeps a raw inode protected for the sweep in which a lease is
+observed, and never evicts a recent ownership hold solely because the lease
+cap was exceeded. A malformed or replaced lease fails closed. The state
+directory and its parents reject paths that another user could replace; a
+standard sticky temporary root is accepted because its sticky rule protects
+entries owned by this user.
 
 Recently used state lock files are retained because the kernel releases
 `flock` when a holder exits, while unlinking a live file would create a
@@ -340,13 +346,14 @@ for a state lock held by the caller performing cleanup. Each acquisition
 inspects at most 258 directory entries (256 name-lock files plus the
 maintenance file) and removes at most 32 files. Files older than seven days
 are eligible; if the bounded scan shows that the 256-file retention cap is
-exceeded, an otherwise-unlocked file may be removed earlier. A reaper lease
-is an explicit exception: its hard-linked inode is retained until the
-reaper entry is no longer registered, and a malformed or replaced lease
-causes cleanup to fail closed rather than unlink the original. Cleanup uses
-nonblocking exclusive `flock` and skips a busy candidate, so it never
-unlinks an inode held by another cooperating process. The historical files
-are not swept while old binaries can coexist.
+exceeded, an otherwise-unlocked file may be removed earlier. Lease GC uses
+the same bounded budget, removes old orphan holds/fixed links, and skips a
+busy inode. A recent ownership hold is not removed just to satisfy the cap;
+if a lease is observed, its raw path is retained for that sweep. A malformed
+or replaced lease causes cleanup to fail closed rather than unlink the
+original. Cleanup uses nonblocking exclusive `flock` and skips a busy
+candidate, so it never unlinks an inode held by another cooperating process.
+The historical files are not swept while old binaries can coexist.
 
 These guarantees cover cooperating processes on the same host and the same
 account-derived state namespace. A direct `container delete` plus re-create
@@ -355,13 +362,17 @@ name, and closing that gap would need an immutable ID or an atomic
 conditional delete that Apple Container does not provide. An old binary
 that uses a different historical `TMPDIR` cannot be coordinated with the
 new state-only barrier; mixed-revision safety is therefore limited to
-matching historical paths and requires staged rollout. The reaper follows
-the same four-barrier order and fails closed if any historical path, lease,
-or `lockf` invocation is unavailable. An inspect failure other than
-not-found aborts the delete (fail closed). Lock and directory failures from
-failed-create cleanup are joined to `Run`'s error, so a container left
-behind cannot be hidden by a silent lock error. `Run`'s rollback and reuse
-post-create rollback preserve the cleanup error in the returned error chain.
+matching historical paths and requires staged rollout. The reaper's
+four-barrier protocol has a stricter same-revision contract: an older
+reaper that does not acquire those barriers is not a participant, so
+mixed-version reaper safety is explicitly not claimed. Drain old reapers
+before upgrading. The reaper follows the same four-barrier order and fails
+closed if any historical path, lease, or `lockf` invocation is unavailable.
+An inspect failure other than not-found aborts the delete (fail closed).
+Lock and directory failures from failed-create cleanup are joined to
+`Run`'s error, so a container left behind cannot be hidden by a silent
+lock error. `Run`'s rollback and reuse post-create rollback preserve the
+cleanup error in the returned error chain.
 
 `Terminate` and `TerminateContainer` apply one 30-second aggregate budget by
 default, rather than a fresh 30 seconds for each barrier, inspect, and
@@ -371,10 +382,13 @@ watchdog reaper registers Docker containers by verified immutable `Id`; for
 Apple it stores a valid generation and the four leased lock paths, reads the
 label as a line-anchored JSON field (`"key": "value"`, never a substring),
 and holds legacy, transitional, maintenance, and durable locks across
-inspect and delete with `lockf`. It rechecks the registered device/inode
-identity before and after inspect. If any helper, lease, or lock invocation
-is unavailable, the entry is skipped rather than deleted unlocked. The
-leader's own pull/create uses an independent `runTimeout` budget;
+inspect and delete with `lockf`. The BSD `lockf` invocation includes its
+required write-open mode (`-w`), because an exclusive record lock cannot be
+taken through a read-only descriptor. It rechecks the registered device/inode
+identity before and after inspect, and the shell releases its ownership
+holds after the EOF cleanup pass. If any helper, lease, identity, or lock
+invocation is unavailable, the entry is skipped rather than deleted unlocked.
+The leader's own pull/create uses an independent `runTimeout` budget;
 `reuseAttachTimeout` bounds only attach polling for another process's
 container.
 
@@ -550,7 +564,10 @@ subcommand per backend (`delete --force` for Apple, `rm --force` for
 Docker). The reaper depends on `/bin/sh` and thus does not run on
 Windows; v0.2 documents that Windows relies on the normal cleanup
 paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
-on Docker (`--filter label=... --filter status=exited`).
+on Docker (`--filter label=... --filter status=exited`), but its list
+contract is `--no-trunc --format '{{.ID}}'`: every listed value must be a
+64-hex immutable ID, and both `Prune` and `PruneReuseGroup` delete that
+validated ID rather than a replaceable container name.
 
 **Liveness detection**: the probe command switches per backend
 (`system status` for Apple, `info` for Docker).

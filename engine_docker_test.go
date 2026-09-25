@@ -147,15 +147,26 @@ func TestDockerLifecycleArgs(t *testing.T) {
 
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
-	if got := e.listArgs(); !slices.Contains(got, "--filter") {
-		t.Errorf("listArgs = %v, want daemon-side filters", got)
+	args := e.listArgs()
+	if !slices.Contains(args, "--filter") || !slices.Contains(args, "--no-trunc") || !slices.Contains(args, "{{.ID}}") {
+		t.Errorf("listArgs = %v, want full-ID daemon-side format", args)
 	}
-	ids, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	first := strings.Repeat("a", 64)
+	second := strings.Repeat("b", 64)
+	ids, err := e.parseStoppedManaged([]byte(first + "\n" + second + "\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []pruneCandidate{{id: "one"}, {id: "two"}}) {
+	if !slices.Equal(ids, []pruneCandidate{{id: first}, {id: second}}) {
 		t.Errorf("ids = %v", ids)
+	}
+	for _, data := range []string{"short\n", strings.Repeat("a", 63) + "\n", strings.Repeat("A", 64) + "\n", "name with spaces\n"} {
+		if _, err := e.parseStoppedManaged([]byte(data)); err == nil {
+			t.Errorf("parseStoppedManaged(%q) accepted a non-full ID", data)
+		}
+		if _, err := e.parseReuseGroupIDs([]byte(data), "integration"); err == nil {
+			t.Errorf("parseReuseGroupIDs(%q) accepted a non-full ID", data)
+		}
 	}
 }
 

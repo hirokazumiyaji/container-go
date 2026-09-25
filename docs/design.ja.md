@@ -216,23 +216,23 @@ Docker は検証済み immutable ID でのみ削除し、名前ロックを取�
 新しい実装は、親リビジョンの `TMPDIR` ロック、UserCacheDir を使う初版ハードニングのロック、namespace maintenance ロック、アカウント情報から導いた固定 state ディレクトリのロックを、この順で取得する。
 `XDG_STATE_HOME` や `HOME` で同じアカウントの lock namespace を分けたりはしない。
 移行用ロックの解決または取得に失敗した場合は、臨界領域へ入らず互換性エラーを返す。
-古い実装が異なる `TMPDIR` を使う場合、旧実装と新しい実装の historical path は一致しないため、mixed-revision の保証はその組み合わせには適用されない。rollout は段階的に行う。
+古い実装が異なる `TMPDIR` を使う場合、旧実装と新しい実装の historical path は一致しないため、mixed-revision の保証はその組み合わせには適用されない。rollout は段階的に行う。watchdog の 4-barrier プロトコルは同じ revision 間の契約であり、barrier を取得しない旧リーパーとは協調できない。mixed-version のリーパー安全性は保証せず、アップグレード前に旧リーパーを終了させる。
 state のファイル名は名前の SHA-256 ダイジェストであり、`TMPDIR` や cache が異なっても新しい実装彼此は同じ state inode を使う。
 すべてのロックファイルは `O_NOFOLLOW` で開き、ファイル種別、所有者、`0600`、path と open fd の inode 一致を `flock` の前後で確認する。
-reaper 登録時には 4 つの barrier すべてに durable な hard-link lease を作り、age/cap cleanup から保護する。shell は cleanup で置換可能な元 path ではなく、検証済み lease path の device/inode を `lockf` でロックする。
+reaper 登録時には 4 つの barrier すべてに fixed hard-link lease と entry ごとの ownership hold を作る。fixed lease を通常 caller と shell が共有し、hold によって複数 reaper の参照を数える。正常な Terminate、登録失敗、reaper child の exit では entry の hold を回収し、shell 自体も EOF 後の cleanup で parent が kill された場合まで回収する。maintenance sweep は古い orphan lease を bounded に GC し、古い lease を観測した sweep では raw inode を保護する。busy inode は削除せず、壊れた lease は fail closed とする。
 state ディレクトリは所有者と置換可能性を検索し、sticky bit を持つ標準の temporary root は sticky 規則で保護されるため受け入れる。
 
 最近使用した state ロックファイルは保持し、他の協力プロセスが保持する inode は unlink しない。
 namespace の maintenance `flock` は cleanup の sweep が終わるまで保持し、maintenance を保持しながら state lock を待つ順位逆転を防ぐ。
 cleanup は 1 回の取得ごとに最大 258 件（name-lock 256 件と maintenance 1 件）を調べ、最大 32 件だけを削除する。
 7 日より古いファイルは削除対象であり、256 件の上限を超えた場合は他のプロセスが使用していないファイルなら早く削除できる。
-reaper lease がある inode は age/cap cleanup から除外し、lease が壊れていれば安全側 fail closed とする。
+lease GC も同じ bounded budget を使い、古い orphan の hold/fixed link を回収する。ただし最近の ownership hold を cap だけで削除하지는 않으며、lease を観測した sweep では raw path を残す。lease が壊れていれば安全側 fail closed とする。
 非 blocking exclusive `flock` を取得できない候補は skip するため、保持中の inode は cleanup 対象にならない。
 旧実装と併存できるあいだは、移行用ロックファイルを cleanup しない。
 
 外部の `container delete` と再作成は、この lock を使わず、名前だけでは検出できない。
 `Prune` と `PruneReuseGroup` は list 時の generation、managed label、group、state を保存し、name lock 内で fresh inspect して再検証する。
-watchdog reaper は Apple の inspect/delete 間 동안 legacy、transitional、maintenance、durable の 4 つの lease lock を `lockf` で同じ順序に保持し、inspect 前後に device/inode を再確認する。helper、lease、barrier のいずれかがない場合は fail closed して削除しない。Docker の ID 経路は lock-free。
+watchdog reaper は Apple の inspect/delete 間 동안 legacy、transitional、maintenance、durable の 4 つの lease lock を `lockf` で同じ順序に保持し、inspect 前後に device/inode を再確認する。BSD `lockf` は read-only descriptor では exclusive lock を取得できないため、必須の write-open モード `-w` を必ず付ける。helper、lease、identity、barrier のいずれかがない場合は fail closed して削除しない。EOF cleanup では shell 自身が ownership hold を回収する。Docker の ID 経路は lock-free。
 `Terminate` と `TerminateContainer` は、各段階へ 30 秒ずつ割り当てるのではなく、lock 取得、inspect、delete を一つの既定 30 秒の aggregate budget で実行する。
 `cleanupFailedCreate` も lock 取得と backend 処理に一つの 30 秒 budget を使う。
 呼び出し元が指定した短い deadline は、この aggregate budget を上書きしない。
@@ -363,7 +363,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 **クリーンアップの違い**:watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
-`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。ただし list は `--no-trunc --format '{{.ID}}'` を使い、各行を 64 hex の immutable ID として検証する。`Prune` と `PruneReuseGroup` は、置換可能な名前ではなく検証済み ID を `rm` する。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
 

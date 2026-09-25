@@ -170,9 +170,13 @@ Three layers make sure containers do not outlive your tests:
    SIGKILL and panics included. On Apple it holds the legacy,
    transitional, maintenance, and durable name-lock barriers in order
    across generation inspection and deletion. Registered lock inodes
-   use durable hard-link leases protected from age/cap cleanup, and an
+   use durable hard-link leases with per-entry ownership holds; active
+   entries are protected while old orphan links are collected, and an
    entry is skipped if any lease, identity check, or `lockf` invocation
-   is unavailable. The reaper needs `/bin/sh`, so it is unavailable on
+   is unavailable. This is a same-revision reaper protocol: it does not
+   coordinate with an older reaper that does not take these barriers, so
+   mixed-version reaper safety is not claimed. Drain old reapers before
+   upgrading. The reaper needs `/bin/sh`, so it is unavailable on
    Windows — there, cleanup relies on the first two layers only.
 
 Extras:
@@ -182,9 +186,15 @@ Extras:
   created in any previous session (they carry the
   `com.github.hirokazumiyaji.container-go` label). On Apple,
   candidates are freshly re-inspected under the name lock before
-  deletion. During a rolling upgrade, an old binary using a different
-  historical `TMPDIR` cannot participate in the new state-only barrier;
-  stage the upgrade rather than assuming mixed-`TMPDIR` coordination.
+  deletion. On Docker, both `Prune` and `PruneReuseGroup` request
+  `--no-trunc` full IDs, reject anything that is not 64 hex, and delete
+  the validated ID rather than a replaceable name. During a rolling
+  upgrade, an old binary using a different historical `TMPDIR` cannot
+  participate in the new state-only barrier; stage the upgrade rather
+  than assuming mixed-`TMPDIR` coordination. The same restriction
+  applies to the watchdog: an older unlocked reaper is not a participant
+  in the current four-barrier protocol, so do not run old and new
+  reapers against the same Apple names concurrently.
 
 ## Reuse (shared containers across tests/processes)
 

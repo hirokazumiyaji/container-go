@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -96,6 +97,10 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	uid string
+	// reaper is the process-wide watchdog registration for this handle.
+	// Terminate removes it after a successful delete so completed entries
+	// do not remain in the replay set.
+	reaper *reaperRegistration
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -183,9 +188,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			bin = cfg.eng.binary()
 		}
 		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+			c.reaper = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
 		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+			c.reaper = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
 	}
 
@@ -314,6 +319,14 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
+	err := c.terminate(ctx)
+	if err == nil || errors.Is(err, ErrGenerationReplaced) {
+		unregisterWithGlobalReaper(c.reaper)
+	}
+	return err
+}
+
+func (c *Container) terminate(ctx context.Context) error {
 	if c.uid != "" {
 		return c.delete(ctx, c.uid)
 	}

@@ -74,6 +74,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
+			if dir != "" {
+				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+			}
 			return 0, nil, err
 		}
 		envFile, envDir = path, dir

@@ -135,7 +135,9 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
    defer 派には `container.TerminateContainer(ctr)` があります。どちらも
    nil 安全なので、`Run` のエラーチェックより前に呼べます。
 2. `Run` が途中で失敗した場合は、`Run` 自身が作成済みリソースを削除して
-   から返ります。
+   から返ります。作成後の env-file cleanup が失敗した場合は、利用可能な
+   ハンドルと結合済みエラーを返します。呼び出し側はそのハンドルを確認
+   または明示的に `Terminate` してください。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
    削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
@@ -187,14 +189,15 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
   シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
   stdin データとしてのみ渡ります。
-- Unix では環境変数を `os.UserCacheDir()` 配下の、所有者とモードを検証した
-  0700 ディレクトリ内の 0600 ファイル経由で渡します。
-  `TMPDIR` は使用しません。
-  異常終了分の回収にはバージョンマーカー、所有者とモード、許可された子
-  ファイル名、書き込み側ロックの解放をすべて確認します。
-  実行中の backend 呼び出しを age だけで削除することはありません。
-  共有一時ディレクトリは走査しないため、旧ビルドが残したファイルを安全に
-  帰属できません。利用者が内容を確認して手動で削除する必要があります。
+- Unix では環境変数を、正規化済みの `os.UserCacheDir()` 配下の、所有者と
+  モードを検証した 0700 ディレクトリ内の 0600 ファイル経由で渡します。
+  既存の symlink 祖先は一度だけ解決し、`..` と書き込み可能な信頼できない
+  祖先は拒否します。`TMPDIR` は使用しません。
+  24 時間経過した staging ディレクトリだけを age で回収し、marker 作成後、
+  lock 作成前に終了した状態や tombstone 化した部分削除は自動修復します。
+  初期化済みディレクトリは age ではなく書き込み側 lock で生存を判断します。
+  marker が不正な場合、置き換えられた場合、許可されない子がある場合は
+  fail closed します。利用者が内容を確認して手動で削除してください。
   cleanup 失敗は API から返し、関数から返る前に deferred retry します。
 - Windows の Go `chmod` はユーザー単位の秘密性を保証しません。
   空でない環境変数指定を含む `Run`/`Exec` は `ErrEnvFileUnsupported` で
@@ -236,6 +239,10 @@ make bench-integration   # pull が多い bench / singleflight
 統合テストのイメージは Docker Hub 匿名 pull 制限を避けるため
 `public.ecr.aws/docker/library/...` を使います。
 `CONTAINERGO_BACKEND=apple` または `docker` で片方だけ実行できます。
+
+リポジトリ CI の unit/race job は Ubuntu で実行します。
+Windows 固有の環境変数のテストは開発時にコンパイル確認しますが、
+この変更では Windows 実行時 CI のカバレッジを主張しません。
 
 設計ドキュメント: [docs/design.md](docs/design.md)(日本語版:
 [docs/design.ja.md](docs/design.ja.md))

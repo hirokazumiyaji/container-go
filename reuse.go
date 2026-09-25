@@ -25,6 +25,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
 	if err != nil {
+		// A successful create can still report an env-file cleanup error.
+		// Preserve the handle at this boundary so callers never lose the
+		// only usable reference to the shared container.
+		if base != nil {
+			return base, err
+		}
 		return nil, err
 	}
 
@@ -79,6 +85,12 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
+			if ctr != nil {
+				// reuseCreate can return a usable handle together with a
+				// post-create cleanup error. Do not turn that into an
+				// orphaned container by treating it as a failed create.
+				return ctr, createErr
+			}
 			if createErr == nil {
 				return ctr, nil
 			}
@@ -149,6 +161,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
+			if dir != "" {
+				return nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+			}
 			return nil, err
 		}
 		envFile, envDir = path, dir
@@ -182,12 +197,18 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       cfg.eng.parseRunID(stdout),
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
+		cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
+		if cleanupErr != nil {
+			return ctr, joinEnvFileCleanupError(joinEnvFileCleanupError(err, envCleanupErr), cleanupErr)
+		}
 		return nil, joinEnvFileCleanupError(err, envCleanupErr)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
+			cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
+			if cleanupErr != nil {
+				return ctr, joinEnvFileCleanupError(joinEnvFileCleanupError(err, envCleanupErr), cleanupErr)
+			}
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
 	}

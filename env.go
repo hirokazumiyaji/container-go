@@ -19,14 +19,15 @@ const (
 	envFileRootMarkerName = ".root"
 	envFileRootLockMarker = "container-go secure environment-file root v1\n"
 
-	envFileDirPrefix     = "containergo-env-"
-	envFileStagingPrefix = ".containergo-env-new-"
-	envFileDirMarkerName = ".container-go-env"
-	envFileDirMarker     = "container-go environment directory v1\n"
-	envFileLockName      = ".lock"
-	envFileName          = "env"
-	envFileMode          = 0o600
-	envDirMode           = 0o700
+	envFileDirPrefix       = "containergo-env-"
+	envFileStagingPrefix   = ".containergo-env-new-"
+	envFileTombstonePrefix = ".containergo-env-gone-"
+	envFileDirMarkerName   = ".container-go-env"
+	envFileDirMarker       = "container-go environment directory v1\n"
+	envFileLockName        = ".lock"
+	envFileName            = "env"
+	envFileMode            = 0o600
+	envDirMode             = 0o700
 
 	// A process that dies while staging releases the root lock, so an
 	// abandoned staging directory is eligible for an age-based retry. Fully
@@ -41,18 +42,28 @@ var (
 	// activeEnvFiles holds the lock descriptor and identity of each env
 	// directory made by this process. The descriptor remains open for the
 	// whole backend call, even if the directory is unlinked.
-	activeEnvFiles sync.Map // map[string]activeEnvFile
+	activeEnvFiles sync.Map // map[string]*activeEnvFile
 
 	// pendingEnvCleanups records a trusted directory whose first removal
-	// failed. A later deferred retry may continue even if RemoveAll already
-	// removed the marker before encountering the original error.
-	pendingEnvCleanups sync.Map // map[string]activeEnvFile
+	// failed. A later deferred retry may continue after a partial child
+	// removal. The same state pointer is retained until removal and lock
+	// close both succeed; late release/close errors must not make cleanup
+	// ownership disappear.
+	pendingEnvCleanups sync.Map // map[string]*activeEnvFile
+
+	// cleanupEnvMu prevents two cleanup callers for the same process from
+	// racing the ownership transition between active and pending state.
+	cleanupEnvMu sync.Mutex
 )
 
 type activeEnvFile struct {
-	lock    *os.File
-	dirInfo os.FileInfo
-	root    string
+	mu       sync.Mutex
+	lock     *os.File
+	dirInfo  os.FileInfo
+	root     string
+	path     string
+	original string
+	pending  bool
 }
 
 // validateEnvMap enforces the format understood by both supported
@@ -149,13 +160,22 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 }
 
 func writeEnvFileAt(base string, env map[string]string) (path, dir string, err error) {
+	return writeEnvFileAtWithRoot(base, env, withEnvFileRoot)
+}
+
+type envRootRunner func(string, func(string) error) error
+
+func writeEnvFileAtWithRoot(base string, env map[string]string, runRoot envRootRunner) (path, dir string, err error) {
 	if err := ensureEnvFileSecurity(); err != nil {
 		return "", "", err
 	}
 	if err := validateEnvMap(env); err != nil {
 		return "", "", err
 	}
-	err = withEnvFileRoot(base, func(root string) error {
+	if runRoot == nil {
+		return "", "", errors.New("environment storage: nil root runner")
+	}
+	err = runRoot(base, func(root string) error {
 		if err := cleanupEnvDirs(root); err != nil {
 			return err
 		}
@@ -164,6 +184,16 @@ func writeEnvFileAt(base string, env map[string]string) (path, dir string, err e
 		return err
 	})
 	if err != nil {
+		// withEnvFileRoot can report a late root-lock release/close error
+		// after createEnvFile has already published ownership. Do not
+		// discard that path: retry cleanup here, and return it only when
+		// the caller must perform a later retry.
+		if dir != "" {
+			cleanupErr := cleanupEnvFileAt(base, dir, removeExpectedEnvChildren)
+			if cleanupErr != nil {
+				return path, dir, errors.Join(err, cleanupErr)
+			}
+		}
 		return "", "", err
 	}
 	return path, dir, nil
@@ -185,13 +215,16 @@ func createEnvFile(root string, env map[string]string) (path, dir string, err er
 		if lock != nil {
 			cleanupErr = closeEnvFileLock(lock)
 		}
-		if removeErr := os.RemoveAll(cleanupDir); removeErr != nil {
+		// Staging cleanup is also constrained to the exact child
+		// allowlist. RemoveAll would turn a same-user race or a corrupted
+		// staging entry into an unintended recursive delete.
+		if removeErr := removeExpectedEnvChildren(cleanupDir); removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
 			cleanupErr = errors.Join(cleanupErr, removeErr)
 		}
 		err = errors.Join(err, cleanupErr)
 	}()
 
-	if err := os.Chmod(staging, envDirMode); err != nil {
+	if err := chmodEnvDirectory(staging); err != nil {
 		return "", "", err
 	}
 	if err := validatePrivateDirectory(staging); err != nil {
@@ -268,7 +301,13 @@ func createEnvFile(root string, env map[string]string) (path, dir string, err er
 	if err != nil {
 		return "", "", err
 	}
-	activeEnvFiles.Store(dir, activeEnvFile{lock: lock, dirInfo: dirInfo, root: root})
+	activeEnvFiles.Store(dir, &activeEnvFile{
+		lock:     lock,
+		dirInfo:  dirInfo,
+		root:     root,
+		path:     dir,
+		original: dir,
+	})
 	keep = true
 	path = filepath.Join(dir, envFileName)
 	return path, dir, nil
@@ -327,42 +366,58 @@ func closeEnvFileLock(lock *os.File) error {
 // directory. It is idempotent. Removal and lock-close failures are returned;
 // callers also retain the directory for a deferred retry.
 func cleanupEnvFile(dir string) error {
-	return cleanupEnvFileAt("", dir, os.RemoveAll)
+	return cleanupEnvFileAt("", dir, removeExpectedEnvChildren)
 }
 
 func cleanupEnvFileAt(base, dir string, removeAll func(string) error) error {
+	return cleanupEnvFileAtWithClose(base, dir, removeAll, closeEnvFileLock)
+}
+
+func cleanupEnvFileAtWithClose(base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
 	if dir == "" {
 		return nil
 	}
 	if removeAll == nil {
 		return errors.New("environment cleanup: nil remove function")
 	}
+	if closeLock == nil {
+		return errors.New("environment cleanup: nil lock close function")
+	}
 
-	value, active := activeEnvFiles.Load(dir)
-	entry, hasEntry := value.(activeEnvFile)
-	if !hasEntry && active {
-		return fmt.Errorf("environment cleanup: invalid active entry for %q", dir)
+	// A state transition is part of cleanup, not a best-effort afterthought:
+	// once a directory has been renamed to a tombstone, a late root-lock or
+	// descriptor error must leave the same state available to the retry.
+	cleanupEnvMu.Lock()
+	defer cleanupEnvMu.Unlock()
+
+	original := filepath.Clean(dir)
+	state := loadEnvCleanupState(original)
+	if state == nil {
+		state = &activeEnvFile{path: original, original: original}
+	} else {
+		state.mu.Lock()
+		defer state.mu.Unlock()
+		if state.path != "" {
+			dir = state.path
+		}
 	}
-	pendingValue, isPending := pendingEnvCleanups.Load(dir)
-	if isPending {
-		entry = pendingValue.(activeEnvFile)
-		hasEntry = true
-		active = false
-	}
+	wasPending := state.pending
 
 	var lock *os.File
-	if hasEntry {
-		lock = entry.lock
-	}
+	stateLock := false
+	pathMissing := false
 	removeStarted := false
+	renamed := false
 	cleanupErr := withEnvFileRoot(base, func(root string) error {
-		if filepath.Clean(filepath.Dir(dir)) != root {
-			return fmt.Errorf("%w: cleanup path %q is outside root %q", errUnsafeEnvFile, dir, root)
+		if err := validateEnvCleanupPath(root, dir); err != nil {
+			return err
 		}
 		info, err := os.Lstat(dir)
 		if errors.Is(err, os.ErrNotExist) {
-			pendingEnvCleanups.Delete(dir)
-			activeEnvFiles.Delete(dir)
+			// A previous attempt may have removed the directory before a
+			// deferred close/release reported an error. The state remains
+			// owned until this idempotent retry observes the absence.
+			pathMissing = true
 			return nil
 		}
 		if err != nil {
@@ -371,54 +426,65 @@ func cleanupEnvFileAt(base, dir string, removeAll func(string) error) error {
 		if err := validatePrivateDirectoryInfo(dir, info); err != nil {
 			return err
 		}
-		if hasEntry {
-			if entry.root != root || !os.SameFile(entry.dirInfo, info) {
-				return fmt.Errorf("%w: environment directory %q was replaced", errUnsafeEnvFile, dir)
-			}
-			if lock != nil {
-				lockInfo, err := lock.Stat()
-				if err != nil {
-					return err
-				}
-				lockPath := filepath.Join(dir, envFileLockName)
-				if err := validatePrivateRegularInfo(lockPath, lockInfo); err != nil {
-					return err
-				}
-				pathInfo, err := os.Lstat(lockPath)
-				if err != nil {
-					return err
-				}
-				if !os.SameFile(lockInfo, pathInfo) {
-					return fmt.Errorf("%w: environment lock %q was replaced", errUnsafeEnvFile, lockPath)
-				}
-			}
+		if state.root != "" && state.root != root {
+			return fmt.Errorf("%w: environment directory %q belongs to another root", errUnsafeEnvFile, dir)
+		}
+		if state.dirInfo != nil && !os.SameFile(state.dirInfo, info) {
+			return fmt.Errorf("%w: environment directory %q was replaced", errUnsafeEnvFile, dir)
+		}
+		state.root = root
+		state.dirInfo = info
+		state.path = dir
+		if state.original == "" {
+			state.original = original
 		}
 
-		cleanupLock := lock
-		if cleanupLock == nil {
-			var err error
-			cleanupLock, _, err = openValidatedPrivateFile(filepath.Join(dir, envFileLockName))
+		if state.lock != nil {
+			lock = state.lock
+			stateLock = true
+			lockInfo, err := lock.Stat()
 			if err != nil {
-				if isPending && errors.Is(err, os.ErrNotExist) {
-					cleanupLock = nil
-				} else {
-					return err
-				}
-			}
-		}
-		if cleanupLock != nil && cleanupLock != lock {
-			locked, err := tryAcquireEnvFileLock(cleanupLock)
-			if err != nil {
-				_ = cleanupLock.Close()
 				return err
 			}
-			if !locked {
-				_ = cleanupLock.Close()
-				return fmt.Errorf("environment cleanup: directory %q is active", dir)
+			lockPath := filepath.Join(dir, envFileLockName)
+			pathInfo, err := os.Lstat(lockPath)
+			if err != nil {
+				return err
 			}
-			defer func() { _ = cleanupLock.Close() }()
+			if err := validatePrivateRegularInfo(lockPath, lockInfo); err != nil {
+				return err
+			}
+			if !os.SameFile(lockInfo, pathInfo) {
+				return fmt.Errorf("%w: environment lock %q was replaced", errUnsafeEnvFile, lockPath)
+			}
+		} else if state.pending {
+			// A pending retry may have already removed the lock while
+			// removing an earlier child. If it is still present, validate
+			// and acquire it before touching any remaining child.
+			lock, _, err = openValidatedPrivateFile(filepath.Join(dir, envFileLockName))
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) {
+					return err
+				}
+				lock = nil
+			} else {
+				locked, lockErr := tryAcquireEnvFileLock(lock)
+				if lockErr != nil {
+					_ = lock.Close()
+					lock = nil
+					return lockErr
+				}
+				if !locked {
+					_ = lock.Close()
+					lock = nil
+					return fmt.Errorf("environment cleanup: directory %q is active", dir)
+				}
+			}
+		} else {
+			return fmt.Errorf("environment cleanup: directory %q has no owned lock", dir)
 		}
-		if !isPending {
+
+		if !state.pending && !strings.HasPrefix(filepath.Base(dir), envFileTombstonePrefix) {
 			marker, _, err := openValidatedEnvMarker(filepath.Join(dir, envFileDirMarkerName), envFileDirMarker, os.O_RDONLY)
 			if err != nil {
 				return err
@@ -427,26 +493,105 @@ func cleanupEnvFileAt(base, dir string, removeAll func(string) error) error {
 				return err
 			}
 		}
+		if err := validateExpectedEnvChildren(dir); err != nil {
+			return err
+		}
+		if state.pending || strings.HasPrefix(filepath.Base(dir), envFileTombstonePrefix) {
+			if err := validateEnvMarkerIfPresent(dir); err != nil {
+				return err
+			}
+		}
+
+		// Rename while the writer lock is held. A crash after this point
+		// leaves a recognizable tombstone rather than a half-marked live
+		// directory; a later stale scan can finish the exact-child removal.
+		if !strings.HasPrefix(filepath.Base(dir), envFileTombstonePrefix) {
+			tombstone, renameErr := renameEnvDirToTombstone(dir, info)
+			if tombstone != "" {
+				dir = tombstone
+				renamed = true
+				state.path = dir
+				if tombstoneInfo, statErr := os.Lstat(dir); statErr == nil {
+					state.dirInfo = tombstoneInfo
+				}
+			}
+			if renameErr != nil {
+				return renameErr
+			}
+		}
 
 		removeStarted = true
 		return removeAll(dir)
 	})
 
-	if active && hasEntry {
-		activeEnvFiles.Delete(dir)
-	}
-	if removeStarted {
-		if cleanupErr == nil {
-			pendingEnvCleanups.Delete(dir)
+	if lock != nil {
+		// A validation failure before the tombstone hand-off must leave the
+		// writer lock held. Otherwise a deferred retry would downgrade an
+		// active directory to an apparently lock-less unsafe entry.
+		if stateLock && !removeStarted && !renamed && !pathMissing {
+			lock = nil // retain state.lock for the next attempt
 		} else {
-			info, infoErr := os.Lstat(dir)
-			if infoErr == nil {
-				pendingEnvCleanups.Store(dir, activeEnvFile{dirInfo: info, root: filepath.Dir(dir)})
+			closeErr := closeLock(lock)
+			// Whether release or Close reports an error, the descriptor is
+			// no longer safe to reuse. Ownership is represented by the
+			// pending state until a later retry confirms the directory is gone.
+			if state != nil && stateLock {
+				state.lock = nil
 			}
+			cleanupErr = errors.Join(cleanupErr, closeErr)
+			lock = nil
 		}
 	}
-	if lock != nil {
-		cleanupErr = errors.Join(cleanupErr, closeEnvFileLock(lock))
+
+	// Keep the state until both the filesystem operation and all late
+	// close/release operations succeeded. This is what prevents a successful
+	// removal followed by a late error from orphaning the directory.
+	dirExists := false
+	if info, err := os.Lstat(dir); err == nil {
+		dirExists = true
+		if state != nil {
+			state.dirInfo = info
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		cleanupErr = errors.Join(cleanupErr, err)
+	}
+	if state != nil {
+		state.path = dir
+		if cleanupErr == nil && removeStarted && dirExists {
+			cleanupErr = fmt.Errorf("environment cleanup: directory %q remains after removal", dir)
+		}
+		if cleanupErr == nil && !dirExists {
+			clearEnvCleanupState(state)
+		} else if state.root != "" {
+			if removeStarted || renamed {
+				state.pending = true
+				pendingEnvCleanups.Store(state.original, state)
+				if state.path != state.original {
+					pendingEnvCleanups.Store(state.path, state)
+				}
+				activeEnvFiles.Delete(state.original)
+				if state.path != state.original {
+					activeEnvFiles.Delete(state.path)
+				}
+			} else if wasPending {
+				// A pending retry that still cannot make progress stays
+				// pending; it must not be downgraded to a live writer.
+				pendingEnvCleanups.Store(state.original, state)
+				if state.path != state.original {
+					pendingEnvCleanups.Store(state.path, state)
+				}
+				activeEnvFiles.Delete(state.original)
+				if state.path != state.original {
+					activeEnvFiles.Delete(state.path)
+				}
+			} else {
+				// Validation failed before the hand-off. Keep the live
+				// writer state intact rather than weakening marker checks on
+				// a later retry.
+				activeEnvFiles.Store(state.original, state)
+				pendingEnvCleanups.Delete(state.original)
+			}
+		}
 	}
 	return cleanupErr
 }
@@ -467,11 +612,90 @@ func joinEnvFileCleanupError(err, cleanupErr error) error {
 	return errors.Join(err, cleanupErr)
 }
 
+func loadEnvCleanupState(dir string) *activeEnvFile {
+	if value, ok := activeEnvFiles.Load(dir); ok {
+		if state, ok := value.(*activeEnvFile); ok && state != nil {
+			return state
+		}
+	}
+	if value, ok := pendingEnvCleanups.Load(dir); ok {
+		if state, ok := value.(*activeEnvFile); ok && state != nil {
+			return state
+		}
+	}
+	return nil
+}
+
+func clearEnvCleanupState(state *activeEnvFile) {
+	if state == nil {
+		return
+	}
+	if state.original != "" {
+		activeEnvFiles.Delete(state.original)
+		pendingEnvCleanups.Delete(state.original)
+	}
+	if state.path != "" {
+		activeEnvFiles.Delete(state.path)
+		pendingEnvCleanups.Delete(state.path)
+	}
+}
+
+func validateEnvCleanupPath(root, dir string) error {
+	for _, part := range strings.Split(dir, string(filepath.Separator)) {
+		if part == ".." {
+			return fmt.Errorf("%w: cleanup path %q contains '..'", errUnsafeEnvFile, dir)
+		}
+	}
+	clean := filepath.Clean(dir)
+	if !filepath.IsAbs(clean) || filepath.Dir(clean) != root {
+		return fmt.Errorf("%w: cleanup path %q is outside root %q", errUnsafeEnvFile, dir, root)
+	}
+	name := filepath.Base(clean)
+	if name == "." || name == ".." ||
+		(!strings.HasPrefix(name, envFileDirPrefix) &&
+			!strings.HasPrefix(name, envFileStagingPrefix) &&
+			!strings.HasPrefix(name, envFileTombstonePrefix)) {
+		return fmt.Errorf("%w: cleanup path %q is not a library directory", errUnsafeEnvFile, dir)
+	}
+	return nil
+}
+
+func renameEnvDirToTombstone(dir string, dirInfo os.FileInfo) (string, error) {
+	parent := filepath.Dir(dir)
+	for attempts := 0; attempts < 8; attempts++ {
+		candidate, err := os.MkdirTemp(parent, envFileTombstonePrefix)
+		if err != nil {
+			return "", err
+		}
+		if err := os.Remove(candidate); err != nil {
+			return "", err
+		}
+		if err := os.Rename(dir, candidate); err != nil {
+			if errors.Is(err, os.ErrExist) {
+				continue
+			}
+			return "", err
+		}
+		// The rename is the ownership hand-off. Verify the destination
+		// still names the directory we validated before reporting success.
+		info, err := os.Lstat(candidate)
+		if err != nil {
+			return candidate, err
+		}
+		if !os.SameFile(dirInfo, info) {
+			return candidate, fmt.Errorf("%w: environment directory %q changed during tombstone rename", errUnsafeEnvFile, dir)
+		}
+		return candidate, nil
+	}
+	return "", fmt.Errorf("%w: could not allocate environment cleanup tombstone", errUnsafeEnvFile)
+}
+
 // cleanupStaleEnvFiles reclaims directories left by a process that died
 // before deferred cleanup ran. It is intentionally not available on Windows.
 // Unix writers hold a non-blocking advisory lock for the whole backend call;
-// only an unlocked, marked, owned 0700 directory with the exact expected
-// children can be removed.
+// initialized directories are removed only when that lock is free, while
+// old staging directories and transactional tombstones are handled by their
+// age and exact-child rules.
 func cleanupStaleEnvFiles() error {
 	return cleanupStaleEnvFilesAt("")
 }
@@ -483,9 +707,16 @@ func cleanupStaleEnvFilesAt(base string) error {
 	return withEnvFileRoot(base, cleanupEnvDirs)
 }
 
-func withEnvFileRoot(base string, fn func(string) error) (err error) {
+func withEnvFileRoot(base string, fn func(string) error) error {
+	return withEnvFileRootWithClose(base, fn, closeEnvFileLock)
+}
+
+func withEnvFileRootWithClose(base string, fn func(string) error, closeRoot func(*os.File) error) (err error) {
 	if err := ensureEnvFileSecurity(); err != nil {
 		return err
+	}
+	if fn == nil || closeRoot == nil {
+		return errors.New("environment root: nil callback")
 	}
 	if base == "" {
 		var err error
@@ -499,25 +730,15 @@ func withEnvFileRoot(base string, fn func(string) error) (err error) {
 		return err
 	}
 	markerPath := filepath.Join(root, envFileRootMarkerName)
-	marker, _, err := openValidatedEnvMarker(markerPath, envFileRootLockMarker, os.O_RDWR)
-	if errors.Is(err, os.ErrNotExist) {
-		if err := writeEnvMarker(markerPath, envFileRootLockMarker); err != nil {
-			return err
-		}
-		marker, _, err = openValidatedEnvMarker(markerPath, envFileRootLockMarker, os.O_RDWR)
-	}
+	marker, _, err := openOrCreateRootMarker(root, markerPath)
 	if err != nil {
 		return err
 	}
 	if err := acquireEnvFileRootLock(marker); err != nil {
-		_ = marker.Close()
-		return err
+		return errors.Join(err, closeRoot(marker))
 	}
 	defer func() {
-		err = errors.Join(err, releaseEnvFileRootLock(marker))
-		if closeErr := marker.Close(); closeErr != nil {
-			err = errors.Join(err, closeErr)
-		}
+		err = errors.Join(err, closeRoot(marker))
 	}()
 
 	markerInfo, err := marker.Stat()
@@ -540,6 +761,157 @@ func withEnvFileRoot(base string, fn func(string) error) (err error) {
 	return fn(root)
 }
 
+func rootContainsOnlyMarker(root string) (bool, error) {
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Name() != envFileRootMarkerName {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func openOrCreateRootMarker(root, markerPath string) (*os.File, os.FileInfo, error) {
+	for attempt := 0; attempt < 64; attempt++ {
+		marker, info, err := openValidatedEnvMarker(markerPath, envFileRootLockMarker, os.O_RDWR)
+		if err == nil {
+			return marker, info, nil
+		}
+		if errors.Is(err, os.ErrNotExist) {
+			// Only an otherwise empty root may acquire a new trust marker.
+			empty, readErr := rootContainsOnlyMarker(root)
+			if readErr != nil {
+				return nil, nil, readErr
+			}
+			if !empty {
+				return nil, nil, fmt.Errorf("%w: environment root marker is missing while root contains entries", errUnsafeEnvFile)
+			}
+			created, createInfo, createErr := createRootMarker(markerPath)
+			if createErr == nil {
+				return created, createInfo, nil
+			}
+			if !errors.Is(createErr, os.ErrExist) {
+				return nil, nil, createErr
+			}
+			// Another initializer won O_EXCL. Reopen and validate it.
+			continue
+		}
+
+		// An existing invalid marker is repaired only after acquiring its
+		// advisory lock. A live creator holds that lock before it writes,
+		// so concurrent initialization waits for the creator instead of
+		// removing a marker that is still being initialized.
+		f, openErr := openEnvFileNoFollow(markerPath, os.O_RDWR, 0)
+		if openErr != nil {
+			return nil, nil, fmt.Errorf("%w: environment root marker %q is unsafe: %v", errUnsafeEnvFile, markerPath, err)
+		}
+		if lockErr := acquireEnvFileRootLock(f); lockErr != nil {
+			_ = f.Close()
+			return nil, nil, lockErr
+		}
+		empty, emptyErr := rootContainsOnlyMarker(root)
+		if emptyErr != nil {
+			_ = closeEnvFileLock(f)
+			return nil, nil, emptyErr
+		}
+		if !empty {
+			_ = closeEnvFileLock(f)
+			return nil, nil, fmt.Errorf("%w: environment root marker recovery found root entries", errUnsafeEnvFile)
+		}
+		repairErr := repairRootMarker(f, markerPath)
+		if repairErr != nil {
+			_ = closeEnvFileLock(f)
+			return nil, nil, repairErr
+		}
+		info, statErr := f.Stat()
+		if statErr != nil {
+			_ = closeEnvFileLock(f)
+			return nil, nil, statErr
+		}
+		return f, info, nil
+	}
+	return nil, nil, fmt.Errorf("%w: root marker creation remained contended", errUnsafeEnvFile)
+}
+
+func createRootMarker(path string) (*os.File, os.FileInfo, error) {
+	f, err := openEnvFileNoFollow(path, os.O_CREATE|os.O_EXCL|os.O_RDWR, envFileMode)
+	if err != nil {
+		return nil, nil, err
+	}
+	keep := false
+	defer func() {
+		if keep {
+			return
+		}
+		// Remove while the descriptor still owns the initialization lock so
+		// another process cannot repair the marker and lose it to this
+		// failed creator's cleanup.
+		_ = os.Remove(path)
+		_ = errors.Join(releaseEnvFileRootLock(f), f.Close())
+	}()
+	if err := f.Chmod(envFileMode); err != nil {
+		return nil, nil, err
+	}
+	// Acquire the lock before the first write. Other initializers can
+	// distinguish a live partial marker from a crash and will wait rather
+	// than declaring it unsafe.
+	if err := acquireEnvFileRootLock(f); err != nil {
+		return nil, nil, err
+	}
+	if err := writeAll(f, envFileRootLockMarker); err != nil {
+		return nil, nil, err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	keep = true
+	return f, info, nil
+}
+
+func repairRootMarker(f *os.File, path string) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if err := validatePrivateRegularInfo(path, info); err != nil {
+		return fmt.Errorf("%w: environment root marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+	}
+	if info.Size() > int64(len(envFileRootLockMarker)) {
+		return fmt.Errorf("%w: environment root marker %q is too long", errUnsafeEnvFile, path)
+	}
+	data := make([]byte, info.Size())
+	if len(data) > 0 {
+		n, readErr := f.ReadAt(data, 0)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
+		}
+		if n != len(data) || !strings.HasPrefix(envFileRootLockMarker, string(data)) {
+			return fmt.Errorf("%w: environment root marker %q has unsafe contents", errUnsafeEnvFile, path)
+		}
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) {
+		return fmt.Errorf("%w: environment root marker %q was replaced", errUnsafeEnvFile, path)
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	if err := writeAll(f, envFileRootLockMarker); err != nil {
+		return err
+	}
+	return nil
+}
+
 func releaseEnvFileRootLock(f *os.File) error {
 	return releaseEnvFileLock(f)
 }
@@ -548,82 +920,123 @@ func ensureEnvFileRoot(base string) (string, error) {
 	if err := ensureEnvFileBase(base); err != nil {
 		return "", err
 	}
+	base, err := canonicalEnvFileBase(base)
+	if err != nil {
+		return "", err
+	}
 	root := filepath.Join(base, envFileRootName)
-	err := os.Mkdir(root, envDirMode)
+
+	// Never resolve the root itself through a symlink. A pre-existing
+	// symlink with the library's name is an unsafe entry, even when its
+	// target happens to be owned by this user; all later operations use
+	// the canonical, non-symlink path returned below.
+	if info, statErr := os.Lstat(root); statErr == nil {
+		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+			return "", fmt.Errorf("%w: environment root %q is not a private directory", errUnsafeEnvFile, root)
+		}
+	} else if !errors.Is(statErr, os.ErrNotExist) {
+		return "", statErr
+	}
+
+	err = os.Mkdir(root, envDirMode)
 	created := err == nil
 	if err != nil && !errors.Is(err, os.ErrExist) {
 		return "", err
 	}
 	if created {
-		if err := os.Chmod(root, envDirMode); err != nil {
+		if err := chmodEnvDirectory(root); err != nil {
 			return "", err
 		}
 	}
-	if err := validateEnvPathComponents(root); err != nil {
+	canonicalRoot, err := canonicalEnvPath(root)
+	if err != nil {
 		return "", err
 	}
-	if err := validatePrivateDirectory(root); err != nil {
+	if canonicalRoot != root {
+		return "", fmt.Errorf("%w: environment root %q was not canonical", errUnsafeEnvFile, root)
+	}
+	if err := validateEnvPathComponents(canonicalRoot); err != nil {
 		return "", err
 	}
-	return root, nil
+	if err := validatePrivateDirectory(canonicalRoot); err != nil {
+		return "", err
+	}
+	return canonicalRoot, nil
 }
 
+// ensureEnvFileBase retains the original validation-only helper contract.
+// Filesystem callers use canonicalEnvFileBase so they can retain the resolved
+// path for all subsequent operations.
 func ensureEnvFileBase(base string) error {
-	if !filepath.IsAbs(base) {
-		return fmt.Errorf("%w: cache path %q is not absolute", errUnsafeEnvFile, base)
+	_, err := canonicalEnvFileBase(base)
+	return err
+}
+
+// canonicalEnvFileBase canonicalizes the cache base before creating anything.
+// The returned path is the only path subsequently used for filesystem
+// operations. This closes the validation/use gap for symlinked ancestors:
+// EvalSymlinks resolves those ancestors once, while explicit '..' components
+// are rejected before any filesystem operation.
+func canonicalEnvFileBase(base string) (string, error) {
+	canonical, err := canonicalEnvPath(base)
+	if err != nil {
+		return "", err
 	}
-	parent := filepath.Dir(filepath.Clean(base))
+	parent := filepath.Dir(canonical)
 	if err := validateEnvPathComponents(parent); err != nil {
-		return err
+		return "", err
 	}
 	parentInfo, err := os.Lstat(parent)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !trustedEnvParent(parentInfo) {
-		return fmt.Errorf("%w: cache parent %q is not private to this user", errUnsafeEnvFile, parent)
+		return "", fmt.Errorf("%w: cache parent %q is not private to this user", errUnsafeEnvFile, parent)
 	}
 
-	err = os.Mkdir(base, envDirMode)
-	created := err == nil
-	if err != nil && !errors.Is(err, os.ErrExist) {
-		return err
-	}
-	if created {
-		if err := os.Chmod(base, envDirMode); err != nil {
-			return err
+	info, statErr := os.Lstat(canonical)
+	if errors.Is(statErr, os.ErrNotExist) {
+		if err := os.Mkdir(canonical, envDirMode); err == nil {
+			if err := chmodEnvDirectory(canonical); err != nil {
+				return "", err
+			}
+		} else if !errors.Is(err, os.ErrExist) {
+			return "", err
 		}
+		info, statErr = os.Lstat(canonical)
 	}
-	if err := validateEnvPathComponents(base); err != nil {
-		return err
+	if statErr != nil {
+		return "", statErr
 	}
-	info, err := os.Lstat(base)
-	if err != nil {
-		return err
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return "", fmt.Errorf("%w: cache directory %q is not a private directory", errUnsafeEnvFile, canonical)
+	}
+	if err := validateEnvPathComponents(canonical); err != nil {
+		return "", err
 	}
 	uid := currentEnvFileUID()
 	owner, ok := envFileUID(info)
 	if !ok || owner != uid {
-		return fmt.Errorf("%w: cache directory %q is not owned by this user", errUnsafeEnvFile, base)
+		return "", fmt.Errorf("%w: cache directory %q is not owned by this user", errUnsafeEnvFile, canonical)
 	}
 	if info.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("%w: cache directory %q is group- or world-writable", errUnsafeEnvFile, base)
+		return "", fmt.Errorf("%w: cache directory %q is group- or world-writable", errUnsafeEnvFile, canonical)
 	}
-	return nil
+	return canonical, nil
 }
 
 func trustedEnvParent(info os.FileInfo) bool {
-	uid := currentEnvFileUID()
-	owner, ok := envFileUID(info)
-	if !ok {
-		return false
-	}
+	return trustedEnvPathComponent(info)
+}
+
+func trustedEnvPathComponent(info os.FileInfo) bool {
 	mode := info.Mode()
-	if owner == uid {
-		return mode.Perm()&0o022 == 0
+	if mode.Perm()&0o022 == 0 {
+		return true
 	}
-	// A sticky world-writable directory such as /tmp still prevents other
-	// users from replacing a child they do not own.
+	// A sticky world-writable directory such as /tmp prevents another user
+	// from replacing a child they do not own. Group-writable directories
+	// without the sticky bit are not trusted.
 	return mode.Perm()&0o002 != 0 && mode&os.ModeSticky != 0
 }
 
@@ -635,31 +1048,44 @@ func cleanupEnvDirs(root string) error {
 	now := time.Now()
 	for _, entry := range entries {
 		name := entry.Name()
-		if !strings.HasPrefix(name, envFileDirPrefix) && !strings.HasPrefix(name, envFileStagingPrefix) {
+		if !strings.HasPrefix(name, envFileDirPrefix) &&
+			!strings.HasPrefix(name, envFileStagingPrefix) &&
+			!strings.HasPrefix(name, envFileTombstonePrefix) {
 			continue
 		}
 		dir := filepath.Join(root, name)
 		if _, active := activeEnvFiles.Load(dir); active {
 			continue
 		}
+		if _, pending := pendingEnvCleanups.Load(dir); pending {
+			continue
+		}
 		info, err := os.Lstat(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return err
 		}
 		if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 			return fmt.Errorf("%w: stale environment entry %q is not a directory", errUnsafeEnvFile, dir)
 		}
-		if strings.HasPrefix(name, envFileDirPrefix) {
+		switch {
+		case strings.HasPrefix(name, envFileTombstonePrefix):
+			if err := removeStaleTombstoneEnvDir(dir, info); err != nil {
+				return err
+			}
+		case strings.HasPrefix(name, envFileDirPrefix):
 			if err := removeStaleEnvDir(dir); err != nil {
 				return err
 			}
-			continue
-		}
-		if now.Sub(info.ModTime()) < envFileStagingStaleAfter {
-			continue
-		}
-		if err := removeStaleStagingEnvDir(dir, info); err != nil {
-			return err
+		default:
+			if now.Sub(info.ModTime()) < envFileStagingStaleAfter {
+				continue
+			}
+			if err := removeStaleStagingEnvDir(dir, info); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -681,7 +1107,14 @@ func removeStaleEnvDir(dir string) (err error) {
 	if err := marker.Close(); err != nil {
 		return err
 	}
+	return removeStaleLockedEnvDir(dir, dirInfo)
+}
 
+// removeStaleLockedEnvDir is the transactional removal phase. The writer
+// lock is acquired before the directory is renamed, so a crash leaves a
+// tombstone that a later scan can finish without mistaking it for a live
+// writer.
+func removeStaleLockedEnvDir(dir string, dirInfo os.FileInfo) (err error) {
 	lockPath := filepath.Join(dir, envFileLockName)
 	lock, lockInfo, err := openValidatedPrivateFile(lockPath)
 	if err != nil {
@@ -713,6 +1146,63 @@ func removeStaleEnvDir(dir string) (err error) {
 	if err := validateExpectedEnvChildren(dir); err != nil {
 		return err
 	}
+	tombstone := dir
+	if !strings.HasPrefix(filepath.Base(dir), envFileTombstonePrefix) {
+		tombstone, err = renameEnvDirToTombstone(dir, dirInfo)
+		if err != nil {
+			return err
+		}
+	}
+	return removeExpectedEnvChildren(tombstone)
+}
+
+func removeStaleTombstoneEnvDir(dir string, dirInfo os.FileInfo) (err error) {
+	if err := validatePrivateDirectoryInfo(dir, dirInfo); err != nil {
+		return err
+	}
+	if err := validateExpectedEnvChildren(dir); err != nil {
+		return err
+	}
+	if err := validateEnvMarkerIfPresent(dir); err != nil {
+		return err
+	}
+	lockPath := filepath.Join(dir, envFileLockName)
+	lock, lockInfo, err := openValidatedPrivateFile(lockPath)
+	if errors.Is(err, os.ErrNotExist) {
+		current, err := os.Lstat(dir)
+		if err != nil {
+			return err
+		}
+		if !os.SameFile(dirInfo, current) {
+			return fmt.Errorf("%w: tombstone %q was replaced", errUnsafeEnvFile, dir)
+		}
+		return removeExpectedEnvChildren(dir)
+	}
+	if err != nil {
+		return err
+	}
+	locked, err := tryAcquireEnvFileLock(lock)
+	if err != nil {
+		_ = lock.Close()
+		return err
+	}
+	if !locked {
+		return lock.Close()
+	}
+	defer func() {
+		err = errors.Join(err, closeEnvFileLock(lock))
+	}()
+	currentDirInfo, statErr := os.Lstat(dir)
+	if statErr != nil {
+		return statErr
+	}
+	currentLockInfo, statErr := os.Lstat(lockPath)
+	if statErr != nil {
+		return statErr
+	}
+	if !os.SameFile(dirInfo, currentDirInfo) || !os.SameFile(lockInfo, currentLockInfo) {
+		return fmt.Errorf("%w: tombstone %q was replaced during validation", errUnsafeEnvFile, dir)
+	}
 	return removeExpectedEnvChildren(dir)
 }
 
@@ -722,6 +1212,9 @@ func removeStaleStagingEnvDir(dir string, dirInfo os.FileInfo) error {
 	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
+		return err
+	}
+	if err := validateExpectedEnvChildren(dir); err != nil {
 		return err
 	}
 	markerPath := filepath.Join(dir, envFileDirMarkerName)
@@ -737,15 +1230,56 @@ func removeStaleStagingEnvDir(dir string, dirInfo os.FileInfo) error {
 		if !os.SameFile(dirInfo, current) {
 			return fmt.Errorf("%w: staging directory %q was replaced", errUnsafeEnvFile, dir)
 		}
-		return os.Remove(dir)
+		if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		return nil
 	}
 	if markerErr != nil {
 		return markerErr
 	}
-	return removeStaleEnvDir(dir)
+
+	lockPath := filepath.Join(dir, envFileLockName)
+	_, lockErr := os.Lstat(lockPath)
+	if errors.Is(lockErr, os.ErrNotExist) {
+		// A crash between marker creation and lock creation is a known
+		// staging state. Only the marker is accepted here; any env file
+		// or other child remains a fail-closed manual-review case. A
+		// partial marker is repaired in place before the tombstone hand-off.
+		if len(entries) != 1 || entries[0].Name() != envFileDirMarkerName {
+			return fmt.Errorf("%w: staging directory %q has no lock but contains unexpected state", errUnsafeEnvFile, dir)
+		}
+		if err := repairEnvMarker(markerPath, envFileDirMarker); err != nil {
+			return err
+		}
+		tombstone, err := renameEnvDirToTombstone(dir, dirInfo)
+		if err != nil {
+			return err
+		}
+		return removeExpectedEnvChildren(tombstone)
+	}
+	if lockErr != nil {
+		return lockErr
+	}
+	marker, _, err := openValidatedEnvMarker(markerPath, envFileDirMarker, os.O_RDONLY)
+	if err != nil {
+		return err
+	}
+	if err := marker.Close(); err != nil {
+		return err
+	}
+	// The helper rechecks identities and performs the tombstone hand-off.
+	return removeStaleLockedEnvDir(dir, dirInfo)
 }
 
 func validateExpectedEnvChildren(dir string) error {
+	info, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if err := validatePrivateDirectoryInfo(dir, info); err != nil {
+		return err
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
@@ -775,6 +1309,19 @@ func validateExpectedEnvChildren(dir string) error {
 }
 
 func removeExpectedEnvChildren(dir string) error {
+	// Validate the complete allowlist first. Never use RemoveAll here:
+	// a foreign child added after validation must make cleanup fail
+	// closed rather than be recursively deleted.
+	dirInfo, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if err := validatePrivateDirectoryInfo(dir, dirInfo); err != nil {
+		return err
+	}
+	if err := validateExpectedEnvChildren(dir); err != nil {
+		return err
+	}
 	for _, name := range []string{envFileName, envFileDirMarkerName, envFileLockName} {
 		path := filepath.Join(dir, name)
 		info, err := os.Lstat(path)
@@ -787,11 +1334,24 @@ func removeExpectedEnvChildren(dir string) error {
 		if err := validateEnvOwnership(info, currentEnvFileUID(), envFileMode); err != nil {
 			return err
 		}
-		if err := os.Remove(path); err != nil {
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 	}
-	return os.Remove(dir)
+	current, err := os.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return err
+	}
+	if !os.SameFile(dirInfo, current) {
+		return fmt.Errorf("%w: environment directory %q was replaced during removal", errUnsafeEnvFile, dir)
+	}
+	if err := os.Remove(dir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
 }
 
 func validatePrivateDirectory(path string) error {
@@ -839,6 +1399,59 @@ func validateEnvOwnership(info os.FileInfo, wantOwner uint32, wantMode os.FileMo
 		return fmt.Errorf("mode is %04o, want %04o", info.Mode().Perm(), wantMode.Perm())
 	}
 	return nil
+}
+
+func validateEnvMarkerIfPresent(dir string) error {
+	marker, _, err := openValidatedEnvMarker(filepath.Join(dir, envFileDirMarkerName), envFileDirMarker, os.O_RDONLY)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return marker.Close()
+}
+
+func repairEnvMarker(path, contents string) (err error) {
+	f, err := openEnvFileNoFollow(path, os.O_RDWR, 0)
+	if err != nil {
+		return fmt.Errorf("%w: environment marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+	}
+	defer func() { err = errors.Join(err, f.Close()) }()
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if err := validatePrivateRegularInfo(path, info); err != nil {
+		return fmt.Errorf("%w: environment marker %q is unsafe: %v", errUnsafeEnvFile, path, err)
+	}
+	if info.Size() > int64(len(contents)) {
+		return fmt.Errorf("%w: environment marker %q is too long", errUnsafeEnvFile, path)
+	}
+	data := make([]byte, info.Size())
+	if len(data) > 0 {
+		n, readErr := f.ReadAt(data, 0)
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			return readErr
+		}
+		if n != len(data) || !strings.HasPrefix(contents, string(data)) {
+			return fmt.Errorf("%w: environment marker %q has unsafe contents", errUnsafeEnvFile, path)
+		}
+	}
+	pathInfo, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if pathInfo.Mode()&os.ModeSymlink != 0 || !os.SameFile(info, pathInfo) {
+		return fmt.Errorf("%w: environment marker %q was replaced", errUnsafeEnvFile, path)
+	}
+	if err := f.Truncate(0); err != nil {
+		return err
+	}
+	if _, err := f.Seek(0, 0); err != nil {
+		return err
+	}
+	return writeAll(f, contents)
 }
 
 func openValidatedEnvMarker(path, contents string, flag int) (*os.File, os.FileInfo, error) {

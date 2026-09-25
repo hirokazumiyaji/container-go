@@ -346,12 +346,17 @@ injection through IDs.
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
 channel for secrets, Unix writes them to a 0600 file in a 0700,
-current-user-owned directory under `os.UserCacheDir()` and passes
-`--env-file`. `TMPDIR` is not trusted. A version marker, owner/mode
+current-user-owned directory under the canonical `os.UserCacheDir()` path
+and passes `--env-file`. Existing symlinked ancestors are resolved once;
+`..`, symlinked storage roots, and writable untrusted ancestors are
+rejected, and `TMPDIR` is not trusted. A version marker, owner/mode
 checks, an expected-child allowlist, and a writer lock held for the
-whole backend call bound crash cleanup. Cleanup errors are returned
-and retried. Windows has no equivalent secrecy guarantee through Go
-`chmod`, so operations requiring an env file return
+whole backend call bound crash cleanup. A staging directory becomes
+eligible for cleanup after 24 hours. Marker-before-lock and tombstoned
+partial-removal states are self-healing, while an unmarked, replaced, or
+unexpected entry fails closed and requires manual inspection. Cleanup
+errors are returned and retried. Windows has no equivalent secrecy
+guarantee through Go `chmod`, so operations requiring an env file return
 `ErrEnvFileUnsupported` before invoking the backend.
 
 **Validate inputs**. Container names (name rule above), label keys

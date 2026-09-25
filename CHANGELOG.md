@@ -25,6 +25,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Store Unix env files under a marked, current-user-owned cache root instead
   of `TMPDIR`; make stale cleanup marker/mode/owner/child aware, protect
   live calls with locks, and return plus retry cleanup failures.
+- Canonicalize Unix cache paths once, repair only provable staging/root-marker
+  crash states, use transactional tombstones for partial removal, and retain
+  cleanup ownership across late close/release errors. A successful reuse
+  create now returns its handle with a joined cleanup error instead of
+  orphaning the container.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

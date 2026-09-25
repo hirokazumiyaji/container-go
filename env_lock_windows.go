@@ -26,6 +26,10 @@ func releaseEnvFileLock(*os.File) error {
 	return ErrEnvFileUnsupported
 }
 
+func chmodEnvDirectory(string) error {
+	return ErrEnvFileUnsupported
+}
+
 func openEnvFileNoFollow(string, int, os.FileMode) (*os.File, error) {
 	return nil, ErrEnvFileUnsupported
 }
@@ -36,6 +40,10 @@ func currentEnvFileUID() uint32 {
 
 func envFileUID(os.FileInfo) (uint32, bool) {
 	return 0, false
+}
+
+func canonicalEnvPath(string) (string, error) {
+	return "", ErrEnvFileUnsupported
 }
 
 func validateEnvPathComponents(string) error {

@@ -170,6 +170,61 @@ func TestWriteEnvFileUsesPrivatePermissions(t *testing.T) {
 	}
 }
 
+func TestWriteEnvFileCleansUpAfterLateRootCloseError(t *testing.T) {
+	base := t.TempDir()
+	lateErr := errors.New("injected root lock close failure")
+	path, dir, err := writeEnvFileAtWithRoot(base, map[string]string{"TOKEN": "secret"}, func(base string, fn func(string) error) error {
+		return withEnvFileRootWithClose(base, fn, func(marker *os.File) error {
+			_ = closeEnvFileLock(marker)
+			return lateErr
+		})
+	})
+	if !errors.Is(err, lateErr) {
+		t.Fatalf("write error = %v, want late root close error", err)
+	}
+	if path != "" || dir != "" {
+		t.Fatalf("write returned live path after cleanup: path=%q dir=%q", path, dir)
+	}
+	root := filepath.Join(base, envFileRootName)
+	entries, readErr := os.ReadDir(root)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), envFileDirPrefix) ||
+			strings.HasPrefix(entry.Name(), envFileStagingPrefix) ||
+			strings.HasPrefix(entry.Name(), envFileTombstonePrefix) {
+			t.Fatalf("environment artifact %q remained after root close failure", entry.Name())
+		}
+	}
+}
+
+func TestCleanupRetainsOwnershipAfterLateCloseError(t *testing.T) {
+	root := isolateEnvFileRoot(t)
+	_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	lateErr := errors.New("injected late lock close failure")
+	err = cleanupEnvFileAtWithClose(filepath.Dir(root), dir, removeExpectedEnvChildren, func(lock *os.File) error {
+		_ = closeEnvFileLock(lock)
+		return lateErr
+	})
+	if !errors.Is(err, lateErr) {
+		t.Fatalf("cleanup error = %v, want late close error", err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil || !state.pending {
+		t.Fatalf("cleanup ownership was lost after late close error: %#v", state)
+	}
+	if err := cleanupEnvFileAt(filepath.Dir(root), dir, removeExpectedEnvChildren); err != nil {
+		t.Fatalf("cleanup retry after late close error: %v", err)
+	}
+	if state := loadEnvCleanupState(dir); state != nil {
+		t.Fatalf("cleanup state remains after successful retry: %#v", state)
+	}
+}
+
 func TestCleanupEnvFileReturnsRemovalFailureAndCanRetry(t *testing.T) {
 	root := isolateEnvFileRoot(t)
 	_, dir, err := writeEnvFile(map[string]string{"TOKEN": "secret"})
@@ -191,8 +246,15 @@ func TestCleanupEnvFileReturnsRemovalFailureAndCanRetry(t *testing.T) {
 	if !errors.Is(err, removeFailure) {
 		t.Fatalf("cleanup error = %v, want injected removal failure", err)
 	}
-	if _, err := os.Stat(dir); err != nil {
-		t.Fatalf("environment directory was removed by failed cleanup: %v", err)
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("original environment path was not handed off to a tombstone: %v", err)
+	}
+	state := loadEnvCleanupState(dir)
+	if state == nil || !state.pending || state.path == "" {
+		t.Fatalf("cleanup ownership was not retained for retry: %#v", state)
+	}
+	if _, err := os.Stat(state.path); err != nil {
+		t.Fatalf("cleanup tombstone is missing after failed cleanup: %v", err)
 	}
 
 	// cleanupEnvFileAt models the deferred retry used by Run, reuse, and

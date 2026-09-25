@@ -101,8 +101,11 @@ type Container struct {
 
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
-// WithReuse for the shared-handle lifecycle.
+// normally removed before returning. If a post-create environment-file
+// cleanup cannot be completed, Run returns the usable handle together
+// with the joined error so the container is not orphaned. WithReuse
+// switches to get-or-create; see WithReuse for the shared-handle
+// lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -167,6 +170,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
+			if dir != "" {
+				return nil, joinEnvFileCleanupError(err, cleanupEnvFile(dir))
+			}
 			return nil, err
 		}
 		envFile, envDir = path, dir

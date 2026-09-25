@@ -164,7 +164,9 @@ Three layers make sure containers do not outlive your tests:
    `container.TerminateContainer(ctr)` is the deferred-style variant.
    Both are nil-safe, so call them before checking `Run`'s error.
 2. If `Run` fails partway, it removes whatever it created before
-   returning.
+   returning. If a post-create environment-file cleanup still fails,
+   `Run` returns the usable handle together with the joined error; the
+   caller must inspect or explicitly terminate that handle.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
    SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
@@ -224,14 +226,18 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   script (the reaper) is a fixed string that receives container IDs
   only as validated stdin data.
 - On Unix, environment variables are passed through a `0600` file in a
-  validated, current-user-owned `0700` directory under
-  `os.UserCacheDir()`. The library deliberately does not use `TMPDIR`.
-  Stale cleanup requires a version marker, exact ownership/mode and child
-  names, and an unlocked writer lock; a live backend call cannot be aged out.
-  It never scans shared temporary directories, so files left there by an older
-  build cannot be attributed safely and must be inspected and removed by the
-  user. Cleanup failures are returned and retried before `Run`, reuse creation,
-  or `Exec` returns.
+  validated, current-user-owned `0700` directory under the canonical
+  `os.UserCacheDir()` path. The library resolves existing symlinked ancestors
+  once, rejects `..` and untrusted writable ancestors, and never uses
+  `TMPDIR`. The root marker is created with an exclusive, locked hand-off;
+  a partially written marker is repaired only while the private root is empty.
+- Stale cleanup removes only exact, owned library children. A staging
+  directory is eligible after `24h`; marker-before-lock and tombstoned
+  partial-removal states are self-healing. An initialized directory is never
+  aged out: its unlocked writer lock is the liveness proof. If an entry is
+  unmarked, replaced, or contains an unexpected child, cleanup fails closed
+  and leaves it for manual inspection and removal. Cleanup failures are
+  returned and retried before `Run`, reuse creation, or `Exec` returns.
 - Windows cannot provide the claimed per-user secrecy with Go `chmod`, so
   `Run`/`Exec` fail with `ErrEnvFileUnsupported` when a non-empty environment
   map requires an env file. Other Windows operations remain supported.
@@ -270,6 +276,10 @@ make bench-integration   # pull-heavy bench and singleflight scenarios
 Integration tests pull library images via `public.ecr.aws/docker/library/...`
 to avoid anonymous Docker Hub rate limits. Set `CONTAINERGO_BACKEND=apple` or
 `docker` to skip the other backend.
+
+The repository CI runs unit and race jobs on Ubuntu. Windows-specific
+environment-file tests are compile-checked during development; this change
+does not claim Windows runtime CI coverage.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md))

@@ -108,11 +108,39 @@ func TestDockerParseInspect(t *testing.T) {
 	}
 }
 
+func TestDockerNameInspectDoesNotPublishUnverifiedUID(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &dockerRunner{fakeRunner: newTestRunner(), inspectJSON: data}
+	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr"}
+	ctr := namedContainer(cfg, cfg.name)
+
+	info, err := ctr.inspectFresh(context.Background())
+	if err != nil {
+		t.Fatalf("name inspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Fatalf("inspected UID = %q, want fixture UID", info.uid)
+	}
+	if ctr.uid != "" {
+		t.Fatalf("name inspect published unverified UID: %q", ctr.uid)
+	}
+}
+
 func TestDockerInspectArgsRestrictTargetToContainers(t *testing.T) {
 	got := (dockerEngine{}).inspectArgs("myctr")
 	want := []string{"inspect", "--type=container", "myctr"}
 	if !slices.Equal(got, want) {
 		t.Errorf("inspectArgs = %v, want %v", got, want)
+	}
+}
+
+func TestDockerNameInspectRequiresSlashPrefixedName(t *testing.T) {
+	data := []byte(`[{"Id":"` + dockerFixtureID + `","Name":"myctr","State":{"Status":"running"}}]`)
+	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("name without slash was accepted: %v", err)
 	}
 }
 
@@ -341,6 +369,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	}
 	ctr := &Container{
 		id:      "myctr",
+		uid:     dockerFixtureID,
 		runner:  runner,
 		eng:     dockerEngine{},
 		exposed: []portSpec{{port: 6379, proto: "tcp"}},
@@ -390,7 +419,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	if got := ctr.uid; got != dockerFixtureID {
 		t.Fatalf("uid = %q, want %q", got, dockerFixtureID)
 	}
-	wantTargets := []string{"myctr", dockerFixtureID}
+	wantTargets := []string{dockerFixtureID, dockerFixtureID}
 	if got := runner.targets(); !slices.Equal(got, wantTargets) {
 		t.Errorf("inspect targets = %v, want %v", got, wantTargets)
 	}
@@ -438,7 +467,7 @@ func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
 		firstStarted: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
 
 	release := func() {
 		select {
@@ -485,6 +514,78 @@ func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
 	}
 	if got := runner.calls(); got != 1 {
 		t.Errorf("inspect calls = %d, want 1", got)
+	}
+}
+
+func TestDockerStopUsesBoundUID(t *testing.T) {
+	runner := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	if err := ctr.Stop(context.Background(), nil); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	call := runner.callWith("stop")
+	if len(call) == 0 || call[len(call)-1] != dockerFixtureID {
+		t.Fatalf("stop target = %v, want immutable UID", call)
+	}
+}
+
+func TestDockerTerminateDoesNotWaitBehindInspectLock(t *testing.T) {
+	runner := &cancelingDockerInspectRunner{
+		fakeRunner:   newTestRunner(),
+		data:         []byte(`[{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`),
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	release := func() {
+		select {
+		case <-runner.releaseFirst:
+		default:
+			close(runner.releaseFirst)
+		}
+	}
+	defer release()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	terminateDone := make(chan error, 1)
+	go func() { terminateDone <- ctr.Terminate(ctx) }()
+	select {
+	case err := <-terminateDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Terminate error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-firstDone
+		t.Fatal("canceled Terminate waited behind inspectMu")
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+}
+
+func TestDockerOperationFailsClosedWithoutUID(t *testing.T) {
+	runner := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	if err := ctr.Stop(context.Background(), nil); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("Stop error = %v, want ErrGenerationReplaced", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("unverified Docker handle issued calls: %v", runner.calls)
 	}
 }
 

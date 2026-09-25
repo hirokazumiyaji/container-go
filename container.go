@@ -136,6 +136,10 @@ type Container struct {
 	mu        contextLock
 	info      *engineInfo // cached first inspect; immutable fields only
 	inspectMu contextLock // serializes inspect and protects uid after publication
+	// nameInspect is limited to short-lived name lookups used by reuse
+	// and failed-create cleanup. Their inspected UID is data, not a
+	// caller-visible identity.
+	nameInspect bool
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -288,8 +292,13 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 	}
 	target := cfg.name
-	if info.uid != "" {
+	if requiresImmutableID(cfg.eng) {
+		if !info.uidVerified || !validImmutableID(cfg.eng, info.uid) {
+			return
+		}
 		target = info.uid
+	} else if info.uid != "" {
+		return
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
@@ -334,9 +343,13 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return err
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
 	return c.classify(ctx, err)
 }
 
@@ -351,7 +364,14 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if target := c.inspectTarget(); target != c.id {
+	target, err := c.inspectTarget(ctx)
+	if err != nil {
+		return fmt.Errorf("terminate %s: %w", c.id, err)
+	}
+	if requiresImmutableID(c.eng) && !dockerIDRE.MatchString(target) {
+		return fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
+	}
+	if target != c.id {
 		return c.delete(ctx, target)
 	}
 	if c.creation == "" {
@@ -476,15 +496,63 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
 }
 
+func requiresImmutableID(eng engine) bool {
+	switch eng.(type) {
+	case dockerEngine, *dockerEngine:
+		return true
+	default:
+		return false
+	}
+}
+
+func validImmutableID(eng engine, id string) bool {
+	return !requiresImmutableID(eng) || dockerIDRE.MatchString(id)
+}
+
+// verifiedOperationTarget returns the strongest safe backend target. A
+// Docker handle without a verified full ID fails closed instead of falling
+// back to a mutable logical name.
+func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
+	}
+	uid := c.uid
+	c.inspectMu.Unlock()
+	if !requiresImmutableID(c.eng) {
+		return c.id, nil
+	}
+	if uid != "" {
+		if !dockerIDRE.MatchString(uid) {
+			return "", fmt.Errorf("%w: Docker handle has invalid immutable ID %q", ErrGenerationReplaced, uid)
+		}
+		return uid, nil
+	}
+	if dockerIDRE.MatchString(c.id) {
+		return c.id, nil
+	}
+	return "", fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
+}
+
 // cachedInfo returns the first successful inspect result. Only fields
 // that cannot change while the container exists (labels, network
 // address, port bindings) should be read from it.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
+	if c.nameInspect {
+		return c.inspectFresh(ctx)
+	}
 	if err := c.mu.Lock(ctx); err != nil {
 		return nil, err
 	}
 	defer c.mu.Unlock()
 	if c.info != nil {
+		if requiresImmutableID(c.eng) {
+			if !dockerIDRE.MatchString(c.uid) {
+				return nil, fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
+			}
+			if c.info.uid != "" && c.info.uid != c.uid {
+				return nil, fmt.Errorf("%w: cached Docker identity does not match handle", ErrGenerationReplaced)
+			}
+		}
 		return c.info, nil
 	}
 	info, err := c.inspectFresh(ctx)
@@ -501,9 +569,18 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	}
 	defer c.inspectMu.Unlock()
 
+	target := c.inspectTargetLocked()
+	if requiresImmutableID(c.eng) {
+		if c.uid != "" && !validImmutableID(c.eng, c.uid) {
+			return nil, fmt.Errorf("%w: Docker handle has invalid immutable ID %q", ErrGenerationReplaced, c.uid)
+		}
+		if c.uid == "" && !c.nameInspect && !dockerIDRE.MatchString(target) {
+			return nil, fmt.Errorf("%w: refusing Docker name inspect without a verified immutable ID", ErrGenerationReplaced)
+		}
+	}
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
@@ -512,20 +589,33 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if c.uid == "" {
+	if requiresImmutableID(c.eng) {
+		if !info.uidVerified || !validImmutableID(c.eng, info.uid) {
+			return nil, fmt.Errorf("%w: Docker inspect returned no verified immutable ID", ErrGenerationReplaced)
+		}
+		if c.uid != "" && c.uid != info.uid {
+			return nil, fmt.Errorf("%w: Docker inspect returned a different immutable ID", ErrGenerationReplaced)
+		}
+	}
+	// A name-addressed lookup may return a UID as data, but it cannot
+	// publish that UID into a handle: a same-name replacement may have
+	// supplied it. Only an exact full-ID target is self-authenticating.
+	if c.uid == "" && requiresImmutableID(c.eng) && info.uidVerified &&
+		dockerIDRE.MatchString(target) && info.uid == target {
 		c.uid = info.uid
 	}
 	return info, nil
 }
 
 // inspectTarget prefers an immutable ID so a same-name replacement cannot
-// satisfy a Docker inspect.
-func (c *Container) inspectTarget() string {
-	if err := c.inspectMu.Lock(context.Background()); err != nil {
-		return c.id
+// satisfy a Docker inspect. A failed context-aware acquisition is returned
+// to the caller; it must never fall back to the mutable logical name.
+func (c *Container) inspectTarget(ctx context.Context) (string, error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
 	}
 	defer c.inspectMu.Unlock()
-	return c.inspectTargetLocked()
+	return c.inspectTargetLocked(), nil
 }
 
 func (c *Container) inspectTargetLocked() string {

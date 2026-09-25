@@ -37,6 +37,7 @@ const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
+inspect_timeout="${4:-10}"
 ids=""
 while IFS= read -r line; do
   ids="$ids
@@ -53,9 +54,9 @@ run_with_timeout() {
 }
 inspect_container() {
   if [ "$sub" = "rm" ]; then
-    "$bin" inspect --type=container "$1"
+    exec "$bin" inspect --type=container "$1"
   else
-    "$bin" inspect "$1"
+    exec "$bin" inspect "$1"
   fi
 }
 echo "$ids" | while IFS= read -r line; do
@@ -66,7 +67,7 @@ echo "$ids" | while IFS= read -r line; do
   target="$id"
   if [ -n "$creation" ]; then
     tmp=$(mktemp 2>/dev/null) || continue
-    (inspect_container "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep 10; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
+    (inspect_container "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep "$inspect_timeout"; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
     got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
     uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
@@ -78,6 +79,8 @@ done
 `
 
 const maxReaperSpawnFailures = 3
+
+var reaperInspectTimeout = 10
 
 // breQuote escapes a literal for use inside the reaper's sed basic
 // regular expression, so the label key's dots match only dots.
@@ -181,7 +184,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 }
 
 func (r *reaper) spawnLocked() error {
-	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel))
+	cmd := exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), fmt.Sprint(reaperInspectTimeout))
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
 		return err

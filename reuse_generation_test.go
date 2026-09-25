@@ -83,11 +83,14 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 }
 
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
+	uid := strings.Repeat("0f", 32)
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state:       StateStopped,
+		uid:         uid,
+		uidVerified: true,
+		labels:      map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
-	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
+	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
 		t.Fatalf("deleteStoppedReuse = %v", err)

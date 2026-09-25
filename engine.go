@@ -14,6 +14,10 @@ type engineInfo struct {
 	// Id). Empty when the backend addresses containers by name only
 	// (Apple Container), where a delete cannot be bound to a generation.
 	uid string
+	// uidVerified is set only by a parser after it matched the returned
+	// object to the exact inspect target. Generic engineInfo values must
+	// not be published as a Docker handle's immutable identity.
+	uidVerified bool
 	// image is the image reference the container was created from.
 	image string
 	// ip is the container's address on its first network; empty when

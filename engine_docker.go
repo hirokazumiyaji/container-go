@@ -210,7 +210,9 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	} else {
 		for i, c := range containers {
-			if c.State != nil && dockerIDRE.MatchString(c.ID) && strings.TrimPrefix(c.Name, "/") == target {
+			// Docker container names are reported with one leading slash;
+			// accepting a bare name would also admit non-container objects.
+			if target != "" && c.State != nil && dockerIDRE.MatchString(c.ID) && c.Name == "/"+target {
 				match = i
 				break
 			}
@@ -222,11 +224,12 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	c := containers[match]
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		uidVerified: true,
+		image:       c.Config.Image,
+		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {

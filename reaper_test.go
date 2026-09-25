@@ -2,7 +2,10 @@ package container
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -106,6 +109,61 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	}
 	if !strings.Contains(reaperScript, `[ "$got" = "$creation" ] || continue`) {
 		t.Error("reaper script must compare the extracted generation exactly")
+	}
+}
+
+func TestReaperInspectTimeoutKillsBackendProcess(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("reaper uses a POSIX shell")
+	}
+	oldTimeout := reaperInspectTimeout
+	reaperInspectTimeout = 1
+	defer func() { reaperInspectTimeout = oldTimeout }()
+
+	dir := t.TempDir()
+	pidPath := filepath.Join(dir, "inspect.pid")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\n" +
+		"if [ \"$1\" = inspect ]; then echo $$ > " + pidPath + "; exec sleep 30; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	r := newReaper(binPath, "delete")
+	if err := r.register("ctr", "0123456789abcdef"); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	r.closeStdin()
+
+	var pid int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		data, err := os.ReadFile(pidPath)
+		if err == nil {
+			pid, err = strconv.Atoi(strings.TrimSpace(string(data)))
+			if err != nil {
+				t.Fatalf("inspect pid file = %q: %v", data, err)
+			}
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if pid == 0 {
+		t.Fatal("reaper did not start the backend inspect process")
+	}
+	t.Cleanup(func() { _ = exec.Command("kill", "-9", strconv.Itoa(pid)).Run() })
+
+	gone := false
+	deadline = time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := exec.Command("kill", "-0", strconv.Itoa(pid)).Run(); err != nil {
+			gone = true
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if !gone {
+		t.Fatalf("backend inspect process %d survived the reaper timeout", pid)
 	}
 }
 

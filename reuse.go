@@ -39,6 +39,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := checkReuseCompat(info, image, cfg); err != nil {
 		return nil, err
 	}
+	if requiresImmutableID(cfg.eng) && (!info.uidVerified || !validImmutableID(cfg.eng, info.uid)) {
+		return nil, fmt.Errorf("reuse %s: existing container has no verified immutable ID", cfg.name)
+	}
 
 	ctr := &Container{
 		id:        base.id,
@@ -49,7 +52,11 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		reused:    true,
 		info:      info,
 		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+	}
+	if requiresImmutableID(cfg.eng) {
+		// Ownership and compatibility were checked above; only now is
+		// a name-addressed UID safe to publish to the returned handle.
+		ctr.uid = info.uid
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -122,7 +129,6 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				reused:    true,
 				info:      info,
 				creation:  info.labels[creationLabel],
-				uid:       info.uid,
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -195,6 +201,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+	if requiresImmutableID(cfg.eng) {
+		if !info.uidVerified || !validImmutableID(cfg.eng, info.uid) {
+			return fmt.Errorf("reuse %s: stopped Docker container has no verified immutable ID", cfg.name)
+		}
+		ctr.uid = info.uid
+	}
 	err := ctr.Terminate(ctx)
 	if errors.Is(err, ErrGenerationReplaced) {
 		return nil
@@ -222,11 +234,12 @@ func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, err
 
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:        id,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
+		id:          id,
+		runner:      cfg.runner,
+		eng:         cfg.eng,
+		exposed:     cfg.exposed,
+		published:   cfg.published,
+		nameInspect: true,
 	}
 }
 

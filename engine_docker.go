@@ -68,8 +68,8 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 func dockerProbeUnavailable(err error) bool {
-	ctx, ok := backendCLIError(err, "docker")
-	if !ok || ctx.operation != "version" {
+	text, ok := backendCLIErrorText(err, "docker", "version")
+	if !ok {
 		return false
 	}
 	// A reachable daemon can fail the client for TLS, certificate, SSH,
@@ -78,19 +78,13 @@ func dockerProbeUnavailable(err error) bool {
 	if cli.IsProbeConfigurationError(err) {
 		return false
 	}
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
-		for _, fragment := range []string{
-			"cannot connect to the docker daemon",
-			"is the docker daemon running",
-			"connection refused",
-		} {
-			if strings.Contains(line, fragment) {
-				return true
-			}
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"connection refused",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
 		}
 	}
 	return false
@@ -220,7 +214,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+		return nil, &inspectTargetNotFoundError{id: id}
 	}
 	c := containers[0]
 

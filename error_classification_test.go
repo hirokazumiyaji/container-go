@@ -594,6 +594,75 @@ func TestAppleLogsMissingAcceptsKnownBoundedWrapperVariants(t *testing.T) {
 	}
 }
 
+func TestProductionProbePredicatesInspectJoinedWrappedText(t *testing.T) {
+	cases := []struct {
+		name      string
+		binary    string
+		args      []string
+		joined    string
+		available func(error) bool
+	}{
+		{
+			name:      "docker",
+			binary:    "docker",
+			args:      []string{"version", "--format", "{{.Server.Version}}"},
+			joined:    "Cannot connect to the Docker daemon",
+			available: dockerProbeUnavailable,
+		},
+		{
+			name:      "apple",
+			binary:    "container",
+			args:      []string{"system", "status"},
+			joined:    "XPC connection failed",
+			available: appleProbeUnavailable,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cliErr := &cli.CLIError{
+				Binary: tc.binary, Args: tc.args, ExitCode: 1,
+				Stderr: "probe command failed without backend wording",
+			}
+			joined := errors.Join(errors.New(tc.joined), cliErr)
+			wrapped := fmt.Errorf("instrumented runner: %w", joined)
+			if !tc.available(wrapped) {
+				t.Fatalf("predicate ignored joined wrapped liveness text %q", tc.joined)
+			}
+
+			wrongOperation := &cli.CLIError{
+				Binary: tc.binary, Args: []string{"inspect", "myctr"}, ExitCode: 1,
+			}
+			if tc.available(fmt.Errorf("wrapped: %w", errors.Join(errors.New(tc.joined), wrongOperation))) {
+				t.Fatal("predicate accepted joined liveness text from the wrong operation")
+			}
+		})
+	}
+}
+
+func TestProductionProbePredicatesKeepJoinedConfigurationAsVeto(t *testing.T) {
+	dockerErr := errors.Join(
+		&cli.CLIError{
+			Binary: "docker", Args: []string{"version", "--format", "{{.Server.Version}}"},
+			ExitCode: 1, Stderr: "Cannot connect to the Docker daemon",
+		},
+		errors.New("x509: certificate signed by unknown authority"),
+	)
+	if dockerProbeUnavailable(dockerErr) {
+		t.Fatal("Docker joined certificate failure was classified as daemon down")
+	}
+
+	appleErr := errors.Join(
+		&cli.CLIError{
+			Binary: "container", Args: []string{"system", "status"},
+			ExitCode: 1, Stderr: "XPC connection failed",
+		},
+		errors.New("proxyconnect tcp: connection refused"),
+	)
+	if appleProbeUnavailable(appleErr) {
+		t.Fatal("Apple joined proxy failure was classified as system down")
+	}
+}
+
 func TestGenericErrorWrapperIsNotDockerExecEvidence(t *testing.T) {
 	err := &cli.CLIError{
 		Binary: "docker", Args: []string{"exec", "myctr", "true"},

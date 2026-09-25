@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"fmt"
 	"strconv"
 	"strings"
 	"time"
@@ -48,27 +47,24 @@ func (appleEngine) probe() cli.Probe {
 }
 
 func appleProbeUnavailable(err error) bool {
-	ctx, ok := backendCLIError(err, "container")
-	if !ok || ctx.operation != "system" {
-		return false
-	}
-	lines, ok := cliErrorLines(err)
+	text, ok := backendCLIErrorText(err, "container", "system")
 	if !ok {
 		return false
 	}
-	for _, line := range lines {
-		for _, fragment := range []string{
-			"xpc connection",
-			"container-apiserver",
-			"plugins are unavailable",
-			"start the container system services",
-			"system is not running",
-			"system service is not running",
-			"connection refused",
-		} {
-			if strings.Contains(line, fragment) {
-				return true
-			}
+	if cli.IsProbeConfigurationError(err) {
+		return false
+	}
+	for _, fragment := range []string{
+		"xpc connection",
+		"container-apiserver",
+		"plugins are unavailable",
+		"start the container system services",
+		"system is not running",
+		"system service is not running",
+		"connection refused",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
 		}
 	}
 	return false
@@ -110,7 +106,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, &inspectTargetNotFoundError{id: id}
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {

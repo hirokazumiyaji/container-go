@@ -48,6 +48,18 @@ func backendCLIError(err error, backend string) (cliErrorContext, bool) {
 	}, true
 }
 
+// backendCLIErrorText validates a matching backend command before returning
+// the complete wrapped/joined error text. Probe predicates use this instead
+// of reading only the first CLIError.Stderr so instrumentation branches are
+// not silently discarded.
+func backendCLIErrorText(err error, backend, operation string) (string, bool) {
+	ctx, ok := backendCLIError(err, backend)
+	if !ok || ctx.operation != operation {
+		return "", false
+	}
+	return strings.ToLower(err.Error()), true
+}
+
 func cliBinaryMatches(got, want string) bool {
 	got = strings.TrimSpace(strings.ToLower(got))
 	if got == "" {

@@ -6,6 +6,14 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+type inspectTargetNotFoundError struct {
+	id string
+}
+
+func (e *inspectTargetNotFoundError) Error() string {
+	return "container " + e.id + " not in inspect output"
+}
+
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
 	state  State

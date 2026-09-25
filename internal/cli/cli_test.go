@@ -1,11 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -127,6 +130,44 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want joined *CLIError", err)
+	}
+	if cliErr.ExitCode == 0 || !slices.Equal(cliErr.Args, []string{"logs", "--follow", "x"}) {
+		t.Errorf("CLIError exit/args = %d %v", cliErr.ExitCode, cliErr.Args)
+	}
+}
+
+func TestCommandRunErrorCancellationRacePreservesExitAndContext(t *testing.T) {
+	binary := writeStub(t, `echo cancel-race >&2; exit 7`)
+	cmd := exec.Command(binary)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	exitErr := cmd.Run()
+	if exitErr == nil {
+		t.Fatal("stub command unexpectedly succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := commandRunError(ctx, binary, []string{"exec", "myctr", "query"}, stderr.Bytes(), exitErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want joined *CLIError", err)
+	}
+	if cliErr.ExitCode != 7 {
+		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
+	}
+	if cliErr.Binary != binary || !slices.Equal(cliErr.Args, []string{"exec", "myctr", "query"}) {
+		t.Errorf("CLIError command = %q %v", cliErr.Binary, cliErr.Args)
+	}
+	if !strings.Contains(cliErr.Stderr, "cancel-race") {
+		t.Errorf("Stderr = %q, want command diagnostic", cliErr.Stderr)
 	}
 }
 
@@ -454,6 +495,76 @@ func TestClassifyDoesNotTreatExpiredProbeContextAsReturnedTimeout(t *testing.T) 
 	}
 }
 
+func TestClassifyOnlyTreatsPureReturnedTimeoutAsProbeTimeout(t *testing.T) {
+	causes := []struct {
+		name  string
+		cause error
+	}{
+		{name: "permission", cause: os.ErrPermission},
+		{name: "cancellation", cause: context.Canceled},
+		{name: "configuration", cause: errors.New("x509: certificate signed by unknown authority")},
+	}
+	for _, tc := range causes {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+			probeErr := errors.Join(context.DeadlineExceeded, tc.cause)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, joined non-timeout cause was ignored", got)
+			}
+			if !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, tc.cause) {
+				t.Fatalf("classified error = %v, want timeout and joined cause", got)
+			}
+		})
+	}
+
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	probeErr := errors.Join(
+		context.DeadlineExceeded,
+		fmt.Errorf("wrapped probe timeout: %w", context.DeadlineExceeded),
+	)
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, pure joined timeout should be liveness", got)
+	}
+}
+
+func TestClassifyPreservesCallerCancellationDuringPredicate(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	probeErr := &CLIError{
+		Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error",
+	}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := appleProbe
+	probe.IsUnavailable = func(error) bool {
+		cancel()
+		return true
+	}
+
+	got := Classify(ctx, r, orig, probe)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, cancellation during predicate was ignored", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("classified error = %v, want caller cancellation", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and probe errors", got)
+	}
+}
+
 func TestClassifyRespectsCallerCancel(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
 	r := &hangingProbeRunner{started: make(chan struct{})}
@@ -462,6 +573,14 @@ func TestClassifyRespectsCallerCancel(t *testing.T) {
 	err := Classify(ctx, r, orig, appleProbe)
 	if !errors.Is(err, orig) {
 		t.Fatalf("error = %v, want original preserved on cancel", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want caller cancellation preserved", err)
+	}
+	select {
+	case <-r.started:
+		t.Fatal("probe ran for an already-canceled caller")
+	default:
 	}
 }
 
@@ -475,8 +594,8 @@ func TestClassifyPreservesOriginalWhenParentCancelsDuringProbe(t *testing.T) {
 	}()
 	start := time.Now()
 	err := Classify(ctx, r, orig, appleProbe)
-	if !errors.Is(err, orig) {
-		t.Fatalf("error = %v, want original when parent cancels mid-probe", err)
+	if !errors.Is(err, orig) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want original and caller cancellation", err)
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("Classify took %v, want fast return on parent cancel", elapsed)

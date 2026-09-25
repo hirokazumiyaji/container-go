@@ -57,6 +57,12 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 	if len(args) > 0 && args[0] == "version" {
 		return []byte("29.7"), nil, nil
 	}
+	if len(args) > 0 && args[0] == "inspect" {
+		return nil, nil, &cli.CLIError{
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: "Error: container not found: myctr",
+		}
+	}
 	return nil, nil, n.err
 }
 

@@ -112,21 +112,33 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
-		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
-			}
-		}
-		return stdout.Bytes(), stderr.Bytes(), err
+		return stdout.Bytes(), stderr.Bytes(), commandRunError(ctx, bin, args, stderr.Bytes(), err)
 	}
 	return stdout.Bytes(), stderr.Bytes(), nil
+}
+
+func commandRunError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
+	// A canceled CommandContext commonly returns *exec.ExitError after
+	// killing the process. Preserve the command result before consulting
+	// ctx.Err, then join both causes when cancellation raced the exit.
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		cliErr := &CLIError{
+			Binary:   bin,
+			Args:     args,
+			ExitCode: exitErr.ExitCode(),
+			Stderr:   truncateStderr(string(stderr)),
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+			return errors.Join(cliErr, contextErr)
+		}
+		return cliErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+	}
+	return err
 }
 
 // truncateStderr bounds the diagnostic copy kept in CLIError.
@@ -162,18 +174,18 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if !errors.As(err, &cliErr) {
 		return err
 	}
-	if ctx.Err() != nil {
-		// Caller already gave up; preserve the original failure
-		// instead of masking it with a probe cancellation.
-		return err
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// The caller already gave up. Keep both the original failure and
+		// the context cause so cancellation remains observable.
+		return errors.Join(err, ctxErr)
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
 	if _, _, probeErr := r.Run(probeCtx, probe.Args...); probeErr != nil {
 		// A caller cancellation must not be relabeled as a stopped
-		// backend. Keep the probe result as diagnostic context.
-		if ctx.Err() != nil {
-			return errors.Join(err, probeErr)
+		// backend. Keep the probe result and context as diagnostic context.
+		if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+			return classified
 		}
 		// A permission/configuration failure in the original command is
 		// not evidence that the backend is down when only the conservative
@@ -185,16 +197,16 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 			(probe.IsUnavailable == nil || isDefinitiveNonLivenessError(err)) {
 			return errors.Join(err, probeErr)
 		}
-		// Probe-side transport configuration failures are not daemon-down
-		// evidence, even if a backend predicate would otherwise accept a
-		// broad connect fragment.
-		if IsProbeConfigurationError(probeErr) {
-			return errors.Join(err, probeErr)
-		}
-		// A returned timeout cause, while the caller remains active, is a
-		// bounded liveness-check timeout. probeCtx.Err alone races a
-		// definite error returned as the deadline fires.
-		if errors.Is(probeErr, context.DeadlineExceeded) && ctx.Err() == nil {
+		// A returned timeout is liveness evidence only when every reachable
+		// cause is a timeout. A joined permission, cancellation, or
+		// configuration failure must veto classification.
+		if errors.Is(probeErr, context.DeadlineExceeded) {
+			if !isPureProbeTimeout(probeErr) {
+				return errors.Join(err, probeErr)
+			}
+			if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+				return classified
+			}
 			return errors.Join(
 				fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint),
 				err,
@@ -202,11 +214,26 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 			)
 		}
 		// A direct cancellation or a permission/configuration failure is
-		// not proof that the backend is down.
+		// not proof that the backend is down. This check includes every
+		// joined/wrapped cause.
 		if isNonLivenessError(probeErr) {
 			return errors.Join(err, probeErr)
 		}
-		if probeUnavailable(probe, probeErr) {
+		// Recheck immediately before invoking backend code: predicates may
+		// perform instrumentation and cancellation can race their work.
+		if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+			return classified
+		}
+		unavailable := probeUnavailable(probe, probeErr)
+		if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+			return classified
+		}
+		if unavailable {
+			// Recheck once more at the sentinel boundary. Predicate work and
+			// result construction must never mask a caller cancellation.
+			if classified, canceled := joinCallerCancellation(ctx, err, probeErr); canceled {
+				return classified
+			}
 			return errors.Join(
 				fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint),
 				err,
@@ -219,6 +246,14 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return errors.Join(err, probeErr)
 	}
 	return err
+}
+
+func joinCallerCancellation(ctx context.Context, original, probeErr error) (error, bool) {
+	ctxErr := ctx.Err()
+	if ctxErr == nil {
+		return nil, false
+	}
+	return errors.Join(original, probeErr, ctxErr), true
 }
 
 func probeUnavailable(probe Probe, err error) bool {
@@ -237,6 +272,32 @@ func defaultProbeUnavailable(err error) bool {
 	// CLIError.Stderr. Requiring a reachable CLIError keeps arbitrary
 	// application errors from becoming liveness evidence on their own.
 	return defaultProbeUnavailableText(strings.ToLower(err.Error()))
+}
+
+func isPureProbeTimeout(err error) bool {
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	return errorTreeIsOnly(err, context.DeadlineExceeded)
+}
+
+func errorTreeIsOnly(err error, target error) bool {
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		causes := joined.Unwrap()
+		if len(causes) == 0 {
+			return false
+		}
+		for _, cause := range causes {
+			if cause == nil || !errorTreeIsOnly(cause, target) {
+				return false
+			}
+		}
+		return true
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return errorTreeIsOnly(cause, target)
+	}
+	return errors.Is(err, target)
 }
 
 func defaultProbeUnavailableText(s string) bool {

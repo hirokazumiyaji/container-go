@@ -191,18 +191,20 @@ command (`WithCmd`) and use `FollowLogs` for their output rather than
 holding an Exec call open.
 
 On backend, timeout, or cancellation errors, Exec retains partial
-stdout+stderr in its reader and returns the classified error; a backend
-exit status, when available, remains in the first return value. If the
-context expires without an exit status, cancellation stops only the
-local CLI process group on Unix (on Windows the local process is
-stopped, while child cleanup is platform-dependent). The supported
-backend CLIs do not expose a common exec-instance kill operation, so
-Exec returns
+stdout+stderr in its reader and returns the classified error; a
+CLI-reported exit status, when available, remains in the first return
+value. A context error that terminates the local CLI is classified
+independently of that status. This matters on Windows, where
+`Process.Kill` can report the killed process with exit code `1`; the
+status remains observable but does not suppress the typed error.
+Cancellation stops only the local CLI
+process group on Unix (on Windows the local process is stopped, while
+child cleanup is platform-dependent). The supported backend CLIs do not
+expose a common exec-instance kill operation, so Exec returns
 `*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
 rather than claiming that the daemon-side process stopped. Callers must
-terminate the container or use backend-specific cleanup. An exit status
-that races with context expiry is preserved without that warning.
-Callers must read the output reader even when the error is non-nil.
+terminate the container or use backend-specific cleanup. Callers must
+read the output reader even when the error is non-nil.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -431,8 +433,9 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
 - `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
-  expiry or cancellation returned no process exit status; the local CLI
-  was stopped, but the backend-side exec process may still be running
+  expiry or cancellation terminated the local CLI, regardless of any
+  reported local exit status; the backend-side exec process may still be
+  running
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

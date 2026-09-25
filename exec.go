@@ -97,11 +97,12 @@ func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, con
 // combined output. A non-zero exit code is a result, not an error. When
 // the backend or the context fails, the reader still contains whatever
 // stdout and stderr the command produced before the failure; callers
-// should read it even when err is non-nil. If the backend reports an
-// exit status, that status is returned alongside the classified error.
-// When a context error has no exit status, Exec returns an
-// ExecTerminationError because the backend-side process may still be
-// running and neither supported CLI exposes a common exec-instance kill.
+// should read it even when err is non-nil. If the CLI reports an exit
+// status, that status is returned alongside the classified error.
+// When a context error terminates the local CLI, Exec returns an
+// ExecTerminationError even if the operating system represents the killed
+// process with a normal exit status. The backend-side process may still be
+// running because neither supported CLI exposes a common exec-instance kill.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	if len(cmd) == 0 {
 		return 0, nil, errors.New("exec: command must not be empty")
@@ -163,7 +164,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// Preserve both the CLI exit code and the classified infrastructure
 	// error. The output reader is intentionally non-nil on this path.
 	classified := wrapNotFound(c.classify(execCtx, err))
-	if isExecContextError(err) && cliErr.ExitCode < 0 {
+	if isExecContextError(err) {
 		classified = &ExecTerminationError{Err: classified}
 	}
 	return cliErr.ExitCode, output, classified
@@ -173,14 +174,11 @@ func isExecContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
-func execContextResultError(err error, cliErr *cli.CLIError) error {
+func execContextResultError(err error, _ *cli.CLIError) error {
 	if !isExecContextError(err) {
 		return nil
 	}
-	if cliErr.ExitCode < 0 {
-		return &ExecTerminationError{Err: err}
-	}
-	return err
+	return &ExecTerminationError{Err: err}
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

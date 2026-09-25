@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add bounded `Exec` timeouts, partial-output retention, and typed
+  unsupported-termination errors for canceled or timed-out calls (#116).
 - Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
@@ -25,6 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Endpoint` when publish host-IPs differ.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
+
+### Fixed
+
+- Classify `Exec` cancellation and timeout independently of local exit
+  status, including exit code `1` used by Windows `Process.Kill` (#116).
 
 ## [0.2.0] - 2026-09-02
 

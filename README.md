@@ -154,7 +154,7 @@ rather than a long-lived `Exec` call.
 
 Exec keeps the existing `(exitCode, output, error)` contract: a
 command's non-zero exit is a result, while a backend, timeout, or
-cancellation error is returned with the classified error. A backend
+cancellation error is returned with the classified error. A CLI-reported
 exit status, when available, is retained in `exitCode` even alongside
 that error. In either error case, read `output` to retain partial stdout
 and stderr produced before the failure.
@@ -162,13 +162,15 @@ and stderr produced before the failure.
 Cancellation stops the local CLI process group on Unix (on Windows,
 the local process is stopped but child cleanup is platform-dependent).
 Neither supported backend CLI exposes a common kill operation for an
-exec instance. If a context expires without a command exit status, Exec
+exec instance. When a context error terminates the local CLI, Exec
 returns an `*ExecTerminationError` (`errors.Is(err,
 ErrExecTerminationUnsupported)`) instead of claiming that the
-container-side process stopped. The process may still be running; callers
-must terminate the container or use a backend-specific cleanup path.
-An exit status that races with context expiry is preserved and does not
-produce this warning.
+container-side process stopped. Classification does not depend on the
+local exit status: in particular, Windows `Process.Kill` may report the
+killed process as exit code `1`, and that status remains visible without
+suppressing the typed error. The backend-side process may still be
+running; callers must terminate the container or use a backend-specific
+cleanup path.
 
 ## Image pulls
 

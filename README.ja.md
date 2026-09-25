@@ -140,22 +140,16 @@ deadline のみを無効化し、caller の deadline は取り除きません。
 コンテナの本体的コマンド(`WithCmd`)として起動し、出力には `FollowLogs`
 を使ってください。長-open な `Exec` 呼び出しは避けてください。
 
-Exec は既存の `(exitCode, output, error)` 契約を維持します。command
-の非ゼロ終了は結果であり、backend・timeout・cancellation のエラーは
-分類済み error として返されます。backend が終了コードを返している
-場合は、その error と併せて `exitCode` にも保持されます。いずれのエラー
-でも、失敗前に生成された partial stdout/stderr を保持しているため
-`output` を読んでください。
+Exec は既存の `(exitCode, output, error)` 契約を維持します。
+command の非ゼロ終了は結果であり、backend、timeout、cancellation のエラーは分類済み error として返されます。
+CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
+いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
 
-context が期限切れになって終了コードが取得できない場合、Unix では
-local CLI の process group を停止します(Windows では local process のみを
-停止し、child cleanup は platform に依存します)。対応する backend CLI
-には exec instance を kill する共通操作がありません。そのため container
-側 process が終了したと誤認せず、`*ExecTerminationError`(`errors.Is(err,
-ErrExecTerminationUnsupported)`)を返します。process が残り得るため、
-caller は container を terminate するか backend 固有の cleanup を実行
-してください。context 期限と競合して終了コードが取得できた場合は、
-その status を保持し、この warning は出しません。
+context error によって local CLI が終了した場合、Unix では process group を停止します(Windows では local process のみを停止し、child cleanup は platform に依存します)。
+backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
+この分類は local の終了コードに依存しません。
+Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
+backend 側 process が残っている可能性があるため、caller は container を terminate するか backend 固有の cleanup を実行してください。
 
 ## クリーンアップの契約
 

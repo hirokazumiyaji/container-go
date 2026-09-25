@@ -134,7 +134,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Exec` は有限時間・バッファリングされる操作で、終了コードと stdout+stderr
+`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr
 を返す(非ゼロ終了は結果であり error ではない)。caller の context に
 deadline がない場合は 30 秒の既定 deadline を適用する。正の
 `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の
@@ -142,19 +142,14 @@ deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadlin
 のみを無効化し、caller の deadline は取り除かない。
 長寿命のプロセスは通常 `WithCmd` で本体的コマンドとして起動し、出力は
 `FollowLogs` で取得する(Long-open な Exec は避ける)。
-backend・timeout・cancellation error の場合も、failure 前に生成された
-partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
-backend の終了コードが利用できる場合は、最初の戻り値にも保持する。
-context が期限切れになって終了コードが取得できない場合、Unix の local CLI
-process group は停止するが(Windows では local process のみを停止し、
-child cleanup は platform に依存する)、対応する backend CLI には exec
-instance を kill する共通操作がない。そのため container 側 process の終了を
-誤認せず、
-`*ExecTerminationError`(`errors.Is(err,
-ErrExecTerminationUnsupported)`)を返す。process が残り得るため、caller は
-container を terminate するか backend 固有 cleanup を実行する。context
-期限と競合して終了コードが取得できた場合は status を保持し、この warning
-は出さない。したがって error が non-nil でも reader を読む。
+backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
+CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。
+context error によって local CLI が終了した場合、その分類は終了コードに依存しません。
+Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
+context 取消時は Unix の local CLI process group を停止します(Windows では local process のみを停止し、child cleanup は platform に依存します)。
+backend CLI には exec instance を kill する共通操作がないため、container 側 process の終了を誤認せず、`*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。
+process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。
+したがって error が non-nil でも reader を読む。
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
@@ -289,7 +284,7 @@ platform に依存する)。これは remote exec process の kill を意味し�
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
-- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：context の期限切れまたは取消で process の終了コードが取得できなかった場合。local CLI は停止したが、backend 側 exec process は残っている可能性がある
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：報告された local の終了コードにかかわらず、context の期限切れまたは取消によって local CLI が終了した場合。backend 側 exec process は残っている可能性がある
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

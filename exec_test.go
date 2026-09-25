@@ -455,7 +455,7 @@ func (r *issue116ConcurrentExitRunner) Run(ctx context.Context, args ...string) 
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestExecPreservesExitStatusWhenContextExpiresConcurrently(t *testing.T) {
+func TestExecContextTerminationPreservesExitStatus(t *testing.T) {
 	f := &issue116ConcurrentExitRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
@@ -470,9 +470,76 @@ func TestExecPreservesExitStatusWhenContextExpiresConcurrently(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
-	var terminationErr *ExecTerminationError
-	if errors.As(err, &terminationErr) {
-		t.Fatal("a completed command with an exit status must not claim termination was unsupported")
+	assertExecTerminationError(t, err)
+}
+
+// Windows Process.Kill terminates the local CLI with exit code 1 rather
+// than the negative status used for a Unix signal.
+type issue116WindowsKillExecRunner struct {
+	*fakeRunner
+	stderr string
+}
+
+func (r *issue116WindowsKillExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		<-ctx.Done()
+		return []byte("windows stdout"), []byte("windows stderr"), errors.Join(
+			&cli.CLIError{Args: args, ExitCode: 1, Stderr: r.stderr},
+			ctx.Err(),
+		)
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+type issue116WindowsKillInfraRunner struct {
+	*issue116WindowsKillExecRunner
+}
+
+func (r *issue116WindowsKillInfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "inspect" {
+		return nil, nil, errors.New("inspect failed")
+	}
+	return r.issue116WindowsKillExecRunner.Run(ctx, args...)
+}
+
+func TestExecWindowsKillExitCodeStillReturnsTerminationError(t *testing.T) {
+	f := &issue116WindowsKillExecRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
+	assertIssue116WindowsKillResult(t, issue116ExecResult{code: code, out: out, err: err})
+}
+
+func TestExecWindowsKillInfrastructureStatusStillReturnsTerminationError(t *testing.T) {
+	f := &issue116WindowsKillInfraRunner{issue116WindowsKillExecRunner: &issue116WindowsKillExecRunner{
+		fakeRunner: newTestRunner(),
+		stderr:     "daemon unavailable",
+	}}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
+	assertIssue116WindowsKillResult(t, issue116ExecResult{code: code, out: out, err: err})
+}
+
+func assertIssue116WindowsKillResult(t *testing.T, got issue116ExecResult) {
+	t.Helper()
+	if got.code != 1 || got.out == nil {
+		t.Fatalf("code/output = %d/%v, want code 1 and output", got.code, got.out)
+	}
+	var cliErr *CLIError
+	if !errors.As(got.err, &cliErr) || cliErr.ExitCode != 1 {
+		t.Fatalf("error = %v, want local CLI exit status 1", got.err)
+	}
+	if !errors.Is(got.err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
+	}
+	assertExecTerminationError(t, got.err)
+	data, err := io.ReadAll(got.out)
+	if err != nil {
+		t.Fatalf("read output: %v", err)
+	}
+	if !strings.Contains(string(data), "windows stdout") || !strings.Contains(string(data), "windows stderr") {
+		t.Fatalf("output = %q, want partial output", data)
 	}
 }
 

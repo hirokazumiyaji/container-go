@@ -93,4 +93,7 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+	// platformCompatible compares a requested platform selector with the
+	// platform this backend reports from container inspect.
+	platformCompatible(selector, actual string) bool
 }

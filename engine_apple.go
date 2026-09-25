@@ -199,39 +199,22 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 	if err := json.Unmarshal(data, &images); err != nil {
 		return true
 	}
-	wantOS, wantArch, wantVariant := splitPlatform(platform)
 	for _, img := range images {
 		if len(img.Variants) == 0 {
 			return true
 		}
 		for _, v := range img.Variants {
-			if wantOS != "" && v.Platform.Os != wantOS {
-				continue
+			actual := formatInspectPlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant)
+			if (appleEngine{}).platformCompatible(platform, actual) {
+				return true
 			}
-			if wantArch != "" && v.Platform.Architecture != wantArch {
-				continue
-			}
-			if wantVariant != "" && v.Platform.Variant != wantVariant {
-				continue
-			}
-			return true
 		}
 	}
 	return false
 }
 
-func splitPlatform(p string) (os, arch, variant string) {
-	parts := strings.Split(p, "/")
-	if len(parts) > 0 {
-		os = parts[0]
-	}
-	if len(parts) > 1 {
-		arch = parts[1]
-	}
-	if len(parts) > 2 {
-		variant = parts[2]
-	}
-	return os, arch, variant
+func (appleEngine) platformCompatible(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
 }
 
 func (appleEngine) listReuseGroupArgs(string) []string {

@@ -360,6 +360,10 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 	return len(images) > 0
 }
 
+func (dockerEngine) platformCompatible(selector, actual string) bool {
+	return dockerPlatformMatches(selector, actual)
+}
+
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
 		"ps", "--all", "--quiet",

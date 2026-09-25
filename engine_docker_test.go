@@ -98,6 +98,9 @@ func TestDockerParseInspect(t *testing.T) {
 	if info.image != "redis:7-alpine" {
 		t.Errorf("image = %q", info.image)
 	}
+	if info.platform != "linux" {
+		t.Errorf("platform = %q, want Docker's OS-only inspect value", info.platform)
+	}
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)

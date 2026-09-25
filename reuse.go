@@ -347,7 +347,7 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 		if info.platform == "" {
 			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
 		}
-		if !strings.EqualFold(cfg.platform, info.platform) {
+		if !cfg.eng.platformCompatible(cfg.platform, info.platform) {
 			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
 		}
 	}

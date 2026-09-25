@@ -46,13 +46,18 @@ func issue83FinalVerifyBackends() []issue83FinalVerifyBackend {
 }
 
 func (b issue83FinalVerifyBackend) spec() issue83FinalVerifySpec {
+	platform := "linux/arm64"
+	if b.eng.name() == "docker" {
+		// Docker container inspect reports Platform as the OS only.
+		platform = "linux"
+	}
 	return issue83FinalVerifySpec{
 		name:     "final-" + b.name,
 		uid:      b.uid,
 		creation: "aaaaaaaaaaaaaaaa",
 		state:    "running",
 		image:    "redis:7-alpine",
-		platform: "linux/amd64",
+		platform: platform,
 		ports: []boundPort{{
 			containerPort: 6379,
 			proto:         "tcp",
@@ -175,7 +180,7 @@ func TestIssue83ReuseFinalVerificationRejectsBackendReplacement(t *testing.T) {
 			}
 			runner.imagePresent = true
 			ctr, err := Run(context.Background(), "redis:7-alpine",
-				WithName(before.name), WithReuse(), WithPublishedPort("127.0.0.1:49153:6379"),
+				WithName(before.name), WithReuse(), WithPlatform("linux/arm64"), WithPublishedPort("127.0.0.1:49153:6379"),
 				WithWaitStrategy(issue83FinalVerifyStrategy{}), withRunner(runner), withEngine(backend.eng))
 			if err == nil || ctr != nil || !errors.Is(err, ErrGenerationReplaced) {
 				t.Fatalf("Run = (%v, %v), want replacement error", ctr, err)
@@ -188,8 +193,39 @@ func TestIssue83ReuseFinalVerificationRejectsBackendReplacement(t *testing.T) {
 }
 
 func TestIssue83ReuseChecksRequestedPlatform(t *testing.T) {
-	for _, backend := range issue83FinalVerifyBackends() {
-		t.Run(backend.name, func(t *testing.T) {
+	backends := issue83FinalVerifyBackends()
+	tests := []struct {
+		name     string
+		backend  int
+		platform string
+		wantErr  bool
+	}{
+		{
+			name:     "docker OS-only inspect accepts architecture selector",
+			backend:  0,
+			platform: "linux/arm64",
+		},
+		{
+			name:     "docker rejects OS mismatch",
+			backend:  0,
+			platform: "windows/arm64",
+			wantErr:  true,
+		},
+		{
+			name:     "apple OS selector is unconstrained",
+			backend:  1,
+			platform: "linux",
+		},
+		{
+			name:     "apple rejects architecture mismatch",
+			backend:  1,
+			platform: "linux/amd64",
+			wantErr:  true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			backend := backends[tc.backend]
 			spec := backend.spec()
 			runner := &issue83FinalVerifyRunner{
 				fakeRunner: newTestRunner(),
@@ -197,11 +233,20 @@ func TestIssue83ReuseChecksRequestedPlatform(t *testing.T) {
 				after:      backend.json(spec),
 			}
 			runner.imagePresent = true
-			_, err := Run(context.Background(), "redis:7-alpine",
-				WithName(spec.name), WithReuse(), WithPlatform("linux/arm64"),
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName(spec.name), WithReuse(), WithPlatform(tc.platform),
 				withRunner(runner), withEngine(backend.eng))
-			if err == nil || !strings.Contains(err.Error(), "platform") {
-				t.Fatalf("Run error = %v, want platform mismatch", err)
+			if tc.wantErr {
+				if err == nil || ctr != nil || !strings.Contains(err.Error(), "platform") {
+					t.Fatalf("Run = (%v, %v), want platform mismatch", ctr, err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if ctr == nil || ctr.creation != spec.creation {
+				t.Fatalf("handle = %+v, want creation %q", ctr, spec.creation)
 			}
 		})
 	}
@@ -219,7 +264,7 @@ func TestIssue83ReuseRejectsDockerGenerationChangeWithSameUID(t *testing.T) {
 	}
 	runner.imagePresent = true
 	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName(before.name), WithReuse(), WithPublishedPort("127.0.0.1:49153:6379"),
+		WithName(before.name), WithReuse(), WithPlatform("linux/arm64"), WithPublishedPort("127.0.0.1:49153:6379"),
 		WithWaitStrategy(issue83FinalVerifyStrategy{}), withRunner(runner), withEngine(backend.eng))
 	if err == nil || ctr != nil || !errors.Is(err, ErrGenerationReplaced) {
 		t.Fatalf("Run = (%v, %v), want generation replacement error", ctr, err)
@@ -238,7 +283,7 @@ func TestIssue83ReuseFinalVerificationFailsClosedOnMissingGeneration(t *testing.
 	}
 	runner.imagePresent = true
 	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName(before.name), WithReuse(), WithPublishedPort("127.0.0.1:49153:6379"),
+		WithName(before.name), WithReuse(), WithPlatform("linux/arm64"), WithPublishedPort("127.0.0.1:49153:6379"),
 		WithWaitStrategy(issue83FinalVerifyStrategy{}), withRunner(runner), withEngine(backend.eng))
 	if err == nil || ctr != nil || !strings.Contains(err.Error(), "generation") {
 		t.Fatalf("Run = (%v, %v), want missing-generation refusal", ctr, err)
@@ -258,7 +303,7 @@ func TestIssue83ReuseFinalVerificationRejectsChangedReadinessResult(t *testing.T
 			}
 			runner.imagePresent = true
 			ctr, err := Run(context.Background(), "redis:7-alpine",
-				WithName(before.name), WithReuse(), WithPublishedPort("127.0.0.1:49153:6379"),
+				WithName(before.name), WithReuse(), WithPlatform("linux/arm64"), WithPublishedPort("127.0.0.1:49153:6379"),
 				WithWaitStrategy(issue83FinalVerifyStrategy{}), withRunner(runner), withEngine(backend.eng))
 			if err == nil || ctr != nil || !strings.Contains(err.Error(), "state") {
 				t.Fatalf("Run = (%v, %v), want stopped-state refusal", ctr, err)
@@ -278,7 +323,7 @@ func TestIssue83ReuseFinalVerificationAcceptsUnchangedResult(t *testing.T) {
 			}
 			runner.imagePresent = true
 			ctr, err := Run(context.Background(), "redis:7-alpine",
-				WithName(spec.name), WithReuse(), WithPublishedPort("127.0.0.1:49153:6379"),
+				WithName(spec.name), WithReuse(), WithPlatform("linux/arm64"), WithPublishedPort("127.0.0.1:49153:6379"),
 				WithWaitStrategy(issue83FinalVerifyStrategy{}), withRunner(runner), withEngine(backend.eng))
 			if err != nil {
 				t.Fatalf("Run: %v", err)

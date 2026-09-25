@@ -45,7 +45,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	target, err := c.verifiedOperationTarget()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return err
 	}
@@ -69,7 +69,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	dst := filepath.Join(dir, filepath.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	target, err := c.verifiedOperationTarget()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err

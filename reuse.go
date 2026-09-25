@@ -302,9 +302,10 @@ func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, err
 func inspectReuseBase(ctx context.Context, base *Container, cfg *config) (*engineInfo, error) {
 	ctr := namedContainer(cfg, cfg.name)
 	if base != nil {
-		base.inspectMu.Lock()
-		uid := base.uid
-		base.inspectMu.Unlock()
+		uid, _, err := base.identitySnapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
 		if uid != "" {
 			ctr.uid = uid
 		}

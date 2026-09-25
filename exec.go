@@ -80,7 +80,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	target, err := c.verifiedOperationTarget()
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return 0, nil, err
 	}

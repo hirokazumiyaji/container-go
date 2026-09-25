@@ -39,12 +39,12 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // output. Long-lived reuse containers can grow unbounded logs, so
 // prefer Tail for diagnostics.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
-	target, err := c.verifiedOperationTarget()
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return nil, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
 	args := c.eng.logsArgs(target, false)
 	if extra := opts.args(); len(extra) > 0 {
 		// Insert --tail/--since before the container ID (last arg).
@@ -63,7 +63,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // or the context is cancelled. Close terminates the underlying CLI
 // process.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
-	target, err := c.verifiedOperationTarget()
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return nil, err
 	}

@@ -31,6 +31,43 @@ const (
 	runTimeout = 10 * time.Minute
 )
 
+// contextLock is a zero-value mutex whose acquisition can be canceled.
+// It protects identity publication and serializes backend inspects without
+// allowing a canceled caller to wait indefinitely for a long inspect.
+type contextLock struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (l *contextLock) channel() chan struct{} {
+	l.once.Do(func() {
+		l.gate = make(chan struct{}, 1)
+		l.gate <- struct{}{}
+	})
+	return l.gate
+}
+
+func (l *contextLock) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gate := l.channel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func (l *contextLock) Unlock() {
+	l.channel() <- struct{}{}
+}
+
 // reuseAttachTimeout bounds waiting for another process's create to
 // reach a usable state during WithReuse get-or-create. It applies to
 // attach polling only; a leader's own image pull and create carry an
@@ -108,7 +145,7 @@ type Container struct {
 
 	mu        sync.Mutex
 	info      *engineInfo // immutable identity snapshot; dynamic data is never cached
-	inspectMu sync.Mutex  // serializes inspect target selection and UID publication
+	inspectMu contextLock // serializes inspect target selection and UID publication
 	// nameInspect is limited to short-lived name lookups used by reuse
 	// discovery and failed-create cleanup. It never publishes an inspected
 	// Docker UID to a caller-visible handle.
@@ -339,12 +376,12 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
-	target, err := c.verifiedOperationTarget()
+	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	defer cancel()
+	target, err := c.verifiedOperationTarget(stopCtx)
 	if err != nil {
 		return err
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
-	defer cancel()
 	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
 	return c.classify(ctx, err)
 }
@@ -355,17 +392,17 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // allowed only with a valid generation and a fresh locked inspect.
 func (c *Container) Terminate(ctx context.Context) error {
 	if requiresImmutableID(c.eng) {
-		target, err := c.verifiedOperationTarget()
+		target, err := c.verifiedOperationTarget(ctx)
 		if err != nil {
 			return fmt.Errorf("terminate %s: %w", c.id, err)
 		}
 		return c.delete(ctx, target)
 	}
 	if c.eng.name() == "apple" {
-		c.inspectMu.Lock()
-		creation := c.creation
-		uid := c.uid
-		c.inspectMu.Unlock()
+		uid, creation, err := c.identitySnapshot(ctx)
+		if err != nil {
+			return err
+		}
 		if uid != "" {
 			return identityError("Apple inspect unexpectedly returned a container ID")
 		}
@@ -389,7 +426,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 		}
 		return c.delete(ctx, c.id)
 	}
-	target, err := c.verifiedOperationTarget()
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return err
 	}
@@ -588,7 +625,7 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := c.rememberIdentity(info); err != nil {
+	if err := c.rememberIdentity(ctx, info); err != nil {
 		return nil, err
 	}
 	c.mu.Lock()
@@ -604,19 +641,23 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	c.applyCachedDefaultNetwork(info)
+	if err := c.applyCachedDefaultNetwork(ctx, info); err != nil {
+		return nil, err
+	}
 	if c.nameInspect {
 		return info, nil
 	}
-	if err := c.rememberIdentity(info); err != nil {
+	if err := c.rememberIdentity(ctx, info); err != nil {
 		return nil, err
 	}
 	return info, nil
 }
 
-func (c *Container) rememberIdentity(info *engineInfo) error {
+func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) error {
 	identity := immutableInfo(info)
-	c.inspectMu.Lock()
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return err
+	}
 	defer c.inspectMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -703,28 +744,30 @@ func (c *Container) inspectTargetLocked() string {
 	return c.id
 }
 
-func (c *Container) operationTarget() string {
-	c.inspectMu.Lock()
+// identitySnapshot reads the handle's backend identity and creation
+// generation while holding the same lock that protects their publication.
+func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string, err error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", "", err
+	}
 	defer c.inspectMu.Unlock()
-	if requiresImmutableID(c.eng) && !validImmutableID(c.eng, c.uid) {
-		return ""
-	}
-	if c.eng.name() == "apple" && !validCreationID(c.creation) {
-		return ""
-	}
-	return c.inspectTargetLocked()
+	return c.uid, c.creation, nil
 }
 
 // verifiedOperationTarget is the safe target for lifecycle, copy, exec,
 // and log operations. In particular, a Docker handle with an empty or
 // malformed UID fails before a CLI call instead of falling back to its
 // name. Apple handles likewise require a valid generation before using a
-// name-addressed operation.
-func (c *Container) verifiedOperationTarget() (string, error) {
-	c.inspectMu.Lock()
+// name-addressed operation. Lock acquisition is context-aware so a copy
+// cannot wait behind another call's inspect or default-network lookup after
+// its caller has been canceled.
+func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
+	}
+	defer c.inspectMu.Unlock()
 	uid := c.uid
 	creation := c.creation
-	c.inspectMu.Unlock()
 	if requiresImmutableID(c.eng) {
 		if !validImmutableID(c.eng, uid) {
 			return "", identityError("Docker operation has no valid immutable container ID")
@@ -742,7 +785,7 @@ func (c *Container) verifiedOperationTarget() (string, error) {
 	if c.id == "" {
 		return "", identityError("container has no logical name")
 	}
-	return c.operationTarget(), nil
+	return c.inspectTargetLocked(), nil
 }
 
 func configNeedsDefaultNetwork(cfg *config) bool {
@@ -759,7 +802,9 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if !c.needsDefaultNetwork() {
 		return "", nil
 	}
-	c.inspectMu.Lock()
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
+	}
 	defer c.inspectMu.Unlock()
 	if c.defaultNetwork != "" {
 		return c.defaultNetwork, nil
@@ -800,16 +845,21 @@ func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engin
 	return nil
 }
 
-func (c *Container) applyCachedDefaultNetwork(info *engineInfo) {
-	c.inspectMu.Lock()
+func (c *Container) applyCachedDefaultNetwork(ctx context.Context, info *engineInfo) error {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return err
+	}
 	defer c.inspectMu.Unlock()
 	if c.defaultNetwork != "" {
 		info.defaultNetwork = c.defaultNetwork
 	}
+	return nil
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	c.inspectMu.Lock()
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return nil, err
+	}
 	defer c.inspectMu.Unlock()
 	return c.inspectFreshLocked(ctx)
 }

@@ -54,6 +54,14 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
+	// A readiness strategy can outlive the generation inspected above.
+	fresh, err := ctr.inspectFresh(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+	}
+	if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -214,6 +222,52 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
 	}
 	return nil
+}
+
+func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) error {
+	if !sameReuseGeneration(before, fresh) {
+		return fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+	}
+	if fresh.state != before.state {
+		return fmt.Errorf("reuse %s: state changed from %s to %s before return", cfg.name, before.state, fresh.state)
+	}
+	if fresh.state != StateRunning {
+		return fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
+	}
+	if fresh.image != before.image {
+		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
+	}
+	if fresh.platform != before.platform {
+		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
+	}
+	if !sameReusePorts(before.bound, fresh.bound) {
+		return fmt.Errorf("reuse %s: published ports changed before return", cfg.name)
+	}
+	return checkReuseCompat(fresh, image, cfg)
+}
+
+func sameReuseGeneration(before, fresh *engineInfo) bool {
+	if before.uid != "" || fresh.uid != "" {
+		return before.uid != "" && before.uid == fresh.uid
+	}
+	return before.labels[creationLabel] == fresh.labels[creationLabel]
+}
+
+func sameReusePorts(before, fresh []boundPort) bool {
+	if len(before) != len(fresh) {
+		return false
+	}
+	counts := make(map[boundPort]int, len(before))
+	for _, port := range before {
+		counts[port]++
+	}
+	for _, port := range fresh {
+		if counts[port] == 0 {
+			return false
+		}
+		counts[port]--
+	}
+	return true
 }
 
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {

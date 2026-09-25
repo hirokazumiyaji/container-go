@@ -62,10 +62,12 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if c.ID != id {
 			continue
 		}
+		platform := c.Configuration.Platform
 		info := &engineInfo{
-			state:  State(c.Status.State),
-			labels: c.Configuration.Labels,
-			image:  c.Configuration.Image.Reference,
+			state:    State(c.Status.State),
+			labels:   c.Configuration.Labels,
+			image:    c.Configuration.Image.Reference,
+			platform: formatInspectPlatform(platform.OS, platform.Architecture, platform.Variant),
 		}
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
@@ -81,6 +83,16 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return info, nil
 	}
 	return nil, fmt.Errorf("container %s not in inspect output", id)
+}
+
+func formatInspectPlatform(os, architecture, variant string) string {
+	parts := make([]string, 0, 3)
+	for _, part := range []string{os, architecture, variant} {
+		if part != "" {
+			parts = append(parts, part)
+		}
+	}
+	return strings.Join(parts, "/")
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {

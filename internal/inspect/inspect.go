@@ -19,11 +19,18 @@ type Container struct {
 type Configuration struct {
 	Image          Image             `json:"image"`
 	Labels         map[string]string `json:"labels"`
+	Platform       Platform          `json:"platform"`
 	PublishedPorts []PublishedPort   `json:"publishedPorts"`
 }
 
 type Image struct {
 	Reference string `json:"reference"`
+}
+
+type Platform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
 }
 
 type PublishedPort struct {

@@ -543,8 +543,6 @@ func isUnsupportedServiceVersionError(err error) bool {
 		"unknown flag",
 		"unrecognized flag",
 		"command not found",
-		"does not support",
-		"not supported",
 		"unsupported command",
 		"unsupported subcommand",
 		"unsupported flag",

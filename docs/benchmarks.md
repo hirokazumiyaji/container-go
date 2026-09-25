@@ -119,8 +119,11 @@ backend/library/scenario image and cache input, not just table row shape.
 Testcontainers properties are parsed with its Java-properties grammar before
 any identity setting is accepted.
 
-The image provenance fields are deliberately split: `image_digest` is the
-policy digest, `expected_image_digest` records that same expected value, and
+The environment object uses the stable fields `env.os`, `env.arch`,
+`env.cpus`, `env.go`, `env.host`, `env.commit`, `env.tree`, and
+`env.dirty`. The image provenance fields are deliberately split:
+`image_digest` is the policy digest, `expected_image_digest` records that
+same expected value, and
 `observed_image_digest`/`observed_image_id` are captured from the backend
 after the measurement. This prevents a mutable tag or a mismatched local
 content from being mistaken for the pinned workload. Docker records the

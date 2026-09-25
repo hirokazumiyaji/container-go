@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"io"
+	"strconv"
 
 	"github.com/hirokazumiyaji/container-go/wait"
 )
@@ -13,6 +14,9 @@ import (
 // tail of its logs.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
+		if err := wait.Validate(s); err != nil {
+			return err
+		}
 		c.waitStrategy = s
 		return nil
 	}
@@ -25,10 +29,26 @@ type waitTarget struct {
 
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
-		if len(t.c.exposed) == 0 {
+		// Port probes are TCP-only. A UDP declaration must not silently
+		// become the target of an implicit ForExposedPort/ForHTTP probe.
+		// Prefer explicit published bindings, matching Container.resolve.
+		for _, published := range t.c.published {
+			if published.proto == "tcp" {
+				port = strconv.Itoa(published.containerPort) + "/" + published.proto
+				break
+			}
+		}
+		if port == "" {
+			for _, exposed := range t.c.exposed {
+				if exposed.proto == "tcp" {
+					port = exposed.String()
+					break
+				}
+			}
+		}
+		if port == "" {
 			return "", ErrPortNotExposed
 		}
-		port = t.c.exposed[0].String()
 	}
 	return t.c.Endpoint(ctx, port)
 }

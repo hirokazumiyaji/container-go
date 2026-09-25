@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 const (
@@ -109,6 +110,15 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	cfg := newConfig()
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
+			return nil, err
+		}
+	}
+	// Validate the complete wait tree at the public Run boundary. This
+	// must happen before image inspection/pull and before a container can
+	// be created, so a bad readiness policy cannot be masked by an absent
+	// image or leave a partially-created container behind.
+	if cfg.waitStrategy != nil {
+		if err := wait.ValidateWithPorts(cfg.waitStrategy, runWaitPorts(cfg)); err != nil {
 			return nil, err
 		}
 	}
@@ -206,6 +216,17 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 	}
 	return c, nil
+}
+
+func runWaitPorts(cfg *config) []string {
+	ports := make([]string, 0, len(cfg.exposed)+len(cfg.published))
+	for _, exposed := range cfg.exposed {
+		ports = append(ports, exposed.String())
+	}
+	for _, published := range cfg.published {
+		ports = append(ports, strconv.Itoa(published.containerPort)+"/"+published.proto)
+	}
+	return ports
 }
 
 // rollback removes a container Run created but cannot return. A failed

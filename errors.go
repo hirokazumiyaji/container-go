@@ -17,6 +17,10 @@ type CLIError = cli.CLIError
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrInvalidConfiguration reports a wait strategy that cannot run with
+// the options supplied to Run.
+var ErrInvalidConfiguration = wait.ErrInvalidConfiguration
+
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts.
 var ErrPortNotExposed = wait.ErrPortNotExposed

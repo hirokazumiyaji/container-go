@@ -37,11 +37,15 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 	return s
 }
 
-func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
-	if err := s.validate(); err != nil {
+func (s *HostPortStrategy) validate() error {
+	if err := s.options.validate(); err != nil {
 		return err
 	}
-	if err := validateTCPPortSpec(s.port, !s.portSet); err != nil {
+	return validateTCPPortSpec(s.port, !s.portSet)
+}
+
+func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
 		return err
 	}
 

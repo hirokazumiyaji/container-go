@@ -153,7 +153,8 @@ Apple Container ではこの方式を既定にしない。
 公開した場合、`Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
 
 `MappedPort` は `WithExposedPorts` で宣言されていないポートに対してエラーを返す。
-宣言は待機戦略(ForListeningPort の既定ポートなど)にも使う。
+`ForExposedPort` と `WithPort` なしの HTTP probe は、宣言されたポートのうち
+最初の TCP ポートを選ぶ。UDP だけのコンテナを暗黙の TCP 対象にはしない。
 
 ## 待機戦略
 
@@ -166,11 +167,27 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
-各待機戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-ログでは、パターンを検出する前にログストリームが終了した場合の再接続間隔として `WithPollInterval` を使う。
-`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトも設定できる。
-不正な待機設定や恒久的な対象エラーは即座に失敗する。
-待機中にコンテナが停止状態へ遷移した場合もタイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+各 leaf 戦略の `WithStartupTimeout` は 0 なら 60 秒、
+`WithPollInterval` は 0 なら 100 ミリ秒です(`ForExec` のみ 250 ミリ秒)。
+ログでは、正常に EOF した後の再接続間隔として `WithPollInterval` を使う。
+`logs --follow` が非 0 で終了した場合は終端エラーとして再接続せず、
+一致行があっても readiness を満たさない。
+`WithOccurrence(n)` の `n` は 1 以上で、行単位で数える。再接続時は履歴の
+共通接頭辞を重複排除し、新しく観測した行だけを加算する。この契約は
+`FollowLogs` が追記専用履歴を再生することを前提とし、位置が異なる
+同一行は別イベントとして数える。
+`ForAll` / `ForAny` は入れ子の戦略を再帰的に検証する。合成の
+`WithStartupTimeout` は正の値なら全体の上限、0 または負の値では従来の
+互換契約どおり無制限とする。
+
+`Run` は宣言・公開したポートを含めて待機戦略ツリー全体を、イメージの
+照会・pull より前に検証する。不正な待機設定や恒久的な対象エラーは即座に
+失敗する。transient な probe 原因、`context.Canceled`、
+`context.DeadlineExceeded` は同じエラーチェーンに残る。EOF と最後の状態
+照会は呼び出し元の既存予算を使い、
+`WithoutCancel` で切り離して budget を延長しない。待機中にコンテナが停止
+状態へ遷移した場合も残り timeout を待たずに失敗し、診断用にログ末尾
+(上限 1MiB)を添えてエラーを返す。
 
 戦略のインターフェースは次のとおり。
 
@@ -260,10 +277,15 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 エラーは `errors.Is`/`errors.As` で判別できる形で返す。
 
+- `ErrInvalidConfiguration`：指定した設定で実行できない待機戦略。イメージ照会・pull より前に返る
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：非 0 で終了した `logs --follow` を含むその他の終端 CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+
+transient な probe 原因は timeout/cancellation エラーのエラーチェーンから
+捨てられない。`errors.Is`/`errors.As` で context 原因とともに取得できる。
+不正な設定、ポート未宣言、コンテナ不在、終端 CLI エラーは retry しない。
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

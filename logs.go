@@ -64,5 +64,50 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
 	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
-	return stream, wrapNotFound(err)
+	if err != nil {
+		return nil, wrapNotFound(c.classify(ctx, err))
+	}
+	return &classifyingStream{
+		ReadCloser: stream,
+		ctx:        ctx,
+		container:  c,
+	}, nil
+}
+
+type classifyingStream struct {
+	io.ReadCloser
+	ctx       context.Context
+	container *Container
+}
+
+func (s *classifyingStream) Read(p []byte) (int, error) {
+	n, err := s.ReadCloser.Read(p)
+	if err == nil || errors.Is(err, io.EOF) {
+		return n, err
+	}
+	return n, wrapNotFound(s.container.classify(s.ctx, err))
+}
+
+// Done and TerminalError forward the optional process status exposed by
+// the stream implementation. They let wait.ForLog distinguish a live
+// follow stream from one that has already terminated with an error.
+func (s *classifyingStream) Done() <-chan struct{} {
+	if status, ok := s.ReadCloser.(interface{ Done() <-chan struct{} }); ok {
+		return status.Done()
+	}
+	return nil
+}
+
+func (s *classifyingStream) TerminalError() error {
+	if status, ok := s.ReadCloser.(interface{ TerminalError() error }); ok {
+		return s.wrap(status.TerminalError())
+	}
+	return nil
+}
+
+func (s *classifyingStream) wrap(err error) error {
+	if err == nil || errors.Is(err, io.EOF) {
+		return err
+	}
+	return wrapNotFound(s.container.classify(s.ctx, err))
 }

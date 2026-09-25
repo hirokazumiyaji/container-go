@@ -117,18 +117,35 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 ```go
 wait.ForLog("Ready to accept connections")   // 部分一致。.AsRegexp()、.WithOccurrence(n)
 wait.ForListeningPort("6379/tcp")            // TCP 接続成功まで
-wait.ForExposedPort()                        // 最初に宣言したポート
-wait.ForHTTP("/health")                      // .WithPort、.WithMethod、.WithStatusCodeMatcher、.WithHeaders、.WithBasicAuth、.WithTLS/.WithHTTPClient
+wait.ForExposedPort()                        // 最初に宣言した TCP ポート
+wait.ForHTTP("/health")                      // 既定は最初に宣言した TCP ポート
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 ```
 
-各待機戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持ちます。
-ログでは、パターンを検出する前にログストリームが終了した場合の再接続間隔として `WithPollInterval` を使います。
-`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定できます。
-不正な待機設定や恒久的な対象エラーは即座に失敗します。
-待機中にコンテナが停止した場合も即座に失敗します。
-待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
+各 leaf 戦略の `WithStartupTimeout` は 0 なら 60 秒、
+`WithPollInterval` は 0 なら 100 ミリ秒です(`ForExec` のみ 250 ミリ秒)。
+`ForLog.WithPollInterval` は、logs ストリームが正常に EOF した後の
+再接続間隔です。`logs --follow` が非 0 で終了した場合は終端エラーとして
+再接続せず、一致行があっても readiness を満たしません。
+`WithOccurrence(n)` の `n` は 1 以上で、行単位で数えます。再接続時に
+履歴の共通接頭辞を重複排除してから、新しく観測した行だけを加算します。
+この契約は `FollowLogs` が追記専用の履歴を再接続ごとに再生することを
+前提とし、位置が異なる同一行は別イベントとして数えます。
+`ForAll` / `ForAny` は入れ子の戦略を再帰的に検証します。合成の
+`WithStartupTimeout` は正の値なら全体の上限、0 または負の値では従来の
+互換契約どおり無制限です。
+
+`Run` は、宣言・公開したポートを含めて待機戦略ツリー全体を、
+イメージの照会・pull より前に検証します。不正な設定は
+`ErrInvalidConfiguration`(`container.ErrInvalidConfiguration`
+としても参照可能)、未宣言ポートと存在しないコンテナはそれぞれ
+`ErrPortNotExposed` と `ErrContainerNotFound` で返ります。恒久的な設定・
+対象エラーは即座に失敗し、transient な probe の原因、呼び出し元の
+`context.Canceled`、または `context.DeadlineExceeded` は同じエラーチェーン
+に残ります。EOF と最後の状態照会が呼び出し元・起動予算を超えて待つこと
+はありません。待機に失敗した場合はロールバック削除し、ログ末尾をエラーに
+添付します。
 
 ## クリーンアップの契約
 

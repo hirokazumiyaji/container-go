@@ -128,19 +128,37 @@ probed client-side by the `wait` package:
 ```go
 wait.ForLog("Ready to accept connections")   // substring; .AsRegexp(), .WithOccurrence(n)
 wait.ForListeningPort("6379/tcp")            // TCP dial succeeds
-wait.ForExposedPort()                        // first declared port
-wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
+wait.ForExposedPort()                        // first declared TCP port
+wait.ForHTTP("/health")                      // defaults to the first declared TCP port
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher
 wait.ForAll(...), wait.ForAny(...)           // composition; .WithStartupTimeout
 ```
 
-Every leaf strategy accepts `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). For logs, the interval is the delay
-before reconnecting a stream that ends before the pattern is found.
-`ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition.
-Invalid wait configuration and permanent target errors fail fast;
-waiting also fails fast if the container stops, and a failed wait rolls
-the container back with a tail of its logs attached to the error.
+Every leaf strategy accepts `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms, except `ForExec`, which defaults
+to 250ms). `ForLog.WithPollInterval` is the delay before reconnecting
+after a clean EOF; a non-zero `logs --follow` CLI exit is terminal and
+is returned without reconnecting or accepting a matching line.
+`WithOccurrence(n)` requires a positive `n`, counts matches per line,
+and counts across reconnects after the replayed prefix is de-duplicated.
+This prefix contract assumes `FollowLogs` replays the append-only history
+on each reconnect; repeated identical lines at different positions remain
+separate events.
+`ForAll` and `ForAny` validate nested strategies recursively. Their
+`WithStartupTimeout` is the total composition timeout when positive;
+zero or a negative value retains the historical unbounded behavior.
+
+`Run` validates the complete wait tree, including the declared/published
+port set, before inspecting or pulling the image. Invalid configuration
+is reported as `ErrInvalidConfiguration`
+(and is also available as `container.ErrInvalidConfiguration`);
+undeclared ports and missing containers are reported as
+`ErrPortNotExposed` and `ErrContainerNotFound`. Permanent target and
+configuration errors fail fast. Transient probe causes remain in the
+returned error chain together with `context.Canceled` or
+`context.DeadlineExceeded`; EOF and final state probes never extend the
+caller or startup budget. A failed wait rolls the container back with a
+tail of its logs attached to the error.
 
 ## Image pulls
 

@@ -111,6 +111,9 @@ func (s *HTTPStrategy) validate() error {
 	if err := validateTCPPortSpec(s.port, true); err != nil {
 		return err
 	}
+	if s.method == "" {
+		return invalidConfigf("HTTP method must not be empty")
+	}
 	if s.path != "" && !strings.HasPrefix(s.path, "/") {
 		return invalidConfigf("invalid HTTP path %q: path must start with /", s.path)
 	}

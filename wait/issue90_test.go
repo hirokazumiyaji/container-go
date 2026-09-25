@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 type issue90Target struct {
@@ -60,6 +62,16 @@ func TestWaitRejectsInvalidConfigurationBeforeTargetCalls(t *testing.T) {
 			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
 		},
 		{
+			name:     "UDP port is not a TCP wait target",
+			strategy: ForListeningPort("6379/udp"),
+			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+		},
+		{
+			name:     "HTTP UDP port is not a TCP wait target",
+			strategy: ForHTTP("/").WithPort("6379/udp"),
+			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+		},
+		{
 			name:     "empty explicit port",
 			strategy: ForListeningPort(""),
 			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
@@ -67,6 +79,11 @@ func TestWaitRejectsInvalidConfigurationBeforeTargetCalls(t *testing.T) {
 		{
 			name:     "http method",
 			strategy: ForHTTP("/").WithMethod("GET\n"),
+			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+		},
+		{
+			name:     "empty HTTP method",
+			strategy: ForHTTP("/").WithMethod(""),
 			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
 		},
 		{
@@ -267,5 +284,120 @@ func TestForAllValidatesChildrenBeforeRunning(t *testing.T) {
 	}
 	if got := target.endpointCalls.Load(); got != 0 {
 		t.Fatalf("endpoint calls = %d, want 0", got)
+	}
+}
+
+type terminalLogReader struct {
+	err  error
+	sent bool
+}
+
+func (r *terminalLogReader) Read(p []byte) (int, error) {
+	if r.sent {
+		return 0, io.EOF
+	}
+	r.sent = true
+	return copy(p, "ready\n"), r.err
+}
+
+func (r *terminalLogReader) Close() error { return nil }
+
+func TestForLogDoesNotAcceptTerminalCLIError(t *testing.T) {
+	terminal := &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"logs", "--follow", "myctr"},
+		ExitCode: 17,
+		Stderr:   "logs stream failed",
+	}
+	target := &issue90Target{logs: []io.ReadCloser{&terminalLogReader{err: terminal}}}
+	err := ForLog("ready").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("terminal CLI error unexpectedly satisfied the log pattern")
+	}
+	var got *cli.CLIError
+	if !errors.As(err, &got) {
+		t.Fatalf("error = %v, want *cli.CLIError", err)
+	}
+	if got.ExitCode != 17 {
+		t.Fatalf("ExitCode = %d, want 17", got.ExitCode)
+	}
+	if target.followCalls.Load() != 1 {
+		t.Fatalf("FollowLogs calls = %d, want no reconnect", target.followCalls.Load())
+	}
+	if target.runningCalls.Load() != 0 {
+		t.Fatalf("Running calls = %d, want no probe after terminal error", target.runningCalls.Load())
+	}
+}
+
+func TestForLogDeduplicatesReplayedHistoryAcrossReconnect(t *testing.T) {
+	target := &issue90Target{logs: []io.ReadCloser{
+		io.NopCloser(strings.NewReader("ready\n")),
+		io.NopCloser(strings.NewReader("ready\n")),
+		io.NopCloser(strings.NewReader("ready\nstill starting\nready\n")),
+	}}
+	err := ForLog("ready").
+		WithOccurrence(2).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+	if got := target.followCalls.Load(); got != 3 {
+		t.Fatalf("FollowLogs calls = %d, want 3 after two replayed snapshots", got)
+	}
+}
+
+type instantStrategy struct{}
+
+func (instantStrategy) WaitUntilReady(context.Context, Target) error { return nil }
+
+func TestCompositeNegativeTimeoutRemainsUnbounded(t *testing.T) {
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(instantStrategy{}).WithStartupTimeout(-time.Second),
+		"any": ForAny(instantStrategy{}).WithStartupTimeout(-time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := Validate(strategy); err != nil {
+				t.Fatalf("Validate: %v", err)
+			}
+			if err := strategy.WaitUntilReady(context.Background(), &issue90Target{}); err != nil {
+				t.Fatalf("WaitUntilReady: %v", err)
+			}
+		})
+	}
+}
+
+func TestValidateRecursesAndRejectsTypedNil(t *testing.T) {
+	var typedNil *LogStrategy
+	for name, strategy := range map[string]Strategy{
+		"typed nil leaf":  typedNil,
+		"typed nil child": ForAll(ForAny(typedNil)),
+		"nested invalid":  ForAll(ForAny(ForExec(nil))),
+		"invalid port":    ForAll(ForListeningPort("not-a-port")),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := Validate(strategy); err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("Validate error = %v, want ErrInvalidConfiguration", err)
+			}
+		})
+	}
+}
+
+func TestValidateWithPortsChecksDeclarationsRecursively(t *testing.T) {
+	if err := ValidateWithPorts(ForListeningPort("6379/tcp"), []string{"6379/tcp"}); err != nil {
+		t.Fatalf("declared TCP port: %v", err)
+	}
+	if err := ValidateWithPorts(ForExposedPort(), []string{"53/udp"}); !errors.Is(err, ErrPortNotExposed) {
+		t.Fatalf("UDP-only default error = %v, want ErrPortNotExposed", err)
+	}
+	if err := ValidateWithPorts(ForAll(ForAny(ForHTTP("/"))), []string{"80/tcp"}); err != nil {
+		t.Fatalf("nested default TCP port: %v", err)
+	}
+	if err := ValidateWithPorts(ForHTTP("/").WithPort("8080/tcp"), []string{"80/tcp"}); !errors.Is(err, ErrPortNotExposed) {
+		t.Fatalf("missing explicit port error = %v, want ErrPortNotExposed", err)
 	}
 }

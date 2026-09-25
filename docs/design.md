@@ -215,8 +215,9 @@ unreachable in a given setup), publish explicitly with
 given host address and `MappedPort` the host port.
 
 `MappedPort` errors with `ErrPortNotExposed` for ports not declared
-via `WithExposedPorts`. The declarations also feed wait strategies
-(the default port of ForListeningPort, for example).
+via `WithExposedPorts`. `ForExposedPort` and an HTTP probe without
+`WithPort` select the first declared **TCP** port; a UDP-only
+container is not an implicit TCP target.
 
 ## Wait strategies
 
@@ -242,14 +243,28 @@ provides:
   composition can also be bounded with `WithStartupTimeout` (or
   `context.WithTimeout` from the caller).
 
-Every leaf strategy carries `WithStartupTimeout` (default 60s) and
-`WithPollInterval` (default 100ms). For logs, the interval is the delay
-before reconnecting a stream that ends before the pattern is found.
-`ForAll` / `ForAny` can bound the composition with
-`WithStartupTimeout`. Invalid wait configuration and permanent target
-errors fail fast; if the container transitions to stopped while waiting,
-the wait also fails immediately (no timeout burn) and the error carries
-a log tail capped at 1MiB for diagnosis.
+Every leaf strategy carries `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms; `ForExec` defaults to 250ms).
+For logs, the interval is the delay before reconnecting after a clean
+EOF. A non-zero `logs --follow` CLI exit is terminal: it is returned
+without reconnecting and cannot be satisfied by a matching line.
+`WithOccurrence(n)` requires a positive count, matches per line, and
+counts across reconnects after de-duplicating the replayed log prefix.
+The prefix contract assumes `FollowLogs` replays append-only history;
+identical lines at different positions remain separate events.
+`ForAll` / `ForAny` validate nested strategies recursively. Their
+`WithStartupTimeout` bounds the whole composition when positive; zero or
+negative retains the historical unbounded behavior.
+
+`Run` validates the complete wait tree, including the declared and published
+port set, before image inspection or pull. Invalid wait configuration
+and permanent target errors fail fast. Transient probe errors,
+`context.Canceled`, and `context.DeadlineExceeded` remain in the
+returned error chain. EOF and final state probes use the caller's
+existing budget and do not detach
+with `WithoutCancel`; if the container transitions to stopped while
+waiting, the wait also fails without burning the remaining timeout and
+the error carries a log tail capped at 1MiB for diagnosis.
 
 The strategy interface:
 
@@ -396,14 +411,22 @@ cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 
 Errors are discriminable with `errors.Is`/`errors.As`.
 
+- `ErrInvalidConfiguration`: a wait strategy cannot run with the
+  supplied options; it is reported before image inspection/pull
 - `ErrSystemNotRunning`: after a CLI failure, a follow-up
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
-- `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+- `*CLIError`: any other terminal CLI failure, including a non-zero
+  `logs --follow` exit; it carries the subcommand, exit code, and stderr
+  (capped at 64KiB)
+
+Transient probe errors are not discarded: timeout and cancellation
+errors expose them through `errors.Is`/`errors.As` alongside the
+context cause. Permanent configuration, missing-port, missing-container,
+and terminal CLI errors fail without retrying.
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

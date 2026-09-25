@@ -56,8 +56,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 }
 
 // FollowLogs streams the container's log output until Close is called
-// or the context is cancelled. Close terminates the underlying CLI
-// process.
+// or the context is cancelled. The built-in runner starts the CLI
+// asynchronously: a process that exits after start reports its terminal
+// stderr on the returned stream and then reaches EOF, so that terminal
+// failure is not returned synchronously by FollowLogs. Close terminates
+// the underlying CLI process.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {

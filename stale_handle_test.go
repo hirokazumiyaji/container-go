@@ -6,9 +6,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -17,7 +19,6 @@ const staleHandleUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 type staleHandleRunner struct {
 	calls               [][]string
-	streamCalls         [][]string
 	replacementRunning  bool
 	replacementFileData string
 }
@@ -57,14 +58,6 @@ func (r *staleHandleRunner) Run(_ context.Context, args ...string) ([]byte, []by
 	default:
 		return nil, nil, nil
 	}
-}
-
-func (r *staleHandleRunner) Stream(_ context.Context, args ...string) (io.ReadCloser, error) {
-	r.streamCalls = append(r.streamCalls, args)
-	if hasImmutableTarget(args, staleHandleUID) {
-		return nil, notFoundError(args)
-	}
-	return io.NopCloser(strings.NewReader("replacement logs")), nil
 }
 
 func notFoundError(args []string) error {
@@ -122,9 +115,6 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 	if _, err := ctr.LogsWithOptions(ctx, LogsOptions{Tail: 10}); !errors.Is(err, ErrContainerNotFound) {
 		t.Errorf("LogsWithOptions error = %v, want ErrContainerNotFound", err)
 	}
-	if _, err := ctr.FollowLogs(ctx); !isNotFound(err) {
-		t.Errorf("FollowLogs error = %v, want backend not-found", err)
-	}
 	if err := ctr.Stop(ctx, nil); !isNotFound(err) {
 		t.Errorf("Stop error = %v, want backend not-found", err)
 	}
@@ -145,9 +135,54 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 		t.Error("stale handle changed the replacement state")
 	}
 	assertUIDTargets(t, r.calls, staleHandleUID)
-	if len(r.streamCalls) != 1 || !hasImmutableTarget(r.streamCalls[0], staleHandleUID) {
-		t.Errorf("FollowLogs args = %v, want immutable ID", r.streamCalls)
+}
+
+// TestDockerFollowLogsUsesImmutableIDForTerminalError exercises the
+// built-in asynchronous stream contract: Start returns before the CLI
+// exits, and a terminal failure arrives as merged stderr followed by EOF.
+func TestDockerFollowLogsUsesImmutableIDForTerminalError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("stream regression uses a POSIX stub")
 	}
+
+	ctr := &Container{
+		id:     "replacement",
+		uid:    staleHandleUID,
+		eng:    dockerEngine{},
+		runner: &cli.ExecRunner{Binary: writeStaleFollowLogsStub(t)},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	stream, err := ctr.FollowLogs(ctx)
+	if err != nil {
+		t.Fatalf("FollowLogs start: %v", err)
+	}
+	defer stream.Close()
+	data, readErr := io.ReadAll(stream)
+	if readErr != nil {
+		t.Fatalf("FollowLogs terminal read error = %v, want asynchronous EOF", readErr)
+	}
+	got := string(data)
+	if !strings.Contains(got, "No such container: logs --follow "+staleHandleUID) {
+		t.Errorf("terminal stream = %q, want immutable-ID command", got)
+	}
+	if strings.Contains(got, "replacement") {
+		t.Errorf("terminal stream = %q, must not target the logical name", got)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatalf("FollowLogs close: %v", err)
+	}
+}
+
+func writeStaleFollowLogsStub(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "docker")
+	script := "#!/bin/sh\nprintf 'Error response from daemon: No such container: %s\\n' \"$*\" >&2\nexit 1\n"
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func assertUIDTargets(t *testing.T, calls [][]string, uid string) {

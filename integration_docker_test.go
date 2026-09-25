@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -35,6 +36,22 @@ func requireDocker(t *testing.T) {
 		t.Skip("docker daemon not running")
 	}
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
+}
+
+// dockerContainerMissing accepts the typed error used by inspect/State/
+// Exec/Logs and the raw CLIError retained by copy/stop operations.
+func dockerContainerMissing(err error) bool {
+	if errors.Is(err, container.ErrContainerNotFound) {
+		return true
+	}
+	var cliErr *container.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	stderr := strings.ToLower(cliErr.Stderr)
+	return strings.Contains(stderr, "no such container") ||
+		strings.Contains(stderr, "no such object") ||
+		strings.Contains(stderr, "not found")
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -464,23 +481,29 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 		t.Fatalf("seed replacement file: %v", err)
 	}
 
-	if _, err := oldCtr.State(ctx); err == nil {
-		t.Error("stale State succeeded; it inspected the replacement")
+	if _, err := oldCtr.State(ctx); !dockerContainerMissing(err) {
+		t.Errorf("stale State error = %v, want container not-found", err)
 	}
-	if _, _, err := oldCtr.Exec(ctx, []string{"sh", "-c", "printf stale > /tmp/stale-exec.txt"}); err == nil {
-		t.Error("stale Exec succeeded; it executed in the replacement")
+	if _, _, err := oldCtr.Exec(ctx, []string{"sh", "-c", "printf stale > /tmp/stale-exec.txt"}); !dockerContainerMissing(err) {
+		t.Errorf("stale Exec error = %v, want container not-found", err)
 	}
-	if err := oldCtr.CopyToContainer(ctx, marker, "/tmp/stale-copy.txt"); err == nil {
-		t.Error("stale CopyToContainer succeeded; it wrote to the replacement")
+	if err := oldCtr.CopyToContainer(ctx, marker, "/tmp/stale-copy.txt"); !dockerContainerMissing(err) {
+		t.Errorf("stale CopyToContainer error = %v, want container not-found", err)
 	}
-	if _, err := oldCtr.CopyFileFromContainer(ctx, "/tmp/replacement.txt"); err == nil {
-		t.Error("stale CopyFileFromContainer succeeded; it read from the replacement")
+	rc, copyErr := oldCtr.CopyFileFromContainer(ctx, "/tmp/replacement.txt")
+	if rc != nil {
+		if err := rc.Close(); err != nil {
+			t.Errorf("stale CopyFileFromContainer close: %v", err)
+		}
 	}
-	if _, err := oldCtr.Logs(ctx); err == nil {
-		t.Error("stale Logs succeeded; it read the replacement logs")
+	if !dockerContainerMissing(copyErr) {
+		t.Errorf("stale CopyFileFromContainer error = %v, want container not-found", copyErr)
 	}
-	if err := oldCtr.Stop(ctx, nil); err == nil {
-		t.Error("stale Stop succeeded; it stopped the replacement")
+	if _, err := oldCtr.Logs(ctx); !dockerContainerMissing(err) {
+		t.Errorf("stale Logs error = %v, want container not-found", err)
+	}
+	if err := oldCtr.Stop(ctx, nil); !dockerContainerMissing(err) {
+		t.Errorf("stale Stop error = %v, want container not-found", err)
 	}
 	// A missing immutable target is idempotently removed, not an error.
 	if err := oldCtr.Terminate(ctx); err != nil {

@@ -56,6 +56,64 @@ func (o options) effective() (timeout, interval time.Duration) {
 	return timeout, interval
 }
 
+type waitError struct {
+	message string
+	causes  []error
+}
+
+func (e *waitError) Error() string   { return e.message }
+func (e *waitError) Unwrap() []error { return e.causes }
+
+func newWaitError(message string, causes ...error) error {
+	filtered := make([]error, 0, len(causes))
+	for _, cause := range causes {
+		if cause != nil {
+			filtered = append(filtered, cause)
+		}
+	}
+	return &waitError{message: message, causes: filtered}
+}
+
+func waitContextError(what string, contextErr error, lastErr error) error {
+	message := fmt.Sprintf("%s: %s", what, contextErr)
+	if lastErr != nil {
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
+	}
+	return newWaitError(message, contextErr, lastErr)
+}
+
+func waitTimeoutError(what string, timeout time.Duration, lastErr error) error {
+	message := fmt.Sprintf("%s: timed out after %v", what, timeout)
+	if lastErr != nil {
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
+	}
+	return newWaitError(message, context.DeadlineExceeded, lastErr)
+}
+
+func waitStoppedError(what string, lastErr error) error {
+	message := fmt.Sprintf("%s: container stopped while waiting", what)
+	if lastErr != nil {
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
+	}
+	return newWaitError(message, lastErr)
+}
+
+// waitContextTerminationError classifies the context that ended a wait. The
+// caller's context is checked first so a caller deadline is not reported
+// as the strategy's own startup timeout.
+func waitContextTerminationError(callerCtx, waitCtx context.Context, what string, timeout time.Duration, lastErr error) error {
+	if err := callerCtx.Err(); err != nil {
+		return waitContextError(what, err, lastErr)
+	}
+	if err := waitCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return waitTimeoutError(what, timeout, lastErr)
+		}
+		return waitContextError(what, err, lastErr)
+	}
+	return nil
+}
+
 // poll runs check every interval until it succeeds, the container
 // stops, or the timeout elapses. When checkRunning is true the poll
 // also probes target.Running between checks and fails fast once the
@@ -64,53 +122,79 @@ func (o options) effective() (timeout, interval time.Duration) {
 // below.
 func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
 	timeout, interval := o.effective()
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	callerCtx := ctx
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	var lastErr error
 	var lastStateCheck time.Time
+	terminationErr := func() error {
+		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastErr)
+	}
 	for {
-		if err := check(ctx); err != nil {
+		if err := terminationErr(); err != nil {
+			return err
+		}
+
+		if err := check(waitCtx); err != nil {
+			// A context can end while the check is returning. Prefer
+			// that terminal cause over a check error so cancellation
+			// and deadlines remain visible to callers.
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
+
 			var fatal fatalCheckError
 			if errors.As(err, &fatal) {
 				// The check could not run at all; retrying cannot
 				// help, so surface the error right away.
 				return fmt.Errorf("%s: %w", what, fatal.err)
 			}
-			if ctx.Err() == nil {
-				lastErr = err
-			}
+			lastErr = err
 		} else {
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
 			return nil
 		}
 
+		if terminalErr := terminationErr(); terminalErr != nil {
+			return terminalErr
+		}
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
 			lastStateCheck = time.Now()
-			if running, err := target.Running(ctx); err == nil && !running {
-				return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+			running, err := target.Running(waitCtx)
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
+			if err == nil && !running {
+				return waitStoppedError(what, lastErr)
 			}
 		}
 
 		select {
-		case <-ctx.Done():
-			// Termination point: classify once. A poll without
-			// state checks only inspects the container now, so a
-			// stopped container is still reported accurately.
-			// Probe only after our wait deadline; never override
-			// caller cancellation, and bound the probe so a hung
-			// backend cannot outlive the wait by queryTimeout.
-			if !checkRunning && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
+		case <-waitCtx.Done():
+			// A poll without state checks performs one final
+			// classification only after its own startup timeout. It
+			// must not start a probe after the caller's context ended,
+			// and the probe retains caller cancellation as a bound.
+			if !checkRunning && callerCtx.Err() == nil && errors.Is(waitCtx.Err(), context.DeadlineExceeded) {
+				probeCtx, probeCancel := context.WithTimeout(callerCtx, stateCheckInterval)
 				running, err := target.Running(probeCtx)
 				probeCancel()
+				if callerErr := callerCtx.Err(); callerErr != nil {
+					return waitContextError(what, callerErr, lastErr)
+				}
 				if err == nil && !running {
-					return fmt.Errorf("%s: container stopped while waiting (last error: %v)", what, lastErr)
+					return waitStoppedError(what, lastErr)
 				}
 			}
-			if errors.Is(ctx.Err(), context.Canceled) {
-				return fmt.Errorf("%s: %w (last error: %v)", what, context.Canceled, lastErr)
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
 			}
-			return fmt.Errorf("%s: timed out after %v (last error: %v)", what, timeout, lastErr)
+			// waitCtx.Done was observed, so this is only a defensive
+			// fallback for unusual Context implementations.
+			return waitTimeoutError(what, timeout, lastErr)
 		case <-time.After(interval):
 		}
 	}

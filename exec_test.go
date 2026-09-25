@@ -85,7 +85,7 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`},
+			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 		},
 	}
 	ctr := runTestContainer(t, f)
@@ -101,7 +101,7 @@ type execMissingRunner struct {
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: myctr`}
 	}
 	return m.execRunner.Run(ctx, args...)
 }
@@ -109,7 +109,7 @@ func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []
 func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	f := &execRunner{
 		fakeRunner: newTestRunner(),
-		execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "record not found"},
+		execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "container not found: myctr"},
 	}
 	ctr := runTestContainer(t, f)
 

@@ -173,7 +173,7 @@ var appleProbe = Probe{Args: []string{"system", "status"}, Hint: "run `container
 func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "XPC connection error"}
 	r := &fakeRunner{results: map[string]fakeResult{
-		"system status": {err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1}},
+		"system status": {err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}},
 	}}
 
 	err := Classify(context.Background(), r, orig, appleProbe)
@@ -189,7 +189,7 @@ func TestClassifyUsesProbeSpecificHint(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
 	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
 	r := &fakeRunner{results: map[string]fakeResult{
-		strings.Join(probeArgs, " "): {err: &CLIError{Args: probeArgs, ExitCode: 1}},
+		strings.Join(probeArgs, " "): {err: &CLIError{Args: probeArgs, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}},
 	}}
 
 	err := Classify(context.Background(), r, orig, Probe{Args: probeArgs, Hint: "start the Docker daemon"})
@@ -213,6 +213,62 @@ func TestClassifyKeepsOriginalErrorWhenSystemIsRunning(t *testing.T) {
 	}
 	if errors.Is(err, ErrSystemNotRunning) {
 		t.Error("error wrongly classified as ErrSystemNotRunning")
+	}
+}
+
+func TestClassifyPreservesNonLivenessOriginalAndProbeErrors(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "permission denied: image config rejected"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and probe errors", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatal("permission failure was classified as daemon down")
+	}
+	var gotCLI *CLIError
+	if !errors.As(got, &gotCLI) || gotCLI != orig {
+		t.Fatalf("errors.As(*CLIError) = %v, want original CLIError", gotCLI)
+	}
+}
+
+func TestClassifyDoesNotCallAmbiguousMissingDaemonDown(t *testing.T) {
+	orig := &CLIError{Args: []string{"run", "--name", "ctr"}, ExitCode: 1, Stderr: "container not found: ctr"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want both errors", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatal("ambiguous missing message was classified as daemon down")
+	}
+}
+
+func TestClassifyUsesProbePredicateAndPreservesChains(t *testing.T) {
+	orig := &CLIError{Args: []string{"inspect", "ctr"}, ExitCode: 1, Stderr: "command failed"}
+	probeErr := &CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "transport unavailable"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"version": {err: probeErr},
+	}}
+	probe := Probe{
+		Args: []string{"version"}, Hint: "start the daemon",
+		IsUnavailable: func(error) bool { return true },
+	}
+
+	got := Classify(context.Background(), r, orig, probe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want both errors", got)
+	}
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, want sentinel from explicit probe predicate", got)
 	}
 }
 

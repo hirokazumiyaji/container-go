@@ -52,10 +52,11 @@ The design decisions below rest on these properties of Apple Container
   Docker/OCI-style keys.
 - `container cp` only works on running containers.
 - `--rm` removal leaves anonymous volumes behind.
-- Error classification depends on CLI stderr substrings owned by
-  `engine_apple.go` (name conflict, image/container missing). Those
-  matchers are regression-tested against a live CLI in
-  `cli_compat_integration_test.go`.
+- Error classification depends on the backend binary, command, and
+  anchored CLI stderr forms owned by `engine_apple.go` and
+  `engine_docker.go` (name conflict, image/container missing). Those
+  matchers are regression-tested against recorded 1.2/1.3 and Docker 29
+  fixtures and a live CLI in `cli_compat_integration_test.go`.
 
 ## Choosing the implementation strategy
 

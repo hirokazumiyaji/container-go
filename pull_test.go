@@ -37,6 +37,7 @@ func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
 
 func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
 	f := newTestRunner()
+	f.binary = "docker"
 	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
@@ -78,6 +79,7 @@ func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 
 func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
 	f := newTestRunner()
+	f.binary = "docker"
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(f), withEngine(dockerEngine{}))
 	if !errors.Is(err, ErrImageNotFound) {
@@ -93,6 +95,7 @@ func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
 
 func TestRunPullNeverRunsWhenImagePresent(t *testing.T) {
 	f := newTestRunner()
+	f.binary = "docker"
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, WithPullPolicy(PullNever), withEngine(dockerEngine{}))
 	_ = ctr
@@ -140,19 +143,19 @@ func TestDockerRunArgsNeverPullImplicitly(t *testing.T) {
 }
 
 func TestImageMissingClassification(t *testing.T) {
-	imageErr := func(stderr string) error {
-		return &cli.CLIError{Args: []string{"image", "inspect", "x"}, ExitCode: 1, Stderr: stderr}
+	imageErr := func(binary, stderr string) error {
+		return &cli.CLIError{Binary: binary, Args: []string{"image", "inspect", "redis:7-alpine"}, ExitCode: 1, Stderr: stderr}
 	}
-	if !(dockerEngine{}).imageMissing(imageErr("Error response from daemon: No such image: redis:7-alpine")) {
+	if !(dockerEngine{}).imageMissing(imageErr("docker", "Error response from daemon: No such image: redis:7-alpine")) {
 		t.Error("docker: daemon not-found not classified as missing")
 	}
-	if (dockerEngine{}).imageMissing(imageErr("XPC connection error")) {
+	if (dockerEngine{}).imageMissing(imageErr("docker", "XPC connection error")) {
 		t.Error("docker: transport error classified as missing")
 	}
-	if !(appleEngine{}).imageMissing(imageErr("image not found: redis:7-alpine")) {
+	if !(appleEngine{}).imageMissing(imageErr("container", "image not found: redis:7-alpine")) {
 		t.Error("apple: not-found not classified as missing")
 	}
-	if (appleEngine{}).imageMissing(imageErr("XPC connection error")) {
+	if (appleEngine{}).imageMissing(imageErr("container", "XPC connection error")) {
 		t.Error("apple: transport error classified as missing")
 	}
 }
@@ -449,7 +452,7 @@ func TestPullWithSharesFlightAcrossConcurrentCallers(t *testing.T) {
 }
 
 func TestPullWithClassifiesBackendDown(t *testing.T) {
-	f := &fakeRunner{systemUp: false}
+	f := &fakeRunner{systemUp: false, binary: "docker"}
 	if err := pullWith(context.Background(), f, dockerEngine{}, "redis:7-alpine"); !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}

@@ -54,29 +54,5 @@
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
-  },
-  {
-    "name": "application_container_not_found_on_run",
-    "operation": "run",
-    "stderr": "Error: application: container not found: myctr",
-    "nameConflict": false,
-    "imageMissing": false,
-    "containerMissing": false
-  },
-  {
-    "name": "application_container_not_found_on_delete",
-    "operation": "delete",
-    "stderr": "Error: application: container not found: myctr",
-    "nameConflict": false,
-    "imageMissing": false,
-    "containerMissing": false
-  },
-  {
-    "name": "docker_wording_on_apple",
-    "operation": "inspect",
-    "stderr": "Error response from daemon: No such container: myctr",
-    "nameConflict": false,
-    "imageMissing": false,
-    "containerMissing": false
   }
 ]

@@ -126,7 +126,7 @@ func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform 
 		if eng.imageMissing(err) {
 			return false, nil
 		}
-		return false, cli.Classify(ctx, r, err, eng.probe())
+		return false, classifyError(ctx, r, err, eng)
 	}
 	return eng.parseImageExists(stdout, platform), nil
 }
@@ -136,7 +136,7 @@ func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform 
 func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform string) error {
 	_, _, err := r.Run(ctx, eng.pullImageArgs(image, platform)...)
 	if err != nil {
-		return cli.Classify(ctx, r, err, eng.probe())
+		return classifyError(ctx, r, err, eng)
 	}
 	return nil
 }

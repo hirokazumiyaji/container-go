@@ -52,6 +52,7 @@ func TestEnsureImagePassesPlatformToInspect(t *testing.T) {
 
 func TestPullNeverWithPlatformReportsMissing(t *testing.T) {
 	f := newTestRunner()
+	f.binary = "docker"
 	f.imagePresent = false
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/amd64"),

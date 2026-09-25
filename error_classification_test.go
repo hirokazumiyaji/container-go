@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -15,6 +16,7 @@ import (
 
 type backendStderrFixture struct {
 	Name             string `json:"name"`
+	Operation        string `json:"operation"`
 	Stderr           string `json:"stderr"`
 	NameConflict     bool   `json:"nameConflict"`
 	ImageMissing     bool   `json:"imageMissing"`
@@ -43,18 +45,33 @@ func loadBackendStderrFixtures(t *testing.T, file string) []backendStderrFixture
 	return fixtures
 }
 
+func fixtureArgs(operation string) []string {
+	switch operation {
+	case "image inspect":
+		return []string{"image", "inspect", "redis:7-alpine"}
+	case "run":
+		return []string{"run", "--name", "myctr"}
+	case "rm":
+		return []string{"rm", "--force", "myctr"}
+	default:
+		return []string{operation, "myctr"}
+	}
+}
+
 // The fixture files contain the verified stderr shapes from the supported
 // CLI versions; the table keeps each classifier's positive and negative
 // contract together.
 func TestBackendStderrFixtures(t *testing.T) {
 	cases := []struct {
 		name       string
+		backend    string
 		file       string
 		classifier backendStderrClassifier
 	}{
 		{
-			name: "apple",
-			file: "cli_stderr_apple_1.3.0.json",
+			name:    "apple-1.2",
+			backend: "apple",
+			file:    "cli_stderr_apple_1.2.0.json",
 			classifier: backendStderrClassifier{
 				nameConflict:     appleEngine{}.nameConflict,
 				imageMissing:     appleEngine{}.imageMissing,
@@ -62,8 +79,19 @@ func TestBackendStderrFixtures(t *testing.T) {
 			},
 		},
 		{
-			name: "docker",
-			file: "cli_stderr_docker_29.json",
+			name:    "apple-1.3",
+			backend: "apple",
+			file:    "cli_stderr_apple_1.3.0.json",
+			classifier: backendStderrClassifier{
+				nameConflict:     appleEngine{}.nameConflict,
+				imageMissing:     appleEngine{}.imageMissing,
+				containerMissing: appleEngine{}.containerMissing,
+			},
+		},
+		{
+			name:    "docker-29",
+			backend: "docker",
+			file:    "cli_stderr_docker_29.json",
 			classifier: backendStderrClassifier{
 				nameConflict:     dockerEngine{}.nameConflict,
 				imageMissing:     dockerEngine{}.imageMissing,
@@ -76,9 +104,13 @@ func TestBackendStderrFixtures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, fixture := range loadBackendStderrFixtures(t, tc.file) {
 				t.Run(fixture.Name, func(t *testing.T) {
+					binary := "container"
+					if tc.backend == "docker" {
+						binary = "docker"
+					}
 					err := &cli.CLIError{
-						Binary:   tc.name,
-						Args:     []string{"fixture"},
+						Binary:   binary,
+						Args:     fixtureArgs(fixture.Operation),
 						ExitCode: 1,
 						Stderr:   fixture.Stderr,
 					}
@@ -122,8 +154,12 @@ func TestBackendStderrClassifiersRejectAmbiguousMessages(t *testing.T) {
 	}
 
 	for i, classifier := range classifiers {
+		binary := "container"
+		if i == 1 {
+			binary = "docker"
+		}
 		for _, stderr := range messages {
-			err := &cli.CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: stderr}
+			err := &cli.CLIError{Binary: binary, Args: []string{"run"}, ExitCode: 1, Stderr: stderr}
 			if classifier.nameConflict(err) || classifier.imageMissing(err) || classifier.containerMissing(err) || isNotFound(err) {
 				t.Errorf("classifier %d classified %q", i, stderr)
 			}
@@ -279,9 +315,10 @@ func (r *ambiguousReuseRunner) Run(ctx context.Context, args ...string) ([]byte,
 		r.inspectCalls++
 		r.mu.Unlock()
 		return nil, nil, &cli.CLIError{
+			Binary:   "docker",
 			Args:     args,
 			ExitCode: 1,
-			Stderr:   `Error: container not found: "ambiguous-reuse"`,
+			Stderr:   `Error response from daemon: No such object: "ambiguous-reuse"`,
 		}
 	default:
 		return r.fakeRunner.Run(ctx, args...)
@@ -318,5 +355,326 @@ func (r *fixedInspectErrorRunner) Run(_ context.Context, args ...string) ([]byte
 		return []byte("running"), nil, nil
 	default:
 		return nil, nil, nil
+	}
+}
+
+func TestClassifiersRejectCrossBackendOperationAndTarget(t *testing.T) {
+	cases := []struct {
+		name string
+		got  bool
+	}{
+		{
+			name: "docker wording through apple",
+			got: (appleEngine{}).containerMissing(&cli.CLIError{
+				Binary: "docker", Args: []string{"inspect", "myctr"},
+				Stderr: "Error response from daemon: No such container: myctr",
+			}),
+		},
+		{
+			name: "apple wording through docker",
+			got: (dockerEngine{}).containerMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"inspect", "myctr"},
+				Stderr: "Error: container not found: myctr",
+			}),
+		},
+		{
+			name: "empty binary is not docker",
+			got: (dockerEngine{}).containerMissing(&cli.CLIError{
+				Args:   []string{"inspect", "myctr"},
+				Stderr: "error: no such object: myctr",
+			}),
+		},
+		{
+			name: "wrong operation",
+			got: (dockerEngine{}).containerMissing(&cli.CLIError{
+				Binary: "docker", Args: []string{"delete", "myctr"},
+				Stderr: "Error response from daemon: No such container: myctr",
+			}),
+		},
+		{
+			name: "wrong target",
+			got: (appleEngine{}).containerMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"inspect", "myctr"},
+				Stderr: "Error: container not found: other",
+			}),
+		},
+		{
+			name: "application output on run",
+			got: createRaceMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: application: container not found: myctr",
+			}),
+		},
+		{
+			name: "application output on exec",
+			got: (appleEngine{}).containerMissing(&cli.CLIError{
+				Binary: "container", Args: []string{"exec", "myctr", "true"},
+				Stderr: "Error: application: container not found: myctr",
+			}),
+		},
+		{
+			name: "image wording on pull",
+			got: (dockerEngine{}).imageMissing(&cli.CLIError{
+				Binary: "docker", Args: []string{"pull", "redis:7-alpine"},
+				Stderr: "Error response from daemon: No such image: redis:7-alpine",
+			}),
+		},
+		{
+			name: "conflict wording on delete",
+			got: (dockerEngine{}).nameConflict(&cli.CLIError{
+				Binary: "docker", Args: []string{"rm", "--force", "myctr"},
+				Stderr: "Conflict. The container name \"/myctr\" is already in use by container abc",
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.got {
+				t.Fatal("ambiguous or cross-backend message was classified")
+			}
+		})
+	}
+}
+
+func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
+	cases := []struct {
+		name string
+		err  *cli.CLIError
+		want bool
+	}{
+		{
+			name: "direct apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+			want: true,
+		},
+		{
+			name: "wrapped apple race",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: failed to bootstrap container: container with ID myctr not found",
+			},
+			want: true,
+		},
+		{
+			name: "generic application message",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container not found: myctr",
+			},
+		},
+		{
+			name: "wrong command",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"exec", "myctr", "true"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+		},
+		{
+			name: "wrong target",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID other not found",
+			},
+		},
+		{
+			name: "wrong binary",
+			err: &cli.CLIError{
+				Binary: "docker", Args: []string{"run", "--name", "myctr"},
+				Stderr: "Error: container with ID myctr not found",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := createRaceMissing(tc.err); got != tc.want {
+				t.Fatalf("createRaceMissing() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+type ambiguousOriginalRunner struct {
+	*fakeRunner
+	original     *cli.CLIError
+	partial      bool
+	reuse        bool
+	runCalls     int
+	inspectCalls int
+	probeCalls   int
+	deleteCalls  int
+}
+
+func (r *ambiguousOriginalRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "run":
+		r.mu.Lock()
+		r.runCalls++
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return nil, nil, r.original
+	case "system":
+		r.mu.Lock()
+		r.probeCalls++
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return nil, nil, &cli.CLIError{
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: "XPC connection error",
+		}
+	case "inspect":
+		r.mu.Lock()
+		r.inspectCalls++
+		n := r.inspectCalls
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		if r.partial && ((!r.reuse && n > 0) || (r.reuse && n > 1)) {
+			return []byte(ownedInspectJSON(args[len(args)-1])), nil, nil
+		}
+		return nil, nil, &cli.CLIError{
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: "Error: container not found: " + args[len(args)-1],
+		}
+	case "delete":
+		r.mu.Lock()
+		r.deleteCalls++
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return nil, nil, nil
+	default:
+		return r.fakeRunner.Run(ctx, args...)
+	}
+}
+
+func TestAmbiguousRunPreservesOriginalAndCleansPartialCreate(t *testing.T) {
+	cases := []struct {
+		name        string
+		container   string
+		withReuse   bool
+		partial     bool
+		wantInspect int
+		wantProbe   int
+	}{
+		{name: "ordinary run", container: "ambiguous-run-original", wantInspect: 1, wantProbe: 1},
+		{name: "ordinary run partial", container: "ambiguous-run-partial", partial: true, wantInspect: 1},
+		{name: "reuse no retry", container: "ambiguous-reuse-original", withReuse: true, wantInspect: 2, wantProbe: 2},
+		{name: "reuse partial cleanup", container: "ambiguous-reuse-partial", withReuse: true, partial: true, wantInspect: 2, wantProbe: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			base := newTestRunner()
+			base.imagePresent = true
+			original := &cli.CLIError{
+				Binary: "container", Args: []string{"run", "--name", tc.container},
+				ExitCode: 1, Stderr: "Error: application: container not found: " + tc.container,
+			}
+			r := &ambiguousOriginalRunner{
+				fakeRunner: base, original: original, partial: tc.partial, reuse: tc.withReuse,
+			}
+			opts := []Option{WithName(tc.container), withRunner(r), withEngine(appleEngine{})}
+			if tc.withReuse {
+				opts = append(opts, WithReuse())
+			}
+			_, err := Run(context.Background(), "redis:7-alpine", opts...)
+			if err != original {
+				t.Fatalf("Run error = %v, want original CLIError", err)
+			}
+			if errors.Is(err, ErrSystemNotRunning) {
+				t.Fatal("ambiguous application error was classified as daemon down")
+			}
+			if r.runCalls != 1 {
+				t.Fatalf("run calls = %d, want 1", r.runCalls)
+			}
+			if r.probeCalls != tc.wantProbe {
+				t.Fatalf("probe calls = %d, want %d", r.probeCalls, tc.wantProbe)
+			}
+			if r.inspectCalls != tc.wantInspect {
+				t.Fatalf("inspect calls = %d, want %d", r.inspectCalls, tc.wantInspect)
+			}
+			wantDeletes := 0
+			if tc.partial {
+				wantDeletes = 1
+			}
+			if r.deleteCalls != wantDeletes {
+				t.Fatalf("delete calls = %d, want %d", r.deleteCalls, wantDeletes)
+			}
+		})
+	}
+}
+
+type pruneDeleteRunner struct {
+	list        string
+	deleteErr   error
+	deleteCalls int
+}
+
+func (r *pruneDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ls" {
+		return []byte(r.list), nil, nil
+	}
+	if args[0] == "delete" || args[0] == "rm" {
+		r.deleteCalls++
+		return nil, nil, r.deleteErr
+	}
+	return nil, nil, nil
+}
+
+func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
+	cases := []struct {
+		name    string
+		err     *cli.CLIError
+		wantIDs []string
+		wantErr bool
+	}{
+		{
+			name: "apple missing delete",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"delete", "--force", "id"},
+				Stderr: "Error: failed to delete container: container with ID id not found",
+			},
+			wantIDs: []string{"id"},
+		},
+		{
+			name: "ambiguous delete",
+			err: &cli.CLIError{
+				Binary: "container", Args: []string{"delete", "--force", "id"},
+				Stderr: "Error: application: container not found: id",
+			},
+			wantErr: true,
+		},
+		{
+			name: "docker delete through apple cleanup",
+			err: &cli.CLIError{
+				Binary: "docker", Args: []string{"rm", "--force", "id"},
+				Stderr: "Error response from daemon: No such container: id",
+			},
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &pruneDeleteRunner{list: "id\n", deleteErr: tc.err}
+			ids, err := pruneListed(context.Background(), r, appleEngine{}, []string{"ls"}, func(data []byte) ([]string, error) {
+				return splitNonEmptyLines(data), nil
+			}, "prune")
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("prune error = %v, want error=%v", err, tc.wantErr)
+			}
+			if !slices.Equal(ids, tc.wantIDs) {
+				t.Fatalf("removed = %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestImageMissingClassifierRejectsPullOperation(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker", Args: []string{"pull", "redis:7-alpine"},
+		Stderr: "Error response from daemon: No such image: redis:7-alpine",
+	}
+	if (dockerEngine{}).imageMissing(err) {
+		t.Fatal("pull output was classified as image-missing")
 	}
 }

@@ -206,6 +206,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
+	uid := cfg.eng.parseRunID(stdout)
+	if requiresImmutableID(cfg.eng) && !dockerIDRE.MatchString(uid) {
+		cleanupFailedCreate(ctx, cfg, nil, nil)
+		return nil, fmt.Errorf("container %s: docker run returned no valid immutable ID", cfg.name)
+	}
 
 	c := &Container{
 		id:        cfg.name,
@@ -214,17 +219,17 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
 	}
 	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. With an
-	// immutable ID the reaper deletes by it and needs no generation.
+	// test runner there is nothing external to clean up. Docker uses
+	// only the immutable ID; name-addressed backends use the generation.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
 		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
+		if requiresImmutableID(cfg.eng) {
 			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
 		} else {
 			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
@@ -288,7 +293,8 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return
 	}
 	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
+		actual, ok := info.labels[creationLabel]
+		if !ok || actual != cfg.creation {
 			return
 		}
 	}

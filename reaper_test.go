@@ -92,7 +92,10 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 
 	docker := newReaper(bin, "rm")
 	if err := docker.register("docker-name", ""); err == nil {
-		t.Error("Docker name without generation was accepted")
+		t.Error("Docker name without an immutable ID was accepted")
+	}
+	if err := docker.register("docker-name", "0123456789abcdef"); err == nil {
+		t.Error("generation-guarded Docker name was accepted")
 	}
 	if err := docker.register(strings.Repeat("A", 64), ""); err == nil {
 		t.Error("uppercase Docker ID was accepted")
@@ -118,14 +121,14 @@ func TestRegisterWithGlobalReaperRecordsError(t *testing.T) {
 	if err := registerWithGlobalReaper(binary, "rm", "bad id", ""); err == nil {
 		t.Fatal("registration unexpectedly succeeded")
 	}
-	if got := logs.String(); !strings.Contains(got, "reaper registration failed") || !strings.Contains(got, "invalid container id") {
+	if got := logs.String(); !strings.Contains(got, "reaper registration failed") || !strings.Contains(got, "full immutable ID") {
 		t.Fatalf("registration log = %q, want validation error", got)
 	}
 	if err := registerWithGlobalReaper(binary, "rm", "docker-name", ""); err == nil {
-		t.Fatal("generationless Docker name registration unexpectedly succeeded")
+		t.Fatal("Docker name registration unexpectedly succeeded")
 	}
-	if got := logs.String(); !strings.Contains(got, "no generation") {
-		t.Fatalf("registration log = %q, want generationless Docker rejection", got)
+	if got := logs.String(); !strings.Contains(got, "full immutable ID") {
+		t.Fatalf("registration log = %q, want Docker name rejection", got)
 	}
 }
 
@@ -320,58 +323,26 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/docker"
-	creation := "0123456789abcdef"
 	uid := strings.Repeat("ab", 32)
-	// Docker-style inspect: the generation matches and an immutable Id is
-	// present, so the delete must target the Id rather than the name.
-	script := "#!/bin/sh\n" +
-		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then\n" +
-		"  echo '    \"Id\": \"" + uid + "\",'\n" +
-		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
-		"fi\n"
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "rm")
-	if err := r.register("ctr", creation); err != nil {
+	if err := r.register(uid, "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
 	waitForLogLines(t, logPath, "rm --force "+uid)
-	if data, _ := os.ReadFile(logPath); !strings.Contains(string(data), "inspect --type=container ctr") {
-		t.Errorf("reaper inspect args = %q, want --type=container", data)
-	}
-	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "rm --force ctr") {
-		t.Fatalf("reaper deleted by name despite an immutable Id: %q", data)
+	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "inspect") {
+		t.Fatalf("immutable Docker entry unexpectedly inspected: %q", data)
 	}
 }
 
-func TestReaperDockerGenerationRequiresImmutableID(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "calls.log")
-	binPath := filepath.Join(dir, "docker")
-	creation := "0123456789abcdef"
-	script := "#!/bin/sh\n" +
-		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = inspect ]; then\n" +
-		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
-		"fi\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	r := newReaper(binPath, "rm")
-	if err := r.register("ctr", creation); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	r.closeStdin()
-	waitForLogLines(t, logPath, "inspect --type=container ctr")
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		data, _ := os.ReadFile(logPath)
-		if strings.Contains(string(data), "rm --force") {
-			t.Fatalf("Docker generation-guarded entry fell back to name: %q", data)
-		}
-		time.Sleep(20 * time.Millisecond)
+func TestReaperRejectsDockerNameEvenWithGeneration(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	if err := r.register("ctr", "0123456789abcdef"); err == nil {
+		t.Fatal("generation-guarded Docker name was accepted")
 	}
 }

@@ -16,6 +16,7 @@ type failRunRunner struct {
 	runErr      error
 	inspectJSON string
 	deleted     []string
+	creation    string
 }
 
 func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -23,13 +24,21 @@ func (r *failRunRunner) Run(ctx context.Context, args ...string) ([]byte, []byte
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if creation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = creation
+				}
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.runErr
 	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		creation := r.creation
 		r.mu.Unlock()
-		return []byte(r.inspectJSON), nil, nil
+		return []byte(strings.ReplaceAll(r.inspectJSON, "__CONTAINERGO_CREATION__", creation)), nil, nil
 	case "delete", "rm":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
@@ -51,7 +60,8 @@ func ownedInspectJSON(name string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q
+        "com.github.hirokazumiyaji.container-go.session": %q,
+        "com.github.hirokazumiyaji.container-go.creation": "__CONTAINERGO_CREATION__"
       }
     },
     "status": {"state": "created", "networks": []}
@@ -72,6 +82,24 @@ func foreignInspectJSON(name string) string {
     "status": {"state": "created", "networks": []}
   }
 ]`, name, name)
+}
+
+func unverifiableOwnedInspectJSON(name string) string {
+	return fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q
+      }
+    },
+    "status": {"state": "created", "networks": []}
+  }
+]`, name, name, sessionID())
 }
 
 func TestRunFailureCleansUpOwnedContainer(t *testing.T) {
@@ -126,6 +154,24 @@ func TestRunFailurePreservesForeignContainer(t *testing.T) {
 	}
 	if len(r.deleted) != 0 {
 		t.Fatalf("deleted = %v, want no cleanup for foreign container", r.deleted)
+	}
+}
+
+func TestRunFailurePreservesContainerWithMissingGeneration(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "port bind failed"},
+		inspectJSON: unverifiableOwnedInspectJSON("myctr"),
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no cleanup without a verified generation", r.deleted)
 	}
 }
 

@@ -25,14 +25,12 @@ import (
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
 // silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, the script inspects first and
-// reads the creation label as a structural JSON field: the match is
-// anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. When inspect
-// also reports an immutable "Id" (Docker), the delete targets that ID
-// instead of the name, so a same-name replacement created after the
-// check is simply not found. Apple Container has no such ID; there the
-// delete necessarily goes by name.
+// When a creation generation is known for a name-addressed Apple entry,
+// the script inspects first and reads the creation label as a structural
+// JSON field: the match is anchored at line start on the quoted key, so
+// label values or other text containing the same characters cannot satisfy
+// it. Docker entries are registered only by a full immutable ID and are
+// removed directly; a Docker name is never authorized for reaping.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -69,15 +67,8 @@ echo "$ids" | while IFS= read -r line; do
     tmp=$(mktemp 2>/dev/null) || continue
     (inspect_container "$id" >"$tmp" 2>/dev/null & pid=$!; (sleep "$inspect_timeout"; kill -9 "$pid" 2>/dev/null) & killer=$!; wait "$pid" 2>/dev/null; rc=$?; kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null; exit "$rc") || { rm -f "$tmp"; continue; }
     got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-    uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
     rm -f "$tmp"
     [ "$got" = "$creation" ] || continue
-    if [ "$sub" = "rm" ]; then
-      # A generation-guarded Docker entry must never fall back to its
-      # mutable name when inspect omitted a valid immutable ID.
-      [ -n "$uid" ] || continue
-      target="$uid"
-    fi
   fi
   run_with_timeout "$bin" "$sub" --force "$target" || true
 done
@@ -128,28 +119,29 @@ func newReaper(binary, subcommand string) *reaper {
 }
 
 func validReaperID(subcommand, id string) bool {
-	return nameRE.MatchString(id) || (subcommand == "rm" && dockerIDRE.MatchString(id))
+	if subcommand == "rm" {
+		return dockerIDRE.MatchString(id)
+	}
+	return nameRE.MatchString(id)
 }
 
 func validateReaperEntry(subcommand, id, creation string) (bool, error) {
 	if !validReaperID(subcommand, id) {
+		if subcommand == "rm" {
+			return false, fmt.Errorf("reaper: Docker entry %q is not a full immutable ID", id)
+		}
 		return false, fmt.Errorf("reaper: invalid container id %q", id)
-	}
-	// A full Docker ID is already immutable and needs no generation. A
-	// Docker name entry is only safe when it is generation-guarded.
-	if subcommand == "rm" && !dockerIDRE.MatchString(id) && creation == "" {
-		return false, fmt.Errorf("reaper: Docker name entry %q has no generation", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
 		return false, fmt.Errorf("reaper: invalid creation id %q", creation)
 	}
-	return subcommand == "rm" && dockerIDRE.MatchString(id), nil
+	return subcommand == "rm", nil
 }
 
 // register adds a container ID to the reaper's kill list, spawning or
 // respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; empty skips the generation check for Apple and
-// immutable Docker IDs, but never for a Docker name.
+// ID from creationLabel; it is used for name-addressed Apple entries.
+// Docker entries must be full immutable IDs and do not use this check.
 func (r *reaper) register(id, creation string) error {
 	immutableID, err := validateReaperEntry(r.subcommand, id, creation)
 	if err != nil {

@@ -776,6 +776,7 @@ type dockerRunner struct {
 	*fakeRunner
 	inspectJSON []byte
 	failInspect bool
+	runID       string
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -784,6 +785,9 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	case "info":
 		return []byte("ok"), nil, nil
 	case "run":
+		if d.runID != "" {
+			return []byte(d.runID + "\n"), nil, nil
+		}
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
@@ -823,6 +827,36 @@ func TestDockerParseRunID(t *testing.T) {
 		if got := e.parseRunID([]byte(out)); got != "" {
 			t.Errorf("parseRunID(%q) = %q, want empty", out, got)
 		}
+	}
+}
+
+func TestDockerRunRejectsInvalidImmutableID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+	}{
+		{name: "create"},
+		{name: "reuse", opts: []Option{WithReuse()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &dockerRunner{
+				fakeRunner:  newTestRunner(),
+				runID:       "not-an-immutable-id",
+				inspectJSON: []byte(`[]`),
+			}
+			d.imagePresent = true
+			opts := append([]Option{WithName("myctr"), withRunner(d), withEngine(dockerEngine{})}, tc.opts...)
+			ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
+			if ctr != nil {
+				t.Fatalf("Run returned container %+v after invalid ID", ctr)
+			}
+			if err == nil || !strings.Contains(err.Error(), "no valid immutable ID") {
+				t.Fatalf("Run error = %v, want invalid immutable ID error", err)
+			}
+			if rm := d.callWith("rm"); rm != nil {
+				t.Fatalf("invalid run output issued an unverified delete: %v", rm)
+			}
+		})
 	}
 }
 

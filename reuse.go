@@ -169,6 +169,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, classified
 	}
+	uid := cfg.eng.parseRunID(stdout)
+	if requiresImmutableID(cfg.eng) && !dockerIDRE.MatchString(uid) {
+		cleanupFailedCreate(ctx, cfg, nil, nil)
+		return nil, fmt.Errorf("reuse %s: docker run returned no valid immutable ID", cfg.name)
+	}
 
 	ctr := &Container{
 		id:        cfg.name,
@@ -178,7 +183,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		uid:       uid,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		_ = ctr.Terminate(context.WithoutCancel(ctx))

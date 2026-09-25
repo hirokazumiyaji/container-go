@@ -105,6 +105,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
+		if slices.Contains(args, "--pull") {
+			// Docker prints the immutable container ID from `run`.
+			return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
+		}
 		return []byte(args[len(args)-1] + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON

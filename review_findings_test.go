@@ -301,13 +301,17 @@ func (r *reviewAppleStateRunner) Run(_ context.Context, args ...string) ([]byte,
 }
 
 func TestCleanupRefusesForeignCreationEvenWithMatchingSession(t *testing.T) {
+	const foreignCreation = "bbbbbbbbbbbbbbbb"
 	runner := &dockerRunner{
 		fakeRunner:  newTestRunner(),
-		inspectJSON: []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{"managed":"true","session":%q,"creation":"bbbbbbbbbbbbbbbb"}}}]`, dockerFixtureID, sessionID())),
+		inspectJSON: []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q,%q:%q}}}]`, dockerFixtureID, managedLabel, sessionLabel, sessionID(), creationLabel, foreignCreation)),
 	}
 	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr", creation: "aaaaaaaaaaaaaaaa"}
 	if err := cleanupFailedCreate(context.Background(), cfg, errors.New("failed"), errors.New("failed")); err != nil {
 		t.Fatalf("cleanup error = %v", err)
+	}
+	if inspect := runner.callWith("inspect"); len(inspect) == 0 || inspect[len(inspect)-1] != "myctr" {
+		t.Fatalf("cleanup inspect calls = %v, want a fresh name inspect", inspect)
 	}
 	if len(runner.callWith("rm")) != 0 {
 		t.Fatal("cleanup deleted a different creation generation")

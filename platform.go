@@ -86,30 +86,24 @@ func (m platformMetadata) normalized() string {
 	return strings.Join(parts, "/")
 }
 
-func (m platformMetadata) hasEmptyReportedComponent() bool {
-	return (m.osSet && m.os == "") ||
-		(m.archSet && m.architecture == "") ||
-		(m.variantSet && m.variant == "")
-}
-
 func (m platformMetadata) has(selector platformParts) (string, bool, bool) {
-	// The second result says whether the selected component was reported;
+	// The second result says whether the selected components all matched;
 	// the third says whether the observed metadata was structurally valid.
-	if !m.valid || m.hasEmptyReportedComponent() {
+	if !m.valid {
 		return "", false, false
 	}
 	if selector.os != "" {
-		if !m.osSet || !strings.EqualFold(selector.os, m.os) {
+		if !m.osSet || m.os == "" || !strings.EqualFold(selector.os, m.os) {
 			return "", false, true
 		}
 	}
 	if selector.architecture != "" {
-		if !m.archSet || !strings.EqualFold(selector.architecture, m.architecture) {
+		if !m.archSet || m.architecture == "" || !strings.EqualFold(selector.architecture, m.architecture) {
 			return "", false, true
 		}
 	}
 	if selector.variant != "" {
-		if !m.variantSet || !strings.EqualFold(selector.variant, m.variant) {
+		if !m.variantSet || m.variant == "" || !strings.EqualFold(selector.variant, m.variant) {
 			return "", false, true
 		}
 	}

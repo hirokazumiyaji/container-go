@@ -28,6 +28,25 @@ func TestDockerPlatformCompatible(t *testing.T) {
 	}
 }
 
+func TestPlatformSelectorChecksOnlyNamedComponents(t *testing.T) {
+	reported := platformMetadataFromParts("linux", "arm64", "", true, true, true)
+	if actual := reported.normalized(); actual != "linux/arm64/" {
+		t.Fatalf("normalized platform = %q", actual)
+	}
+	if !platformMetadataMatches("linux/arm64", reported) {
+		t.Fatal("empty unreported variant invalidated an architecture-only selector")
+	}
+	if platformSelectorUnverifiable("linux/arm64", reported.normalized()) {
+		t.Fatal("architecture-only selector was reported as unverifiable")
+	}
+	if platformMetadataMatches("linux/arm/v7", reported) {
+		t.Fatal("empty selected variant was treated as a match")
+	}
+	if platformMetadataMatches("darwin/arm64", reported) {
+		t.Fatal("different selected OS was treated as a match")
+	}
+}
+
 func TestApplePlatformSelectorIsArchitectureAware(t *testing.T) {
 	tests := []struct {
 		name     string

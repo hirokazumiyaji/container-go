@@ -67,6 +67,50 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	return ctr, nil
 }
 
+func waitReusePoll(ctx context.Context) error {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// inspectReuseCandidate serializes Apple adoption with failed-create
+// cleanup. A created generation is held under the name lock until it
+// becomes running, so a cleanup that observed Created cannot delete it
+// after a peer has begun adoption.
+func inspectReuseCandidate(ctx context.Context, cfg *config) (*engineInfo, error) {
+	if cfg.eng.name() != "apple" {
+		return inspectNamed(ctx, cfg, cfg.name)
+	}
+	unlock, err := lockName(ctx, cfg.name)
+	if err != nil {
+		return nil, fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
+	}
+	defer unlock()
+	for {
+		info, err := inspectNamed(ctx, cfg, cfg.name)
+		if err != nil {
+			return nil, err
+		}
+		switch info.state {
+		case StateRunning, StateStopped:
+			return info, nil
+		case StateCreated, StateStopping, StateUnknown:
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
+		default:
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
+		}
+	}
+}
+
 // reuseEnsureContainer creates or attaches to the named container
 // without per-caller wait or port compatibility checks. Those run in
 // reuseRun so every concurrent caller applies its own configuration.
@@ -81,7 +125,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			return nil, err
 		}
 
-		info, err := inspectNamed(ctx, cfg, cfg.name)
+		info, err := inspectReuseCandidate(ctx, cfg)
 		if err != nil {
 			if !isNotFoundFor(cfg.eng, err) {
 				return nil, err
@@ -91,6 +135,22 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// not be cut off after reuseAttachTimeout.
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
 			if createErr == nil {
+				if ctr.info != nil && ctr.info.state == StateRunning {
+					return ctr, nil
+				}
+				info, inspectErr := inspectReuseCandidate(ctx, cfg)
+				if inspectErr != nil {
+					if isNotFoundFor(cfg.eng, inspectErr) {
+						continue
+					}
+					return nil, inspectErr
+				}
+				if info.state != StateRunning {
+					continue
+				}
+				ctr.info = info
+				ctr.creation = info.labels[creationLabel]
+				ctr.uid = info.uid
 				return ctr, nil
 			}
 			// nameConflict: another process won create. createRaceMissing
@@ -100,7 +160,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// conflict must not make a failed create look like a peer win.
 			primaryErr := primaryOperationError(createErr)
 			if cfg.eng.nameConflict(primaryErr) || createRaceMissing(primaryErr) {
-				time.Sleep(reusePollInterval)
+				if err := waitReusePoll(ctx); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			return nil, createErr
@@ -108,7 +170,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
 			continue
 		case StateStopped:
 			if recreated {
@@ -140,7 +204,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				uid:       info.uid,
 			}, nil
 		default:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, err
+			}
 		}
 	}
 }
@@ -166,8 +232,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {

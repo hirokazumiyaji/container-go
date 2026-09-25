@@ -470,6 +470,29 @@ func TestBuiltInWaitFailurePreservesPrimaryAndCleanupCLIError(t *testing.T) {
 	}
 }
 
+func TestFailedCreateDoesNotDeleteRunningGeneration(t *testing.T) {
+	base := newTestRunner()
+	r := &failRunRunner{
+		fakeRunner:  base,
+		inspectJSON: ownedInspectJSONWithState("myctr", "running", false),
+	}
+	cfg := &config{
+		runner:   r,
+		eng:      appleEngine{},
+		name:     "myctr",
+		creation: "0123456789abcdef",
+	}
+	r.creation = cfg.creation
+	runErr := errors.New("create failed")
+	if err := cleanupFailedCreate(context.Background(), cfg, runErr, runErr); err == nil ||
+		!strings.Contains(err.Error(), "running generation") {
+		t.Fatalf("cleanupFailedCreate = %v, want running-generation refusal", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no automatic delete of running generation", r.deleted)
+	}
+}
+
 func TestReuseFailedCreateDoesNotDeleteRunningGeneration(t *testing.T) {
 	base := newTestRunner()
 	base.imagePresent = true
@@ -490,11 +513,11 @@ func TestReuseFailedCreateDoesNotDeleteRunningGeneration(t *testing.T) {
 	if !errors.As(err, &cleanupErr) {
 		t.Fatalf("error = %v, want CleanupError", err)
 	}
-	if !strings.Contains(cleanupErr.CleanupErr.Error(), "running reuse generation") {
+	if !strings.Contains(cleanupErr.CleanupErr.Error(), "running generation") {
 		t.Fatalf("cleanup error = %v, want running-generation refusal", cleanupErr.CleanupErr)
 	}
 	if len(inner.deleted) != 0 {
-		t.Fatalf("deleted = %v, want no automatic delete of running reuse generation", inner.deleted)
+		t.Fatalf("deleted = %v, want no automatic delete of running generation", inner.deleted)
 	}
 }
 

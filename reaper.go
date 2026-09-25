@@ -19,8 +19,8 @@ import (
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data validated against Apple Container's name rule, and the script
-// itself disables globbing and quotes every expansion the IDs reach.
+// data validated as an Apple Container name or a full Docker ID, and the
+// script itself disables globbing and quotes every expansion the IDs reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay
@@ -117,10 +117,13 @@ func newReaper(binary, subcommand string) *reaper {
 // ID from creationLabel; it may be empty only for a Docker-style
 // immutable container ID, never for a name-addressed target.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
+	immutableID := r.subcommand == "rm" && dockerIDRE.MatchString(id)
+	if !nameRE.MatchString(id) && !immutableID {
 		return fmt.Errorf("reaper: invalid container id %q", id)
 	}
-	if creation == "" && !dockerIDRE.MatchString(id) {
+	if immutableID {
+		creation = ""
+	} else if creation == "" {
 		return fmt.Errorf("reaper: creation id is required for name-addressed container %q", id)
 	}
 	if creation != "" && !creationRE.MatchString(creation) {
@@ -221,12 +224,12 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) {
+// process-wide reaper for its backend binary. Reaper trouble is logged
+// but never fails container startup. The reaper needs /bin/sh, so on
+// Windows this is a no-op and cleanup relies on the normal paths.
+func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
 	if runtime.GOOS == "windows" {
-		return
+		return nil
 	}
 	globalReapersMu.Lock()
 	r, ok := globalReapers[binary]
@@ -235,5 +238,9 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
 }

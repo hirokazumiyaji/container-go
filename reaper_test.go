@@ -3,6 +3,7 @@ package container
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -75,6 +76,27 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 	if err := r.register("unidentified", ""); err == nil {
 		t.Error("register name without creation: want error")
+	}
+}
+
+func TestReaperAcceptsFullDockerID(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	uid := strings.Repeat("ab", 32)
+	if err := r.register(uid, ""); err != nil {
+		t.Fatalf("register full Docker ID = %v, want nil", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "rm --force "+uid)
+}
+
+func TestRegisterWithGlobalReaperReturnsRegistrationError(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("reaper is unavailable on Windows")
+	}
+	err := registerWithGlobalReaper(filepath.Join(t.TempDir(), "invalid-reaper"), "rm", strings.Repeat("A", 64), "")
+	if err == nil || !strings.Contains(err.Error(), "invalid container id") {
+		t.Fatalf("registerWithGlobalReaper = %v, want observable registration error", err)
 	}
 }
 

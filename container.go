@@ -106,6 +106,23 @@ type Container struct {
 	inspectMu sync.Mutex  // serializes fresh inspects and protects uid
 }
 
+// runCreateLocked serializes an Apple name-addressed create with the
+// generation-checked cleanup/adoption lock. attempted is false when the
+// lock could not be acquired, so callers must not run failed-create
+// cleanup for a command that was never issued.
+func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout []byte, attempted bool, err error) {
+	unlock := func() {}
+	if cfg.eng.name() == "apple" {
+		unlock, err = lockName(ctx, cfg.name)
+		if err != nil {
+			return nil, false, fmt.Errorf("create %s: lock name: %w", cfg.name, err)
+		}
+	}
+	defer unlock()
+	stdout, _, err = cfg.runner.Run(ctx, args...)
+	return stdout, true, err
+}
+
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
 // removed before returning. WithReuse switches to get-or-create; see
@@ -163,8 +180,11 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
+		if !attempted {
+			return nil, err
+		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
 		return nil, withCleanupError(classified, cleanupErr)
@@ -188,9 +208,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			bin = cfg.eng.binary()
 		}
 		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
 		} else {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
 	}
 
@@ -280,8 +300,8 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
-	if cfg.reuse && info.state == StateRunning {
-		return fmt.Errorf("cleanup container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)
+	if info.state == StateRunning {
+		return fmt.Errorf("cleanup container %s: running generation may already be adopted; refusing automatic deletion", cfg.name)
 	}
 	if err := ctr.delete(cleanupCtx, target); err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)

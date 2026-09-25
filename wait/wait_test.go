@@ -513,6 +513,51 @@ func TestForExecRetainsReadinessCauseAtTimeout(t *testing.T) {
 	}
 }
 
+type anyImmediateErrorStrategy struct{ err error }
+
+func (s anyImmediateErrorStrategy) WaitUntilReady(context.Context, Target) error {
+	return s.err
+}
+
+type anyNonCooperativeStrategy struct {
+	release chan struct{}
+}
+
+func (s anyNonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
+	<-s.release
+	return nil
+}
+
+func TestForAnyStartupTimeoutDoesNotDrainNoncooperativeStrategy(t *testing.T) {
+	cause := errors.New("child readiness failed")
+	release := make(chan struct{})
+	strategy := ForAny(
+		anyImmediateErrorStrategy{err: cause},
+		anyNonCooperativeStrategy{release: release},
+	).WithStartupTimeout(30 * time.Millisecond)
+
+	start := time.Now()
+	done := make(chan error, 1)
+	go func() { done <- strategy.WaitUntilReady(context.Background(), newFakeTarget()) }()
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(500 * time.Millisecond):
+		close(release)
+		t.Fatal("ForAny did not honor its startup timeout")
+	}
+	close(release)
+	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
+		t.Fatalf("ForAny took %v, want bounded timeout", elapsed)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline exceeded", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want collected child cause", err)
+	}
+}
+
 func TestForExecRejectsEmptyCommand(t *testing.T) {
 	target := newFakeTarget()
 	s := ForExec(nil).WithStartupTimeout(60 * time.Second)

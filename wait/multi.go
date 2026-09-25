@@ -137,44 +137,68 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	}
 
 	var errs []error
-	remaining := len(s.strategies)
-	var terminal error
-	for remaining > 0 {
-		if terminal != nil {
-			// Built-in strategies honor cancellation. Collect their final
-			// errors so a timeout does not erase the readiness cause.
-			if err := <-results; err != nil {
-				errs = append(errs, err)
-			}
-			remaining--
-			continue
-		}
+	for remaining := len(s.strategies); remaining > 0; {
 		select {
 		case err := <-results:
 			remaining--
-			if terminal = anyContextError(callerCtx, waitCtx, s.startupTimeout); terminal == nil && err == nil {
+			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout); terminal != nil {
+				if err != nil {
+					errs = append(errs, err)
+				}
+				return anyTerminalError(terminal, errs)
+			}
+			if err == nil {
 				return nil
 			}
-			if err != nil {
-				errs = append(errs, err)
-			}
+			errs = append(errs, err)
 		case <-waitCtx.Done():
-			terminal = anyContextError(callerCtx, waitCtx, s.startupTimeout)
+			terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout)
 			if terminal == nil {
 				terminal = newWaitError("wait for any: context ended", context.Canceled)
 			}
+			// A custom Strategy is allowed to ignore cancellation. Give
+			// cooperative children only a small, bounded collection window
+			// for their final causes, then return without waiting for the
+			// remaining children.
+			drain := time.NewTimer(anyResultDrainWindow(s.startupTimeout))
+			defer drain.Stop()
+			for remaining > 0 {
+				select {
+				case err := <-results:
+					remaining--
+					if err != nil {
+						errs = append(errs, err)
+					}
+				case <-drain.C:
+					return anyTerminalError(terminal, errs)
+				}
+			}
+			return anyTerminalError(terminal, errs)
 		}
 	}
-	if terminal == nil {
-		terminal = anyContextError(callerCtx, waitCtx, s.startupTimeout)
-	}
-	if terminal != nil {
-		causes := make([]error, 0, len(errs)+1)
-		causes = append(causes, terminal)
-		causes = append(causes, errs...)
-		return newWaitError(fmt.Sprintf("%v", terminal), causes...)
-	}
 	return errors.Join(errs...)
+}
+
+// anyResultDrainWindow gives cooperative children a short opportunity to
+// publish their terminal cause without turning cancellation into a second
+// unbounded wait for a custom strategy.
+func anyResultDrainWindow(startupTimeout time.Duration) time.Duration {
+	const maxDrain = 10 * time.Millisecond
+	if startupTimeout > 0 && startupTimeout/2 < maxDrain {
+		return startupTimeout / 2
+	}
+	return maxDrain
+}
+
+func anyTerminalError(terminal error, errs []error) error {
+	primary := terminal
+	if cause := errors.Unwrap(terminal); cause != nil {
+		primary = cause
+	}
+	causes := make([]error, 0, len(errs)+2)
+	causes = append(causes, primary, terminal)
+	causes = append(causes, errs...)
+	return newWaitError(fmt.Sprintf("%v", terminal), causes...)
 }
 
 func anyContextError(callerCtx, waitCtx context.Context, startupTimeout time.Duration) error {

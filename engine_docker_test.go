@@ -2,12 +2,14 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -173,17 +175,13 @@ func TestDockerListArgsIncludeStoppedStatuses(t *testing.T) {
 	}
 }
 
-type dockerPruneCandidate struct {
-	id      string
-	status  string
-	managed bool
-}
-
-// dockerPruneRunner models Docker's repeated status filters: containers
-// matching any requested status are returned, while other states are not.
+// dockerPruneRunner returns a fixed response for the exact expected
+// docker ps command. It does not synthesize a dead result from the presence
+// of a status filter; the test supplies an explicit daemon response.
 type dockerPruneRunner struct {
 	calls      [][]string
-	candidates []dockerPruneCandidate
+	listArgs   []string
+	listOutput string
 }
 
 func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -191,30 +189,23 @@ func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []by
 	if args[0] != "ps" {
 		return nil, nil, nil
 	}
-
-	var ids []string
-	for _, candidate := range d.candidates {
-		if !candidate.managed || !slices.Contains(args, "label="+managedLabel+"=true") {
-			continue
-		}
-		if slices.Contains(args, "status="+candidate.status) {
-			ids = append(ids, candidate.id)
-		}
+	if !slices.Equal(args, d.listArgs) {
+		return nil, nil, fmt.Errorf("unexpected docker ps args: got %v, want %v", args, d.listArgs)
 	}
-	if len(ids) == 0 {
-		return nil, nil, nil
-	}
-	return []byte(strings.Join(ids, "\n") + "\n"), nil, nil
+	return []byte(d.listOutput), nil, nil
 }
 
 func TestDockerPruneRemovesExitedAndDeadOnly(t *testing.T) {
-	f := &dockerPruneRunner{candidates: []dockerPruneCandidate{
-		{id: "exited", status: "exited", managed: true},
-		{id: "dead", status: "dead", managed: true},
-		{id: "created", status: "created", managed: true},
-		{id: "running", status: "running", managed: true},
-		{id: "unmanaged", status: "exited"},
-	}}
+	f := &dockerPruneRunner{
+		listArgs: []string{
+			"ps", "--all", "--quiet",
+			"--filter", "label=" + managedLabel + "=true",
+			"--filter", "status=exited",
+			"--filter", "status=dead",
+			"--format", "{{.Names}}",
+		},
+		listOutput: "exited\ndead\n",
+	}
 
 	removed, err := pruneWith(context.Background(), f, dockerEngine{})
 	if err != nil {

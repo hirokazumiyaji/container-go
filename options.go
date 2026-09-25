@@ -6,6 +6,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -13,6 +14,20 @@ import (
 
 // Option configures Run.
 type Option func(*config) error
+
+const (
+	// maxOptionCount bounds both the number of Option functions and the
+	// number of values in each public collection option. It is a
+	// backend-neutral guard against accidentally building an unbounded
+	// argv or env file.
+	maxOptionCount = 128
+	// maxMemoryBytes is a portable, backend-neutral ceiling. Individual
+	// backends may enforce a smaller capability limit in checkConfig.
+	maxMemoryBytes     uint64 = 1 << 50 // 1 PiB
+	maxVolumeNameBytes        = 255
+	maxMountPathBytes         = 4096
+	maxReuseGroupBytes        = 128
+)
 
 type config struct {
 	runner       cli.Runner
@@ -45,6 +60,58 @@ func newConfig() *config {
 		env:    map[string]string{},
 		labels: map[string]string{},
 	}
+}
+
+func checkOptionCount(option string, n int) error {
+	if n > maxOptionCount {
+		return validationErrorf(option, n, "option count exceeds maximum %d: got %d", maxOptionCount, n)
+	}
+	return nil
+}
+
+func (c *config) validate() error {
+	if err := checkOptionCount("environment", len(c.env)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("labels", len(c.labels)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("exposed ports", len(c.exposed)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("published ports", len(c.published)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("mounts", len(c.mounts)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("files", len(c.files)); err != nil {
+		return err
+	}
+	if err := checkOptionCount("command arguments", len(c.cmd)); err != nil {
+		return err
+	}
+	if c.memory != "" {
+		if err := validateMemorySize(c.memory); err != nil {
+			return err
+		}
+	}
+	if c.reuseGroup != "" {
+		if err := validateReuseGroup(c.reuseGroup); err != nil {
+			return err
+		}
+	}
+	for _, m := range c.mounts {
+		if err := m.validate(); err != nil {
+			return err
+		}
+	}
+	for _, f := range c.files {
+		if err := validateContainerPath(f.ContainerPath); err != nil {
+			return newValidationError("WithFiles", f, err)
+		}
+	}
+	return nil
 }
 
 // allLabels merges the session labels the library always applies with
@@ -92,7 +159,9 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 		args = append(args, "--publish", raw)
 	}
 	for _, m := range c.mounts {
-		args = append(args, "--mount", m.arg())
+		if arg := m.arg(); arg != "" {
+			args = append(args, "--mount", arg)
+		}
 	}
 	if c.cpus > 0 {
 		args = append(args, "--cpus", strconv.Itoa(c.cpus))
@@ -137,11 +206,8 @@ func WithReuse() Option {
 // shared container. Requires WithReuse.
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
-		if group == "" {
-			return fmt.Errorf("reuse group must not be empty")
-		}
-		if len(group) > 128 || !labelKeyRE.MatchString(group) {
-			return fmt.Errorf("invalid reuse group %q", group)
+		if err := validateReuseGroup(group); err != nil {
+			return err
 		}
 		c.reuseGroup = group
 		return nil
@@ -155,6 +221,16 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 // labelKeyRE is the Docker-style label key rule the CLI enforces,
 // extended with slash-separated OCI segments.
 var labelKeyRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:[./][a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$`)
+
+func validateReuseGroup(group string) error {
+	if group == "" {
+		return validationErrorf("reuse group", group, "reuse group must not be empty")
+	}
+	if len(group) > maxReuseGroupBytes || !labelKeyRE.MatchString(group) {
+		return validationErrorf("reuse group", group, "invalid reuse group %q", group)
+	}
+	return nil
+}
 
 // imageRE keeps image references to registry-reference characters and,
 // critically, rejects a leading dash so an image can never be parsed as
@@ -180,7 +256,7 @@ func withEngine(e engine) Option {
 func WithName(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid container name %q: must match %s", name, nameRE)
+			return validationErrorf("WithName", name, "invalid container name %q: must match %s", name, nameRE)
 		}
 		c.name = name
 		return nil
@@ -191,12 +267,15 @@ func WithName(name string) Option {
 // temporary env file so values never appear in the process table.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithEnv", len(env)); err != nil {
+			return err
+		}
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") {
-				return fmt.Errorf("invalid environment variable name %q", k)
+				return validationErrorf("WithEnv", k, "invalid environment variable name %q", k)
 			}
 			if strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("environment variable %s: value must not contain newlines", k)
+				return validationErrorf("WithEnv", k, "environment variable %s: value must not contain newlines", k)
 			}
 			c.env[k] = v
 		}
@@ -207,6 +286,9 @@ func WithEnv(env map[string]string) Option {
 // WithCmd overrides the arguments passed to the image's entrypoint.
 func WithCmd(cmd ...string) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithCmd", len(cmd)); err != nil {
+			return err
+		}
 		c.cmd = cmd
 		return nil
 	}
@@ -218,7 +300,7 @@ func WithCmd(cmd ...string) Option {
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
 		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
-			return fmt.Errorf("invalid entrypoint %q", entrypoint)
+			return validationErrorf("WithEntrypoint", entrypoint, "invalid entrypoint %q", entrypoint)
 		}
 		c.entrypoint = entrypoint
 		return nil
@@ -229,13 +311,21 @@ func WithEntrypoint(entrypoint string) Option {
 // that MappedPort and Endpoint may resolve.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithExposedPorts", len(ports)); err != nil {
+			return err
+		}
+		if len(c.exposed)+len(ports) > maxOptionCount {
+			return validationErrorf("WithExposedPorts", len(c.exposed)+len(ports), "option count exceeds maximum %d: got %d", maxOptionCount, len(c.exposed)+len(ports))
+		}
+		specs := make([]portSpec, 0, len(ports))
 		for _, p := range ports {
 			spec, err := parsePortSpec(p)
 			if err != nil {
-				return err
+				return newValidationError("WithExposedPorts", p, err)
 			}
-			c.exposed = append(c.exposed, spec)
+			specs = append(specs, spec)
 		}
+		c.exposed = append(c.exposed, specs...)
 		return nil
 	}
 }
@@ -245,9 +335,12 @@ func WithExposedPorts(ports ...string) Option {
 // resolve to the container's own IP, which needs no host port at all.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
+		if len(c.published) >= maxOptionCount {
+			return validationErrorf("WithPublishedPort", len(c.published)+1, "option count exceeds maximum %d: got %d", maxOptionCount, len(c.published)+1)
+		}
 		ps, err := parsePublishSpec(spec)
 		if err != nil {
-			return err
+			return newValidationError("WithPublishedPort", spec, err)
 		}
 		c.published = append(c.published, ps)
 		return nil
@@ -258,19 +351,22 @@ func WithPublishedPort(spec string) Option {
 // always applies. Internal labels are reserved and rejected.
 func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithLabels", len(labels)); err != nil {
+			return err
+		}
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
-				return fmt.Errorf("invalid label key %q", k)
+				return validationErrorf("WithLabels", k, "invalid label key %q", k)
 			}
 			switch k {
 			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
-				return fmt.Errorf("label key %q is reserved", k)
+				return validationErrorf("WithLabels", k, "label key %q is reserved", k)
 			}
 			if len(k)+len(v)+1 > 4096 {
-				return fmt.Errorf("label %s: key=value exceeds 4096 bytes", k)
+				return validationErrorf("WithLabels", k, "label %s: key=value exceeds 4096 bytes", k)
 			}
 			if strings.ContainsAny(v, "\x00") {
-				return fmt.Errorf("label %s: value must not contain NUL", k)
+				return validationErrorf("WithLabels", k, "label %s: value must not contain NUL", k)
 			}
 			c.labels[k] = v
 		}
@@ -281,12 +377,18 @@ func WithLabels(labels map[string]string) Option {
 // WithMounts adds bind, volume, or tmpfs mounts.
 func WithMounts(mounts ...Mount) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithMounts", len(mounts)); err != nil {
+			return err
+		}
+		if len(c.mounts)+len(mounts) > maxOptionCount {
+			return validationErrorf("WithMounts", len(c.mounts)+len(mounts), "option count exceeds maximum %d: got %d", maxOptionCount, len(c.mounts)+len(mounts))
+		}
 		for _, m := range mounts {
 			if err := m.validate(); err != nil {
 				return err
 			}
-			c.mounts = append(c.mounts, m)
 		}
+		c.mounts = append(c.mounts, mounts...)
 		return nil
 	}
 }
@@ -295,21 +397,57 @@ func WithMounts(mounts ...Mount) Option {
 func WithCPUs(n int) Option {
 	return func(c *config) error {
 		if n < 1 {
-			return fmt.Errorf("cpus must be >= 1, got %d", n)
+			return validationErrorf("WithCPUs", n, "cpus must be >= 1, got %d", n)
 		}
 		c.cpus = n
 		return nil
 	}
 }
 
-// memoryRE accepts sizes like "512M" or "1G".
+// memoryRE accepts sizes like "512M" or "1G". Unit support beyond
+// this syntax is a backend capability and is checked separately.
 var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
+
+func validateMemorySize(size string) error {
+	if !memoryRE.MatchString(size) {
+		return validationErrorf("WithMemory", size, "invalid memory size %q", size)
+	}
+
+	digits := size
+	unit := uint64(1)
+	if last := size[len(size)-1]; last < '0' || last > '9' {
+		digits = size[:len(size)-1]
+		switch last {
+		case 'K':
+			unit = 1 << 10
+		case 'M':
+			unit = 1 << 20
+		case 'G':
+			unit = 1 << 30
+		case 'T':
+			unit = 1 << 40
+		case 'P':
+			unit = 1 << 50
+		}
+	}
+	value, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		return newValidationError("WithMemory", size, fmt.Errorf("invalid or overflowing memory size %q: %w", size, err))
+	}
+	if value == 0 {
+		return validationErrorf("WithMemory", size, "memory size must be greater than zero: %q", size)
+	}
+	if value > maxMemoryBytes/unit {
+		return validationErrorf("WithMemory", size, "memory size overflows the %d-byte maximum: %q", maxMemoryBytes, size)
+	}
+	return nil
+}
 
 // WithMemory sets the VM memory size, e.g. "512M" or "1G".
 func WithMemory(size string) Option {
 	return func(c *config) error {
-		if !memoryRE.MatchString(size) {
-			return fmt.Errorf("invalid memory size %q", size)
+		if err := validateMemorySize(size); err != nil {
+			return err
 		}
 		c.memory = size
 		return nil
@@ -323,7 +461,7 @@ var userRE = regexp.MustCompile(`^[a-zA-Z0-9._][a-zA-Z0-9._-]*(:[a-zA-Z0-9._-]+)
 func WithUser(u string) Option {
 	return func(c *config) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid user %q", u)
+			return validationErrorf("WithUser", u, "invalid user %q", u)
 		}
 		c.user = u
 		return nil
@@ -334,7 +472,7 @@ func WithUser(u string) Option {
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("working directory %q must be an absolute path", dir)
+			return validationErrorf("WithWorkingDir", dir, "working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
 		return nil
@@ -346,7 +484,7 @@ func WithWorkingDir(dir string) Option {
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid network name %q", name)
+			return validationErrorf("WithNetwork", name, "invalid network name %q", name)
 		}
 		c.network = name
 		return nil
@@ -361,7 +499,7 @@ var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
 func WithPlatform(p string) Option {
 	return func(c *config) error {
 		if !platformRE.MatchString(p) {
-			return fmt.Errorf("invalid platform %q", p)
+			return validationErrorf("WithPlatform", p, "invalid platform %q", p)
 		}
 		c.platform = p
 		return nil
@@ -370,6 +508,11 @@ func WithPlatform(p string) Option {
 
 // MountType selects how a Mount is backed.
 type MountType int
+
+// volumeNameRE matches the portable Docker/OCI volume-name grammar:
+// one leading alphanumeric followed by name characters. Backend-specific
+// volume capability checks remain in each engine.
+var volumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 const (
 	// MountBind mounts a host directory (virtiofs).
@@ -389,24 +532,39 @@ type Mount struct {
 }
 
 func (m Mount) validate() error {
-	if strings.ContainsAny(m.Source, ",=\x00") || strings.ContainsAny(m.Target, ",=\x00") {
-		return fmt.Errorf("mount %q -> %q: paths must not contain ',' or '='", m.Source, m.Target)
+	if m.Type < MountBind || m.Type > MountTmpfs {
+		return validationErrorf("mount", m, "unknown mount type %d", m.Type)
+	}
+	if len(m.Source) > maxMountPathBytes || len(m.Target) > maxMountPathBytes {
+		return validationErrorf("mount", m, "mount paths exceed the %d-byte maximum", maxMountPathBytes)
+	}
+	if !utf8.ValidString(m.Source) || !utf8.ValidString(m.Target) {
+		return validationErrorf("mount", m, "mount paths must be valid UTF-8")
+	}
+	if strings.ContainsAny(m.Source, ",=\x00\r\n") || strings.ContainsAny(m.Target, ",=\x00\r\n") {
+		return validationErrorf("mount", m, "mount %q -> %q: paths must not contain ',' or '=' or control characters", m.Source, m.Target)
 	}
 	if !strings.HasPrefix(m.Target, "/") {
-		return fmt.Errorf("mount target %q must be absolute", m.Target)
+		return validationErrorf("mount", m, "mount target %q must be absolute", m.Target)
 	}
 	switch m.Type {
 	case MountBind:
 		if !strings.HasPrefix(m.Source, "/") {
-			return fmt.Errorf("bind mount source %q must be an absolute host path", m.Source)
+			return validationErrorf("mount", m, "bind mount source %q must be an absolute host path", m.Source)
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+			return validationErrorf("mount", m, "volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+		}
+		if len(m.Source) > maxVolumeNameBytes {
+			return validationErrorf("mount", m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
+		}
+		if !volumeNameRE.MatchString(m.Source) {
+			return validationErrorf("mount", m, "invalid volume name %q", m.Source)
 		}
 	case MountTmpfs:
 		if m.Source != "" {
-			return fmt.Errorf("tmpfs mount for %q must not have a source", m.Target)
+			return validationErrorf("mount", m, "tmpfs mount for %q must not have a source", m.Target)
 		}
 	}
 	return nil
@@ -421,6 +579,11 @@ func (m Mount) arg() string {
 		b.WriteString("type=volume,source=" + m.Source)
 	case MountTmpfs:
 		b.WriteString("type=tmpfs")
+	default:
+		// Run validates mounts before argv construction. Keep a direct
+		// call from producing a partial --mount value if that invariant
+		// is ever bypassed by internal code.
+		return ""
 	}
 	b.WriteString(",target=" + m.Target)
 	if m.ReadOnly {

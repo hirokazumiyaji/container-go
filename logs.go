@@ -12,11 +12,18 @@ import (
 )
 
 // LogsOptions bounds a Logs snapshot. Tail keeps the last N lines
-// (0 means all); Since drops entries older than the timestamp. Both
-// map to the backend CLI's --tail/--since flags.
+// (it must be non-negative; 0 means all); Since drops entries older than
+// the timestamp. Both map to the backend CLI's --tail/--since flags.
 type LogsOptions struct {
 	Tail  int
 	Since time.Time
+}
+
+func (o LogsOptions) validate() error {
+	if o.Tail < 0 {
+		return validationErrorf("LogsOptions.Tail", o.Tail, "log tail must be >= 0, got %d", o.Tail)
+	}
+	return nil
 }
 
 func (o LogsOptions) args() []string {
@@ -39,6 +46,9 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // output. Long-lived reuse containers can grow unbounded logs, so
 // prefer Tail for diagnostics.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
+	if err := opts.validate(); err != nil {
+		return nil, err
+	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	args := c.eng.logsArgs(c.id, false)

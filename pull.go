@@ -34,7 +34,7 @@ const (
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {
-			return fmt.Errorf("invalid pull policy %d", policy)
+			return validationErrorf("WithPullPolicy", policy, "invalid pull policy %d", policy)
 		}
 		c.pullPolicy = policy
 		return nil

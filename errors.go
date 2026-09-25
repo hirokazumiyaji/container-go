@@ -20,6 +20,81 @@ var ErrSystemNotRunning = cli.ErrSystemNotRunning
 // WithExposedPorts.
 var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
 
+// ErrInvalidOption identifies an invalid public option or option value.
+// Callers can use errors.Is without matching the human-readable message.
+var ErrInvalidOption = errors.New("invalid option")
+
+// ValidationError describes a public input rejected before a backend
+// operation starts. Option and Field contain the public option name,
+// Value contains the rejected value, and Message preserves the detailed
+// explanation returned to the caller.
+type ValidationError struct {
+	Option  string
+	Field   string
+	Value   any
+	Message string
+	Err     error
+}
+
+func (e *ValidationError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return ErrInvalidOption.Error()
+}
+
+// Unwrap preserves an underlying parse or validation error when one is
+// available. Is classifies every ValidationError as ErrInvalidOption.
+func (e *ValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *ValidationError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	if target == ErrInvalidOption {
+		return true
+	}
+	return e.Err != nil && errors.Is(e.Err, target)
+}
+
+// OptionError is an option-specific name for ValidationError.
+type OptionError = ValidationError
+
+// InvalidOptionError is an alias for ValidationError.
+type InvalidOptionError = ValidationError
+
+func newValidationError(option string, value any, err error) error {
+	if err == nil {
+		err = ErrInvalidOption
+	}
+	var existing *ValidationError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &ValidationError{
+		Option:  option,
+		Field:   option,
+		Value:   value,
+		Message: err.Error(),
+		Err:     err,
+	}
+}
+
+func validationErrorf(option string, value any, format string, args ...any) error {
+	return newValidationError(option, value, fmt.Errorf(format, args...))
+}
+
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
 // is absent.

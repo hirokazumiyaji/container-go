@@ -106,20 +106,29 @@ type Container struct {
 // removed before returning. WithReuse switches to get-or-create; see
 // WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
+	if err := checkOptionCount("Run", len(opts)); err != nil {
+		return nil, err
+	}
 	cfg := newConfig()
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, validationErrorf("Run", i, "option %d is nil", i)
+		}
 		if err := opt(cfg); err != nil {
 			return nil, err
 		}
+	}
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	if !imageRE.MatchString(image) {
 		return nil, fmt.Errorf("invalid image reference %q", image)
 	}
 	if cfg.reuse && cfg.name == "" {
-		return nil, fmt.Errorf("WithReuse requires WithName")
+		return nil, validationErrorf("WithReuse", nil, "WithReuse requires WithName")
 	}
 	if cfg.reuseGroup != "" && !cfg.reuse {
-		return nil, fmt.Errorf("WithReuseGroup requires WithReuse")
+		return nil, validationErrorf("WithReuseGroup", cfg.reuseGroup, "WithReuseGroup requires WithReuse")
 	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()

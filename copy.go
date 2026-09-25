@@ -20,9 +20,15 @@ type File struct {
 // failures fail Run and roll the container back.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
+		if err := checkOptionCount("WithFiles", len(files)); err != nil {
+			return err
+		}
+		if len(c.files)+len(files) > maxOptionCount {
+			return validationErrorf("WithFiles", len(c.files)+len(files), "option count exceeds maximum %d: got %d", maxOptionCount, len(c.files)+len(files))
+		}
 		for _, f := range files {
 			if err := validateContainerPath(f.ContainerPath); err != nil {
-				return err
+				return newValidationError("WithFiles", f, err)
 			}
 		}
 		c.files = append(c.files, files...)

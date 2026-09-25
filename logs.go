@@ -16,8 +16,8 @@ import (
 // does not reject a negative Tail and treats it as 0/all (#102). Since
 // drops entries older than the timestamp. The current checkout translates
 // both options to the Docker-style --tail/--since arguments for either
-// engine. Docker supports those flags. Apple Container 1.2.x–1.3.x uses
-// -n for a tail but has no --since option; issue #82 is intended to map
+// engine. Docker supports those flags. The checked Apple Container CLI
+// versions use -n for a tail but have no --since option; issue #82 is intended to map
 // Tail to -n and reject Since with an explicit unsupported-capability
 // result. Until #82 is applied, non-empty LogsWithOptions options are
 // reliable for Docker only.

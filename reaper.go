@@ -20,10 +20,11 @@ import (
 // failures are best-effort.
 //
 // The script is a fixed string; container IDs enter it only as stdin
-// data. On this base the library validates reaper targets as
-// Apple Container names, so full Docker IDs require the #73 registration
-// change. The script itself disables globbing and quotes every
-// expansion the IDs reach.
+// data. On this base the library validates name-addressed reaper targets
+// with the shared safe-name guard, not the complete Apple Container name
+// contract; full Docker IDs require the #73 registration change. The
+// script itself disables globbing and quotes every expansion the IDs
+// reach.
 // Each backend call runs with a per-entry timeout implemented with
 // background jobs and kill (timeout(1) is not standard on macOS), so a
 // hung daemon cannot wedge deletion of later entries. Failures stay

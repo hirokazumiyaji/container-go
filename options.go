@@ -152,8 +152,8 @@ func WithReuseGroup(group string) Option {
 	}
 }
 
-// nameRE is Apple Container's container name rule; the name doubles as
-// the container ID.
+// nameRE is the shared safe container-name form used by the library and
+// reaper; it is not the complete name grammar of either backend.
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 // labelKeyRE is the Docker-style label key rule the CLI enforces,

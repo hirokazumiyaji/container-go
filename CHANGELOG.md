@@ -25,10 +25,10 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `WithStartupTimeout` to bound a composite wait.
 - Expose the root `CLIError` alias and add `ErrContainerNotFound` and
   `ErrGenerationReplaced`.
-- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
-  versions; centralize stderr matchers on each engine with source comments;
-  add live CLI compatibility integration tests; add an Apple inspect fixture
-  for 1.3.0.
+- Document the repository evidence for Apple Container CLI 1.2.2 and 1.3.0
+  and a Docker 29.x-shaped inspect fixture with a local 29.7.2 run; centralize
+  stderr matchers on each engine with source comments; add live CLI
+  compatibility integration tests; add an Apple inspect fixture for 1.3.0.
 
 ### Changed
 

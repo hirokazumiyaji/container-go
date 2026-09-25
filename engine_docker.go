@@ -22,7 +22,7 @@ import (
 // detected non-loopback tcp:// DOCKER_HOST).
 type dockerEngine struct{}
 
-// Verified against Docker Engine / CLI 29.x (local: 29.7.2).
+// Verified against a Docker 29.x-shaped inspect fixture (local: 29.7.2).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
@@ -188,6 +188,8 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
+// The current parser uses the first returned object; target validation and
+// no-match classification are tracked by issue #103.
 func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	var containers []dockerInspect
 	if err := json.Unmarshal(data, &containers); err != nil {

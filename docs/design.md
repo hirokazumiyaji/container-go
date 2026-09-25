@@ -4,7 +4,10 @@
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
 Last synchronized: 2026-09-25
-Targets: Apple Container v1.2.x–1.3.x (macOS 26+, Apple Silicon), Docker 29.x (Linux, Windows, macOS), root module Go 1.23+; nested `bench/` module Go 1.25+
+Targets: Apple Container CLI 1.2.2 and 1.3.0 (macOS 26+, Apple Silicon;
+the versions represented by repository evidence), Docker 29.x (29.7.2
+local run and a v29 inspect fixture; Linux, Windows, macOS), root module
+Go 1.23+; nested `bench/` module Go 1.25+
 
 This document describes the current implementation in this checkout.
 The **Implementation phases** section is retained as a historical plan;
@@ -16,7 +19,8 @@ This checkout is not a merge of the follow-up issue branches that harden
 backend-specific behavior. Apple log options depend on #82, dynamic
 endpoint refreshes depend on #85, reuse ownership and final generation
 verification depend on #83 and #84, stale Docker operation targeting
-depends on #74, and Docker dead-state pruning depends on #113. Apple
+depends on #74, and Docker inspect target validation depends on #103.
+Docker dead-state pruning depends on #113. Apple
 `Prune` list-to-delete cleanup validation depends on #98; WithReuse attach
 side effects depend on #94; missing-inspect classification depends on #103;
 error-chain preservation depends on #104; and Apple PullNever capability
@@ -65,8 +69,9 @@ Three constraints shape the design.
 
 ## Apple Container facts the design relies on
 
-The design decisions below rest on these properties of Apple Container
-(verified against v1.2.x–1.3.x; fixtures cover 1.2.2 and 1.3.0).
+The design decisions below rest on properties of Apple Container's CLI and
+source. The repository's inspect fixtures cover 1.2.2 and 1.3.0; this is
+not an exhaustive compatibility claim for every 1.2.x or 1.3.x release.
 
 - Host requirement: macOS 26 or later on Apple Silicon.
 - By default, each container boots as a lightweight VM with a real IP on
@@ -78,8 +83,11 @@ The design decisions below rest on these properties of Apple Container
 - The CLI talks XPC to `container-apiserver` under launchd. Commands
   fail while the service is down; `container system status` reports
   its state.
-- The container name is the container ID. Names must match
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters).
+- The container name is the container ID. The shared library guard is
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters). Apple
+  Container's CLI has a stricter 2–63-character rule,
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`; this checkout does not apply that
+  backend-specific preflight check (#112).
 - Several Docker features do not exist: healthchecks, a `wait`
   command, an event stream, label filters on `ls`, and re-attaching to
   a running container. Their behavior must be reproduced client-side.
@@ -211,7 +219,9 @@ described below are not.
   `WithCmd`.
 - `WithWaitStrategy(s wait.Strategy)`: readiness detection.
 - `WithName(name string)`: container name (default
-  `containergo-<random hex>`).
+  `containergo-<random hex>`). It uses the shared 1–63-character guard;
+  Apple's stricter 2–63-character rule is not enforced by the current
+  checkout's backend preflight (#112).
 - `WithLabels(labels map[string]string)`: extra labels. The library's
   managed labels are reserved.
 - `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
@@ -292,9 +302,9 @@ values use the same temporary-file mechanism as `WithEnv`. `Logs` and
 a supported `LogsWithOptions` call return a finite snapshot because the
 backend command finishes, but neither imposes a byte limit by itself.
 `Logs` requests all output. `LogsOptions` is backend-specific: Docker
-supports `Tail` and `Since`, while Apple Container 1.2.x–1.3.x uses
-`-n` for a tail and has no `--since` option. This checkout still sends
-Docker-style `--tail` and `--since` arguments to Apple, so
+supports `Tail` and `Since`, while the checked Apple Container CLI
+versions use `-n` for a tail and have no `--since` option. This checkout
+still sends Docker-style `--tail` and `--since` arguments to Apple, so
 `LogsWithOptions` is not backend-neutral here; #82 must be applied before
 Apple support can be documented as a capability. The #82 change is intended
 to map `Tail` to Apple's `-n` and reject `Since` as unsupported. A requested
@@ -314,10 +324,15 @@ by the current parser, unknown `MountType` values are not rejected by
 guarantees.
 
 `Terminate` maps to `container delete --force` on Apple Container and
-`docker rm --force` on Docker, and is idempotent when the container is
-already absent. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are
-nil-safe helpers preserving the testcontainers-go idiom of registering
-cleanup before checking `Run`'s error.
+`docker rm --force` on Docker. It treats a recognized backend not-found
+CLI failure as success, so its idempotence claim is limited to that case
+(and to a successful delete). It does not normalize empty or malformed
+inspect output, and the current Docker parser does not reject a valid
+object whose ID or name differs from the requested target. Neither case
+is covered by the idempotence claim; unrelated delete failures still
+propagate. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are nil-safe
+helpers preserving the testcontainers-go idiom of registering cleanup
+before checking `Run`'s error.
 
 ## Connection endpoints
 
@@ -398,11 +413,16 @@ The primitive strategies default to a 60-second startup timeout.
 `WithPollInterval`, but it has no effect because it consumes a stream.
 Connection and HTTP strategies check the stopped state at most once per
 second. `ForExec` does not fail fast while polling; it checks the
-container state when its wait deadline expires. `ForLog` reports a
-stopped container when its stream ends before the pattern appears. A
-failed non-reuse `Run` wait rolls the container back and, when the
-bounded log fetch succeeds, attaches a log tail capped at 1MiB to the
-error; a reuse wait leaves the shared container in place.
+container state when its wait deadline expires. `ForLog` returns success
+only after the required pattern count is reached. If its log stream ends
+first, it performs a bounded (up to five seconds) `Running` probe: a
+confirmed stopped container produces the stopped-before-pattern error;
+otherwise it reports that the log stream ended before the pattern
+appeared, including any reader error. EOF alone is not proof that the
+container stopped. A failed
+non-reuse `Run` wait rolls the container back and, when the bounded log
+fetch succeeds, attaches a log tail capped at 1MiB to the error; a reuse
+wait leaves the shared container in place.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only probes. UDP can be
 declared for endpoint configuration, but the current implementation does
@@ -414,7 +434,7 @@ retried until the wait ends. See #77.
 |---|---|---|
 | `WithExposedPorts` / `WithPublishedPort` | Accepted by the current option parser | Accepted for endpoint/publish configuration |
 | `wait.ForListeningPort` | `PORT` or `PORT/tcp` | Not a UDP probe; a UDP declaration may be TCP-dialed |
-| `wait.ForExposedPort` | Uses the first TCP declaration | If it resolves, a first UDP declaration is still passed to a TCP dial |
+| `wait.ForExposedPort` | Uses the first declared port, regardless of protocol | If that first declaration is UDP, it is still passed to a TCP dial |
 
 The strategy contract is:
 
@@ -516,9 +536,14 @@ candidate under the per-name lock before deleting its name; a replacement
 can therefore occur between list and delete. #98 tracks the fresh
 identity/label/state revalidation and lock cleanup.
 
-Setting `CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`,
-and reaper registration. It does not change an explicit
-`Container.Terminate`, post-create rollback, or failed-create cleanup.
+Setting `CONTAINERGO_KEEP=1` skips the automatic `Cleanup` and
+`TerminateContainer` helpers and reaper registration. It does not suppress
+explicit `Container.Terminate`, post-create rollback, or best-effort
+failed-create cleanup, and `Prune` or `PruneReuseGroup` can still delete
+containers. `WithReuse` also keeps its stopped-container replacement
+behavior, so a matching stopped reuse container can still be deleted and
+recreated. Treat the variable as a debugging aid, not a global deletion
+lock.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -554,6 +579,9 @@ has a non-empty generation; an empty-generation handle takes the legacy
 name-delete path. `reuseRun` also does not re-inspect after its readiness
 strategy returns, so a replacement can occur during the wait. Issues #83
 and #84 track the ownership checks and final generation verification.
+`CONTAINERGO_KEEP=1` does not change these reuse rules: a matching stopped
+reuse container can still be deleted and recreated, and
+`PruneReuseGroup` can still remove the group.
 
 For a handle with a valid non-empty generation, the Apple path checks a
 fresh inspect and runs inspect plus delete under a per-name `flock` in the
@@ -565,22 +593,23 @@ not re-inspect a candidate or hold the lock across deletion; #98 tracks
 that race. The external reaper also does not take this lock on the
 current checkout, which is a separate cleanup limitation. An external
 `container delete` plus re-create in the same window also remains outside
-the guarantee. Docker handles that retain the immutable `Id` printed by
-`docker run` (or returned by inspect) delete by that ID, so a same-name
-replacement does not share the deletion target. Other Docker operations
-on the current base still address the logical name; #74 tracks using the
-immutable ID for those operations as well. These are different
-protections; the current base does not make reuse a general fail-closed
-guarantee. The watchdog reaper registers Apple containers by name and
-generation, reads the label as a line-anchored JSON field (`"key":
-"value"`, never a substring), and skips deletion on mismatch. The
-current base does not register Docker's immutable ID with the reaper;
-issue #73 is required before Docker reaper entries can use `Id`. Each
-backend call carries a 10-30s timeout via POSIX `sleep`/`kill` (no
-`timeout(1)` dependency) so one hung daemon call cannot wedge the rest.
-The leader's own pull/create uses an independent `runTimeout` budget;
-`reuseAttachTimeout` bounds only attach polling for another process's
-container.
+the guarantee. A Docker handle that retains the immutable `Id` printed by
+`docker run` deletes by that ID, so a same-name replacement does not share
+the deletion target. An `Id` recovered through inspect depends on target
+validation, which the current Docker parser does not perform (#103).
+Other Docker operations on the current base still address the logical
+name; #74 tracks using the immutable ID for those operations as well.
+These are different protections; the current base does not make reuse a
+general fail-closed guarantee. The watchdog reaper registers Apple
+containers by name and generation, reads the label as a line-anchored
+JSON field (`"key": "value"`, never a substring), and skips deletion on
+mismatch. The current base does not register Docker's immutable ID with
+the reaper; issue #73 is required before Docker reaper entries can use
+`Id`. Each backend call carries a 10-30s timeout via POSIX `sleep`/`kill`
+(no `timeout(1)` dependency) so one hung daemon call cannot wedge the
+rest. The leader's own pull/create uses an independent `runTimeout`
+budget; `reuseAttachTimeout` bounds only attach polling for another
+process's container.
 
 ## Security design
 
@@ -593,12 +622,15 @@ security boundary. The reaper staging exception in #111 means that
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions). On this base, the library validates reaper targets as
-Apple-style names matching `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
-writing them to the pipe. After issue #73, the same validation will also
-accept a full lowercase 64-hex Docker ID. Reaper registration failures
-are ignored. The two layers together leave no command injection through
-registered IDs.
+expansions). On this base, name-addressed reaper entries use the shared
+library guard `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63
+characters) before they are written to the pipe. This is not the
+complete Apple Container contract: Apple's CLI requires 2–63 characters
+using `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`, and the current checkout does
+not apply that backend-specific preflight check (#112). After issue #73,
+the reaper will separately accept a full lowercase 64-hex Docker ID.
+Reaper registration failures are ignored. The two layers together leave
+no command injection through registered IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -610,15 +642,18 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 to an un-namespaced `mktemp` file before removing it. A killed reaper can
 leave environment data on disk; see the #111 mitigation above.
 
-**Validate inputs**. Container names (name rule above), label keys
-(the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
-environment keys (no `=`, no NUL), and container-side copy paths
-(absolute, valid UTF-8) are all validated before reaching the CLI.
-Host-side copy paths are resolved to absolute paths. The CLI validates
-too, but validating first gives clearer errors and independence from
-future CLI changes. Public option validation remains partial: negative
-`LogsOptions.Tail`, zero memory, unknown mount types, and reuse-group
-grammar are not uniformly rejected before backend work (#102).
+**Validate inputs**. The shared `WithName` guard and name-addressed
+reaper check use the rule above; label keys (the CLI's Docker/OCI form),
+ports (numeric range and `tcp`/`udp`), environment keys (no `=`, no NUL),
+and container-side copy paths (absolute, valid UTF-8) are also validated
+before reaching the CLI. This library-side guard is not a claim of full
+backend name validation: Apple's stricter minimum remains unenforced in
+this checkout (#112). Host-side copy paths are resolved to absolute
+paths. The CLI validates too, but validating first gives clearer errors
+and independence from future CLI changes. Public option validation
+remains partial: negative `LogsOptions.Tail`, zero memory, unknown mount
+types, and reuse-group grammar are not uniformly rejected before backend
+work (#102).
 
 **Handle no credentials**. Registry authentication is delegated to
 the backend CLI: use `container registry login` for Apple Container or
@@ -654,8 +689,9 @@ Docker's daemon assigns published ports atomically.
 **Bound snapshots only when requested**. `Logs` and a supported
 `LogsWithOptions` call finish a finite CLI snapshot, but `Logs` can buffer
 all available output. `LogsOptions{Tail, Since}` is backend-specific:
-Docker accepts both options, while Apple Container 1.2.x–1.3.x uses `-n`
-for Tail and has no Since option. The current checkout still sends Docker
+Docker accepts both options, while the checked Apple Container CLI
+versions use `-n` for Tail and have no Since option. The current checkout
+still sends Docker
 flag spellings to Apple, so the option contract is pending #82. Neither
 path adds a byte cap. `FollowLogs` is intentionally an unbounded stream;
 closing its `io.ReadCloser` or cancelling its context terminates the CLI
@@ -679,10 +715,13 @@ preserved.
 Root and backend errors are intended to be discriminable with
 `errors.Is`/`errors.As`, but the current checkout has additional limits:
 `Classify` formats the original CLI error into the `ErrSystemNotRunning`
-wrapper as text rather than retaining it as an unwrap target (#104), and
-a successful inspect response with no matching target may return a
-generic error instead of `ErrContainerNotFound` (#103). The built-in
-wait strategies also do not preserve context errors uniformly in every
+wrapper as text rather than retaining it as an unwrap target (#104). A
+successful inspect response with no matching target may return a generic
+error instead of `ErrContainerNotFound` (#103). For Docker, this includes
+empty or malformed inspect data, and the current parser does not verify
+that a returned object matches the requested ID or name; a valid but
+mismatched object is not a reliable no-match signal. The built-in wait
+strategies also do not preserve context errors uniformly in every
 timeout/cancellation path (#92). Some primitive timeout errors and
 `ForLog` cancellations are string-only, while composite strategies may
 retain a context error. Do not assume one error-chain contract until
@@ -697,7 +736,9 @@ these follow-up issues are applied.
 - `ErrContainerNotFound`: a classified CLI-reported missing-container
   failure. A successful inspect response with no matching target is not
   guaranteed to produce this sentinel and may return a generic error
-  (#103).
+  (#103). For Docker, empty or malformed inspect data can take that
+  generic path, while a valid but mismatched object is not rejected as a
+  no-match by the current parser.
 - `ErrImageNotFound`: the current `PullNever` precheck found no local
   image. On Apple this is a best-effort backend-specific precheck, not a
   no-fetch guarantee (#112).
@@ -969,8 +1010,8 @@ v0.2 (Docker backend) proceeded as:
 
 ## References
 
-- [apple/container](https://github.com/apple/container) v1.2.x–v1.3.x
-  command reference and `ContainerResource` sources
+- [apple/container](https://github.com/apple/container) v1.2.2 and v1.3.0
+  command/source references and `ContainerResource` sources
 - [shiguredo/container-rs](https://github.com/shiguredo/container-rs):
   the direct-XPC prior art; its watchdog reaper, cleanup contract, and
   catalog of macOS-specific constraints (port races, forwarding

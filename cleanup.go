@@ -12,7 +12,8 @@ import (
 
 // keepContainers reports whether CONTAINERGO_KEEP=1 skips the
 // automatic cleanup helpers and watchdog registration. Explicit
-// Container.Terminate and Run rollback are not changed.
+// Container.Terminate, Run rollback, failed-create cleanup, Prune,
+// PruneReuseGroup, and reuse replacement are not changed.
 func keepContainers() bool {
 	return os.Getenv("CONTAINERGO_KEEP") == "1"
 }
@@ -44,8 +45,9 @@ func Cleanup(tb testing.TB, ctr *Container) {
 // in the exited state only; dead-state selection is tracked by issue #113.
 // On Apple, the current list-to-delete path does not re-inspect each
 // candidate under the per-name lock, so a same-name replacement can race
-// the delete; #98 tracks that cleanup gap. It returns the backend list
-// identifiers it removed; Docker currently returns container names.
+// the delete; #98 tracks that cleanup gap. CONTAINERGO_KEEP does not
+// suppress this operation. It returns the backend list identifiers it
+// removed; Docker currently returns container names.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {

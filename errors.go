@@ -36,8 +36,9 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // ErrContainerNotFound reports a classified CLI failure that identifies a
 // missing container. Inspect, State, Exec, and Logs wrap that failure with
 // %w when the backend reports not-found text. A successful inspect response
-// with no matching target is not guaranteed to produce this sentinel; the
-// current parsers may return a generic error (#103).
+// with no matching target is not guaranteed to produce this sentinel; empty
+// or malformed inspect data can return a generic error, and the current
+// Docker parser does not verify a returned object's ID or name (#103).
 var ErrContainerNotFound = errors.New("container not found")
 
 // ErrGenerationReplaced reports that a delete-time generation check

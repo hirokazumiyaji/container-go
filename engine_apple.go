@@ -15,7 +15,8 @@ import (
 // appleEngine drives Apple Container's `container` CLI.
 type appleEngine struct{}
 
-// Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
+// Verified against Apple Container CLI source/help and inspect fixtures for
+// 1.2.2 and 1.3.0 (local: 1.3.0).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Sources (apple/container):
 //   - name conflict: ContainerRun.swift throws ContainerizationError(.exists,

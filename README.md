@@ -44,10 +44,11 @@ backend-specific behavior. In particular:
   container and does not re-check the generation after readiness. A missing
   generation can reach a name-based delete path; #83 and #84 track those
   fail-open paths.
-- A Docker handle currently uses its immutable ID for deletion, but other
-  backend operations still address the logical name. A stale handle can
+- A Docker handle currently uses an immutable ID printed by `docker run` for
+  deletion, but an ID recovered from inspect still lacks target validation;
+  other backend operations address the logical name. A stale handle can
   therefore inspect or modify a same-name replacement; #74 tracks the
-  operation-target fix.
+  operation-target fix and #103 tracks Docker inspect target validation.
 - Docker `Prune` currently selects exited containers, not containers in the
   dead state; #113 tracks dead-state coverage.
 - Apple `Prune` and `PruneReuseGroup` currently use a list-to-delete path
@@ -70,8 +71,11 @@ backend-specific behavior. In particular:
 - A failed liveness probe currently flattens the original `*CLIError` into
   an `ErrSystemNotRunning` message; #104 tracks error-chain preservation.
 - A successful inspect response with no matching target may return a
-  generic error rather than `ErrContainerNotFound`; #103 tracks that
-  classification gap.
+  generic error rather than `ErrContainerNotFound`. For Docker, empty or
+  malformed inspect data can take that path, and the current parser does
+  not verify that a returned object matches the requested ID or name; a
+  valid but mismatched object is not a reliable no-match signal. #103
+  tracks that classification gap.
 - Public option validation is partial: negative log tails, zero memory,
   unknown mount types, and reuse-group grammar are not uniformly rejected;
   #102 tracks the typed validation work.
@@ -116,9 +120,9 @@ func TestRedis(t *testing.T) {
 
 | OS | Default backend | Requirement |
 |---|---|---|
-| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) 1.2.x–1.3.x with `container system start` done |
-| Linux | Docker | docker CLI + running daemon |
-| Windows | Docker | docker CLI + running daemon (no watchdog reaper; see below) |
+| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) CLI 1.2.2 or 1.3.0 with `container system start` done |
+| Linux | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon |
+| Windows | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon (no watchdog reaper; see below) |
 
 Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
 Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
@@ -129,17 +133,27 @@ are handled by the docker CLI itself. The library uses only
 `DOCKER_HOST=tcp://...` to select a remote Docker endpoint; a remote
 Docker context is not detected.
 
-Verified backends for the current checkout (CLI stderr wording and inspect
-JSON shapes this library matches against):
+Verified backend behavior (the CLI stderr wording and inspect JSON shapes
+this library matches against):
 
-| Backend | Verified versions |
+| Backend | Evidence used by this checkout |
 |---|---|
-| Apple Container | 1.2.x–1.3.x |
-| Docker Engine / CLI | 29.x |
+| Apple Container CLI | Source/help and inspect fixtures for 1.2.2 and 1.3.0 |
+| Docker Engine / CLI | A 29.x-shaped inspect fixture; local development run 29.7.2 |
 
-Newer CLI releases may change error text or JSON fields; see the stderr
-matchers at the top of `engine_apple.go` / `engine_docker.go` and the
-fixtures under `internal/inspect/testdata/` and `testdata/`.
+These entries describe repository evidence, not an exhaustive
+compatibility claim for every release in a range. Newer CLI releases may
+change error text or JSON fields; see the stderr matchers at the top of
+`engine_apple.go` / `engine_docker.go` and the fixtures under
+`internal/inspect/testdata/` and `testdata/`.
+
+`WithName` and name-addressed reaper entries use the shared library guard
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters). This is a
+conservative safety rule, not a claim about the complete Docker or Apple
+name grammar. Apple Container's CLI has the stricter 2–63-character rule
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`; this checkout does not yet apply
+that backend-specific preflight check (#112), so a one-character name can
+pass library validation and still be rejected by Apple.
 
 ## Installation
 
@@ -296,8 +310,12 @@ continuous `FollowLogs` stream rather than polling, so its
 `v0.2.0` do not expose a composite timeout setter. Connection and HTTP
 strategies probe the stopped state at most once per second. `ForExec` does
 not fail fast while polling; it checks the container state when its wait
-deadline expires. `ForLog` reports a stopped container when its log stream
-ends before the pattern appears.
+deadline expires. `ForLog` returns success only after the required
+pattern count is reached. If its log stream ends first, it performs a
+bounded (up to five seconds) `Running` probe: a confirmed stopped
+container produces the stopped-before-pattern error; otherwise it reports
+that the log stream ended before the pattern appeared, including any
+reader error. EOF alone is not proof that the container stopped.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
 UDP may be declared for endpoint configuration, but the current
@@ -309,7 +327,7 @@ port specifications are likewise retried until the wait ends. See #77.
 |---|---|---|
 | `WithExposedPorts` / `WithPublishedPort` | Accepted by the current option parser | Accepted for endpoint/publish configuration |
 | `wait.ForListeningPort` | `PORT` or `PORT/tcp` | Not a UDP probe; a UDP declaration may be TCP-dialed |
-| `wait.ForExposedPort` | Uses the first TCP declaration | If it resolves, a first UDP declaration is still passed to a TCP dial |
+| `wait.ForExposedPort` | Uses the first declared port, regardless of protocol | If that first declaration is UDP, it is still passed to a TCP dial |
 
 ### Stop timeouts
 
@@ -358,8 +376,9 @@ described below.
 `Logs` and a supported `LogsWithOptions` call return a finite snapshot
 because the CLI process finishes, but neither method imposes a byte limit
 by itself. `Logs` requests all available output. `LogsOptions` is
-backend-specific: Docker supports both `Tail` and `Since`. Apple Container
-1.2.x–1.3.x uses `-n` for a tail and has no `--since` option, while this
+backend-specific: Docker supports both `Tail` and `Since`. The checked
+Apple Container CLI versions use `-n` for a tail and have no `--since`
+option, while this
 checkout still sends the Docker-style `--tail` and `--since` spellings to
 Apple. `LogsWithOptions` is therefore not backend-neutral here; use `Logs`
 on Apple until #82 is applied. The #82 change is intended to map `Tail` to
@@ -428,9 +447,18 @@ func DockerLogOptions(ctx context.Context, ctr *container.Container) error {
 ```
 
 These error checks are path-specific: a liveness-classified error may
-flatten the original `*CLIError` into text (#104), and a successful inspect
-response with no matching target may not produce
-`ErrContainerNotFound` (#103).
+flatten the original `*CLIError` into text (#104). For Docker, a
+successful inspect response with an empty or malformed result can instead
+return a generic parse error, and the current parser does not verify that
+a returned object matches the requested ID or name; a valid but mismatched
+object is not a reliable no-match signal (#103).
+
+`Terminate` treats a recognized backend not-found CLI failure as success,
+so its idempotence claim is limited to that case (and to a successful
+delete). It does not normalize empty or malformed inspect output, and a
+valid but mismatched Docker object is not rejected as a no-match by the
+current parser. Neither case is covered by the idempotence claim, and
+unrelated delete failures still propagate.
 
 ## Image pulls
 
@@ -547,10 +575,14 @@ only files positively tied to the affected run, and rotate credentials
 that may have appeared in inspect output (#111). This is not a no-leak
 guarantee.
 
-`CONTAINERGO_KEEP=1` skips `Cleanup`, `TerminateContainer`, and reaper
-registration so containers can be inspected during debugging. It does not
-change explicit `Container.Terminate`, rollback after a post-create
-failure, or the best-effort failed-create cleanup.
+`CONTAINERGO_KEEP=1` skips the automatic `Cleanup` and
+`TerminateContainer` helpers and reaper registration. It does not suppress
+explicit `Container.Terminate`, post-create rollback, or best-effort
+failed-create cleanup, and `Prune` or `PruneReuseGroup` can still delete
+containers. `WithReuse` also keeps its stopped-container replacement
+behavior, so a matching stopped reuse container can still be deleted and
+recreated. Treat the variable as a debugging aid, not a global deletion
+lock.
 
 `container.Prune(ctx)` removes containers this library created that are
 selected by the active backend's filter. Apple selects managed containers
@@ -623,12 +655,17 @@ Contract:
   name-based delete path, and the current code does not perform a final
   generation re-check after readiness. Issues #83 and #84 track closing
   these fail-open paths. Until they are applied, do not treat reuse as a
-  protection against an untrusted same-name replacement. Docker deletion
-  handles use the immutable Docker ID when it is available, but other
-  operations still use the logical name until #74 is applied.
+  protection against an untrusted same-name replacement. A Docker handle
+  that retains the full ID printed by `docker run` deletes by that ID;
+  an ID recovered from inspect still depends on target validation, which
+  the current Docker parser does not perform (#103). Other operations
+  still use the logical name until #74 is applied.
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
+- `CONTAINERGO_KEEP=1` does not change this reuse contract: a stopped
+  matching reuse container can still be deleted and recreated, and
+  `PruneReuseGroup` can still remove the group.
 - The per-name `flock` protects the generation-checked ordinary
   `Terminate`/failed-create cleanup paths. It does not cover the current
   Apple `Prune`/`PruneReuseGroup` list-to-delete path, which lacks fresh

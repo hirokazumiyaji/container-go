@@ -315,9 +315,11 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	return c.classify(ctx, err)
 }
 
-// Terminate force-removes the container. Removing a container that no
-// longer exists is a success. A handle with an immutable ID deletes by
-// it, so a same-name replacement is never touched. For a name-addressed
+// Terminate force-removes the container. A backend-reported not-found
+// failure is treated as success, but malformed or mismatched inspect data
+// is not normalized as not-found. A handle with an immutable ID deletes by
+// it; when that ID came from a matching inspect, a same-name replacement
+// does not share the target. For a name-addressed
 // handle with a non-empty creation generation, Terminate requires a
 // matching fresh inspect and holds the per-name lock across inspect and
 // delete. A handle with an empty generation currently takes the legacy

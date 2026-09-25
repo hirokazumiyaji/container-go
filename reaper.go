@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -53,28 +55,66 @@ case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 # With the default timeout this is a sleep 30 bound; timeout(1) is not
 # available on every supported Unix host.
 kill_descendants() {
-  children=$(pgrep -P "$1" 2>/dev/null) || children=
-  for child in $children; do
-    kill_descendants "$child"
-    kill -9 "$child" 2>/dev/null || true
+  kill_descendant_children=$(pgrep -P "$1" 2>/dev/null) || kill_descendant_children=
+  for kill_descendant_pid in $kill_descendant_children; do
+    kill_descendants "$kill_descendant_pid"
+    kill -9 "$kill_descendant_pid" 2>/dev/null || true
   done
 }
 kill_pipeline() {
-  pid="$1"
-  kill_descendants "$pid"
-  kill -9 "$pid" 2>/dev/null || true
-  kill -9 -"$pid" 2>/dev/null || true
+  kill_target_pid="$1"
+  kill_descendants "$kill_target_pid"
+  # A background target is not necessarily a process-group leader. Only
+  # signal a negative PID after confirming that it owns that group; the
+  # target is still owned by the waiting shell, so its PID cannot be reused.
+  kill_target_pgid=$(ps -o pgid= -p "$kill_target_pid" 2>/dev/null | tr -d '[:space:]') || kill_target_pgid=
+  if [ "$kill_target_pgid" = "$kill_target_pid" ]; then
+    kill -9 -"$kill_target_pid" 2>/dev/null || true
+  fi
+  kill -9 "$kill_target_pid" 2>/dev/null || true
 }
 run_with_timeout() {
-  seconds="$1"
+  timeout_seconds="$1"
   shift
-  "$@" & pid=$!
-  (sleep "$seconds"; kill_pipeline "$pid") & killer=$!
-  wait "$pid" 2>/dev/null
-  rc=$?
-  kill "$killer" 2>/dev/null || true
-  wait "$killer" 2>/dev/null || true
-  return "$rc"
+  timeout_command_pid=
+  timeout_killer_pid=
+  "$@" &
+  timeout_command_pid=$!
+  (
+    timeout_sleep_pid=
+    cleanup_timeout_killer() {
+      if [ -n "$timeout_sleep_pid" ]; then
+        kill -9 "$timeout_sleep_pid" 2>/dev/null || true
+        wait "$timeout_sleep_pid" 2>/dev/null || true
+      fi
+    }
+    trap 'cleanup_timeout_killer; exit 0' 0 1 2 15
+    sleep "$timeout_seconds" &
+    timeout_sleep_pid=$!
+    wait "$timeout_sleep_pid" || true
+    timeout_sleep_pid=
+    kill_pipeline "$timeout_command_pid"
+  ) &
+  timeout_killer_pid=$!
+  wait "$timeout_command_pid" 2>/dev/null
+  timeout_rc=$?
+  kill "$timeout_killer_pid" 2>/dev/null || true
+  wait "$timeout_killer_pid" 2>/dev/null || true
+  return "$timeout_rc"
+}
+inspect_projection() {
+  # Project only the fields needed for guarded deletion while the backend
+  # response is streaming. The raw inspect response may contain credentials,
+  # so never stage it in a temporary file.
+  id="$1"
+  {
+    "$bin" inspect "$id" 2>/dev/null
+    inspect_rc=$?
+    printf '\n__containergo_reaper_inspect_rc__%s\n' "$inspect_rc"
+  } | sed -n \
+    -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/generation=\1/p" \
+    -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
+    -e 's/^__containergo_reaper_inspect_rc__\([0-9][0-9]*\)$/rc=\1/p'
 }
 process_entry() {
   id="$1"
@@ -84,11 +124,18 @@ process_entry() {
   if [ -n "$creation" ]; then
     tries=0
     while :; do
-      tmp=$(mktemp 2>/dev/null) || return 0
-      if run_with_timeout 10 "$bin" inspect "$id" >"$tmp" 2>/dev/null; then
-        got=$(sed -n "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/\1/p" "$tmp" 2>/dev/null | head -n 1)
-        uid=$(sed -n 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/\1/p' "$tmp" 2>/dev/null | head -n 1)
-        rm -f "$tmp"
+      inspect_fields=$(run_with_timeout 10 inspect_projection "$id") || inspect_fields=
+      got=
+      uid=
+      inspect_rc=
+      for field in $inspect_fields; do
+        case "$field" in
+          generation=*) got=${field#generation=};;
+          id=*) uid=${field#id=};;
+          rc=*) inspect_rc=${field#rc=};;
+        esac
+      done
+      if [ "$inspect_rc" = 0 ]; then
         # A missing generation is retried only for a pending create.
         if [ "$got" != "$creation" ]; then
           [ "$pending" = 1 ] && [ -z "$got" ] || return 0
@@ -97,7 +144,6 @@ process_entry() {
           break
         fi
       fi
-      rm -f "$tmp"
       [ "$pending" = 1 ] || return 0
       tries=$((tries + 1))
       [ "$tries" -lt "$pending_attempts" ] || return 0
@@ -133,6 +179,18 @@ const (
 	defaultReaperPendingAttempts = 30
 )
 
+var (
+	reaperWriteTimeout         = 500 * time.Millisecond
+	reaperOperationLockTimeout = 30 * time.Second
+	reaperOperationTimeout     = 5 * time.Second
+	reaperRecoveryTimeout      = 5 * time.Second
+)
+
+var (
+	errReaperWriteTimeout = errors.New("reaper: pipe write timed out")
+	errReaperClosed       = errors.New("reaper: closed")
+)
+
 // breQuote escapes a literal for use inside the reaper's sed basic
 // regular expression, so the label key's dots match only dots.
 func breQuote(s string) string {
@@ -163,9 +221,13 @@ type reaperProcess struct {
 	stdin  io.WriteCloser
 	exited chan struct{}
 	pgid   int
+
+	stateMu sync.Mutex
+	reaped  bool
 	// stopOnce makes the process-group signal happen exactly once, before
-	// either the recovery path or the wait path calls cmd.Wait. This keeps
-	// a saved numeric group ID from being used after PID reuse.
+	// either the recovery path or the wait path calls cmd.Wait. stateMu
+	// closes the small hand-off window between Wait returning and marking
+	// the identity reaped, so a saved group ID can never be signaled then.
 	stopOnce sync.Once
 }
 
@@ -173,9 +235,61 @@ func (p *reaperProcess) terminate() {
 	if p == nil {
 		return
 	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	if p.reaped {
+		return
+	}
 	p.stopOnce.Do(func() {
 		killReaperProcess(p.cmd, p.pgid)
 	})
+}
+
+func (p *reaperProcess) waitAndMarkReaped() {
+	if p == nil {
+		return
+	}
+	p.stateMu.Lock()
+	_ = p.cmd.Wait()
+	p.reaped = true
+	p.stateMu.Unlock()
+}
+
+type reaperOperationLock struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (l *reaperOperationLock) init() {
+	l.once.Do(func() { l.gate = make(chan struct{}, 1) })
+}
+
+// Lock preserves the package-test helper shape; lifecycle operations use
+// LockContext so a blocked lifecycle transition cannot wait forever.
+func (l *reaperOperationLock) Lock() {
+	l.init()
+	l.gate <- struct{}{}
+}
+
+func (l *reaperOperationLock) Unlock() {
+	<-l.gate
+}
+
+func (l *reaperOperationLock) LockContext(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	l.init()
+	select {
+	case l.gate <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			<-l.gate
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
 
 type reaper struct {
@@ -187,7 +301,7 @@ type reaper struct {
 	// opMu serializes registration, completion, close, and respawn
 	// transitions. r.mu protects the fields below; no process wait is
 	// performed while r.mu is held.
-	opMu          sync.Mutex
+	opMu          reaperOperationLock
 	mu            sync.Mutex
 	cmd           *exec.Cmd
 	stdin         io.WriteCloser
@@ -238,12 +352,19 @@ func (r *reaper) registerEntry(entry reaperEntry) error {
 		return errors.New("reaper: pending entry requires a creation id")
 	}
 
-	r.opMu.Lock()
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer lockCancel()
+	if err := r.opMu.LockContext(lockCtx); err != nil {
+		return err
+	}
 	defer r.opMu.Unlock()
+	opCtx, opCancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
+	defer opCancel()
+
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return errors.New("reaper: closed")
+		return errReaperClosed
 	}
 	duplicate := false
 	for _, active := range r.entries {
@@ -255,16 +376,17 @@ func (r *reaper) registerEntry(entry reaperEntry) error {
 	if !duplicate {
 		r.entries = append(r.entries, entry)
 	}
-	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	process := r.process
+	failures := r.spawnFailures
 	r.mu.Unlock()
 
-	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
-		if err := writeReaperEntry(stdin, entry); err == nil {
+	if failures < maxReaperSpawnFailures && processLive(process) {
+		if err := writeReaperEntry(opCtx, process.stdin, entry); err == nil {
 			r.clearSpawnFailure()
 			return nil
 		}
 	}
-	return r.respawnAndReplayLocked()
+	return r.recoverAndReplay(opCtx, process)
 }
 
 func validateReaperEntry(entry reaperEntry) error {
@@ -277,10 +399,7 @@ func validateReaperEntry(entry reaperEntry) error {
 	return nil
 }
 
-func writeReaperEntry(stdin io.Writer, entry reaperEntry) error {
-	if stdin == nil {
-		return io.ErrClosedPipe
-	}
+func writeReaperEntry(ctx context.Context, stdin io.Writer, entry reaperEntry) error {
 	prefix := "+"
 	if entry.pending {
 		prefix = "P"
@@ -289,36 +408,72 @@ func writeReaperEntry(stdin io.Writer, entry reaperEntry) error {
 	if entry.creation != "" {
 		line += " " + entry.creation
 	}
-	n, err := io.WriteString(stdin, line+"\n")
-	if err == nil && n != len(line)+1 {
-		return io.ErrShortWrite
-	}
-	return err
+	return writeReaperRecord(ctx, stdin, line+"\n")
 }
 
-func (r *reaper) writeLocked(entry reaperEntry) error {
-	return writeReaperEntry(r.stdin, entry)
-}
-
-func (r *reaper) writeCurrentEntry(entry reaperEntry) error {
+func (r *reaper) writeCurrentEntry(ctx context.Context, entry reaperEntry) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	return r.writeLocked(entry)
+	stdin := r.stdin
+	r.mu.Unlock()
+	return writeReaperEntry(ctx, stdin, entry)
 }
 
-func writeReaperCompletion(stdin io.Writer, entry reaperEntry) error {
-	if stdin == nil {
-		return io.ErrClosedPipe
-	}
+func writeReaperCompletion(ctx context.Context, stdin io.Writer, entry reaperEntry) error {
 	line := "C " + entry.id
 	if entry.creation != "" {
 		line += " " + entry.creation
 	}
-	n, err := io.WriteString(stdin, line+"\n")
-	if err == nil && n != len(line)+1 {
-		return io.ErrShortWrite
+	return writeReaperRecord(ctx, stdin, line+"\n")
+}
+
+func writeReaperRecord(ctx context.Context, stdin io.Writer, line string) error {
+	if stdin == nil {
+		return io.ErrClosedPipe
 	}
-	return err
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	writeCtx, cancel := context.WithTimeout(ctx, reaperWriteTimeout)
+	defer cancel()
+	if err := writeCtx.Err(); err != nil {
+		return err
+	}
+
+	// StdinPipe returns an *os.File whose write deadline interrupts a
+	// blocked pipe write. Keep a goroutine fallback for test doubles and
+	// writers without deadline support.
+	if deadlineWriter, ok := stdin.(interface{ SetWriteDeadline(time.Time) error }); ok {
+		deadline := time.Now().Add(reaperWriteTimeout)
+		if ctxDeadline, ok := writeCtx.Deadline(); ok && ctxDeadline.Before(deadline) {
+			deadline = ctxDeadline
+		}
+		_ = deadlineWriter.SetWriteDeadline(deadline)
+		defer func() { _ = deadlineWriter.SetWriteDeadline(time.Time{}) }()
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := io.WriteString(stdin, line)
+		done <- result{n: n, err: err}
+	}()
+	select {
+	case result := <-done:
+		if result.err == nil && result.n != len(line) {
+			return io.ErrShortWrite
+		}
+		if result.err != nil {
+			if writeCtx.Err() != nil {
+				return fmt.Errorf("%w: %w", errReaperWriteTimeout, writeCtx.Err())
+			}
+			return result.err
+		}
+		return nil
+	case <-writeCtx.Done():
+		return fmt.Errorf("%w: %w", errReaperWriteTimeout, writeCtx.Err())
+	}
 }
 
 // completePending marks a pre-registered generation as having completed
@@ -330,8 +485,15 @@ func (r *reaper) completePending(id, creation string) error {
 		return err
 	}
 
-	r.opMu.Lock()
+	lockCtx, lockCancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer lockCancel()
+	if err := r.opMu.LockContext(lockCtx); err != nil {
+		return err
+	}
 	defer r.opMu.Unlock()
+	opCtx, opCancel := context.WithTimeout(context.Background(), reaperOperationTimeout)
+	defer opCancel()
+
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
@@ -345,25 +507,22 @@ func (r *reaper) completePending(id, creation string) error {
 		}
 	}
 	if index < 0 {
-		closed := r.closed
 		r.mu.Unlock()
-		if closed {
-			return errors.New("reaper: closed")
-		}
 		return nil
 	}
 	entry.pending = false
 	r.entries[index] = entry
-	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	process := r.process
+	failures := r.spawnFailures
 	r.mu.Unlock()
 
-	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
-		if err := writeReaperCompletion(stdin, entry); err == nil {
+	if failures < maxReaperSpawnFailures && processLive(process) {
+		if err := writeReaperCompletion(opCtx, process.stdin, entry); err == nil {
 			r.clearSpawnFailure()
 			return nil
 		}
 	}
-	return r.respawnAndReplayLocked()
+	return r.recoverAndReplay(opCtx, process)
 }
 
 func (r *reaper) clearSpawnFailure() {
@@ -377,11 +536,28 @@ func (r *reaper) clearSpawnFailure() {
 // opMu. r.mu is only used for short state snapshots and never held while
 // waiting for the old process tree.
 func (r *reaper) respawnAndReplayLocked() error {
-	r.stopCurrentProcess()
+	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+	defer cancel()
+	return r.respawnAndReplayContext(ctx)
+}
+
+func (r *reaper) respawnAndReplayContext(ctx context.Context) error {
+	r.mu.Lock()
+	current := r.process
+	r.mu.Unlock()
+	if current != nil {
+		if err := r.stopProcessContext(ctx, current); err != nil {
+			// Keep the process published when the barrier is not complete.
+			// A later recovery must wait for this retiring child instead of
+			// starting a replacement beside it.
+			return err
+		}
+		r.detachProcess(current)
+	}
 	r.mu.Lock()
 	if r.closed {
 		r.mu.Unlock()
-		return errors.New("reaper: closed")
+		return errReaperClosed
 	}
 	if len(r.entries) == 0 {
 		r.spawnFailures = 0
@@ -398,6 +574,9 @@ func (r *reaper) respawnAndReplayLocked() error {
 	r.mu.Unlock()
 
 	for r.spawnFailuresValue() < maxReaperSpawnFailures {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		_, _, _, err := r.spawnProcess()
 		if err != nil {
 			r.recordSpawnFailure()
@@ -405,7 +584,7 @@ func (r *reaper) respawnAndReplayLocked() error {
 		}
 		replayed := true
 		for _, entry := range entries {
-			if err := r.writeCurrentEntry(entry); err != nil {
+			if err := r.writeCurrentEntry(ctx, entry); err != nil {
 				replayed = false
 				break
 			}
@@ -414,7 +593,12 @@ func (r *reaper) respawnAndReplayLocked() error {
 			r.clearSpawnFailure()
 			return nil
 		}
-		r.stopCurrentProcess()
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+		stopErr := r.stopCurrentProcessContext(cleanupCtx)
+		cleanupCancel()
+		if stopErr != nil {
+			return stopErr
+		}
 		r.recordSpawnFailure()
 	}
 	if !r.gaveUpValue() {
@@ -424,6 +608,44 @@ func (r *reaper) respawnAndReplayLocked() error {
 		log.Printf("container-go: reaper giving up after %d consecutive spawn failures (binary=%q)", maxReaperSpawnFailures, r.binary)
 	}
 	return errors.New("reaper: giving up after repeated spawn failures")
+}
+
+// recoverAndReplay always gets a fresh recovery budget. A caller context
+// may have expired while waiting for opMu or writing the old pipe; active
+// entries must still be handed to a replacement rather than left without a
+// watchdog.
+func (r *reaper) recoverAndReplay(_ context.Context, process *reaperProcess) error {
+	ctx, cancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+	defer cancel()
+	if process == nil {
+		r.mu.Lock()
+		process = r.process
+		r.mu.Unlock()
+	}
+	if process != nil {
+		if err := r.stopProcessContext(ctx, process); err != nil {
+			// Retain the published process until its strict shutdown
+			// barrier completes. A later registration can then retry the
+			// recovery without overlapping the old tree.
+			return err
+		}
+		r.detachProcess(process)
+	}
+	return r.respawnAndReplayContext(ctx)
+}
+
+func (r *reaper) detachProcess(process *reaperProcess) *reaperProcess {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if process == nil {
+		process = r.process
+	}
+	if process == nil || r.process != process {
+		return nil
+	}
+	r.process = nil
+	r.cmd, r.stdin, r.exited, r.pgid = nil, nil, nil, 0
+	return process
 }
 
 func (r *reaper) spawnFailuresValue() int {
@@ -495,29 +717,38 @@ func (r *reaper) spawnLocked() error {
 }
 
 func (r *reaper) waitProcess(process *reaperProcess) {
-	// On Unix, observe the child with WNOWAIT first. The process group is
-	// terminated while the direct child is still owned, before Wait can
-	// recycle its PID. Other platforms have no watchdog process to recover.
-	if waitForReaperTermination(process.cmd) {
-		process.terminate()
-	}
-	_ = process.cmd.Wait()
+	// Observe the direct child without reaping it, then terminate the
+	// still-owned process group. The group barrier must complete before
+	// os/exec reaps the child; otherwise a replacement could overlap old
+	// descendants and a saved PGID could be recycled underneath us.
+	_ = waitForReaperTermination(process.cmd)
+	process.terminate()
+	_ = waitForReaperProcessGroupExit(process.pgid)
+	process.waitAndMarkReaped()
+	// No signal is sent after Wait. finishReaperProcess is only a
+	// platform-specific hook for code that needs to observe completion.
 	finishReaperProcess(process.cmd, process.pgid)
 	close(process.exited)
 }
 
-func (r *reaper) stopCurrentProcess() {
+func (r *reaper) stopCurrentProcessContext(ctx context.Context) error {
 	r.mu.Lock()
 	process := r.process
-	r.process = nil
-	r.cmd, r.stdin, r.exited, r.pgid = nil, nil, nil, 0
 	r.mu.Unlock()
-	if process != nil {
-		r.stopProcess(process)
+	if process == nil {
+		return nil
 	}
+	if err := r.stopProcessContext(ctx, process); err != nil {
+		return err
+	}
+	r.detachProcess(process)
+	return nil
 }
 
-func (r *reaper) stopProcess(process *reaperProcess) {
+func (r *reaper) stopProcessContext(ctx context.Context, process *reaperProcess) error {
+	if process == nil {
+		return nil
+	}
 	// Claim the process-group signal before closing the registration pipe.
 	// Closing first would intentionally release the old script to run
 	// deletes while a replacement is already being prepared.
@@ -525,8 +756,17 @@ func (r *reaper) stopProcess(process *reaperProcess) {
 	if process.stdin != nil {
 		_ = process.stdin.Close()
 	}
-	if process.exited != nil {
-		<-process.exited
+	if process.exited == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-process.exited:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("reaper: child shutdown: %w", ctx.Err())
 	}
 }
 
@@ -535,7 +775,12 @@ func (r *reaper) stopProcess(process *reaperProcess) {
 // best-effort shutdown; an actual child exit is replayed.
 func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{}) {
 	<-exited
-	r.opMu.Lock()
+	lockCtx, cancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer cancel()
+	if err := r.opMu.LockContext(lockCtx); err != nil {
+		log.Printf("container-go: reaper recovery lock: %v", err)
+		return
+	}
 	defer r.opMu.Unlock()
 	r.mu.Lock()
 	current := !r.closed && r.cmd == cmd
@@ -550,7 +795,12 @@ func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{
 // responsible for reaping the child; callers that need a completion
 // barrier can wait on r.exited.
 func (r *reaper) closeStdin() {
-	r.opMu.Lock()
+	lockCtx, cancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer cancel()
+	if err := r.opMu.LockContext(lockCtx); err != nil {
+		log.Printf("container-go: reaper close lock: %v", err)
+		return
+	}
 	defer r.opMu.Unlock()
 	r.mu.Lock()
 	if r.closed {
@@ -568,8 +818,14 @@ func (r *reaper) closeStdin() {
 
 // killForTest kills the current reaper process group and waits until the
 // child and its descendants have been reaped before a replacement starts.
+// Keep the process published while waiting: the exit watcher must still
+// observe the old command and perform the normal recovery replay.
 func (r *reaper) killForTest() {
-	r.opMu.Lock()
+	lockCtx, cancel := context.WithTimeout(context.Background(), reaperOperationLockTimeout)
+	defer cancel()
+	if err := r.opMu.LockContext(lockCtx); err != nil {
+		return
+	}
 	defer r.opMu.Unlock()
 	r.mu.Lock()
 	process := r.process
@@ -578,9 +834,22 @@ func (r *reaper) killForTest() {
 		return
 	}
 	process.terminate()
-	if process.exited != nil {
-		<-process.exited
+	if process.stdin != nil {
+		_ = process.stdin.Close()
 	}
+	if process.exited == nil {
+		return
+	}
+	processCtx, processCancel := context.WithTimeout(context.Background(), reaperRecoveryTimeout)
+	defer processCancel()
+	select {
+	case <-process.exited:
+	case <-processCtx.Done():
+	}
+}
+
+func processLive(process *reaperProcess) bool {
+	return process != nil && process.stdin != nil && !channelClosed(process.exited)
 }
 
 func channelClosed(ch <-chan struct{}) bool {

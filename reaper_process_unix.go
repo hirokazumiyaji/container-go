@@ -1,4 +1,4 @@
-//go:build darwin || dragonfly || freebsd || linux || netbsd || openbsd || solaris
+//go:build darwin || dragonfly || freebsd || linux || netbsd || solaris
 
 package container
 
@@ -48,6 +48,9 @@ func waitForReaperTermination(cmd *exec.Cmd) bool {
 	return waitForReaperProcessExit(cmd)
 }
 
+// killReaperProcess is called only while exec.Cmd still owns the direct
+// child. The process-group signal must therefore happen before cmd.Wait;
+// a saved numeric group ID is never used after the child has been reaped.
 func killReaperProcess(cmd *exec.Cmd, pgid int) {
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -57,26 +60,36 @@ func killReaperProcess(cmd *exec.Cmd, pgid int) {
 		if err == nil {
 			return
 		}
-		// Fall through to the direct handle. It is still owned by
-		// os/exec when this function is called during recovery.
+		// Fall through to the direct handle. It is still owned by os/exec
+		// when this function is called during recovery.
 	}
 	_ = cmd.Process.Kill()
 }
 
-// finishReaperProcess runs after the direct shell has been waited. The
-// process group was terminated before Wait while the child was still
-// owned; only wait for the group to disappear now. Re-signaling a saved
-// numeric ID after Wait could hit an unrelated, recycled process group.
-func finishReaperProcess(cmd *exec.Cmd, pgid int) {
+// waitForReaperProcessGroupExit is a strict barrier. A replacement is not
+// allowed to start until the old group has disappeared, including any
+// timeout helper's sleep descendants. The direct shell is intentionally
+// still a zombie here, so its process-group ID cannot be recycled while
+// this loop observes the group.
+func waitForReaperProcessGroupExit(pgid int) bool {
 	if pgid <= 0 {
-		return
+		return true
 	}
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
+	for {
 		err := syscall.Kill(-pgid, syscall.Signal(0))
 		if errors.Is(err, syscall.ESRCH) {
-			return
+			return true
 		}
+		// The group leader is still waitable, so repeated signals remain
+		// ownership-safe even if a descendant is briefly slow to die. An
+		// unexpected error is not proof that the group disappeared; keep
+		// the barrier closed until an ESRCH observation confirms it.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// finishReaperProcess is intentionally a no-op. The group barrier has
+// already completed before os/exec reaps the direct child; signaling a
+// saved PGID here could hit an unrelated, recycled process group.
+func finishReaperProcess(*exec.Cmd, int) {}

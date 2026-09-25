@@ -42,11 +42,14 @@ func TestExecRunnerParentDeathKillsBackendTree(t *testing.T) {
 	}
 	dir := t.TempDir()
 	pidPath := filepath.Join(dir, "backend.pid")
+	childPath := filepath.Join(dir, "child.pid")
 	target := filepath.Join(dir, "backend")
 	script := "#!/bin/sh\n" +
 		"echo $$ > " + pidPath + "\n" +
+		"sleep 30 &\n" +
+		"echo $! > " + childPath + "\n" +
 		"trap '' TERM\n" +
-		"while :; do sleep 1; done\n"
+		"wait\n"
 	if err := os.WriteFile(target, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -55,17 +58,20 @@ func TestExecRunnerParentDeathKillsBackendTree(t *testing.T) {
 	helper.Env = append(os.Environ(),
 		"CONTAINERGO_PARENT_DEATH_HELPER=1",
 		"CONTAINERGO_PARENT_DEATH_TARGET="+target,
+		"SHELLOPTS=monitor",
 	)
 	if err := helper.Start(); err != nil {
 		t.Fatal(err)
 	}
 
 	pid := waitForPIDFile(t, pidPath)
+	child := waitForPIDFile(t, childPath)
 	if err := helper.Process.Kill(); err != nil {
 		t.Fatal(err)
 	}
 	_ = helper.Wait()
 	waitForProcessGone(t, pid)
+	waitForProcessGone(t, child)
 }
 
 func TestExecRunnerParentDeathHelper(t *testing.T) {

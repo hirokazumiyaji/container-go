@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,71 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	if err := r.register("ctr-one", "not-hex"); err == nil {
 		t.Error("register bad creation: want error")
 	}
+}
+
+type blockingReaperWriter struct {
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (w *blockingReaperWriter) Write(p []byte) (int, error) {
+	w.once.Do(func() { close(w.started) })
+	<-w.release
+	return len(p), nil
+}
+
+func TestReaperRecoveryUsesFreshBudget(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+	r.entries = []reaperEntry{{id: "fresh-budget"}}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := r.recoverAndReplay(ctx, nil); err != nil {
+		t.Fatalf("recover with canceled caller context: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force fresh-budget")
+}
+
+func TestReaperOperationLockHonorsContext(t *testing.T) {
+	var lock reaperOperationLock
+	lock.Lock()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	err := lock.LockContext(ctx)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second lock error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("context-bounded lock took %s", elapsed)
+	}
+	lock.Unlock()
+}
+
+func TestReaperWriteIsContextBounded(t *testing.T) {
+	writer := &blockingReaperWriter{started: make(chan struct{}), release: make(chan struct{})}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- writeReaperRecord(ctx, writer, "entry\n")
+	}()
+	select {
+	case <-writer.started:
+	case <-time.After(time.Second):
+		t.Fatal("write did not start")
+	}
+	select {
+	case err := <-result:
+		if !errors.Is(err, errReaperWriteTimeout) {
+			t.Fatalf("write error = %v, want timeout", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("write did not honor its context budget")
+	}
+	close(writer.release)
 }
 
 func TestReaperCompletionStopsPendingRecheck(t *testing.T) {
@@ -513,6 +579,9 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	}
 	if !strings.Contains(reaperScript, "set +m") || !strings.Contains(reaperScript, "kill_descendants") {
 		t.Error("reaper script must keep helpers in a killable process tree")
+	}
+	if strings.Contains(reaperScript, "mktemp") {
+		t.Error("reaper script must stream inspect output instead of staging it")
 	}
 	if !strings.Contains(reaperScript, `$1 == "P"`) || !strings.Contains(reaperScript, `$1 == "C"`) {
 		t.Error("reaper script must retain pending create state until completion")

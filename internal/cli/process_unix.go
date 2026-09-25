@@ -14,6 +14,7 @@ import (
 // arguments arrive as positional parameters, so no caller-controlled shell
 // text is assembled. The read end of the parent pipe is fd 3 in the child.
 const parentDeathScript = `
+set +m
 bin=$1
 shift
 "$bin" "$@" 3<&- &

@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"io"
 	"slices"
 	"strings"
@@ -100,33 +101,50 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 	}
 }
 
-func TestLogsWithOptionsPassesTailAndSince(t *testing.T) {
-	f := newTestRunner()
-	ctr := runTestContainer(t, f)
-	f.calls = nil
-
+func TestLogsWithOptionsBackendMatrix(t *testing.T) {
 	since := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
-	rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Tail: 50, Since: since})
-	if err != nil {
-		t.Fatalf("LogsWithOptions: %v", err)
+	sinceArg := since.Format(time.RFC3339)
+	tests := []struct {
+		name            string
+		eng             engine
+		opts            LogsOptions
+		wantArgs        []string
+		wantUnsupported bool
+	}{
+		{name: "apple tail only", eng: appleEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "-n", "50", "myctr"}},
+		{name: "apple since only", eng: appleEngine{}, opts: LogsOptions{Since: since}, wantUnsupported: true},
+		{name: "apple tail and since", eng: appleEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantUnsupported: true},
+		{name: "apple neither", eng: appleEngine{}, wantArgs: []string{"logs", "myctr"}},
+		{name: "docker tail only", eng: dockerEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "--tail", "50", "myctr"}},
+		{name: "docker since only", eng: dockerEngine{}, opts: LogsOptions{Since: since}, wantArgs: []string{"logs", "--since", sinceArg, "myctr"}},
+		{name: "docker tail and since", eng: dockerEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantArgs: []string{"logs", "--tail", "50", "--since", sinceArg, "myctr"}},
+		{name: "docker neither", eng: dockerEngine{}, wantArgs: []string{"logs", "myctr"}},
 	}
-	_ = rc.Close()
 
-	call := f.callWith("logs")
-	if call == nil {
-		t.Fatal("no logs call recorded")
-	}
-	joined := strings.Join(call, " ")
-	if !strings.Contains(joined, "--tail 50") {
-		t.Errorf("missing --tail 50: %v", call)
-	}
-	if !strings.Contains(joined, "--since") {
-		t.Errorf("missing --since: %v", call)
-	}
-	tailIdx := strings.Index(joined, "--tail")
-	idIdx := strings.LastIndex(joined, "myctr")
-	if tailIdx < 0 || idIdx < 0 || tailIdx > idIdx {
-		t.Errorf("flags must precede container id: %v", call)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := &Container{id: "myctr", runner: f, eng: tc.eng}
+
+			rc, err := ctr.LogsWithOptions(context.Background(), tc.opts)
+			if tc.wantUnsupported {
+				if !errors.Is(err, ErrUnsupportedCapability) {
+					t.Fatalf("LogsWithOptions error = %v, want ErrUnsupportedCapability", err)
+				}
+				if call := f.callWith("logs"); call != nil {
+					t.Errorf("unsupported options must not invoke the CLI: %v", call)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LogsWithOptions: %v", err)
+			}
+			_ = rc.Close()
+
+			if call := f.callWith("logs"); !slices.Equal(call, tc.wantArgs) {
+				t.Errorf("logs args = %v, want %v", call, tc.wantArgs)
+			}
+		})
 	}
 }
 

@@ -53,6 +53,9 @@ type engine interface {
 	copyFromArgs(id, containerPath, hostPath string) []string
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	logsArgs(id string, follow bool) []string
+	// logsArgsWithOptions builds snapshot args and rejects options the
+	// backend cannot honor.
+	logsArgsWithOptions(id string, opts LogsOptions) ([]string, error)
 	// logsTailArgs fetches a bounded tail for diagnostics without
 	// pulling the full log stream.
 	logsTailArgs(id string) []string

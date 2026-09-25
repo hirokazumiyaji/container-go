@@ -127,6 +127,17 @@ func (appleEngine) logsArgs(id string, follow bool) []string {
 	return []string{"logs", id}
 }
 
+func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	if !opts.Since.IsZero() {
+		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
+	}
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Tail))
+	}
+	return append(args, id), nil
+}
+
 func (appleEngine) logsTailArgs(id string) []string {
 	return []string{"logs", "-n", "1000", id}
 }

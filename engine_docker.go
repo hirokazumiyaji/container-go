@@ -291,6 +291,17 @@ func (dockerEngine) logsArgs(id string, follow bool) []string {
 	return []string{"logs", id}
 }
 
+func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(opts.Tail))
+	}
+	if !opts.Since.IsZero() {
+		args = append(args, "--since", opts.Since.Format(time.RFC3339))
+	}
+	return append(args, id), nil
+}
+
 // logsTailArgs bounds diagnostics at the CLI: last 1000 lines, then
 // trimmed to logTailLimit bytes in Go with a fixed-size ring.
 func (dockerEngine) logsTailArgs(id string) []string {

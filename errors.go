@@ -30,6 +30,10 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
+// ErrUnsupportedCapability reports a requested feature that the selected
+// backend CLI cannot provide.
+var ErrUnsupportedCapability = errors.New("unsupported capability")
+
 // ErrGenerationReplaced reports that Terminate refused to delete because
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")

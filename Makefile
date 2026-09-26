@@ -13,22 +13,27 @@ lint:
 integration:
 	go test -tags integration -count=1 -timeout 20m -skip 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 
-# A required integration job must actually exercise the backend. `go test`
-# exits 0 when a -run pattern matches nothing, so assert on the verbose log:
-# every non-matching package prints "no tests to run", so the aggregate
-# string is useless. A `--- PASS: TestIntegrationDocker...` line appears only
-# for a test that started and passed, which is what we need.
+# `go test` exits 0 when a -run pattern matches nothing, so assert on the
+# verbose log that the pattern actually selected a test. Every non-matching
+# package prints "no tests to run", so the aggregate string is useless; a
+# `=== RUN TestIntegrationDocker...` line appears only for a test that ran.
+#
+# Under REQUIRE_BACKEND the job must also have exercised the backend, so a
+# pass is required rather than a mere start. Locally a missing daemon is a
+# legitimate skip, so only the "selected nothing" case fails there.
 integration-docker:
 	@log=$$(mktemp); \
-	trap 'rm -f "$$log"' EXIT INT TERM; \
-	go test -tags integration -count=1 -timeout 20m -v -run IntegrationDocker ./... >$$log 2>&1; \
+	go test -tags integration -count=1 -timeout 20m -v -run IntegrationDocker ./... >"$$log" 2>&1; \
 	status=$$?; \
-	cat $$log; \
-	if ! grep -qE '^--- PASS:[[:space:]]+TestIntegrationDocker' $$log; then \
-		echo 'error: no TestIntegrationDocker test passed; the pattern matched nothing or every test skipped'; \
+	cat "$$log"; \
+	if ! grep -qE '^=== RUN[[:space:]]+TestIntegrationDocker' "$$log"; then \
+		echo 'error: -run IntegrationDocker selected no tests; check the test names and the integration build tag'; \
+		status=1; \
+	elif [ "$$REQUIRE_BACKEND" = 1 ] && ! grep -qE '^--- PASS:[[:space:]]+TestIntegrationDocker' "$$log"; then \
+		echo 'error: no TestIntegrationDocker test passed; check the SKIP lines above (backend unavailable?)'; \
 		status=1; \
 	fi; \
-	rm -f $$log; trap - EXIT INT TERM; \
+	rm -f "$$log"; \
 	exit $$status
 
 bench-integration:

@@ -4,10 +4,13 @@
 package integrationtest
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
+	"time"
 )
 
 // RequireBackendEnv makes a missing backend an error instead of a skip. Set
@@ -104,15 +107,35 @@ func Required() bool {
 	return os.Getenv(RequireBackendEnv) == "1"
 }
 
+// probeTimeout bounds an availability probe. A wedged daemon socket or an
+// unreachable remote Docker context would otherwise block here forever, so a
+// local run hangs and a required job burns its whole timeout instead of
+// failing fast with a reason.
+const probeTimeout = 30 * time.Second
+
+// probe runs a backend CLI, bounded, and keeps its own explanation. Run
+// discards stderr, leaving only "exit status 1" — which cannot tell a stopped
+// daemon from a permission-denied socket or a stale DOCKER_HOST, and this
+// preflight exists precisely to report that reason.
+func probe(name, binary string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), probeTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
+	if err != nil {
+		if detail := strings.TrimSpace(string(out)); detail != "" {
+			return fmt.Errorf("%s: %w: %s", name, err, detail)
+		}
+		return fmt.Errorf("%s: %w", name, err)
+	}
+	return nil
+}
+
 // DockerUnavailable reports why the Docker backend cannot run, or nil.
 func DockerUnavailable() error {
 	if _, err := exec.LookPath("docker"); err != nil {
 		return fmt.Errorf("docker CLI: %w", err)
 	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		return fmt.Errorf("docker daemon: %w", err)
-	}
-	return nil
+	return probe("docker daemon", "docker", "info")
 }
 
 // AppleUnavailable reports why the Apple backend cannot run, or nil.
@@ -120,8 +143,5 @@ func AppleUnavailable() error {
 	if _, err := exec.LookPath("container"); err != nil {
 		return fmt.Errorf("container CLI: %w", err)
 	}
-	if err := exec.Command("container", "system", "status").Run(); err != nil {
-		return fmt.Errorf("apple container system service: %w", err)
-	}
-	return nil
+	return probe("apple container system service", "container", "system", "status")
 }

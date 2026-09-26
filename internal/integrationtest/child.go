@@ -49,6 +49,10 @@ func (g *ChildGroup) Track(cmd *exec.Cmd) {
 }
 
 // Kill terminates and reaps every tracked child.
+//
+// It uses cmd.Wait rather than cmd.Process.Wait because Wait is what closes
+// the parent side of a StdoutPipe and joins exec's I/O copy goroutines;
+// bypassing it leaks both for the life of the test binary.
 func (g *ChildGroup) Kill() {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -57,7 +61,7 @@ func (g *ChildGroup) Kill() {
 			continue
 		}
 		_ = cmd.Process.Kill()
-		_, _ = cmd.Process.Wait()
+		_ = cmd.Wait()
 	}
 }
 
@@ -89,14 +93,28 @@ func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
 			n, err := r.Read(buf)
 			acc += string(buf[:n])
 			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				ch <- chunk{text: acc, done: true, err: err}
+				// Non-blocking: the caller may already have timed out, and a
+				// blocked send would wedge this goroutine forever.
+				select {
+				case ch <- chunk{text: acc, done: true, err: err}:
+				default:
+				}
 				return
 			}
 			select {
 			case ch <- chunk{text: acc}:
 			default:
-				// Keep only the newest snapshot; the reader must not block
-				// on a caller that has already moved on.
+				// The caller is behind. Overwrite the stale snapshot rather
+				// than dropping the newer text, so the reported output is
+				// never older than what the child has already written.
+				select {
+				case <-ch:
+				default:
+				}
+				select {
+				case ch <- chunk{text: acc}:
+				default:
+				}
 			}
 		}
 	}()
@@ -109,9 +127,21 @@ func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
 		case c := <-ch:
 			seen = c.text
 			if c.done {
+				// A read that ended without a marker is a failure, and the
+				// read error is the only explanation available.
+				if c.err != nil && !strings.Contains(seen, "READY:") && !strings.Contains(seen, "CHILD-ERROR:") {
+					return seen, fmt.Errorf("child read ended before reporting readiness: %w", c.err)
+				}
 				return seen, nil
 			}
 		case <-timer.C:
+			// Release the reader: the blocked Read has no cancellation of
+			// its own, and a grandchild holding the pipe write end would
+			// otherwise keep this goroutine and the pipe alive for the rest
+			// of the test binary's run.
+			if closer, ok := r.(io.Closer); ok {
+				_ = closer.Close()
+			}
 			return seen, fmt.Errorf("child did not report readiness within %v", timeout)
 		}
 	}

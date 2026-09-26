@@ -79,11 +79,32 @@ func (dockerEngine) defaultHost() string {
 	return "127.0.0.1"
 }
 
-// isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
-// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
-// the remote host is unreachable from the client.
+// isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
+// live on another machine. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1
+// bind on the remote host is unreachable from the client.
+//
+// The scheme is checked directly rather than through defaultHost, which
+// recognizes only tcp://. ssh:// is a first-class Docker remote transport, and
+// the daemon there resolves bind-mount sources on its own host, so a
+// configuration derived from defaultHost would report local and let the bind
+// through unchanged. A loopback host is still this machine, and an unparsable
+// value is treated as remote so a malformed setting fails closed rather than
+// permitting a bind the daemon would resolve in the wrong place.
 func isRemoteDockerHost() bool {
-	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
+	raw := os.Getenv("DOCKER_HOST")
+	if raw == "" {
+		return false
+	}
+	for _, local := range []string{"unix://", "npipe://"} {
+		if strings.HasPrefix(strings.ToLower(raw), local) {
+			return false
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return true
+	}
+	return !isLoopbackOrUnspecified(u.Hostname())
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and

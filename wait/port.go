@@ -4,9 +4,10 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/portspec"
 )
 
 // HostPortStrategy waits until a TCP connection to the container's
@@ -42,7 +43,7 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 
 func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if s.explicitPort {
-		if err := validateTCPPortSpec(s.port); err != nil {
+		if err := validateTCPPortSpec("ForListeningPort", s.port); err != nil {
 			return err
 		}
 	}
@@ -60,32 +61,21 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) er
 	}, true)
 }
 
-func validateTCPPortSpec(spec string) error {
-	port, protocol, ok := strings.Cut(spec, "/")
-	if !ok {
-		protocol = "tcp"
+func validateTCPPortSpec(strategy, spec string) error {
+	_, err := portspec.ParseTCP(spec)
+	if err == nil {
+		return nil
 	}
-	if protocol != "tcp" {
-		reason := "protocol must be tcp"
-		if protocol == "udp" {
-			reason = "only TCP is supported"
-		}
-		return &ConfigError{
-			Strategy: "ForListeningPort",
-			Field:    "port specification",
-			Value:    spec,
-			Reason:   reason,
-		}
+	// ConfigError.Value already carries the specification, so keep only the
+	// reason rather than repeating the value in the message.
+	reason := err.Error()
+	if _, rest, ok := strings.Cut(reason, ": "); ok {
+		reason = rest
 	}
-
-	n, err := strconv.Atoi(port)
-	if err != nil || n < 1 || n > 65535 {
-		return &ConfigError{
-			Strategy: "ForListeningPort",
-			Field:    "port specification",
-			Value:    spec,
-			Reason:   "port must be 1-65535",
-		}
+	return &ConfigError{
+		Strategy: strategy,
+		Field:    "port specification",
+		Value:    spec,
+		Reason:   reason,
 	}
-	return nil
 }

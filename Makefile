@@ -14,7 +14,12 @@ integration:
 	go test -tags integration -count=1 -timeout 20m -skip 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 
 integration-docker:
-	go test -tags integration -count=1 -timeout 20m -run IntegrationDocker ./...
+	@log=$$(mktemp); \
+	go test -tags integration -count=1 -timeout 20m -v -run IntegrationDocker ./... 2>&1 | tee $$log; \
+	status=$${PIPESTATUS[0]}; \
+	grep -q 'no tests to run' $$log && { echo 'error: -run IntegrationDocker selected no tests'; status=1; }; \
+	rm -f $$log; \
+	exit $$status
 
 bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...

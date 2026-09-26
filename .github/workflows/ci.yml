@@ -6,6 +6,10 @@ on:
   pull_request:
   workflow_dispatch:
 
+# No job here needs write access: they only check out, build, and test.
+permissions:
+  contents: read
+
 jobs:
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
@@ -60,6 +64,9 @@ jobs:
   # Docker is preinstalled on ubuntu-latest; Apple Container stays local-only.
   integration-docker:
     runs-on: ubuntu-latest
+    # go test's own -timeout is per test binary and does not cover a helper
+    # process that outlives it, so cap the job as well.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

@@ -165,6 +165,10 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 // dockerIDRE matches the full container ID `docker run --detach` prints.
 var dockerIDRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
+// dockerIDLen is the length dockerIDRE requires, kept next to the pattern
+// so the two cannot drift apart.
+const dockerIDLen = 64
+
 func (dockerEngine) parseRunID(stdout []byte) string {
 	id := strings.TrimSpace(string(stdout))
 	if !dockerIDRE.MatchString(id) {
@@ -174,6 +178,10 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 }
 
 func (dockerEngine) nameAddressedDeletes() bool { return false }
+
+// copyNeedsRunning reports that `docker cp` accepts created and stopped
+// containers, so copy must not require a running state.
+func (dockerEngine) copyNeedsRunning() bool { return false }
 
 func (dockerEngine) inspectArgs(id string) []string {
 	// Docker resolves an unqualified target across object types by
@@ -213,7 +221,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	// A 64-character target is intended to be Docker's immutable ID. Do
 	// not let a malformed ID fall through to name matching, where a
 	// same-name replacement could satisfy the operation.
-	if len(id) == len(strings.Repeat("a", 64)) && !dockerIDRE.MatchString(id) {
+	if len(id) == dockerIDLen && !dockerIDRE.MatchString(id) {
 		return nil, fmt.Errorf("invalid immutable container id %q", id)
 	}
 	var containers []dockerInspect
@@ -221,35 +229,40 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	match := -1
+	malformedMatch := -1
 	targetIsID := dockerIDRE.MatchString(id)
 	targetName := strings.TrimPrefix(strings.TrimSpace(id), "/")
 	for i, container := range containers {
-		// A container inspect object has both a full ID and a State
-		// object. Reject malformed or non-container records before name
-		// matching so they cannot shadow the requested container.
+		if targetIsID {
+			if container.ID != id {
+				continue
+			}
+		} else {
+			if targetName == "" || !strings.HasPrefix(container.Name, "/") ||
+				strings.TrimPrefix(container.Name, "/") != targetName {
+				continue
+			}
+		}
+		// Select by identity first, then judge the record shape. Skipping
+		// malformed records here would report a live container as
+		// ErrContainerNotFound, which every caller treats as already gone.
 		if !dockerIDRE.MatchString(container.ID) || container.State == nil ||
 			strings.TrimSpace(container.State.Status) == "" {
-			continue
-		}
-		if targetIsID {
-			if container.ID == id {
-				match = i
-				break
+			if malformedMatch < 0 {
+				malformedMatch = i
 			}
 			continue
 		}
-		if targetName != "" && strings.HasPrefix(container.Name, "/") && strings.TrimPrefix(container.Name, "/") == targetName {
-			match = i
-			break
-		}
+		match = i
+		break
 	}
 	if match < 0 {
+		if malformedMatch >= 0 {
+			return nil, fmt.Errorf("docker inspect for %s returned no container-shaped state", id)
+		}
 		return nil, fmt.Errorf("%w: %s not in inspect output", ErrContainerNotFound, id)
 	}
 	c := containers[match]
-	if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
-		return nil, fmt.Errorf("docker inspect for %s returned no container-shaped state", id)
-	}
 
 	info := &engineInfo{
 		state:  dockerState(c.State.Status),

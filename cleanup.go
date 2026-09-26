@@ -169,11 +169,19 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	return deletePruneCandidate(guardCtx, r, eng, target, errKind)
 }
 
+// pruneCandidateStillCurrent reports whether a fresh inspect still proves
+// the listed candidate is the same container, so a delete cannot land on a
+// replacement.
+//
+// A reuse-group prune is keyed on group membership alone: PruneReuseGroup
+// force-removes every container tagged with the group, whether or not it
+// carries the managed label. Requiring `managed` there would silently skip
+// group members and still report success.
 func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reuseGroup string) bool {
-	if fresh == nil || !candidate.managed || !validCreationID(candidate.creation) || !knownPruneState(candidate.state) {
+	if fresh == nil || !validCreationID(candidate.creation) || !knownPruneState(candidate.state) {
 		return false
 	}
-	if fresh.labels[managedLabel] != "true" || !validCreationID(fresh.labels[creationLabel]) ||
+	if !validCreationID(fresh.labels[creationLabel]) ||
 		fresh.labels[creationLabel] != candidate.creation || fresh.state != candidate.state ||
 		fresh.labels[reuseGroupLabel] != candidate.reuseGroup {
 		return false
@@ -181,7 +189,7 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	if reuseGroup != "" {
 		return candidate.reuseGroup == reuseGroup && fresh.labels[reuseGroupLabel] == reuseGroup && knownPruneState(fresh.state)
 	}
-	return fresh.state == StateStopped
+	return candidate.managed && fresh.labels[managedLabel] == "true" && fresh.state == StateStopped
 }
 
 func knownPruneState(state State) bool {

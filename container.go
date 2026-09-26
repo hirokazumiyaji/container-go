@@ -1068,6 +1068,23 @@ func (c *Container) withVerifiedOperationTarget(ctx context.Context, requireRunn
 	return fn(target, info)
 }
 
+// verifiedReadTarget resolves a read-only target and releases the name lock
+// before returning. Streaming callers must not hold that lock: it is
+// cross-process and non-reentrant, so keeping it for a stream's lifetime
+// would serialize concurrent readers (wait.ForAny over two log patterns)
+// behind the first stream, and would leak the lock outright if a caller
+// abandons the stream. Verification already proved the identity, and a
+// read-only stream performs no destructive step, so releasing early costs
+// nothing.
+func (c *Container) verifiedReadTarget(ctx context.Context) (string, error) {
+	target, _, release, err := c.acquireVerifiedOperationTarget(ctx, false)
+	if err != nil {
+		return "", err
+	}
+	release()
+	return target, nil
+}
+
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
 	if _, ok := ctx.Deadline(); ok {
 		return ctx, func() {}

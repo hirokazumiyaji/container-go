@@ -204,9 +204,20 @@ func truncateOutput(s string) string {
 func truncateStderr(s string) string { return truncateOutput(s) }
 
 // IsCommandExit reports whether err is a CLIError from a child process
-// that started and returned an exit status. Launch failures (missing
-// binary, OS exec errors) are not CLIErrors and return false.
+// that started and returned an exit status on its own. Launch failures
+// (missing binary, OS exec errors) are not CLIErrors and return false.
+//
+// A context error in the chain vetoes the result: the child was signalled
+// because the caller cancelled, so its -1 exit code is not an app outcome.
+// Without the veto a killed child would be reported as "exit -1, no error"
+// and a cancellation would silently become a successful command result.
 func IsCommandExit(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
 	var e *CLIError
 	return errors.As(err, &e)
 }
@@ -296,9 +307,12 @@ func classifySystemNotRunning(original, probeErr error, hint string) error {
 	)
 }
 
+// isProbeTimeoutError reports a pure bounded-probe timeout: the probe
+// context expired and the probe error is that expiry. Both conjuncts are
+// required, so a genuine non-timeout failure that merely arrived after the
+// deadline is not promoted to liveness evidence.
 func isProbeTimeoutError(probeCtx context.Context, err error) bool {
-	return probeCtx.Err() == context.DeadlineExceeded &&
-		(errors.Is(err, context.DeadlineExceeded) || probeCtx.Err() != nil)
+	return probeCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded)
 }
 
 func probeVetoError(err error) bool {
@@ -317,8 +331,13 @@ func probeVetoError(err error) bool {
 	return containsNonLivenessText(strings.ToLower(diagnosticText(err)))
 }
 
+// isProbeCancellationOrConfiguration reports an error that must never be
+// read as liveness evidence: a definite client-side or configuration
+// failure, or a cancellation. A bounded-probe timeout is excluded by the
+// caller via the probe context, so every DeadlineExceeded reaching here is
+// a real cancellation.
 func isProbeCancellationOrConfiguration(err error) bool {
-	return probeVetoError(err) || errors.Is(err, context.DeadlineExceeded) && !isProbeTimeoutError(context.Background(), err)
+	return probeVetoError(err) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func operationLivenessText(err error) bool {

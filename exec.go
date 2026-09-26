@@ -80,6 +80,10 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
+	// verifyCtx bounds only the identity lock and verification inspect.
+	// The user command itself runs under the caller's ctx: Exec has no
+	// default deadline, and a library-injected timeout would be reported
+	// as an exit code rather than as the caller's cancellation.
 	verifyCtx, verifyCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer verifyCancel()
 	var (
@@ -88,13 +92,13 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		execErr  error
 	)
 	err := c.withVerifiedOperationTarget(verifyCtx, true, func(target string, _ *engineInfo) error {
-		stdout, stderr, runErr := c.runner.Run(verifyCtx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+		stdout, stderr, runErr := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 		if runErr == nil {
 			return nil
 		}
 		if !cli.IsCommandExit(runErr) {
-			execErr = wrapNotFoundFor(c.eng, c.classify(verifyCtx, runErr))
+			execErr = wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
 			return execErr
 		}
 		var cliErr *cli.CLIError
@@ -109,7 +113,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		if c.execContainerRunningTarget(verifyCtx, target) {
 			return nil
 		}
-		execErr = wrapNotFoundFor(c.eng, c.classify(verifyCtx, runErr))
+		execErr = wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
 		return execErr
 	})
 	if err != nil {

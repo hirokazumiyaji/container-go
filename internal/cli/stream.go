@@ -47,6 +47,7 @@ func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser,
 		args:       append([]string(nil), args...),
 		output:     publicWrite,
 		stderr:     &tailBuffer{},
+		stdoutTail: &tailBuffer{},
 		stdoutRead: stdoutRead,
 		stderrRead: stderrRead,
 		waitDone:   make(chan struct{}),
@@ -102,6 +103,7 @@ type processStream struct {
 	closed     bool
 	cancelled  bool
 	stderr     *tailBuffer
+	stdoutTail *tailBuffer
 }
 
 func (s *processStream) startPumps() {
@@ -125,9 +127,12 @@ func (s *processStream) pump(source *os.File, isStderr bool) {
 			chunk := buf[:n]
 			// Capture diagnostics before applying public backpressure. A
 			// terminal error remains available even when the caller never
-			// drains the merged stream.
+			// drains the merged stream. Both tails are kept because the
+			// backends report failures on either stream.
 			if isStderr {
 				_, _ = s.stderr.Write(chunk)
+			} else {
+				_, _ = s.stdoutTail.Write(chunk)
 			}
 			if _, writeErr := s.output.Write(chunk); writeErr != nil {
 				return
@@ -165,8 +170,10 @@ func (s *processStream) Read(p []byte) (int, error) {
 }
 
 // TerminalError returns a terminal CLI error, if the process has ended
-// with one. It deliberately returns nil for a clean EOF and for an
-// intentional Close/context cancellation.
+// with one. It returns nil for a clean EOF and for an intentional Close.
+// A context cancellation is reported as a non-nil wrapped context error,
+// because callers branch on this value to tell a finished stream from an
+// interrupted one.
 func (s *processStream) TerminalError() error {
 	s.wait()
 	s.mu.Lock()
@@ -188,12 +195,15 @@ func (s *processStream) TerminalError() error {
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {
-		return &CLIError{
+		// withStdout keeps the stdout tail reachable through
+		// DiagnosticText, so a not-found/conflict diagnostic written to
+		// stdout still matches the line-based classifiers.
+		return withStdout(&CLIError{
 			Binary:   s.binary,
 			Args:     s.args,
 			ExitCode: exitErr.ExitCode(),
 			Stderr:   s.stderr.String(),
-		}
+		}, s.stdoutTail.String())
 	}
 	return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), waitErr)
 }

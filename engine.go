@@ -40,6 +40,17 @@ func usesNameAddressedDeletes(eng engine) bool {
 	return ok && capability.nameAddressedDeletes()
 }
 
+// copyRequiresRunning reports whether the backend's copy verb only works
+// against a running container. Docker's `cp` accepts created and stopped
+// containers, so gating on state there would reject a common workflow
+// (fetching an artifact from an exited container) for no safety benefit.
+// The identity and generation checks in withVerifiedOperationTarget already
+// protect the target regardless of lifecycle state.
+func copyRequiresRunning(eng engine) bool {
+	capability, ok := eng.(interface{ copyNeedsRunning() bool })
+	return ok && capability.copyNeedsRunning()
+}
+
 type boundPort struct {
 	containerPort int
 	proto         string

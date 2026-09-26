@@ -166,7 +166,11 @@ func handleLogScanResult(callerCtx, waitCtx context.Context, timeout time.Durati
 	if deadline, ok := waitCtx.Deadline(); ok {
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err)
+			// The pattern was never observed, so this wait must fail. The
+			// context timer callback is dispatched asynchronously, so
+			// waitContextTerminationError can still report nil here; a
+			// readiness gate must never return success on this path.
+			return waitTimeoutError(what, timeout, result.err)
 		}
 		if remaining < probeBudget {
 			probeBudget = remaining

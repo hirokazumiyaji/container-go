@@ -72,20 +72,18 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	target, _, release, err := c.acquireVerifiedOperationTarget(ctx, false)
+	target, err := c.verifiedReadTarget(ctx)
 	if err != nil {
 		return nil, err
 	}
 	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
 	if err != nil {
-		release()
 		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	classified := &classifyingStream{
 		ReadCloser: stream,
 		container:  c,
 		ctx:        ctx,
-		release:    release,
 		done:       make(chan struct{}),
 		closeDone:  make(chan struct{}),
 	}
@@ -106,7 +104,6 @@ type classifyingStream struct {
 	ctx         context.Context
 	container   *Container
 	once        sync.Once
-	release     func()
 	releaseOnce sync.Once
 	terminal    error
 	done        chan struct{}
@@ -146,9 +143,6 @@ func (s *classifyingStream) finish() {
 	s.releaseOnce.Do(func() {
 		if s.done != nil {
 			close(s.done)
-		}
-		if s.release != nil {
-			s.release()
 		}
 	})
 }

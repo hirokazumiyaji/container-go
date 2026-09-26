@@ -72,6 +72,10 @@ func (appleEngine) parseRunID([]byte) string { return "" }
 
 func (appleEngine) nameAddressedDeletes() bool { return true }
 
+// copyNeedsRunning reports that `container cp` only accepts a running
+// container on this backend.
+func (appleEngine) copyNeedsRunning() bool { return true }
+
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {

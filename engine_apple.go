@@ -120,11 +120,8 @@ func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []st
 	return append(args, cmd...)
 }
 
-func (appleEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
-	}
-	return []string{"logs", id}
+func (appleEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
 }
 
 func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {

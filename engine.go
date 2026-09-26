@@ -52,7 +52,8 @@ type engine interface {
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
-	logsArgs(id string, follow bool) []string
+	// logsFollowArgs builds the streaming follow argv.
+	logsFollowArgs(id string) []string
 	// logsArgsWithOptions builds snapshot args and rejects options the
 	// backend cannot honor.
 	logsArgsWithOptions(id string, opts LogsOptions) ([]string, error)

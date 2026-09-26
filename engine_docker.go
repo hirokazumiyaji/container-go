@@ -284,11 +284,8 @@ func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []s
 	return append(args, cmd...)
 }
 
-func (dockerEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
-	}
-	return []string{"logs", id}
+func (dockerEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
 }
 
 func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {

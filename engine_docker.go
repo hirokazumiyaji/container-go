@@ -67,16 +67,36 @@ func (dockerEngine) probe() cli.Probe {
 	}
 }
 
-// defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
-// else publishes on loopback. Note: a `docker context` pointing at a
-// remote daemon is not detected; only DOCKER_HOST is honored.
+// defaultHost returns the address the client should dial to reach the
+// container. For a remote daemon that is the DOCKER_HOST host; otherwise it is
+// this machine's loopback.
+//
+// Unlike the auto-publish bind decision, this must be scheme-aware for every
+// remote transport. A client told to dial 127.0.0.1 for a container published
+// on a remote daemon reaches nothing, which is the exact symptom the remote
+// detection exists to prevent. Note: a `docker context` pointing at a remote
+// daemon is not detected; only DOCKER_HOST is honored.
 func (dockerEngine) defaultHost() string {
-	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
-		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-			return u.Hostname()
+	if isRemoteDockerHost() {
+		if host := dockerHostName(); host != "" {
+			return host
 		}
 	}
 	return "127.0.0.1"
+}
+
+// dockerHostName returns the hostname DOCKER_HOST names, or "" when it names
+// no host (a local socket, or an unparsable value).
+func dockerHostName() string {
+	raw := os.Getenv("DOCKER_HOST")
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
 }
 
 // isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
@@ -95,7 +115,11 @@ func isRemoteDockerHost() bool {
 	if raw == "" {
 		return false
 	}
-	for _, local := range []string{"unix://", "npipe://"} {
+	// These transports name a socket on this machine. fd:// (systemd
+	// socket activation) yields an empty hostname from url.Parse, so it has
+	// to be listed explicitly rather than falling through to fail-closed,
+	// which would report a purely local daemon as remote.
+	for _, local := range []string{"unix://", "npipe://", "fd://"} {
 		if strings.HasPrefix(strings.ToLower(raw), local) {
 			return false
 		}
@@ -147,8 +171,8 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
 	// Publish every declared port the user did not publish explicitly
 	// to a daemon-assigned port. Locally this binds loopback; on a
-	// remote daemon (tcp:// DOCKER_HOST) it binds all interfaces so
-	// the client can reach it via defaultHost().
+	// remote daemon it binds all interfaces so the client can reach it
+	// via defaultHost().
 	bindAddr := "127.0.0.1"
 	if isRemoteDockerHost() {
 		bindAddr = "0.0.0.0"

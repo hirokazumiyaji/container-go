@@ -504,11 +504,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	c.uidMu.Lock()
-	if c.uid == "" {
-		c.uid = info.uid
-	}
-	c.uidMu.Unlock()
+	// Delegate, so the "never downgrade a promoted value" invariant lives in
+	// one place rather than being reimplemented here.
+	c.setImmutableID(info.uid)
 	return info, nil
 }
 

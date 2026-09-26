@@ -31,6 +31,10 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 		"",
 		"unix:///var/run/docker.sock",
 		"npipe:////./pipe/docker_engine",
+		// fd:// is systemd socket activation: a real Docker transport for a
+		// local daemon. url.Parse yields an empty hostname for it, so it must
+		// be listed explicitly rather than falling through to fail-closed.
+		"fd://",
 		"tcp://127.0.0.1:2375",
 		"tcp://127.0.0.2:2375",
 		"tcp://[::1]:2375",
@@ -53,16 +57,59 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 	}
 }
 
-// defaultHost still only understands tcp://, because it decides the auto-publish
-// bind address and that rewrite is defined for tcp. The two must not be
-// conflated: deriving remote detection from defaultHost is what missed ssh://.
-func TestReviewDefaultHostRemainsTCPOnly(t *testing.T) {
-	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
-	if got := (dockerEngine{}).defaultHost(); got != "127.0.0.1" {
-		t.Errorf("defaultHost() = %q, want 127.0.0.1", got)
+// The client-facing host must be scheme-aware for every remote transport.
+// Telling the caller to dial 127.0.0.1 for a container published on a remote
+// daemon reaches nothing, which is the symptom this change exists to prevent.
+func TestReviewDefaultHostIsSchemeAware(t *testing.T) {
+	cases := map[string]string{
+		"ssh://user@remote-host":    "remote-host",
+		"ssh://user@10.0.0.5":       "10.0.0.5",
+		"http://10.0.0.5:2375":      "10.0.0.5",
+		"tcp://10.0.0.5:2375":       "10.0.0.5",
+		"":                          "127.0.0.1",
+		"unix:///var/run/d.sock":    "127.0.0.1",
+		"fd://":                     "127.0.0.1",
+		"npipe:////./pipe/docker_e": "127.0.0.1",
 	}
+	for host, want := range cases {
+		t.Run(host, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", host)
+			if got := (dockerEngine{}).defaultHost(); got != want {
+				t.Errorf("defaultHost() = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// A remote daemon's published address must not be rewritten to the client's own
+// loopback, which is what an incomplete fix leaves behind.
+func TestReviewConnectHostUsesRemoteHostName(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
+	eng := dockerEngine{}
+	// A 0.0.0.0 bind on a remote daemon must resolve to the remote host, not
+	// to 127.0.0.1.
+	if got := dockerConnectHost("0.0.0.0", eng); got != "remote-host" {
+		t.Errorf("dockerConnectHost(0.0.0.0) = %q, want remote-host", got)
+	}
+	// Locally the same bind is this machine.
+	t.Setenv("DOCKER_HOST", "")
+	if got := dockerConnectHost("0.0.0.0", eng); got != "127.0.0.1" {
+		t.Errorf("dockerConnectHost(0.0.0.0) locally = %q, want 127.0.0.1", got)
+	}
+}
+
+// Auto-publish must keep binding loopback for a local daemon, including the
+// transports that carry no hostname.
+func TestReviewAutoPublishBindsLoopbackLocally(t *testing.T) {
+	for _, host := range []string{"", "unix:///var/run/d.sock", "fd://", "npipe:////./pipe/docker_e"} {
+		t.Setenv("DOCKER_HOST", host)
+		if isRemoteDockerHost() {
+			t.Errorf("DOCKER_HOST=%q: reported remote; auto-publish would bind 0.0.0.0", host)
+		}
+	}
+	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
 	if !isRemoteDockerHost() {
-		t.Error("an ssh:// daemon must still be detected as remote")
+		t.Error("an ssh:// daemon must be remote so auto-publish binds 0.0.0.0")
 	}
 }
 

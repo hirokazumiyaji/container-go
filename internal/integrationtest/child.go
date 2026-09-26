@@ -69,11 +69,19 @@ func (g *ChildGroup) Kill() {
 // package-wide timeout, and the declared bound would be a lie. The timeout
 // is returned as an error rather than reported through t, so the caller
 // decides how to fail.
+//
+// Whatever the child managed to write is returned even on timeout. A hang is
+// exactly when the partial output is the only diagnostic available, so
+// dropping it would leave nothing to explain the failure.
 func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
-	type result struct {
-		out string
+	// The single reader publishes each chunk, so the timeout path can report
+	// what the child produced before it went quiet.
+	type chunk struct {
+		text string
+		done bool
+		err  error
 	}
-	ch := make(chan result, 1)
+	ch := make(chan chunk, 1)
 	go func() {
 		var acc string
 		buf := make([]byte, 4096)
@@ -81,17 +89,30 @@ func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
 			n, err := r.Read(buf)
 			acc += string(buf[:n])
 			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				ch <- result{out: acc}
+				ch <- chunk{text: acc, done: true, err: err}
 				return
+			}
+			select {
+			case ch <- chunk{text: acc}:
+			default:
+				// Keep only the newest snapshot; the reader must not block
+				// on a caller that has already moved on.
 			}
 		}
 	}()
+
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
-	select {
-	case res := <-ch:
-		return res.out, nil
-	case <-timer.C:
-		return "", fmt.Errorf("child did not report readiness within %v", timeout)
+	var seen string
+	for {
+		select {
+		case c := <-ch:
+			seen = c.text
+			if c.done {
+				return seen, nil
+			}
+		case <-timer.C:
+			return seen, fmt.Errorf("child did not report readiness within %v", timeout)
+		}
 	}
 }

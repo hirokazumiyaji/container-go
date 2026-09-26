@@ -34,6 +34,26 @@ func TestReadReadyFailsOnSilentChild(t *testing.T) {
 	}
 }
 
+// A hang is exactly when the partial output is the only diagnostic, so it
+// must survive the timeout.
+func TestReadReadyReturnsPartialOutputOnTimeout(t *testing.T) {
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+
+	go func() {
+		_, _ = pw.Write([]byte("starting up\n"))
+		// Then go quiet without ever sending a marker.
+	}()
+
+	out, err := ReadReady(pr, shortChildTimeout)
+	if err == nil {
+		t.Fatalf("expected a timeout, got %q", out)
+	}
+	if !strings.Contains(out, "starting up") {
+		t.Errorf("partial output lost on timeout: %q", out)
+	}
+}
+
 // A ready marker must be returned promptly.
 func TestReadReadyReturnsOnMarker(t *testing.T) {
 	pr, pw := io.Pipe()

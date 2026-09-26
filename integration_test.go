@@ -363,13 +363,15 @@ func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
 	}
 	children.Track(c2)
 
+	// The partial output is reported with the error: a hang is exactly when
+	// it is the only diagnostic available.
 	o1, err := integrationtest.ReadReady(out1, integrationtest.ChildReadyTimeout)
 	if err != nil {
-		t.Fatalf("child1: %v", err)
+		t.Fatalf("child1: %v (output so far: %q)", err, o1)
 	}
 	o2, err := integrationtest.ReadReady(out2, integrationtest.ChildReadyTimeout)
 	if err != nil {
-		t.Fatalf("child2: %v", err)
+		t.Fatalf("child2: %v (output so far: %q)", err, o2)
 	}
 	if !strings.Contains(o1, "READY:") {
 		t.Fatalf("child1: %q", o1)

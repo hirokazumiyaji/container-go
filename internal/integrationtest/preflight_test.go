@@ -71,3 +71,23 @@ func TestDecideTypoWinsOverUnavailable(t *testing.T) {
 		t.Errorf("reason=%q", reason)
 	}
 }
+
+// A required run that selects the other backend must fail, not skip. Skipping
+// would leave the job green having executed nothing, which is the exact
+// failure mode this preflight exists to prevent.
+func TestDecideRequiredCrossBackendFails(t *testing.T) {
+	ok := func() error { return nil }
+
+	verdict, reason := Decide("docker", "apple", true, ok)
+	if verdict != Fail {
+		t.Fatalf("verdict=%v, want Fail when REQUIRE_BACKEND=1 selects the other backend", verdict)
+	}
+	if !strings.Contains(reason, "other backend") {
+		t.Errorf("reason=%q", reason)
+	}
+
+	// Locally the same case skips, so a developer can run either suite.
+	if verdict, _ := Decide("docker", "apple", false, ok); verdict != Skip {
+		t.Errorf("verdict=%v, want Skip without REQUIRE_BACKEND", verdict)
+	}
+}

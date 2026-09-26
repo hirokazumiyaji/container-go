@@ -69,15 +69,23 @@ const (
 //
 // selected is the CONTAINERGO_BACKEND value and required reports whether
 // RequireBackendEnv is set. A typo is always a failure, because skipping on
-// one hides the mistake behind a green job. A backend that simply cannot run
-// skips locally but fails when the job requires it, so a backend outage is
-// never reported as success.
+// one hides the mistake behind a green job.
+//
+// required means this run must exercise want. Two things would otherwise
+// leave a required job green with nothing executed: a backend that cannot
+// run, and a selection naming the other backend. Both fail under required.
+// Without it, both skip, so a developer without the backend can still run
+// the suite locally.
 func Decide(want, selected string, required bool, unavailable func() error) (Verdict, string) {
 	switch selected {
 	case "", want:
 	default:
 		if selected != "apple" && selected != "docker" {
 			return Fail, fmt.Sprintf("invalid CONTAINERGO_BACKEND=%q: valid values are \"apple\" and \"docker\"", selected)
+		}
+		if required {
+			return Fail, fmt.Sprintf("%s integration is required but CONTAINERGO_BACKEND=%s selects the other backend",
+				want, selected)
 		}
 		return Skip, fmt.Sprintf("CONTAINERGO_BACKEND=%s; skipping %s integration", selected, want)
 	}

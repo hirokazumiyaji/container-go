@@ -47,10 +47,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		// Carry the creator bit: if this process created the generation, a
-		// later failure must roll it back rather than hand back no handle at
-		// all and leave a half-configured container with no way to remove it.
-		creator:  base.creator,
+		// Deliberately not the creator bit. The flight result is shared with
+		// every waiter that joined this name, so a failure after this point
+		// must never delete a generation a sibling caller is still using.
+		// The creator's own post-create failures are already rolled back
+		// inside reuseCreate, before the flight completes.
+		creator:  false,
 		info:     info,
 		creation: info.labels[creationLabel],
 		uid:      info.uid,

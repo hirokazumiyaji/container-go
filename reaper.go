@@ -49,10 +49,18 @@ pending_attempts="$REAPER_PENDING_ATTEMPTS"
 run_with_timeout() {
   seconds="$1"
   shift
+  # "$@" is a shell function, so backgrounding it forks a subshell and $!
+  # would be that subshell rather than the backend CLI. Killing it would
+  # leave the CLI alive, still holding the command-substitution pipe, so the
+  # caller's assignment would never return and the per-entry timeout would
+  # not bound anything. Job control makes the background job a
+  # process-group leader, so the whole tree can be signalled.
+  set -m
   "$@" & command_pid=$!
-  (sleep "$seconds"; kill -9 "$command_pid" 2>/dev/null || true) >/dev/null 2>&1 & killer_pid=$!
+  (sleep "$seconds"; kill -9 -"$command_pid" 2>/dev/null || kill -9 "$command_pid" 2>/dev/null || true) >/dev/null 2>&1 & killer_pid=$!
   wait "$command_pid" 2>/dev/null
   rc=$?
+  set +m
   kill -9 "$killer_pid" 2>/dev/null || true
   wait "$killer_pid" 2>/dev/null || true
   return "$rc"
@@ -244,10 +252,18 @@ lock_file_secure() {
 run_with_timeout() {
   seconds="$1"
   shift
+  # "$@" is a shell function, so backgrounding it forks a subshell and $!
+  # would be that subshell rather than the backend CLI. Killing it would
+  # leave the CLI alive, still holding the command-substitution pipe, so the
+  # caller's assignment would never return and the per-entry timeout would
+  # not bound anything. Job control makes the background job a
+  # process-group leader, so the whole tree can be signalled.
+  set -m
   "$@" & command_pid=$!
-  (sleep "$seconds"; kill -9 "$command_pid" 2>/dev/null || true) >/dev/null 2>&1 & killer_pid=$!
+  (sleep "$seconds"; kill -9 -"$command_pid" 2>/dev/null || kill -9 "$command_pid" 2>/dev/null || true) >/dev/null 2>&1 & killer_pid=$!
   wait "$command_pid" 2>/dev/null
   rc=$?
+  set +m
   kill -9 "$killer_pid" 2>/dev/null || true
   wait "$killer_pid" 2>/dev/null || true
   return "$rc"

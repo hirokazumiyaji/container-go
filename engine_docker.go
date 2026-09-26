@@ -175,14 +175,22 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 
 func (dockerEngine) nameAddressedDeletes() bool { return false }
 
-func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
+func (dockerEngine) inspectArgs(id string) []string {
+	// Docker resolves an unqualified target across object types by
+	// default. Restrict the lookup so a network or volume cannot satisfy
+	// a container identity check.
+	return []string{"inspect", "--type=container", id}
+}
 
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID   string `json:"Id"`
+	Name string `json:"Name"`
+	// State is present on container inspect objects, but not on Docker
+	// network or volume objects. A pointer lets parseInspect fail closed
+	// when a non-container object shadows a requested name.
+	State *struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	Config struct {
@@ -213,15 +221,24 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	match := -1
+	targetIsID := dockerIDRE.MatchString(id)
+	targetName := strings.TrimPrefix(strings.TrimSpace(id), "/")
 	for i, container := range containers {
-		if dockerIDRE.MatchString(id) {
+		// A container inspect object has both a full ID and a State
+		// object. Reject malformed or non-container records before name
+		// matching so they cannot shadow the requested container.
+		if !dockerIDRE.MatchString(container.ID) || container.State == nil ||
+			strings.TrimSpace(container.State.Status) == "" {
+			continue
+		}
+		if targetIsID {
 			if container.ID == id {
 				match = i
 				break
 			}
 			continue
 		}
-		if strings.TrimPrefix(container.Name, "/") == strings.TrimPrefix(id, "/") {
+		if targetName != "" && strings.HasPrefix(container.Name, "/") && strings.TrimPrefix(container.Name, "/") == targetName {
 			match = i
 			break
 		}
@@ -230,8 +247,8 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("%w: %s not in inspect output", ErrContainerNotFound, id)
 	}
 	c := containers[match]
-	if !dockerIDRE.MatchString(c.ID) {
-		return nil, fmt.Errorf("docker inspect for %s returned invalid container ID %q", id, c.ID)
+	if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+		return nil, fmt.Errorf("docker inspect for %s returned no container-shaped state", id)
 	}
 
 	info := &engineInfo{

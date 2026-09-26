@@ -209,8 +209,9 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		}
 		shouldCheckState := checkRunning && time.Since(lastStateCheck) >= stateCheckInterval
 		if !checkRunning && !finalStateChecked {
-			_, callerHasDeadline := callerCtx.Deadline()
-			if deadline, ok := waitCtx.Deadline(); ok && !callerHasDeadline && time.Until(deadline) <= stateCheckInterval {
+			// Reserve the final probe from the wait budget itself. A caller
+			// deadline changes the budget but must not disable the probe.
+			if deadline, ok := waitCtx.Deadline(); ok && time.Until(deadline) <= stateCheckInterval {
 				shouldCheckState = true
 				finalStateChecked = true
 			}

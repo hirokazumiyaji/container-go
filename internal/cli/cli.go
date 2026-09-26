@@ -268,8 +268,10 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return errors.Join(err, probeErr, ctxErr)
 	}
 	// A precise client-side failure in the original command is not made
-	// into daemon-down by an unrelated failed probe.
-	if IsDefinitiveNonLivenessError(err) {
+	// into daemon-down by an unrelated failed probe. An unqualified
+	// application/run not-found is also ambiguous: it may describe the
+	// workload rather than the backend daemon.
+	if IsDefinitiveNonLivenessError(err) || containsAmbiguousNotFoundText(diagnosticText(err)) {
 		return errors.Join(err, probeErr)
 	}
 	// A pure bounded-probe timeout is liveness evidence. A joined
@@ -438,6 +440,21 @@ func containsNonLivenessText(s string) bool {
 	return false
 }
 
+// containsAmbiguousNotFoundText reports unqualified absence text that
+// may describe an application rather than the backend daemon.
+func containsAmbiguousNotFoundText(s string) bool {
+	for _, fragment := range []string{
+		"not found", "container not found", "image not found",
+		"no such container", "no such object", "no such image",
+		"executable file not found", "no such file or directory",
+	} {
+		if strings.Contains(s, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
 // IsDefinitiveNonLivenessError reports a client-side failure that vetoes
 // backend liveness and absence classification.
 func IsDefinitiveNonLivenessError(err error) bool {
@@ -461,7 +478,11 @@ func IsDefinitiveNonLivenessError(err error) bool {
 }
 
 // IsNonLivenessError is the broader predicate used by backend probes.
-func IsNonLivenessError(err error) bool { return IsDefinitiveNonLivenessError(err) }
+// It also recognizes ambiguous object-absence diagnostics, which must not
+// be promoted to a daemon-down result by a backend-specific matcher.
+func IsNonLivenessError(err error) bool {
+	return IsDefinitiveNonLivenessError(err) || containsAmbiguousNotFoundText(diagnosticText(err))
+}
 
 // IsOperationTimeoutError reports structured timeout/cancellation evidence
 // without treating arbitrary application stderr as an operation timeout.

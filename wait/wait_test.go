@@ -330,6 +330,24 @@ func TestForExecReportsStoppedAtTimeout(t *testing.T) {
 	}
 }
 
+func TestForExecFinalRunningProbeUsesRemainingBudgetWithCallerDeadline(t *testing.T) {
+	target := newFakeTarget()
+	target.execCode = 1
+	target.running.Store(false)
+
+	callerCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	s := ForExec([]string{"pg_isready"}).
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond)
+	if err := s.WaitUntilReady(callerCtx, target); err == nil || !strings.Contains(err.Error(), "stopped") {
+		t.Fatalf("error = %v, want final stopped classification", err)
+	}
+	if got := target.runningCalls.Load(); got != 1 {
+		t.Fatalf("Running calls = %d, want final probe despite caller deadline", got)
+	}
+}
+
 func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1

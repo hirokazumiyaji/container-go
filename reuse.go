@@ -26,7 +26,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return reuseEnsureContainer(flightCtx, image, cfg)
 	})
 	if err != nil {
-		return nil, err
+		return base, err
 	}
 
 	info := base.info
@@ -52,6 +52,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		uid:       info.uid,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
+		if keepContainers() {
+			return ctr, err
+		}
 		return nil, err
 	}
 	fresh, err := ctr.inspectFresh(ctx)
@@ -134,6 +137,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
 			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
+			if createErr != nil && ctr != nil && keepContainers() {
+				return ctr, createErr
+			}
 			if createErr == nil {
 				if ctr.info != nil && ctr.info.state == StateRunning {
 					return ctr, nil
@@ -287,11 +293,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		ctr.unregisterReapers()
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		return nil, ctr.rollback(ctx, err)
+		return ctr.rollbackResult(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, ctr.rollback(ctx, err)
+			return ctr.rollbackResult(ctx, err)
 		}
 	}
 	return ctr, nil

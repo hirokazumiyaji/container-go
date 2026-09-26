@@ -59,7 +59,11 @@ run_with_timeout() {
 }
 inspect_projection() {
   {
-    "$bin" inspect "$1" 2>/dev/null
+    if [ "$sub" = rm ]; then
+      "$bin" inspect --type=container "$1" 2>/dev/null
+    else
+      "$bin" inspect "$1" 2>/dev/null
+    fi
     rc=$?
     printf '\n__containergo_reaper_rc__%s\n' "$rc"
   } | sed -n \
@@ -67,7 +71,10 @@ inspect_projection() {
     -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
     -e "s/^[[:space:]]*\"$managed_key\"[[:space:]]*:[[:space:]]*\"true\".*/managed=true/p" \
     -e "s/^[[:space:]]*\"$session_key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/session=\1/p" \
-    -e 's/^[[:space:]]*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/state=\1/p' \
+    -e 's/^[[:space:]]*"State"[[:space:]]*:.*/state_object=yes/p' \
+    -e 's/^[[:space:]]*"state"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/state_object=yes\nstate=\1/p' \
+    -e 's/^[[:space:]]*"Status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/state=\1/p' \
+    -e 's/^[[:space:]]*"status"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/state=\1/p' \
     -e 's/^__containergo_reaper_rc__\([0-9][0-9]*\)$/rc=\1/p'
 }
 file_identity() {
@@ -133,6 +140,7 @@ uid=
 managed=
 got_session=
 state=
+state_object=
 inspect_rc=
 for field in $fields; do
   case "$field" in
@@ -141,17 +149,18 @@ for field in $fields; do
     managed=*) managed=${field#managed=} ;;
     session=*) got_session=${field#session=} ;;
     state=*) state=${field#state=} ;;
+    state_object=*) state_object=${field#state_object=} ;;
     rc=*) inspect_rc=${field#rc=} ;;
   esac
 done
 tries=0
-while [ "$inspect_rc" != 0 ] || [ -z "$got" ]; do
+while [ "$inspect_rc" != 0 ] || { [ -n "$creation" ] && [ -z "$got" ]; }; do
   [ "$pending" = 1 ] || exit 0
   tries=$((tries + 1))
   [ "$tries" -lt "$pending_attempts" ] || exit 0
   sleep 1
   fields=$(run_with_timeout 10 inspect_projection "$id") || fields=
-  got=; uid=; managed=; got_session=; state=; inspect_rc=
+  got=; uid=; managed=; got_session=; state=; state_object=; inspect_rc=
   for field in $fields; do
     case "$field" in
       generation=*) got=${field#generation=} ;;
@@ -159,24 +168,42 @@ while [ "$inspect_rc" != 0 ] || [ -z "$got" ]; do
       managed=*) managed=${field#managed=} ;;
       session=*) got_session=${field#session=} ;;
       state=*) state=${field#state=} ;;
+    state_object=*) state_object=${field#state_object=} ;;
       rc=*) inspect_rc=${field#rc=} ;;
     esac
   done
 done
-# A stale or mismatched generation is skipped: [ "$got" = "$creation" ] || exit 0
-[ "$got" = "$creation" ] || exit 0
-if [ "$sub" = delete ]; then
-  [ -z "$uid" ] || exit 0
-  if [ "$require_owner" = 1 ]; then
-    [ "$managed" = true ] || exit 0
-    [ -n "$REAPER_SESSION" ] || exit 0
-    [ "$got_session" = "$REAPER_SESSION" ] || exit 0
-    case "$state" in running|stopped|created) ;; *) exit 0 ;; esac
+# A stale or mismatched generation is skipped. Docker rm additionally
+# requires a container-shaped State and an ID that matches the requested
+# target before it can derive an immutable rm target.
+if [ "$sub" = rm ]; then
+  [ "$state_object" = yes ] || exit 0
+  case "$state" in
+    created|running|paused|restarting|removing|exited|dead) ;;
+    *) exit 0 ;;
+  esac
+  if [ -z "$creation" ]; then
+    [ -n "$uid" ] && [ "$uid" = "$id" ] || exit 0
+  else
+    [ "$got" = "$creation" ] || exit 0
+    [ -n "$uid" ] || exit 0
   fi
-  target="$id"
-else
-  [ -n "$uid" ] || exit 0
   target="$uid"
+else
+  [ "$got" = "$creation" ] || exit 0
+  if [ "$sub" = delete ]; then
+    [ -z "$uid" ] || exit 0
+    if [ "$require_owner" = 1 ]; then
+      [ "$managed" = true ] || exit 0
+      [ -n "$REAPER_SESSION" ] || exit 0
+      [ "$got_session" = "$REAPER_SESSION" ] || exit 0
+      case "$state" in running|stopped|created) ;; *) exit 0 ;; esac
+    fi
+    target="$id"
+  else
+    [ -n "$uid" ] || exit 0
+    target="$uid"
+  fi
 fi
 if [ "$stage" -ge 0 ]; then
   identities_valid "$p1" "$i1" "$p2" "$i2" "$p3" "$i3" || exit 0
@@ -271,7 +298,9 @@ printf '%s\n' "$records" | while IFS="$tab" read -r op id creation p1 i1 p2 i2 p
         run_unlocked "$id" "$creation" "$pending" "$owner" "$session"
       else
         valid_docker_id "$id" || continue
-        run_with_timeout "$timeout_seconds" "$bin" "$sub" --force "$id" >/dev/null 2>&1 || true
+        # Even immutable IDs are inspected as containers before rm. A
+        # network or volume with a colliding ID must never be removed.
+        run_unlocked "$id" "" "$pending" "$owner" "$session"
       fi
       ;;
     *) continue ;;
@@ -283,6 +312,13 @@ const (
 	maxReaperSpawnFailures    = 3
 	initialReaperSpawnBackoff = time.Second
 	maxReaperSpawnBackoff     = 30 * time.Second
+	// A child that exits this quickly is treated as a failed spawn, not
+	// as a healthy replacement. This prevents a broken reaper command
+	// from turning recovery into a tight respawn loop.
+	immediateReaperExitWindow = time.Second
+	// A short observation interval closes the race between writing the
+	// replay records and a command that exits immediately afterwards.
+	reaperReplacementVerification = 50 * time.Millisecond
 )
 
 var (
@@ -333,23 +369,28 @@ type reaper struct {
 	// (Docker); both take --force.
 	subcommand string
 
-	opMu            sync.Mutex
-	mu              sync.Mutex
-	cmd             *exec.Cmd
-	stdin           io.WriteCloser
-	exited          chan struct{}
-	closed          bool
-	entries         []reaperEntry
-	completed       []reaperEntry
-	spawnFailures   int
-	gaveUp          bool
-	retryAt         time.Time
-	retryLevel      int
-	now             func() time.Time
-	command         func() *exec.Cmd
-	backoff         func(int) time.Duration
-	timeoutSeconds  int
-	pendingAttempts int
+	opMu                  sync.Mutex
+	mu                    sync.Mutex
+	cmd                   *exec.Cmd
+	stdin                 io.WriteCloser
+	exited                chan struct{}
+	closed                bool
+	entries               []reaperEntry
+	completed             []reaperEntry
+	spawnFailures         int
+	gaveUp                bool
+	retryAt               time.Time
+	retryLevel            int
+	retryDelay            time.Duration
+	retryTimer            *time.Timer
+	retryEpoch            uint64
+	processStarted        time.Time
+	immediateExitFailures int
+	now                   func() time.Time
+	command               func() *exec.Cmd
+	backoff               func(int) time.Duration
+	timeoutSeconds        int
+	pendingAttempts       int
 }
 
 func newReaper(binary, subcommand string) *reaper {
@@ -491,6 +532,7 @@ func (r *reaper) registerEntry(entry reaperEntry) error {
 	r.mu.Unlock()
 	if !ready {
 		r.mu.Lock()
+		r.armRetryLocked()
 		err := r.spawnCooldownErrorLocked()
 		r.mu.Unlock()
 		return err
@@ -714,11 +756,12 @@ func (r *reaper) recoverAndReplayLocked() error {
 		return errors.New("reaper: closed")
 	}
 	if len(r.entries) == 0 {
-		r.clearSpawnFailure()
 		r.mu.Unlock()
+		r.clearSpawnFailure()
 		return nil
 	}
 	if !r.retryReadyLocked() {
+		r.armRetryLocked()
 		err := r.spawnCooldownErrorLocked()
 		r.mu.Unlock()
 		return err
@@ -740,8 +783,14 @@ func (r *reaper) recoverAndReplayLocked() error {
 			}
 		}
 		if replayed {
-			r.clearSpawnFailure()
-			return nil
+			// A successful write is not proof that the replacement is
+			// usable. Verify the child before clearing the failure budget;
+			// an immediately exiting command must remain on the backoff path.
+			if r.replacementAlive() {
+				r.clearSpawnFailure()
+				return nil
+			}
+			lastErr = errors.New("reaper: child exited before replay verification")
 		}
 		if cmd := r.currentProcess(); cmd != nil {
 			_ = r.stopProcess(cmd)
@@ -793,6 +842,7 @@ func (r *reaper) spawnLocked() error {
 	exited := make(chan struct{})
 	r.mu.Lock()
 	r.cmd, r.stdin, r.exited = cmd, stdin, exited
+	r.processStarted = time.Now()
 	r.mu.Unlock()
 	go func() {
 		_ = cmd.Wait()
@@ -808,7 +858,27 @@ func (r *reaper) monitorExit(cmd *exec.Cmd, exited <-chan struct{}) {
 	defer r.opMu.Unlock()
 	r.mu.Lock()
 	current := !r.closed && r.cmd == cmd
+	immediate := current && !r.processStarted.IsZero() && time.Since(r.processStarted) < immediateReaperExitWindow
+	if current {
+		// The child is already reaped. Clear the current identity so a
+		// replacement can be installed without trying to stop the old one.
+		r.cmd, r.stdin, r.exited = nil, nil, nil
+		r.processStarted = time.Time{}
+	}
 	r.mu.Unlock()
+	if current {
+		if immediate {
+			// An immediate unexpected exit is a failed replacement, even
+			// when the record write itself succeeded. Count it before
+			// recovery so repeated exits reach the bounded cooldown instead
+			// of spinning.
+			r.recordImmediateExit()
+		} else {
+			r.mu.Lock()
+			r.immediateExitFailures = 0
+			r.mu.Unlock()
+		}
+	}
 	if current {
 		if err := r.recoverAndReplayLocked(); err != nil {
 			log.Printf("container-go: reaper recovery failed: %v", err)
@@ -818,6 +888,19 @@ func (r *reaper) monitorExit(cmd *exec.Cmd, exited <-chan struct{}) {
 
 func (r *reaper) processLiveLocked() bool {
 	return r.stdin != nil && !channelClosed(r.exited)
+}
+
+func (r *reaper) replacementAlive() bool {
+	deadline := time.Now().Add(reaperReplacementVerification)
+	for {
+		r.mu.Lock()
+		alive := r.processLiveLocked()
+		r.mu.Unlock()
+		if !alive || time.Now().After(deadline) {
+			return alive
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func (r *reaper) stopProcess(cmd *exec.Cmd) error {
@@ -831,6 +914,7 @@ func (r *reaper) stopProcess(cmd *exec.Cmd) error {
 	}
 	stdin, exited := r.stdin, r.exited
 	r.cmd, r.stdin, r.exited = nil, nil, nil
+	r.processStarted = time.Time{}
 	r.mu.Unlock()
 	if cmd.Process != nil {
 		_ = cmd.Process.Kill()
@@ -854,6 +938,12 @@ func (r *reaper) clearSpawnFailure() {
 	r.gaveUp = false
 	r.retryAt = time.Time{}
 	r.retryLevel = 0
+	r.retryDelay = 0
+	r.retryEpoch++
+	if r.retryTimer != nil {
+		r.retryTimer.Stop()
+		r.retryTimer = nil
+	}
 	r.mu.Unlock()
 }
 
@@ -861,6 +951,21 @@ func (r *reaper) recordSpawnFailure() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.spawnFailures++
+	r.enterCooldownIfNeededLocked()
+}
+
+func (r *reaper) recordImmediateExit() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.immediateExitFailures++
+	r.spawnFailures++
+	if r.immediateExitFailures >= maxReaperSpawnFailures {
+		r.spawnFailures = maxReaperSpawnFailures
+	}
+	r.enterCooldownIfNeededLocked()
+}
+
+func (r *reaper) enterCooldownIfNeededLocked() {
 	if r.spawnFailures < maxReaperSpawnFailures {
 		return
 	}
@@ -870,7 +975,49 @@ func (r *reaper) recordSpawnFailure() {
 	}
 	delay := r.backoffDurationLocked(r.retryLevel)
 	r.retryAt = r.nowLocked().Add(delay)
+	r.retryDelay = delay
+	r.armRetryLocked()
 	log.Printf("container-go: reaper spawn failures; retrying after %s", delay)
+}
+
+// armRetryLocked schedules an autonomous recovery attempt. The caller
+// holds r.mu; the callback takes opMu before touching the child.
+func (r *reaper) armRetryLocked() {
+	if r.closed || !r.gaveUp || r.retryAt.IsZero() {
+		return
+	}
+	delay := r.retryDelay
+	if delay < 0 {
+		delay = 0
+	}
+	r.retryEpoch++
+	epoch := r.retryEpoch
+	if r.retryTimer != nil {
+		r.retryTimer.Stop()
+	}
+	r.retryTimer = time.AfterFunc(delay, func() { r.retryWake(epoch) })
+}
+
+func (r *reaper) retryWake(epoch uint64) {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.mu.Lock()
+	if r.closed || epoch != r.retryEpoch || !r.gaveUp {
+		r.mu.Unlock()
+		return
+	}
+	r.retryTimer = nil
+	// The timer is the autonomous deadline. Do not make the callback wait
+	// on r.now: tests and clock adjustments can move that logical clock
+	// independently, and the wake itself is the liveness signal.
+	r.spawnFailures = 0
+	r.gaveUp = false
+	r.retryAt = time.Time{}
+	r.retryDelay = 0
+	r.mu.Unlock()
+	if err := r.recoverAndReplayLocked(); err != nil {
+		log.Printf("container-go: reaper autonomous recovery failed: %v", err)
+	}
 }
 
 func (r *reaper) backoffDurationLocked(level int) time.Duration {
@@ -916,6 +1063,7 @@ func (r *reaper) retryReadyLocked() bool {
 	r.spawnFailures = 0
 	r.gaveUp = false
 	r.retryAt = time.Time{}
+	r.retryDelay = 0
 	return true
 }
 
@@ -943,11 +1091,15 @@ func (r *reaper) closeStdin() {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.mu.Lock()
-	if r.closed {
-		r.mu.Unlock()
-		return
+	if !r.closed {
+		r.closed = true
 	}
-	r.closed = true
+	r.retryEpoch++
+	if r.retryTimer != nil {
+		r.retryTimer.Stop()
+		r.retryTimer = nil
+	}
+	r.retryDelay = 0
 	stdin := r.stdin
 	r.mu.Unlock()
 	if stdin != nil {
@@ -1010,25 +1162,32 @@ func registerContainerWithGlobalReaper(binary, subcommand, id, creation, session
 	} else {
 		err = r.registerEntry(entry)
 	}
+	// Capture the normalized entry, including prepared lock identities and
+	// the pending marker. The registration handle is later used to cancel
+	// exactly the record that was sent to the child. If a recovery attempt
+	// failed after staging the entry, return the handle too; the caller can
+	// then transactionally unregister it when create is not attempted.
+	r.mu.Lock()
+	found := false
+	for _, active := range r.entries {
+		if active.id == id && active.creation == creation {
+			entry = active
+			found = true
+			break
+		}
+	}
+	r.mu.Unlock()
 	if err != nil {
 		label := "registration"
 		if pending {
 			label = "pre-registration"
 		}
 		log.Printf("container-go: reaper %s failed (binary=%q): %v", label, binary, err)
+		if found {
+			return &reaperRegistration{reaper: r, entry: entry}, err
+		}
 		return nil, err
 	}
-	// Capture the normalized entry, including prepared lock identities and
-	// the pending marker. The registration handle is later used to cancel
-	// exactly the record that was sent to the child.
-	r.mu.Lock()
-	for _, active := range r.entries {
-		if active.id == id && active.creation == creation {
-			entry = active
-			break
-		}
-	}
-	r.mu.Unlock()
 	return &reaperRegistration{reaper: r, entry: entry}, nil
 }
 

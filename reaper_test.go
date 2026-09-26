@@ -100,7 +100,14 @@ func TestReaperRejectsOwnedEntryWithoutSession(t *testing.T) {
 }
 
 func TestReaperAcceptsFullDockerID(t *testing.T) {
-	bin, logPath := writeReaperStub(t)
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "docker")
+	logPath := filepath.Join(dir, "calls.log")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"Id\": \"'\"$3\"'\"'; echo '  \"state\": \"running\"'; fi\n"
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	r := newReaper(bin, "rm")
 	uid := strings.Repeat("ab", 32)
 	if err := r.register(uid, ""); err != nil {
@@ -164,7 +171,8 @@ func TestReaperScriptRejectsDockerNameWithoutImmutableID(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "docker")
 	logPath := filepath.Join(dir, "calls.log")
-	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"Id\": \"'\"$3\"'\"'; echo '  \"state\": \"running\"'; fi\n"
 	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -300,6 +308,8 @@ func TestReaperDeletesByImmutableID(t *testing.T) {
 		"if [ \"$1\" = \"inspect\" ]; then\n" +
 		"  echo '    \"Id\": \"" + uid + "\",'\n" +
 		"  echo '      \"" + creationLabel + "\": \"" + creation + "\"'\n" +
+		"  echo '    \"State\": {'\n" +
+		"  echo '      \"Status\": \"running\"'\n" +
 		"fi\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)

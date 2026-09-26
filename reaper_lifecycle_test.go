@@ -154,7 +154,11 @@ func TestReaperPreRegistrationCoversCreateBoundary(t *testing.T) {
 			if ctr.creation != generation {
 				t.Fatalf("handle generation = %q, run generation = %q", ctr.creation, generation)
 			}
-			waitForLogLines(t, logPath, "inspect review-pre-register", tc.wantDelete)
+			inspectCall := "inspect review-pre-register"
+			if tc.docker {
+				inspectCall = "inspect --type=container review-pre-register"
+			}
+			waitForLogLines(t, logPath, inspectCall, tc.wantDelete)
 		})
 	}
 }
@@ -243,7 +247,11 @@ func TestReaperPreRegistrationDoesNotDeleteConflict(t *testing.T) {
 			if err == nil {
 				t.Fatal("Run succeeded, want name conflict")
 			}
-			waitForLogLines(t, logPath, "inspect review-conflict")
+			inspectCall := "inspect review-conflict"
+			if tc.docker {
+				inspectCall = "inspect --type=container review-conflict"
+			}
+			waitForLogLines(t, logPath, inspectCall)
 			deadline := time.Now().Add(2 * time.Second)
 			for time.Now().Before(deadline) {
 				data, _ := os.ReadFile(logPath)

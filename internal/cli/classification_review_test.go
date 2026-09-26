@@ -87,6 +87,19 @@ func TestReviewClassifyVetoesProbePermissionFailure(t *testing.T) {
 	}
 }
 
+func TestReviewClassifyVetoesAmbiguousApplicationNotFound(t *testing.T) {
+	original := &CLIError{Binary: "container", Args: []string{"run", "--name", "myctr"}, ExitCode: 1, Stderr: "application dependency not found"}
+	probe := &CLIError{Binary: "container", Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	runner := &reviewProbeRunner{results: map[string]fakeResult{"system status": {err: probe}}}
+	got := Classify(context.Background(), runner, original, Probe{Args: []string{"system", "status"}, Hint: "start"})
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("ambiguous application not-found was classified as daemon down: %v", got)
+	}
+	if !errors.Is(got, original) || !errors.Is(got, probe) {
+		t.Fatalf("classification lost an error branch: %v", got)
+	}
+}
+
 func TestReviewClassifyDoesNotProbeOperationTimeout(t *testing.T) {
 	commandErr := &CLIError{Binary: "container", Args: []string{"exec"}, ExitCode: 7, Stderr: "application timeout"}
 	original := errors.Join(commandErr, context.DeadlineExceeded)

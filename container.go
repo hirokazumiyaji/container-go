@@ -124,9 +124,11 @@ type Container struct {
 	reaper   *reaperRegistration
 	reaperMu sync.Mutex
 
-	mu        sync.Mutex
-	info      *engineInfo // cached first inspect; immutable fields only
-	inspectMu sync.Mutex  // serializes fresh inspects and protects uid
+	mu            sync.Mutex
+	info          *engineInfo  // cached first inspect; immutable fields only
+	inspectMu     sync.RWMutex // protects uid
+	inspectGateMu sync.Mutex
+	inspectGate   chan struct{}
 }
 
 // runCreateLocked serializes an Apple name-addressed create with the
@@ -167,7 +169,9 @@ func preRegisterContainer(cfg *config) (*reaperRegistration, string) {
 	reg, err := preRegisterWithGlobalReaperRegistration(binary, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, sessionID())
 	if err != nil {
 		log.Printf("container-go: reaper pre-registration failed (binary=%q): %v", binary, err)
-		return nil, binary
+		// A failed recovery can still have staged an existing entry. Keep
+		// that rollback handle so the create boundary can unregister it.
+		return reg, binary
 	}
 	return reg, binary
 }
@@ -303,7 +307,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, c.rollback(ctx, err)
+			return c.rollbackResult(ctx, err)
 		}
 	}
 	if cfg.waitStrategy != nil {
@@ -314,7 +318,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			if tail != "" {
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, c.rollback(ctx, err)
+			return c.rollbackResult(ctx, err)
 		}
 	}
 	return c, nil
@@ -339,6 +343,43 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 		return withCleanupError(cause, cleanupErr)
 	}
 	return cause
+}
+
+// rollbackResult applies the normal rollback policy, but KEEP returns the
+// partially initialized handle only after a fresh ownership/identity
+// verification. Callers can therefore inspect or explicitly terminate a
+// retained failed Run without receiving an unverified name-only handle.
+func (c *Container) rollbackResult(ctx context.Context, cause error) (*Container, error) {
+	if !keepContainers() {
+		return nil, c.rollback(ctx, cause)
+	}
+	if err := c.verifyRetainedHandle(ctx); err != nil {
+		return nil, withCleanupError(cause, fmt.Errorf("container %s retained-handle verification failed: %w", c.id, err))
+	}
+	return c, cause
+}
+
+func (c *Container) verifyRetainedHandle(ctx context.Context) error {
+	verifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer cancel()
+	_, info, release, err := c.acquireVerifiedOperationTarget(verifyCtx, false)
+	if err != nil {
+		return err
+	}
+	defer release()
+	if info == nil {
+		return fmt.Errorf("inspect returned no container identity")
+	}
+	if err := verifyDestructiveInfo(c.eng, info, !c.reused); err != nil {
+		return err
+	}
+	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
+		return fmt.Errorf("%w: creation generation is missing or changed", ErrGenerationReplaced)
+	}
+	if c.uid != "" && (!requiresImmutableID(c.eng) || info.uid != c.uid) {
+		return fmt.Errorf("%w: immutable identity is missing or changed", ErrGenerationReplaced)
+	}
+	return nil
 }
 
 // cleanupFailedCreate removes the container this Run left behind after
@@ -626,9 +667,12 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
-	c.inspectMu.Lock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	c.inspectMu.RLock()
 	uid := c.uid
-	c.inspectMu.Unlock()
+	c.inspectMu.RUnlock()
 	if uid != "" {
 		if !validImmutableContainerID(c.eng, uid) {
 			return fmt.Errorf("terminate %s: invalid immutable container ID: %w", c.id, ErrGenerationReplaced)
@@ -659,9 +703,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 // cannot inherit that ID; the lock is only needed for name-addressed
 // backends.
 func (c *Container) terminateImmutable(ctx context.Context, expected *engineInfo, stoppedOnly bool, verify func(*engineInfo) error) (bool, error) {
-	c.inspectMu.Lock()
+	c.inspectMu.RLock()
 	uid := c.uid
-	c.inspectMu.Unlock()
+	c.inspectMu.RUnlock()
 	if !validImmutableContainerID(c.eng, uid) {
 		return false, fmt.Errorf("terminate %s: missing valid immutable container ID: %w", c.id, ErrGenerationReplaced)
 	}
@@ -852,26 +896,70 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 
 // cachedInfo returns the first successful inspect result. Only fields
 // that cannot change while the container exists (labels, network
-// address, port bindings) should be read from it.
+// address, port bindings) should be read from it. The cache mutex is
+// deliberately not held across the CLI call: a canceled concurrent
+// caller must be able to stop waiting for the inspect gate.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	info := c.info
+	c.mu.Unlock()
+	if info != nil {
+		return info, nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
+	c.mu.Lock()
+	if c.info == nil {
+		c.info = info
+	}
+	info = c.info
+	c.mu.Unlock()
 	return info, nil
 }
 
-func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	c.inspectMu.Lock()
-	defer c.inspectMu.Unlock()
+// acquireInspectGate serializes backend inspect calls with a
+// context-aware semaphore. A sync.Mutex would make a canceled waiter
+// remain blocked behind a 30-second query timeout.
+func (c *Container) acquireInspectGate(ctx context.Context) (func(), error) {
+	c.inspectGateMu.Lock()
+	if c.inspectGate == nil {
+		c.inspectGate = make(chan struct{}, 1)
+		c.inspectGate <- struct{}{}
+	}
+	gate := c.inspectGate
+	c.inspectGateMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	select {
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return nil, err
+		}
+		var once sync.Once
+		return func() {
+			once.Do(func() { gate <- struct{}{} })
+		}, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
 
+func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	release, err := c.acquireInspectGate(qCtx)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+
+	c.inspectMu.RLock()
 	uid := c.uid
+	c.inspectMu.RUnlock()
 	if uid != "" && !validImmutableContainerID(c.eng, uid) {
 		return nil, fmt.Errorf("container %s has invalid immutable ID %q", c.id, uid)
 	}
@@ -879,8 +967,6 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if target == "" {
 		target = c.id
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
@@ -892,11 +978,16 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	if uid != "" && requiresImmutableID(c.eng) && info.uid != uid {
 		return nil, fmt.Errorf("%w: inspected immutable ID changed", ErrContainerNotFound)
 	}
-	if c.uid == "" && requiresImmutableID(c.eng) {
-		if !validImmutableContainerID(c.eng, info.uid) {
-			return nil, fmt.Errorf("container %s: inspect returned no valid immutable ID", c.id)
+	if requiresImmutableID(c.eng) {
+		c.inspectMu.Lock()
+		if c.uid == "" {
+			if !validImmutableContainerID(c.eng, info.uid) {
+				c.inspectMu.Unlock()
+				return nil, fmt.Errorf("container %s: inspect returned no valid immutable ID", c.id)
+			}
+			c.uid = info.uid
 		}
-		c.uid = info.uid
+		c.inspectMu.Unlock()
 	}
 	return info, nil
 }
@@ -908,9 +999,9 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireRunning bool) (target string, info *engineInfo, release func(), err error) {
 	opCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	if requiresImmutableID(c.eng) {
-		c.inspectMu.Lock()
+		c.inspectMu.RLock()
 		uid := c.uid
-		c.inspectMu.Unlock()
+		c.inspectMu.RUnlock()
 		if !validImmutableContainerID(c.eng, uid) {
 			cancel()
 			return "", nil, func() {}, fmt.Errorf("container %s: missing valid immutable container ID: %w", c.id, ErrGenerationReplaced)

@@ -3,6 +3,7 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -77,6 +78,33 @@ func TestStreamHonorsContextCancellation(t *testing.T) {
 		if time.Now().After(deadline) {
 			t.Fatal("stream still open after context cancellation")
 		}
+	}
+}
+
+func TestReviewStreamReapsBeforePublicOutputIsRead(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ "$i" -lt 32 ]; do printf 'line-%s\\n' "$i"; i=$((i + 1)); done; exit 7`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	process, ok := stream.(interface {
+		Done() <-chan struct{}
+		TerminalError() error
+	})
+	if !ok {
+		t.Fatalf("stream type %T does not expose process status", stream)
+	}
+	select {
+	case <-process.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("process was not reaped while public output was unread")
+	}
+	var cliErr *CLIError
+	if err := process.TerminalError(); !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("terminal error = %v, want exit 7", err)
+	}
+	if err := stream.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

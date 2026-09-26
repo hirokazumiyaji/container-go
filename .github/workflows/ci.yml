@@ -6,12 +6,24 @@ on:
   pull_request:
   workflow_dispatch:
 
+# No job here needs write access: they only check out, build, and test.
+permissions:
+  contents: read
+
+# A new push supersedes the in-flight run. Without this, successive pushes
+# start overlapping integration-docker matrices that pull the same images
+# and contend for the same containers.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
   # run locally via `make integration`.
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -25,6 +37,7 @@ jobs:
 
   race:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -39,6 +52,7 @@ jobs:
   # golangci-lint runs govet as part of its default linter set.
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -50,6 +64,7 @@ jobs:
 
   govulncheck:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
@@ -60,6 +75,9 @@ jobs:
   # Docker is preinstalled on ubuntu-latest; Apple Container stays local-only.
   integration-docker:
     runs-on: ubuntu-latest
+    # go test's own -timeout is per test binary and does not cover a helper
+    # process that outlives it, so cap the job as well.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -70,3 +88,8 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: make integration-docker
+        env:
+          # A missing or broken Docker backend must fail this required job
+          # rather than skip every test and report success.
+          REQUIRE_BACKEND: '1'
+          CONTAINERGO_BACKEND: docker

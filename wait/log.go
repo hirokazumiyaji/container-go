@@ -162,24 +162,29 @@ func handleLogScanResult(callerCtx, waitCtx context.Context, timeout time.Durati
 		return terminal
 	}
 
+	// probeBudget bounds the diagnostic probe when the wait has no deadline.
+	const probeBudget = 5 * time.Second
 	// Keep the caller's context as the probe base so a later cancellation
 	// or deadline also bounds diagnostics. Never extend the startup budget
 	// when a stream ends near its deadline.
-	probeBudget := 5 * time.Second
+	var (
+		probeCtx    context.Context
+		probeCancel context.CancelFunc
+	)
 	if deadline, ok := waitCtx.Deadline(); ok {
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if time.Until(deadline) <= 0 {
 			// The pattern was never observed, so this wait must fail. The
 			// context timer callback is dispatched asynchronously, so
 			// waitContextTerminationError can still report nil here; a
 			// readiness gate must never return success on this path.
 			return waitTimeoutError(what, timeout, result.err)
 		}
-		if remaining < probeBudget {
-			probeBudget = remaining
-		}
+		// Bound on the absolute deadline rather than a re-based duration,
+		// so the probe cannot outlive the wait budget it is diagnosing.
+		probeCtx, probeCancel = context.WithDeadline(callerCtx, deadline)
+	} else {
+		probeCtx, probeCancel = context.WithTimeout(callerCtx, probeBudget)
 	}
-	probeCtx, probeCancel := context.WithTimeout(callerCtx, probeBudget)
 	if probeErr := probeCtx.Err(); probeErr != nil {
 		probeCancel()
 		return waitContextError(what, probeErr, result.err)

@@ -40,6 +40,54 @@ type Runner interface {
 	Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
 }
 
+// Spawner starts the CLI as a child process and returns immediately, so a
+// caller can release a name-addressed lock as soon as the process exists.
+// The name is resolved by the backend at exec time, so the lock must still
+// be held across the Start call itself.
+type Spawner interface {
+	Start(ctx context.Context, args ...string) (*StartedCommand, error)
+}
+
+// StartedCommand is a child process that has been spawned and is still
+// running.
+type StartedCommand struct {
+	cmd    *exec.Cmd
+	bin    string
+	args   []string
+	stdout *bytes.Buffer
+	stderr *bytes.Buffer
+	ctx    context.Context
+}
+
+// Wait blocks until the child exits and returns its output and error, using
+// the same contract as ExecRunner.Run.
+func (s *StartedCommand) Wait() ([]byte, []byte, error) {
+	err := s.cmd.Wait()
+	if err != nil {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
+			cliErr := &CLIError{
+				Binary:   s.bin,
+				Args:     s.args,
+				ExitCode: exitErr.ExitCode(),
+				Stderr:   truncateStderr(s.stderr.String()),
+			}
+			commandErr := withStdout(cliErr, s.stdout.String())
+			if ctxErr := s.ctx.Err(); ctxErr != nil {
+				return s.stdout.Bytes(), s.stderr.Bytes(), errors.Join(commandErr, ctxErr)
+			}
+			return s.stdout.Bytes(), s.stderr.Bytes(), commandErr
+		}
+		if ctxErr := s.ctx.Err(); ctxErr != nil {
+			return s.stdout.Bytes(), s.stderr.Bytes(), errors.Join(
+				fmt.Errorf("%s %s: %w", s.bin, strings.Join(s.args, " "), err), ctxErr)
+		}
+		return s.stdout.Bytes(), s.stderr.Bytes(),
+			fmt.Errorf("%s %s: %w", s.bin, strings.Join(s.args, " "), err)
+	}
+	return s.stdout.Bytes(), s.stderr.Bytes(), nil
+}
+
 // ExternalRunner identifies runners that execute the CLI as real child
 // processes. container.Run registers containers started through such
 // runners with the orphan-cleanup reaper, so a runner that wraps an
@@ -167,6 +215,28 @@ func (r *ExecRunner) binary() string {
 	return r.Binary
 }
 
+// Start spawns the child and returns without waiting, so a caller can drop
+// a name lock as soon as the process exists.
+func (r *ExecRunner) Start(ctx context.Context, args ...string) (*StartedCommand, error) {
+	bin := r.binary()
+	cmd := exec.CommandContext(ctx, bin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	// If the process ignores the kill long enough to hold pipes open,
+	// give up waiting shortly after.
+	cmd.WaitDelay = 3 * time.Second
+
+	if err := cmd.Start(); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err), ctxErr)
+		}
+		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
+	}
+	return &StartedCommand{cmd: cmd, bin: bin, args: args, stdout: &stdout, stderr: &stderr, ctx: ctx}, nil
+}
+
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
@@ -259,6 +329,32 @@ func collectCLIErrors(err error) []*CLIError {
 // aborts the probe via context propagation.
 const probeTimeout = 5 * time.Second
 
+// probeDiagnostic carries a liveness-probe failure alongside the error it
+// was investigating.
+//
+// It deliberately does NOT implement Unwrap. Chain walkers collect every
+// *CLIError they can reach and veto on the first definitive non-liveness
+// branch, so a probe that failed for an unrelated reason (a permission or
+// certificate problem, say) would otherwise suppress ErrContainerNotFound
+// for the original command. errors.Is still reaches the probe through Is,
+// so callers keep full access to the probe's causes.
+type probeDiagnostic struct {
+	probe error
+}
+
+func (p probeDiagnostic) Error() string { return p.probe.Error() }
+
+func (p probeDiagnostic) Is(target error) bool { return errors.Is(p.probe, target) }
+
+// wrapProbe returns a probe failure that is visible to errors.Is but hidden
+// from chain type walks over the original error.
+func wrapProbe(probeErr error) error {
+	if probeErr == nil {
+		return nil
+	}
+	return probeDiagnostic{probe: probeErr}
+}
+
 // Classify augments a failed CLI call only when a probe proves that the
 // backend is unavailable. Both the original and probe errors remain in the
 // returned chain; a generic probe failure is never promoted to
@@ -287,28 +383,30 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		}
 		return err
 	}
+	// Classify the raw probe, but publish it wrapped.
+	diag := wrapProbe(probeErr)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return errors.Join(err, probeErr, ctxErr)
+		return errors.Join(err, diag, ctxErr)
 	}
 	// A precise client-side failure in the original command is not made
 	// into daemon-down by an unrelated failed probe. An unqualified
 	// application/run not-found is also ambiguous: it may describe the
 	// workload rather than the backend daemon.
 	if IsDefinitiveNonLivenessError(err) || containsAmbiguousNotFoundText(diagnosticText(err)) {
-		return errors.Join(err, probeErr)
+		return errors.Join(err, diag)
 	}
 	// A pure bounded-probe timeout is liveness evidence. A joined
 	// permission/configuration/cancellation cause vetoes it.
 	if isProbeTimeoutError(probeCtx, probeErr) && !probeVetoError(probeErr) {
-		return classifySystemNotRunning(err, probeErr, probe.Hint)
+		return classifySystemNotRunning(err, diag, probe.Hint)
 	}
 	if isProbeCancellationOrConfiguration(probeErr) {
-		return errors.Join(err, probeErr)
+		return errors.Join(err, diag)
 	}
 	if operationLivenessText(err) || probeUnavailable(probe, probeErr) {
-		return classifySystemNotRunning(err, probeErr, probe.Hint)
+		return classifySystemNotRunning(err, diag, probe.Hint)
 	}
-	return errors.Join(err, probeErr)
+	return errors.Join(err, diag)
 }
 
 func classifySystemNotRunning(original, probeErr error, hint string) error {
@@ -329,6 +427,10 @@ func isProbeTimeoutError(probeCtx context.Context, err error) bool {
 	if probeCtx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
+	// A child that returned a real exit status is not timeout evidence: it
+	// failed on its own, just after the deadline. A bare DeadlineExceeded
+	// (no CLIError at all) means the child never produced an exit status,
+	// which is exactly the hang this probe is looking for.
 	for _, cliErr := range collectCLIErrors(err) {
 		if cliErr.ExitCode >= 0 {
 			return false

@@ -48,8 +48,13 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			}
 			return err
 		}
-		if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d", i)); err != nil {
-			return err
+		// Only gate the next strategy on the context. Once the last one has
+		// succeeded the composite wait is satisfied, and a context that
+		// ended during final bookkeeping must not turn it into a failure.
+		if i < len(s.strategies)-1 {
+			if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d", i)); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -141,14 +146,15 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		select {
 		case err := <-results:
 			remaining--
-			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout); terminal != nil {
-				if err != nil {
-					errs = append(errs, err)
-				}
-				return anyTerminalError(terminal, errs)
-			}
+			// A result already published wins over a timer that fired
+			// afterwards, so a strategy that succeeded just before the
+			// deadline is not reported as a timeout.
 			if err == nil {
 				return nil
+			}
+			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout); terminal != nil {
+				errs = append(errs, err)
+				return anyTerminalError(terminal, errs)
 			}
 			errs = append(errs, err)
 		case <-waitCtx.Done():
@@ -166,9 +172,12 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				select {
 				case err := <-results:
 					remaining--
-					if err != nil {
-						errs = append(errs, err)
+					// Same rule as above: an observed success wins over a
+					// context that ended while it was being handed over.
+					if err == nil {
+						return nil
 					}
+					errs = append(errs, err)
 				case <-drain.C:
 					return anyTerminalError(terminal, errs)
 				}

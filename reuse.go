@@ -47,15 +47,16 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		info:      info,
-		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		// Carry the creator bit: if this process created the generation, a
+		// later failure must roll it back rather than hand back no handle at
+		// all and leave a half-configured container with no way to remove it.
+		creator:  base.creator,
+		info:     info,
+		creation: info.labels[creationLabel],
+		uid:      info.uid,
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
-		if keepContainers() {
-			return ctr, err
-		}
-		return nil, err
+		return ctr.rollbackResult(ctx, err)
 	}
 	fresh, err := ctr.inspectFresh(ctx)
 	if err != nil {
@@ -291,10 +292,6 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if reaperRegistration != nil {
 		ctr.addReaperRegistration(reaperRegistration)
 		completeContainerReaperRegistration(cfg, reaperRegistration, reaperBinary, ctr.uid)
-		// Reuse containers are shared and intentionally outlive the
-		// creating process. The pending registration only closes the
-		// create acknowledgement race, so retire it after success.
-		ctr.unregisterReapers()
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		return ctr.rollbackResult(ctx, err)
@@ -303,6 +300,14 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			return ctr.rollbackResult(ctx, err)
 		}
+	}
+	// Reuse containers are shared and intentionally outlive the creating
+	// process, so the registration is retired only once the generation is
+	// fully configured. The reaper is EOF-gated crash insurance: retiring it
+	// earlier would leave a half-configured container unreaped if this
+	// process were killed during the copy loop.
+	if reaperRegistration != nil {
+		ctr.unregisterReapers()
 	}
 	return ctr, nil
 }
@@ -314,6 +319,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 // caller loops and attaches to the fresh generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	if err := checkReuseLabels(info, cfg); err != nil {
+		return err
+	}
+	// checkReuseLabels alone cannot tell one reuse group from another, so a
+	// stopped container of a different group carrying this name must never
+	// be deleted here.
+	if err := checkReuseGroup(info, cfg); err != nil {
 		return err
 	}
 	ctr := namedContainer(cfg, cfg.name)
@@ -481,6 +492,20 @@ func checkReuseLabels(info *engineInfo, cfg *config) error {
 	}
 	if !creationRE.MatchString(info.labels[creationLabel]) {
 		return fmt.Errorf("reuse %s: existing container has no valid creation generation: %w", cfg.name, ErrGenerationReplaced)
+	}
+	return nil
+}
+
+// checkReuseGroup rejects a container that carries the requested name but
+// belongs to a different reuse group. That container is another group's
+// shared generation and must never be adopted or terminated by this call.
+func checkReuseGroup(info *engineInfo, cfg *config) error {
+	if cfg.reuseGroup == "" {
+		return nil
+	}
+	if got := info.labels[reuseGroupLabel]; got != cfg.reuseGroup {
+		return fmt.Errorf("reuse %s: existing container belongs to reuse group %q, want %q",
+			cfg.name, got, cfg.reuseGroup)
 	}
 	return nil
 }

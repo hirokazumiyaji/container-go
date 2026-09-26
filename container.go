@@ -1002,10 +1002,14 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 }
 
 // acquireVerifiedOperationTarget verifies the target immediately before an
-// operation. For Apple it also returns a release function that keeps all
-// name-lock barriers held until the caller is finished. Callers must release
-// as soon as the name has been resolved: holding the lock across an
-// unbounded operation would block every other name-addressed call on this
+// operation. For Apple it also returns a release function that holds every
+// name-lock barrier.
+//
+// The caller must keep the lock until the name has been resolved by the
+// backend: for a name-addressed engine, releasing before the CLI process is
+// spawned reopens the window where a peer deletes and recreates the name.
+// Release as soon as the process is started, because holding the lock across
+// an unbounded operation would block every other name-addressed call on this
 // container, and holding it for a stream's lifetime would leak it when a
 // caller abandons the stream.
 func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireRunning bool) (target string, info *engineInfo, release func(), err error) {

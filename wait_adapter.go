@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 
 	"github.com/hirokazumiyaji/container-go/wait"
 )
@@ -64,14 +65,19 @@ func (c *Container) logTail(ctx context.Context) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	var tail string
-	_ = c.withVerifiedOperationTarget(qCtx, false, func(target string, _ *engineInfo) error {
+	if err := c.withVerifiedOperationTarget(qCtx, false, func(target string, _ *engineInfo) error {
 		stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
 		if err != nil {
 			return err
 		}
 		tail = lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
 		return nil
-	})
+	}); err != nil {
+		// The tail is best effort, but target verification can fail for a
+		// transient state, and a silently empty tail would hide that from
+		// whoever reads the rollback diagnostic.
+		log.Printf("container-go: log tail unavailable for %s: %v", c.id, err)
+	}
 	return tail
 }
 

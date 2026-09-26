@@ -39,6 +39,37 @@ func TestReviewStreamTerminalErrorKeepsStdoutDiagnostic(t *testing.T) {
 // A probe timeout must be a pure timeout: the context expired AND the error
 // is that expiry. A genuine failure that merely arrived after the deadline
 // is not liveness evidence.
+// A liveness probe failure must stay out of the original error's whole-chain
+// analysis, or a probe that failed for an unrelated reason (a permission or
+// certificate problem) suppresses not-found detection for the original.
+func TestReviewProbeDiagnosticStaysOutOfChainAnalysis(t *testing.T) {
+	orig := &CLIError{Binary: "docker", Args: []string{"logs", "web"}, ExitCode: 1, Stderr: "No such container: web"}
+	probeErr := &CLIError{
+		Binary:   "docker",
+		Args:     []string{"version"},
+		ExitCode: 1,
+		Stderr:   "permission denied while trying to connect to the Docker daemon socket",
+	}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"version": {err: probeErr},
+	}}
+	classified := Classify(context.Background(), r, orig, Probe{Args: []string{"version"}, Hint: "start the Docker daemon"})
+
+	// The probe cause must stay reachable for diagnostics.
+	if !strings.Contains(classified.Error(), "permission denied") {
+		t.Errorf("probe cause lost from the message: %v", classified)
+	}
+	// But it must not be visible to a chain walk over the original error.
+	var found *CLIError
+	if errors.As(classified, &found) && found == probeErr {
+		t.Error("probe CLIError is reachable through a chain walk")
+	}
+	// The original must remain the only CLIError a walk can see.
+	if !errors.Is(classified, orig) {
+		t.Errorf("original error lost: %v", classified)
+	}
+}
+
 func TestReviewProbeTimeoutRequiresErrorIdentity(t *testing.T) {
 	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()

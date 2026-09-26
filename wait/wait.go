@@ -198,9 +198,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				return wrapWaitCause(what, fatal.err, joinNonNil(lastErr, lastProbeErr))
 			}
 		} else {
-			if terminal := terminationErr(); terminal != nil {
-				return terminal
-			}
+			// check succeeded, which is an observed readiness result. A
+			// deadline that fires between the call returning and here must
+			// not rewrite it as a timeout, or a container that became ready
+			// right at the deadline is rolled back.
 			return nil
 		}
 
@@ -228,16 +229,29 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				// A later successful probe supersedes an earlier failure, so
 				// a transient probe error is not reported forever.
 				lastProbeErr = nil
-				if terminal := terminationErr(); terminal != nil {
-					return terminal
-				}
+				// A definitive stopped result is an observation too, so it
+				// is reported as "stopped" rather than as a plain timeout.
 				if !running {
 					return waitStoppedError(what, joinNonNil(lastErr, lastProbeErr))
 				}
 			}
 		}
 
-		timer := time.NewTimer(interval)
+		// Wake in time to run the reserved final state probe, otherwise an
+		// interval that does not divide the budget skips the window
+		// entirely and a stopped container is reported as a plain timeout.
+		sleep := interval
+		if !checkRunning && !finalStateChecked {
+			if deadline, ok := waitCtx.Deadline(); ok {
+				if untilFinal := time.Until(deadline) - stateCheckInterval; untilFinal < sleep {
+					sleep = untilFinal
+				}
+			}
+		}
+		if sleep < 0 {
+			sleep = 0
+		}
+		timer := time.NewTimer(sleep)
 		select {
 		case <-waitCtx.Done():
 			timer.Stop()

@@ -80,24 +80,51 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	// verifyCtx bounds only the identity lock and verification inspect.
-	// The user command itself runs under the caller's ctx: Exec has no
-	// default deadline, and a library-injected timeout would be reported
-	// as an exit code rather than as the caller's cancellation.
+	// verifyCtx bounds the identity lock and verification inspect. The user
+	// command runs under the caller's ctx: Exec has no default deadline, and
+	// a library-injected timeout would be reported as an exit code rather
+	// than as the caller's cancellation.
 	verifyCtx, verifyCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer verifyCancel()
 
-	// The name lock covers the generation check and name resolution only.
-	// Holding it for the command would block every other name-addressed
-	// operation (Stop, Terminate, Logs, the reaper) for as long as the app
-	// runs, and Exec has no default deadline to bound that.
-	target, _, release, err := c.acquireVerifiedOperationTarget(verifyCtx, true)
-	if err != nil {
-		return 0, nil, err
+	// The name lock must stay held until the backend has resolved the name,
+	// so the command is spawned inside the critical section. Waiting for it
+	// under the lock would block every other name-addressed operation (Stop,
+	// Terminate, Logs, the reaper) for as long as the app runs, and Exec
+	// applies no default deadline to bound that.
+	spawner, canSpawn := c.runner.(cli.Spawner)
+	var target string
+	var started *cli.StartedCommand
+	if canSpawn {
+		err := c.withVerifiedOperationTarget(verifyCtx, true, func(t string, _ *engineInfo) error {
+			child, err := spawner.Start(ctx, c.eng.execArgs(t, cfg, envFile, cmd)...)
+			if err != nil {
+				return wrapNotFoundFor(c.eng, c.classify(ctx, err))
+			}
+			target, started = t, child
+			return nil
+		})
+		if err != nil {
+			return 0, nil, err
+		}
+	} else {
+		// Without a spawner the lock has to cover the whole command, which
+		// is the pre-existing behavior for custom runners.
+		if err := c.withVerifiedOperationTarget(ctx, true, func(t string, _ *engineInfo) error {
+			target = t
+			return nil
+		}); err != nil {
+			return 0, nil, err
+		}
 	}
-	release()
 
-	stdout, stderr, runErr := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	var stdout, stderr []byte
+	var runErr error
+	if started != nil {
+		stdout, stderr, runErr = started.Wait()
+	} else {
+		stdout, stderr, runErr = c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	}
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if runErr == nil {
 		return 0, output, nil

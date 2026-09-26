@@ -119,6 +119,8 @@ type classifyingStream struct {
 	closeOnce   sync.Once
 	closeDone   chan struct{}
 	closeErr    error
+	cancelOnce  sync.Once
+	canceled    bool
 }
 
 func (s *classifyingStream) Read(p []byte) (int, error) {
@@ -141,6 +143,10 @@ func (s *classifyingStream) Read(p []byte) (int, error) {
 func (s *classifyingStream) watchContext(processDone <-chan struct{}) {
 	select {
 	case <-s.ctx.Done():
+		// Record why the stream is being closed. A reader that reaches
+		// TerminalError after this sees an intentional Close and would
+		// otherwise report the interrupted stream as a clean finish.
+		s.cancelOnce.Do(func() { s.canceled = true })
 		_ = s.Close()
 	case <-processDone:
 		s.finish()
@@ -168,6 +174,17 @@ func (s *classifyingStream) Close() error {
 
 func (s *classifyingStream) TerminalError() error {
 	s.once.Do(func() {
+		// An interrupted stream must stay distinguishable from a cleanly
+		// finished one even when the cancellation path won the race to
+		// Close, because Close alone reports a nil terminal error.
+		if s.canceled {
+			if ctxErr := s.ctx.Err(); ctxErr != nil {
+				s.terminal = ctxErr
+				return
+			}
+			s.terminal = context.Canceled
+			return
+		}
 		if status, ok := s.ReadCloser.(terminalStreamStatus); ok {
 			if terminal := status.TerminalError(); terminal != nil {
 				s.terminal = s.classifyTerminal(terminal)

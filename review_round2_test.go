@@ -157,6 +157,34 @@ func TestReviewPruneReuseGroupDeletesUnmanagedMember(t *testing.T) {
 	}
 }
 
+// A stopped container carrying the requested name but belonging to a
+// different reuse group must never be terminated by this call.
+func TestReviewDeleteStoppedReuseRejectsForeignGroup(t *testing.T) {
+	creation := strings.Repeat("c", 16)
+	info := &engineInfo{
+		state: StateStopped,
+		labels: map[string]string{
+			reuseLabel:      "true",
+			managedLabel:    "true",
+			creationLabel:   creation,
+			reuseGroupLabel: "other-group",
+		},
+	}
+	cfg := &config{name: "myctr", reuseGroup: "mine"}
+	if err := checkReuseGroup(info, cfg); err == nil {
+		t.Error("a foreign reuse group was accepted")
+	}
+	// No group requested means no group constraint.
+	if err := checkReuseGroup(info, &config{name: "myctr"}); err != nil {
+		t.Errorf("ungrouped call rejected by a group check: %v", err)
+	}
+	// The matching group passes.
+	info.labels[reuseGroupLabel] = "mine"
+	if err := checkReuseGroup(info, cfg); err != nil {
+		t.Errorf("matching reuse group rejected: %v", err)
+	}
+}
+
 // Exec must not hold the container's name lock for the duration of the user
 // command: Exec has no default deadline, so a long command would block every
 // other name-addressed operation on that container until it returns.

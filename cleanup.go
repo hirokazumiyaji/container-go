@@ -164,7 +164,10 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
 		return false, nil
 	}
-	if err := verifyDestructiveInfo(eng, fresh, false, reuseGroup != ""); err != nil {
+	// A reuse-group prune force-removes every container tagged with the
+	// group, so the managed label must not gate it. A plain Prune keeps the
+	// requirement.
+	if err := verifyDestructiveInfo(eng, fresh, false, reuseGroup == ""); err != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	target, err := verifiedDeleteTarget(eng, fresh, candidate.id)

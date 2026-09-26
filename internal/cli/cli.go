@@ -344,7 +344,16 @@ type probeDiagnostic struct {
 
 func (p probeDiagnostic) Error() string { return p.probe.Error() }
 
-func (p probeDiagnostic) Is(target error) bool { return errors.Is(p.probe, target) }
+// Is forwards the probe's causes, except the context sentinels. The probe runs
+// on its own internal budget, so its DeadlineExceeded is not the caller's
+// deadline; leaking it would make hasDefinitiveErrorBranch treat the original
+// error as definitively broken and suppress ErrContainerNotFound.
+func (p probeDiagnostic) Is(target error) bool {
+	if target == context.Canceled || target == context.DeadlineExceeded {
+		return false
+	}
+	return errors.Is(p.probe, target)
+}
 
 // wrapProbe returns a probe failure that is visible to errors.Is but hidden
 // from chain type walks over the original error.
@@ -373,6 +382,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
+	probeStarted := time.Now()
 	probeStdout, _, probeErr := r.Run(probeCtx, probe.Args...)
 	if probeErr != nil {
 		probeErr = withStdout(probeErr, string(probeStdout))
@@ -397,7 +407,7 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	}
 	// A pure bounded-probe timeout is liveness evidence. A joined
 	// permission/configuration/cancellation cause vetoes it.
-	if isProbeTimeoutError(probeCtx, probeErr) && !probeVetoError(probeErr) {
+	if isProbeTimeoutError(probeCtx, probeStarted, probeErr) && !probeVetoError(probeErr) {
 		return classifySystemNotRunning(err, diag, probe.Hint)
 	}
 	if isProbeCancellationOrConfiguration(probeErr) {
@@ -423,8 +433,20 @@ func classifySystemNotRunning(original, probeErr error, hint string) error {
 // DeadlineExceeded conjunct alone is not enough: a child that returned a
 // real exit status just after the deadline failed on its own and must not
 // be promoted to liveness evidence.
-func isProbeTimeoutError(probeCtx context.Context, err error) bool {
+// isProbeTimeoutError reports that the liveness probe exhausted its own
+// bounded budget.
+//
+// started is when the probe was launched. The probe context inherits the
+// caller's deadline, so probeCtx.Err() can report DeadlineExceeded because the
+// *caller* ran out of time before the probe consumed its own 5s. That is not
+// evidence about the backend: a slow-but-healthy daemon would be reported as
+// down, and callers branch on ErrSystemNotRunning.
+func isProbeTimeoutError(probeCtx context.Context, started time.Time, err error) bool {
 	if probeCtx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Only the probe's own budget counts.
+	if time.Since(started) < probeTimeout {
 		return false
 	}
 	// A child that returned a real exit status is not timeout evidence: it

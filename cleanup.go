@@ -130,9 +130,11 @@ func pruneImmutableCandidate(ctx context.Context, r cli.Runner, eng engine, cand
 	stdout, _, err := r.Run(ctx, eng.inspectArgs(candidate.id)...)
 	if err != nil {
 		if isNotFoundFor(eng, err) {
-			// Already gone: an idempotent success that reports nothing
-			// removed, because this call did not remove it.
-			return true, nil
+			// Already gone: an idempotent success, but this call removed
+			// nothing, so it must not be reported in the removed list. Prune
+			// returns the IDs it removed, and crediting a concurrent actor's
+			// deletion to this call misreports what the caller did.
+			return false, nil
 		}
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
 	}
@@ -195,7 +197,9 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 
 	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng}).inspectFresh(guardCtx)
 	if isNotFoundFor(eng, err) {
-		return true, nil
+		// Already gone: idempotent success, but this call removed nothing, so
+		// it does not belong in the removed list.
+		return false, nil
 	}
 	if err != nil {
 		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)

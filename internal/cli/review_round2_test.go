@@ -76,23 +76,25 @@ func TestReviewProbeTimeoutRequiresErrorIdentity(t *testing.T) {
 	if expired.Err() != context.DeadlineExceeded {
 		t.Fatalf("test setup: got %v", expired.Err())
 	}
-	if isProbeTimeoutError(expired, errors.New("some other failure")) {
+	// The probe consumed its own full budget.
+	ranFull := time.Now().Add(-probeTimeout - time.Second)
+	if isProbeTimeoutError(expired, ranFull, errors.New("some other failure")) {
 		t.Error("non-timeout error promoted to probe timeout")
 	}
-	if !isProbeTimeoutError(expired, context.DeadlineExceeded) {
+	if !isProbeTimeoutError(expired, ranFull, context.DeadlineExceeded) {
 		t.Error("genuine timeout not recognized")
 	}
-	if isProbeTimeoutError(context.Background(), context.DeadlineExceeded) {
+	if isProbeTimeoutError(context.Background(), ranFull, context.DeadlineExceeded) {
 		t.Error("Background context reported a probe timeout")
 	}
 	// Run joins the context error onto any exit status, so a real non-zero
 	// probe exit is not timeout evidence.
 	realExit := errors.Join(&CLIError{Binary: "docker", Args: []string{"info"}, ExitCode: 1}, context.DeadlineExceeded)
-	if isProbeTimeoutError(expired, realExit) {
+	if isProbeTimeoutError(expired, ranFull, realExit) {
 		t.Error("a real probe exit status was read as a timeout")
 	}
 	signalled := errors.Join(&CLIError{Binary: "docker", Args: []string{"info"}, ExitCode: -1}, context.DeadlineExceeded)
-	if !isProbeTimeoutError(expired, signalled) {
+	if !isProbeTimeoutError(expired, ranFull, signalled) {
 		t.Error("a signalled child was not read as a timeout")
 	}
 }
@@ -114,5 +116,16 @@ func TestReviewStreamCleanExitBeatsLateCancellation(t *testing.T) {
 	}
 	if terminal := status.TerminalError(); terminal != nil {
 		t.Errorf("clean exit reported as %v", terminal)
+	}
+}
+
+// A probe cut short by the caller's own deadline proves nothing about the
+// backend, so it must not be reported as a daemon-down diagnosis.
+func TestReviewProbeCutShortByCallerIsNotLivenessEvidence(t *testing.T) {
+	expired, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancel()
+	signalled := errors.Join(&CLIError{Binary: "docker", Args: []string{"info"}, ExitCode: -1}, context.DeadlineExceeded)
+	if isProbeTimeoutError(expired, time.Now(), signalled) {
+		t.Error("a probe that never consumed its own budget was read as a timeout")
 	}
 }

@@ -239,6 +239,16 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
+			// checkReuseOwned validates the reuse, managed, and creation
+			// labels, but those cannot tell one reuse group from another. A
+			// running same-name container owned by a different group must be
+			// rejected before adoption, exactly as in deleteStoppedReuse;
+			// otherwise this caller's teardown can terminate another group's
+			// live generation and defeat the isolation PruneReuseGroup relies
+			// on.
+			if err := checkReuseGroup(info, cfg); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:        cfg.name,
 				runner:    cfg.runner,

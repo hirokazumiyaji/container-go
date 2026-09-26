@@ -95,6 +95,8 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	spawner, canSpawn := c.runner.(cli.Spawner)
 	var target string
 	var started *cli.StartedCommand
+	var stdout, stderr []byte
+	var runErr error
 	if canSpawn {
 		err := c.withVerifiedOperationTarget(verifyCtx, true, func(t string, _ *engineInfo) error {
 			child, err := spawner.Start(ctx, c.eng.execArgs(t, cfg, envFile, cmd)...)
@@ -107,23 +109,22 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		if err != nil {
 			return 0, nil, err
 		}
-	} else {
-		// Without a spawner the lock has to cover the whole command, which
-		// is the pre-existing behavior for custom runners.
-		if err := c.withVerifiedOperationTarget(ctx, true, func(t string, _ *engineInfo) error {
-			target = t
-			return nil
-		}); err != nil {
-			return 0, nil, err
-		}
-	}
-
-	var stdout, stderr []byte
-	var runErr error
-	if started != nil {
 		stdout, stderr, runErr = started.Wait()
 	} else {
-		stdout, stderr, runErr = c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+		// Without a spawner there is no way to release the lock between the
+		// name resolution and the child process, so the command has to run
+		// inside the critical section. Holding the name lock for an unbounded
+		// command blocks other name-addressed operations, but releasing it
+		// early would let a peer delete and recreate the name first, and the
+		// command would run in a different container.
+		err := c.withVerifiedOperationTarget(ctx, true, func(t string, _ *engineInfo) error {
+			target = t
+			stdout, stderr, runErr = c.runner.Run(ctx, c.eng.execArgs(t, cfg, envFile, cmd)...)
+			return nil
+		})
+		if err != nil {
+			return 0, nil, err
+		}
 	}
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if runErr == nil {

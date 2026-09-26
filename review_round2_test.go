@@ -2,7 +2,9 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -185,10 +187,117 @@ func TestReviewDeleteStoppedReuseRejectsForeignGroup(t *testing.T) {
 	}
 }
 
-// Exec must not hold the container's name lock for the duration of the user
-// command: Exec has no default deadline, so a long command would block every
-// other name-addressed operation on that container until it returns.
+// With a spawner, Exec must release the name lock once the child exists:
+// Exec has no default deadline, so holding the lock for the command would
+// block every other name-addressed operation on that container until it
+// returns. A real cli.ExecRunner is used because cli.StartedCommand cannot be
+// constructed from outside the cli package.
 func TestReviewExecDoesNotHoldNameLockDuringCommand(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+
+	// A stub that answers `inspect` for the verification step, and signals
+	// then blocks for the exec itself.
+	dir := t.TempDir()
+	startedFile := dir + "/started"
+	releaseFile := dir + "/release"
+	inspectJSON := dir + "/inspect.json"
+	payload, err := json.Marshal([]map[string]any{{
+		"id": ctr.ID(),
+		"configuration": map[string]any{
+			"id":             ctr.ID(),
+			"image":          map[string]any{"reference": "docker.io/library/redis:7-alpine"},
+			"publishedPorts": []any{},
+			"labels": map[string]string{
+				managedLabel:  "true",
+				sessionLabel:  sessionID(),
+				creationLabel: ctr.creation,
+			},
+		},
+		"status": map[string]any{
+			"state":    "running",
+			"networks": []any{map[string]string{"ipv4Address": "192.168.64.3/24", "network": "default"}},
+		},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(inspectJSON, payload, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := dir + "/stub"
+	body := "#!/bin/sh\n" +
+		"if [ \"$1\" = inspect ]; then cat " + inspectJSON + "; exit 0; fi\n" +
+		"touch " + startedFile + "\n" +
+		"while [ ! -f " + releaseFile + " ]; do sleep 0.02; done\n"
+	if err := os.WriteFile(script, []byte(body), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	ctr.runner = &cli.ExecRunner{Binary: script}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ctr.Exec(context.Background(), []string{"ignored"})
+		done <- err
+	}()
+
+	// Wait for the child to be running.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(startedFile); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = os.WriteFile(releaseFile, nil, 0o600)
+			t.Fatalf("the exec child never started; Exec returned: %v", <-done)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// The name must be free while the command is still running.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, lockErr := ctr.verifiedReadTarget(ctx)
+	cancel()
+	_ = os.WriteFile(releaseFile, nil, 0o600)
+	if execErr := <-done; execErr != nil {
+		t.Fatalf("Exec: %v", execErr)
+	}
+	if lockErr != nil {
+		t.Fatalf("name lock still held while the command ran: %v", lockErr)
+	}
+}
+
+// blockingExecRunner is a plain Runner with no Spawner. Exec must then hold
+// the name lock across the whole command, because there is no way to release
+// it between resolving the name and the child process.
+type blockingExecRunner struct {
+	*fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		select {
+		case <-b.started:
+		default:
+			close(b.started)
+		}
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return b.fakeRunner.Run(ctx, args...)
+}
+
+// Without a spawner there is no window between the name resolution and the
+// child process, so the lock must span the command. Releasing it early would
+// let a peer delete and recreate the name, and the command would run in a
+// different container.
+func TestReviewExecHoldsNameLockWithoutSpawner(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 
@@ -203,38 +312,17 @@ func TestReviewExecDoesNotHoldNameLockDuringCommand(t *testing.T) {
 	}()
 	<-started
 
-	// The name must be free while the command is still running.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
 	_, err := ctr.verifiedReadTarget(ctx)
 	cancel()
-	if err != nil {
+	if err == nil {
 		close(release)
 		<-done
-		t.Fatalf("name lock still held while the command ran: %v", err)
+		t.Fatal("name lock was released mid-command; a peer could recreate the name")
 	}
 
 	close(release)
 	if err := <-done; err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
-}
-
-// blockingExecRunner signals when the exec call starts and blocks until
-// released, so the lock window can be inspected from another goroutine.
-type blockingExecRunner struct {
-	*fakeRunner
-	started chan struct{}
-	release chan struct{}
-}
-
-func (b *blockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if len(args) > 0 && args[0] == "exec" {
-		close(b.started)
-		select {
-		case <-b.release:
-		case <-ctx.Done():
-			return nil, nil, ctx.Err()
-		}
-	}
-	return b.fakeRunner.Run(ctx, args...)
 }

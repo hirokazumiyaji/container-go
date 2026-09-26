@@ -344,6 +344,12 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminateTimeout)
 	defer cancel()
 	if err := c.Terminate(cleanupCtx); err != nil {
+		// A replaced or already-absent generation is not a leak: there is
+		// nothing left behind. Reporting it as one is a false alarm on the
+		// exact signal CleanupError exists to carry.
+		if errors.Is(err, ErrGenerationReplaced) || errors.Is(err, ErrContainerNotFound) {
+			return cause
+		}
 		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
 		return withCleanupError(cause, cleanupErr)
 	}

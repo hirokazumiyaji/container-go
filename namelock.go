@@ -375,7 +375,25 @@ func resolveNameLocks(name string) (resolvedNameLocks, error) {
 	if err != nil {
 		return resolvedNameLocks{}, fmt.Errorf("resolve durable lock: %w", err)
 	}
-	return resolvedNameLocks{legacy: legacy, transitional: transitional, state: state}, nil
+	resolved := resolvedNameLocks{legacy: legacy, transitional: transitional, state: state}
+	// The three barriers must be distinct. transitional comes from the user
+	// cache dir (XDG_CACHE_HOME) and state from the user state dir, so a
+	// configuration that points them at the same root collapses two barriers
+	// onto one path. That is a self-inflicted deadlock rather than a redundant
+	// lock: each barrier is opened separately, and flock locks belong to the
+	// open file description, so the second LOCK_EX returns EWOULDBLOCK and the
+	// acquisition spins until the context expires. The reaper's lockf chain
+	// breaks the same way. Fail closed instead.
+	seen := make(map[string]struct{}, 3)
+	for _, path := range resolved.ordered() {
+		if _, dup := seen[path]; dup {
+			return resolvedNameLocks{}, fmt.Errorf(
+				"%w: name-lock namespaces resolve to the same path %s; point XDG_CACHE_HOME and the state directory at different roots",
+				ErrNameLockCompatibility, path)
+		}
+		seen[path] = struct{}{}
+	}
+	return resolved, nil
 }
 
 // reaperNameLockPaths prepares all compatibility barriers before their paths

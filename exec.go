@@ -181,9 +181,15 @@ func execCLIStderr(err error) (string, bool) {
 	return strings.ToLower(stdout + "\n" + stderr), true
 }
 
-// execContainerRunningTarget verifies the already-bound operation target.
-// It is called while the Apple name lock is held, so it does not acquire a
-// second lock.
+// execContainerRunningTarget reports whether the operation target is still
+// running, as a best-effort liveness probe for an ambiguous exec failure.
+//
+// It does not hold the name lock: the command is spawned inside the
+// critical section and then runs unbounded, so the lock is released before
+// this call. A name-addressed target can therefore be replaced in between,
+// so the creation generation is re-checked here. A probe that cannot prove
+// "the same container is running" returns false, which keeps the ambiguous
+// failure classified as an error rather than as an app result.
 func (c *Container) execContainerRunningTarget(ctx context.Context, target string) bool {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
@@ -193,6 +199,12 @@ func (c *Container) execContainerRunningTarget(ctx context.Context, target strin
 	}
 	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
+		return false
+	}
+	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
+		return false
+	}
+	if c.uid != "" && requiresImmutableID(c.eng) && info.uid != c.uid {
 		return false
 	}
 	return info.state == StateRunning

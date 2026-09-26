@@ -82,10 +82,23 @@ func waitReusePoll(ctx context.Context) error {
 	}
 }
 
+// reuseLockedPollBudget bounds how long adoption holds the exclusive name
+// lock while waiting for a created generation to settle. It must stay well
+// under queryTimeout/terminateTimeout, because every peer name-addressed
+// operation waits on the same lock with a 30s budget: holding it for the
+// whole attach timeout would make a concurrent Terminate or Prune fail
+// spuriously.
+var reuseLockedPollBudget = 5 * time.Second
+
 // inspectReuseCandidate serializes Apple adoption with failed-create
 // cleanup. A created generation is held under the name lock until it
 // becomes running, so a cleanup that observed Created cannot delete it
 // after a peer has begun adoption.
+//
+// The lock is only held for that settling window. Past it the poll continues
+// without the lock, pinned to the creation generation first observed: a
+// failed-create cleanup can then act, but the generation check below rejects
+// whatever replaced it instead of adopting a different container.
 func inspectReuseCandidate(ctx context.Context, cfg *config) (*engineInfo, error) {
 	if cfg.eng.name() != "apple" {
 		return inspectNamed(ctx, cfg, cfg.name)
@@ -94,23 +107,50 @@ func inspectReuseCandidate(ctx context.Context, cfg *config) (*engineInfo, error
 	if err != nil {
 		return nil, fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
 	}
-	defer unlock()
+	locked := true
+	release := func() {
+		if locked {
+			unlock()
+			locked = false
+		}
+	}
+	defer release()
+
+	lockDeadline := time.Now().Add(reuseLockedPollBudget)
+	var generation string
 	for {
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
 			return nil, err
 		}
+		if generation == "" {
+			generation = info.labels[creationLabel]
+			if !validCreationID(generation) {
+				return nil, fmt.Errorf("reuse %s: existing container has no valid creation generation: %w",
+					cfg.name, ErrGenerationReplaced)
+			}
+		} else if info.labels[creationLabel] != generation {
+			// The name was reused while we polled. Re-acquire under the lock
+			// and re-pin to the new generation.
+			release()
+			unlock, err = lockName(ctx, cfg.name)
+			if err != nil {
+				return nil, fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
+			}
+			locked = true
+			lockDeadline = time.Now().Add(reuseLockedPollBudget)
+			generation = ""
+			continue
+		}
 		switch info.state {
 		case StateRunning, StateStopped:
 			return info, nil
-		case StateCreated, StateStopping, StateUnknown:
-			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
-			}
-		default:
-			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
-			}
+		}
+		if !time.Now().Before(lockDeadline) {
+			release()
+		}
+		if err := waitReusePoll(ctx); err != nil {
+			return nil, err
 		}
 	}
 }

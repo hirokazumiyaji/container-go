@@ -105,7 +105,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		if usesNameAddressedDeletes(eng) {
 			didRemove, err = pruneNamedCandidate(cCtx, r, eng, candidate, errKind, reuseGroup)
 		} else {
-			didRemove, err = deletePruneCandidate(cCtx, r, eng, candidate.id, errKind)
+			didRemove, err = pruneImmutableCandidate(cCtx, r, eng, candidate, errKind, reuseGroup)
 		}
 		cCancel()
 		if err != nil {
@@ -117,6 +117,45 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		}
 	}
 	return removed, errors.Join(errs...)
+}
+
+// pruneImmutableCandidate re-verifies an immutable-ID candidate before
+// deleting it. The name-addressed path already re-inspects, and without the
+// same check a container that restarted between the list call and the delete
+// would be force-removed even though Prune only targets stopped containers.
+//
+// The list call yields only IDs on this backend, so ownership is derived
+// from the fresh inspect rather than compared against the list.
+func pruneImmutableCandidate(ctx context.Context, r cli.Runner, eng engine, candidate pruneCandidate, errKind, reuseGroup string) (bool, error) {
+	stdout, _, err := r.Run(ctx, eng.inspectArgs(candidate.id)...)
+	if err != nil {
+		if isNotFoundFor(eng, err) {
+			// Already gone: an idempotent success that reports nothing
+			// removed, because this call did not remove it.
+			return true, nil
+		}
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	fresh, err := eng.parseInspect(stdout, candidate.id)
+	if err != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, err)
+	}
+	if fresh.uid != candidate.id {
+		return false, fmt.Errorf("%s %s: inspect returned a different immutable ID", errKind, candidate.id)
+	}
+	if reuseGroup != "" {
+		if fresh.labels[reuseGroupLabel] != reuseGroup {
+			return false, nil
+		}
+	} else if fresh.labels[managedLabel] != "true" || fresh.state != StateStopped {
+		// A plain Prune only removes stopped managed containers, so a
+		// container that restarted since the list call is left alone.
+		return false, nil
+	}
+	if err := verifyDestructiveInfo(eng, fresh, false, reuseGroup == ""); err != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
+	}
+	return deletePruneCandidate(ctx, r, eng, candidate.id, errKind)
 }
 
 func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {

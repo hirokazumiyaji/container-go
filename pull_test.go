@@ -498,6 +498,11 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil
+	case "inspect":
+		// The list call yields only IDs, so the prune re-verifies ownership
+		// and state from this inspect.
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/x","State":{"Status":"exited"},"Config":{"Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`, id)), nil, nil
 	case "rm", "delete":
 		r.deleteCalls++
 		return nil, nil, nil

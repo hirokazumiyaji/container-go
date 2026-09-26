@@ -122,6 +122,11 @@ func probe(name, binary string, args ...string) error {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, binary, args...).CombinedOutput()
 	if err != nil {
+		// A killed probe reports "signal: killed", which says nothing about
+		// why. Name the deadline instead.
+		if ctx.Err() != nil {
+			return fmt.Errorf("%s: probe timed out after %v", name, probeTimeout)
+		}
 		if detail := strings.TrimSpace(string(out)); detail != "" {
 			return fmt.Errorf("%s: %w: %s", name, err, detail)
 		}

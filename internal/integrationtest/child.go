@@ -93,12 +93,16 @@ func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
 			n, err := r.Read(buf)
 			acc += string(buf[:n])
 			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				// Non-blocking: the caller may already have timed out, and a
-				// blocked send would wedge this goroutine forever.
+				// The terminal signal must never be dropped. If a non-terminal
+				// snapshot is still queued the caller would wait out the whole
+				// timeout even though the child already reported, so evict the
+				// stale snapshot first and then send without blocking: the
+				// buffer is guaranteed free at that point.
 				select {
-				case ch <- chunk{text: acc, done: true, err: err}:
+				case <-ch:
 				default:
 				}
+				ch <- chunk{text: acc, done: true, err: err}
 				return
 			}
 			select {
@@ -135,6 +139,16 @@ func ReadReady(r io.Reader, timeout time.Duration) (string, error) {
 				return seen, nil
 			}
 		case <-timer.C:
+			// A snapshot may already be queued: select picks randomly when both
+			// cases are ready, so the newest text the reader published can
+			// still be sitting in the channel. Drain it before returning, or
+			// the reported output is older than what the child wrote — and a
+			// hang is exactly when that output is the only diagnostic.
+			select {
+			case c := <-ch:
+				seen = c.text
+			default:
+			}
 			// Release the reader: the blocked Read has no cancellation of
 			// its own, and a grandchild holding the pipe write end would
 			// otherwise keep this goroutine and the pipe alive for the rest

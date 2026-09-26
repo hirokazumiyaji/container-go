@@ -191,7 +191,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
 	}
 	c := containers[0]
 

@@ -161,7 +161,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 
@@ -208,46 +210,60 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create, and reports whether it succeeded.
+//
+// It never deletes a pre-existing same-name container: name conflicts are
+// skipped, and only a container carrying this process's managed+session labels
+// is removed. When the creation generation is known it must also match. Those
+// skips are successes, because there is nothing of ours left to remove.
+//
+// Every other failure is returned, so the caller can tell a caller-visible
+// "the container is still there" apart from a silent best-effort attempt. A
+// container that cannot even be inspected may still exist, so that case is a
+// failure too rather than an assumption that it is gone.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("lock name for cleanup: %w", err)
 	}
 	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
 	if err != nil {
-		return
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.creation != "" {
 		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
+			return nil
 		}
 	}
 	target := cfg.name
@@ -256,7 +272,15 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
+		// The container passed the ownership checks, so it exists and is
+		// ours. A failure here means it is still running.
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", target, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary

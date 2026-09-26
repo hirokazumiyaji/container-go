@@ -35,7 +35,9 @@ var ErrContainerNotFound = errors.New("container not found")
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // ErrUnsupportedCapability reports a configuration that the selected
-// backend cannot support safely.
+// backend cannot support safely, such as a bind mount whose source the
+// remote daemon would resolve on its own host. Every rejection of that class
+// wraps this sentinel, so callers detect it uniformly with errors.Is.
 var ErrUnsupportedCapability = errors.New("unsupported capability")
 
 // isNotFound reports whether a CLI failure means the container does not

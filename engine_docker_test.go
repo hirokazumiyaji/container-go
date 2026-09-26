@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
@@ -350,6 +351,72 @@ func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
 	if !isRemoteDockerHost() {
 		t.Error("tcp://10.0.0.5:2375 must be remote")
+	}
+}
+
+// ssh:// is a first-class Docker remote transport, and the daemon there
+// resolves bind-mount sources on its own host. Detecting only tcp:// let that
+// configuration through unchanged.
+func TestIsRemoteDockerHostCoversNonTCPRemoteSchemes(t *testing.T) {
+	for _, host := range []string{
+		"ssh://user@remote-host",
+		"ssh://user@10.0.0.5",
+		"http://10.0.0.5:2375",
+		"https://10.0.0.5:2376",
+		"npipe:////./pipe/docker_engine",
+	} {
+		if host == "npipe:////./pipe/docker_engine" {
+			continue // a named pipe is local even on Windows
+		}
+		t.Setenv("DOCKER_HOST", host)
+		if !isRemoteDockerHost() {
+			t.Errorf("DOCKER_HOST=%q: want remote", host)
+		}
+	}
+	// A Windows named pipe is a local transport.
+	t.Setenv("DOCKER_HOST", "npipe:////./pipe/docker_engine")
+	if isRemoteDockerHost() {
+		t.Error("npipe:// must be local")
+	}
+	// An ssh host on loopback is still this machine.
+	t.Setenv("DOCKER_HOST", "ssh://user@127.0.0.1")
+	if isRemoteDockerHost() {
+		t.Error("ssh:// to loopback must be local")
+	}
+	// A malformed value must fail closed rather than permit a bind the
+	// daemon would resolve in the wrong place.
+	t.Setenv("DOCKER_HOST", "://///")
+	if !isRemoteDockerHost() {
+		t.Error("a malformed DOCKER_HOST must be treated as remote")
+	}
+}
+
+// A bind mount must be rejected on an ssh:// daemon, which is the exact
+// failure the guard exists to prevent.
+func TestDockerRejectsBindMountOnSSHDaemon(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
+	err := (dockerEngine{}).checkConfig(&config{
+		mounts: []Mount{{Type: MountBind, Source: "/host/data"}},
+	})
+	if !errors.Is(err, ErrUnsupportedCapability) {
+		t.Fatalf("err = %v, want ErrUnsupportedCapability", err)
+	}
+}
+
+// Both remote-daemon rejections are the same class, so both must carry the
+// sentinel for uniform errors.Is detection.
+func TestDockerRemoteRejectionsShareSentinel(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	eng := dockerEngine{}
+
+	bindErr := eng.checkConfig(&config{mounts: []Mount{{Type: MountBind, Source: "/host/data"}}})
+	if !errors.Is(bindErr, ErrUnsupportedCapability) {
+		t.Errorf("bind mount err = %v, want ErrUnsupportedCapability", bindErr)
+	}
+
+	publishErr := eng.checkConfig(&config{published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}}})
+	if !errors.Is(publishErr, ErrUnsupportedCapability) {
+		t.Errorf("loopback publish err = %v, want ErrUnsupportedCapability", publishErr)
 	}
 }
 

@@ -62,7 +62,13 @@ func (dockerEngine) checkConfig(cfg *config) error {
 	// hostAddr is validated as an IP literal by parsePublishSpec.
 	for _, p := range cfg.published {
 		if p.hostAddr != "" && net.ParseIP(p.hostAddr).IsLoopback() {
-			return fmt.Errorf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw)
+			// Same class as the bind-mount rejection above, so it carries the
+			// same sentinel: a caller detecting unsupported configurations
+			// uniformly must not have to special-case this one.
+			return fmt.Errorf(
+				"%w: published port %q binds loopback on a remote DOCKER_HOST and would be unreachable",
+				ErrUnsupportedCapability, p.raw,
+			)
 		}
 	}
 	return nil
@@ -89,11 +95,33 @@ func (dockerEngine) defaultHost() string {
 	return "127.0.0.1"
 }
 
-// isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
-// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
-// the remote host is unreachable from the client.
+// isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
+// live on another machine. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1
+// bind on the remote host is unreachable from the client.
+//
+// Every non-local transport counts, not just tcp://: ssh:// is a first-class
+// Docker remote transport, and the daemon there resolves bind-mount sources
+// on its own host. Deriving this from defaultHost would miss every scheme it
+// does not recognize, so the scheme is checked directly. A loopback host is
+// still this machine, and an unparsable value is treated as remote so a
+// malformed setting fails closed rather than silently permitting a bind that
+// the daemon would resolve in the wrong place.
 func isRemoteDockerHost() bool {
-	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
+	raw := os.Getenv("DOCKER_HOST")
+	switch raw {
+	case "":
+		return false
+	}
+	for _, local := range []string{"unix://", "npipe://"} {
+		if strings.HasPrefix(strings.ToLower(raw), local) {
+			return false
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" {
+		return true
+	}
+	return !isLoopbackOrUnspecified(u.Hostname())
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and

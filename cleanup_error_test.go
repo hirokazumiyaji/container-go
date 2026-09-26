@@ -116,6 +116,26 @@ func TestReviewFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
 	}
 }
 
+// An inspect that succeeds but reports no container is proof of absence, so
+// it must be an idempotent success. Reporting it as a leak is worse than the
+// original silence: the caller is told about a container that is gone.
+func TestReviewFailedCreateEmptyInspectOutputIsNotAReport(t *testing.T) {
+	r := &emptyInspectRunner{fakeRunner: newTestRunner()}
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("Run returned nil")
+	}
+	var cleanupErr *CleanupError
+	if errors.As(err, &cleanupErr) {
+		t.Errorf("a provably absent container was reported as a leak: %v", err)
+	}
+	if r.deletedCalls != 0 {
+		t.Errorf("deletedCalls = %d, want 0 for a container that is already gone", r.deletedCalls)
+	}
+}
+
 // A container that cannot be inspected may still be running, so that is a
 // failure rather than an assumption that it is gone.
 func TestReviewFailedCreateUninspectableIsReported(t *testing.T) {
@@ -304,6 +324,28 @@ func quote(s string) string {
 		return `""`
 	}
 	return string(b)
+}
+
+// emptyInspectRunner fails the create and then answers a successful inspect
+// with no containers, which is authoritative proof of absence.
+type emptyInspectRunner struct {
+	*fakeRunner
+	deletedCalls int
+}
+
+func (r *emptyInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "run":
+		recordCreation(r.fakeRunner, args)
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 125, Stderr: "start failed"}
+	case "inspect":
+		// Exit 0 with an empty result: the daemon answered, and the answer
+		// does not contain the container.
+		return []byte("[]"), nil, nil
+	case "rm", "delete":
+		r.deletedCalls++
+	}
+	return r.fakeRunner.Run(ctx, args...)
 }
 
 // recordCreation captures the creation generation from a run invocation, as

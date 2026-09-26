@@ -330,7 +330,7 @@ Apple Container バックエンドの既定(直接 IP)は変えない。
 **クリーンアップの違い**:watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
 リーパーは `/bin/sh` に依存するため Windows では動かない。
 v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
-`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited`)を使える。
+`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited --filter status=dead`)を使える。`dead` はデーモンが回収できない停止済みコンテナで、`exited` だけだと取りこぼす。
 
 **システム未起動の検出**:probe コマンドをバックエンドごとに切り替える(Apple は `system status`、Docker は `info`)。
 

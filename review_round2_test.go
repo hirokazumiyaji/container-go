@@ -118,3 +118,95 @@ func TestReviewVerifiedReadTargetReleasesNameLock(t *testing.T) {
 		}
 	}
 }
+
+// The exact not-found matchers must read both streams. A backend that writes
+// the diagnostic to stdout would otherwise leave a missing container
+// unclassified, and callers treat "not found" as already gone.
+func TestReviewNotFoundMatcherReadsStdout(t *testing.T) {
+	stdoutOnly := cli.NewStreamCLIError("docker", []string{"inspect", "myctr"}, 1, "", "Error response from daemon: No such object: myctr")
+	if !exactContainerNotFoundFor(stdoutOnly, "docker") {
+		t.Error("stdout-only not-found was not matched")
+	}
+	if !isNotFoundFor(dockerEngine{}, stdoutOnly) {
+		t.Error("stdout-only not-found did not classify as not-found")
+	}
+	// The stderr-only form still matches.
+	stderrOnly := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"inspect", "myctr"},
+		Stderr: "Error response from daemon: No such object: myctr",
+	}
+	if !exactContainerNotFoundFor(stderrOnly, "docker") {
+		t.Error("stderr not-found was not matched")
+	}
+}
+
+// A reuse-group prune must delete an unmanaged group member; ordinary Prune
+// must not.
+func TestReviewPruneReuseGroupDeletesUnmanagedMember(t *testing.T) {
+	creation := strings.Repeat("c", 16)
+	fresh := &engineInfo{
+		state:  StateRunning,
+		labels: map[string]string{creationLabel: creation, reuseGroupLabel: "grp"},
+	}
+	if err := verifyDestructiveInfo(appleEngine{}, fresh, false, false); err != nil {
+		t.Errorf("reuse-group prune rejected an unmanaged member: %v", err)
+	}
+	if err := verifyDestructiveInfo(appleEngine{}, fresh, false, true); err == nil {
+		t.Error("ordinary prune accepted an unmanaged container")
+	}
+}
+
+// Exec must not hold the container's name lock for the duration of the user
+// command: Exec has no default deadline, so a long command would block every
+// other name-addressed operation on that container until it returns.
+func TestReviewExecDoesNotHoldNameLockDuringCommand(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	ctr.runner = &blockingExecRunner{fakeRunner: f, started: started, release: release}
+
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := ctr.Exec(context.Background(), []string{"true"})
+		done <- err
+	}()
+	<-started
+
+	// The name must be free while the command is still running.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	_, err := ctr.verifiedReadTarget(ctx)
+	cancel()
+	if err != nil {
+		close(release)
+		<-done
+		t.Fatalf("name lock still held while the command ran: %v", err)
+	}
+
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("Exec: %v", err)
+	}
+}
+
+// blockingExecRunner signals when the exec call starts and blocks until
+// released, so the lock window can be inspected from another goroutine.
+type blockingExecRunner struct {
+	*fakeRunner
+	started chan struct{}
+	release chan struct{}
+}
+
+func (b *blockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		close(b.started)
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return b.fakeRunner.Run(ctx, args...)
+}

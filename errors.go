@@ -435,6 +435,21 @@ func appleIDMessageMatches(message, target string) bool {
 	return exactAppleIDNotFound(strings.TrimSpace(strings.Trim(message, `"'`)), target)
 }
 
+// cliErrorDiagnosticLines returns the diagnostic lines of a CLIError from
+// both streams. The backends report some failures on stdout (a streamed
+// command, for example), so a matcher that reads only Stderr would miss a
+// not-found or conflict that the backend did print.
+func cliErrorDiagnosticLines(err error, cliErr *cli.CLIError) []string {
+	stdout, stderr, ok := cli.DiagnosticText(err)
+	if !ok {
+		stdout, stderr = "", cliErr.Stderr
+	}
+	if stderr == "" {
+		stderr = cliErr.Stderr
+	}
+	return strings.Split(stdout+"\n"+stderr, "\n")
+}
+
 func exactContainerNotFoundFor(err error, backend string) bool {
 	cliErr, ok := backendCLIError(err, backend)
 	if !ok || len(cliErr.Args) == 0 {
@@ -444,7 +459,7 @@ func exactContainerNotFoundFor(err error, backend string) bool {
 	if !ok || target == "" {
 		return false
 	}
-	for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
+	for _, rawLine := range cliErrorDiagnosticLines(err, cliErr) {
 		line := stripCLIErrorPrefix(rawLine)
 		if line == "" {
 			continue
@@ -555,7 +570,7 @@ func exactNameConflictFor(err error, backend string) bool {
 				break
 			}
 		}
-		for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
+		for _, rawLine := range cliErrorDiagnosticLines(err, cliErr) {
 			line := stripCLIErrorPrefix(rawLine)
 			lower := strings.ToLower(line)
 			if backend == "apple" {
@@ -633,7 +648,7 @@ func exactImageMissingFor(err error, backend string) bool {
 		if backend == "apple" {
 			phrase = "image not found"
 		}
-		for _, rawLine := range strings.Split(cliErr.Stderr, "\n") {
+		for _, rawLine := range cliErrorDiagnosticLines(err, cliErr) {
 			line := stripCLIErrorPrefix(rawLine)
 			if exactImageLine(line, phrase, target) {
 				return true

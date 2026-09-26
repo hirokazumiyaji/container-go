@@ -152,11 +152,14 @@ func receiveLogScanResult(results <-chan logScanResult, state *logScanState, don
 }
 
 func handleLogScanResult(callerCtx, waitCtx context.Context, timeout time.Duration, what string, target Target, result logScanResult) error {
-	if terminal := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); terminal != nil {
-		return terminal
-	}
+	// receiveLogScanResult prefers a result published before the deadline, so
+	// an observed pattern wins over a timer that fired afterwards. Checking
+	// the context first would turn a satisfied wait into a rollback.
 	if result.found {
 		return nil
+	}
+	if terminal := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); terminal != nil {
+		return terminal
 	}
 
 	// Keep the caller's context as the probe base so a later cancellation

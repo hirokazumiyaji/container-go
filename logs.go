@@ -72,13 +72,22 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	target, err := c.verifiedReadTarget(ctx)
+	// The name lock covers the generation check and name resolution only.
+	// Holding it for the stream's lifetime would serialize concurrent
+	// readers behind the first stream, and would leak the lock outright if
+	// a caller abandons the stream. Releasing it after the CLI process has
+	// started keeps the resolved name bound to this generation.
+	var stream io.ReadCloser
+	err := c.withVerifiedOperationTarget(ctx, false, func(target string, _ *engineInfo) error {
+		started, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
+		if err != nil {
+			return wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		}
+		stream = started
+		return nil
+	})
 	if err != nil {
 		return nil, err
-	}
-	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
-	if err != nil {
-		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	classified := &classifyingStream{
 		ReadCloser: stream,

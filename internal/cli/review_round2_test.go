@@ -54,4 +54,34 @@ func TestReviewProbeTimeoutRequiresErrorIdentity(t *testing.T) {
 	if isProbeTimeoutError(context.Background(), context.DeadlineExceeded) {
 		t.Error("Background context reported a probe timeout")
 	}
+	// Run joins the context error onto any exit status, so a real non-zero
+	// probe exit is not timeout evidence.
+	realExit := errors.Join(&CLIError{Binary: "docker", Args: []string{"info"}, ExitCode: 1}, context.DeadlineExceeded)
+	if isProbeTimeoutError(expired, realExit) {
+		t.Error("a real probe exit status was read as a timeout")
+	}
+	signalled := errors.Join(&CLIError{Binary: "docker", Args: []string{"info"}, ExitCode: -1}, context.DeadlineExceeded)
+	if !isProbeTimeoutError(expired, signalled) {
+		t.Error("a signalled child was not read as a timeout")
+	}
+}
+
+// A child that exits on its own reports its own outcome. A cancellation
+// observed afterwards must not rewrite a clean exit into an error, or a wait
+// that actually succeeded reads as failed.
+func TestReviewStreamCleanExitBeatsLateCancellation(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf out; exit 0`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.ReadAll(stream)
+
+	status, ok := stream.(interface{ TerminalError() error })
+	if !ok {
+		t.Fatalf("stream %T does not expose TerminalError", stream)
+	}
+	if terminal := status.TerminalError(); terminal != nil {
+		t.Errorf("clean exit reported as %v", terminal)
+	}
 }

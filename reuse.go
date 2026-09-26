@@ -281,8 +281,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		creation:  cfg.creation,
-		uid:       uid,
+		// This call created the generation, so a post-create failure must
+		// remove it rather than leave a half-configured container that the
+		// next attach would adopt as ready.
+		creator:  true,
+		creation: cfg.creation,
+		uid:      uid,
 	}
 	if reaperRegistration != nil {
 		ctr.addReaperRegistration(reaperRegistration)

@@ -125,6 +125,18 @@ func withStdout(err error, stdout string) error {
 
 // DiagnosticText returns the bounded diagnostic streams carried by a CLI
 // failure. The bool reports whether err contains a CLIError.
+// NewStreamCLIError builds a CLIError carrying a stdout diagnostic. A
+// streamed command may report its failure on stdout, so the not-found and
+// conflict matchers must see both streams.
+func NewStreamCLIError(binary string, args []string, exitCode int, stdout, stderr string) error {
+	return withStdout(&CLIError{
+		Binary:   binary,
+		Args:     args,
+		ExitCode: exitCode,
+		Stderr:   stderr,
+	}, stdout)
+}
+
 func DiagnosticText(err error) (stdout, stderr string, ok bool) {
 	if err == nil {
 		return "", "", false
@@ -308,11 +320,21 @@ func classifySystemNotRunning(original, probeErr error, hint string) error {
 }
 
 // isProbeTimeoutError reports a pure bounded-probe timeout: the probe
-// context expired and the probe error is that expiry. Both conjuncts are
-// required, so a genuine non-timeout failure that merely arrived after the
-// deadline is not promoted to liveness evidence.
+// context expired, the error carries that expiry, and the child was
+// signalled. Run joins the context error onto any *exec.ExitError, so the
+// DeadlineExceeded conjunct alone is not enough: a child that returned a
+// real exit status just after the deadline failed on its own and must not
+// be promoted to liveness evidence.
 func isProbeTimeoutError(probeCtx context.Context, err error) bool {
-	return probeCtx.Err() == context.DeadlineExceeded && errors.Is(err, context.DeadlineExceeded)
+	if probeCtx.Err() != context.DeadlineExceeded || !errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	for _, cliErr := range collectCLIErrors(err) {
+		if cliErr.ExitCode >= 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func probeVetoError(err error) bool {

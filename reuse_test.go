@@ -480,6 +480,7 @@ type reuseRollbackRunner struct {
 	*fakeRunner
 	created      bool
 	inspectCalls int
+	deleteCalls  int
 	inspectErr   error
 	copyErr      error
 	deleteErr    error
@@ -532,17 +533,22 @@ func (r *reuseRollbackRunner) Run(ctx context.Context, args ...string) ([]byte, 
 			return nil, nil, r.copyErr
 		}
 	case "delete":
-		if r.deleteErr != nil {
-			r.mu.Lock()
-			r.calls = append(r.calls, args)
-			r.mu.Unlock()
-			return nil, nil, r.deleteErr
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.deleteCalls++
+		deleteErr := r.deleteErr
+		r.mu.Unlock()
+		if deleteErr != nil {
+			return nil, nil, deleteErr
 		}
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestReuseInspectFailurePreservesRollbackCLIError(t *testing.T) {
+// A reuse generation created by this call is owned by this call until it is
+// published, so a post-create failure must remove it. Leaving it behind would
+// let the next attach adopt a half-configured container as ready.
+func TestReuseInspectFailureRemovesOwnGenerationAndPreservesErrors(t *testing.T) {
 	inspectErr := &cli.CLIError{Args: []string{"inspect", "reuse-rollback"}, ExitCode: 1, Stderr: "post-create inspect failed"}
 	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
 	r := &reuseRollbackRunner{
@@ -556,15 +562,20 @@ func TestReuseInspectFailurePreservesRollbackCLIError(t *testing.T) {
 	if got := cliErrorWithStderr(err, inspectErr.Stderr); got == nil {
 		t.Fatalf("error = %v, want original inspect CLIError", err)
 	}
-	if !strings.Contains(err.Error(), "refusing automatic deletion") {
-		t.Fatalf("error = %v, want shared-generation cleanup refusal", err)
+	if strings.Contains(err.Error(), "refusing automatic deletion") {
+		t.Fatalf("error = %v, creator must not refuse to remove its own generation", err)
 	}
-	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got != nil {
-		t.Fatalf("cleanup error = %v, want no automatic delete", got)
+	// The creator attempted the delete, and that delete failed, so both
+	// errors must be recoverable from the chain.
+	if r.deleteCalls == 0 {
+		t.Fatal("creator did not attempt to remove its own generation")
+	}
+	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want the cleanup failure preserved too", err)
 	}
 }
 
-func TestReuseCopyFailurePreservesRollbackCLIError(t *testing.T) {
+func TestReuseCopyFailureRemovesOwnGenerationAndPreservesErrors(t *testing.T) {
 	copyErr := &cli.CLIError{Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
 	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-copy-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
 	r := &reuseRollbackRunner{
@@ -583,11 +594,59 @@ func TestReuseCopyFailurePreservesRollbackCLIError(t *testing.T) {
 	if got := cliErrorWithStderr(err, copyErr.Stderr); got == nil {
 		t.Fatalf("error = %v, want original copy CLIError", err)
 	}
-	if !strings.Contains(err.Error(), "refusing automatic deletion") {
-		t.Fatalf("error = %v, want shared-generation cleanup refusal", err)
+	if strings.Contains(err.Error(), "refusing automatic deletion") {
+		t.Fatalf("error = %v, creator must not refuse to remove its own generation", err)
 	}
-	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got != nil {
-		t.Fatalf("cleanup error = %v, want no automatic delete", got)
+	if r.deleteCalls == 0 {
+		t.Fatal("creator did not attempt to remove its own generation")
+	}
+	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
+		t.Fatalf("error = %v, want the cleanup failure preserved too", err)
+	}
+}
+
+// An attacher that did not create the generation shares it, so its rollback
+// must not delete it.
+func TestReuseAttacherDoesNotDeleteSharedGeneration(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	ctr.reused = true
+	ctr.creator = false
+
+	cause := errors.New("copy failed")
+	err := ctr.rollback(context.Background(), cause)
+	if err == nil {
+		t.Fatal("rollback returned nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("original cause lost: %v", err)
+	}
+	if !strings.Contains(err.Error(), "refusing automatic deletion") {
+		t.Errorf("error = %v, want shared-generation cleanup refusal", err)
+	}
+	if call := f.callWith("delete"); call != nil {
+		t.Errorf("attacher deleted a shared generation: %v", call)
+	}
+}
+
+// The creator of a reuse generation may remove it, so its rollback is not
+// blocked by the shared-handle refusal.
+func TestReuseCreatorMayRemoveOwnGeneration(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	ctr.reused = true
+	ctr.creator = true
+
+	cause := errors.New("copy failed")
+	err := ctr.rollback(context.Background(), cause)
+	if err == nil {
+		t.Fatal("rollback returned nil")
+	}
+	if !errors.Is(err, cause) {
+		t.Errorf("original cause lost: %v", err)
+	}
+	if strings.Contains(err.Error(), "refusing automatic deletion") {
+		t.Errorf("creator refused to remove its own generation: %v", err)
 	}
 }
 

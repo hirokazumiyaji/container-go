@@ -278,7 +278,7 @@ tab=$(printf '\t')
 records=$(awk -F '\t' '
 function key(id, gen) { return id SUBSEP gen }
 $1 == "P" { k = key($2, $3); state[k] = "P"; record[k] = $0; next }
-$1 == "C" { k = key($2, $3); if (k in record) { state[k] = "A"; sub(/^C\t/, "A\t", record[k]) } next }
+$1 == "C" { k = key($2, $3); if (k in record) { state[k] = "A"; sub(/^P\t/, "A\t", record[k]) } next }
 $1 == "+" { k = key($2, $3); state[k] = "A"; record[k] = $0; next }
 $1 == "-" { k = key($2, $3); delete state[k]; delete record[k]; next }
 END { for (k in record) print record[k] }

@@ -129,6 +129,11 @@ type Container struct {
 	inspectMu     sync.RWMutex // protects uid
 	inspectGateMu sync.Mutex
 	inspectGate   chan struct{}
+
+	// creator marks the process that created a reuse generation. A creator
+	// owns the generation until it is published, so its rollback may delete
+	// it; every other attacher shares it and must not.
+	creator bool
 }
 
 // runCreateLocked serializes an Apple name-addressed create with the
@@ -332,7 +337,7 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	if keepContainers() {
 		return cause
 	}
-	if c.reused {
+	if c.reused && !c.creator {
 		cleanupErr := fmt.Errorf("container %s is a shared reuse generation; refusing automatic deletion", c.id)
 		return withCleanupError(cause, cleanupErr)
 	}
@@ -370,7 +375,7 @@ func (c *Container) verifyRetainedHandle(ctx context.Context) error {
 	if info == nil {
 		return fmt.Errorf("inspect returned no container identity")
 	}
-	if err := verifyDestructiveInfo(c.eng, info, !c.reused); err != nil {
+	if err := verifyDestructiveInfo(c.eng, info, !c.reused, true); err != nil {
 		return err
 	}
 	if !validCreationID(c.creation) || info.labels[creationLabel] != c.creation {
@@ -453,14 +458,18 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	return nil
 }
 
-// verifiedDeleteTarget returns the only safe target for a fresh inspect.
+// verifyDestructiveInfo returns the only safe target for a fresh inspect.
 // Docker must provide its immutable ID; Apple is name-addressed and must not
 // report an unexpected backend ID.
-func verifyDestructiveInfo(eng engine, info *engineInfo, requireSession bool) error {
+//
+// requireManaged is false only for a reuse-group prune, whose contract is to
+// force-remove every container tagged with the group whether or not it
+// carries the managed label.
+func verifyDestructiveInfo(eng engine, info *engineInfo, requireSession, requireManaged bool) error {
 	if info == nil {
 		return fmt.Errorf("inspect returned no container identity")
 	}
-	if info.labels[managedLabel] != "true" {
+	if requireManaged && info.labels[managedLabel] != "true" {
 		return fmt.Errorf("container is not managed by container-go")
 	}
 	if requireSession {
@@ -723,7 +732,7 @@ func (c *Container) terminateImmutable(ctx context.Context, expected *engineInfo
 	} else if !validCreationID(c.creation) || fresh.labels[creationLabel] != c.creation {
 		return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused); err != nil {
+	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused, true); err != nil {
 		return false, fmt.Errorf("terminate %s: %w", c.id, err)
 	}
 	if verify != nil {
@@ -773,7 +782,7 @@ func (c *Container) terminateByName(ctx context.Context, expected *engineInfo, s
 	} else if !validCreationID(c.creation) || fresh.labels[creationLabel] != c.creation {
 		return false, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused); err != nil {
+	if err := verifyDestructiveInfo(c.eng, fresh, !c.reused, true); err != nil {
 		return false, fmt.Errorf("terminate %s: %w", c.id, err)
 	}
 	if !knownStableState(fresh.state) {
@@ -994,8 +1003,11 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 
 // acquireVerifiedOperationTarget verifies the target immediately before an
 // operation. For Apple it also returns a release function that keeps all
-// name-lock barriers held until the caller is finished; this is used by
-// FollowLogs so a long-lived stream cannot outlive its generation check.
+// name-lock barriers held until the caller is finished. Callers must release
+// as soon as the name has been resolved: holding the lock across an
+// unbounded operation would block every other name-addressed call on this
+// container, and holding it for a stream's lifetime would leak it when a
+// caller abandons the stream.
 func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireRunning bool) (target string, info *engineInfo, release func(), err error) {
 	opCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	if requiresImmutableID(c.eng) {
@@ -1015,7 +1027,7 @@ func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireR
 			cancel()
 			return "", nil, func() {}, fmt.Errorf("container %s: operation target has no valid immutable ID", c.id)
 		}
-		if err := verifyDestructiveInfo(c.eng, info, false); err != nil {
+		if err := verifyDestructiveInfo(c.eng, info, false, true); err != nil {
 			cancel()
 			return "", nil, func() {}, fmt.Errorf("container %s: %w", c.id, err)
 		}
@@ -1044,7 +1056,7 @@ func (c *Container) acquireVerifiedOperationTarget(ctx context.Context, requireR
 		release()
 		return "", nil, func() {}, fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if err := verifyDestructiveInfo(c.eng, info, !c.reused); err != nil {
+	if err := verifyDestructiveInfo(c.eng, info, !c.reused, true); err != nil {
 		release()
 		return "", nil, func() {}, fmt.Errorf("operation %s: %w", c.id, err)
 	}
@@ -1069,13 +1081,9 @@ func (c *Container) withVerifiedOperationTarget(ctx context.Context, requireRunn
 }
 
 // verifiedReadTarget resolves a read-only target and releases the name lock
-// before returning. Streaming callers must not hold that lock: it is
-// cross-process and non-reentrant, so keeping it for a stream's lifetime
-// would serialize concurrent readers (wait.ForAny over two log patterns)
-// behind the first stream, and would leak the lock outright if a caller
-// abandons the stream. Verification already proved the identity, and a
-// read-only stream performs no destructive step, so releasing early costs
-// nothing.
+// before returning. Prefer withVerifiedOperationTarget, which holds the lock
+// across the whole callback; use this only when the caller has already
+// resolved the name and no further name-addressed CLI call is needed.
 func (c *Container) verifiedReadTarget(ctx context.Context) (string, error) {
 	target, _, release, err := c.acquireVerifiedOperationTarget(ctx, false)
 	if err != nil {

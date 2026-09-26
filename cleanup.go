@@ -93,16 +93,21 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 	var removed []string
 	var errs []error
 	for _, candidate := range candidates {
-		if err := qCtx.Err(); err != nil {
+		// Gate on the caller's cancellation, not the list budget: every
+		// candidate gets its own queryTimeout so one slow delete cannot
+		// exhaust the remaining candidates' allowance.
+		if err := ctx.Err(); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", errKind, err))
 			break
 		}
+		cCtx, cCancel := withDefaultTimeout(ctx, queryTimeout)
 		var didRemove bool
 		if usesNameAddressedDeletes(eng) {
-			didRemove, err = pruneNamedCandidate(qCtx, r, eng, candidate, errKind, reuseGroup)
+			didRemove, err = pruneNamedCandidate(cCtx, r, eng, candidate, errKind, reuseGroup)
 		} else {
-			didRemove, err = deletePruneCandidate(qCtx, r, eng, candidate.id, errKind)
+			didRemove, err = deletePruneCandidate(cCtx, r, eng, candidate.id, errKind)
 		}
+		cCancel()
 		if err != nil {
 			errs = append(errs, err)
 			continue
@@ -159,7 +164,7 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) {
 		return false, nil
 	}
-	if err := verifyDestructiveInfo(eng, fresh, false); err != nil {
+	if err := verifyDestructiveInfo(eng, fresh, false, reuseGroup != ""); err != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	target, err := verifiedDeleteTarget(eng, fresh, candidate.id)

@@ -86,43 +86,40 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// as an exit code rather than as the caller's cancellation.
 	verifyCtx, verifyCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer verifyCancel()
-	var (
-		exitCode int
-		output   io.Reader
-		execErr  error
-	)
-	err := c.withVerifiedOperationTarget(verifyCtx, true, func(target string, _ *engineInfo) error {
-		stdout, stderr, runErr := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
-		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
-		if runErr == nil {
-			return nil
-		}
-		if !cli.IsCommandExit(runErr) {
-			execErr = wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
-			return execErr
-		}
-		var cliErr *cli.CLIError
-		errors.As(runErr, &cliErr)
-		exitCode = cliErr.ExitCode
-		// App stderr alone must not decide infrastructure state. Only
-		// ambiguous failures pay for a verification inspect; clear app
-		// results return immediately with no extra CLI call.
-		if !isNotFoundFor(c.eng, runErr) && !maybeInfraExecErr(runErr) {
-			return nil
-		}
-		if c.execContainerRunningTarget(verifyCtx, target) {
-			return nil
-		}
-		execErr = wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
-		return execErr
-	})
+
+	// The name lock covers the generation check and name resolution only.
+	// Holding it for the command would block every other name-addressed
+	// operation (Stop, Terminate, Logs, the reaper) for as long as the app
+	// runs, and Exec has no default deadline to bound that.
+	target, _, release, err := c.acquireVerifiedOperationTarget(verifyCtx, true)
 	if err != nil {
-		if execErr != nil {
-			return exitCode, output, execErr
-		}
-		return 0, output, err
+		return 0, nil, err
 	}
-	return exitCode, output, execErr
+	release()
+
+	stdout, stderr, runErr := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	if runErr == nil {
+		return 0, output, nil
+	}
+	if !cli.IsCommandExit(runErr) {
+		return 0, output, wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
+	}
+	var cliErr *cli.CLIError
+	errors.As(runErr, &cliErr)
+	exitCode := cliErr.ExitCode
+	// App stderr alone must not decide infrastructure state. Only
+	// ambiguous failures pay for a verification inspect; clear app
+	// results return immediately with no extra CLI call.
+	if !isNotFoundFor(c.eng, runErr) && !maybeInfraExecErr(runErr) {
+		return exitCode, output, nil
+	}
+	// Bound the re-check from the caller's context: verifyCtx is already
+	// spent once a long-running command returns.
+	if c.execContainerRunningTarget(ctx, target) {
+		return exitCode, output, nil
+	}
+	return exitCode, output, wrapNotFoundFor(c.eng, c.classify(ctx, runErr))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

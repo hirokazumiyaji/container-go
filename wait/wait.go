@@ -224,10 +224,16 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				if terminal := terminationErr(); terminal != nil {
 					return terminal
 				}
-			} else if terminal := terminationErr(); terminal != nil {
-				return terminal
-			} else if !running {
-				return waitStoppedError(what, joinNonNil(lastErr, lastProbeErr))
+			} else {
+				// A later successful probe supersedes an earlier failure, so
+				// a transient probe error is not reported forever.
+				lastProbeErr = nil
+				if terminal := terminationErr(); terminal != nil {
+					return terminal
+				}
+				if !running {
+					return waitStoppedError(what, joinNonNil(lastErr, lastProbeErr))
+				}
 			}
 		}
 

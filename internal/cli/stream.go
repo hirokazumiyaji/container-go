@@ -184,14 +184,17 @@ func (s *processStream) TerminalError() error {
 	if closed {
 		return nil
 	}
+	// A child that finished on its own reports its own outcome. A context
+	// error observed afterwards must not rewrite a clean exit into a
+	// cancellation, or a wait that actually succeeded reads as failed.
+	if waitErr == nil {
+		return nil
+	}
 	if ctxErr := s.ctx.Err(); ctxErr != nil || cancelled {
 		if ctxErr == nil {
 			ctxErr = context.Canceled
 		}
 		return fmt.Errorf("%s %s: %w", s.binary, strings.Join(s.args, " "), ctxErr)
-	}
-	if waitErr == nil {
-		return nil
 	}
 	var exitErr *exec.ExitError
 	if errors.As(waitErr, &exitErr) {

@@ -44,7 +44,7 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		err := strategy.WaitUntilReady(waitCtx, target)
 		if err != nil {
 			if terminal := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i)); terminal != nil {
-				return withWaitCause(terminal, err, fmt.Sprintf("wait for all: %v (strategy %d: %v)", terminal, i, err))
+				return withWaitCause(terminal, err, fmt.Sprintf("%v (strategy %d: %v)", terminal, i, err))
 			}
 			return err
 		}
@@ -198,7 +198,16 @@ func anyTerminalError(terminal error, errs []error) error {
 	causes := make([]error, 0, len(errs)+2)
 	causes = append(causes, primary, terminal)
 	causes = append(causes, errs...)
-	return newWaitError(fmt.Sprintf("%v", terminal), causes...)
+	// The message must name the strategies that failed. waitError.Error
+	// renders only this text, so the causes below would otherwise be
+	// reachable through errors.Is alone and invisible in a log.
+	message := terminal.Error()
+	for _, err := range errs {
+		if err != nil {
+			message += "; " + err.Error()
+		}
+	}
+	return newWaitError(message, causes...)
 }
 
 func anyContextError(callerCtx, waitCtx context.Context, startupTimeout time.Duration) error {

@@ -70,3 +70,8 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: make integration-docker
+        env:
+          # A missing or broken Docker backend must fail this required job
+          # rather than skip every test and report success.
+          REQUIRE_BACKEND: '1'
+          CONTAINERGO_BACKEND: docker

@@ -9,6 +9,16 @@ on:
 # No job here needs write access: they only check out, build, and test.
 # Declaring it explicitly means the workflow does not inherit whatever
 # default the repository happens to have.
+#
+# On the trust boundary for fork pull requests: every job here checks out
+# the PR's code and runs `go test` against it, on a runner image that also
+# has a Docker daemon. Fencing the Docker integration off a fork therefore
+# limits how hard the daemon is driven, not whether untrusted code can
+# reach it at all. The real boundaries are the ephemeral runner, the
+# read-only token, and persist-credentials: false — the token is not in
+# .git/config for the code under test to read. Isolating untrusted code
+# from a daemon needs a separate runner or workflow; that is not something
+# this file can express.
 permissions:
   contents: read
 
@@ -84,7 +94,28 @@ jobs:
           go-version-file: go.mod
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
+      #
+      # bench/ is a separate module, so the root ./... does not reach it.
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - run: cd bench && go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+
+  # bench/ is a separate module, so no job above reaches it: they all run
+  # ./... from the root. Without this a Dependabot bump of bench/go.mod would
+  # merge with no signal that the module still builds.
+  bench-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+        working-directory: bench
+      - run: go test ./...
+        working-directory: bench
 
   # actionlint validates workflow syntax, expressions, and runner labels. It
   # does not check action pinning or job timeouts; internal/workflowcheck
@@ -100,17 +131,22 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
+      # No path argument: actionlint discovers .github/workflows itself, so a
+      # workflow added with the .yaml extension is covered too. A shell glob
+      # over *.yml would silently skip it.
       - name: Lint workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/*.yml
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
 
-  # Docker is preinstalled on ubuntu-latest. The daemon and network are
-  # available to any pull request, so the job is skipped for forks: it would
-  # otherwise run untrusted PR code against a Docker daemon.
+  # Docker is preinstalled on ubuntu-latest, and this job hands the daemon to
+  # the checked-out code. The trusted triggers are enumerated rather than
+  # negated: under pull_request_target or workflow_run a fork's code is still
+  # untrusted while the base-branch token is available, so a
+  # "not pull_request" test would pass them straight through.
   integration-docker:
-    # `pull_request` from a fork runs with a read-only token and no
-    # repository secrets, but the runner still has a Docker daemon. Only a
-    # same-repository branch is trusted enough to hand the daemon to.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    if: >-
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:

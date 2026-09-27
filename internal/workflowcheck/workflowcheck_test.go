@@ -87,35 +87,60 @@ func TestCheckoutDoesNotPersistCredentials(t *testing.T) {
 	}
 }
 
-// A job that gives a Docker daemon to the workflow must not run on a fork
-// pull request, where the code under test is untrusted.
+// dockerUsage matches a step that would actually drive a container backend,
+// not merely a job that mentions one. Matching a single literal like
+// "integration-docker" would let a new `make integration` job bypass the
+// policy silently, while matching any occurrence of "docker" would flag a
+// comment or a `go run` of a linting tool.
+//
+// The patterns are deliberately anchored on the shell command that runs.
+var dockerUsage = regexp.MustCompile(`(?im)^\s*(?:-\s*)?(?:run|working-directory).*\bmake\s+(?:bench-)?integration\b|^\s*-\s*run:\s*(?:docker|container)\s`)
+
+// forkGuard is the trusted-trigger test every Docker-touching job must carry.
+const forkGuard = "github.event.pull_request.head.repo.full_name == github.repository"
+
+// A job that hands a container backend to the checked-out code must not run on
+// a fork pull request, where that code is untrusted.
 func TestUntrustedDockerJobsAreGuarded(t *testing.T) {
 	for _, path := range workflowFiles(t) {
 		lines := readLines(t, path)
 		for _, job := range jobs(lines) {
 			body := jobBody(lines, job)
-			if !strings.Contains(body, "integration-docker") {
+			if !dockerUsage.MatchString(body) {
 				continue
 			}
-			guard := "github.event.pull_request.head.repo.full_name == github.repository"
-			if !strings.Contains(body, guard) {
-				t.Errorf("%s: job %q runs the Docker integration with no fork guard; add 'if: ... %s'",
-					path, job, guard)
+			if strings.Contains(body, forkGuard) {
+				continue
 			}
+			t.Errorf("%s: job %q drives a container backend with no fork guard; "+
+				"add an 'if:' that trusts only push, workflow_dispatch, and a same-repo PR (%s)",
+				path, job, forkGuard)
 		}
 	}
 }
 
 func workflowFiles(t *testing.T) []string {
 	t.Helper()
-	matches, err := filepath.Glob(filepath.Join(workflowDir, "*.yml"))
-	if err != nil {
-		t.Fatal(err)
+	// Both extensions: GitHub accepts .yml and .yaml, and a workflow added
+	// with the latter must not escape every rule below.
+	seen := map[string]bool{}
+	var out []string
+	for _, ext := range []string{"*.yml", "*.yaml"} {
+		matches, err := filepath.Glob(filepath.Join(workflowDir, ext))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, m := range matches {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
 	}
-	if len(matches) == 0 {
+	if len(out) == 0 {
 		t.Fatalf("no workflow files found under %s", workflowDir)
 	}
-	return matches
+	return out
 }
 
 func readLines(t *testing.T, path string) []string {

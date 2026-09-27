@@ -44,27 +44,29 @@ func read(t *testing.T, rel string) string {
 //
 // Unexported because it takes a *testing.T, so it is only callable from a test
 // and an exported name would promise a use that cannot exist.
-func latestRelease(t *testing.T) (version, date string) {
+func latestRelease(t *testing.T) string {
 	t.Helper()
 	m := changelogRelease.FindAllStringSubmatch(read(t, "CHANGELOG.md"), -1)
 	if len(m) == 0 {
 		t.Fatal("CHANGELOG.md has no released version section")
 	}
-	// The file is newest-first, but do not rely on that ordering silently.
+	// The file is newest-first, but comparing rather than taking the first
+	// section means a backport patch placed above a newer minor does not
+	// become "latest". The workflow's tag check must agree with this.
 	best := m[0]
 	for _, cand := range m {
 		if compareVersions(cand[1], best[1]) > 0 {
 			best = cand
 		}
 	}
-	return best[1], best[2]
+	return best[1]
 }
 
 // Every documented install instruction must name the latest release. A README
 // that still points at an older version sends `go get` users to old code that
 // predates every fix since.
 func TestReadmeInstallVersionMatchesLatestRelease(t *testing.T) {
-	latest, _ := latestRelease(t)
+	latest := latestRelease(t)
 	for _, readme := range []string{"README.md", "README.ja.md"} {
 		matches := installLine.FindAllStringSubmatch(read(t, readme), -1)
 		if len(matches) == 0 {
@@ -85,7 +87,7 @@ func TestReadmeInstallVersionMatchesLatestRelease(t *testing.T) {
 // more than one series at a time is a policy choice, not a version-consistency
 // invariant.
 func TestSecuritySupportMatrixCoversLatestRelease(t *testing.T) {
-	latest, _ := latestRelease(t)
+	latest := latestRelease(t)
 	parts := strings.Split(latest, ".")
 	if len(parts) < 2 {
 		t.Fatalf("latest release %q is not major.minor.patch", latest)

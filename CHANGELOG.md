@@ -36,11 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Cleanup failures are no longer discarded. A failed-create, reuse
   inspect/copy rollback, or public `Cleanup` that could not remove the
-  container now returns the cleanup failure alongside the operation error
-  through the exported `CleanupError`, so `errors.Is` and `errors.As` can
-  separate them. An already-absent container and a name conflict remain
-  idempotent successes, and a successful inspect that lists no container is
-  treated as proof of absence rather than reported as a leak (#86).
+  container now joins the cleanup failure onto the operation error, so
+  `errors.Is` still matches the operation error and `errors.As` reaches the
+  new exported `CleanupError` to learn that a container was left behind. An
+  already-absent container and a name conflict remain idempotent successes,
+  and a successful inspect that lists no container is treated as proof of
+  absence rather than reported as a leak (#86).
 - `DOCKER_HOST` transports other than `tcp://` are recognized. A
   `ssh://` daemon was reported local, so the loopback-publish guard never
   fired and the caller received an unreachable published port. The

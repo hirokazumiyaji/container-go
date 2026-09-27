@@ -7,6 +7,8 @@ on:
   workflow_dispatch:
 
 # No job here needs write access: they only check out, build, and test.
+# Declaring it explicitly means the workflow does not inherit whatever
+# default the repository happens to have.
 permissions:
   contents: read
 
@@ -29,8 +31,12 @@ jobs:
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The token is only needed to clone. Leaving it in .git/config
+          # makes it readable by any later step, including code under test.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test ./...
@@ -43,8 +49,10 @@ jobs:
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test -race ./...
@@ -54,11 +62,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.0
 
@@ -66,25 +76,52 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      # Pinned rather than @latest, so the same commit always scans the same
+      # tool version. Bump the pin deliberately.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
 
-  # Docker is preinstalled on ubuntu-latest; Apple Container stays local-only.
-  integration-docker:
+  # actionlint validates workflow syntax, expressions, and runner labels. It
+  # does not check action pinning or job timeouts; internal/workflowcheck
+  # guards those, and runs as part of `go test ./...` so it is checked locally
+  # too.
+  workflow-lint:
     runs-on: ubuntu-latest
-    # go test's own -timeout is per test binary and does not cover a helper
-    # process that outlives it, so cap the job as well.
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes= .github/workflows/*.yml
+
+  # Docker is preinstalled on ubuntu-latest. The daemon and network are
+  # available to any pull request, so the job is skipped for forks: it would
+  # otherwise run untrusted PR code against a Docker daemon.
+  integration-docker:
+    # `pull_request` from a fork runs with a read-only token and no
+    # repository secrets, but the runner still has a Docker daemon. Only a
+    # same-repository branch is trusted enough to hand the daemon to.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: make integration-docker

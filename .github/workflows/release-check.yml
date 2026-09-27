@@ -20,7 +20,12 @@ on:
       # it must trigger this workflow. Without it a dropped `go vet` or a
       # weakened `go mod verify` would never be checked.
       - 'Makefile'
-      - '.github/workflows/release-check.yml'
+      # The gate lints with .golangci.yml, and its actionlint step validates
+      # every workflow in the directory, not just this one. Both are inputs, so
+      # a PR touching either must run the gate: a weakened linter config would
+      # otherwise pass ci.yml's lint, and a broken ci.yml would not run at all.
+      - '.golangci.yml'
+      - '.github/workflows/**'
       - 'internal/releasecheck/**'
   workflow_dispatch:
 

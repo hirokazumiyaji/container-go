@@ -1,4 +1,4 @@
-.PHONY: test vet lint integration integration-docker bench-integration release-check
+.PHONY: test vet lint integration integration-docker bench-integration release-check release-check-bench
 
 test:
 	go test ./...
@@ -59,9 +59,6 @@ bench-integration:
 # go.sum that tidy creates from nothing, because `git diff` ignores untracked
 # files, and a failing run would leave a rewritten, unreviewed go.mod in the
 # tree.
-#
-# bench/ is a separate module, so a root-level ./... never reaches it. It gets
-# its own full pass, including the tidy check.
 GOVULNCHECK_VERSION := v1.1.4
 ACTIONLINT_VERSION := v1.7.12
 
@@ -69,13 +66,29 @@ release-check:
 	@command -v golangci-lint >/dev/null || { \
 		echo 'error: golangci-lint not found; run "mise install" (see AGENTS.md)' >&2; exit 1; }
 	go build ./...
-	go vet ./...
+	# Also type-checks the `integration`-tagged files, which no untagged build
+	# compiles. ci.yml's integration-docker job covers this on a PR, but that
+	# job does not run on a tag push, so the tag gate would not.
+	go vet -tags integration ./...
 	$(MAKE) lint
 	go test -count=1 -race ./...
 	go mod verify
 	go mod tidy -diff
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
-	cd bench && go build ./... && go vet ./... && go test -count=1 -race ./... \
-		&& go mod verify && go mod tidy -diff
+	$(MAKE) release-check-bench
 	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
+
+# bench/ is a separate module, so a root-level ./... reaches none of it: not
+# the build, and not golangci-lint or govulncheck either. Verified by planting a
+# violation in bench and watching a root `golangci-lint run ./...` report
+# "0 issues". So every check the root gets, bench gets again, from inside bench.
+release-check-bench:
+	cd bench && go build ./... \
+		&& go vet ./... \
+		&& go vet -tags integration ./... \
+		&& golangci-lint run ./... \
+		&& go test -count=1 -race ./... \
+		&& go mod verify \
+		&& go mod tidy -diff \
+		&& go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 

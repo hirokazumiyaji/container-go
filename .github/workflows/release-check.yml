@@ -14,8 +14,11 @@ on:
       - 'SECURITY.md'
       - 'go.mod'
       - 'go.sum'
-      - 'bench/go.mod'
-      - 'bench/go.sum'
+      # bench/ is a separate module and no job in ci.yml reaches it, so without
+      # this a PR touching only bench sources would run no bench check at all:
+      # the tag push would be the first time release-check-bench saw the code,
+      # which is what this workflow exists to prevent.
+      - 'bench/**'
       # The Makefile defines the gate this workflow runs, so a PR that weakens
       # it must trigger this workflow. Without it a dropped `go vet` or a
       # weakened `go mod verify` would never be checked.
@@ -65,7 +68,13 @@ jobs:
           # newer minor does not become "latest". This must agree with
           # internal/releasecheck.LatestRelease, which compares numerically
           # rather than trusting file order.
-          latest=$(grep -Eo '^## \[[0-9]+\.[0-9]+\.[0-9]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md \
+          #
+          # The `|| true` is load-bearing: a `run:` step defaults to
+          # `bash -eo pipefail`, so a grep that finds nothing would fail the
+          # assignment, errexit would end the step, and the diagnostic below
+          # would never print. Verified by stripping the date from a release
+          # heading and getting a bare exit 1 with no message.
+          latest=$( { grep -Eo '^## \[[0-9]+\.[0-9]+\.[0-9]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md || true; } \
                    | sed -E 's/^## \[([0-9.]+)\].*/\1/' | sort -V | tail -1)
           if [ -z "$latest" ]; then
             echo "::error::no dated release section found in CHANGELOG.md"

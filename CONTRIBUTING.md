@@ -42,16 +42,26 @@ To cut a release:
 1. Move the accumulated `## [Unreleased]` entries under a new
    `## [X.Y.Z] - YYYY-MM-DD` heading, adding an `### Fixed` section if the
    release has fixes. Keep a fresh empty `## [Unreleased]` above it.
-2. Update the `go get` install line in `README.md` and `README.ja.md` to
-   `@vX.Y.Z`, and the `SECURITY.md` support matrix to cover `X.Y.x`.
-3. Run `make release-check` from a clean checkout. It builds, vets, tests,
-   runs `go mod verify`, checks that `go mod tidy` is a no-op, and repeats
-   build/vet/test/verify for the separate `bench` module.
+2. Update every version reference to `@vX.Y.Z` in `README.md` and
+   `README.ja.md` — both the `go get` install instruction and the shorthand in
+   the pinning prose — and the `SECURITY.md` support matrix to cover `X.Y.x`.
+   `internal/releasecheck` names each one it checks if you miss any.
+3. Run `make release-check` from a clean checkout: build, vet, `golangci-lint`,
+   `go test -race`, `go mod verify`, a `go mod tidy -diff` no-op check,
+   `govulncheck`, and `actionlint`, then the same for the separate `bench`
+   module. It is the same gate the tag push runs, so a green local run means
+   the tag will pass. It needs `golangci-lint` on `PATH` (`mise install`).
 4. Tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-   The `release-check` workflow re-runs the gate and fails if the tag does not
-   match the newest `CHANGELOG` release.
+   The `release-check` workflow re-runs the gate and fails if the tag is not
+   the highest version in the `CHANGELOG`.
 
 The tag is what downstream pins, so it is annotated rather than lightweight.
+
+"Latest" means the highest version, not the topmost section. A backport patch
+belongs at the top of the `CHANGELOG`, but the tag check will not accept it
+while a higher version exists — so a patch for an older series cannot be
+released once a newer one is out. Given `SECURITY.md` supports a single series,
+that is the intended behavior; cut the newer release first if both are needed.
 
 ## Project layout
 

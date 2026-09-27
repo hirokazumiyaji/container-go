@@ -1,9 +1,8 @@
 name: Release check
 
-# Verifies a tag before it is published, and again on the tag itself. The
-# point is that a tag is never the first time these run: the version
-# invariants live in `go test ./...`, so drift is caught on the change that
-# introduces it.
+# Verifies a tag before it is published. The point is that a tag is never the
+# first time these run: the version invariants live in `go test ./...`, so drift
+# is caught on the change that introduces it.
 on:
   push:
     tags: ['v*']
@@ -14,7 +13,13 @@ on:
       - 'README.ja.md'
       - 'SECURITY.md'
       - 'go.mod'
+      - 'go.sum'
       - 'bench/go.mod'
+      - 'bench/go.sum'
+      # The Makefile defines the gate this workflow runs, so a PR that weakens
+      # it must trigger this workflow. Without it a dropped `go vet` or a
+      # weakened `go mod verify` would never be checked.
+      - 'Makefile'
       - '.github/workflows/release-check.yml'
       - 'internal/releasecheck/**'
   workflow_dispatch:
@@ -29,9 +34,9 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  # The tag must name the version the docs advertise, and that version must be
-  # the newest dated CHANGELOG section. internal/releasecheck asserts the
-  # docs agree with each other; this asserts the tag agrees with them.
+  # The tag must name the version the docs advertise. internal/releasecheck
+  # asserts the docs agree with each other; this asserts the tag agrees with
+  # them. It reads only the working tree, so no git history is needed.
   version:
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -39,9 +44,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
-          # The tag is not fetched by default, and the check needs the history
-          # to resolve which release is newest.
-          fetch-depth: 0
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
@@ -53,8 +55,13 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
           tagged="${GITHUB_REF_NAME#v}"
+          # `sort -V | tail -1` takes the highest version rather than the first
+          # section, so a backport patch release legitimately placed above a
+          # newer minor does not become "latest". This must agree with
+          # internal/releasecheck.LatestRelease, which compares numerically
+          # rather than trusting file order.
           latest=$(grep -Eo '^## \[[0-9]+\.[0-9]+\.[0-9]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md \
-                   | head -1 | sed -E 's/^## \[([0-9.]+)\].*/\1/')
+                   | sed -E 's/^## \[([0-9.]+)\].*/\1/' | sort -V | tail -1)
           if [ -z "$latest" ]; then
             echo "::error::no dated release section found in CHANGELOG.md"
             exit 1
@@ -65,16 +72,18 @@ jobs:
           fi
           echo "tag $GITHUB_REF_NAME matches CHANGELOG $latest"
 
-      # A dry run of the full gate, so a maintainer can require all of it to
-      # pass from a clean checkout before tagging.
-      - name: Dry-run the release gate
-        run: make release-check
-
-  # Everything that must hold for a tag to be worth publishing. The root and
-  # bench are separate modules, so each is verified on its own.
+  # Everything that must hold for a tag to be worth publishing.
+  #
+  # This calls `make release-check` rather than listing the steps again, so the
+  # gate a maintainer runs locally before tagging is the gate that runs here.
+  # The linter is installed without being run, because the target invokes it.
+  #
+  # The timeout is generous on purpose: this job is a superset of ci.yml's race
+  # and lint jobs, and additionally compiles govulncheck and actionlint from
+  # source and walks the separate bench module.
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -82,44 +91,9 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test -race ./...
-      - run: go mod verify
-      - run: go mod tidy && git diff --exit-code -- go.mod go.sum
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
-
-      - name: Verify the bench module
-        working-directory: bench
-        run: |
-          go build ./...
-          go vet ./...
-          go test ./...
-          go mod verify
-
-  lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version: stable
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.0
-
-  workflow-lint:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
-        with:
-          go-version-file: go.mod
-      - name: Lint workflows
-        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
+          # The target runs the linter, so only the binary is needed here.
+          install-only: true
+      - run: make release-check

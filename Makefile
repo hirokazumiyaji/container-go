@@ -48,18 +48,34 @@ bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...
 
-# Everything a tag must satisfy, runnable from a clean checkout before
-# tagging. Mirrors the release-check workflow so the gate is not something
-# only CI can run.
+# Everything a tag must satisfy, runnable from a clean checkout before tagging.
 #
-# `go mod tidy` is checked rather than applied: a tidy that changes go.mod
-# means the committed files were not tidy, which should fail the gate instead
-# of silently rewriting them.
+# This target is the gate, and the release-check workflow calls it rather than
+# restating the steps. Two parallel lists of checks drift, and the weaker one is
+# the one a maintainer runs locally before tagging.
+#
+# `go mod tidy -diff` reports what tidy would change and exits non-zero without
+# writing anything. Applying tidy and diffing afterwards would also miss a
+# go.sum that tidy creates from nothing, because `git diff` ignores untracked
+# files, and a failing run would leave a rewritten, unreviewed go.mod in the
+# tree.
+#
+# bench/ is a separate module, so a root-level ./... never reaches it. It gets
+# its own full pass, including the tidy check.
+GOVULNCHECK_VERSION := v1.1.4
+ACTIONLINT_VERSION := v1.7.12
+
 release-check:
+	@command -v golangci-lint >/dev/null || { \
+		echo 'error: golangci-lint not found; run "mise install" (see AGENTS.md)' >&2; exit 1; }
 	go build ./...
 	go vet ./...
-	go test -count=1 ./...
+	$(MAKE) lint
+	go test -count=1 -race ./...
 	go mod verify
-	go mod tidy && git diff --exit-code -- go.mod go.sum
-	cd bench && go build ./... && go vet ./... && go test -count=1 ./... && go mod verify
+	go mod tidy -diff
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	cd bench && go build ./... && go vet ./... && go test -count=1 -race ./... \
+		&& go mod verify && go mod tidy -diff
+	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
 

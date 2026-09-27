@@ -21,8 +21,11 @@ const repoRoot = "../.."
 // mistaken for a release.
 var changelogRelease = regexp.MustCompile(`(?m)^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$`)
 
-// installLine matches the `go get` install instruction in a README.
-var installLine = regexp.MustCompile(`go get github\.com/hirokazumiyaji/container-go@(\S+)`)
+// installLine matches every version-bearing `go get` reference in a README.
+// Both forms exist: the full install instruction, and the shorthand used in
+// the pinning prose ("go get ...@v0.2.0"). Matching only the first would let
+// the pinning advice drift while the check still passed.
+var installLine = regexp.MustCompile(`go get (?:github\.com/hirokazumiyaji/container-go|\.\.\.)@(\S+)`)
 
 // supportRow matches a SECURITY.md support-matrix row for a minor series.
 var supportRow = regexp.MustCompile(`(?m)^\|\s*(\d+\.\d+)\.x\s*\|\s*(\w+)\s*\|$`)
@@ -66,7 +69,7 @@ func TestReadmeInstallVersionMatchesLatestRelease(t *testing.T) {
 			continue
 		}
 		for _, m := range matches {
-			got := strings.TrimSuffix(m[1], "`")
+			got := trimVersion(m[1])
 			if got != "v"+latest {
 				t.Errorf("%s: install line pins %s, want v%s (latest CHANGELOG release)", readme, got, latest)
 			}
@@ -132,6 +135,12 @@ func TestChangelogReleaseDatesAreValid(t *testing.T) {
 			t.Errorf("CHANGELOG.md: release heading %q is missing a YYYY-MM-DD date", line)
 		}
 	}
+}
+
+// trimVersion strips the punctuation that follows a version inside prose, such
+// as the closing backtick of `go get ...@v0.2.0` or a sentence-ending period.
+func trimVersion(s string) string {
+	return strings.Trim(s, "`\"'()[]{}.,;:。、」』")
 }
 
 func timeParse(date string) (string, error) {

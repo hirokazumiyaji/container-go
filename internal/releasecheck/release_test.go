@@ -5,13 +5,13 @@
 package releasecheck
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const repoRoot = "../.."
@@ -39,9 +39,12 @@ func read(t *testing.T, rel string) string {
 	return string(data)
 }
 
-// LatestRelease is the newest version with a dated CHANGELOG section. It is
+// latestRelease is the highest version with a dated CHANGELOG section. It is
 // the reference every other version reference must agree with.
-func LatestRelease(t *testing.T) (version, date string) {
+//
+// Unexported because it takes a *testing.T, so it is only callable from a test
+// and an exported name would promise a use that cannot exist.
+func latestRelease(t *testing.T) (version, date string) {
 	t.Helper()
 	m := changelogRelease.FindAllStringSubmatch(read(t, "CHANGELOG.md"), -1)
 	if len(m) == 0 {
@@ -61,7 +64,7 @@ func LatestRelease(t *testing.T) (version, date string) {
 // that still points at an older version sends `go get` users to old code that
 // predates every fix since.
 func TestReadmeInstallVersionMatchesLatestRelease(t *testing.T) {
-	latest, _ := LatestRelease(t)
+	latest, _ := latestRelease(t)
 	for _, readme := range []string{"README.md", "README.ja.md"} {
 		matches := installLine.FindAllStringSubmatch(read(t, readme), -1)
 		if len(matches) == 0 {
@@ -78,9 +81,11 @@ func TestReadmeInstallVersionMatchesLatestRelease(t *testing.T) {
 }
 
 // SECURITY.md must claim support for the minor series that is actually
-// released, and must not claim support for one that is not.
+// released. This says nothing about the other rows: whether a project supports
+// more than one series at a time is a policy choice, not a version-consistency
+// invariant.
 func TestSecuritySupportMatrixCoversLatestRelease(t *testing.T) {
-	latest, _ := LatestRelease(t)
+	latest, _ := latestRelease(t)
 	parts := strings.Split(latest, ".")
 	if len(parts) < 2 {
 		t.Fatalf("latest release %q is not major.minor.patch", latest)
@@ -116,12 +121,13 @@ func TestChangelogHasUnreleasedSection(t *testing.T) {
 	}
 }
 
-// Release sections must be dated, and dates must be real. A placeholder or a
-// malformed date ships in the published changelog.
+// Release sections must be dated, and dates must be real calendar dates. The
+// heading regex only guarantees the shape, so `## [0.2.0] - 2026-13-45` matches
+// it; checking the shape again would be vacuous, so the date is parsed.
 func TestChangelogReleaseDatesAreValid(t *testing.T) {
 	for _, m := range changelogRelease.FindAllStringSubmatch(read(t, "CHANGELOG.md"), -1) {
 		version, date := m[1], m[2]
-		if _, err := timeParse(date); err != nil {
+		if _, err := time.Parse(time.DateOnly, date); err != nil {
 			t.Errorf("CHANGELOG.md: release %s has an invalid date %q: %v", version, date, err)
 		}
 	}
@@ -141,20 +147,6 @@ func TestChangelogReleaseDatesAreValid(t *testing.T) {
 // as the closing backtick of `go get ...@v0.2.0` or a sentence-ending period.
 func trimVersion(s string) string {
 	return strings.Trim(s, "`\"'()[]{}.,;:。、」』")
-}
-
-func timeParse(date string) (string, error) {
-	parts := strings.Split(date, "-")
-	if len(parts) != 3 {
-		return "", fmt.Errorf("expected YYYY-MM-DD")
-	}
-	for i, p := range parts {
-		if _, err := strconv.Atoi(p); err != nil {
-			return "", fmt.Errorf("non-numeric component %q", p)
-		}
-		_ = i
-	}
-	return date, nil
 }
 
 // compareVersions orders dotted numeric versions. It returns >0 when a is

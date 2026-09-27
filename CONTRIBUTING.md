@@ -29,6 +29,30 @@ pull other Hub images locally.
 - Link related issues when applicable.
 - Keep changes focused; match existing naming and formatting (`gofmt`).
 
+## Releasing
+
+The version is not stored anywhere authoritative. It is derived from the newest
+dated `CHANGELOG` release, and every other place that names a version must
+agree with it. `internal/releasecheck` asserts that, and it runs as part of
+`go test ./...`, so drift is caught on the change that introduces it rather
+than at tag time.
+
+To cut a release:
+
+1. Move the accumulated `## [Unreleased]` entries under a new
+   `## [X.Y.Z] - YYYY-MM-DD` heading, adding an `### Fixed` section if the
+   release has fixes. Keep a fresh empty `## [Unreleased]` above it.
+2. Update the `go get` install line in `README.md` and `README.ja.md` to
+   `@vX.Y.Z`, and the `SECURITY.md` support matrix to cover `X.Y.x`.
+3. Run `make release-check` from a clean checkout. It builds, vets, tests,
+   runs `go mod verify`, checks that `go mod tidy` is a no-op, and repeats
+   build/vet/test/verify for the separate `bench` module.
+4. Tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
+   The `release-check` workflow re-runs the gate and fails if the tag does not
+   match the newest `CHANGELOG` release.
+
+The tag is what downstream pins, so it is annotated rather than lightweight.
+
 ## Project layout
 
 - Root package: public container API and backend abstraction.

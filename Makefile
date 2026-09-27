@@ -1,4 +1,4 @@
-.PHONY: test vet lint integration integration-docker bench-integration
+.PHONY: test vet lint integration integration-docker bench-integration release-check
 
 test:
 	go test ./...
@@ -47,3 +47,19 @@ integration-docker:
 bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...
+
+# Everything a tag must satisfy, runnable from a clean checkout before
+# tagging. Mirrors the release-check workflow so the gate is not something
+# only CI can run.
+#
+# `go mod tidy` is checked rather than applied: a tidy that changes go.mod
+# means the committed files were not tidy, which should fail the gate instead
+# of silently rewriting them.
+release-check:
+	go build ./...
+	go vet ./...
+	go test -count=1 ./...
+	go mod verify
+	go mod tidy && git diff --exit-code -- go.mod go.sum
+	cd bench && go build ./... && go vet ./... && go test -count=1 ./... && go mod verify
+

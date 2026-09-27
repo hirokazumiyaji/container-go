@@ -30,6 +30,36 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Windows and macOS are the platforms the README claims support for, so
+  # they need a build and unit-test guarantee rather than a claim. Only
+  # ubuntu-latest running before meant a Windows path, ACL, or reaper
+  # regression could not be caught at all, and macOS Apple Container
+  # protocol changes went unnoticed.
+  #
+  # These are unit tests against a fake CLI runner. Neither runs a real
+  # backend: Windows has no Apple Container, and the Apple live checks
+  # need a service the hosted runner does not provide.
+  cross-platform:
+    name: ${{ matrix.os }} unit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+        go-version: ['1.23.0', 'stable']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: ${{ matrix.go-version }}
+      # The integration suites are excluded: they need a real backend,
+      # which neither of these runners provides for both backends.
+      - run: go build ./...
+      - run: go test ./...
+
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
   # run locally via `make integration`.

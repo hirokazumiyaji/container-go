@@ -52,6 +52,11 @@ To cut a release:
    `actionlint`, then the same for the separate `bench` module. This is the same
    gate the tag push runs, so a green local run means the code half will pass.
    It needs `golangci-lint` on `PATH` (`mise install`).
+
+   This covers everything checkable without a container backend. The
+   `integration`-tagged suites are not part of it — run `make integration` and
+   `make bench-integration` locally before tagging if you touched backend
+   behavior. Their compilation *is* covered, by the tagged vet.
 4. Tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
    The `release-check` workflow then re-runs the gate and additionally fails if
    the tag is not the highest version in the `CHANGELOG`. That last comparison

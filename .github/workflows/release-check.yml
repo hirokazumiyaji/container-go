@@ -7,17 +7,25 @@ on:
   push:
     tags: ['v*']
   pull_request:
+    # This is not a filter for a faster CI. It is the list of every input the
+    # gate reads. Anything that can change a gate result belongs here, and the
+    # gate is close to a superset of ci.yml, so a PR touching Go code is a PR
+    # that needs the gate.
     paths:
       - 'CHANGELOG.md'
       - 'README.md'
       - 'README.ja.md'
       - 'SECURITY.md'
       - 'go.mod'
-      - 'go.sum'
+      - 'bench/go.mod'
+      - 'bench/go.sum'
+      # `go mod tidy -diff` reads the root import graph, so a PR that drops a
+      # dependency's last use and forgets to re-tidy touches only .go files and
+      # still leaves go.mod wrong. Listing go.mod alone would not catch it.
+      - '**/*.go'
       # bench/ is a separate module and no job in ci.yml reaches it, so without
       # this a PR touching only bench sources would run no bench check at all:
-      # the tag push would be the first time release-check-bench saw the code,
-      # which is what this workflow exists to prevent.
+      # the tag push would be the first time release-check-bench saw the code.
       - 'bench/**'
       # The Makefile defines the gate this workflow runs, so a PR that weakens
       # it must trigger this workflow. Without it a dropped `go vet` or a
@@ -104,7 +112,14 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          # Not `go-version-file: go.mod`. The root module says 1.23.0 but
+          # bench/go.mod says 1.25.0, and this gate builds bench. setup-go with
+          # go-version-file installs exactly the root directive, after which
+          # `cd bench && go build` fails with "go.mod requires go >= 1.25.0";
+          # where the toolchain is allowed to switch, it switches silently
+          # instead. Both were reproduced. `stable` satisfies both modules, and
+          # matches ci.yml's lint job.
+          go-version: stable
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.0

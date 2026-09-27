@@ -48,11 +48,19 @@ bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...
 
-# Everything a tag must satisfy, runnable from a clean checkout before tagging.
+# Everything a tag must satisfy that can be checked without a container
+# backend, runnable from a clean checkout before tagging.
 #
 # This target is the gate, and the release-check workflow calls it rather than
 # restating the steps. Two parallel lists of checks drift, and the weaker one is
 # the one a maintainer runs locally before tagging.
+#
+# The `integration`-tagged suites are deliberately absent: they need a real
+# backend, which a hosted runner does not have for either backend, and they run
+# locally via `make integration` / `make bench-integration`. They are not
+# ignored, though — `go vet -tags integration` type-checks them below, so a
+# rename that breaks their compilation fails the gate even though they are not
+# executed.
 #
 # `go mod tidy -diff` reports what tidy would change and exits non-zero without
 # writing anything. Applying tidy and diffing afterwards would also miss a
@@ -82,6 +90,11 @@ release-check:
 # the build, and not golangci-lint or govulncheck either. Verified by planting a
 # violation in bench and watching a root `golangci-lint run ./...` report
 # "0 issues". So every check the root gets, bench gets again, from inside bench.
+#
+# The untagged `go test` is not at parity with the root's, and is not meant to
+# be: both real bench tests are `//go:build integration` and need a backend, so
+# untagged this module runs exactly one test, a fixture-schema check. The tagged
+# vet above is what keeps the other two from bit-rotting uncompiled.
 release-check-bench:
 	cd bench && go build ./... \
 		&& go vet ./... \

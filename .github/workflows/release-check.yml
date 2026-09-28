@@ -112,14 +112,13 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # Not `go-version-file: go.mod`. The root module says 1.23.0 but
-          # bench/go.mod says 1.25.0, and this gate builds bench. setup-go with
-          # go-version-file installs exactly the root directive, after which
-          # `cd bench && go build` fails with "go.mod requires go >= 1.25.0";
-          # where the toolchain is allowed to switch, it switches silently
-          # instead. Both were reproduced. `stable` satisfies both modules, and
-          # matches ci.yml's lint job.
-          go-version: stable
+          # The toolchain of the module this gate builds, not the root one.
+          # The root go.mod says 1.23.0 but bench/go.mod says 1.25.0, and the
+          # gate builds bench: deriving from the root fails with "go.mod
+          # requires go >=" instead of building anything (both modes
+          # reproduced), while `stable` would float. The bench toolchain also
+          # satisfies the root module. Same choice as ci.yml's bench-build.
+          go-version-file: bench/go.mod
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.0

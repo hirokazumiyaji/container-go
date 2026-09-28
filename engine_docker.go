@@ -128,6 +128,14 @@ func dockerHostName() string {
 // through unchanged. A loopback host is still this machine, and an unparsable
 // value is treated as remote so a malformed setting fails closed rather than
 // permitting a bind the daemon would resolve in the wrong place.
+//
+// ssh:// is remote in the same sense as tcp://, not a special case. The CLI's
+// SSH session tunnels only the Docker API (`docker system dial-stdio` over
+// stdio); it does not forward published container ports, which the daemon
+// allocates on the remote host. So the connect address is the remote hostname,
+// and that hostname must be directly dialable: an ssh-config alias reachable
+// only through a ProxyJump or bastion needs a manual `ssh -L` forward, which
+// is outside what DOCKER_HOST can express.
 func isRemoteDockerHost() bool {
 	raw := normalizeDockerHost(os.Getenv("DOCKER_HOST"))
 	if raw == "" {

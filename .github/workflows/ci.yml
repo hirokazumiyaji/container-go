@@ -91,13 +91,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          # Not the root go.mod. This job scans bench/ too, whose go.mod
+          # requires a newer toolchain; a Go older than that aborts the scan
+          # instead of reporting vulnerabilities. The bench toolchain also
+          # satisfies the root module.
+          go-version-file: bench/go.mod
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
       # bench/ is a separate module, so the root ./... does not reach it.
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
-      - run: cd bench && go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        working-directory: bench
 
   # bench/ is a separate module, so no job above reaches it: they all run
   # ./... from the root. Without this a Dependabot bump of bench/go.mod would
@@ -111,7 +116,11 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          # The module this job builds, not the root one. The root go.mod
+          # declares an older toolchain than bench/go.mod, so deriving from
+          # the root fails the build with "go.mod requires go >=" instead
+          # of building anything.
+          go-version-file: bench/go.mod
       - run: go build ./...
         working-directory: bench
       - run: go test ./...
@@ -142,6 +151,11 @@ jobs:
   # negated: under pull_request_target or workflow_run a fork's code is still
   # untrusted while the base-branch token is available, so a
   # "not pull_request" test would pass them straight through.
+  #
+  # NOTE: fork PRs skip this job, and a skipped job reports no check run. Keep
+  # it out of the required-check set, or fork PRs will wait for a status that
+  # never arrives and can never merge. The branch is currently unprotected, so
+  # this is a constraint on future protection settings, not a live problem.
   integration-docker:
     if: >-
       github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||

@@ -24,6 +24,16 @@ var (
 	// localAction is a reference to a path inside this repository, which has
 	// no upstream commit to pin.
 	localAction = regexp.MustCompile(`^\./`)
+	// makeIntegration matches the make targets that drive a container backend.
+	makeIntegration = regexp.MustCompile(`\bmake\s+(?:bench-)?integration\b`)
+	// dockerOrContainerCmd matches a direct docker/container CLI invocation.
+	dockerOrContainerCmd = regexp.MustCompile(`^\s*(?:docker|container)\s`)
+	// runStepKey matches a step's run: key, with or without the list dash.
+	runStepKey = regexp.MustCompile(`^(\s*)(?:-\s*)?run:\s*(.*)$`)
+	// blockScalar marks a YAML block scalar introducer for run:.
+	blockScalar = regexp.MustCompile(`^[|>][-+]?$`)
+	// jobIfKey matches a job-level if: at four-space indentation.
+	jobIfKey = regexp.MustCompile(`^    if:\s*(.*)$`)
 )
 
 // Every third-party action must be pinned to a full commit SHA. A mutable tag
@@ -52,22 +62,46 @@ func TestActionsArePinnedToCommitSHA(t *testing.T) {
 	}
 }
 
-// Every job needs an explicit timeout. Without one a hang occupies a runner
-// until the six-hour default, which is far longer than any job here should
-// take.
+// Every job needs an explicit timeout. GitHub Actions has no workflow-level
+// timeout that applies to jobs, so timeout-minutes before jobs: — including
+// in a comment — does not cover them. Without a per-job timeout a hang
+// occupies a runner until the six-hour default.
 func TestEveryJobHasTimeout(t *testing.T) {
 	for _, path := range workflowFiles(t) {
 		lines := readLines(t, path)
-		// A workflow-level default covers jobs that omit it, so a workflow
-		// carrying one is not required to repeat it per job.
-		if hasWorkflowLevelTimeout(lines) {
-			continue
-		}
 		for _, job := range jobs(lines) {
 			if !jobHasTimeout(lines, job) {
 				t.Errorf("%s: job %q has no timeout-minutes", path, job)
 			}
 		}
+	}
+}
+
+// A timeout-minutes mention before jobs: must not exempt any job.
+func TestTimeoutBeforeJobsDoesNotExemptJobs(t *testing.T) {
+	lines := []string{
+		"# timeout-minutes: 10",
+		"name: example",
+		"on: push",
+		"jobs:",
+		"  build:",
+		"    runs-on: ubuntu-latest",
+		"    steps:",
+		"      - run: echo hi",
+		"  lint:",
+		"    runs-on: ubuntu-latest",
+		"    timeout-minutes: 5",
+		"    steps:",
+		"      - run: echo hi",
+	}
+	var missing []string
+	for _, job := range jobs(lines) {
+		if !jobHasTimeout(lines, job) {
+			missing = append(missing, job)
+		}
+	}
+	if len(missing) != 1 || missing[0] != "build" {
+		t.Fatalf("jobs missing timeout = %v, want [build]", missing)
 	}
 }
 
@@ -87,17 +121,11 @@ func TestCheckoutDoesNotPersistCredentials(t *testing.T) {
 	}
 }
 
-// dockerUsage matches a step that would actually drive a container backend,
-// not merely a job that mentions one. Matching a single literal like
-// "integration-docker" would let a new `make integration` job bypass the
-// policy silently, while matching any occurrence of "docker" would flag a
-// comment or a `go run` of a linting tool.
-//
-// The patterns are deliberately anchored on the shell command that runs.
-var dockerUsage = regexp.MustCompile(`(?im)^\s*(?:-\s*)?(?:run|working-directory).*\bmake\s+(?:bench-)?integration\b|^\s*-\s*run:\s*(?:docker|container)\s`)
-
-// forkGuard is the trusted-trigger test every Docker-touching job must carry.
-const forkGuard = "github.event.pull_request.head.repo.full_name == github.repository"
+// trustedTriggerIf is the exact allowlist every Docker-touching job must use.
+// Trusted events are enumerated rather than negated: under pull_request_target
+// or workflow_run a fork's code is still untrusted, so a "not pull_request"
+// test would pass them through.
+const trustedTriggerIf = "github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)"
 
 // A job that hands a container backend to the checked-out code must not run on
 // a fork pull request, where that code is untrusted.
@@ -105,17 +133,78 @@ func TestUntrustedDockerJobsAreGuarded(t *testing.T) {
 	for _, path := range workflowFiles(t) {
 		lines := readLines(t, path)
 		for _, job := range jobs(lines) {
-			body := jobBody(lines, job)
-			if !dockerUsage.MatchString(body) {
+			body := jobBodyLines(lines, job)
+			if !jobDrivesDocker(body) {
 				continue
 			}
-			if strings.Contains(body, forkGuard) {
-				continue
+			if !hasTrustedTrigger(body) {
+				t.Errorf("%s: job %q drives a container backend without the trusted-trigger allowlist; "+
+					"add a job-level 'if:' that trusts only push, workflow_dispatch, and a same-repo PR",
+					path, job)
 			}
-			t.Errorf("%s: job %q drives a container backend with no fork guard; "+
-				"add an 'if:' that trusts only push, workflow_dispatch, and a same-repo PR (%s)",
-				path, job, forkGuard)
 		}
+	}
+}
+
+func TestHasTrustedTriggerRejectsNegatedPullRequest(t *testing.T) {
+	// The previously unsafe form admits pull_request_target / workflow_run.
+	body := []string{
+		"    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository",
+		"    runs-on: ubuntu-latest",
+		"    steps:",
+		"      - run: make integration-docker",
+	}
+	if hasTrustedTrigger(body) {
+		t.Fatal("negated pull_request condition must not pass as a trusted trigger")
+	}
+}
+
+func TestHasTrustedTriggerAcceptsAllowlist(t *testing.T) {
+	body := []string{
+		"    if: >-",
+		"      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||",
+		"      (github.event_name == 'pull_request' &&",
+		"      github.event.pull_request.head.repo.full_name == github.repository)",
+		"    runs-on: ubuntu-latest",
+		"    steps:",
+		"      - run: make integration-docker",
+	}
+	if !hasTrustedTrigger(body) {
+		t.Fatal("folded allowlist if: must be accepted")
+	}
+}
+
+func TestJobDrivesDockerDetectsMultilineRun(t *testing.T) {
+	body := []string{
+		"    steps:",
+		"      - name: Integrate",
+		"        run: |",
+		"          make integration",
+		"          echo done",
+	}
+	if !jobDrivesDocker(body) {
+		t.Fatal("block-scalar run with make integration must be classified as Docker usage")
+	}
+}
+
+func TestJobDrivesDockerDetectsInlineRun(t *testing.T) {
+	body := []string{
+		"    steps:",
+		"      - run: make bench-integration",
+	}
+	if !jobDrivesDocker(body) {
+		t.Fatal("inline make bench-integration must be classified as Docker usage")
+	}
+}
+
+func TestJobDrivesDockerIgnoresCommentOnly(t *testing.T) {
+	body := []string{
+		"    # make integration runs locally",
+		"    steps:",
+		"      - run: go test ./...",
+	}
+	if jobDrivesDocker(body) {
+		t.Fatal("comment mentioning make integration must not count as Docker usage")
 	}
 }
 
@@ -173,7 +262,11 @@ func jobs(lines []string) []string {
 }
 
 func jobBody(lines []string, job string) string {
-	var b strings.Builder
+	return strings.Join(jobBodyLines(lines, job), "\n") + "\n"
+}
+
+func jobBodyLines(lines []string, job string) []string {
+	var out []string
 	inJob := false
 	for _, line := range lines {
 		if m := jobLine.FindStringSubmatch(line); m != nil {
@@ -184,35 +277,111 @@ func jobBody(lines []string, job string) string {
 			continue
 		}
 		if inJob {
-			b.WriteString(line)
-			b.WriteByte('\n')
+			out = append(out, line)
 		}
 	}
-	return b.String()
+	return out
 }
 
 func jobHasTimeout(lines []string, job string) bool {
 	return strings.Contains(jobBody(lines, job), "timeout-minutes:")
 }
 
-func hasWorkflowLevelTimeout(lines []string) bool {
-	inJobs := false
-	for _, line := range lines {
-		if line == "jobs:" {
-			inJobs = true
+// hasTrustedTrigger reports whether the job-level if: matches the trusted
+// allowlist exactly (after collapsing whitespace). A same-repo substring
+// alone is not enough: a negated pull_request test would still pass it.
+func hasTrustedTrigger(body []string) bool {
+	cond, ok := jobIfCondition(body)
+	if !ok {
+		return false
+	}
+	return normalizeExpr(cond) == normalizeExpr(trustedTriggerIf)
+}
+
+// jobIfCondition extracts the job-level if: value, including folded/block
+// scalar continuations. Step-level if: keys are ignored (they sit under steps:).
+func jobIfCondition(body []string) (string, bool) {
+	inSteps := false
+	for i, line := range body {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "steps:" {
+			inSteps = true
 			continue
 		}
-		if !inJobs {
-			if strings.Contains(line, "timeout-minutes:") {
-				return true
+		if inSteps {
+			continue
+		}
+		m := jobIfKey.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		value := strings.TrimSpace(m[1])
+		if blockScalar.MatchString(value) {
+			var parts []string
+			baseIndent := leadingSpaces(line)
+			for _, cont := range body[i+1:] {
+				if strings.TrimSpace(cont) == "" {
+					continue
+				}
+				if leadingSpaces(cont) <= baseIndent {
+					break
+				}
+				parts = append(parts, strings.TrimSpace(cont))
+			}
+			return strings.Join(parts, " "), true
+		}
+		return value, true
+	}
+	return "", false
+}
+
+func normalizeExpr(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+// jobDrivesDocker reports whether any run: step in the job body invokes a
+// container backend. Inline and block-scalar (multiline) run values are both
+// inspected so `run: |` / `make integration` is not missed.
+func jobDrivesDocker(body []string) bool {
+	for i := 0; i < len(body); i++ {
+		m := runStepKey.FindStringSubmatch(body[i])
+		if m == nil {
+			continue
+		}
+		indent, value := m[1], strings.TrimSpace(m[2])
+		if blockScalar.MatchString(value) {
+			baseIndent := len(indent)
+			for j := i + 1; j < len(body); j++ {
+				cont := body[j]
+				if strings.TrimSpace(cont) == "" {
+					continue
+				}
+				if leadingSpaces(cont) <= baseIndent {
+					break
+				}
+				script := strings.TrimSpace(cont)
+				if makeIntegration.MatchString(script) || dockerOrContainerCmd.MatchString(script) {
+					return true
+				}
 			}
 			continue
 		}
-		if jobLine.MatchString(line) {
-			return false
+		if makeIntegration.MatchString(value) || dockerOrContainerCmd.MatchString(value) {
+			return true
 		}
 	}
 	return false
+}
+
+func leadingSpaces(s string) int {
+	n := 0
+	for _, r := range s {
+		if r != ' ' {
+			break
+		}
+		n++
+	}
+	return n
 }
 
 // blockHas reports whether one of the next few lines after i contains want.

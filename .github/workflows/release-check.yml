@@ -1,0 +1,131 @@
+name: Release check
+
+# Re-checks a release. A push of a v* tag runs only after GitHub has accepted
+# the tag, so this workflow cannot stop a bad tag from being published. The
+# pre-tag gate is `make release-check` on a clean checkout (and this same
+# workflow on pull requests); see CONTRIBUTING.md. The tag-push run is a
+# post-push safety net: if it fails, the tag already exists and a maintainer
+# must delete it and retag. The version invariants also live in
+# `go test ./...`, so drift is caught on the change that introduces it.
+on:
+  push:
+    tags: ['v*']
+  pull_request:
+    # This is not a filter for a faster CI. It is the list of every input the
+    # gate reads. Anything that can change a gate result belongs here, and the
+    # gate is close to a superset of ci.yml, so a PR touching Go code is a PR
+    # that needs the gate.
+    paths:
+      - 'CHANGELOG.md'
+      - 'README.md'
+      - 'README.ja.md'
+      - 'SECURITY.md'
+      - 'go.mod'
+      - 'bench/go.mod'
+      - 'bench/go.sum'
+      # `go mod tidy -diff` reads the root import graph, so a PR that drops a
+      # dependency's last use and forgets to re-tidy touches only .go files and
+      # still leaves go.mod wrong. Listing go.mod alone would not catch it.
+      - '**/*.go'
+      # bench/ is a separate module and no job in ci.yml reaches it, so without
+      # this a PR touching only bench sources would run no bench check at all:
+      # the tag push would be the first time release-check-bench saw the code.
+      - 'bench/**'
+      # The Makefile defines the gate this workflow runs, so a PR that weakens
+      # it must trigger this workflow. Without it a dropped `go vet` or a
+      # weakened `go mod verify` would never be checked.
+      - 'Makefile'
+      # The gate lints with .golangci.yml, and its actionlint step validates
+      # every workflow in the directory, not just this one. Both are inputs, so
+      # a PR touching either must run the gate: a weakened linter config would
+      # otherwise pass ci.yml's lint, and a broken ci.yml would not run at all.
+      - '.golangci.yml'
+      - '.github/workflows/**'
+      - 'internal/releasecheck/**'
+  workflow_dispatch:
+
+# Read-only: this workflow verifies, it never publishes. A release is cut by
+# tagging, and the GitHub release is created by a maintainer.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # The tag must name the version the docs advertise. internal/releasecheck
+  # asserts the docs agree with each other; this asserts the tag agrees with
+  # them. It reads only the working tree, so no git history is needed.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version-file: go.mod
+
+      - name: Docs and CHANGELOG agree on a version
+        run: go test ./internal/releasecheck/...
+
+      - name: Tag matches the latest CHANGELOG release
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tagged="${GITHUB_REF_NAME#v}"
+          # `sort -V | tail -1` takes the highest version rather than the first
+          # section, so a backport patch release legitimately placed above a
+          # newer minor does not become "latest". This must agree with
+          # internal/releasecheck.latestRelease, which compares numerically
+          # rather than trusting file order.
+          #
+          # The `|| true` is load-bearing: a `run:` step defaults to
+          # `bash -eo pipefail`, so a grep that finds nothing would fail the
+          # assignment, errexit would end the step, and the diagnostic below
+          # would never print. Verified by stripping the date from a release
+          # heading and getting a bare exit 1 with no message.
+          latest=$( { grep -Eo '^## \[[0-9]+\.[0-9]+\.[0-9]+\] - [0-9]{4}-[0-9]{2}-[0-9]{2}$' CHANGELOG.md || true; } \
+                   | sed -E 's/^## \[([0-9.]+)\].*/\1/' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "::error::no dated release section found in CHANGELOG.md"
+            exit 1
+          fi
+          if [ "$tagged" != "$latest" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the latest CHANGELOG release $latest"
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches CHANGELOG $latest"
+
+  # Everything that must hold for a tag to be worth publishing.
+  #
+  # This calls `make release-check` rather than listing the steps again, so the
+  # gate a maintainer runs locally before tagging is the gate that runs here.
+  # The linter is installed without being run, because the target invokes it.
+  #
+  # The timeout is generous on purpose: this job is a superset of ci.yml's race
+  # and lint jobs, and additionally compiles govulncheck and actionlint from
+  # source and walks the separate bench module.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          # The toolchain of the module this gate builds, not the root one.
+          # The root go.mod says 1.23.0 but bench/go.mod says 1.25.0, and the
+          # gate builds bench: deriving from the root fails with "go.mod
+          # requires go >=" instead of building anything (both modes
+          # reproduced), while `stable` would float. The bench toolchain also
+          # satisfies the root module. Same choice as ci.yml's bench-build.
+          go-version-file: bench/go.mod
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.13.0
+          # The target runs the linter, so only the binary is needed here.
+          install-only: true
+      - run: make release-check

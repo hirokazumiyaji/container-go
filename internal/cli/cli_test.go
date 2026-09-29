@@ -14,9 +14,11 @@ import (
 	"time"
 )
 
-// writeStub creates an executable shell script and returns its path.
+// writeStub creates an executable shell script and returns its path. It skips
+// on Windows, which has no /bin/sh, so the stub is never executed there.
 func writeStub(t *testing.T, script string) string {
 	t.Helper()
+	requirePOSIXShell(t)
 	path := filepath.Join(t.TempDir(), "container")
 	if err := os.WriteFile(path, []byte("#!/bin/sh\n"+script), 0o755); err != nil {
 		t.Fatal(err)
@@ -387,7 +389,7 @@ func TestProbeConfigurationDetectionSurvivesArgvExclusion(t *testing.T) {
 		},
 		{
 			name: "wrapped non-CLI cause",
-			err: fmt.Errorf("probe instrumentation: %w", errors.New("proxyconnect tcp: connection refused")),
+			err:  fmt.Errorf("probe instrumentation: %w", errors.New("proxyconnect tcp: connection refused")),
 		},
 		{
 			name: "captured probe output",

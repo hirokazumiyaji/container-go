@@ -104,6 +104,12 @@ type Container struct {
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
+
+	// infoFlight collapses concurrent cachedInfo callers onto one
+	// inspect. The inspect is a subprocess, so the flight is what keeps
+	// N concurrent callers from spawning N of them; mu guards only the
+	// cache read and publish.
+	infoFlight flightGroup[*engineInfo]
 }
 
 // immutableID returns the backend's immutable container ID, or "" when the
@@ -493,21 +499,51 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 // cachedInfo returns the first successful inspect result. Only fields
 // that cannot change while the container exists (labels, network
 // address, port bindings) should be read from it.
+//
+// The inspect is a subprocess that can take up to queryTimeout, so it
+// runs outside c.mu: holding the cache lock across it would block every
+// other Endpoint/ContainerIP caller for that whole window. The
+// singleflight collapses concurrent callers onto one inspect, and c.mu
+// guards only the read and the publish.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
+	if info := c.loadInfo(); info != nil {
+		return info, nil
+	}
+	return c.infoFlight.do(ctx, cachedInfoFlightKey, func() (*engineInfo, error) {
+		// Re-check: a caller that queued behind the flight's inspect
+		// would otherwise run a second one.
+		if info := c.loadInfo(); info != nil {
+			return info, nil
+		}
+		// The inspect is shared, so it must not inherit any one
+		// caller's cancellation: the caller that happened to start the
+		// flight would otherwise abort the inspect for everyone waiting
+		// on it. WithoutCancel keeps the caller's values; the deadline
+		// is dropped, so inspectFresh re-applies queryTimeout and the
+		// inspect stays bounded.
+		info, err := c.inspectFresh(context.WithoutCancel(ctx))
+		if err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		c.info = info
+		c.mu.Unlock()
+		// Delegate, so the "never downgrade a promoted value" invariant lives in
+		// one place rather than being reimplemented here.
+		c.setImmutableID(info.uid)
+		return info, nil
+	})
+}
+
+// cachedInfoFlightKey is the single key for a Container's own
+// cachedInfo flight. The group is per-Container, so one constant key
+// identifies the one inspect that can be in flight.
+const cachedInfoFlightKey = "cachedInfo"
+
+func (c *Container) loadInfo() *engineInfo {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
-	}
-	info, err := c.inspectFresh(ctx)
-	if err != nil {
-		return nil, err
-	}
-	c.info = info
-	// Delegate, so the "never downgrade a promoted value" invariant lives in
-	// one place rather than being reimplemented here.
-	c.setImmutableID(info.uid)
-	return info, nil
+	return c.info
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

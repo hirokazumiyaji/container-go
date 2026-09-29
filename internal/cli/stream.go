@@ -64,13 +64,14 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		stderr:     &tailBuffer{},
 		// Keep both names as aliases for package-local compatibility;
 		// they intentionally refer to the same ordered endpoint.
-		stdoutRead: childRead,
-		stderrRead: childRead,
-		startDone:  make(chan struct{}),
-		waitDone:   make(chan struct{}),
-		pumpsDone:  make(chan struct{}),
+		stdoutRead:   childRead,
+		stderrRead:   childRead,
+		startDone:    make(chan struct{}),
+		waitDone:     make(chan struct{}),
+		pumpsDone:    make(chan struct{}),
+		drainStarted: make(chan struct{}),
 	}
-	stream.ordered = newStreamOutput(pw, stream.stderr, &stream.terminalDrain)
+	stream.ordered = newStreamOutput(pw, stream.stderr, &stream.terminalDrain, stream.drainStarted)
 	cmd.Stdout = childWrite
 	cmd.Stderr = childWrite
 	// Cancel closes the reader as well as killing the process tree. This
@@ -172,6 +173,7 @@ type processStream struct {
 	outputCloseOnce sync.Once
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
+	drainStarted    chan struct{}
 	drainStartOnce  sync.Once
 	drainDoneOnce   sync.Once
 	terminalDrain   atomic.Bool
@@ -207,14 +209,19 @@ type processStream struct {
 // terminal CLI diagnostic even though its source is the merged stream. A
 // bounded queue decouples child draining from public-reader backpressure, so
 // a terminal child can exit and release its stderr even when nobody is
-// currently reading the public stream.
+// currently reading the public stream. The queue applies backpressure rather
+// than discarding chunks, so a reader that is merely slow still observes
+// every byte the child wrote.
 type streamOutput struct {
 	output        io.Writer
 	stderr        *tailBuffer
 	terminalDrain *atomic.Bool
-	chunks        chan []byte
-	workerDone    chan struct{}
-	closeInput    sync.Once
+	// drainStarted is closed once the terminal drain begins, releasing a
+	// pump that is blocked on a full queue.
+	drainStarted <-chan struct{}
+	chunks       chan []byte
+	workerDone   chan struct{}
+	closeInput   sync.Once
 }
 
 const orderedOutputQueue = 32
@@ -223,11 +230,13 @@ func newStreamOutput(
 	output io.Writer,
 	stderr *tailBuffer,
 	terminalDrain *atomic.Bool,
+	drainStarted <-chan struct{},
 ) *streamOutput {
 	return &streamOutput{
 		output:        output,
 		stderr:        stderr,
 		terminalDrain: terminalDrain,
+		drainStarted:  drainStarted,
 		chunks:        make(chan []byte, orderedOutputQueue),
 		workerDone:    make(chan struct{}),
 	}
@@ -250,12 +259,13 @@ func (w *streamOutput) Write(p []byte) (int, error) {
 		// for TerminalError, and the child must not be held hostage by a
 		// blocked public reader.
 		return len(p), nil
-	case w.chunks <- chunk:
+	case <-w.drainStarted:
+		// The terminal drain owns the diagnostic tail from here on.
 		return len(p), nil
-	default:
-		// Preserve the bounded-memory guarantee for a caller that never
-		// reads. The diagnostic tail still receives every subsequent byte.
-		// A live consumer normally drains this queue immediately.
+	case w.chunks <- chunk:
+		// A full queue applies ordinary backpressure. Discarding here
+		// would silently drop child output from a live reader that is only
+		// temporarily slow, and the tail above is already complete.
 		return len(p), nil
 	}
 }
@@ -408,6 +418,9 @@ func (s *processStream) Drain(ctx context.Context) error {
 
 	s.drainStartOnce.Do(func() {
 		s.terminalDrain.Store(true)
+		if s.drainStarted != nil {
+			close(s.drainStarted)
+		}
 		s.outputCloseOnce.Do(func() { _ = s.output.Close() })
 	})
 	complete := func() {

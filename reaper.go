@@ -361,11 +361,11 @@ END {
 ' | while IFS=' ' read -r state id creation; do
   [ -n "$id" ] || continue
   if [ "$sub" = delete ] && [ -n "$creation" ]; then
-    run_with_timeout "$timeout" locked run_locked "$id" "$creation" "$state" || true
+    run_with_timeout "$timeout" locked run_locked "$id" "$creation" "$state" >/dev/null 2>&1 || true
   else
     pending=0
     [ "$state" = P ] && pending=1
-    run_with_timeout "$timeout" entry process_entry "$id" "$creation" "$pending" || true
+    run_with_timeout "$timeout" entry process_entry "$id" "$creation" "$pending" >/dev/null 2>&1 || true
   fi
 done
 `

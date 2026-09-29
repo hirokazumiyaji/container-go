@@ -124,8 +124,8 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-`Run` fetches the image (the CLI auto-pulls when missing), creates and
-starts the container, and completes the wait strategy; on failure it
+`Run` resolves the image according to the selected pull policy, creates
+and starts the container, and completes the wait strategy; on failure it
 rolls back whatever it created before returning the error.
 
 Options use the functional options pattern. The initial release
@@ -299,10 +299,14 @@ volumes must be named, and their lifecycle belongs to the caller.
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes). The compatibility check is intentionally
-narrow: image reference and declared/published ports only. `env`,
-`cmd`, and `mounts` differences attach silently to the existing
-container by design; callers needing isolation should use distinct
-names or reset state via `Exec`.
+narrow: the resolved image identity (digest or local image ID) and
+declared/published ports only. It never treats the original mutable tag
+as proof that an existing container uses the same image. A newly-created
+reuse container that fails its post-create identity or port validation
+is removed before the error is returned. `env`, `cmd`, and `mounts`
+differences attach silently to the existing container by design;
+callers needing isolation should use distinct names or reset state via
+`Exec`.
 
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
@@ -363,6 +367,54 @@ the library has no credential input path.
 **No secrets in logs**. Debug logging of CLI argv never includes
 env-file contents.
 
+**Image identity is resolved before create**. After `PullMissing` or
+`PullAlways` prepares the local store, `Run` inspects the image again and
+passes the reported immutable identity to the backend. Docker prefers a
+matching registry digest and falls back to the inspected local image ID;
+a local alias with a foreign `RepoDigests` entry also uses that ID, while
+an explicit pinned repository/digest conflict is an error. Apple Container
+uses the root image descriptor as the run and reuse identity and keeps the
+selected platform variant as separate validation metadata. When Apple
+resolves an unqualified input to a custom default registry, the reported
+canonical repository is retained in the run reference and identity
+comparison. An ID-only image record is normalized to a digest reference
+when a repository and descriptor prove that identity. This prevents a later local tag
+reassignment from changing that create, but it does not make a mutable
+tag's pull-to-inspect operation atomic. Caller-supplied Apple
+`name@digest` and `name:tag@digest` references remain pinned, including
+when `WithAllowMutableImageTag` is set. If a backend version reports no
+usable identity, the default policy fails closed with
+`ErrImageIdentityUnavailable`. A digest without repository provenance is
+not identity proof; a bare Docker image ID is accepted only when the
+backend inspect verifies that exact local ID.
+
+Apple Container has no `--pull=never` run flag. Before a pinned Apple
+reference is passed to `container run`, the library verifies that exact
+reference locally for every pull policy. If it is absent and the policy
+allows fetching, the library performs an explicit exact-digest pull and
+inspects it again; `container run` is never allowed to perform an
+implicit fetch. A confirmed local absence returns
+`ErrImageIdentityNotLocal`; a successful inspect that cannot report a
+repository-bearing digest or verified local ID returns
+`ErrImageIdentityUnavailable`. Transport, permission, and cancellation
+errors from the addressability check remain operational errors and never
+authorize the mutable fallback. `WithAllowMutableImageTag` is an
+explicit compatibility escape hatch for a mutable input whose identity
+is unavailable or whose resolved reference is not locally addressable;
+it carries no identity guarantee and never downgrades a caller-supplied
+repository digest, a bare digest, or a Docker image-ID-shaped value.
+Locally built Apple images may therefore require the explicit
+mutable-tag fallback when no local digest reference is available.
+
+Apple can synthesize a local index around a single manifest. That index
+root is content-addressed in the local store but is not necessarily
+registry-addressable by `name@digest`. The resolver therefore does not
+blindly exact-pull a synthetic root. It requires a locally addressable
+tag or alias, or the explicit mutable-tag fallback. A newly-created Apple
+container is inspected again after `container run`; a root, platform, or
+selected-variant mismatch rolls the container back before `Run` or reuse
+returns it.
+
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one
@@ -396,6 +448,14 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrImageIdentityUnavailable`: a successful image inspect returned no
+  repository-bearing digest or verified local image ID, and the caller
+  did not opt into the mutable-tag fallback
+- `ErrImageIdentityNotLocal`: a pinned reference was confirmed absent
+  from the backend's local store under the selected policy; Apple does
+  not let `container run` perform an implicit fetch
+- `ErrImageIdentityMismatch`: inspect returned an identity for a
+  different image; the mutable-tag fallback is not used
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit

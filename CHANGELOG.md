@@ -13,6 +13,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
+- Resolve inspected image digests or Docker image IDs before create, retain
+  the identity on the handle, compare reuse by that identity, verify
+  Apple-created image identity before returning, and remove newly-created
+  containers when post-create validation fails.
+  Expose `WithAllowMutableImageTag` plus identity-related errors for
+  explicit fallback and fail-closed policies; handle foreign Docker
+  RepoDigests with the inspected local ID, require Apple pinned references
+  to be locally addressable, and keep operational addressability errors
+  distinct from successful identity-unavailable results. Treat Apple
+  `name@digest` and `name:tag@digest` references as pinned, validate
+  selected platform variants while retaining the root index digest, and
+  accept verified unprefixed Docker image IDs in canonical `sha256:`
+  form.
 - `StrictCleanup`, which reports a container-teardown failure as a test
   failure instead of logging it. `Cleanup` still logs, so an unrelated
   backend problem does not turn an unrelated test red.

@@ -1,0 +1,33 @@
+[
+  {
+    "id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "configuration": {
+      "creationDate": "2026-09-25T00:00:00Z",
+      "name": "registry.example/team/demo:stable",
+      "descriptor": {
+        "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "annotations": {
+          "com.apple.containerization.index.indirect": "true"
+        },
+        "size": 1234
+      }
+    },
+    "variants": [
+      {
+        "platform": {
+          "os": "linux",
+          "architecture": "arm64",
+          "variant": "v8"
+        },
+        "digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "size": 5678,
+        "config": {
+          "architecture": "arm64",
+          "os": "linux",
+          "config": {}
+        }
+      }
+    ]
+  }
+]

@@ -301,8 +301,22 @@ func (r *reuseRollbackCleanupRunner) Run(ctx context.Context, args ...string) ([
 			}
 		}
 		name := args[len(args)-1]
+		// Mirror the default fakeRunner inspect identity so post-create
+		// image-identity checks (issue #115) succeed and the test can reach
+		// the intended copy-failure path.
+		platform := appleHostPlatform()
+		platformParts := strings.Split(platform, "/")
+		platformJSON := `{"os":` + quote(platformParts[0]) + `,"architecture":` + quote(platformParts[1]) + `}`
+		variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		if strings.Contains(platformParts[1], "arm") {
+			variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		}
+		if len(platformParts) == 3 {
+			platformJSON = `{"os":` + quote(platformParts[0]) + `,"architecture":` + quote(platformParts[1]) + `,"variant":` + quote(platformParts[2]) + `}`
+		}
 		return []byte(`[{"id":` + quote(name) + `,"configuration":{"id":` + quote(name) +
-			`,"image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{` +
+			`,"image":{"reference":"docker.io/library/redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":` + quote(variantDigest) + `},` +
+			`"platform":` + platformJSON + `,"publishedPorts":[],"labels":{` +
 			quote(managedLabel) + `:"true",` + quote(sessionLabel) + `:` + quote(sessionID()) + `,` +
 			quote(creationLabel) + `:` + quote(creation) + `,` + quote(reuseLabel) + `:"true"}},` +
 			`"status":{"state":"running","networks":[]}}]`), nil, nil

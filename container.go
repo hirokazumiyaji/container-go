@@ -101,6 +101,10 @@ type Container struct {
 	// on the Terminate path must not hold the inspect lock.
 	uid   string
 	uidMu sync.RWMutex
+	// image is the image identity resolved immediately before create.
+	// reference is what was passed to run; it is immutable-pinned
+	// unless the caller explicitly allowed the mutable-tag fallback.
+	image imageIdentity
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -159,6 +163,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(cfg); err != nil {
 		return nil, err
 	}
+	materializeAppleRunPlatform(cfg)
 	if cfg.reuse {
 		return reuseRun(ctx, image, cfg)
 	}
@@ -181,11 +186,13 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	defer cancel()
 	// The pull policy brings the image into the local store before the
 	// run command; both share the aggregated flight so concurrent Runs
-	// of the same image pull once.
-	if err := cfg.ensureImage(runCtx, image); err != nil {
+	// of the same image pull once. The resolved reference, rather than
+	// the caller's mutable tag, is passed to run.
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
 		return nil, err
 	}
-	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
@@ -202,6 +209,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		published: cfg.published,
 		creation:  cfg.creation,
 		uid:       cfg.eng.parseRunID(stdout),
+		image:     resolvedImage,
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -216,6 +224,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
+	}
+	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
+		return nil, c.rollback(ctx, err)
 	}
 
 	for _, f := range cfg.files {
@@ -263,7 +274,7 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // container that cannot even be inspected may still exist, so that case is a
 // failure too rather than an assumption that it is gone.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
-	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
+	if cfg.eng.nameConflict(lifecycleRun, cfg.name, runErr) || cfg.eng.nameConflict(lifecycleRun, cfg.name, classified) {
 		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
@@ -277,7 +288,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if err != nil {
 		// A container that cannot be inspected may still be running, so this
 		// is reported rather than treated as "nothing to clean up".
-		if isNotFound(err) {
+		if isContainerNotFound(cfg.eng, lifecycleInspect, cfg.name, err) {
 			return nil
 		}
 		return fmt.Errorf("inspect before cleanup: %w", err)
@@ -302,7 +313,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
 		// The container passed the ownership checks, so it exists and is
 		// ours. A failure here means it is still running.
-		if isNotFound(err) {
+		if isContainerNotFound(cfg.eng, lifecycleDelete, target, err) {
 			return nil
 		}
 		return fmt.Errorf("delete %s: %w", target, err)
@@ -351,7 +362,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
-	return c.classify(ctx, err)
+	return wrapContainerNotFound(c.eng, lifecycleStop, c.id, c.classify(ctx, err))
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -377,7 +388,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
+	if isContainerNotFound(c.eng, lifecycleInspect, c.id, err) {
 		return nil
 	}
 	if err != nil {
@@ -398,7 +409,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isContainerNotFound(c.eng, lifecycleDelete, target, err) {
 		return nil
 	}
 	return c.classify(ctx, err)
@@ -504,6 +515,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
+	if c.image.reference == "" {
+		c.image = imageFromInfo(info)
+	}
 	// Delegate, so the "never downgrade a promoted value" invariant lives in
 	// one place rather than being reimplemented here.
 	c.setImmutableID(info.uid)
@@ -515,7 +529,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapContainerNotFound(c.eng, lifecycleInspect, c.id, c.classify(ctx, err))
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

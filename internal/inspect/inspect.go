@@ -20,10 +20,34 @@ type Configuration struct {
 	Image          Image             `json:"image"`
 	Labels         map[string]string `json:"labels"`
 	PublishedPorts []PublishedPort   `json:"publishedPorts"`
+	// Platform is the platform selected when the container was created.
+	// Older CLI versions may omit it; callers must treat a zero value as
+	// unknown rather than silently treating it as the host platform.
+	Platform Platform `json:"platform"`
+}
+
+// Platform is the OCI platform reported by Apple Container. It is kept
+// separate from the image descriptor because the descriptor identifies the
+// root index while this field identifies the selected variant.
+type Platform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
 }
 
 type Image struct {
-	Reference string `json:"reference"`
+	Reference  string     `json:"reference"`
+	Descriptor Descriptor `json:"descriptor"`
+	// VariantDigest is present in some Apple CLI versions for the selected
+	// manifest. Older versions report only the root index descriptor.
+	VariantDigest string `json:"variantDigest"`
+}
+
+// Descriptor is the OCI descriptor reported alongside an image
+// reference. Older CLI versions may omit it, so callers must treat a
+// zero digest as identity-unavailable rather than infer one.
+type Descriptor struct {
+	Digest string `json:"digest"`
 }
 
 type PublishedPort struct {

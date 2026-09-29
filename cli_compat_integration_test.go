@@ -42,7 +42,7 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(conflictErr) {
+	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -54,14 +54,15 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 		t.Fatalf("imageMissing = false for %v", missingImg)
 	}
 
-	_, _, missingCtr := r.Run(ctx, "inspect", "no-such-ctr-containergo")
+	missingName := "no-such-ctr-containergo"
+	_, _, missingCtr := r.Run(ctx, "inspect", missingName)
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(missingCtr) {
+	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isNotFound(missingCtr) {
+	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }
@@ -86,7 +87,7 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(conflictErr) {
+	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -98,14 +99,15 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 		t.Fatalf("imageMissing = false for %v", missingImg)
 	}
 
-	_, _, missingCtr := r.Run(ctx, "inspect", "no-such-ctr-containergo")
+	missingName := "no-such-ctr-containergo"
+	_, _, missingCtr := r.Run(ctx, "inspect", missingName)
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(missingCtr) {
+	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isNotFound(missingCtr) {
+	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }

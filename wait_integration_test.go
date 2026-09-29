@@ -77,6 +77,7 @@ func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.T
 func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
+	f.failInspectAfter = 1
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
 		WithExposedPorts("6379/tcp"),

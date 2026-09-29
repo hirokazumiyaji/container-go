@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -238,10 +237,19 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 
 func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
+// dockerImageInspect mirrors the fields of `docker image inspect`
+// output needed to pin the image that will be run. RepoDigests is the
+// registry digest; Id is the immutable local image ID fallback.
+type dockerImageInspect struct {
+	ID          string   `json:"Id"`
+	RepoDigests []string `json:"RepoDigests"`
+}
+
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
 	ID    string `json:"Id"`
+	Image string `json:"Image"`
 	Name  string `json:"Name"`
 	State struct {
 		Status string `json:"Status"`
@@ -273,11 +281,13 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	c := containers[0]
 
 	info := &engineInfo{
-		state:  dockerState(c.State.Status),
-		labels: c.Config.Labels,
-		uid:    c.ID,
-		image:  c.Config.Image,
-		ip:     c.NetworkSettings.IPAddress,
+		state:       dockerState(c.State.Status),
+		labels:      c.Config.Labels,
+		uid:         c.ID,
+		image:       c.Config.Image,
+		imageID:     c.Image,
+		imageDigest: imageDigest(c.Config.Image),
+		ip:          c.NetworkSettings.IPAddress,
 	}
 	if info.ip == "" {
 		for _, n := range c.NetworkSettings.Networks {
@@ -403,17 +413,157 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 	return []string{"pull", image}
 }
 
-// imageMissing matches the daemon's response for an absent image.
+// imageMissing matches exact daemon image-absence reasons. A platform
+// mismatch from `image inspect --platform` and a registry's
+// `manifest unknown` response both mean that this requested variant is
+// absent; arbitrary "not found" text is not an image classifier.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
-}
-
-func (dockerEngine) parseImageExists(data []byte, _ string) bool {
-	var images []json.RawMessage
-	if err := json.Unmarshal(data, &images); err != nil {
+	cliErr, ok := imageCLIErrorForBackend(err, "docker")
+	if !ok {
 		return false
 	}
-	return len(images) > 0
+	for _, raw := range strings.Split(strings.ToLower(cliErr.Stderr), "\n") {
+		line := strings.TrimSpace(raw)
+		line = strings.Trim(line, "()[]{} \t:,")
+		for range 3 {
+			line = strings.Trim(line, " \t\"'")
+			matchedPrefix := false
+			for _, prefix := range []string{"error response from daemon:", "error:", "failed:"} {
+				if strings.HasPrefix(line, prefix) {
+					line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+					matchedPrefix = true
+					break
+				}
+			}
+			if !matchedPrefix {
+				break
+			}
+		}
+		if strings.HasPrefix(line, "no such image:") ||
+			strings.HasPrefix(line, "manifest unknown:") ||
+			line == "manifest unknown" ||
+			strings.Contains(line, `"code":"manifest_unknown"`) ||
+			strings.Contains(line, `"code": "manifest_unknown"`) ||
+			strings.HasPrefix(line, "image not found:") {
+			return true
+		}
+		if strings.HasPrefix(line, "no matching manifest for ") &&
+			strings.Contains(line, " in the manifest list entries") {
+			return true
+		}
+	}
+	return false
+}
+
+func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
+
+func (dockerEngine) parseImageExists(data []byte, platform string) bool {
+	_, exists := (dockerEngine{}).parseImageIdentity(data, "", platform)
+	return exists
+}
+
+// parseImageIdentity prefers a registry digest because it remains tied
+// to the repository the caller requested, and falls back to Docker's
+// local image ID for locally built or otherwise digest-less images. It
+// accepts both the canonical sha256:... ID and Docker's 64-hex spelling
+// only after the inspected Id matches exactly. Both forms prevent a
+// later tag reassignment from changing run's target.
+func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
+	var images []dockerImageInspect
+	if err := json.Unmarshal(data, &images); err != nil {
+		// A successful CLI invocation with malformed JSON is not proof
+		// that the image is absent. Treat it as identity-unavailable so
+		// PullMissing cannot turn a parser failure into a fetch.
+		return imageIdentity{}, true
+	}
+	if len(images) == 0 {
+		return imageIdentity{}, false
+	}
+	requestedID, requestedIsID := canonicalDockerImageID(image)
+	if image != "" && isBareImageReference(image) && !requestedIsID {
+		// A malformed or unprefixed digest/ID-shaped value is not a
+		// Docker image-ID request that inspect can verify.
+		return imageIdentity{}, true
+	}
+	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
+	sawExplicitConflict := false
+	sawDifferentID := false
+	fallbackID := ""
+	for _, img := range images {
+		inspectedID, inspectedIDOK := canonicalDockerImageID(img.ID)
+		// An ID-shaped request is only accepted when inspect reports that
+		// exact verified local ID. A different, well-formed Docker ID is a
+		// known mismatch rather than an unavailable identity.
+		if requestedIsID {
+			if inspectedIDOK && strings.EqualFold(inspectedID, requestedID) {
+				identity := imageReferenceWithDigest(requestedID, "", "", inspectedID)
+				identity.rootDigest = ""
+				return identity, true
+			}
+			if inspectedIDOK {
+				sawDifferentID = true
+			}
+			continue
+		}
+		for _, repoDigest := range img.RepoDigests {
+			digest := imageDigest(repoDigest)
+			if !validImageDigest(digest) || imageReferenceBase(repoDigest) == "" {
+				continue
+			}
+			if image != "" {
+				requestedDigest := imageDigest(image)
+				if requestedDigest != "" {
+					// An explicit digest is a claim about both the
+					// manifest and its repository. A foreign RepoDigest
+					// is a conflict, even when its digest happens to be
+					// the same.
+					if !strings.EqualFold(requestedDigest, digest) || imageRepository(image) != imageRepository(repoDigest) {
+						sawExplicitConflict = true
+						continue
+					}
+				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
+					// Docker's RepoDigests commonly omit the tag. In
+					// that form the repository still has to match.
+					continue
+				}
+			}
+			identityID := ""
+			if inspectedIDOK {
+				identityID = inspectedID
+			}
+			identity := imageReferenceWithDigest(image, repoDigest, digest, identityID)
+			identity.repository = imageRepository(repoDigest)
+			return identity, true
+		}
+		if inspectedIDOK {
+			// A tag can be a local alias whose RepoDigests came from a
+			// different registry. The inspected local ID is still the
+			// safe immutable target for that alias. An explicit pinned
+			// request remains a conflict when a RepoDigest contradicted
+			// it, even if the local content ID is available.
+			if !explicitPinned {
+				identity := imageReferenceWithDigest(image, "", "", inspectedID)
+				identity.repository = imageRepository(image)
+				return identity, true
+			}
+			if fallbackID == "" {
+				fallbackID = inspectedID
+			}
+		}
+		// A non-empty Docker inspect array proves existence even when
+		// this old/versioned response has no usable identity fields.
+	}
+	if explicitPinned {
+		if sawExplicitConflict || sawDifferentID {
+			return imageIdentity{mismatch: true}, true
+		}
+		if fallbackID != "" {
+			identity := imageReferenceWithDigest(image, "", "", fallbackID)
+			identity.repository = imageRepository(image)
+			return identity, true
+		}
+	}
+	return imageIdentity{}, true
 }
 
 func (dockerEngine) listReuseGroupArgs(group string) []string {
@@ -428,36 +578,41 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 	return splitNonEmptyLines(data), nil
 }
 
-// nameConflict matches Docker's duplicate container name error.
-func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
+// nameConflict matches Docker's documented duplicate-container wording,
+// only for a run targeting the requested name.
+func (dockerEngine) nameConflict(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "docker", operation, target)
 	if !ok {
+		return false
+	}
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if !lifecycleTargetInText(s, target) ||
+		(!strings.Contains(s, "container name") && !strings.Contains(s, "container with id")) {
 		return false
 	}
 	return strings.Contains(s, dockerStderrConflict) ||
 		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
 }
 
-// containerMissing matches a CLI failure for an absent container.
-func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
+// Docker has no Apple-style concurrent-create missing-container race.
+func (dockerEngine) createRaceMissing(string, string, error) bool { return false }
+
+// containerMissing matches an absent Docker container target, not a
+// generic application command's "not found" output.
+func (dockerEngine) containerMissing(operation, target string, err error) bool {
+	cliErr, ok := lifecycleCLIErrorForBackend(err, "docker", operation, target)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
-}
-
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
+	s := strings.ToLower(cliErr.Stderr)
+	target = strings.ToLower(target)
+	if lifecycleTargetNotFoundAtStart(s, target) ||
+		(operation != lifecycleExec && lifecycleTargetNotFound(s, target)) {
+		return true
 	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	return lifecycleTargetInText(s, target) &&
+		(strings.Contains(s, dockerStderrNoSuchCtr) ||
+			strings.Contains(s, dockerStderrNoSuchObj) ||
+			(strings.Contains(s, "container") && strings.Contains(s, dockerStderrNotFound)))
 }

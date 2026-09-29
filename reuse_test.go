@@ -34,7 +34,7 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "` + args[len(args)-1] + `"`}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -160,13 +160,29 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 	}
 }
 
+const reuseInspectDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+
 func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONWithDigest(id, state, image, reuseInspectDigest)
+}
+
+func reuseInspectJSONWithDigest(id, state, image, digest string) string {
+	platformParts := strings.Split(issue115FreshHostPlatform(), "/")
+	platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if strings.Contains(platformParts[1], "arm") {
+		variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	}
+	if len(platformParts) == 3 {
+		platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+	}
 	return fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": %q},
+      "image": {"reference": %q, "descriptor": {"digest": %q}, "variantDigest": %q},
+      "platform": %s,
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
@@ -178,7 +194,7 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, digest, variantDigest, platformJSON, state)
 }
 
 type attachRunner struct {
@@ -418,7 +434,7 @@ func (m *mismatchRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 		m.mu.Lock()
 		m.calls = append(m.calls, args)
 		m.mu.Unlock()
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", m.image)), nil, nil
+		return []byte(reuseInspectJSONWithDigest(args[len(args)-1], "running", m.image, reuseInspectDigest)), nil, nil
 	}
 	return m.attachRunner.Run(ctx, args...)
 }
@@ -506,15 +522,15 @@ func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 }
 
 func TestAppleNameConflict(t *testing.T) {
-	err := &cli.CLIError{Stderr: `Error: already exists: container "x"`}
-	if !(appleEngine{}).nameConflict(err) {
+	err := &cli.CLIError{Binary: "container", Args: []string{"run", "--name", "x", "redis"}, Stderr: `Error: already exists: container "x"`}
+	if !(appleEngine{}).nameConflict(lifecycleRun, "x", err) {
 		t.Error("want nameConflict")
 	}
 }
 
 func TestDockerNameConflict(t *testing.T) {
-	err := &cli.CLIError{Stderr: `Conflict. The container name "/x" is already in use by container`}
-	if !(dockerEngine{}).nameConflict(err) {
+	err := &cli.CLIError{Binary: "docker", Args: []string{"run", "--name", "x", "redis"}, Stderr: `Conflict. The container name "/x" is already in use by container`}
+	if !(dockerEngine{}).nameConflict(lifecycleRun, "x", err) {
 		t.Error("want nameConflict")
 	}
 }

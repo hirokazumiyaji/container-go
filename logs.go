@@ -48,7 +48,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapContainerNotFound(c.eng, lifecycleLogs, c.id, c.classify(ctx, err))
 	}
 	// docker logs splits the container's streams across the CLI's
 	// stdout and stderr; a snapshot carries both.

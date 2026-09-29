@@ -42,6 +42,9 @@ func TestTerminateProcessTreePinsChildBeforeWaitInterleaving(t *testing.T) {
 			return unix.Kill(pid, sig)
 		},
 		kill: cmd.Process.Kill,
+		// The test seam supplies the stopped-state observation that
+		// production obtains from the platform identity barrier.
+		stopped: func() (bool, error) { return true, nil },
 	}
 	resultDone := make(chan terminationResult, 1)
 	go func() { resultDone <- terminateProcessTreeWithOps(cmd, ops) }()

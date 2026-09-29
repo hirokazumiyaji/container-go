@@ -51,6 +51,9 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 		"127.0.0.1:2375",
 		"localhost:2375",
 		"[::1]:2375",
+		// Empty host: Docker substitutes its default hostname (local).
+		"tcp://:2375",
+		":2375",
 	}
 
 	for _, host := range local {
@@ -117,7 +120,7 @@ func TestReviewConnectHostUsesRemoteHostName(t *testing.T) {
 // developer's own machine, which is the opposite of what the loopback default
 // is for.
 func TestReviewAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
-	for _, host := range []string{"127.0.0.1:2375", "localhost:2375", "", "unix:///var/run/d.sock"} {
+	for _, host := range []string{"127.0.0.1:2375", "localhost:2375", "", "unix:///var/run/d.sock", "tcp://:2375", ":2375"} {
 		t.Run(host, func(t *testing.T) {
 			t.Setenv("DOCKER_HOST", host)
 			cfg := newConfig()

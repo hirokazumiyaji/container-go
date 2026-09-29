@@ -86,9 +86,11 @@ func (dockerEngine) defaultHost() string {
 }
 
 // normalizeDockerHost applies the same normalization the Docker CLI performs
-// before dialing: a value with no "://" is a TCP host (hostname or host:port),
-// so "tcp://" is prepended. A bare numeric value such as "2375" is a hostname,
-// not a port — matching the Docker CLI.
+// before dialing: a value with no "://" is a TCP host (hostname, host:port, or
+// :port), so "tcp://" is prepended. A bare numeric value such as "2375" is a
+// hostname, not a port — matching the Docker CLI. Scheme-less ":2375" becomes
+// "tcp://:2375", after which isRemoteDockerHost applies Docker's empty-host
+// fallback (default hostname → local).
 //
 // url.Parse cannot read those forms — "127.0.0.1:2375" errors outright and
 // "localhost:2375" parses as an opaque scheme with no host — so without this
@@ -120,8 +122,11 @@ func dockerHostName() string {
 // recognizes only tcp://. ssh:// is a first-class Docker remote transport, and
 // the daemon there resolves bind-mount sources on its own host, so a
 // configuration derived from defaultHost would report local and let the bind
-// through unchanged. A loopback host is still this machine, and an unparsable
-// value is treated as remote so a malformed setting fails closed rather than
+// through unchanged. A loopback host is still this machine. An empty hostname
+// after parse (tcp://:2375, or scheme-less :2375 after normalizeDockerHost)
+// matches the Docker CLI's TCP parser, which substitutes its default hostname
+// — a local daemon — so those forms are local too. An unparsable value is
+// treated as remote so a malformed setting fails closed rather than
 // permitting a bind the daemon would resolve in the wrong place.
 //
 // ssh:// is remote in the same sense as tcp://, not a special case. The CLI's
@@ -137,19 +142,25 @@ func isRemoteDockerHost() bool {
 		return false
 	}
 	// These transports name a socket on this machine. fd:// (systemd
-	// socket activation) yields an empty hostname from url.Parse, so it has
-	// to be listed explicitly rather than falling through to fail-closed,
-	// which would report a purely local daemon as remote.
+	// socket activation) yields an empty hostname from url.Parse; list it
+	// with the other local sockets so the classification does not depend
+	// on the empty-host TCP fallback below.
 	for _, local := range []string{"unix://", "npipe://", "fd://"} {
 		if strings.HasPrefix(strings.ToLower(raw), local) {
 			return false
 		}
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Hostname() == "" {
+	if err != nil {
 		return true
 	}
-	return !isLoopbackOrUnspecified(u.Hostname())
+	host := u.Hostname()
+	if host == "" {
+		// Docker's ParseTCPAddr does `if host == "" { host = defaultAddr.Hostname() }`.
+		// That default is this machine, so tcp://:2375 / :2375 are local.
+		return false
+	}
+	return !isLoopbackOrUnspecified(host)
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and

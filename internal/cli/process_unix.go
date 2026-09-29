@@ -246,14 +246,16 @@ func terminateProcessTreeWithOps(cmd *exec.Cmd, ops unixProcessOps) terminationR
 		}
 		return terminationResult{}
 	}
-	if ops.stopped != nil {
-		stopped, stoppedErr := ops.stopped()
-		if stoppedErr != nil || !stopped {
-			if stoppedErr == nil {
-				stoppedErr = errProcessStopNotObserved
-			}
-			return terminateIdentityKillOps(ops, stoppedErr)
+	stoppedFn := ops.stopped
+	if stoppedFn == nil {
+		return terminateIdentityKillOps(ops, errProcessStopNotObserved)
+	}
+	stopped, stoppedErr := stoppedFn()
+	if stoppedErr != nil || !stopped {
+		if stoppedErr == nil {
+			stoppedErr = errProcessStopNotObserved
 		}
+		return terminateIdentityKillOps(ops, stoppedErr)
 	}
 
 	var groupErr error

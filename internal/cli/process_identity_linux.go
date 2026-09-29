@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -15,8 +16,9 @@ import (
 // numeric PID fallback, a pidfd remains tied to the original process across
 // Wait and cannot be redirected to a recycled PID.
 type processIdentity struct {
-	pid   int
-	pidfd int
+	pid      int
+	pidfd    int
+	closeOne sync.Once
 }
 
 func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
@@ -27,10 +29,10 @@ func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
 	if err != nil {
 		return nil, err
 	}
-	return processIdentity{pid: process.Pid, pidfd: fd}, nil
+	return &processIdentity{pid: process.Pid, pidfd: fd}, nil
 }
 
-func (p processIdentity) active() (bool, error) {
+func (p *processIdentity) active() (bool, error) {
 	for {
 		fds := []unix.PollFd{{Fd: int32(p.pidfd), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 0)
@@ -50,11 +52,11 @@ func (p processIdentity) active() (bool, error) {
 	}
 }
 
-func (p processIdentity) stop() error {
+func (p *processIdentity) stop() error {
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGSTOP, nil, 0)
 }
 
-func (p processIdentity) stopped() (bool, error) {
+func (p *processIdentity) stopped() (bool, error) {
 	deadline := time.Now().Add(processStoppedObservationWindow)
 	for {
 		var info unix.Siginfo
@@ -86,11 +88,11 @@ func (p processIdentity) stopped() (bool, error) {
 	}
 }
 
-func (p processIdentity) kill() error {
+func (p *processIdentity) kill() error {
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0)
 }
 
-func (p processIdentity) groupID() (int, bool) {
+func (p *processIdentity) groupID() (int, bool) {
 	pgid, err := unix.Getpgid(p.pid)
 	if err != nil {
 		return 0, false
@@ -98,10 +100,13 @@ func (p processIdentity) groupID() (int, bool) {
 	return pgid, true
 }
 
-func (p processIdentity) close() {
-	if p.pidfd > 0 {
-		_ = unix.Close(p.pidfd)
-	}
+func (p *processIdentity) close() {
+	p.closeOne.Do(func() {
+		if p.pidfd > 0 {
+			_ = unix.Close(p.pidfd)
+			p.pidfd = 0
+		}
+	})
 }
 
 // A pidfd cannot be recreated safely from a bare PID here. If pidfd_open was

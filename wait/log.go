@@ -452,16 +452,26 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			// A queued read or a settled process can become ready in the
-			// same turn as caller cancellation. Give that evidence one
-			// final priority check so a terminal CLI error is not hidden by
-			// the context cause.
-			if read, hasRead, doneReady := nextReadyLogSettle(readResults, done); hasRead {
+			// same turn as caller cancellation. Drain the evidence already
+			// queued before returning the context cause, so a terminal CLI
+			// error is not hidden by a scheduling race.
+			for attempts := 0; attempts < 4; attempts++ {
+				select {
+				case <-done:
+					return joinNonNil(settleTerminal(), ctxErr)
+				default:
+				}
+				read, hasRead, doneReady := nextReadyLogSettle(readResults, done)
+				if doneReady {
+					return joinNonNil(settleTerminal(), ctxErr)
+				}
+				if !hasRead {
+					break
+				}
 				terminal, err := handleRead(read)
 				if terminal {
 					return joinNonNil(err, ctxErr)
 				}
-			} else if doneReady {
-				return joinNonNil(settleTerminal(), ctxErr)
 			}
 			return ctxErr
 		}

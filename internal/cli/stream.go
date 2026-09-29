@@ -254,16 +254,6 @@ func (w *streamOutput) Write(p []byte) (int, error) {
 		// child endpoint without adding more queued output.
 		return len(p), nil
 	}
-	if w.chunks == nil {
-		// Package-local lifecycle tests can construct a processStream
-		// without the production ordered-output worker. Preserve the
-		// original direct-write behavior for that case.
-		n, err := w.output.Write(p)
-		if err != nil && w.terminalDrain.Load() {
-			return len(p), nil
-		}
-		return n, err
-	}
 	chunk := append([]byte(nil), p...)
 	select {
 	case <-w.workerDone:

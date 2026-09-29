@@ -51,15 +51,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # OS is the only matrix axis: the ubuntu legs already cover the older
+        # Go version, so a second dimension with a single fixed value would
+        # only suggest multi-Go legs were planned.
         os: [windows-latest, macos-latest]
-        go-version: ['stable']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: stable
       # The integration suites are excluded: they need a real backend,
       # which neither of these runners provides for both backends.
       - run: go build ./...

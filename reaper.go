@@ -664,20 +664,6 @@ func handoffIdentity(values []string) (creation, uid string) {
 
 func (r *reaper) unregisterHandoff(name string, identity ...string) error {
 	creation, uid := handoffIdentity(identity)
-	return r.unregisterHandoffWithMode(name, creation, uid, false)
-}
-
-// unregisterReuseHandoff retires the verified reuse generation and any
-// settled name-addressed watchdog entry for the same logical name. The
-// latter cannot coexist with the freshly verified generation and would
-// otherwise leave stale ownership behind. Pending entries are retained:
-// they may belong to a concurrent create that has not replaced the target
-// yet.
-func (r *reaper) unregisterReuseHandoff(name, creation, uid string) error {
-	return r.unregisterHandoffWithMode(name, creation, uid, true)
-}
-
-func (r *reaper) unregisterHandoffWithMode(name, creation, uid string, removeSettledNameEntries bool) error {
 	validName := nameRE.MatchString(name)
 	validUID := r.subcommand == "rm" && dockerIDRE.MatchString(uid)
 	validCreation := creation == "" || creationRE.MatchString(creation)
@@ -698,14 +684,15 @@ func (r *reaper) unregisterHandoffWithMode(name, creation, uid string, removeSet
 	removed := make([]reaperEntry, 0)
 	for _, entry := range r.entries {
 		// A promoted Docker entry no longer carries the name/generation
-		// pair; its immutable UID is the only safe retirement key. For a
-		// name-addressed entry, exact generation matching protects a
-		// different live same-name generation. A verified reuse handoff
-		// may additionally remove settled entries from older generations.
+		// pair; its immutable UID is the only safe retirement key. Every
+		// name-addressed entry is matched by name *and* creation
+		// generation, so retiring one generation never drops a concurrent
+		// same-name generation's watchdog coverage. A stale entry left
+		// behind stays safe: the child re-checks the live generation before
+		// it deletes.
 		matchesUID := validUID && entry.id == uid
 		matchesNameGeneration := validName && validCreation && creation != "" &&
-			entry.id == name && (entry.creation == creation ||
-			(removeSettledNameEntries && !entry.pending))
+			entry.id == name && entry.creation == creation
 		if matchesUID || matchesNameGeneration {
 			removed = append(removed, entry)
 		} else {
@@ -972,7 +959,11 @@ func (r *reaper) stopChildLocked() error {
 	cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
 	defer cleanupCancel()
 	var cleanupErr error
-	quiesceErr := acknowledgeReaperCommand(cleanupCtx, stdin, ack, "Q#containergo-quiesce:", r.writeTimeout)
+	// A dropped control barrier would let the retiring child reach EOF with
+	// a live snapshot and delete an entry that the replacement child also
+	// replays. Give the barrier the same bounded budget as its
+	// acknowledgement instead of the bulk-registration write timeout.
+	quiesceErr := acknowledgeReaperCommand(cleanupCtx, stdin, ack, "Q#containergo-quiesce:", reaperCleanupTimeout)
 	quiesced := quiesceErr == nil
 	canKill := false
 	if !quiesced {
@@ -1157,9 +1148,15 @@ func (r *reaper) spawnLocked() error {
 
 func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{}) {
 	<-exited
+	// Claim the exited child while holding opMu, the same lock a controlled
+	// stop and every registration take. Without this claim the watcher could
+	// observe r.cmd between a stop's field hand-off and its quiesce barrier
+	// and schedule a replay that races the still-unquiesced child.
+	r.opMu.Lock()
 	r.mu.Lock()
 	if r.closed || r.cmd != cmd {
 		r.mu.Unlock()
+		r.opMu.Unlock()
 		return
 	}
 	ack := r.ack
@@ -1167,19 +1164,20 @@ func (r *reaper) respawnAfterUnexpectedExit(cmd *exec.Cmd, exited <-chan struct{
 	r.stdin = nil
 	r.exited = nil
 	r.ack = nil
-	// EOF means the child consumed the retirement records before it
-	// exited; a future replay cannot resurrect a handed-off entry.
+	// The child is already gone, so the retirement snapshot it consumed can
+	// never be replayed by a replacement.
 	r.retiredPending = false
 	r.retirementAcked = false
+	r.mu.Unlock()
+	r.opMu.Unlock()
 	if ack != nil {
 		_ = ack.Close()
 	}
+
 	backoff := reaperBackoff
 	if backoff <= 0 {
 		backoff = 100 * time.Millisecond
 	}
-	r.mu.Unlock()
-
 	timer := time.NewTimer(backoff)
 	defer timer.Stop()
 	<-timer.C
@@ -1210,43 +1208,18 @@ func (r *reaper) closeStdin() {
 	}
 }
 
-// killForTest kills the owned reaper child and waits until it is reaped,
-// so the next write deterministically fails. The cleanup is bounded and
-// never signals a numeric process-group ID.
+// killForTest retires the owned reaper child and waits until it is reaped,
+// so the next write deterministically fails. The child is asked to
+// quiesce first and is only force-killed when that barrier is not
+// acknowledged, so a retired child can never reach EOF with a live
+// snapshot. The cleanup is bounded and never signals a numeric
+// process-group ID.
 func (r *reaper) killForTest() error {
 	r.opMu.Lock()
 	defer r.opMu.Unlock()
 	r.mu.Lock()
-	cmd, exited := r.cmd, r.exited
-	stdin := r.stdin
-	r.mu.Unlock()
-	if stdin != nil {
-		_ = stdin.Close()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
-	defer cancel()
-	var cleanupErrors []error
-	r.lifecycleMu.Lock()
-	canKill := cmd != nil && !r.reaping
-	if canKill {
-		r.stopping = true
-	}
-	r.lifecycleMu.Unlock()
-	if canKill && !channelClosed(exited) {
-		if err := killReaperCommand(ctx, cmd); err != nil {
-			log.Printf("container-go: reaper cleanup: %v", err)
-			cleanupErrors = append(cleanupErrors, err)
-		}
-	}
-	if exited != nil {
-		select {
-		case <-exited:
-		case <-ctx.Done():
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("reaper: cleanup timed out: %w", ctx.Err()))
-		}
-	}
-	return errors.Join(cleanupErrors...)
+	defer r.mu.Unlock()
+	return r.stopChildLocked()
 }
 
 var (
@@ -1316,14 +1289,6 @@ func retireReaperEntry(binary, subcommand, name string, identity ...string) {
 
 func unregisterHandoffWithGlobalReaper(binary, subcommand, name string, identity ...string) error {
 	creation, uid := handoffIdentity(identity)
-	return unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid, false)
-}
-
-func unregisterReuseHandoffWithGlobalReaper(binary, subcommand, name, creation, uid string) error {
-	return unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid, true)
-}
-
-func unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, uid string, reuseHandoff bool) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
@@ -1336,13 +1301,7 @@ func unregisterHandoffWithGlobalReaperMode(binary, subcommand, name, creation, u
 	if r.subcommand != subcommand {
 		return fmt.Errorf("reaper: subcommand mismatch for %q: have %q, want %q", binary, r.subcommand, subcommand)
 	}
-	var err error
-	if reuseHandoff {
-		err = r.unregisterReuseHandoff(name, creation, uid)
-	} else {
-		err = r.unregisterHandoff(name, creation, uid)
-	}
-	if err != nil {
+	if err := r.unregisterHandoff(name, creation, uid); err != nil {
 		log.Printf("container-go: reaper handoff cleanup failed (binary=%q): %v", binary, err)
 		return err
 	}

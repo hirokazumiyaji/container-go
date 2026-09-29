@@ -108,6 +108,48 @@ func TestKeepNeverReturnsUnverifiedPostCreateHandle(t *testing.T) {
 	}
 }
 
+// keepPlatformRunner reports a complete but incompatible container platform
+// for every post-create inspect, so platform resolution fails after create.
+type keepPlatformRunner struct {
+	*fakeRunner
+}
+
+func (r *keepPlatformRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "inspect" {
+		id := args[len(args)-1]
+		creation := r.creations[id]
+		if creation == "" {
+			creation = r.lastCreation
+		}
+		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"id":%q,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:%s"}},"platform":{"os":"linux","architecture":"arm64"},"labels":{%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`,
+			id, id, strings.Repeat("b", 64), managedLabel, reuseLabel, creationLabel, creation)), nil, nil
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+// TestKeepNeverReturnsUnverifiedPostCreatePlatformHandle covers the platform
+// half of the same rule: a constructed handle whose post-create platform
+// check failed is not returned under KEEP.
+func TestKeepNeverReturnsUnverifiedPostCreatePlatformHandle(t *testing.T) {
+	t.Setenv("CONTAINERGO_KEEP", "1")
+	f := &keepPlatformRunner{fakeRunner: newTestRunner()}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("keep-post-platform"), WithPlatform("linux/amd64"),
+		withRunner(f), withEngine(appleEngine{}))
+	if err == nil || ctr != nil {
+		t.Fatalf("Run = (%v, %v), want nil handle and joined verification error", ctr, err)
+	}
+	if !strings.Contains(err.Error(), "platform") ||
+		!strings.Contains(err.Error(), "verify retained container") {
+		t.Fatalf("error = %v, want platform and verification errors", err)
+	}
+	for _, call := range f.calls {
+		if len(call) > 0 && (call[0] == "delete" || call[0] == "rm") {
+			t.Fatalf("KEEP issued deletion: %v", call)
+		}
+	}
+}
+
 type unverifiedReuseRunner struct {
 	*fakeRunner
 	created bool
@@ -184,16 +226,20 @@ func TestReuseCreateDoesNotRegisterReaper(t *testing.T) {
 }
 
 func TestReuseHandoffDoesNotLeaveReaperOwnership(t *testing.T) {
-	binary := "/tmp/container-go-reuse-handoff-test-binary"
+	binary := t.TempDir() + "/docker"
 	uid := strings.Repeat("a", 64)
+	foreign := "0123456789abcdef"
 	globalReapersMu.Lock()
 	delete(globalReapers, binary)
 	globalReapersMu.Unlock()
 
-	// Simulate a normal run's still-active watchdog entry for the same
-	// logical name. A successful reuse handoff must remove it too.
+	// Simulate a normal run's still-active watchdog entry for a different
+	// generation of the same logical name, plus the immutable ID record a
+	// create promotion leaves behind. A successful reuse handoff retires its
+	// own targets and must not claim the foreign generation.
 	watchdog := newReaper(binary, "rm")
-	if err := watchdog.register("reuse-handoff", "0123456789abcdef"); err != nil {
+	t.Cleanup(watchdog.closeStdin)
+	if err := watchdog.register("reuse-handoff", foreign); err != nil {
 		t.Fatal(err)
 	}
 	if err := watchdog.register(uid, ""); err != nil {
@@ -202,24 +248,54 @@ func TestReuseHandoffDoesNotLeaveReaperOwnership(t *testing.T) {
 	globalReapersMu.Lock()
 	globalReapers[binary] = watchdog
 	globalReapersMu.Unlock()
-	defer watchdog.closeStdin()
 
 	runner := &reuseHandoffExternalRunner{binary: binary, uid: uid}
-	if _, err := Run(context.Background(), "redis:7-alpine",
-		WithName("reuse-handoff"), WithReuse(), withRunner(runner), withEngine(dockerEngine{})); err != nil {
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("reuse-handoff"), WithReuse(), withRunner(runner), withEngine(dockerEngine{}))
+	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
+	// Run returned, so the reuse flight that writes the generation has
+	// already been joined.
+	created := runner.creation
 
 	globalReapersMu.Lock()
 	r := globalReapers[binary]
 	delete(globalReapers, binary)
 	globalReapersMu.Unlock()
-	if r != nil {
-		r.mu.Lock()
-		entries := len(r.entries)
-		r.mu.Unlock()
-		if entries != 0 {
-			t.Fatalf("reaper retained %d entries after handoff", entries)
-		}
+	if r == nil {
+		t.Fatal("handoff lost the reaper")
+	}
+	r.mu.Lock()
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].id != "reuse-handoff" || entries[0].creation != foreign {
+		t.Fatalf("reaper entries = %+v, want only the foreign generation %q", entries, foreign)
+	}
+
+	// The generation this handoff owns is matched by name plus creation, and
+	// the promoted immutable ID by UID. Neither key can reach a concurrent
+	// generation of the same name.
+	if err := r.register("reuse-handoff", created); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.unregisterHandoff(ctr.ID(), created, ctr.uid); err != nil {
+		t.Fatalf("retire owned generation: %v", err)
+	}
+	r.mu.Lock()
+	entries = append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 1 || entries[0].creation != foreign {
+		t.Fatalf("reaper entries = %+v, want only the untouched foreign generation %q", entries, foreign)
+	}
+
+	if err := r.unregisterHandoff("reuse-handoff", foreign, ""); err != nil {
+		t.Fatalf("retire foreign generation: %v", err)
+	}
+	r.mu.Lock()
+	entries = append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+	if len(entries) != 0 {
+		t.Fatalf("reaper retained %+v after retiring every generation", entries)
 	}
 }

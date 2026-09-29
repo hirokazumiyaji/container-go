@@ -245,6 +245,72 @@ func TestReaperRetirementDoesNotDeleteHandedOffEntryDuringReplay(t *testing.T) {
 	}
 }
 
+// TestReaperRetirementKeepsConcurrentSameNameGeneration models a peer that
+// recreated the same Apple name while this process still owns the previous
+// generation. Retirement is keyed by name plus creation generation, so the
+// old handoff must leave the new generation's watchdog coverage intact.
+func TestReaperRetirementKeepsConcurrentSameNameGeneration(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	const (
+		name      = "shared-name"
+		retired   = "0123456789abcdef"
+		live      = "fedcba9876543210"
+		unrelated = "aaaaaaaaaaaaaaaa"
+	)
+	script := "#!/bin/sh\n" +
+		"echo \"$@\" >> " + logPath + "\n" +
+		"if [ \"$1\" = inspect ]; then echo '  \"" + creationLabel + "\": \"" + live + "\"'; fi\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register(name, retired); err != nil {
+		t.Fatalf("register retired generation: %v", err)
+	}
+	if err := r.register(name, live); err != nil {
+		t.Fatalf("register live generation: %v", err)
+	}
+	reaperEntryGenerations := func() []string {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		gens := make([]string, 0, len(r.entries))
+		for _, entry := range r.entries {
+			gens = append(gens, entry.creation)
+		}
+		return gens
+	}
+	if got := reaperEntryGenerations(); len(got) != 2 {
+		t.Fatalf("generations = %v, want both registered", got)
+	}
+
+	// A handoff for an unrelated generation is a no-op.
+	if err := r.unregisterHandoff(name, unrelated, ""); err != nil {
+		t.Fatalf("unrelated retirement: %v", err)
+	}
+	if got := reaperEntryGenerations(); len(got) != 2 {
+		t.Fatalf("generations = %v after unrelated retirement, want both", got)
+	}
+
+	if err := r.unregisterHandoff(name, retired, ""); err != nil {
+		t.Fatalf("retire old generation: %v", err)
+	}
+	if got := reaperEntryGenerations(); len(got) != 1 || got[0] != live {
+		t.Fatalf("generations = %v, want only the live generation %q", got, live)
+	}
+
+	r.closeStdin()
+	waitForLogLines(t, logPath, "inspect "+name, "delete --force "+name)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(data), "delete --force "+name); count != 1 {
+		t.Fatalf("live generation deleted %d times, want exactly one: %q", count, data)
+	}
+}
+
 func TestReaperCanReplayAfterAcknowledgedRetirement(t *testing.T) {
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "rm")
@@ -358,9 +424,11 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 
-	// Kill the reaper child; killing closes its stdin read side, so it
-	// reaps what it knows, then the next register must respawn it.
-	r.killForTest()
+	// Retire the reaper child through its acknowledged no-delete barrier;
+	// the next register must respawn it and replay the live entry.
+	if err := r.killForTest(); err != nil {
+		t.Fatalf("retire child: %v", err)
+	}
 
 	if err := r.register(after, ""); err != nil {
 		t.Fatalf("register after crash: %v", err)
@@ -368,6 +436,35 @@ func TestReaperRespawnsAndReRegisters(t *testing.T) {
 	r.closeStdin()
 
 	waitForLogLines(t, logPath, "rm --force "+before, "rm --force "+after)
+}
+
+// TestReaperReplayDeletesLiveEntryExactlyOnce pins the replay contract: a
+// retired child must reach EOF only after acknowledging the quiesce barrier,
+// so it cannot delete the entry that the replacement child replays.
+func TestReaperReplayDeletesLiveEntryExactlyOnce(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+
+	live := strings.Repeat("e", 64)
+	if err := r.register(live, ""); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	if err := r.killForTest(); err != nil {
+		t.Fatalf("retire child: %v", err)
+	}
+	if err := r.register(strings.Repeat("f", 64), ""); err != nil {
+		t.Fatalf("register after retirement: %v", err)
+	}
+	r.closeStdin()
+
+	waitForLogLines(t, logPath, "rm --force "+live)
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count := strings.Count(string(data), "rm --force "+live); count != 1 {
+		t.Fatalf("replayed entry deleted %d times, want exactly one: %q", count, data)
+	}
 }
 
 func TestReaperStopsOldChildBeforeReplay(t *testing.T) {

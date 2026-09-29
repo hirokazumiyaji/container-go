@@ -44,7 +44,7 @@ func cancelReuseReaperHandoffWithGeneration(runner cli.Runner, eng engine, name,
 	if binary == "" {
 		binary = eng.binary()
 	}
-	if err := unregisterReuseHandoffWithGlobalReaper(binary, eng.reaperSubcommand(), name, creation, uid); err != nil {
+	if err := unregisterHandoffWithGlobalReaper(binary, eng.reaperSubcommand(), name, creation, uid); err != nil {
 		return fmt.Errorf("reuse %s: cancel reaper ownership: %w", logicalName, err)
 	}
 	return nil

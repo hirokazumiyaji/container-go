@@ -257,7 +257,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 エラーは `errors.Is`/`errors.As` で判別できる形で返す。
 
-- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
+- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に、選択中 backend に対する liveness probe を追加で実行し、backend のサービスが応答しなかった場合に返す。Apple Container system service と Docker daemon で同じ値を返すため、どちらが落ちていたかはこの値からは判別できない(元の CLI エラーは保持する)。メッセージには backend 固有のヒント(例: `container system start`)を含める
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する

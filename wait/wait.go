@@ -57,11 +57,12 @@ func (o options) effective() (timeout, interval time.Duration) {
 }
 
 // poll runs check every interval until it succeeds, the container
-// stops, or the timeout elapses. When checkRunning is true the poll
-// also probes target.Running between checks and fails fast once the
-// container stopped; strategies whose check itself talks to the
-// container (ForExec) pass false and rely on the final classification
-// below.
+// stops, or the timeout elapses. checkRunning enables the extra
+// target.Running probe: when true the poll samples the state between
+// checks and fails fast as soon as the container stopped; when false
+// the strategy's own check already reaches the container (ForExec) so
+// the probe would only add spawns, and the stopped case is classified
+// once at the termination point below instead.
 func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error, checkRunning bool) error {
 	timeout, interval := o.effective()
 	ctx, cancel := context.WithTimeout(ctx, timeout)
@@ -97,8 +98,9 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			// state checks only inspects the container now, so a
 			// stopped container is still reported accurately.
 			// Probe only after our wait deadline; never override
-			// caller cancellation, and bound the probe so a hung
-			// backend cannot outlive the wait by queryTimeout.
+			// caller cancellation, and bound the probe by
+			// stateCheckInterval so a hung backend cannot outlive
+			// the wait.
 			if !checkRunning && errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				probeCtx, probeCancel := context.WithTimeout(context.WithoutCancel(ctx), stateCheckInterval)
 				running, err := target.Running(probeCtx)

@@ -57,14 +57,19 @@ type engine interface {
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
 	listArgs() []string
-	// parseStoppedManaged extracts, from listArgs output, the IDs of
-	// stopped containers this library created.
+	// parseStoppedManaged extracts, from listArgs output, the
+	// identifiers of stopped containers this library created. The
+	// value is whatever the backend's own deleteArgs accepts, which is
+	// not uniformly an immutable ID: Apple returns container IDs,
+	// Docker's list format is {{.Names}} so it returns names.
 	parseStoppedManaged(data []byte) ([]string, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.
 	listReuseGroupArgs(group string) []string
-	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
-	// output that carry the given reuse group.
+	// parseReuseGroupIDs extracts, from listReuseGroupArgs output, the
+	// identifiers of containers carrying the given reuse group. As
+	// with parseStoppedManaged these are deleteArgs-compatible backend
+	// identifiers, not necessarily immutable IDs.
 	parseReuseGroupIDs(data []byte, group string) ([]string, error)
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.

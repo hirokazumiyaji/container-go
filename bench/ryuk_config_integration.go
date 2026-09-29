@@ -4,6 +4,8 @@ package bench
 
 import (
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -41,29 +43,80 @@ func requireCanonicalTestcontainersConfig(tb testing.TB) string {
 
 	// Set the canonical values explicitly so an inherited false value (or a
 	// property that testcontainers decodes as false) cannot be changed by a
-	// later config read.
-	tb.Setenv("TESTCONTAINERS_RYUK_DISABLED", "false")
-	tb.Setenv("TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED", "false")
-	tb.Setenv("RYUK_VERBOSE", "false")
-	tb.Setenv("TESTCONTAINERS_RYUK_VERBOSE", "false")
+	// later config read. The reaper image is forced to the pinned immutable
+	// reference: the mutable tag the dependency requests by default is only
+	// accepted later because the harness maps it to the same content.
+	for name, value := range canonicalTestcontainersEnvironment() {
+		tb.Setenv(name, value)
+	}
+
+	// The forced environment is held to the same policy as the inherited
+	// one, and the image is checked against the pin directly, so a value that
+	// does not survive forcing fails before anything is measured.
+	if err := validateTestcontainersConfiguration(); err != nil {
+		tb.Fatalf("forced testcontainers configuration was rejected: %v", err)
+	}
+	if err := validateCanonicalRyukImageEnvironment(os.Getenv); err != nil {
+		tb.Fatal(err)
+	}
+	//nolint:staticcheck // verify the dependency's default before starting a reaper.
+	if tc.ReaperDefaultImage != ibench.TestcontainersRyukTag {
+		tb.Fatalf("testcontainers Ryuk default = %q, want pinned tag %q", tc.ReaperDefaultImage, ibench.TestcontainersRyukTag)
+	}
+
+	// ReadConfig memoizes, so it is called once, after the canonical values
+	// are in place, and its result is the configuration the reaper will use.
 	config := tc.ReadConfig()
-	if config.RyukDisabled || config.Config.RyukDisabled || config.RyukPrivileged || config.Config.RyukPrivileged || config.Config.RyukVerbose {
-		tb.Fatal("testcontainers Ryuk must be enabled and non-privileged with verbose logging disabled")
-	}
-	if config.Config.HubImageNamePrefix != "" || config.Config.SessionID == "" {
-		tb.Fatalf("testcontainers image/session configuration was not canonical: prefix=%q session=%q", config.Config.HubImageNamePrefix, config.Config.SessionID)
-	}
-	if config.Config.RyukReconnectionTimeout != 10*time.Second || config.Config.RyukConnectionTimeout != time.Minute {
-		tb.Fatalf("testcontainers Ryuk timeouts are not canonical: reconnection=%s connection=%s", config.Config.RyukReconnectionTimeout, config.Config.RyukConnectionTimeout)
-	}
-	if config.Config.TestcontainersHost != "" || config.Config.Host != "" || config.Config.TLSVerify != 0 || config.Config.CertPath != "" {
-		tb.Fatalf("testcontainers Docker connection overrides are not canonical: host=%q socket=%q tls=%d cert=%q", config.Config.Host, config.Config.TestcontainersHost, config.Config.TLSVerify, config.Config.CertPath)
+	if err := canonicalTestcontainersConfigError(config); err != nil {
+		tb.Fatal(err)
 	}
 	sessionID := strings.TrimSpace(config.Config.SessionID)
 	if !validBenchmarkSessionID(sessionID) {
 		tb.Fatalf("testcontainers generated an invalid reaper session ID %q", sessionID)
 	}
 	return sessionID
+}
+
+// canonicalTestcontainersConfigError reports every resolved setting that does
+// not match the configuration the benchmark records. The deprecated mirror
+// fields are checked alongside the current ones so a release that stops
+// mirroring them cannot let a non-canonical value through.
+func canonicalTestcontainersConfigError(config tc.TestcontainersConfig) error {
+	var problems []string
+	if config.RyukDisabled || config.Config.RyukDisabled {
+		problems = append(problems, "Ryuk must be enabled")
+	}
+	if config.RyukPrivileged || config.Config.RyukPrivileged {
+		problems = append(problems, "Ryuk must be non-privileged")
+	}
+	if config.Config.RyukVerbose {
+		problems = append(problems, "Ryuk verbose logging must be disabled")
+	}
+	if config.Config.HubImageNamePrefix != "" {
+		problems = append(problems, fmt.Sprintf("image name prefix %q must be empty", config.Config.HubImageNamePrefix))
+	}
+	if config.Config.RyukReconnectionTimeout != 10*time.Second {
+		problems = append(problems, fmt.Sprintf("Ryuk reconnection timeout %s must be %s", config.Config.RyukReconnectionTimeout, 10*time.Second))
+	}
+	if config.Config.RyukConnectionTimeout != time.Minute {
+		problems = append(problems, fmt.Sprintf("Ryuk connection timeout %s must be %s", config.Config.RyukConnectionTimeout, time.Minute))
+	}
+	if config.Host != "" || config.Config.Host != "" {
+		problems = append(problems, fmt.Sprintf("Docker host override host=%q config=%q must be empty", config.Host, config.Config.Host))
+	}
+	if config.Config.TestcontainersHost != "" {
+		problems = append(problems, fmt.Sprintf("Docker socket override %q must be empty", config.Config.TestcontainersHost))
+	}
+	if config.TLSVerify != 0 || config.Config.TLSVerify != 0 {
+		problems = append(problems, fmt.Sprintf("Docker TLS verification tls=%d config=%d must be 0", config.TLSVerify, config.Config.TLSVerify))
+	}
+	if config.CertPath != "" || config.Config.CertPath != "" {
+		problems = append(problems, fmt.Sprintf("Docker certificate path cert=%q config=%q must be empty", config.CertPath, config.Config.CertPath))
+	}
+	if len(problems) == 0 {
+		return nil
+	}
+	return errors.New(strings.Join(problems, "; "))
 }
 
 // requireFreshTestcontainersSession verifies that the generated session has

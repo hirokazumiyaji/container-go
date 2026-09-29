@@ -5,26 +5,31 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	ibench "github.com/hirokazumiyaji/container-go/internal/bench"
 	"github.com/magiconair/properties"
 )
 
 // testcontainersBenchmarkOverrides lists every Testcontainers/Ryuk setting
 // that changes the reaper or Docker connection semantics used by this
 // benchmark. Empty values are harmless; non-empty values must equal the
-// canonical value below. DOCKER_HOST and DOCKER_CONTEXT are deliberately not
-// listed here: the Docker provenance capture records and validates those
-// effective selections instead. TESTCONTAINERS_CONFIG is handled separately
-// by testcontainersPropertiesPaths so its effective file is parsed too.
+// canonical value below. The reaper image entries name the pinned reference
+// the benchmark forces before the session starts, so a run cannot fall back
+// to a mutable or substituted image. DOCKER_HOST and DOCKER_CONTEXT are
+// deliberately not listed here: the Docker provenance capture records and
+// validates those effective selections instead. TESTCONTAINERS_CONFIG is
+// handled separately by testcontainersPropertiesPaths so its effective file
+// is parsed too.
 var testcontainersBenchmarkOverrides = map[string]string{
 	"TESTCONTAINERS_RYUK_DISABLED":             "false",
-	"TESTCONTAINERS_RYUK_IMAGE":                "",
+	"TESTCONTAINERS_RYUK_IMAGE":                ibench.PinnedTestcontainersRyukImage,
 	"TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED": "false",
-	"RYUK_IMAGE":                               "",
+	"RYUK_IMAGE":                               ibench.PinnedTestcontainersRyukImage,
 	"RYUK_VERBOSE":                             "false",
 	"TESTCONTAINERS_RYUK_VERBOSE":              "false",
 	"RYUK_RECONNECTION_TIMEOUT":                "10s",
@@ -34,6 +39,10 @@ var testcontainersBenchmarkOverrides = map[string]string{
 	"TESTCONTAINERS_HUB_IMAGE_NAME_PREFIX":     "",
 	"TESTCONTAINERS_SESSION_ID":                "",
 	"RYUK_PORT":                                "",
+	"TESTCONTAINERS_RYUK_PORT":                 "",
+	"TESTCONTAINERS_ALWAYS_PULL_IMAGE":         "false",
+	"TESTCONTAINERS_CHECKS_DISABLE":            "false",
+	"TESTCONTAINERS_DOCKER_SOCKET_PATH":        "",
 	"TESTCONTAINERS_HOST_OVERRIDE":             "",
 	"TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE":    "",
 	"DOCKER_TLS_VERIFY":                        "0",
@@ -43,28 +52,96 @@ var testcontainersBenchmarkOverrides = map[string]string{
 	"DOCKER_CONFIG":                            "",
 }
 
+// testcontainersRyukImageEnvironment names the variables that can select the
+// reaper image. The benchmark forces both to the pinned reference.
+var testcontainersRyukImageEnvironment = []string{"RYUK_IMAGE", "TESTCONTAINERS_RYUK_IMAGE"}
+
+// canonicalTestcontainersEnvironment is the environment the benchmark forces
+// before a Testcontainers session starts, so an inherited value or a
+// property that testcontainers decodes differently cannot change the session
+// that is measured. Every entry has to satisfy the override policy.
+func canonicalTestcontainersEnvironment() map[string]string {
+	forced := map[string]string{
+		"TESTCONTAINERS_RYUK_DISABLED":             "false",
+		"TESTCONTAINERS_RYUK_CONTAINER_PRIVILEGED": "false",
+		"RYUK_VERBOSE":                     "false",
+		"TESTCONTAINERS_RYUK_VERBOSE":      "false",
+		"TESTCONTAINERS_ALWAYS_PULL_IMAGE": "false",
+		"TESTCONTAINERS_CHECKS_DISABLE":    "false",
+	}
+	for _, name := range testcontainersRyukImageEnvironment {
+		forced[name] = ibench.PinnedTestcontainersRyukImage
+	}
+	return forced
+}
+
+// testcontainersRyukImageReferences are the image references a reaper
+// container is allowed to carry. Testcontainers 0.44.0 requests the mutable
+// tag it ships with; releases that honor the image environment use the
+// pinned reference. The content behind either reference is verified, so the
+// reference itself only has to be one the benchmark prepared.
+var testcontainersRyukImageReferences = []string{ibench.TestcontainersRyukTag, ibench.PinnedTestcontainersRyukImage}
+
 // testcontainersPropertiesPaths returns every file that can influence the
 // benchmark's Testcontainers configuration. Older Testcontainers releases
 // read only the home-directory file, while newer/configuration-aware builds
 // may honor TESTCONTAINERS_CONFIG. Checking both paths is fail-closed across
 // those behaviors and also prevents a custom path from bypassing the
 // benchmark's identity checks.
+//
+// Paths are returned as resolved identities, deduplicated, so one file is
+// validated once even when TESTCONTAINERS_CONFIG names it through a symlink
+// or a redundant path. A relative TESTCONTAINERS_CONFIG is refused: it would
+// resolve against the process working directory, which is neither comparable
+// with the default path nor stable for the recorded run.
 func testcontainersPropertiesPaths() ([]string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return nil, fmt.Errorf("resolve testcontainers home directory: %w", err)
 	}
-	defaultPath := filepath.Join(home, ".testcontainers.properties")
-	paths := []string{defaultPath}
-	if configured := os.Getenv("TESTCONTAINERS_CONFIG"); configured != "" {
-		if strings.TrimSpace(configured) != configured {
-			return nil, fmt.Errorf("TESTCONTAINERS_CONFIG must not contain surrounding whitespace")
+	configured := os.Getenv("TESTCONTAINERS_CONFIG")
+	if strings.TrimSpace(configured) != configured {
+		return nil, fmt.Errorf("TESTCONTAINERS_CONFIG must not contain surrounding whitespace")
+	}
+	if configured != "" && !filepath.IsAbs(configured) {
+		return nil, fmt.Errorf("TESTCONTAINERS_CONFIG must be an absolute path, got %q", configured)
+	}
+	paths := make([]string, 0, 2)
+	resolved := make(map[string]struct{}, 2)
+	for _, path := range []string{filepath.Join(home, ".testcontainers.properties"), configured} {
+		if path == "" {
+			continue
 		}
-		if configured != defaultPath {
-			paths = append(paths, configured)
+		canonical, err := canonicalTestcontainersConfigPath(path)
+		if err != nil {
+			return nil, err
 		}
+		if _, duplicate := resolved[canonical]; duplicate {
+			continue
+		}
+		resolved[canonical] = struct{}{}
+		paths = append(paths, canonical)
 	}
 	return paths, nil
+}
+
+// canonicalTestcontainersConfigPath resolves one configuration path to the
+// identity the daemon will read. A path that does not exist yet is
+// canonicalized without link resolution: there is nothing to follow, and the
+// file can still be created before the reaper starts.
+func canonicalTestcontainersConfigPath(path string) (string, error) {
+	absolute, err := filepath.Abs(path)
+	if err != nil {
+		return "", fmt.Errorf("resolve testcontainers configuration path %q: %w", path, err)
+	}
+	linked, err := filepath.EvalSymlinks(absolute)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolve testcontainers configuration path %q: %w", path, err)
+		}
+		return absolute, nil
+	}
+	return linked, nil
 }
 
 func validateTestcontainersConfiguration() error {
@@ -135,6 +212,9 @@ func validateTestcontainersEnvironmentOverride(name, value string) error {
 		}
 		return fmt.Errorf("%s=%q overrides the pinned testcontainers benchmark identity", name, value)
 	}
+	if value == canonical {
+		return nil
+	}
 	if canonical == "false" && strings.EqualFold(value, canonical) {
 		return nil
 	}
@@ -147,10 +227,28 @@ func validateTestcontainersEnvironmentOverride(name, value string) error {
 			return nil
 		}
 	}
-	if name == "DOCKER_TLS_VERIFY" && value == canonical {
-		return nil
-	}
 	return fmt.Errorf("%s=%q overrides the pinned testcontainers benchmark identity (want %q)", name, value, canonical)
+}
+
+// validateCanonicalRyukImageEnvironment proves the reaper image the process
+// will hand to Testcontainers is the pinned reference. The preflight forces
+// the values, and this check refuses to record a result if a forced value
+// did not survive.
+func validateCanonicalRyukImageEnvironment(getenv func(string) string) error {
+	for _, name := range testcontainersRyukImageEnvironment {
+		if value := getenv(name); value != ibench.PinnedTestcontainersRyukImage {
+			return fmt.Errorf("%s=%q is not the pinned Ryuk image %q", name, value, ibench.PinnedTestcontainersRyukImage)
+		}
+	}
+	return nil
+}
+
+// validRyukImageReference reports whether a reaper container may carry this
+// image reference. The content is verified separately, by image ID and
+// resolved digest, so the mutable tag is accepted only because the harness
+// maps it to the pinned image first.
+func validRyukImageReference(reference string) bool {
+	return slices.Contains(testcontainersRyukImageReferences, reference)
 }
 
 // validateTestcontainersProperties uses the same magiconair/properties parser
@@ -185,7 +283,7 @@ func validateTestcontainersProperty(key, value string) error {
 		return nil
 	}
 	switch key {
-	case "ryuk.disabled", "ryuk.container.privileged", "ryuk.verbose":
+	case "ryuk.disabled", "ryuk.container.privileged", "ryuk.verbose", "always.pull.image", "checks.disable":
 		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
 		if err != nil || parsed {
 			return fmt.Errorf(".testcontainers.properties %s=%q overrides the pinned benchmark identity", key, value)
@@ -204,7 +302,7 @@ func validateTestcontainersProperty(key, value string) error {
 		if err != nil || duration != want {
 			return fmt.Errorf(".testcontainers.properties %s=%q overrides the pinned benchmark identity", key, value)
 		}
-	case "docker.host", "docker.cert.path", "hub.image.name.prefix", "session.id", "tc.host", "ryuk.container.image":
+	case "docker.host", "docker.cert.path", "docker.socket.path", "hub.image.name.prefix", "session.id", "tc.host", "ryuk.container.image":
 		return fmt.Errorf(".testcontainers.properties %s=%q overrides the pinned benchmark identity", key, value)
 	}
 	return nil

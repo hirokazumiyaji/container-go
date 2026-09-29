@@ -199,9 +199,14 @@ Variables to keep fixed across comparison runs:
 - the pinned testcontainers Ryuk image and digest:
   `testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0`
   (`sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0`).
-  The harness verifies the actual running reaper container's image ID and
-  digest behind testcontainers-go's `testcontainers/ryuk:0.14.0` request
-  before recording a result. It rejects all fixed reaper/session/image
+  Before the session starts, the harness forces `RYUK_IMAGE` and
+  `TESTCONTAINERS_RYUK_IMAGE` to that reference and refuses to continue
+  unless the effective values still are the pin. testcontainers-go 0.44.0
+  requests `testcontainers/ryuk:0.14.0` instead, so the harness maps that
+  tag to the pinned content first and then verifies the running reaper
+  container's image ID and repository digest. Either reference is accepted
+  only because both are checked against the pin; a reaper carrying any
+  other image fails closed. It rejects all fixed reaper/session/image
   overrides before startup rather than recording a different reaper.
 - `workload_cache_state` (`cold` or `warm`) for every result and the
   independent `cache_state` (`cold` or `warm`) for `tc/session-init`
@@ -221,15 +226,25 @@ cache state (the default is `auto`). Before any reaper is started, the
 benchmark checks both the default properties file and the effective
 `TESTCONTAINERS_CONFIG` path, parsing them with testcontainers-go's
 Java-properties parser (including escaped keys, whitespace separators, and
-backslash continuations). It rejects behavior-affecting Ryuk, Docker,
-timeout, socket, image-prefix, session, and reaper-image settings,
-including `TESTCONTAINERS_RYUK_IMAGE` and the
-`ryuk.container.image` property, plus `RYUK_PORT`, Ryuk timeout/verbose/
-privilege settings, Docker socket/TLS/API/auth settings, image-prefix, and
-session overrides. The generated session is checked for an
-existing reaper, then the actual reaper image ID and digest are verified
-before a result is recorded as `env.reaper_session_id`; a fixed/shared
-session or image identity fails closed.
+backslash continuations). Configuration paths are compared as resolved
+identities: a symlink, a redundant path segment, or a repeated entry is
+validated once, and a relative `TESTCONTAINERS_CONFIG` is refused because it
+would resolve against the process working directory. It rejects
+behavior-affecting Ryuk, Docker, timeout, socket, image-prefix, session, and
+reaper-image settings, including `TESTCONTAINERS_RYUK_IMAGE` and the
+`ryuk.container.image` property, plus `RYUK_PORT` and its
+`TESTCONTAINERS_RYUK_PORT` alias, the always-pull and checks-disable
+switches (`TESTCONTAINERS_ALWAYS_PULL_IMAGE`, `TESTCONTAINERS_CHECKS_DISABLE`,
+`always.pull.image`, `checks.disable`), `TESTCONTAINERS_DOCKER_SOCKET_PATH`
+and `docker.socket.path`, Ryuk timeout/verbose/privilege settings, Docker
+socket/TLS/API/auth settings, image-prefix, and session overrides. After
+forcing the canonical values, the resolved configuration read back from
+testcontainers-go is asserted before the first measurement, so a property or
+environment value that survives validation cannot change the session that is
+measured. The generated session is checked for an existing reaper, then the
+actual reaper image ID and digest are verified before a result is recorded as
+`env.reaper_session_id`; a fixed/shared session or image identity fails
+closed.
 
 ## Baseline (2026-08-29, commit `11b7b8a6fb88d65806141fd6d19befe3772c0b6a`, after #18: pull singleflight + `--pull=never`)
 

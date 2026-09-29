@@ -39,8 +39,16 @@ func killReaperProcess(cmd *exec.Cmd, pgid int) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
+	if pgid <= 0 {
+		// A process can be observed between fork and exec. Recheck the
+		// group identity at signal time rather than either dropping the
+		// descendants or signalling an unverified numeric ID.
+		if current, err := syscall.Getpgid(cmd.Process.Pid); err == nil && current == cmd.Process.Pid {
+			pgid = current
+		}
+	}
 	if pgid > 0 {
-		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil || errors.Is(err, syscall.ESRCH) {
 			return
 		}
 		// Fall through to the direct handle.

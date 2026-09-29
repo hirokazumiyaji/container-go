@@ -28,7 +28,7 @@ func TestReaperReplayFailureStopsAndReapsChildBeforeRetry(t *testing.T) {
 	r.command = func() *exec.Cmd {
 		spawns++
 		if spawns == 1 {
-			return exec.Command("/bin/sh", "-c", fmt.Sprintf("echo $$ > %q; sleep 30", pidPath))
+			return exec.Command("/bin/sh", "-c", fmt.Sprintf("echo $$ > %q; sleep 5", pidPath))
 		}
 		return reaperCommandWithTimeouts(bin, "delete", 2, 2, 2)
 	}

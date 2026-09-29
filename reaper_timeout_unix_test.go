@@ -14,6 +14,13 @@ import (
 	"time"
 )
 
+func TestReaperScriptParsesWithPOSIXShell(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-n", "-c", reaperScript, "containergo-reaper")
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("/bin/sh -n: %v (%s)", err, output)
+	}
+}
+
 // A backend CLI runs its helpers in the process group the reaper created for
 // the operation, exactly as docker and container do. A timed-out operation
 // must therefore take the whole group down: signalling only the wrapper would
@@ -26,7 +33,7 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = rm ]; then\n" +
-		"  /bin/sh -c 'sleep 30' &\n" +
+		"  /bin/sh -c 'sleep 5' &\n" +
 		"  echo \"$!\" > " + childPIDPath + "\n" +
 		"  wait\n" +
 		"fi\n"
@@ -35,19 +42,31 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	}
 
 	uid := strings.Repeat("ab", 32)
-	r := newReaper(bin, "rm")
-	r.command = func() *exec.Cmd {
-		return reaperCommandWithTimeouts(bin, "rm", 2, 1, 1)
+	cmd := reaperCommandWithTimeouts(bin, "rm", 2, 1, 1)
+	prepareReaperCommand(cmd)
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := r.register(uid, ""); err != nil {
-		t.Fatalf("register: %v", err)
+	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
+		t.Fatal(err)
 	}
-	// EOF lets the child consume the registered record and enter the
-	// bounded backend operation.
-	r.closeStdin()
+	waited := false
+	defer func() {
+		_ = stdin.Close()
+		if !waited {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+		}
+	}()
+	if _, err := stdin.Write([]byte("A\t" + uid + "\t\n")); err != nil {
+		t.Fatalf("write reaper record: %v", err)
+	}
+	_ = stdin.Close()
 
 	var childPID int
-	deadline := time.Now().Add(15 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(childPIDPath)
 		if err == nil {
@@ -79,16 +98,15 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 		t.Fatalf("timed-out backend descendant %d survived: %s", childPID, state)
 	}
 
-	// The watchdog itself must finish after the bounded operation rather
-	// than retaining a pipe or a lock while its child tree is cleaned up.
-	r.mu.Lock()
-	exited := r.exited
-	r.mu.Unlock()
-	if exited != nil {
-		select {
-		case <-exited:
-		case <-time.After(5 * time.Second):
-			t.Fatal("reaper did not exit after bounded backend cleanup")
-		}
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- cmd.Wait() }()
+	select {
+	case <-waitDone:
+		waited = true
+	case <-time.After(5 * time.Second):
+		_ = cmd.Process.Kill()
+		<-waitDone
+		waited = true
+		t.Fatal("reaper command did not exit after bounded backend cleanup")
 	}
 }

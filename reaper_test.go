@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -808,6 +809,67 @@ func TestRunPreRegistrationPreservesNameConflict(t *testing.T) {
 				time.Sleep(20 * time.Millisecond)
 			}
 		})
+	}
+}
+
+func TestReaperScriptDashWithoutJobControlKeepsProcessingEntries(t *testing.T) {
+	if _, err := os.Stat("/bin/dash"); err != nil {
+		t.Skipf("/bin/dash unavailable: %v", err)
+	}
+	dir := t.TempDir()
+	binPath := filepath.Join(dir, "container")
+	logPath := filepath.Join(dir, "calls.log")
+	if err := os.WriteFile(binPath, []byte("#!/bin/sh\necho \"$@\" >> "+logPath+"\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	awkPath, err := trustedReaperTool("awk")
+	if err != nil {
+		t.Skipf("awk unavailable: %v", err)
+	}
+	sleepPath, err := trustedReaperTool("sleep")
+	if err != nil {
+		t.Skipf("sleep unavailable: %v", err)
+	}
+	psPath, err := trustedReaperTool("ps")
+	if err != nil {
+		t.Skipf("ps unavailable: %v", err)
+	}
+	trPath, err := trustedReaperTool("tr")
+	if err != nil {
+		t.Skipf("tr unavailable: %v", err)
+	}
+	rmPath, err := trustedReaperTool("rm")
+	if err != nil {
+		t.Skipf("rm unavailable: %v", err)
+	}
+	pgrepPath, err := trustedReaperTool("pgrep")
+	if err != nil {
+		t.Skipf("pgrep unavailable: %v", err)
+	}
+	statusDir := t.TempDir()
+	cmd := exec.Command("/bin/dash", "-c", reaperScript,
+		"containergo-reaper", binPath, "delete", creationLabel, "1", "1",
+		awkPath, sleepPath, "", "", rmPath, "dash-test", "main",
+		psPath, trPath, statusDir, "lockf", pgrepPath, "")
+	group, err := newReaperGroupOwner()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepareReaperCommand(cmd, group)
+	cmd.Stdin = strings.NewReader("first\nlater\n")
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("reaper script: %v", err)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"delete --force first", "delete --force later"} {
+		if !strings.Contains(string(data), want) {
+			t.Fatalf("calls = %q, want %q", data, want)
+		}
 	}
 }
 

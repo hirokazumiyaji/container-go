@@ -96,11 +96,37 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
-
-	mu    sync.Mutex
+	//
+	// It is promoted from a verified inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
 	uidMu sync.RWMutex
-	info  *engineInfo // cached first inspect; immutable fields only
+
+	mu   sync.Mutex
+	info *engineInfo // cached first inspect; immutable fields only
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -163,7 +189,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := classifyErrorFor(ctx, cfg.runner, err, cfg.eng, "run", cfg.name)
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 
@@ -184,8 +212,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if uid := c.immutableUID(); uid != "" {
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
 		} else {
 			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -210,52 +238,66 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create, and reports whether it succeeded.
+//
+// It never deletes a pre-existing same-name container: name conflicts are
+// skipped, and only a container carrying this process's managed+session labels
+// is removed. When the creation generation is known it must also match. Those
+// skips are successes, because there is nothing of ours left to remove.
+//
+// Every other failure is returned, so the caller can tell a caller-visible
+// "the container is still there" apart from a silent best-effort attempt. A
+// container that cannot even be inspected may still exist, so that case is a
+// failure too rather than an assumption that it is gone.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflictForTarget(runErr, cfg.name) || cfg.eng.nameConflictForTarget(classified, cfg.name) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("lock name for cleanup: %w", err)
 	}
 	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
 	if err != nil {
-		return
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		if isNotFoundForOperation(cfg.eng, err, "inspect", cfg.name) {
+			return nil
+		}
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.creation != "" {
 		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
+			return nil
 		}
 	}
 	target := cfg.name
 	if cfg.eng.name() == "docker" {
 		if info.uid == "" {
-			return
+			return fmt.Errorf("inspect before cleanup: no immutable Docker ID")
 		}
 		target = info.uid
 	} else if info.uid != "" {
@@ -263,7 +305,19 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
+		// The container passed the ownership checks, so it exists and is
+		// ours. A failure here means it is still running.
+		deleteOp := "delete"
+		if cfg.eng.name() == "docker" {
+			deleteOp = "rm"
+		}
+		if isNotFoundForOperation(cfg.eng, err, deleteOp, target, cfg.name) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", target, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -300,24 +354,20 @@ func (c *Container) operationTarget() string {
 	return c.id
 }
 
+// immutableUID returns the Docker immutable ID, or "" on name-based backends.
 func (c *Container) immutableUID() string {
 	if c.eng == nil || c.eng.name() != "docker" {
 		return ""
 	}
-	c.uidMu.RLock()
-	defer c.uidMu.RUnlock()
-	return c.uid
+	return c.immutableID()
 }
 
+// setImmutableUID promotes a Docker immutable ID. Name-based backends ignore it.
 func (c *Container) setImmutableUID(uid string) {
-	if uid == "" || c.eng == nil || c.eng.name() != "docker" {
+	if c.eng == nil || c.eng.name() != "docker" {
 		return
 	}
-	c.uidMu.Lock()
-	if c.uid == "" {
-		c.uid = uid
-	}
-	c.uidMu.Unlock()
+	c.setImmutableID(uid)
 }
 
 func (c *Container) dockerGenerationMatches(info *engineInfo) bool {

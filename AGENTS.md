@@ -27,6 +27,8 @@ Add focused regression tests beside changed code. Unit tests should use the repo
 
 Use concise, imperative commit subjects such as `Add ...`, `Extract ...`, or `docs: ...`. PRs should explain the behavior change, identify affected backends or platforms, link related issues when applicable, and list the verification commands run.
 
+Never let a worktree branch inherit an upstream it did not create. `git worktree add -b <new> <path> origin/main` makes the new branch track `origin/main`, so a later `git push -u origin <new>` resolves the refspec against that upstream and pushes onto `main`, bypassing review. Push new branches with an explicit refspec (`git push origin <new>:refs/heads/<new>`), and confirm `git rev-parse --abbrev-ref '@{upstream}'` before relying on `-u`. A `[skip ci]` marker hides this mistake: CI never runs on the direct push, so nothing flags it.
+
 ## Security and Configuration
 
 Never commit credentials or environment files. Configure backend selection with `CONTAINERGO_BACKEND` and use the backend CLI’s own authentication and host settings. Keep integration-only configuration local to the developer environment.

@@ -429,10 +429,14 @@ func killReaperProcessRefContext(ctx context.Context, ref reaperProcessRef) erro
 // external killer can still release it, so the retained start identity is
 // revalidated under a fresh budget before any numeric signal.
 func killReaperStoppedRefs(refs []reaperProcessRef) error {
+	ctx, cancel := context.WithTimeout(context.Background(), reaperSignalTimeout)
+	defer cancel()
+	return killReaperStoppedRefsContext(ctx, refs)
+}
+
+func killReaperStoppedRefsContext(ctx context.Context, refs []reaperProcessRef) error {
 	var errs []error
 	seen := make(map[int]struct{}, len(refs))
-	forceCtx, cancel := context.WithTimeout(context.Background(), reaperSignalTimeout)
-	defer cancel()
 	for _, ref := range refs {
 		if ref.pid <= 0 {
 			errs = append(errs, fmt.Errorf("invalid stopped process pid %d", ref.pid))
@@ -443,17 +447,21 @@ func killReaperStoppedRefs(refs []reaperProcessRef) error {
 		}
 		seen[ref.pid] = struct{}{}
 
-		// The retained numeric PID is not a safe signal target after an
-		// external kill, so always revalidate start identity under the fresh
-		// force budget before signaling.
-		matches, matchErr := reaperProcessRefMatchesContext(forceCtx, ref)
+		matches, matchErr := reaperProcessRefMatchesContext(ctx, ref)
+		contextExpired := errors.Is(matchErr, context.DeadlineExceeded) || errors.Is(matchErr, context.Canceled)
 		if matchErr != nil {
-			if !reaperProcessRefGone(matchErr) {
-				errs = append(errs, fmt.Errorf("verify stopped process %d: %w", ref.pid, matchErr))
+			if reaperProcessRefGone(matchErr) {
+				continue
 			}
-			continue
-		}
-		if !matches {
+			if !contextExpired {
+				errs = append(errs, fmt.Errorf("verify stopped process %d: %w", ref.pid, matchErr))
+				continue
+			}
+			// The SIGSTOP succeeded before the identity context expired. A
+			// stopped process cannot exit or be recycled on its own, so the
+			// retained handle/reserved PID is the only way to guarantee that
+			// it is not left permanently stopped.
+		} else if !matches {
 			continue
 		}
 		var err error

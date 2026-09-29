@@ -64,6 +64,32 @@ func TestKillReaperStoppedRefsReapsQuiescedChild(t *testing.T) {
 	}
 }
 
+func TestKillReaperStoppedRefsSignalsAfterContextExpiry(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	ref, err := captureReaperProcessIdentityContext(context.Background(), cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("capture child identity: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop child: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := killReaperStoppedRefsContext(ctx, []reaperProcessRef{ref}); err != nil {
+		t.Fatalf("kill stopped refs after expiry: %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("stopped child exited successfully; want SIGKILL")
+	}
+}
+
 func TestReaperProcessStartTimeIdentifiesCurrentProcess(t *testing.T) {
 	start, err := reaperProcessStartTime(context.Background(), os.Getpid())
 	if err != nil {

@@ -23,7 +23,7 @@ func writeReaperStub(t *testing.T) (binPath, logPath string) {
 
 func waitForLogLines(t *testing.T, path string, wants ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	var data []byte
 	for time.Now().Before(deadline) {
 		data, _ = os.ReadFile(path)

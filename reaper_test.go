@@ -43,6 +43,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	one := strings.Repeat("1", 64)
@@ -117,6 +118,7 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 }
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	before := strings.Repeat("a", 64)
@@ -159,6 +161,7 @@ func TestBreQuoteEscapesLabelKey(t *testing.T) {
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
@@ -172,6 +175,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -184,6 +188,7 @@ func TestReaperRegisterWithCreationValidation(t *testing.T) {
 }
 
 func TestReaperGuardsDeleteByCreation(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Helper()
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -216,6 +221,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 }
 
 func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"
@@ -251,6 +257,7 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 }
 
 func TestReaperDeletesByImmutableID(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/docker"

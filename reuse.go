@@ -303,8 +303,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, withCleanupError(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	ctr := &Container{

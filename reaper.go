@@ -201,7 +201,8 @@ run_with_timeout() (
       "$sleep_bin" 0.01
       pid_tries=$((pid_tries + 1))
     done
-    entry_pid=$(cat "$entry_pid_path" 2>/dev/null) || entry_pid=
+    entry_pid=
+    IFS= read -r entry_pid <"$entry_pid_path" 2>/dev/null || entry_pid=
     case "$entry_pid" in
       ''|*[!0-9]*) timeout_command_pid=$launched_pid;;
       *) timeout_command_pid=$entry_pid;;

@@ -818,10 +818,19 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if !strings.Contains(reaperScript, "set +m") || !strings.Contains(reaperScript, "run_with_timeout() (") {
 		t.Error("reaper script must keep helpers in a killable process tree")
 	}
-	for _, forbidden := range []string{"mktemp", "sed -n", "pgrep -P", "ps -o"} {
+	for _, forbidden := range []string{"mktemp", "sed -n", "ps -o"} {
 		if strings.Contains(reaperScript, forbidden) {
 			t.Errorf("reaper script must not depend on %q", forbidden)
 		}
+	}
+	if !strings.Contains(reaperScript, `"$pgrep_bin" -P`) {
+		t.Error("reaper script must use the trusted pgrep path for descendant cleanup")
+	}
+	if !strings.Contains(reaperScript, `[ "$target_pgid" = "$timeout_command_pid" ]`) {
+		t.Error("reaper script must not signal a process group the target does not own")
+	}
+	if !strings.Contains(reaperScript, `"$setsid_bin" /bin/sh -c`) {
+		t.Error("reaper script must use a private process group when setsid is available")
 	}
 	if !strings.Contains(reaperScript, `$1 == "P"`) || !strings.Contains(reaperScript, `$1 == "C"`) {
 		t.Error("reaper script must retain pending create state until completion")

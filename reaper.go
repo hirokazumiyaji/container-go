@@ -61,11 +61,15 @@ if [ "${12:-}" = locked ]; then
   tr_bin="${17:-}"
   status_dir="${18:-}"
   lock_kind="${19:-lockf}"
+  pgrep_bin="${20:-}"
+  setsid_bin="${21:-}"
 else
   ps_bin="${13:-}"
   tr_bin="${14:-}"
   status_dir="${15:-}"
   lock_kind="${16:-lockf}"
+  pgrep_bin="${17:-}"
+  setsid_bin="${18:-}"
 fi
 inspect_marker=__containergo_reaper_inspect_rc__
 case "$timeout" in ''|*[!0-9]*) timeout=30;; esac
@@ -133,15 +137,50 @@ run_entry() {
   done
 }
 
+# Some /bin/sh implementations cannot create a job process group without a
+# tty. Use a trusted setsid helper when available; the wrapper publishes its
+# own PID so an implementation that forks is still addressable.
+entry_script='
+entry_status_path=$1
+entry_pid_path=$2
+entry_sleep_bin=$3
+shift 3
+printf "%s\n" "$$" >"$entry_pid_path" || exit 1
+"$@"
+entry_rc=$?
+printf "%s\n" "$entry_rc" >"$entry_status_path"
+while :; do
+  "$entry_sleep_bin" 3600
+done
+'
+
+kill_descendants() {
+  descendant_children=
+  if [ -n "$pgrep_bin" ] && [ -x "$pgrep_bin" ]; then
+    descendant_children=$("$pgrep_bin" -P "$1" 2>/dev/null) || descendant_children=
+  fi
+  for descendant_pid in $descendant_children; do
+    kill_descendants "$descendant_pid"
+    kill -KILL "$descendant_pid" 2>/dev/null || true
+  done
+}
+
 kill_entry_target() {
   target_pgid=
   if [ -n "$ps_bin" ] && [ -x "$ps_bin" ] && [ -n "$tr_bin" ] && [ -x "$tr_bin" ]; then
     target_pgid=$("$ps_bin" -o pgid= -p "$timeout_command_pid" 2>/dev/null | "$tr_bin" -d '[:space:]') || target_pgid=
   fi
   case "$target_pgid" in
-    ''|*[!0-9]*) target_pgid=$timeout_command_pid;;
+    ''|*[!0-9]*) target_pgid=;;
   esac
-  kill -KILL -"$target_pgid" 2>/dev/null || kill -KILL "$timeout_command_pid" 2>/dev/null || true
+  # set -m cannot create a job process group on every /bin/sh (dash
+  # reports "can't access tty"). Only signal a negative PGID that the
+  # target actually owns; otherwise the reaper's own group would be killed.
+  if [ -n "$target_pgid" ] && [ "$target_pgid" = "$timeout_command_pid" ] && kill -KILL -"$target_pgid" 2>/dev/null; then
+    return
+  fi
+  kill_descendants "$timeout_command_pid"
+  kill -KILL "$timeout_command_pid" 2>/dev/null || true
 }
 
 run_with_timeout() (
@@ -150,11 +189,29 @@ run_with_timeout() (
   entry_label="$2"
   shift 2
   entry_status_path="$status_dir/$run_prefix-$entry_label"
+  entry_pid_path="$status_dir/$run_prefix-$entry_label.pid"
   : >"$entry_status_path" 2>/dev/null || exit 1
-  set -m
-  entry_status_path="$entry_status_path"
-  run_entry "$@" 3>&- &
-  timeout_command_pid=$!
+  : >"$entry_pid_path" 2>/dev/null || exit 1
+  if [ "$entry_label" = delete ] && [ -n "$setsid_bin" ] && [ -x "$setsid_bin" ]; then
+    "$setsid_bin" /bin/sh -c "$entry_script" containergo-entry \
+      "$entry_status_path" "$entry_pid_path" "$sleep_bin" "$@" 3>&- &
+    launched_pid=$!
+    pid_tries=0
+    while [ ! -s "$entry_pid_path" ] && [ "$pid_tries" -lt 20 ]; do
+      "$sleep_bin" 0.01
+      pid_tries=$((pid_tries + 1))
+    done
+    entry_pid=$(cat "$entry_pid_path" 2>/dev/null) || entry_pid=
+    case "$entry_pid" in
+      ''|*[!0-9]*) timeout_command_pid=$launched_pid;;
+      *) timeout_command_pid=$entry_pid;;
+    esac
+  else
+    set -m
+    entry_status_path="$entry_status_path"
+    run_entry "$@" 3>&- &
+    timeout_command_pid=$!
+  fi
   (
     timeout_sleep_pid=
     cleanup_timeout_killer() {
@@ -190,7 +247,7 @@ run_with_timeout() (
   kill_entry_target
   wait "$timeout_command_pid" 2>/dev/null || true
   if [ -n "$rm_bin" ] && [ -x "$rm_bin" ]; then
-    "$rm_bin" -f "$entry_status_path" 2>/dev/null || true
+    "$rm_bin" -f "$entry_status_path" "$entry_pid_path" 2>/dev/null || true
   fi
   exit "$entry_rc"
 )
@@ -271,12 +328,12 @@ run_locked() {
   if [ "$lock_kind" = flock ]; then
     "$lockf_bin" -x -w 30 "$locked_path" /bin/sh -c "$CONTAINERGO_REAPER_SCRIPT" \
       containergo-reaper-locked "$bin" "$sub" "$key" "$timeout" "$pending_attempts" \
-      "$awk_bin" "$sleep_bin" "$lockf_bin" "$lock_dir" "$rm_bin" "$run_prefix" locked "$locked_id" "$locked_creation" "$locked_state" "$ps_bin" "$tr_bin" "$status_dir" "$lock_kind" \
+      "$awk_bin" "$sleep_bin" "$lockf_bin" "$lock_dir" "$rm_bin" "$run_prefix" locked "$locked_id" "$locked_creation" "$locked_state" "$ps_bin" "$tr_bin" "$status_dir" "$lock_kind" "$pgrep_bin" "$setsid_bin" \
       >/dev/null 2>&1 || true
   else
     "$lockf_bin" -k -w -t 30 "$locked_path" /bin/sh -c "$CONTAINERGO_REAPER_SCRIPT" \
       containergo-reaper-locked "$bin" "$sub" "$key" "$timeout" "$pending_attempts" \
-      "$awk_bin" "$sleep_bin" "$lockf_bin" "$lock_dir" "$rm_bin" "$run_prefix" locked "$locked_id" "$locked_creation" "$locked_state" "$ps_bin" "$tr_bin" "$status_dir" "$lock_kind" \
+      "$awk_bin" "$sleep_bin" "$lockf_bin" "$lock_dir" "$rm_bin" "$run_prefix" locked "$locked_id" "$locked_creation" "$locked_state" "$ps_bin" "$tr_bin" "$status_dir" "$lock_kind" "$pgrep_bin" "$setsid_bin" \
       >/dev/null 2>&1 || true
   fi
 }
@@ -1004,6 +1061,8 @@ func (r *reaper) startProcessLocked() (*exec.Cmd, io.WriteCloser, <-chan struct{
 	rmPath, _ := trustedReaperTool("rm")
 	psPath, _ := trustedReaperTool("ps")
 	trPath, _ := trustedReaperTool("tr")
+	pgrepPath, _ := trustedReaperTool("pgrep")
+	setsidPath, _ := trustedReaperTool("setsid")
 	lockDir := os.TempDir()
 	statusDir := ""
 	var err error
@@ -1022,7 +1081,7 @@ func (r *reaper) startProcessLocked() (*exec.Cmd, io.WriteCloser, <-chan struct{
 			"/bin/sh", "-c", reaperScript, "containergo-reaper",
 			r.binary, r.subcommand, creationLabel,
 			strconv.Itoa(timeout), strconv.Itoa(pendingAttempts),
-			awkPath, sleepPath, lockBin, lockDir, rmPath, runPrefix, "main", psPath, trPath, statusDir, lockKind,
+			awkPath, sleepPath, lockBin, lockDir, rmPath, runPrefix, "main", psPath, trPath, statusDir, lockKind, pgrepPath, setsidPath,
 		)
 		env := make([]string, 0, len(os.Environ())+1)
 		for _, value := range os.Environ() {

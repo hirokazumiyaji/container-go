@@ -437,13 +437,8 @@ func killReaperStoppedRefs(refs []reaperProcessRef) error {
 func killReaperStoppedRefsContext(ctx context.Context, refs []reaperProcessRef) error {
 	var errs []error
 	seen := make(map[int]struct{}, len(refs))
-	var forceCtx context.Context
-	var forceCancel context.CancelFunc
-	defer func() {
-		if forceCancel != nil {
-			forceCancel()
-		}
-	}()
+	forceCtx, forceCancel := context.WithTimeout(context.Background(), reaperSignalTimeout)
+	defer forceCancel()
 	for _, ref := range refs {
 		if ref.pid <= 0 {
 			errs = append(errs, fmt.Errorf("invalid stopped process pid %d", ref.pid))
@@ -456,9 +451,6 @@ func killReaperStoppedRefsContext(ctx context.Context, refs []reaperProcessRef) 
 
 		matches, matchErr := reaperProcessRefMatchesContext(ctx, ref)
 		if errors.Is(matchErr, context.DeadlineExceeded) || errors.Is(matchErr, context.Canceled) {
-			if forceCtx == nil {
-				forceCtx, forceCancel = context.WithTimeout(context.Background(), reaperSignalTimeout)
-			}
 			matches, matchErr = reaperProcessRefMatchesContext(forceCtx, ref)
 		}
 		if matchErr != nil {

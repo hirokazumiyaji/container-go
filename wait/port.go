@@ -13,12 +13,12 @@ import (
 var (
 	// ErrInvalidPort reports a port declaration that is not valid
 	// syntax. It is a configuration error, not a readiness failure.
-	ErrInvalidPort = errors.New("wait: invalid port")
+	ErrInvalidPort = errors.New("invalid port")
 	// ErrUnsupportedProtocol reports a port declaration whose protocol
 	// this strategy cannot probe. ForListeningPort dials TCP, so a
 	// UDP-only service is rejected instead of consuming a whole
 	// startup timeout on a dial that can never succeed.
-	ErrUnsupportedProtocol = errors.New("wait: unsupported port protocol")
+	ErrUnsupportedProtocol = errors.New("unsupported port protocol")
 )
 
 // HostPortStrategy waits until a TCP connection to the container's
@@ -36,7 +36,9 @@ func ForListeningPort(port string) *HostPortStrategy {
 }
 
 // ForExposedPort waits on the first port declared via
-// WithExposedPorts.
+// WithExposedPorts. The declaration is resolved by the container, so a
+// UDP-first container is not rejected here; the strategy still dials
+// TCP only.
 func ForExposedPort() *HostPortStrategy {
 	return &HostPortStrategy{}
 }
@@ -70,9 +72,11 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) er
 }
 
 // validatePort rejects a declaration this strategy cannot probe before
-// polling starts, so a misconfigured port costs no startup timeout. An
-// empty port means "the first declared port", which the container
-// resolves, so it is left alone.
+// polling starts, so a misconfigured port costs no startup timeout. The
+// grammar mirrors the container's own port parsing; the two are kept in
+// step by the invalid-syntax cases below rather than by sharing code,
+// which this package cannot do. An empty port means "the first declared
+// port", which only the container can resolve, so it is left alone.
 func (s *HostPortStrategy) validatePort() error {
 	if s.port == "" {
 		return nil

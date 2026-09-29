@@ -110,6 +110,29 @@ func registerContainerReaper(cfg *config, c *Container) {
 	registerWithGlobalReaper(bin, subcommand, c.id, c.creation)
 }
 
+// unregisterContainerReaper withdraws a watchdog target after a guarded
+// non-force delete has completed or refused. In particular, a refusal can
+// mean that the generation started after the stopped-state revalidation; an
+// active entry must not turn that refusal into a later force-delete when the
+// parent exits.
+func unregisterContainerReaper(cfg *config, c *Container) {
+	bin, ok := reaperBinaryFor(cfg)
+	if !ok || c == nil {
+		return
+	}
+	subcommand := cfg.eng.reaperSubcommand()
+	if usesImmutableIDs(cfg.eng) {
+		uid := c.immutableID()
+		if dockerIDRE.MatchString(uid) {
+			discardPendingWithGlobalReaper(bin, subcommand, uid, "")
+		}
+		return
+	}
+	if nameRE.MatchString(c.id) && creationRE.MatchString(c.creation) {
+		discardPendingWithGlobalReaper(bin, subcommand, c.id, c.creation)
+	}
+}
+
 // recoverDockerRunOutput handles a successful or failed Docker run whose
 // stdout did not contain a usable full container ID. Docker may have
 // created the container before the output was truncated or malformed, so
@@ -160,10 +183,10 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
+	// A reuse generation is shared state. Refuse running, stopping,
+	// unknown, or otherwise unverifiable generations before adding an
+	// automatic-delete target to the reaper.
 	if cfg.reuse {
-		// A reuse generation is shared state. Refuse running, stopping,
-		// unknown, or otherwise unverifiable generations before adding an
-		// automatic-delete target to the reaper.
 		if info.state == StateRunning {
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name))
 		}
@@ -171,17 +194,27 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state))
 		}
 	}
-	// Register only after the ownership/state refusals above. If rm fails,
-	// the reaper still owns the verified UID and can retry after the process
-	// exits.
-	registerContainerReaper(cfg, ctr)
-	if cfg.reuse {
-		// A reuse generation can be adopted or replaced between the
-		// recovery lookup and the delete. Reinspect the name immediately
-		// before the delete and require the same owned UID and a
-		// stopped/created state; the delete then runs without --force so a
-		// concurrent start is reported instead of killed.
-		fresh, freshErr := ctr.inspectTargetFreshRetry(delCtx, cfg.name)
+	if info.state == StateUnknown || info.state == "" {
+		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation state is %s; refusing automatic deletion", cfg.name, info.state))
+	}
+
+	// A stopped or created generation is guarded: revalidate it immediately
+	// before registering and deleting. A generation that starts in this
+	// window must not be upgraded to a force delete merely because an older
+	// watchdog entry was installed.
+	guarded := cfg.reuse || info.state == StateStopped || info.state == StateCreated
+	if guarded {
+		var fresh *engineInfo
+		var freshErr error
+		if cfg.reuse {
+			// Reuse is name-addressed for adoption purposes, so inspect the
+			// name to detect a peer replacing the generation under us.
+			fresh, freshErr = ctr.inspectTargetFreshRetry(delCtx, cfg.name)
+		} else {
+			// Ordinary recovery has an immutable UID; rechecking that UID
+			// avoids a name lookup while preserving the ownership check.
+			fresh, freshErr = ctr.inspectTargetFreshRetry(delCtx, ctr.immutableID())
+		}
 		if isNotFound(freshErr) {
 			return nil, cause
 		}
@@ -192,11 +225,30 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation changed before cleanup", cfg.name))
 		}
 		if fresh.state != StateStopped && fresh.state != StateCreated {
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation became %s; refusing automatic deletion", cfg.name, fresh.state))
+			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation became %s; refusing automatic deletion", cfg.name, fresh.state))
 		}
+		info = fresh
+		ctr.info = fresh
 	}
-	if err := ctr.deleteWithArgs(delCtx, ctr.immutableID(), stoppedDeleteArgsFor(cfg.eng, ctr.immutableID())); err != nil {
+
+	// Running/stopping ordinary generations are this run's own failed
+	// create and are safe to force-remove. Reuse and settled generations use
+	// the backend's non-forced form so a concurrent start is reported.
+	args := cfg.eng.deleteArgs(ctr.immutableID())
+	if guarded {
+		args = stoppedDeleteArgsFor(cfg.eng, ctr.immutableID())
+	}
+	registerContainerReaper(cfg, ctr)
+	if err := ctr.deleteWithArgs(delCtx, ctr.immutableID(), args); err != nil {
+		if guarded {
+			unregisterContainerReaper(cfg, ctr)
+		}
 		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: cleanup: %w", cfg.name, err))
 	}
+	// A successful delete leaves the registered record in place as the
+	// existing watchdog contract does; the next child revalidation observes
+	// the missing generation and performs no delete. Only a guarded failure
+	// above withdraws the entry, because that is the case where a later
+	// force-delete would be unsafe.
 	return nil, cause
 }

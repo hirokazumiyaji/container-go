@@ -630,10 +630,14 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 			return false, nil
 		}
 		// Hand the verified generation to the watchdog before the delete so
-		// a failed removal can be retried after this process exits.
+		// a failed removal can be retried after this process exits. The
+		// delete itself is non-forced; withdraw the entry when the guarded
+		// delete fails so a refusal caused by a concurrent start cannot
+		// become a later force-delete.
 		ctr.rememberImmutableID(fresh.uid)
 		registerContainerReaper(cfg, ctr)
 		if err := remove(ctx, fresh.uid); err != nil {
+			unregisterContainerReaper(cfg, ctr)
 			return false, err
 		}
 		return true, nil

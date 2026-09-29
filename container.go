@@ -338,8 +338,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	ctr.rememberImmutableID(info.uid)
 	// The ownership and state refusals above are what make this target
 	// safe for automatic removal, so hand it to the watchdog before the
-	// delete: a failed removal can then be retried after this process
-	// exits.
+	// delete: a failed removal can then be retried after this process exits.
 	registerContainerReaper(cfg, ctr)
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
@@ -347,11 +346,15 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	// concurrent start is reported as a failure instead of killed. A
 	// failed create that did start is this run's own container and still
 	// needs the force delete.
+	guarded := cfg.reuse || info.state == StateStopped || info.state == StateCreated
 	args := cfg.eng.deleteArgs(target)
-	if cfg.reuse || info.state == StateStopped || info.state == StateCreated {
+	if guarded {
 		args = stoppedDeleteArgsFor(cfg.eng, target)
 	}
 	if err := ctr.deleteWithArgs(delCtx, target, args); err != nil {
+		if guarded {
+			unregisterContainerReaper(cfg, ctr)
+		}
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
 	return nil

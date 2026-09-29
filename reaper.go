@@ -64,8 +64,14 @@ key="$3"
 managed_key="$4"
 reuse_key="$5"
 pending_attempts="${6:-15}"
+operation_timeout="${7:-30}"
+pending_timeout="${8:-120}"
 case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=15;; esac
+case "$operation_timeout" in ''|*[!0-9]*) operation_timeout=30;; esac
+case "$pending_timeout" in ''|*[!0-9]*) pending_timeout=120;; esac
 [ "$pending_attempts" -gt 0 ] 2>/dev/null || pending_attempts=1
+[ "$operation_timeout" -gt 0 ] 2>/dev/null || operation_timeout=1
+[ "$pending_timeout" -gt 0 ] 2>/dev/null || pending_timeout=1
 stat_bin=$(command -v stat 2>/dev/null) || stat_bin=
 case "$stat_bin" in
   /*) [ -x "$stat_bin" ] || stat_bin= ;;
@@ -77,33 +83,72 @@ while IFS= read -r line; do
   ids="$ids
 $line"
 done
-run_with_timeout() {
-  "$@" >/dev/null 2>&1 & pid=$!
-  deadline=$(( $(date +%s) + 30 ))
-  while kill -0 "$pid" 2>/dev/null; do
+operation_pid=
+# A background job launched with job control enabled is the leader of its
+# own process group, so on timeout the whole backend process tree is
+# signalled as a unit instead of only the wrapper PID. The group ID is
+# used only while kill(1) can still observe it, so a numeric PID the
+# kernel has already recycled is never signalled later. Enumerating
+# descendants with ps is deliberately avoided: a PID read from that
+# snapshot can already have been reused by an unrelated process, and
+# killing it would reach outside the reaper's own group.
+terminate_operation_group() {
+  [ -n "$operation_pid" ] || return 0
+  case "$operation_pid" in *[!0-9]*) operation_pid=; return 0;; esac
+  [ "$operation_pid" -gt 1 ] 2>/dev/null || return 0
+  if kill -0 -"$operation_pid" 2>/dev/null; then
+    kill -9 -"$operation_pid" 2>/dev/null || true
+  elif kill -0 "$operation_pid" 2>/dev/null; then
+    # The shell did not provide job control, so the job never became a
+    # group leader and only its own PID can be signalled.
+    kill -9 "$operation_pid" 2>/dev/null || true
+  fi
+}
+run_bounded() {
+  seconds="$1"; shift
+  set -m 2>/dev/null || true
+  "$@" >/dev/null 2>&1 &
+  operation_pid=$!
+  set +m 2>/dev/null || true
+  deadline=$(( $(date +%s) + seconds ))
+  while kill -0 "$operation_pid" 2>/dev/null; do
     now=$(date +%s)
     if [ "$now" -ge "$deadline" ]; then
-      kill -9 "$pid" 2>/dev/null
+      terminate_operation_group
       break
     fi
     sleep 0.05
   done
-  wait "$pid" 2>/dev/null
-  return $?
+  wait "$operation_pid" 2>/dev/null
+  operation_status=$?
+  operation_pid=
+  return "$operation_status"
+}
+run_capture() {
+  seconds="$1"; shift
+  set -m 2>/dev/null || true
+  "$@" 2>/dev/null &
+  operation_pid=$!
+  set +m 2>/dev/null || true
+  deadline=$(( $(date +%s) + seconds ))
+  while kill -0 "$operation_pid" 2>/dev/null; do
+    now=$(date +%s)
+    if [ "$now" -ge "$deadline" ]; then
+      terminate_operation_group
+      break
+    fi
+    sleep 0.05
+  done
+  wait "$operation_pid" 2>/dev/null
+  operation_status=$?
+  operation_pid=
+  return "$operation_status"
+}
+run_with_timeout() {
+  run_bounded "$operation_timeout" "$@"
 }
 run_pending_timeout() {
-  "$@" >/dev/null 2>&1 & pid=$!
-  deadline=$(( $(date +%s) + 120 ))
-  while kill -0 "$pid" 2>/dev/null; do
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline" ]; then
-      kill -9 "$pid" 2>/dev/null
-      break
-    fi
-    sleep 0.05
-  done
-  wait "$pid" 2>/dev/null
-  return $?
+  run_bounded "$pending_timeout" "$@"
 }
 locked_command='
   stat_bin="$REAPER_STAT_BIN"
@@ -118,32 +163,54 @@ locked_command='
     [ "$actual" = "$2" ] || return 1
     return 0
   }
+  operation_pid=
+  terminate_operation_group() {
+    [ -n "$operation_pid" ] || return 0
+    case "$operation_pid" in *[!0-9]*) operation_pid=; return 0;; esac
+    [ "$operation_pid" -gt 1 ] 2>/dev/null || return 0
+    if kill -0 -"$operation_pid" 2>/dev/null; then
+      kill -9 -"$operation_pid" 2>/dev/null || true
+    elif kill -0 "$operation_pid" 2>/dev/null; then
+      kill -9 "$operation_pid" 2>/dev/null || true
+    fi
+  }
   capture() {
-    "$@" 2>/dev/null & pid=$!
+    set -m 2>/dev/null || true
+    "$@" 2>/dev/null &
+    operation_pid=$!
+    set +m 2>/dev/null || true
     deadline=$(( $(date +%s) + 10 ))
-    while kill -0 "$pid" 2>/dev/null; do
+    while kill -0 "$operation_pid" 2>/dev/null; do
       now=$(date +%s)
       if [ "$now" -ge "$deadline" ]; then
-        kill -9 "$pid" 2>/dev/null
+        terminate_operation_group
         break
       fi
       sleep 0.05
     done
-    wait "$pid" 2>/dev/null
+    wait "$operation_pid" 2>/dev/null
+    operation_status=$?
+    operation_pid=
+    return "$operation_status"
   }
   delete_bounded() {
-    "$@" >/dev/null 2>&1 & pid=$!
+    set -m 2>/dev/null || true
+    "$@" >/dev/null 2>&1 &
+    operation_pid=$!
+    set +m 2>/dev/null || true
     deadline=$(( $(date +%s) + 30 ))
-    while kill -0 "$pid" 2>/dev/null; do
+    while kill -0 "$operation_pid" 2>/dev/null; do
       now=$(date +%s)
       if [ "$now" -ge "$deadline" ]; then
-        kill -9 "$pid" 2>/dev/null
+        terminate_operation_group
         break
       fi
       sleep 0.05
     done
-    wait "$pid" 2>/dev/null
-    return $?
+    wait "$operation_pid" 2>/dev/null
+    operation_status=$?
+    operation_pid=
+    return "$operation_status"
   }
   id="$1"
   creation="$2"
@@ -366,6 +433,8 @@ done
 const (
 	maxReaperSpawnFailures       = 3
 	defaultReaperPendingAttempts = 15
+	defaultReaperTimeoutSeconds  = 30
+	defaultReaperPendingSeconds  = 120
 	defaultReaperWriteTimeout    = 500 * time.Millisecond
 )
 
@@ -504,18 +573,27 @@ type reaper struct {
 	// pendingAttempts is the child's retry budget for a record written
 	// before a create started.
 	pendingAttempts int
-	command         func() *exec.Cmd
+	// operationTimeout and pendingTimeout are shell-side budgets for one
+	// backend operation. They are fields so package tests can exercise
+	// process-group termination without waiting the production bounds.
+	operationTimeout int
+	pendingTimeout   int
+	command          func() *exec.Cmd
 }
 
 func newReaper(binary, subcommand string) *reaper {
 	r := &reaper{
-		binary:          binary,
-		subcommand:      subcommand,
-		supervise:       true,
-		writeTimeout:    defaultReaperWriteTimeout,
-		pendingAttempts: defaultReaperPendingAttempts,
+		binary:           binary,
+		subcommand:       subcommand,
+		supervise:        true,
+		writeTimeout:     defaultReaperWriteTimeout,
+		pendingAttempts:  defaultReaperPendingAttempts,
+		operationTimeout: defaultReaperTimeoutSeconds,
+		pendingTimeout:   defaultReaperPendingSeconds,
 	}
-	r.command = func() *exec.Cmd { return reaperCommand(binary, subcommand, r.pendingAttempts) }
+	r.command = func() *exec.Cmd {
+		return reaperCommandWithTimeouts(binary, subcommand, r.pendingAttempts, r.operationTimeout, r.pendingTimeout)
+	}
 	return r
 }
 
@@ -523,12 +601,23 @@ func newReaper(binary, subcommand string) *reaper {
 // often the child re-inspects a record that was written before a create,
 // so a create that is still settling can still be observed.
 func reaperCommand(binary, subcommand string, pendingAttempts int) *exec.Cmd {
+	return reaperCommandWithTimeouts(binary, subcommand, pendingAttempts,
+		defaultReaperTimeoutSeconds, defaultReaperPendingSeconds)
+}
+
+func reaperCommandWithTimeouts(binary, subcommand string, pendingAttempts, operationTimeout, pendingTimeout int) *exec.Cmd {
 	if pendingAttempts <= 0 {
 		pendingAttempts = defaultReaperPendingAttempts
 	}
+	if operationTimeout <= 0 {
+		operationTimeout = defaultReaperTimeoutSeconds
+	}
+	if pendingTimeout <= 0 {
+		pendingTimeout = defaultReaperPendingSeconds
+	}
 	return exec.Command("/bin/sh", "-c", reaperScript, "containergo-reaper", binary, subcommand,
 		breQuote(creationLabel), breQuote(managedLabel), breQuote(reuseLabel),
-		strconv.Itoa(pendingAttempts))
+		strconv.Itoa(pendingAttempts), strconv.Itoa(operationTimeout), strconv.Itoa(pendingTimeout))
 }
 
 // register adds a verified container target to the reaper's kill list,
@@ -711,16 +800,47 @@ func (r *reaper) writeRecordLocked(record reaperRecord) error {
 	return err
 }
 
+// stopCurrentChildLocked detaches the current child before stopping it. The
+// detach is important: a supervisor goroutine for the old child must not be
+// able to observe a live process handle after a failed replay and act on a
+// replacement. The caller holds r.mu; the wait goroutine closes exited before
+// it needs r.mu, so waiting here cannot deadlock.
+func (r *reaper) stopCurrentChildLocked() {
+	cmd, pgid, stdin, exited, childExited := r.cmd, r.pgid, r.stdin, r.exited, r.childExited
+	r.cmd, r.pgid, r.stdin, r.exited = nil, 0, nil, nil
+	r.childExited = false
+
+	// A supervisor may have reaped the child just before this helper took
+	// the lock. Do not turn a completed process's numeric group ID into a
+	// signal after the kernel is free to reuse it.
+	if !childExited && exited != nil {
+		select {
+		case <-exited:
+			childExited = true
+		default:
+		}
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if cmd != nil {
+		terminateReaperProcess(cmd, pgid, childExited)
+	}
+	if exited != nil {
+		<-exited
+	}
+}
+
 // respawnAndReplayLocked starts a fresh reaper process and re-registers
 // every known record with it. Success resets the consecutive-failure
 // count; giving up logs once so a permanently broken reaper is visible.
 func (r *reaper) respawnAndReplayLocked() error {
-	previous, previousPgid, previousExited := r.cmd, r.pgid, r.childExited
-	r.cmd, r.stdin, r.exited, r.pgid = nil, nil, nil, 0
-	r.childExited = false
-	// Terminate whatever the replaced child left behind before a new child
-	// can inherit the same pipe or compete for the same name barriers.
-	terminateReaperProcess(previous, previousPgid, previousExited)
+	// Terminate and reap whatever the replaced child left behind before a
+	// new child can inherit the same pipe or compete for the same name
+	// barriers. This is also done after every replay failure below: a child
+	// that accepted its stdin pipe but rejected a record is still a live
+	// process with a pipe and potentially a held name lock.
+	r.stopCurrentChildLocked()
 	for r.spawnFailures < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
 			r.spawnFailures++
@@ -738,6 +858,9 @@ func (r *reaper) respawnAndReplayLocked() error {
 			return nil
 		}
 		r.spawnFailures++
+		// Do not leave the failed child, its pipe, or its process group
+		// alive while the next replay attempt is running.
+		r.stopCurrentChildLocked()
 	}
 	if !r.gaveUp {
 		r.gaveUp = true
@@ -767,10 +890,17 @@ func (r *reaper) spawnLocked() error {
 		return nil
 	}
 	// Without supervision nothing replaces the child, so a caller that
-	// kills it to exercise the registration respawn owns that path.
+	// kills it to exercise the registration respawn owns that path. Record
+	// the waited state as well, so a later replacement cannot signal a
+	// process-group ID after the kernel has released it.
 	go func() {
 		_ = cmd.Wait()
 		close(exited)
+		r.mu.Lock()
+		if r.cmd == cmd && r.generation == generation {
+			r.childExited = true
+		}
+		r.mu.Unlock()
 	}()
 	return nil
 }
@@ -816,10 +946,7 @@ func (r *reaper) killForTest() {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.supervise = false
-	if r.cmd != nil {
-		killReaperProcess(r.cmd, r.pgid)
-		<-r.exited
-	}
+	r.stopCurrentChildLocked()
 }
 
 var (

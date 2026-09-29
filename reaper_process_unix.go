@@ -25,7 +25,14 @@ func reaperProcessGroupID(cmd *exec.Cmd) int {
 	if cmd == nil || cmd.Process == nil {
 		return 0
 	}
-	return cmd.Process.Pid
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil || pgid != cmd.Process.Pid {
+		// Never retain a numeric group ID that was not observed as this
+		// child's private group. A direct Process.Kill fallback is safer
+		// than signalling a possibly reused group.
+		return 0
+	}
+	return pgid
 }
 
 func killReaperProcess(cmd *exec.Cmd, pgid int) {

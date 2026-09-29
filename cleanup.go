@@ -104,7 +104,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 				didRemove, err = pruneNamedCandidate(ctx, r, eng, candidate, errKind, reuseGroup)
 			}
 		default:
-			didRemove, err = deletePruneCandidate(ctx, r, eng, id, errKind)
+			didRemove, err = deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, reuseGroup)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -141,13 +141,24 @@ func deleteImmutablePruneCandidate(ctx context.Context, r cli.Runner, eng engine
 	if !dockerIDRE.MatchString(fresh.uid) || fresh.uid != id {
 		return false, nil
 	}
-	return deletePruneCandidate(ctx, r, eng, id, errKind)
+	return deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, reuseGroup)
 }
 
 func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
+	return deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, "")
+}
+
+func deletePruneCandidateWithGroup(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
 	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer dCancel()
-	_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
+	args := eng.deleteArgs(id)
+	if reuseGroup == "" {
+		// Ordinary Prune is a stopped-container operation. A generation
+		// that starts after revalidation must make docker rm/container
+		// delete refuse rather than be force-killed by the cleanup path.
+		args = stoppedDeleteArgsFor(eng, id)
+	}
+	_, _, err := r.Run(dCtx, args...)
 	if err != nil {
 		classified := cli.Classify(ctx, r, err, eng.probe())
 		if isNotFound(classified) {
@@ -189,7 +200,7 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	// Apple has no immutable ID: the name lock and the exact generation
 	// revalidation above are the delete proof.  Never substitute a
 	// backend-reported UID for a name-addressed Apple operation.
-	return deletePruneCandidate(guardCtx, r, eng, candidate.id, errKind)
+	return deletePruneCandidateWithGroup(guardCtx, r, eng, candidate.id, errKind, reuseGroup)
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {

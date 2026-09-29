@@ -30,6 +30,43 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Windows and macOS are the platforms the README claims support for, so
+  # they need a build and unit-test guarantee rather than a claim. Only
+  # ubuntu-latest running before meant a Windows path, ACL, or reaper
+  # regression could not be caught at all, and macOS Apple Container
+  # protocol changes went unnoticed.
+  #
+  # These are unit tests against a fake CLI runner. Neither runs a real
+  # backend: Windows has no Apple Container, and the Apple live checks
+  # need a service the hosted runner does not provide.
+  #
+  # The OS dimension is the point; the Go-version dimension is not. The
+  # ubuntu `test` legs already cover 1.23.0, and macOS minutes are billed
+  # at a large multiplier, so the older-Go legs here would re-run the same
+  # unit suite at high cost for no platform signal. `stable` only.
+  cross-platform:
+    name: ${{ matrix.os }} unit
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        # OS is the only matrix axis: the ubuntu legs already cover the older
+        # Go version, so a second dimension with a single fixed value would
+        # only suggest multi-Go legs were planned.
+        os: [windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: stable
+      # The integration suites are excluded: they need a real backend,
+      # which neither of these runners provides for both backends.
+      - run: go build ./...
+      - run: go test ./...
+
   # Unit tests run against a fake CLI runner, so the cheaper Linux
   # runner is enough; integration tests need real Apple Container and
   # run locally via `make integration`.
@@ -156,6 +193,8 @@ jobs:
   # it out of the required-check set, or fork PRs will wait for a status that
   # never arrives and can never merge. The branch is currently unprotected, so
   # this is a constraint on future protection settings, not a live problem.
+  # There is no maintainer-run path for a fork PR's Docker suite today; adding
+  # one (e.g. a dispatch `ref` input) is a separate feature.
   integration-docker:
     if: >-
       github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||

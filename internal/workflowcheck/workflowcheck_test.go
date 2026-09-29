@@ -223,6 +223,22 @@ func TestHasTrustedTriggerRejectsNegatedPullRequest(t *testing.T) {
 	}
 }
 
+// A step-level if: (or a comment naming the guard) must not count as the job
+// fork guard. Kept from the cross-platform branch's parallel hardening;
+// main's allowlist parser already ignores both, and this pins that.
+func TestHasTrustedTriggerRejectsStepLevelOrComment(t *testing.T) {
+	body := []string{
+		"    # github.event.pull_request.head.repo.full_name == github.repository",
+		"    runs-on: ubuntu-latest",
+		"    steps:",
+		"      - if: github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)",
+		"        run: make integration-docker",
+	}
+	if hasTrustedTrigger(body) {
+		t.Fatal("step-level if: or comment must not count as the job fork guard")
+	}
+}
+
 func TestHasTrustedTriggerAcceptsAllowlist(t *testing.T) {
 	body := []string{
 		"    if: >-",

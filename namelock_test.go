@@ -43,7 +43,7 @@ func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 	// must not start until it is released, so a bounded context fails
 	// before any backend call.
 	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
-	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
 	err = ctr.Terminate(ctx)

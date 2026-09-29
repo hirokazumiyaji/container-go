@@ -121,10 +121,33 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 
 // WithReuse enables process- and cross-process get-or-create for a
 // stable WithName. Concurrent Run calls with the same name share one
-// container; readiness strategies always re-run against it. Returned
-// handles are shared: Cleanup, TerminateContainer, and the watchdog
-// reaper do not remove them. Explicit Terminate still does — only use
-// it when no other process still needs the container.
+// container; readiness strategies always re-run against it.
+//
+// The returned handle is shared, which changes what the operations on it
+// are allowed to do. Anything that would change what a peer sees is
+// refused with ErrSharedContainer rather than executed, because the
+// breakage would surface on the peer's side as an unrelated connection
+// failure that they cannot attribute to this call.
+//
+// Refused on a shared handle:
+//   - Stop
+//   - CopyToContainer
+//   - CopyFileFromContainer
+//
+// Not refused, because they cannot disturb a peer:
+//   - Terminate, Exec, State, Host, Endpoint, MappedPort, ContainerIP,
+//     Logs, FollowLogs
+//
+// Skipped automatically, so shared containers survive process exit:
+//   - Cleanup, TerminateContainer, and the watchdog reaper
+//
+// WithFiles is applied when this call creates the container, before the
+// handle is shared, so it is not subject to the copy guard. It is not
+// applied when this call attaches to an existing one, since the file
+// would already belong to the peers.
+//
+// Container.Shared returns a handle with the three refusals lifted, for
+// the case where this process owns the shared container's lifecycle.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

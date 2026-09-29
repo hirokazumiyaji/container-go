@@ -304,6 +304,16 @@ narrow: image reference and declared/published ports only. `env`,
 container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
+A shared handle also guards against changing what a peer observes.
+`Stop`, `CopyToContainer`, and `CopyFileFromContainer` return
+`ErrSharedContainer` rather than running, so one process cannot stop or
+overwrite a container the others are using. The guard is per operation
+and per handle: `Container.Shared` returns a handle with it lifted, and
+`Cleanup` / `TerminateContainer` skip the handle either way. Read-only
+operations are unaffected, since a peer cannot be disturbed by learning
+the same state. `WithFiles` runs during create, before the handle is
+shared, so it uses the unguarded copy path.
+
 Each creation carries a `creationLabel` generation (16-hex). `Terminate`
 and the stopped-recreate path refuse to delete a replaced name. On
 Docker the handle keeps the immutable `Id` printed by `docker run` (or

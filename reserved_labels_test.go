@@ -28,7 +28,7 @@ func TestTerminateRefusesWhenLabelMissing(t *testing.T) {
 	g := &genRunner{fakeRunner: base, inspectJSON: `[
   {"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}}
 ]`}
-	ctr := &Container{id: "myctr", runner: g, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: "myctr", runner: g, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	if err := ctr.Terminate(context.Background()); err == nil {
 		t.Fatal("want error when generation label absent")
 	}

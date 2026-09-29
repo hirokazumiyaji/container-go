@@ -32,7 +32,22 @@ func WithFiles(files ...File) Option {
 
 // CopyToContainer copies a host file or directory into the running
 // container.
+//
+// It returns ErrSharedContainer on a WithReuse handle: the container is
+// shared with other Run calls and other processes, and overwriting a
+// file in it would change what they see. Use Shared to opt in, or
+// WithFiles at create time, which runs before the handle is shared.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
+	if c.reused {
+		return fmt.Errorf("copy to container %q: %w", containerPath, ErrSharedContainer)
+	}
+	return c.copyTo(ctx, hostPath, containerPath)
+}
+
+// copyTo is the unguarded copy, used by WithFiles at create time. By
+// then the container exists but is not yet shared with anyone, so the
+// copy is not the race the shared guard is about.
+func (c *Container) copyTo(ctx context.Context, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
 		return err
 	}
@@ -51,7 +66,15 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 
 // CopyFileFromContainer copies one file out of the running container
 // and returns its content. Close releases the temporary copy.
+//
+// It returns ErrSharedContainer on a WithReuse handle: the file belongs
+// to whoever else is using the shared container, so a copy-out races
+// their writes. Use Shared to opt in. Exec can read the same content
+// when the shared guard is in the way.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
+	if c.reused {
+		return nil, fmt.Errorf("copy file from container %q: %w", containerPath, ErrSharedContainer)
+	}
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err
 	}

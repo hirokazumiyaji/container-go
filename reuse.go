@@ -29,7 +29,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	info := base.info
+	info := base.state.info
 	if info == nil {
 		info, err = inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
@@ -47,9 +47,8 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		reused:    true,
-		info:      info,
 		creation:  info.labels[creationLabel],
-		uid:       info.uid,
+		state:     &containerState{info: info, uid: info.uid},
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
@@ -120,9 +119,8 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				exposed:   cfg.exposed,
 				published: cfg.published,
 				reused:    true,
-				info:      info,
 				creation:  info.labels[creationLabel],
-				uid:       info.uid,
+				state:     &containerState{info: info, uid: info.uid},
 			}, nil
 		default:
 			time.Sleep(reusePollInterval)
@@ -174,13 +172,13 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		published: cfg.published,
 		reused:    true,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		state:     &containerState{uid: cfg.eng.parseRunID(stdout)},
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyTo(ctx, f.HostPath, f.ContainerPath); err != nil {
 			return nil, ctr.rollback(ctx, err)
 		}
 	}
@@ -227,6 +225,7 @@ func namedContainer(cfg *config, id string) *Container {
 		eng:       cfg.eng,
 		exposed:   cfg.exposed,
 		published: cfg.published,
+		state:     &containerState{},
 	}
 }
 

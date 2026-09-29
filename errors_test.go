@@ -15,7 +15,7 @@ func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 		err: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `No such object: myctr`},
 	}
 	// Clear cached info so inspectFresh runs.
-	ctr.info = nil
+	ctr.state.info = nil
 	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
 	}

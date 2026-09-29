@@ -238,6 +238,27 @@ func TestReusePostCreateFailureDoesNotForceDeletePublishedGeneration(t *testing.
 	}
 }
 
+// The rollback invariant itself: a shared handle is never auto-deleted,
+// whatever the caller.
+func TestRollbackNeverDeletesSharedGeneration(t *testing.T) {
+	ctr := &Container{
+		id: "shared", reused: true, creation: "0123456789abcdef",
+		runner: newTestRunner(), eng: appleEngine{},
+	}
+	cause := errors.New("setup failed")
+	err := ctr.rollback(context.Background(), cause)
+	if !errors.Is(err, cause) {
+		t.Fatalf("rollback error = %v, want the original cause", err)
+	}
+	var joined *CleanupError
+	if !errors.As(err, &joined) {
+		t.Fatalf("error = %v, want CleanupError carrying the refusal", err)
+	}
+	if !strings.Contains(joined.CleanupErr.Error(), "refusing automatic deletion") {
+		t.Fatalf("cleanup error = %v, want an explicit refusal", joined.CleanupErr)
+	}
+}
+
 // --- (2) failed-create cleanup refuses ambiguous/running reuse generations ---
 
 func reuseOwnedLabels(creation string) map[string]string {

@@ -233,9 +233,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 // in place. A failed removal is not hidden: without an immutable ID,
 // Terminate refuses to delete when it cannot verify the generation, and
 // the caller must know the container was left behind.
+//
+// A shared WithReuse generation is never removed here: the backend
+// published it the moment create returned, so a peer may already have
+// adopted it. Shared generations are resolved by the reuse paths, which
+// clean up only while a fresh inspect still proves the generation is
+// unadopted.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if keepContainers() {
 		return cause
+	}
+	if c.reused {
+		refusal := fmt.Errorf("container %s is a shared reuse generation; refusing automatic deletion", c.id)
+		return withCleanupError(cause, refusal)
 	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
 		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)

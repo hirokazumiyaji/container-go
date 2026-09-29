@@ -643,9 +643,9 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 		ctr.rememberImmutableID(fresh.uid)
 		registerContainerReaper(cfg, ctr)
 		if err := remove(ctx, fresh.uid); err != nil {
-			unregisterContainerReaper(cfg, ctr)
 			return false, err
 		}
+		withdrawOnReturn = false
 		return true, nil
 	}
 
@@ -671,6 +671,7 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 		if err := remove(guardCtx, cfg.name); err != nil {
 			return false, err
 		}
+		withdrawOnReturn = false
 		return true, nil
 	}
 
@@ -687,7 +688,11 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 	if !sameStoppedGeneration(info, fresh) || fresh.state != StateStopped || checkReuseLabels(fresh, cfg) != nil {
 		return false, nil
 	}
-	return true, remove(ctx, cfg.name)
+	if err := remove(ctx, cfg.name); err != nil {
+		return false, err
+	}
+	withdrawOnReturn = false
+	return true, nil
 }
 
 func sameStoppedGeneration(before, fresh *engineInfo) bool {

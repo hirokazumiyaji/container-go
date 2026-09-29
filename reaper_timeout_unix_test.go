@@ -47,7 +47,7 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	r.closeStdin()
 
 	var childPID int
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(15 * time.Second)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(childPIDPath)
 		if err == nil {

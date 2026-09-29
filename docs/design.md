@@ -163,10 +163,10 @@ to any destination without an extra option.
 
 Public calls reject invalid inputs before starting a backend operation. An
 input that is known to be invalid returns an error matching
-`ErrInvalidOption`; callers that need details can use
-`var validationErr *container.ValidationError; errors.As(err, &validationErr)`.
-`ValidationError.Option`
-identifies the public option or operation, and `Field` identifies the exact
+`ErrInvalidOption`; callers that need details can declare a
+`*container.ValidationError` and pass its address to `errors.As`.
+`ValidationError.Option` identifies the public option or operation, and
+`Field` identifies the exact
 field such as `key`, `value`, `hostPath`, or `containerPath`. `Value` is
 populated only for values that are safe to expose. Environment and label
 values are never copied into the typed error or rendered diagnostic when

@@ -523,14 +523,14 @@ func (m Mount) validate() error {
 		if m.Source == "" {
 			return mountValidationErrorf(m, "volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
 		}
+		// Docker's minimum length is checked in checkConfig because Apple
+		// accepts one-character names.
 		if len(m.Source) > maxVolumeNameBytes {
 			return mountValidationErrorf(m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
 		}
 		if !volumeNameRE.MatchString(m.Source) {
 			return mountValidationErrorf(m, "invalid volume name %q", m.Source)
 		}
-		// Docker's minimum length is checked in checkConfig because Apple
-		// accepts one-character names.
 	case MountTmpfs:
 		if m.Source != "" {
 			return mountValidationErrorf(m, "tmpfs mount for %q must not have a source", m.Target)

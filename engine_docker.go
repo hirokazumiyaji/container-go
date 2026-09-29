@@ -50,9 +50,9 @@ var dockerVolumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 // container command is issued, including volume names and explicit
 // loopback publish binds on a remote daemon.
 func (dockerEngine) checkConfig(cfg *config) error {
-	// Docker's local volume driver applies this grammar. Keep it out of
-	// the shared mount validator because Apple Container accepts names (for
-	// example, one-character names) that Docker rejects.
+	// Docker's local volume driver adds a minimum length to the shared name
+	// grammar. Apple Container accepts names (for example, one-character
+	// names) that Docker rejects, so this check stays backend-specific.
 	for _, m := range cfg.mounts {
 		if m.Type != MountVolume {
 			continue

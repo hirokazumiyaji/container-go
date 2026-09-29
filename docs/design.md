@@ -228,7 +228,10 @@ provides:
   `AsRegexp`) appears in `container logs --follow` output;
   `WithOccurrence(n)` for repeat counts
 - `wait.ForListeningPort(port string)`: wait until `net.DialTimeout`
-  to the container IP succeeds
+  to the container IP succeeds. The strategy probes TCP only, so the
+  declaration is parsed up front: a `/udp` port or invalid syntax fails
+  immediately with `ErrUnsupportedProtocol` or `ErrInvalidPort` instead
+  of consuming the startup timeout
 - `wait.ForHTTP(path string)`: wait until an HTTP request via
   `net/http` matches the status predicate (2xx by default,
   `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select

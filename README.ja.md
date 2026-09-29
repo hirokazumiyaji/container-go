@@ -116,7 +116,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 
 ```go
 wait.ForLog("Ready to accept connections")   // 部分一致。.AsRegexp()、.WithOccurrence(n)
-wait.ForListeningPort("6379/tcp")            // TCP 接続成功まで
+wait.ForListeningPort("6379/tcp")            // TCP 接続成功まで。"/udp" は即座にエラー
 wait.ForExposedPort()                        // 最初に宣言したポート
 wait.ForHTTP("/health")                      // .WithPort、.WithMethod、.WithStatusCodeMatcher、.WithHeaders、.WithBasicAuth、.WithTLS/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher

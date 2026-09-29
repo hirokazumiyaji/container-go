@@ -127,7 +127,7 @@ probed client-side by the `wait` package:
 
 ```go
 wait.ForLog("Ready to accept connections")   // substring; .AsRegexp(), .WithOccurrence(n)
-wait.ForListeningPort("6379/tcp")            // TCP dial succeeds
+wait.ForListeningPort("6379/tcp")            // TCP dial succeeds; "/udp" fails fast
 wait.ForExposedPort()                        // first declared port
 wait.ForHTTP("/health")                      // .WithPort, .WithMethod, .WithStatusCodeMatcher, .WithHeaders, .WithBasicAuth, .WithTLS/.WithTLSConfig/.WithHTTPClient
 wait.ForExec([]string{"pg_isready"})         // .WithExitCodeMatcher

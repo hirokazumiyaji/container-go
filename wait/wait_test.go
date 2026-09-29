@@ -87,6 +87,73 @@ func TestForListeningPortTimesOut(t *testing.T) {
 	}
 }
 
+func TestForListeningPortRejectsUDPFast(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1" // nothing listens
+
+	// A UDP-only service can never satisfy a TCP dial, so the strategy
+	// must report the configuration error instead of retrying until the
+	// startup timeout expires.
+	s := ForListeningPort("5353/udp").WithStartupTimeout(30 * time.Second)
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, ErrUnsupportedProtocol) {
+		t.Fatalf("WaitUntilReady error = %v, want ErrUnsupportedProtocol", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Errorf("rejection took %v, want an immediate failure", elapsed)
+	}
+	if calls := target.runningCalls.Load(); calls != 0 {
+		t.Errorf("Running probed %d times, want no probe for a configuration error", calls)
+	}
+}
+
+func TestForListeningPortRejectsInvalidPortSyntax(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1"
+
+	for _, tc := range []struct {
+		port string
+		want error
+	}{
+		{port: "0", want: ErrInvalidPort},
+		{port: "65536", want: ErrInvalidPort},
+		{port: "http", want: ErrInvalidPort},
+		{port: "6379/sctp", want: ErrInvalidPort},
+		{port: "6379/", want: ErrInvalidPort},
+		{port: "6379/tcp/extra", want: ErrInvalidPort},
+	} {
+		t.Run(tc.port, func(t *testing.T) {
+			err := ForListeningPort(tc.port).WithStartupTimeout(30*time.Second).WaitUntilReady(context.Background(), target)
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("WaitUntilReady error = %v, want %v", err, tc.want)
+			}
+		})
+	}
+}
+
+func TestForListeningPortAcceptsBarePortAndExposedPort(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	target := newFakeTarget()
+	target.endpoint = ln.Addr().String()
+
+	// A bare port means TCP, and an empty port defers the choice to the
+	// container's first declared port; both must keep working.
+	for name, s := range map[string]*HostPortStrategy{
+		"bare":    ForListeningPort("6379").WithStartupTimeout(3 * time.Second),
+		"exposed": ForExposedPort().WithStartupTimeout(3 * time.Second),
+	} {
+		if err := s.WaitUntilReady(context.Background(), target); err != nil {
+			t.Errorf("%s: WaitUntilReady: %v", name, err)
+		}
+	}
+}
+
 func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // nothing listens

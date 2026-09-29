@@ -48,9 +48,20 @@ func (l *contextLock) channel() chan struct{} {
 }
 
 func (l *contextLock) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	gate := l.channel()
-	<-gate // REGRESSION SHIM: ignores ctx, like sync.Mutex
-	return nil
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	}
 }
 
 func (l *contextLock) Unlock() {

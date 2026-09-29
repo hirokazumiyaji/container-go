@@ -14,6 +14,15 @@ import (
 	"time"
 )
 
+// The operation budget is deliberately longer than the stub needs to start, so
+// the assertions below measure process-tree termination rather than machine
+// load. The helper outlives killTimeout by orders of magnitude, so it can only
+// disappear because the timeout killed it.
+const (
+	operationBudgetSeconds = 3
+	killTimeout            = 30 * time.Second
+)
+
 func TestReaperScriptParsesWithPOSIXShell(t *testing.T) {
 	cmd := exec.Command("/bin/sh", "-n", "-c", reaperScript, "containergo-reaper")
 	if output, err := cmd.CombinedOutput(); err != nil {
@@ -33,7 +42,7 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = rm ]; then\n" +
-		"  /bin/sh -c 'sleep 5' &\n" +
+		"  sleep 300 &\n" +
 		"  echo \"$!\" > " + childPIDPath + "\n" +
 		"  wait\n" +
 		"fi\n"
@@ -42,7 +51,11 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	}
 
 	uid := strings.Repeat("ab", 32)
-	cmd := reaperCommandWithTimeouts(bin, "rm", 2, 1, 1)
+	// The stub has to reach its pid file before the operation budget expires,
+	// so the budget must exceed the stub's startup even on a loaded machine.
+	// Termination is still bounded: the helper is asserted gone within
+	// killTimeout below, far under the helper's own five seconds.
+	cmd := reaperCommandWithTimeouts(bin, "rm", 2, operationBudgetSeconds, 3)
 	prepareReaperCommand(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -66,7 +79,7 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 	_ = stdin.Close()
 
 	var childPID int
-	deadline := time.Now().Add(30 * time.Second)
+	deadline := time.Now().Add(killTimeout)
 	for time.Now().Before(deadline) {
 		data, err := os.ReadFile(childPIDPath)
 		if err == nil {
@@ -82,8 +95,8 @@ func TestReaperTimeoutTerminatesBackendProcessTree(t *testing.T) {
 		t.Fatalf("backend child pid = %d, want a spawned descendant in %s; calls=%q", childPID, childPIDPath, calls)
 	}
 
-	// The one-second bounded rm operation should now terminate the whole
-	// operation, helper included.
+	// The bounded rm operation should now terminate the whole operation,
+	// helper included.
 	deadline = time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
 		if err := syscall.Kill(childPID, 0); errors.Is(err, syscall.ESRCH) {

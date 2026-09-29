@@ -64,14 +64,13 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		stderr:     &tailBuffer{},
 		// Keep both names as aliases for package-local compatibility;
 		// they intentionally refer to the same ordered endpoint.
-		stdoutRead:   childRead,
-		stderrRead:   childRead,
-		startDone:    make(chan struct{}),
-		waitDone:     make(chan struct{}),
-		pumpsDone:    make(chan struct{}),
-		drainStarted: make(chan struct{}),
+		stdoutRead: childRead,
+		stderrRead: childRead,
+		startDone:  make(chan struct{}),
+		waitDone:   make(chan struct{}),
+		pumpsDone:  make(chan struct{}),
 	}
-	stream.ordered = newStreamOutput(pw, stream.stderr, &stream.terminalDrain, stream.drainStarted)
+	stream.ordered = newStreamOutput(pw, stream.stderr, &stream.terminalDrain)
 	cmd.Stdout = childWrite
 	cmd.Stderr = childWrite
 	// Cancel closes the reader as well as killing the process tree. This
@@ -121,7 +120,7 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 	}
 
 	stream.pumpWG.Add(2)
-	go stream.pump(childRead, true)
+	go stream.pump(childRead, stream.ordered)
 	go func() {
 		stream.ordered.run()
 		stream.pumpWG.Done()
@@ -173,7 +172,6 @@ type processStream struct {
 	outputCloseOnce sync.Once
 	sourceCloseOnce sync.Once
 	readerCloseOnce sync.Once
-	drainStarted    chan struct{}
 	drainStartOnce  sync.Once
 	drainDoneOnce   sync.Once
 	terminalDrain   atomic.Bool
@@ -216,12 +214,13 @@ type streamOutput struct {
 	output        io.Writer
 	stderr        *tailBuffer
 	terminalDrain *atomic.Bool
-	// drainStarted is closed once the terminal drain begins, releasing a
-	// pump that is blocked on a full queue.
-	drainStarted <-chan struct{}
-	chunks       chan []byte
-	workerDone   chan struct{}
-	closeInput   sync.Once
+	chunks        chan []byte
+	workerDone    chan struct{}
+	closeInput    sync.Once
+	// drainC is closed by beginDrain, releasing a pump that is blocked on a
+	// full queue once the terminal drain takes over the diagnostic tail.
+	drainC    chan struct{}
+	drainOnce sync.Once
 }
 
 const orderedOutputQueue = 32
@@ -230,16 +229,19 @@ func newStreamOutput(
 	output io.Writer,
 	stderr *tailBuffer,
 	terminalDrain *atomic.Bool,
-	drainStarted <-chan struct{},
 ) *streamOutput {
 	return &streamOutput{
 		output:        output,
 		stderr:        stderr,
 		terminalDrain: terminalDrain,
-		drainStarted:  drainStarted,
 		chunks:        make(chan []byte, orderedOutputQueue),
 		workerDone:    make(chan struct{}),
+		drainC:        make(chan struct{}),
 	}
+}
+
+func (w *streamOutput) beginDrain() {
+	w.drainOnce.Do(func() { close(w.drainC) })
 }
 
 func (w *streamOutput) Write(p []byte) (int, error) {
@@ -252,6 +254,16 @@ func (w *streamOutput) Write(p []byte) (int, error) {
 		// child endpoint without adding more queued output.
 		return len(p), nil
 	}
+	if w.chunks == nil {
+		// Package-local lifecycle tests can construct a processStream
+		// without the production ordered-output worker. Preserve the
+		// original direct-write behavior for that case.
+		n, err := w.output.Write(p)
+		if err != nil && w.terminalDrain.Load() {
+			return len(p), nil
+		}
+		return n, err
+	}
 	chunk := append([]byte(nil), p...)
 	select {
 	case <-w.workerDone:
@@ -259,13 +271,13 @@ func (w *streamOutput) Write(p []byte) (int, error) {
 		// for TerminalError, and the child must not be held hostage by a
 		// blocked public reader.
 		return len(p), nil
-	case <-w.drainStarted:
+	case <-w.drainC:
 		// The terminal drain owns the diagnostic tail from here on.
 		return len(p), nil
 	case w.chunks <- chunk:
-		// A full queue applies ordinary backpressure. Discarding here
-		// would silently drop child output from a live reader that is only
-		// temporarily slow, and the tail above is already complete.
+		// A full queue applies ordinary backpressure. Discarding here would
+		// silently drop child output from a reader that is only temporarily
+		// slow, and the tail above is already complete.
 		return len(p), nil
 	}
 }
@@ -285,24 +297,12 @@ func (w *streamOutput) close() {
 	w.closeInput.Do(func() { close(w.chunks) })
 }
 
-func (s *processStream) pump(r *os.File, stderr bool) {
+func (s *processStream) pump(r *os.File, output io.Writer) {
 	defer s.pumpWG.Done()
 	defer func() { _ = r.Close() }()
-	var output io.Writer = s.output
-	if stderr {
-		if s.ordered == nil {
-			output = &streamOutput{
-				output:        s.output,
-				stderr:        s.stderr,
-				terminalDrain: &s.terminalDrain,
-			}
-		} else {
-			output = s.ordered
-		}
-	}
 	_, _ = io.Copy(output, r)
-	if s.ordered != nil {
-		s.ordered.close()
+	if closer, ok := output.(interface{ close() }); ok {
+		closer.close()
 	}
 }
 
@@ -330,7 +330,19 @@ func (s *processStream) wait() {
 }
 
 func (s *processStream) cancel() error {
-	return s.requestTermination(true)
+	err := s.requestTermination(true)
+	s.stateMu.Lock()
+	signaled := s.terminationSignaled || s.syntheticTermination
+	terminationErr := s.terminateErr
+	s.stateMu.Unlock()
+	if !signaled && terminationErr != nil {
+		// os/exec treats a non-nil Cancel error as an injected failure.
+		// Keep the barrier/ownership cause on the stream state, but report
+		// ErrProcessDone so a child that already settled is not replaced
+		// by a synthetic cancellation error.
+		return os.ErrProcessDone
+	}
+	return err
 }
 
 func (s *processStream) requestTermination(cancelled bool) error {
@@ -418,8 +430,8 @@ func (s *processStream) Drain(ctx context.Context) error {
 
 	s.drainStartOnce.Do(func() {
 		s.terminalDrain.Store(true)
-		if s.drainStarted != nil {
-			close(s.drainStarted)
+		if s.ordered != nil {
+			s.ordered.beginDrain()
 		}
 		s.outputCloseOnce.Do(func() { _ = s.output.Close() })
 	})

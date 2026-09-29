@@ -30,7 +30,7 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 		return nil, os.ErrProcessDone
 	}
 	process, err := windows.OpenProcess(
-		windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
+		windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
 		false,
 		uint32(cmd.Process.Pid),
 	)

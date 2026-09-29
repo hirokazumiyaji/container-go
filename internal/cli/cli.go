@@ -112,6 +112,13 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 			return cancelResult.err
 		}
 		cancelResult = tree.terminate(cmd)
+		if !cancelResult.active && cancelResult.err != nil {
+			// os/exec treats a non-nil Cancel error as an injected
+			// cancellation failure. The retained result still carries the
+			// ownership/barrier cause for classification, but returning
+			// ErrProcessDone keeps a settled child result authoritative.
+			return os.ErrProcessDone
+		}
 		return cancelResult.err
 	}
 	var stdout, stderr bytes.Buffer
@@ -149,7 +156,7 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 		// A cancellation callback is not proof that the child was
 		// signaled. Preserve a settled process/CLI error unless the
 		// termination result contains positive delivery evidence.
-		if ctx.Err() != nil && (!called || result.active) {
+		if ctx.Err() != nil && called && result.active {
 			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError

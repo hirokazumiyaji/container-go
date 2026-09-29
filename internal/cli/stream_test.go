@@ -267,9 +267,11 @@ func TestDrainTimeoutWaitsForPumpsBeforeReturning(t *testing.T) {
 	ps := &processStream{
 		ReadCloser: publicRead,
 		output:     publicWrite,
+		stderr:     &tailBuffer{},
 		stderrRead: sourceRead,
 		pumpsDone:  make(chan struct{}),
 	}
+	ps.ordered = newStreamOutput(ps.output, ps.stderr, &ps.terminalDrain)
 	go func() {
 		_, _ = io.Copy(io.Discard, sourceRead)
 		time.Sleep(25 * time.Millisecond)
@@ -559,6 +561,32 @@ func TestTerminalErrorDoesNotTurnSuccessfulSettledProcessIntoCancellation(t *tes
 	ps.drainCompleted.Store(true)
 	if err := ps.terminalError(nil); err != nil {
 		t.Fatalf("terminal error = %v, want successful settled process", err)
+	}
+}
+
+func TestCancelCallbackDoesNotSynthesizeFailureForSettledChild(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	startDone := make(chan struct{})
+	close(startDone)
+	ps := &processStream{
+		ReadCloser: io.NopCloser(strings.NewReader("")),
+		ctx:        ctx,
+		binary:     "docker",
+		args:       []string{"logs", "--follow", "x"},
+		stderr:     &tailBuffer{},
+		startDone:  startDone,
+		started:    true,
+		terminateTree: func(*exec.Cmd) terminationResult {
+			return terminationResult{err: errors.New("stop state not observed")}
+		},
+	}
+	if err := ps.cancel(); !errors.Is(err, os.ErrProcessDone) {
+		t.Fatalf("cancel error = %v, want os.ErrProcessDone for a non-positive termination", err)
+	}
+	ps.drainCompleted.Store(true)
+	if err := ps.terminalError(nil); err != nil {
+		t.Fatalf("terminal error = %v, want settled success", err)
 	}
 }
 

@@ -451,6 +451,18 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 			return settleTerminal()
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			// A queued read or a settled process can become ready in the
+			// same turn as caller cancellation. Give that evidence one
+			// final priority check so a terminal CLI error is not hidden by
+			// the context cause.
+			if read, hasRead, doneReady := nextReadyLogSettle(readResults, done); hasRead {
+				terminal, err := handleRead(read)
+				if terminal {
+					return joinNonNil(err, ctxErr)
+				}
+			} else if doneReady {
+				return joinNonNil(settleTerminal(), ctxErr)
+			}
 			return ctxErr
 		}
 		if idleExpired || maxExpired {

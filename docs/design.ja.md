@@ -324,7 +324,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
-`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`docker context` 経由のリモート指定は検知できない。
+`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。一方 `unix://`、`npipe://`、ループバックアドレス、空値はローカルのままである。Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではない。`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。`docker context` 経由のリモート指定は検知できない。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 

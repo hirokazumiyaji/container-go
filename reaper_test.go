@@ -1,5 +1,3 @@
-//go:build !windows
-
 package container
 
 import (
@@ -55,6 +53,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -73,6 +72,7 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 }
 
 func TestReaperDeletesRegisteredDockerIDOnEOF(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "rm")
 	id := strings.Repeat("ab", 32)
@@ -134,6 +134,7 @@ func TestPreRegisterWithGlobalReaperLogsValidationFailure(t *testing.T) {
 }
 
 func TestReaperRejectsInvalidID(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -170,6 +171,7 @@ func (w *blockingReaperWriter) Write(p []byte) (int, error) {
 }
 
 func TestReaperRecoveryUsesFreshBudget(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.entries = []reaperEntry{{id: "fresh-budget"}}
@@ -223,6 +225,7 @@ func TestReaperWriteIsContextBounded(t *testing.T) {
 }
 
 func TestReaperInspectProjectionIgnoresPATHHelpers(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	bin, logPath := writeReaperStub(t)
 	helperDir := filepath.Join(dir, "helpers")
@@ -257,6 +260,7 @@ func TestReaperInspectProjectionIgnoresPATHHelpers(t *testing.T) {
 }
 
 func TestReaperAppleNameLockCoversReplacement(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	name := "reaper-lock-" + newContainerName()
 	creation := "0123456789abcdef"
@@ -331,6 +335,7 @@ func waitForFileExists(t *testing.T, path string) {
 }
 
 func TestReaperRegisterGateTimeoutKeepsIntentAndReconciles(t *testing.T) {
+	requirePOSIXShell(t)
 	previous := reaperOperationLockTimeout
 	reaperOperationLockTimeout = 25 * time.Millisecond
 	t.Cleanup(func() { reaperOperationLockTimeout = previous })
@@ -396,6 +401,7 @@ func waitForReaperExit(t *testing.T, r *reaper) {
 }
 
 func TestReaperRecoveryRetriesUntilSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	previous := initialReaperSpawnBackoff
 	initialReaperSpawnBackoff = 10 * time.Millisecond
 	t.Cleanup(func() { initialReaperSpawnBackoff = previous })
@@ -432,6 +438,7 @@ func TestReaperRecoveryRetriesUntilSuccess(t *testing.T) {
 }
 
 func TestReaperCompletionStopsPendingRecheck(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath, generationPath := writeGenerationReaperStub(t, false)
 	if err := os.WriteFile(generationPath, []byte("0123456789abcdef"), 0o600); err != nil {
 		t.Fatal(err)
@@ -448,6 +455,7 @@ func TestReaperCompletionStopsPendingRecheck(t *testing.T) {
 }
 
 func TestReaperPendingEntryRechecksLateCreate(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath, generationPath := writeGenerationReaperStub(t, false)
 	if err := os.WriteFile(generationPath, []byte("0123456789abcdef"), 0o600); err != nil {
 		t.Fatal(err)
@@ -462,6 +470,7 @@ func TestReaperPendingEntryRechecksLateCreate(t *testing.T) {
 }
 
 func TestReaperPendingEntryRechecksAfterCreateFinishes(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "container")
 	logPath := filepath.Join(dir, "calls.log")
@@ -491,6 +500,7 @@ func TestReaperPendingEntryRechecksAfterCreateFinishes(t *testing.T) {
 }
 
 func TestReaperRespawnsAndReplaysAfterUnexpectedExit(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -526,6 +536,7 @@ func waitForReaperReplacement(t *testing.T, r *reaper, old *exec.Cmd) {
 }
 
 func TestReaperIntentionalEOFDoesNotRespawn(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	if err := r.register("eof-once", ""); err != nil {
@@ -551,6 +562,7 @@ func TestReaperIntentionalEOFDoesNotRespawn(t *testing.T) {
 }
 
 func TestReaperRegistrationRetryReplaysRetainedEntries(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.entries = []reaperEntry{{id: "retained", creation: ""}}
@@ -688,6 +700,7 @@ func TestRunAbortsCreateWhenPreRegistrationGateTimesOut(t *testing.T) {
 }
 
 func TestRunPreRegistersReaperBeforeCreate(t *testing.T) {
+	requirePOSIXShell(t)
 	tests := []struct {
 		name       string
 		engine     engine
@@ -746,6 +759,7 @@ func TestRunPreRegistersReaperBeforeCreate(t *testing.T) {
 }
 
 func TestRunPreRegistrationPreservesNameConflict(t *testing.T) {
+	requirePOSIXShell(t)
 	tests := []struct {
 		name       string
 		engine     engine
@@ -813,6 +827,7 @@ func TestRunPreRegistrationPreservesNameConflict(t *testing.T) {
 }
 
 func TestReaperScriptDashWithoutJobControlKeepsProcessingEntries(t *testing.T) {
+	requirePOSIXShell(t)
 	if _, err := os.Stat("/bin/dash"); err != nil {
 		t.Skipf("/bin/dash unavailable: %v", err)
 	}
@@ -912,6 +927,7 @@ func TestBreQuoteEscapesLabelKey(t *testing.T) {
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
@@ -925,6 +941,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -937,6 +954,7 @@ func TestReaperRegisterWithCreationValidation(t *testing.T) {
 }
 
 func TestReaperGuardsDeleteByCreation(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Helper()
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -969,6 +987,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 }
 
 func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"
@@ -1004,6 +1023,7 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 }
 
 func TestReaperDeletesByImmutableID(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/docker"

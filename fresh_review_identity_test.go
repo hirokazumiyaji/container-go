@@ -28,7 +28,7 @@ func TestFreshReviewNameLookupDoesNotPublishDockerUID(t *testing.T) {
 	if _, err := ctr.inspectFresh(context.Background()); err != nil {
 		t.Fatalf("inspectFresh: %v", err)
 	}
-	if got := ctr.immutableUID(); got != "" {
+	if got := ctr.immutableID(); got != "" {
 		t.Fatalf("name lookup published UID %q", got)
 	}
 	if got := ctr.operationTarget(); got != "logical-name" {

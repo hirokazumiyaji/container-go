@@ -63,13 +63,16 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 func TestCleanupErrorUnwrapsOperationAndCleanup(t *testing.T) {
 	operationErr := errors.New("operation failed")
 	cleanupErr := errors.New("cleanup failed")
-	err := withCleanupError(operationErr, cleanupErr)
-	if !errors.Is(err, operationErr) || !errors.Is(err, cleanupErr) {
-		t.Fatalf("joined error = %v, want both causes", err)
+	err := withCleanupError(operationErr, &CleanupError{Container: "myctr", Err: cleanupErr})
+	if !errors.Is(err, operationErr) {
+		t.Fatalf("errors.Is(operation) = false for %v", err)
 	}
 	var wrapped *CleanupError
-	if !errors.As(err, &wrapped) || wrapped.Err != operationErr || wrapped.CleanupErr != cleanupErr {
-		t.Fatalf("wrapped = %#v, want both fields", wrapped)
+	if !errors.As(err, &wrapped) || wrapped.Container != "myctr" || wrapped.Err != cleanupErr {
+		t.Fatalf("errors.As(CleanupError) = %#v, want Container=myctr Err=%v", wrapped, cleanupErr)
+	}
+	if !errors.Is(err, cleanupErr) {
+		t.Fatalf("errors.Is(cleanup) = false for %v", err)
 	}
 }
 

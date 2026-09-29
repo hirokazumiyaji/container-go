@@ -13,30 +13,6 @@ import (
 // an internal package.
 type CLIError = cli.CLIError
 
-// CleanupError reports an operation failure together with a failure
-// from removing the container the operation created. Both errors remain
-// available through errors.Is/errors.As and the exported fields.
-type CleanupError struct {
-	Err        error
-	CleanupErr error
-}
-
-func (e *CleanupError) Error() string {
-	return fmt.Sprintf("%v; cleanup failed: %v", e.Err, e.CleanupErr)
-}
-
-// Unwrap returns both the operation and cleanup errors.
-func (e *CleanupError) Unwrap() []error {
-	return []error{e.Err, e.CleanupErr}
-}
-
-func withCleanupError(err, cleanupErr error) error {
-	if cleanupErr == nil {
-		return err
-	}
-	return &CleanupError{Err: err, CleanupErr: cleanupErr}
-}
-
 // ErrSystemNotRunning reports that the Apple Container system service is
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning

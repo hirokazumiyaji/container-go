@@ -134,20 +134,30 @@ func ownedDockerInspectJSON(name, id string) string {
 }
 
 func cliErrorWithStderr(err error, text string) *cli.CLIError {
-	var cleanupErr *CleanupError
-	if errors.As(err, &cleanupErr) {
-		for _, candidate := range []error{cleanupErr.Err, cleanupErr.CleanupErr} {
-			var cliErr *cli.CLIError
-			if errors.As(candidate, &cliErr) && strings.Contains(cliErr.Stderr, text) {
-				return cliErr
-			}
-		}
-	}
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) || !strings.Contains(cliErr.Stderr, text) {
+	return findCLIErrorWithStderr(err, text)
+}
+
+func findCLIErrorWithStderr(err error, text string) *cli.CLIError {
+	if err == nil {
 		return nil
 	}
-	return cliErr
+	if cliErr, ok := err.(*cli.CLIError); ok {
+		if strings.Contains(cliErr.Stderr, text) {
+			return cliErr
+		}
+		return nil
+	}
+	switch e := err.(type) {
+	case interface{ Unwrap() []error }:
+		for _, u := range e.Unwrap() {
+			if found := findCLIErrorWithStderr(u, text); found != nil {
+				return found
+			}
+		}
+	case interface{ Unwrap() error }:
+		return findCLIErrorWithStderr(e.Unwrap(), text)
+	}
+	return nil
 }
 
 func TestRunFailureCleansUpOwnedContainer(t *testing.T) {

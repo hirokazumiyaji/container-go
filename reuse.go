@@ -195,7 +195,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, withCleanupError(classified, cleanupErr)
+		if cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	ctr := &Container{
@@ -216,7 +219,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// remove the record.
 			protectReuseReaper(cfg)
 			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
-			return nil, withCleanupError(err, cleanupErr)
+			if cleanupErr != nil {
+				return nil, withCleanupError(err, &CleanupError{Container: cfg.name, Err: cleanupErr})
+			}
+			return nil, err
 		}
 		// Marking shared before publication closes the pending-to-active
 		// window. If the child is unavailable, markShared still updates

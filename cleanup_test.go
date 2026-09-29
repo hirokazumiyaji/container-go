@@ -273,13 +273,13 @@ func TestCleanupFunctionsMarkThemselvesAsHelpers(t *testing.T) {
 	}
 
 	tb = &cleanupTBRecorder{}
-	CleanupStrict(tb, nil)
+	StrictCleanup(tb, nil)
 	if tb.helpers < 2 {
-		t.Fatalf("CleanupStrict helper calls = %d, want exported and registration helpers", tb.helpers)
+		t.Fatalf("StrictCleanup helper calls = %d, want exported and registration helpers", tb.helpers)
 	}
 }
 
-func TestCleanupStrictReportsCleanupFailure(t *testing.T) {
+func TestStrictCleanupReportsCleanupFailure(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	f.failPrefix = "delete"

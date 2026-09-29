@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -19,6 +20,7 @@ type processIdentity struct {
 	pid      int
 	pidfd    int
 	closeOne sync.Once
+	closed   atomic.Bool
 }
 
 func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
@@ -32,7 +34,17 @@ func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
 	return &processIdentity{pid: process.Pid, pidfd: fd}, nil
 }
 
+func (p *processIdentity) usable() error {
+	if p == nil || p.closed.Load() || p.pidfd <= 0 {
+		return os.ErrProcessDone
+	}
+	return nil
+}
+
 func (p *processIdentity) active() (bool, error) {
+	if err := p.usable(); err != nil {
+		return false, err
+	}
 	for {
 		fds := []unix.PollFd{{Fd: int32(p.pidfd), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 0)
@@ -53,10 +65,16 @@ func (p *processIdentity) active() (bool, error) {
 }
 
 func (p *processIdentity) stop() error {
+	if err := p.usable(); err != nil {
+		return err
+	}
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGSTOP, nil, 0)
 }
 
 func (p *processIdentity) stopped() (bool, error) {
+	if err := p.usable(); err != nil {
+		return false, err
+	}
 	deadline := time.Now().Add(processStoppedObservationWindow)
 	for {
 		var info unix.Siginfo
@@ -89,10 +107,16 @@ func (p *processIdentity) stopped() (bool, error) {
 }
 
 func (p *processIdentity) kill() error {
+	if err := p.usable(); err != nil {
+		return err
+	}
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0)
 }
 
 func (p *processIdentity) groupID() (int, bool) {
+	if p.usable() != nil {
+		return 0, false
+	}
 	pgid, err := unix.Getpgid(p.pid)
 	if err != nil {
 		return 0, false
@@ -102,9 +126,9 @@ func (p *processIdentity) groupID() (int, bool) {
 
 func (p *processIdentity) close() {
 	p.closeOne.Do(func() {
+		p.closed.Store(true)
 		if p.pidfd > 0 {
 			_ = unix.Close(p.pidfd)
-			p.pidfd = 0
 		}
 	})
 }

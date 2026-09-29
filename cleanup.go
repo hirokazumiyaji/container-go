@@ -41,7 +41,7 @@ func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 	tb.Cleanup(func() {
 		if err := TerminateContainer(ctr); err != nil {
 			if strict {
-				tb.Errorf("container-go: cleanup %s: %v", ctr.ID(), err)
+				tb.Errorf("container-go: cleanup %s left the container behind: %v", ctr.ID(), err)
 				return
 			}
 			tb.Logf("container-go: cleanup %s: %v", ctr.ID(), err)
@@ -51,15 +51,26 @@ func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 
 // Cleanup registers best-effort container removal via tb.Cleanup. It is
 // nil-safe, so call it right after Run, before checking Run's error.
+//
+// A removal failure is logged rather than reported, so an existing test that
+// does not care about teardown is not turned red by an unrelated backend
+// problem. Use StrictCleanup when a leftover container should fail the test.
 func Cleanup(tb testing.TB, ctr *Container) {
 	registerCleanup(tb, ctr, false)
 }
 
-// CleanupStrict is Cleanup with cleanup failures reported as test
-// failures. It is nil-safe and otherwise has the same reuse and
-// CONTAINERGO_KEEP behavior as Cleanup.
-func CleanupStrict(tb testing.TB, ctr *Container) {
+// StrictCleanup registers container removal like Cleanup, but reports a
+// removal failure as a test failure instead of logging it. A container that
+// outlives its test is a leak, and a green run would otherwise hide it.
+// It is nil-safe and otherwise has the same reuse and CONTAINERGO_KEEP
+// behavior as Cleanup.
+func StrictCleanup(tb testing.TB, ctr *Container) {
 	registerCleanup(tb, ctr, true)
+}
+
+// CleanupStrict is an alias for StrictCleanup.
+func CleanupStrict(tb testing.TB, ctr *Container) {
+	StrictCleanup(tb, ctr)
 }
 
 // Prune removes stopped containers created by this library, from any

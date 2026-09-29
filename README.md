@@ -93,12 +93,22 @@ binding's address when several publish host-IPs differ.
 the host (Docker Desktop), so ports declared via `WithExposedPorts` are
 automatically published to daemon-assigned ports — the classic
 testcontainers model. Locally this binds loopback
-(`-p 127.0.0.1::<port>`); with `DOCKER_HOST=tcp://host` (remote daemon,
-e.g. `tcp://docker:2375` in CI) it binds all interfaces
-(`-p 0.0.0.0::<port>`) so the client can reach it. `Host` returns
-`127.0.0.1` (or the host from a `tcp://` `DOCKER_HOST`) and
-`MappedPort` returns the assigned port. Assignment happens atomically
+(`-p 127.0.0.1::<port>`); with a remote `DOCKER_HOST` it binds all
+interfaces (`-p 0.0.0.0::<port>`) so the client can reach it. Remote
+means any `DOCKER_HOST` that does not name this machine:
+`tcp://host` (e.g. `tcp://docker:2375` in CI), `ssh://user@host`, or a
+scheme-less `host:port` / hostname, normalized the way the Docker CLI
+normalizes it (`tcp://` prepended). `unix://`, `npipe://`, loopback
+addresses, and an empty value stay local. Docker CLI client protocols
+are `unix`, `tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1`
+(or the remote hostname) and `MappedPort` returns the assigned port.
+Assignment happens atomically
 in the daemon, so parallel tests do not race over ports here either.
+For `ssh://` the remote hostname must be directly dialable: the CLI's
+SSH session carries only the Docker API, not published ports, so an
+alias reachable only through a ProxyJump or bastion needs a manual
+`ssh -L` forward.
 With a remote daemon, an explicit `WithPublishedPort` bound to loopback
 (`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
 on the remote machine.
@@ -163,7 +173,7 @@ container.Pull(ctx, "redis:7-alpine") // explicit fetch, shared like Run's
 Three layers make sure containers do not outlive your tests:
 
 1. `container.Cleanup(t, ctr)` registers best-effort removal via
-   `t.Cleanup`; `container.CleanupStrict(t, ctr)` reports a removal
+   `t.Cleanup`; `container.StrictCleanup(t, ctr)` reports a removal
    failure as a test failure. `container.TerminateContainer(ctr)` is the
    deferred-style variant. All are nil-safe, so call them before checking
    `Run`'s error.

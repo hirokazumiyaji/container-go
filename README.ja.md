@@ -90,7 +90,7 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。`docker context` 経由のリモート指定は検知しません。割り当ては
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートの `DOCKER_HOST` では全IF(`-p 0.0.0.0::<port>`)に束縛します。リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことです。`tcp://host`(CI での `tcp://docker:2375` など)、`ssh://user@host`、スキームなしの `host:port` / ホスト名(Docker CLI と同じく `tcp://` を前置)が該当し、`unix://`、`npipe://`、ループバックアドレス、空値はローカルのままです。Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではありません。`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。`ssh://` のホスト名は直接 dial 可能でなければなりません。CLI の SSH セッションが運ぶのは Docker API だけで、公開ポートは運ばれないため、ProxyJump や踏み台越しでしか届かないエイリアスは手動の `ssh -L` 転送が必要です。`docker context` 経由のリモート指定は検知しません。割り当ては
 デーモンが起動時に原子的に行うため、こちらでも並列テストがポートを
 奪い合うことはありません。
 
@@ -134,7 +134,7 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 コンテナがテストより長生きしないよう、3 層の仕組みがあります。
 
 1. `container.Cleanup(t, ctr)` は `t.Cleanup` 経由で best-effort の削除を
-   登録します。`container.CleanupStrict(t, ctr)` を使うと、削除失敗を
+   登録します。`container.StrictCleanup(t, ctr)` を使うと、削除失敗を
    テスト失敗として報告します。defer 派には
    `container.TerminateContainer(ctr)` があります。いずれも nil 安全なので、
    `Run` のエラーチェックより前に呼べます。

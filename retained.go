@@ -56,7 +56,7 @@ func retainedFailedCreate(ctx context.Context, cfg *config, _ error, _ error) (*
 
 	ctr.reused = cfg.reuse
 	ctr.creation = cfg.creation
-	ctr.uid = info.uid
+	ctr.setImmutableID(info.uid)
 	ctr.info = info
 	return ctr, nil
 }
@@ -101,7 +101,7 @@ func verifyRetainedHandle(ctx context.Context, c *Container) (*Container, error)
 		published: c.published,
 		reused:    c.reused,
 		creation:  c.creation,
-		uid:       c.uid,
+		uid:       c.immutableID(),
 	}
 	info, err := ctr.inspectFresh(lookupCtx)
 	if err != nil {
@@ -111,7 +111,7 @@ func verifyRetainedHandle(ctx context.Context, c *Container) (*Container, error)
 		return nil, fmt.Errorf("retained container %s: %w", c.id, err)
 	}
 	ctr.creation = info.labels[creationLabel]
-	ctr.uid = info.uid
+	ctr.setImmutableID(info.uid)
 	ctr.info = info
 	return ctr, nil
 }

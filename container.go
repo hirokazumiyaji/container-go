@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -105,10 +106,37 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -204,8 +232,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if uid := c.immutableID(); uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -285,7 +313,11 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	ctr := namedContainer(cfg, cfg.name)
 	info, err := ctr.inspectFresh(cleanupCtx)
 	if err != nil {
-		if isNotFoundFor(cfg.eng, cfg.name, err) {
+		// A successful inspect that lists no container yields
+		// ErrContainerNotFound from parseInspect; that is proof of
+		// absence, not an uninspectable leftover. CLI not-found
+		// wording stays operation- and target-scoped.
+		if errors.Is(err, ErrContainerNotFound) || isNotFoundFor(cfg.eng, cfg.name, err) {
 			return nil
 		}
 		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
@@ -429,8 +461,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	if uid := c.immutableID(); uid != "" {
+		return c.delete(ctx, uid)
 	}
 	if c.creation == "" {
 		return c.delete(ctx, c.id)
@@ -568,9 +600,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
+	// Delegate, so the "never downgrade a promoted value" invariant lives in
+	// one place rather than being reimplemented here.
+	c.setImmutableID(info.uid)
 	return info, nil
 }
 

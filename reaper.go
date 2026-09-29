@@ -66,16 +66,22 @@ max_descendant_depth=32
 max_descendant_lookups=64
 helper_output_blocks=512
 cleanup_helper_budget=8
+cleanup_pgrep_budget=2
 cleanup_enumeration_budget=2
 cleanup_active=0
 cleanup_budget_file=
+cleanup_pgrep_file=
 cleanup_enumeration_file=
+helper_pgrep_active=0
 helper_enumeration_active=0
 consume_cleanup_budget() {
   [ "$cleanup_active" = 1 ] || return 0
   if [ "$helper_enumeration_active" = 1 ]; then
     [ -n "$cleanup_enumeration_file" ] || cleanup_enumeration_file="$work_dir/cleanup.enumeration"
     selected_budget_file="$cleanup_enumeration_file"
+  elif [ "$helper_pgrep_active" = 1 ]; then
+    [ -n "$cleanup_pgrep_file" ] || cleanup_pgrep_file="$work_dir/cleanup.pgrep"
+    selected_budget_file="$cleanup_pgrep_file"
   else
     [ -n "$cleanup_budget_file" ] || cleanup_budget_file="$work_dir/cleanup.budget"
     selected_budget_file="$cleanup_budget_file"
@@ -190,28 +196,32 @@ kill_helper_descendants() {
   helper_tree_root="$1"
   helper_tree_table="$work_dir/helper.table"
   helper_tree_error="$work_dir/helper.err"
-  saved_helper_pid="$helper_pid"
-  saved_helper_timer="$helper_timer"
-  saved_helper_groups="$helper_process_groups"
-  saved_helper_enumeration="$helper_enumeration"
-  saved_helper_enumeration_active="$helper_enumeration_active"
-  helper_enumeration=1
-  helper_enumeration_active=1
-  run_helper "$helper_tree_table" "$helper_tree_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
-  helper_table_status="$?"
-  helper_enumeration_active="$saved_helper_enumeration_active"
-  helper_pid="$saved_helper_pid"
-  helper_timer="$saved_helper_timer"
-  helper_process_groups="$saved_helper_groups"
-  helper_enumeration="$saved_helper_enumeration"
-  helper_tree_table_result=0
-  if [ "$helper_table_status" -eq 0 ]; then
-    build_helper_tree "$helper_tree_root" "$helper_tree_table" || true
-    for tree_pid in $helper_tree_pids; do
-      kill -0 "$tree_pid" 2>/dev/null || continue
-      kill -KILL "$tree_pid" 2>/dev/null || true
-    done
-  fi
+  helper_tree_attempt=0
+  while [ "$helper_tree_attempt" -lt 2 ]; do
+    saved_helper_pid="$helper_pid"
+    saved_helper_timer="$helper_timer"
+    saved_helper_groups="$helper_process_groups"
+    saved_helper_enumeration="$helper_enumeration"
+    saved_helper_enumeration_active="$helper_enumeration_active"
+    helper_enumeration=1
+    helper_enumeration_active=1
+    run_helper "$helper_tree_table" "$helper_tree_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
+    helper_table_status="$?"
+    helper_enumeration_active="$saved_helper_enumeration_active"
+    helper_pid="$saved_helper_pid"
+    helper_timer="$saved_helper_timer"
+    helper_process_groups="$saved_helper_groups"
+    helper_enumeration="$saved_helper_enumeration"
+    helper_tree_table_result=0
+    if [ "$helper_table_status" -eq 0 ]; then
+      build_helper_tree "$helper_tree_root" "$helper_tree_table" || true
+      for tree_pid in $helper_tree_pids; do
+        kill -0 "$tree_pid" 2>/dev/null || continue
+        kill -KILL "$tree_pid" 2>/dev/null || true
+      done
+    fi
+    helper_tree_attempt=$((helper_tree_attempt + 1))
+  done
 }
 run_helper() {
   helper_out="$1"
@@ -413,8 +423,11 @@ list_children() {
   if [ "$pgrep_disabled" = 1 ]; then
     pgrep_status=125
   else
+    saved_pgrep_active="$helper_pgrep_active"
+    helper_pgrep_active=1
     run_helper "$pgrep_out" "$pgrep_err" "$pgrep_bin" -P "$parent"
     pgrep_status="$?"
+    helper_pgrep_active="$saved_pgrep_active"
     if [ "$pgrep_status" -eq 1 ] && [ -s "$pgrep_err" ]; then
       pgrep_status=125
     fi
@@ -684,9 +697,13 @@ kill_pipeline() {
   kill_root_pid="$1"
   cleanup_active=1
   cleanup_helper_budget=8
+  cleanup_pgrep_budget=2
+  cleanup_enumeration_budget=2
   cleanup_budget_file="$work_dir/cleanup.budget.$kill_root_pid"
+  cleanup_pgrep_file="$work_dir/cleanup.pgrep.$kill_root_pid"
   cleanup_enumeration_file="$work_dir/cleanup.enumeration.$kill_root_pid"
   printf '%s\n' "$cleanup_helper_budget" >"$cleanup_budget_file" 2>/dev/null || cleanup_helper_budget=0
+  printf '%s\n' "$cleanup_pgrep_budget" >"$cleanup_pgrep_file" 2>/dev/null || cleanup_pgrep_budget=0
   printf '%s\n' "$cleanup_enumeration_budget" >"$cleanup_enumeration_file" 2>/dev/null || cleanup_enumeration_budget=0
   tombstoned_pids=
   stopped_pids=

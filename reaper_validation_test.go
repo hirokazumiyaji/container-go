@@ -63,6 +63,7 @@ func TestReaperScriptValidationIsPortable(t *testing.T) {
 		"kill -9 \"$snapshot_pid\"",
 		"max_descendant_lookups",
 		"cleanup_helper_budget",
+		"cleanup_pgrep_budget",
 		"cleanup_enumeration_budget",
 		"consume_cleanup_budget",
 		"kill_stopped_processes",

@@ -202,7 +202,7 @@ Apple の場合は generation を保存し、JSON の行頭にある `"key": "va
 本番リーパーはテスト用の Go 製 process walker ではなく外部 shell 子プロセスであり、process ID には安定した `ps lstart`(CPU 時間ではない)を使う。識別情報を失った場合は numeric signal の許可とせず、検証不能として処理を打ち切る。
 停止済みの process には独立した force-signal budget を与え、traversal が budget 切れになっても停止したまま残さない。lookup と signal の budget は別々で、双方は有限である。
 `pgrep` は任意で、利用できない場合は固定した `ps` の process table で子孫を列挙する。
-補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と列挙用の予備 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
+補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と `pgrep`・列挙用の予備各 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
 登録は reaper 子プロセスあたり最大 1024 件を保持・再生する。shell は上限を超える入力も読み捨て続けるため、pipe が満杯で writer が block しない。Go 側の上限超過は明示的な capacity error として返し、`Run` は新規コンテナを rollback する。
 
 **セッションラベル**：作成する全コンテナに次のラベルを付与する。

@@ -339,8 +339,8 @@ stopped, and a fresh signal budget is independent of the traversal budget.
 `pgrep` is optional; a pinned `ps` process-table fallback supplies descendants
 when it is unavailable. Helper output is capped by a file-size limit, each
 helper has a one-second budget, and a timed entry may consume at most eight
-regular helper operations plus a two-operation descendant-enumeration
-reserve. Reaching those bounds skips further cleanup work rather
+regular helper operations plus two-operation `pgrep` and
+descendant-enumeration reserves. Reaching those bounds skips further cleanup work rather
 than blocking the reaper. Helper descendants are enumerated, killed, and
 reaped when monitor mode is unavailable.
 

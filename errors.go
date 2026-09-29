@@ -123,16 +123,17 @@ func notFoundForOps(eng engine, target string, err error, ops ...string) bool {
 
 // lifecycleCLIError returns the CLI failure this backend raised for one
 // of ops, ignoring failures raised for other commands (an image pull or
-// a liveness probe, for example) and for the other backend.
+// a liveness probe, for example) and for the other backend. Without a
+// backend there is no way to attribute the wording, so it reports none.
 func lifecycleCLIError(eng engine, err error, ops ...string) (*cli.CLIError, bool) {
+	if eng == nil {
+		return nil, false
+	}
 	var cliErrs []*cli.CLIError
 	collectCLIErrors(err, &cliErrs)
 	for _, cliErr := range cliErrs {
 		if len(cliErr.Args) == 0 || !slices.Contains(ops, cliErr.Args[0]) {
 			continue
-		}
-		if eng == nil {
-			return cliErr, true
 		}
 		if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
 			continue

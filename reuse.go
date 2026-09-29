@@ -166,7 +166,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 	uid := cfg.eng.parseRunID(stdout)
@@ -186,13 +188,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:       uid,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, ctr.rollback(ctx, err)
 		}
 	}
 	return ctr, nil

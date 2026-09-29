@@ -983,7 +983,16 @@ func TestDockerConnectHostMapping(t *testing.T) {
 }
 
 func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
-	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375", "tcp://127.0.0.2:2375", "tcp://[::1]:2375"} {
+	for _, host := range []string{
+		"",
+		"unix:///var/run/docker.sock",
+		"tcp://127.0.0.1:2375",
+		"tcp://127.0.0.2:2375",
+		"tcp://[::1]:2375",
+		// Docker substitutes defaultAddr.Hostname() for an empty TCP host.
+		"tcp://:2375",
+		":2375",
+	} {
 		t.Setenv("DOCKER_HOST", host)
 		if isRemoteDockerHost() {
 			t.Errorf("DOCKER_HOST=%q: want local (not remote)", host)
@@ -992,6 +1001,15 @@ func TestIsRemoteDockerHostUsesFullLoopbackRange(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
 	if !isRemoteDockerHost() {
 		t.Error("tcp://10.0.0.5:2375 must be remote")
+	}
+}
+
+func TestNormalizeDockerHostEmptyPort(t *testing.T) {
+	if got := normalizeDockerHost(":2375"); got != "tcp://:2375" {
+		t.Errorf("normalizeDockerHost(:2375) = %q, want tcp://:2375", got)
+	}
+	if got := normalizeDockerHost("tcp://:2375"); got != "tcp://:2375" {
+		t.Errorf("normalizeDockerHost(tcp://:2375) = %q, want unchanged", got)
 	}
 }
 

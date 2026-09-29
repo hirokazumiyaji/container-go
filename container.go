@@ -132,7 +132,12 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 
 	mu        contextLock
 	info      *engineInfo // cached first inspect; immutable fields only
@@ -141,6 +146,28 @@ type Container struct {
 	// and failed-create cleanup. Their inspected UID is data, not a
 	// caller-visible identity.
 	nameInspect bool
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -203,7 +230,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 	uid := cfg.eng.parseRunID(stdout)
@@ -230,7 +259,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			bin = cfg.eng.binary()
 		}
 		if requiresImmutableID(cfg.eng) {
-			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.immutableID(), "")
 		} else {
 			_ = registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -255,61 +284,83 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort removes the container this Run left
-// behind after a failed create. It never deletes a pre-existing
-// same-name container: name conflicts are skipped, and only a container
-// carrying this process's managed+session labels is removed. When the
-// creation generation is known it must also match.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes the container this Run left behind after a
+// failed create, and reports whether it succeeded.
+//
+// It never deletes a pre-existing same-name container: name conflicts are
+// skipped, and only a container carrying this process's managed+session labels
+// is removed. When the creation generation is known it must also match. Those
+// skips are successes, because there is nothing of ours left to remove.
+//
+// Every other failure is returned, so the caller can tell a caller-visible
+// "the container is still there" apart from a silent best-effort attempt. A
+// container that cannot even be inspected may still exist, so that case is a
+// failure too rather than an assumption that it is gone.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
 	unlock, err := lockName(cleanupCtx, cfg.name)
 	if err != nil {
-		return
+		return fmt.Errorf("lock name for cleanup: %w", err)
 	}
 	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
 	if err != nil {
-		return
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if info.labels[managedLabel] != "true" {
-		return
+		return nil
 	}
 	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+		return nil
 	}
 	if cfg.creation != "" {
 		actual, ok := info.labels[creationLabel]
 		if !ok || actual != cfg.creation {
-			return
+			return nil
 		}
 	}
 	target := cfg.name
 	if requiresImmutableID(cfg.eng) {
 		if !info.uidVerified || !validImmutableID(cfg.eng, info.uid) {
-			return
+			return nil
 		}
 		target = info.uid
 	} else if info.uid != "" {
-		return
+		return nil
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
+		// The container passed the ownership checks, so it exists and is
+		// ours. A failure here means it is still running.
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", target, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -371,21 +422,24 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // by name (see lockName). An unverifiable generation fails closed with
 // ErrGenerationReplaced rather than authorizing a name-based delete.
 func (c *Container) Terminate(ctx context.Context) error {
-	target, err := c.inspectTarget(ctx)
-	if err != nil {
+	// Observe cancellation before any backend work so a canceled caller
+	// never waits behind inspectMu (uid reads use uidMu instead).
+	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("terminate %s: %w", c.id, err)
 	}
-	if requiresImmutableID(c.eng) {
-		if !dockerIDRE.MatchString(target) {
-			return fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
+	if uid := c.immutableID(); uid != "" {
+		if requiresImmutableID(c.eng) && !dockerIDRE.MatchString(uid) {
+			return fmt.Errorf("%w: Docker handle has invalid immutable ID %q", ErrGenerationReplaced, uid)
 		}
-		// This is the only compatibility path that does not need a
-		// creation generation: the full backend ID cannot name a
-		// replacement.
-		return c.delete(ctx, target)
+		return c.delete(ctx, uid)
 	}
-	if target != c.id {
-		return fmt.Errorf("%w: %s has no verified operation target", ErrGenerationReplaced, c.id)
+	if requiresImmutableID(c.eng) {
+		// Compatibility path: the handle ID itself may already be the
+		// full backend ID, which cannot name a replacement.
+		if dockerIDRE.MatchString(c.id) {
+			return c.delete(ctx, c.id)
+		}
+		return fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
 	}
 	if !creationRE.MatchString(c.creation) {
 		return fmt.Errorf("%w: %s has missing or invalid creation generation", ErrGenerationReplaced, c.id)
@@ -529,7 +583,7 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 	if err := c.inspectMu.Lock(ctx); err != nil {
 		return "", err
 	}
-	uid := c.uid
+	uid := c.immutableID()
 	c.inspectMu.Unlock()
 	if !requiresImmutableID(c.eng) {
 		return c.id, nil
@@ -559,10 +613,11 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	defer c.mu.Unlock()
 	if c.info != nil {
 		if requiresImmutableID(c.eng) {
-			if !dockerIDRE.MatchString(c.uid) {
+			uid := c.immutableID()
+			if !dockerIDRE.MatchString(uid) {
 				return nil, fmt.Errorf("%w: Docker handle has no verified immutable ID", ErrGenerationReplaced)
 			}
-			if c.info.uid != "" && c.info.uid != c.uid {
+			if c.info.uid != "" && c.info.uid != uid {
 				return nil, fmt.Errorf("%w: cached Docker identity does not match handle", ErrGenerationReplaced)
 			}
 		}
@@ -583,11 +638,12 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer c.inspectMu.Unlock()
 
 	target := c.inspectTargetLocked()
+	uid := c.immutableID()
 	if requiresImmutableID(c.eng) {
-		if c.uid != "" && !validImmutableID(c.eng, c.uid) {
-			return nil, fmt.Errorf("%w: Docker handle has invalid immutable ID %q", ErrGenerationReplaced, c.uid)
+		if uid != "" && !validImmutableID(c.eng, uid) {
+			return nil, fmt.Errorf("%w: Docker handle has invalid immutable ID %q", ErrGenerationReplaced, uid)
 		}
-		if c.uid == "" && !c.nameInspect && !dockerIDRE.MatchString(target) {
+		if uid == "" && !c.nameInspect && !dockerIDRE.MatchString(target) {
 			return nil, fmt.Errorf("%w: refusing Docker name inspect without a verified immutable ID", ErrGenerationReplaced)
 		}
 	}
@@ -606,34 +662,28 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 		if !info.uidVerified || !validImmutableID(c.eng, info.uid) {
 			return nil, fmt.Errorf("%w: Docker inspect returned no verified immutable ID", ErrGenerationReplaced)
 		}
-		if c.uid != "" && c.uid != info.uid {
+		if uid != "" && uid != info.uid {
 			return nil, fmt.Errorf("%w: Docker inspect returned a different immutable ID", ErrGenerationReplaced)
 		}
 	}
 	// A name-addressed lookup may return a UID as data, but it cannot
 	// publish that UID into a handle: a same-name replacement may have
 	// supplied it. Only an exact full-ID target is self-authenticating.
-	if c.uid == "" && requiresImmutableID(c.eng) && info.uidVerified &&
+	// Delegate through setImmutableID so the never-downgrade invariant
+	// lives in one place (and under uidMu).
+	if uid == "" && requiresImmutableID(c.eng) && info.uidVerified &&
 		dockerIDRE.MatchString(target) && info.uid == target {
-		c.uid = info.uid
+		c.setImmutableID(info.uid)
 	}
 	return info, nil
 }
 
-// inspectTarget prefers an immutable ID so a same-name replacement cannot
-// satisfy a Docker inspect. A failed context-aware acquisition is returned
-// to the caller; it must never fall back to the mutable logical name.
-func (c *Container) inspectTarget(ctx context.Context) (string, error) {
-	if err := c.inspectMu.Lock(ctx); err != nil {
-		return "", err
-	}
-	defer c.inspectMu.Unlock()
-	return c.inspectTargetLocked(), nil
-}
-
+// inspectTargetLocked prefers an immutable ID so a same-name replacement
+// cannot satisfy a Docker inspect. Callers that need context-aware locking
+// must acquire inspectMu themselves before calling this.
 func (c *Container) inspectTargetLocked() string {
-	if c.uid != "" {
-		return c.uid
+	if uid := c.immutableID(); uid != "" {
+		return uid
 	}
 	return c.id
 }

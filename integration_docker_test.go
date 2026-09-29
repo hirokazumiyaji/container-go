@@ -17,24 +17,15 @@ import (
 	"time"
 
 	container "github.com/hirokazumiyaji/container-go"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-// requireDocker skips unless the docker CLI and daemon are available,
-// and routes this test to the Docker backend. When CONTAINERGO_BACKEND
-// is set to a non-docker value, Docker integration tests are skipped.
+// requireDocker routes this test to the Docker backend, or skips/fails per
+// backendPreflight.
 func requireDocker(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker CLI not installed")
-	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon not running")
-	}
-	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -265,13 +256,20 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 // processes that WithReuse the same name and checks they share one
 // container.
 func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
+	// Scoped per run so two concurrent runs of this suite cannot prune or
+	// delete each other's containers.
+	group := os.Getenv("CONTAINERGO_REUSE_GROUP")
+	if group == "" {
+		group = "integration-reuse-" + integrationtest.Nonce()
+	}
+
 	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
 		requireDocker(t)
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
 			container.WithReuse(),
-			container.WithReuseGroup("integration-reuse"),
+			container.WithReuseGroup(group),
 			container.WithExposedPorts("6379/tcp"),
 			container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
 		)
@@ -289,10 +287,13 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	}
 
 	requireDocker(t)
-	name := fmt.Sprintf("containergo-reuse-%d", os.Getpid())
+	name := fmt.Sprintf("containergo-reuse-%d-%s", os.Getpid(), integrationtest.Nonce())
 	defer func() {
-		_, _ = container.PruneReuseGroup(context.Background(), "integration-reuse")
-		_ = exec.Command("docker", "rm", "--force", name).Run()
+		// A teardown failure must not be discarded: a leaked container
+		// otherwise survives a green run unnoticed.
+		if _, err := container.PruneReuseGroup(context.Background(), group); err != nil {
+			t.Errorf("prune reuse group %s: %v", group, err)
+		}
 	}()
 
 	startChild := func() *exec.Cmd {
@@ -300,6 +301,7 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_BACKEND=docker",
 			"CONTAINERGO_REUSE_CHILD=1",
+			"CONTAINERGO_REUSE_GROUP="+group,
 			"CONTAINERGO_REUSE_NAME="+name)
 		return cmd
 	}
@@ -313,39 +315,29 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
+	// Track each child as it starts, so a failure on the second start still
+	// reaps the first.
+	children := &integrationtest.ChildGroup{}
+	defer children.Kill()
 	if err := c1.Start(); err != nil {
 		t.Fatal(err)
 	}
+	children.Track(c1)
 	if err := c2.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = c1.Process.Kill()
-		_ = c2.Process.Kill()
-		_, _ = c1.Process.Wait()
-		_, _ = c2.Process.Wait()
-	}()
+	children.Track(c2)
 
-	readReady := func(r io.Reader) string {
-		buf := make([]byte, 4096)
-		var acc string
-		deadline := time.After(3 * time.Minute)
-		for {
-			select {
-			case <-deadline:
-				return acc
-			default:
-			}
-			n, err := r.Read(buf)
-			acc += string(buf[:n])
-			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				return acc
-			}
-		}
+	// The partial output is reported with the error: a hang is exactly when
+	// it is the only diagnostic available.
+	o1, err := integrationtest.ReadReady(out1, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child1: %v (output so far: %q)", err, o1)
 	}
-
-	o1 := readReady(out1)
-	o2 := readReady(out2)
+	o2, err := integrationtest.ReadReady(out2, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child2: %v (output so far: %q)", err, o2)
+	}
 	if !strings.Contains(o1, "READY:") {
 		t.Fatalf("child1: %q", o1)
 	}

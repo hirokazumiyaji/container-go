@@ -1,4 +1,4 @@
-.PHONY: test vet lint integration integration-docker bench-integration
+.PHONY: test vet lint integration integration-docker bench-integration release-check release-check-bench
 
 test:
 	go test ./...
@@ -47,3 +47,61 @@ integration-docker:
 bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...
+
+# Everything a tag must satisfy that can be checked without a container
+# backend, runnable from a clean checkout before tagging.
+#
+# This target is the gate, and the release-check workflow calls it rather than
+# restating the steps. Two parallel lists of checks drift, and the weaker one is
+# the one a maintainer runs locally before tagging.
+#
+# The `integration`-tagged suites are deliberately absent: they need a real
+# backend, which a hosted runner does not have for either backend, and they run
+# locally via `make integration` / `make bench-integration`. They are not
+# ignored, though — `go vet -tags integration` type-checks them below, so a
+# rename that breaks their compilation fails the gate even though they are not
+# executed.
+#
+# `go mod tidy -diff` reports what tidy would change and exits non-zero without
+# writing anything. Applying tidy and diffing afterwards would also miss a
+# go.sum that tidy creates from nothing, because `git diff` ignores untracked
+# files, and a failing run would leave a rewritten, unreviewed go.mod in the
+# tree.
+GOVULNCHECK_VERSION := v1.1.4
+ACTIONLINT_VERSION := v1.7.12
+
+release-check:
+	@command -v golangci-lint >/dev/null || { \
+		echo 'error: golangci-lint not found; run "mise install" (see AGENTS.md)' >&2; exit 1; }
+	go build ./...
+	# Also type-checks the `integration`-tagged files, which no untagged build
+	# compiles. ci.yml's integration-docker job covers this on a PR, but that
+	# job does not run on a tag push, so the tag gate would not.
+	go vet -tags integration ./...
+	$(MAKE) lint
+	go test -count=1 -race ./...
+	go mod verify
+	go mod tidy -diff
+	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+	$(MAKE) release-check-bench
+	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
+
+# bench/ is a separate module, so a root-level ./... reaches none of it: not
+# the build, and not golangci-lint or govulncheck either. Verified by planting a
+# violation in bench and watching a root `golangci-lint run ./...` report
+# "0 issues". So every check the root gets, bench gets again, from inside bench.
+#
+# The untagged `go test` is not at parity with the root's, and is not meant to
+# be: both real bench tests are `//go:build integration` and need a backend, so
+# untagged this module runs exactly one test, a fixture-schema check. The tagged
+# vet above is what keeps the other two from bit-rotting uncompiled.
+release-check-bench:
+	cd bench && go build ./... \
+		&& go vet ./... \
+		&& go vet -tags integration ./... \
+		&& golangci-lint run ./... \
+		&& go test -count=1 -race ./... \
+		&& go mod verify \
+		&& go mod tidy -diff \
+		&& go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
+

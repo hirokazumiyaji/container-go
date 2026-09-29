@@ -152,15 +152,15 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	ctr.mu.Unlock()
 	ctr.inspectMu.Lock()
 	ctr.creation = fresh.labels[creationLabel]
-	ctr.uid = fresh.uid
 	ctr.bootstrap = false
 	ctr.inspectMu.Unlock()
+	ctr.setImmutableID(fresh.uid)
 
 	// A reused generation is handed off to the caller, not owned by the
 	// watchdog. This also removes an older normal-run entry for the same
 	// logical name/UID, so a subsequent parent death cannot delete a
 	// successfully attached shared container.
-	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, cfg.name); err != nil {
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.immutableID(), cfg.name); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -352,7 +352,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			return retained, withCleanupError(classified, retainedErr)
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, withCleanupError(classified, cleanupErr)
+		return nil, withCleanupError(classified, leftoverContainer(cfg.name, cleanupErr))
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
@@ -380,7 +380,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		return reuseValidationFailure(ctx, cfg, ctr, resolvedImage, err)
 	}
 	cfg.markReuseCreated(ctr)
-	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, cfg.name); err != nil {
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.immutableID(), cfg.name); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -415,17 +415,17 @@ func reuseHandleOnError(ctx context.Context, cfg *config, ctr *Container, origin
 	if err := verifyContainerImageIdentity(ctr, info); err != nil {
 		return nil, withCleanupError(cause, err)
 	}
-	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.uid, ctr.id); err != nil {
-		return nil, withCleanupError(cause, err)
+	if err := cancelReuseReaperHandoffWithGeneration(ctr.runner, ctr.eng, ctr.id, ctr.creation, ctr.immutableID(), ctr.id); err != nil {
+		return nil, withCleanupError(cause, leftoverContainer(ctr.id, err))
 	}
 	ctr.mu.Lock()
 	ctr.info = info
 	ctr.mu.Unlock()
 	ctr.inspectMu.Lock()
 	ctr.creation = info.labels[creationLabel]
-	ctr.uid = info.uid
 	ctr.bootstrap = false
 	ctr.inspectMu.Unlock()
+	ctr.setImmutableID(info.uid)
 	return ctr, cause
 }
 
@@ -433,18 +433,18 @@ func reuseValidationFailure(ctx context.Context, cfg *config, ctr *Container, ex
 	if keepContainers() {
 		partial, verifyErr := retainedFailedCreate(ctx, cfg, cause, cause)
 		if partial != nil && verifyErr == nil {
-			if err := cancelReuseReaperHandoffWithGeneration(partial.runner, partial.eng, partial.id, partial.creation, partial.uid, partial.id); err != nil {
-				return nil, withCleanupError(cause, err)
+			if err := cancelReuseReaperHandoffWithGeneration(partial.runner, partial.eng, partial.id, partial.creation, partial.immutableID(), partial.id); err != nil {
+				return nil, withCleanupError(cause, leftoverContainer(partial.id, err))
 			}
 			return partial, cause
 		}
 		return nil, withCleanupError(cause, verifyErr)
 	}
 	if err := verifyReuseCleanupImage(ctx, cfg, ctr, expected); err != nil {
-		return nil, withCleanupError(cause, err)
+		return nil, withCleanupError(cause, leftoverContainer(cfg.name, err))
 	}
 	cleanupErr := cleanupFailedCreate(ctx, cfg, cause, cause)
-	return nil, withCleanupError(cause, cleanupErr)
+	return nil, withCleanupError(cause, leftoverContainer(cfg.name, cleanupErr))
 }
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
@@ -513,7 +513,7 @@ func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) erro
 
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
-	ctr.uid = info.uid
+	ctr.setImmutableID(info.uid)
 	ctr.requestedPlatform = cfg.platform
 	ctr.identityOptional = cfg.eng.name() == "apple"
 	ctr.bootstrap = false
@@ -700,7 +700,7 @@ func (c *config) markReuseCreated(ctr *Container) {
 		return
 	}
 	c.reusedCreated = true
-	c.reusedCreatedUID = ctr.uid
+	c.reusedCreatedUID = ctr.immutableID()
 	c.reusedCreatedGen = ctr.creation
 }
 

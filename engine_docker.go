@@ -68,23 +68,100 @@ func (dockerEngine) probe() cli.Probe {
 	}
 }
 
-// defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything
-// else publishes on loopback. Note: a `docker context` pointing at a
-// remote daemon is not detected; only DOCKER_HOST is honored.
+// defaultHost returns the address the client should dial to reach the
+// container. For a remote daemon that is the DOCKER_HOST host; otherwise it is
+// this machine's loopback.
+//
+// Unlike the auto-publish bind decision, this must be scheme-aware for every
+// remote transport. A client told to dial 127.0.0.1 for a container published
+// on a remote daemon reaches nothing, which is the exact symptom the remote
+// detection exists to prevent. Note: a `docker context` pointing at a remote
+// daemon is not detected; only DOCKER_HOST is honored.
 func (dockerEngine) defaultHost() string {
-	if raw := os.Getenv("DOCKER_HOST"); strings.HasPrefix(raw, "tcp://") {
-		if u, err := url.Parse(raw); err == nil && u.Hostname() != "" {
-			return u.Hostname()
+	if isRemoteDockerHost() {
+		if host := dockerHostName(); host != "" {
+			return host
 		}
 	}
 	return "127.0.0.1"
 }
 
-// isRemoteDocker reports whether DOCKER_HOST points at a non-loopback
-// tcp daemon. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1 bind on
-// the remote host is unreachable from the client.
+// normalizeDockerHost applies the same normalization the Docker CLI performs
+// before dialing: a value with no "://" is a TCP host (hostname, host:port, or
+// :port), so "tcp://" is prepended. A bare numeric value such as "2375" is a
+// hostname, not a port — matching the Docker CLI. Scheme-less ":2375" becomes
+// "tcp://:2375", after which isRemoteDockerHost applies Docker's empty-host
+// fallback (default hostname → local).
+//
+// url.Parse cannot read those forms — "127.0.0.1:2375" errors outright and
+// "localhost:2375" parses as an opaque scheme with no host — so without this
+// they would fall through to the fail-closed branch and be reported as remote.
+// That would bind auto-published ports to 0.0.0.0 on the developer's own
+// machine.
+func normalizeDockerHost(raw string) string {
+	if raw == "" || strings.Contains(raw, "://") {
+		return raw
+	}
+	return "tcp://" + raw
+}
+
+// dockerHostName returns the hostname DOCKER_HOST names, or "" when it names
+// no host (a local socket, or an unparsable value).
+func dockerHostName() string {
+	u, err := url.Parse(normalizeDockerHost(os.Getenv("DOCKER_HOST")))
+	if err != nil {
+		return ""
+	}
+	return u.Hostname()
+}
+
+// isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
+// live on another machine. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1
+// bind on the remote host is unreachable from the client.
+//
+// The scheme is checked directly rather than through defaultHost, which
+// recognizes only tcp://. ssh:// is a first-class Docker remote transport, and
+// the daemon there resolves bind-mount sources on its own host, so a
+// configuration derived from defaultHost would report local and let the bind
+// through unchanged. A loopback host is still this machine. An empty hostname
+// after parse (tcp://:2375, or scheme-less :2375 after normalizeDockerHost)
+// matches the Docker CLI's TCP parser, which substitutes its default hostname
+// — a local daemon — so those forms are local too. An unparsable value is
+// treated as remote so a malformed setting fails closed rather than
+// permitting a bind the daemon would resolve in the wrong place.
+//
+// ssh:// is remote in the same sense as tcp://, not a special case. The CLI's
+// SSH session tunnels only the Docker API (`docker system dial-stdio` over
+// stdio); it does not forward published container ports, which the daemon
+// allocates on the remote host. So the connect address is the remote hostname,
+// and that hostname must be directly dialable: an ssh-config alias reachable
+// only through a ProxyJump or bastion needs a manual `ssh -L` forward, which
+// is outside what DOCKER_HOST can express.
 func isRemoteDockerHost() bool {
-	return !isLoopbackOrUnspecified((dockerEngine{}).defaultHost())
+	raw := normalizeDockerHost(os.Getenv("DOCKER_HOST"))
+	if raw == "" {
+		return false
+	}
+	// These transports name a socket on this machine. fd:// (systemd
+	// socket activation) yields an empty hostname from url.Parse; list it
+	// with the other local sockets so the classification does not depend
+	// on the empty-host TCP fallback below.
+	for _, local := range []string{"unix://", "npipe://", "fd://"} {
+		if strings.HasPrefix(strings.ToLower(raw), local) {
+			return false
+		}
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return true
+	}
+	host := u.Hostname()
+	if host == "" {
+		// Docker's ParseTCPAddr does `if host == "" { host = defaultAddr.Hostname() }`.
+		// That default is this machine, so tcp://:2375 / :2375 are local.
+		return false
+	}
+	return !isLoopbackOrUnspecified(host)
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
@@ -127,8 +204,8 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	args := []string{"run", "--detach", "--pull", "never", "--name", cfg.name}
 	// Publish every declared port the user did not publish explicitly
 	// to a daemon-assigned port. Locally this binds loopback; on a
-	// remote daemon (tcp:// DOCKER_HOST) it binds all interfaces so
-	// the client can reach it via defaultHost().
+	// remote daemon it binds all interfaces so the client can reach it
+	// via defaultHost().
 	bindAddr := "127.0.0.1"
 	if isRemoteDockerHost() {
 		bindAddr = "0.0.0.0"
@@ -197,7 +274,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	if len(containers) == 0 {
-		return nil, fmt.Errorf("container %s not in inspect output", id)
+		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
 	}
 
 	// `docker inspect name` can return more than one object, and an

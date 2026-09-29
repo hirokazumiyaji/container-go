@@ -41,26 +41,6 @@ var ErrImageIdentityMismatch = errors.New("backend reported a different image id
 // not be made locally addressable under the selected pull policy.
 var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally under the selected pull policy")
 
-// CleanupError preserves both the operation failure and a failure while
-// removing the container it created.
-type CleanupError struct {
-	Err        error
-	CleanupErr error
-}
-
-func (e *CleanupError) Error() string {
-	return fmt.Sprintf("%v; cleanup failed: %v", e.Err, e.CleanupErr)
-}
-
-func (e *CleanupError) Unwrap() []error { return []error{e.Err, e.CleanupErr} }
-
-func withCleanupError(err, cleanupErr error) error {
-	if cleanupErr == nil {
-		return err
-	}
-	return &CleanupError{Err: err, CleanupErr: cleanupErr}
-}
-
 // ErrContainerNotFound reports that the container does not exist.
 // Inspect, State, Exec, and Logs wrap it with %w so callers can use
 // errors.Is instead of matching CLI stderr text.

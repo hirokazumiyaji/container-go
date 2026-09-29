@@ -99,7 +99,12 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It may be promoted from the first inspect, so it is written long after
+	// the handle is published. Guarded by uidMu rather than inspectMu,
+	// because readers on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 	// requestedPlatform is retained so identity-checked inspects can
 	// resolve Docker's OS-only top-level Platform field to a complete OCI
 	// platform when the caller explicitly selected one.
@@ -117,11 +122,34 @@ type Container struct {
 	imageIdentity imageIdentity
 	image         imageIdentity
 
-	// inspectMu protects uid and serializes target-bound inspects. The
-	// identity cache is protected separately by mu.
+	// inspectMu serializes target-bound inspects and protects bootstrap /
+	// creation fields that change with identity binding. The identity cache
+	// is protected separately by mu; uid has its own uidMu.
 	inspectMu sync.RWMutex
 	mu        sync.Mutex
 	info      *engineInfo // immutable identity snapshot
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -218,7 +246,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if cleanupErr == nil && reaperBin != "" {
 			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, "")
 		}
-		return nil, withCleanupError(classified, cleanupErr)
+		return nil, withCleanupError(classified, leftoverContainer(cfg.name, cleanupErr))
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
@@ -237,7 +265,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if cleanupErr == nil && reaperBin != "" {
 			retireReaperEntry(reaperBin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation, "")
 		}
-		return nil, withCleanupError(identityErr, cleanupErr)
+		return nil, withCleanupError(identityErr, leftoverContainer(cfg.name, cleanupErr))
 	}
 	c := &Container{
 		id:                cfg.name,
@@ -292,11 +320,8 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 		return cause
 	}
 	if keepContainers() {
-		c.inspectMu.RLock()
-		uid := c.uid
-		c.inspectMu.RUnlock()
-		if err := cancelReuseReaperHandoffWithGeneration(c.runner, c.eng, c.id, c.creation, uid, c.id); err != nil {
-			return withCleanupError(cause, err)
+		if err := cancelReuseReaperHandoffWithGeneration(c.runner, c.eng, c.id, c.creation, c.immutableID(), c.id); err != nil {
+			return withCleanupError(cause, leftoverContainer(c.id, err))
 		}
 		return cause
 	}
@@ -304,7 +329,9 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 		return cause
 	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return withCleanupError(cause, fmt.Errorf("container %s left behind: %w", c.id, err))
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, leftoverContainer(c.id, err))
 	}
 	return cause
 }
@@ -334,7 +361,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		if isNotFound(err) {
 			return nil
 		}
-		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if !failedCreateOwned(cfg, info) {
 		return nil
@@ -403,9 +430,7 @@ func (c *Container) ID() string { return c.id }
 // a missing or malformed Docker UID returns an empty string rather than
 // falling back to a name.
 func (c *Container) operationTarget() string {
-	c.inspectMu.RLock()
-	uid := c.uid
-	c.inspectMu.RUnlock()
+	uid := c.immutableID()
 	if validDockerUID(uid) {
 		return uid
 	}
@@ -428,8 +453,8 @@ func (c *Container) targetForInspect() (string, error) {
 	if c.identityOptional {
 		return c.id, nil
 	}
+	uid := c.immutableID()
 	c.inspectMu.RLock()
-	uid := c.uid
 	creation := c.creation
 	bootstrap := c.bootstrap
 	c.inspectMu.RUnlock()
@@ -466,8 +491,8 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, func()
 	if c.identityOptional {
 		return "", noop, generationReplaced(c.id)
 	}
+	uid := c.immutableID()
 	c.inspectMu.RLock()
-	uid := c.uid
 	creation := c.creation
 	c.inspectMu.RUnlock()
 	if c.eng.name() == "docker" {
@@ -547,8 +572,8 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 // inspect failure other than not-found aborts the delete rather than
 // risk a replacement.
 func (c *Container) Terminate(ctx context.Context) error {
+	uid := c.immutableID()
 	c.inspectMu.RLock()
-	uid := c.uid
 	creation := c.creation
 	bootstrap := c.bootstrap
 	c.inspectMu.RUnlock()
@@ -585,9 +610,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 			}
 			return fmt.Errorf("terminate %s: verify immutable ID: %w", c.id, err)
 		}
-		c.inspectMu.RLock()
-		uid = c.uid
-		c.inspectMu.RUnlock()
+		uid = c.immutableID()
 		if !validDockerUID(uid) {
 			return fmt.Errorf("terminate %s: %w: inspect returned no valid immutable ID", c.id, ErrGenerationReplaced)
 		}
@@ -652,10 +675,7 @@ func retireContainerReaper(c *Container) error {
 	if binary == "" {
 		binary = c.eng.binary()
 	}
-	c.inspectMu.RLock()
-	uid := c.uid
-	c.inspectMu.RUnlock()
-	return unregisterHandoffWithGlobalReaper(binary, c.eng.reaperSubcommand(), c.id, c.creation, uid)
+	return unregisterHandoffWithGlobalReaper(binary, c.eng.reaperSubcommand(), c.id, c.creation, c.immutableID())
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
@@ -836,8 +856,8 @@ func (c *Container) bindInspectInfo(info *engineInfo) error {
 	if info == nil {
 		return withGenerationReplaced(c.id, errIdentity("empty inspect result"))
 	}
+	uid := c.immutableID()
 	c.inspectMu.RLock()
-	uid := c.uid
 	creation := c.creation
 	bootstrap := c.bootstrap
 	c.inspectMu.RUnlock()
@@ -859,8 +879,8 @@ func (c *Container) bindInspectInfo(info *engineInfo) error {
 			return generationReplaced(c.id)
 		}
 		if uid == "" {
+			c.setImmutableID(info.uid)
 			c.inspectMu.Lock()
-			c.uid = info.uid
 			c.bootstrap = false
 			c.inspectMu.Unlock()
 		}

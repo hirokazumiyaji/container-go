@@ -51,7 +51,7 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 	ctr.exposed = cfg.exposed
 	ctr.published = cfg.published
 	ctr.creation = cfg.creation
-	ctr.uid = info.uid
+	ctr.setImmutableID(info.uid)
 	ctr.requestedPlatform = cfg.platform
 	ctr.imageIdentity = imageFromInfo(info)
 	ctr.image = ctr.imageIdentity

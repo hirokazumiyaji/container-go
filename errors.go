@@ -169,16 +169,14 @@ func execTarget(args []string) string {
 
 // cliBinaryMatches compares a reported executable with the engine's
 // binary, tolerating absolute paths. An empty reported binary is the
-// historical CLIError default and is accepted for the Apple backend.
+// historical CLIError default, which predates named executables, so it
+// is accepted and the backend's own stderr wording decides instead.
 func cliBinaryMatches(got, want string) bool {
 	got = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(got)), ".exe")
 	if i := strings.LastIndexAny(got, `/\`); i >= 0 {
 		got = got[i+1:]
 	}
-	if got == "" {
-		return want == "container"
-	}
-	return got == strings.ToLower(want)
+	return got == "" || got == strings.ToLower(want)
 }
 
 // collectCLIErrors gathers CLI failures through both single- and

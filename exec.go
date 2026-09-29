@@ -86,7 +86,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, c.execNotFound(ctx, err)
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -99,7 +99,19 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if c.execContainerRunning(ctx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, c.execNotFound(ctx, err)
+}
+
+// execNotFound classifies a failed exec and converts a verified absence
+// of this container into ErrContainerNotFound. An exec failure for
+// another target, or one reported while the backend was unreachable,
+// keeps its own error.
+func (c *Container) execNotFound(ctx context.Context, err error) error {
+	classified := c.classify(ctx, err)
+	if isNotFoundFor(c.eng, c.id, classified) {
+		return wrapNotFound(classified)
+	}
+	return classified
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

@@ -655,6 +655,52 @@ func TestDeletePreservesSystemNotRunningFailure(t *testing.T) {
 	}
 }
 
+// A missing container still reports ErrContainerNotFound, and the same
+// stderr wrapped as a backend-down failure never does.
+func TestMissingContainerStillReportsNotFound(t *testing.T) {
+	missing := &cli.CLIError{
+		Binary: "docker", Args: []string{"inspect", "myctr"},
+		ExitCode: 1, Stderr: `Error: No such object: myctr`,
+	}
+	ctr := &Container{
+		id:     "myctr",
+		runner: &singleErrorRunner{fakeRunner: newTestRunner(), err: missing},
+		eng:    dockerEngine{},
+	}
+	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
+	}
+
+	down := &singleErrorRunner{fakeRunner: newTestRunner(), err: missing}
+	down.probeErr = &cli.CLIError{Args: []string{"version", "--format", "x"}, ExitCode: 1, Stderr: "cannot connect"}
+	ctrDown := &Container{id: "myctr", runner: down, eng: dockerEngine{}}
+	err := ctrDown.State(context.Background())
+	if errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want the backend-down failure, not absence", err)
+	}
+	if !errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("State error = %v, want ErrSystemNotRunning", err)
+	}
+}
+
+// singleErrorRunner fails inspect with a fixed error and answers the
+// liveness probe with probeErr.
+type singleErrorRunner struct {
+	*fakeRunner
+	err      error
+	probeErr error
+}
+
+func (s *singleErrorRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && (args[0] == "version" || args[0] == "system") && s.probeErr != nil {
+		return nil, nil, s.probeErr
+	}
+	if len(args) > 0 && args[0] == "inspect" && s.err != nil {
+		return nil, nil, s.err
+	}
+	return s.fakeRunner.Run(ctx, args...)
+}
+
 type systemDownRunner struct {
 	*fakeRunner
 }

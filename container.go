@@ -567,7 +567,11 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		classified := c.classify(ctx, err)
+		if isNotFoundFor(c.eng, c.id, classified) {
+			return nil, wrapNotFound(classified)
+		}
+		return nil, classified
 	}
 	return c.eng.parseInspect(stdout, c.id)
 }

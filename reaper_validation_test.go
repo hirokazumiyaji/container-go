@@ -63,15 +63,27 @@ func TestReaperScriptValidationIsPortable(t *testing.T) {
 		"kill -9 \"$snapshot_pid\"",
 		"max_descendant_lookups",
 		"cleanup_helper_budget",
+		"cleanup_enumeration_budget",
+		"consume_cleanup_budget",
+		"kill_stopped_processes",
 	} {
 		if !strings.Contains(reaperScript, required) {
 			t.Errorf("reaper script missing bounded cleanup fragment %q", required)
 		}
 	}
-	for _, forbidden := range []string{"sed -n", "head -n", "tail -n", "grep -q", "mktemp"} {
+	for _, forbidden := range []string{"sed -n", "head -n", "tail -n", "grep -q", "mktemp", "stime"} {
 		if strings.Contains(reaperScript, forbidden) {
-			t.Errorf("reaper script still uses unbounded helper %q", forbidden)
+			t.Errorf("reaper script still uses unbounded or CPU-time helper %q", forbidden)
 		}
+	}
+	if !strings.Contains(reaperScript, `if [ "$registered_entries" -lt "$max_registered_entries" ]; then`) {
+		t.Error("registration input must drain and discard records beyond the bounded prefix")
+	}
+}
+
+func TestReaperHelperValidationReportsMissingDependency(t *testing.T) {
+	if err := (reaperHelperPaths{awk: "relative-awk"}).validate(); !errors.Is(err, errReaperHelperUnavailable) {
+		t.Fatalf("helper validation error = %v, want unavailable dependency", err)
 	}
 }
 

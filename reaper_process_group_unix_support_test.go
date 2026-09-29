@@ -9,7 +9,6 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -311,10 +310,7 @@ type reaperProcessRef struct {
 	startTime  string
 	process    *os.Process
 	identified bool
-	// processHandleStable is true where os.Process retains a pidfd. Other
-	// platforms must revalidate start identity before a force signal.
-	processHandleStable bool
-	check               func() (bool, error)
+	check      func() (bool, error)
 }
 
 type reaperProcessRefLookup func(context.Context, int) (reaperProcessRef, error)
@@ -354,7 +350,7 @@ func captureReaperProcessIdentityContext(ctx context.Context, pid int) (reaperPr
 	}
 	return reaperProcessRef{
 		pid: pid, pgid: pgid, startTime: startTime, process: process,
-		identified: true, processHandleStable: runtime.GOOS == "linux",
+		identified: true,
 	}, nil
 }
 
@@ -430,9 +426,8 @@ func killReaperProcessRefContext(ctx context.Context, ref reaperProcessRef) erro
 
 // killReaperStoppedRefs gives already-quiesced processes their own bounded
 // force-signal pass. A successful SIGSTOP normally reserves the PID, but an
-// external killer can still release it; only a pidfd handle is signaled
-// without a fresh identity check. Other platforms revalidate the retained
-// start identity under a fresh budget instead of risking a numeric kill.
+// external killer can still release it, so the retained start identity is
+// revalidated under a fresh budget before any numeric signal.
 func killReaperStoppedRefs(refs []reaperProcessRef) error {
 	var errs []error
 	seen := make(map[int]struct{}, len(refs))
@@ -448,20 +443,18 @@ func killReaperStoppedRefs(refs []reaperProcessRef) error {
 		}
 		seen[ref.pid] = struct{}{}
 
-		// Linux retains a pidfd in os.Process, so the handle itself remains
-		// safe even after the traversal context expired. Elsewhere require a
-		// fresh start-identity match before using a numeric PID.
-		if !ref.processHandleStable {
-			matches, matchErr := reaperProcessRefMatchesContext(forceCtx, ref)
-			if matchErr != nil {
-				if !reaperProcessRefGone(matchErr) {
-					errs = append(errs, fmt.Errorf("verify stopped process %d: %w", ref.pid, matchErr))
-				}
-				continue
+		// The retained numeric PID is not a safe signal target after an
+		// external kill, so always revalidate start identity under the fresh
+		// force budget before signaling.
+		matches, matchErr := reaperProcessRefMatchesContext(forceCtx, ref)
+		if matchErr != nil {
+			if !reaperProcessRefGone(matchErr) {
+				errs = append(errs, fmt.Errorf("verify stopped process %d: %w", ref.pid, matchErr))
 			}
-			if !matches {
-				continue
-			}
+			continue
+		}
+		if !matches {
+			continue
 		}
 		var err error
 		if ref.process != nil {

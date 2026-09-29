@@ -732,6 +732,7 @@ kill_pipeline() {
     return 1
   fi
   signal_snapshot
+  kill_stopped_processes
   kill -9 "$kill_root_pid" 2>/dev/null || true
   return 0
 }
@@ -1040,8 +1041,10 @@ func (r *reaper) spawnLocked() error {
 	if timeout <= 0 {
 		timeout = defaultReaperTimeoutSeconds
 	}
-	if _, err := os.Stat("/bin/sh"); err != nil {
+	if info, err := os.Stat("/bin/sh"); err != nil {
 		return fmt.Errorf("%w: /bin/sh: %v", errReaperHelperUnavailable, err)
+	} else if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+		return fmt.Errorf("%w: /bin/sh is not executable", errReaperHelperUnavailable)
 	}
 	helpers := r.helperPaths
 	if !helpers.complete() {

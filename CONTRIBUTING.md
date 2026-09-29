@@ -49,19 +49,23 @@ To cut a release:
 3. Run `make release-check` from a clean checkout: build, vet (including the
    `integration`-tagged files), `golangci-lint`, `go test -race`,
    `go mod verify`, a `go mod tidy -diff` no-op check, `govulncheck`, and
-   `actionlint`, then the same for the separate `bench` module. This is the same
-   gate the tag push runs, so a green local run means the code half will pass.
-   It needs `golangci-lint` on `PATH` (`mise install`).
+   `actionlint`, then the same for the separate `bench` module. This is the
+   pre-tag gate — the same target the workflow runs — so a green local run
+   means the code half will pass. It needs `golangci-lint` on `PATH`
+   (`mise install`).
 
    This covers everything checkable without a container backend. The
    `integration`-tagged suites are not part of it — run `make integration` and
    `make bench-integration` locally before tagging if you touched backend
    behavior. Their compilation *is* covered, by the tagged vet.
 4. Tag and push: `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-   The `release-check` workflow then re-runs the gate and additionally fails if
-   the tag is not the highest version in the `CHANGELOG`. That last comparison
-   is not in `make release-check` because it needs the pushed tag's name, which
-   only the workflow has; `internal/releasecheck` is the local half of it, and
+   A push of a `v*` tag runs only after GitHub has accepted the tag, so the
+   workflow run on the tag cannot stop a bad tag from being published: it
+   re-runs the gate and additionally fails if the tag is not the highest
+   version in the `CHANGELOG`, as a post-push safety net. If it fails, delete
+   the tag and retag. The tag-vs-`CHANGELOG` comparison is not in
+   `make release-check` because it needs the pushed tag's name, which only
+   the workflow has; `internal/releasecheck` is the local half of it, and
    it already ran as part of step 3.
 
 The tag is what downstream pins, so it is annotated rather than lightweight.

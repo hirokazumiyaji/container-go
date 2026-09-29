@@ -30,6 +30,12 @@ func (c *Container) rememberImmutableID(uid string) {
 	c.uidMu.Unlock()
 }
 
+// setImmutableID is the name used by the uid race-fix path; same semantics
+// as rememberImmutableID.
+func (c *Container) setImmutableID(uid string) {
+	c.rememberImmutableID(uid)
+}
+
 // operationTarget is the sole target selector for public backend
 // operations. Docker handles use their immutable ID; Apple handles use
 // their name. It returns an empty string for an unbound Docker handle;

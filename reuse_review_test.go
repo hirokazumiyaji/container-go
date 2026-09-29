@@ -541,9 +541,20 @@ func (r *reviewRollbackRunner) Run(ctx context.Context, args ...string) ([]byte,
 }
 
 func reviewHasCLIError(err error, stderr string) bool {
+	if err == nil {
+		return false
+	}
 	var cleanupErr *CleanupError
-	if errors.As(err, &cleanupErr) {
-		return reviewCLIErrorContains(cleanupErr.Err, stderr) || reviewCLIErrorContains(cleanupErr.CleanupErr, stderr)
+	if errors.As(err, &cleanupErr) && reviewCLIErrorContains(cleanupErr.Err, stderr) {
+		return true
+	}
+	if multi, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, e := range multi.Unwrap() {
+			if reviewHasCLIError(e, stderr) {
+				return true
+			}
+		}
+		return false
 	}
 	return reviewCLIErrorContains(err, stderr)
 }

@@ -98,7 +98,11 @@ type Container struct {
 	creation string
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it. Access it only
+	// check unnecessary: a replacement never shares it.
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock. Access it only
 	// through immutableID/rememberImmutableID after construction.
 	uid   string
 	uidMu sync.RWMutex
@@ -189,10 +193,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		}
 		if keepContainers() {
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
-			return retained, withCleanupError(classified, retainedErr)
+			return retained, withCleanupError(classified, leftBehind(cfg.name, retainedErr))
 		}
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, withCleanupError(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, leftBehind(cfg.name, cleanupErr))
+		}
+		return nil, classified
 	}
 
 	runID := cfg.eng.parseRunID(stdout)
@@ -265,8 +271,9 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 		return cause
 	}
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		cleanupErr := fmt.Errorf("container %s left behind: %w", c.id, err)
-		return withCleanupError(cause, cleanupErr)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, leftBehind(c.id, err))
 	}
 	return cause
 }

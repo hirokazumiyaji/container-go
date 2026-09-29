@@ -123,8 +123,8 @@ func TestIssue94MalformedDockerRunRecoversCleansAndRegistersUID(t *testing.T) {
 	if !errors.As(err, &cleanupErr) {
 		t.Fatalf("error = %v, want CleanupError", err)
 	}
-	if cleanupErr.CleanupErr == nil || !strings.Contains(cleanupErr.CleanupErr.Error(), "cleanup") {
-		t.Fatalf("cleanup error = %v", cleanupErr.CleanupErr)
+	if cleanupErr.Err == nil || !strings.Contains(cleanupErr.Err.Error(), "cleanup") {
+		t.Fatalf("cleanup error = %v", cleanupErr.Err)
 	}
 
 	runner.mu.Lock()

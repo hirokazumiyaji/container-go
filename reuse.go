@@ -446,10 +446,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		}
 		if keepContainers() {
 			retained, retainedErr := retainedFailedCreate(ctx, cfg, err, classified)
-			return retained, withCleanupError(classified, retainedErr)
+			return retained, withCleanupError(classified, leftBehind(cfg.name, retainedErr))
 		}
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, withCleanupError(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, leftBehind(cfg.name, cleanupErr))
+		}
+		return nil, classified
 	}
 
 	runID := cfg.eng.parseRunID(stdout)

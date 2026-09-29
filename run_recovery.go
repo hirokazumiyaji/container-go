@@ -160,13 +160,13 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		return nil, cause
 	}
 	if err != nil {
-		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: inspect: %w", cfg.name, err))
+		return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: inspect: %w", cfg.name, err)))
 	}
 	if !failedCreateOwned(cfg, info) {
-		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: inspected generation is not owned by this run", cfg.name))
+		return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: inspected generation is not owned by this run", cfg.name)))
 	}
 	if !dockerIDRE.MatchString(info.uid) {
-		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: inspect returned no full immutable Docker ID", cfg.name))
+		return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: inspect returned no full immutable Docker ID", cfg.name)))
 	}
 
 	ctr.creation = cfg.creation
@@ -189,16 +189,16 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 	if cfg.reuse {
 		if info.state == StateRunning {
 			unregisterContainerReaper(cfg, ctr)
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name))
+			return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name)))
 		}
 		if info.state != StateStopped && info.state != StateCreated {
 			unregisterContainerReaper(cfg, ctr)
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state))
+			return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state)))
 		}
 	}
 	if info.state == StateUnknown || info.state == "" {
 		unregisterContainerReaper(cfg, ctr)
-		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation state is %s; refusing automatic deletion", cfg.name, info.state))
+		return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: generation state is %s; refusing automatic deletion", cfg.name, info.state)))
 	}
 
 	// A stopped or created generation is guarded: revalidate it immediately
@@ -224,15 +224,15 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		}
 		if freshErr != nil {
 			unregisterContainerReaper(cfg, ctr)
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: revalidate cleanup: %w", cfg.name, freshErr))
+			return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: revalidate cleanup: %w", cfg.name, freshErr)))
 		}
 		if !failedCreateOwned(cfg, fresh) || !dockerIDRE.MatchString(fresh.uid) || fresh.uid != ctr.immutableID() {
 			unregisterContainerReaper(cfg, ctr)
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation changed before cleanup", cfg.name))
+			return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: generation changed before cleanup", cfg.name)))
 		}
 		if fresh.state != StateStopped && fresh.state != StateCreated {
 			unregisterContainerReaper(cfg, ctr)
-			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation became %s; refusing automatic deletion", cfg.name, fresh.state))
+			return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: generation became %s; refusing automatic deletion", cfg.name, fresh.state)))
 		}
 		info = fresh
 		ctr.info = fresh
@@ -250,7 +250,7 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 		if guarded {
 			unregisterContainerReaper(cfg, ctr)
 		}
-		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: cleanup: %w", cfg.name, err))
+		return nil, withCleanupError(cause, leftBehind(cfg.name, fmt.Errorf("recover container %s: cleanup: %w", cfg.name, err)))
 	}
 	// A successful delete leaves the registered record in place as the
 	// existing watchdog contract does; the next child revalidation observes

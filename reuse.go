@@ -216,7 +216,9 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 
@@ -233,30 +235,23 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	}
 	info, err := ctr.cachedInfo(ctx)
 	if err != nil {
-		return nil, cleanupReuseCreate(ctx, ctr, err)
+		return nil, ctr.rollback(ctx, err)
 	}
 	// Validate the image identity and requested ports before exposing the
 	// new shared container to the flight. A failed post-create check must
 	// not leave an unusable container behind.
 	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
-		return nil, cleanupReuseCreate(ctx, ctr, err)
+		return nil, ctr.rollback(ctx, err)
 	}
 	if err := verifyAppleCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
-		return nil, cleanupReuseCreate(ctx, ctr, err)
+		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, cleanupReuseCreate(ctx, ctr, err)
+			return nil, ctr.rollback(ctx, err)
 		}
 	}
 	return ctr, nil
-}
-
-func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error {
-	if err := ctr.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, ctr.id, err)
-	}
-	return cause
 }
 
 // deleteStoppedReuse removes a stopped reuse container through a

@@ -5,38 +5,21 @@ package container
 import (
 	"context"
 	"fmt"
-	"os"
-	"os/exec"
 	"testing"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
 func requireAppleCLI(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple CLI checks", backend)
-	}
-	if _, err := exec.LookPath("container"); err != nil {
-		t.Skip("container CLI not installed")
-	}
-	if err := exec.Command("container", "system", "status").Run(); err != nil {
-		t.Skip("apple container system service not running; run `container system start`")
-	}
+	integrationtest.Preflight(t, "apple", integrationtest.AppleUnavailable)
 }
 
 func requireDockerCLI(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker CLI checks", backend)
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker CLI not installed")
-	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon not running")
-	}
+	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
 }
 
 // TestIntegrationAppleCLIErrorMatchers exercises nameConflict,

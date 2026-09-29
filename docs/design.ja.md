@@ -198,12 +198,12 @@ generation を持つ Docker エントリは名前から inspect を使って ID 
 generation を持たない Docker の名前エントリは拒否してログに残す。
 Apple の場合は generation を保存し、JSON の行頭にある `"key": "value"` 形式のフィールドだけを読み取る。
 一致しない場合は削除しない。
-タイムアウト時は、固定点に到達した quiesced snapshot を取り、検証してから `setsid` を含む子孫を signal する。
-Unix では pidfd または高分解能な開始時刻(Darwin では `stime`)を ID として保持し、再試行ごとに検証して終了済み PID を tombstone にする。識別情報を失った後は数値 PID で kill しない。
-すべての lookup と再試行は単一の cleanup context と helper budget で制限する。
+タイムアウト時は、対象 helper の部分木だけを固定点まで取得して停止し、検証後に `setsid` を含む子孫を signal する。
+本番リーパーはテスト用の Go 製 process walker ではなく外部 shell 子プロセスであり、process ID には安定した `ps lstart`(CPU 時間ではない)を使う。識別情報を失った場合は numeric signal の許可とせず、検証不能として処理を打ち切る。
+停止済みの process には独立した force-signal budget を与え、traversal が budget 切れになっても停止したまま残さない。lookup と signal の budget は別々で、双方は有限である。
 `pgrep` は任意で、利用できない場合は固定した `ps` の process table で子孫を列挙する。
-補助 executable は固定したシステムパスから解決し、出力を制限する。monitor mode が使えない場合も、信頼済み helper による列挙で子孫を kill して回収する。
-登録入力は先頭から上限まで処理し、上限超過で cleanup 全体を停止しない。
+補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と列挙用の予備 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
+登録は reaper 子プロセスあたり最大 1024 件を保持・再生する。shell は上限を超える入力も読み捨て続けるため、pipe が満杯で writer が block しない。Go 側の上限超過は明示的な capacity error として返し、`Run` は新規コンテナを rollback する。
 
 **セッションラベル**：作成する全コンテナに次のラベルを付与する。
 
@@ -230,7 +230,7 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 ライブラリ側は各 ID を Apple Container の名前規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または 64 文字の小文字 16 進 Docker ID として検証する。
 Docker の generation 付きエントリは inspect で ID を取得して検証し、名前にはフォールバックしない。
 generation なしの Docker 名は拒否してログに残す。
-リーパー補助処理の executable は固定したシステムパスから解決し、出力を制限する。`pgrep` がなくても `ps` の process table で処理하며、monitor mode が使えない場合も helper の子孫を列挙して回収する。
+リーパー補助処理の executable は固定したシステムパスから解決する。`/bin/sh`、`awk`、`ps`、`rm`、`sleep` は必須で、`pgrep` は任意(なければ `ps` の process table を使う)。必須 helper が無い場合は依存関係エラーとして記録し、連続 spawn 失敗予算を永久に消費しない。monitor mode が使えない場合も helper の子孫を列挙して回収する。
 これらの層により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。

@@ -65,20 +65,41 @@ max_descendant_pids=256
 max_descendant_depth=32
 max_descendant_lookups=64
 helper_output_blocks=512
-cleanup_helper_budget=6
+cleanup_helper_budget=8
+cleanup_enumeration_budget=2
 cleanup_active=0
+cleanup_budget_file=
+cleanup_enumeration_file=
+helper_enumeration_active=0
 consume_cleanup_budget() {
   [ "$cleanup_active" = 1 ] || return 0
-  cleanup_budget_file="$work_dir/cleanup.budget"
+  if [ "$helper_enumeration_active" = 1 ]; then
+    [ -n "$cleanup_enumeration_file" ] || cleanup_enumeration_file="$work_dir/cleanup.enumeration"
+    selected_budget_file="$cleanup_enumeration_file"
+  else
+    [ -n "$cleanup_budget_file" ] || cleanup_budget_file="$work_dir/cleanup.budget"
+    selected_budget_file="$cleanup_budget_file"
+  fi
+  cleanup_budget_lock="$selected_budget_file.lock"
+  if ! ( set -C; : >"$cleanup_budget_lock" ) 2>/dev/null; then
+    return 1
+  fi
   cleanup_budget=
-  if [ -r "$cleanup_budget_file" ]; then
-    IFS= read -r cleanup_budget <"$cleanup_budget_file" || cleanup_budget=
+  if [ -r "$selected_budget_file" ]; then
+    IFS= read -r cleanup_budget <"$selected_budget_file" || cleanup_budget=
   fi
   case "$cleanup_budget" in
-    ''|*[!0-9]*) return 1 ;;
+    ''|*[!0-9]*) "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :; return 1 ;;
   esac
-  [ "$cleanup_budget" -gt 0 ] 2>/dev/null || return 1
-  printf '%s\n' "$((cleanup_budget - 1))" >"$cleanup_budget_file" 2>/dev/null || return 1
+  if [ "$cleanup_budget" -le 0 ] 2>/dev/null; then
+    "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
+    return 1
+  fi
+  printf '%s\n' "$((cleanup_budget - 1))" >"$selected_budget_file" 2>/dev/null || {
+    "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
+    return 1
+  }
+  "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
 }
 work_dir="$5"
 awk_bin="$6"
@@ -173,9 +194,12 @@ kill_helper_descendants() {
   saved_helper_timer="$helper_timer"
   saved_helper_groups="$helper_process_groups"
   saved_helper_enumeration="$helper_enumeration"
+  saved_helper_enumeration_active="$helper_enumeration_active"
   helper_enumeration=1
+  helper_enumeration_active=1
   run_helper "$helper_tree_table" "$helper_tree_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
   helper_table_status="$?"
+  helper_enumeration_active="$saved_helper_enumeration_active"
   helper_pid="$saved_helper_pid"
   helper_timer="$saved_helper_timer"
   helper_process_groups="$saved_helper_groups"
@@ -659,8 +683,11 @@ capture_quiesced_process_table() {
 kill_pipeline() {
   kill_root_pid="$1"
   cleanup_active=1
-  cleanup_helper_budget=6
-  printf '%s\n' "$cleanup_helper_budget" >"$work_dir/cleanup.budget" 2>/dev/null || cleanup_helper_budget=0
+  cleanup_helper_budget=8
+  cleanup_budget_file="$work_dir/cleanup.budget.$kill_root_pid"
+  cleanup_enumeration_file="$work_dir/cleanup.enumeration.$kill_root_pid"
+  printf '%s\n' "$cleanup_helper_budget" >"$cleanup_budget_file" 2>/dev/null || cleanup_helper_budget=0
+  printf '%s\n' "$cleanup_enumeration_budget" >"$cleanup_enumeration_file" 2>/dev/null || cleanup_enumeration_budget=0
   tombstoned_pids=
   stopped_pids=
   capture_identity "$kill_root_pid" "$work_dir/identity.$kill_root_pid"

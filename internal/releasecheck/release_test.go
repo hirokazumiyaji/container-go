@@ -27,6 +27,12 @@ const numericComponent = `(?:0|[1-9]\d*)`
 // mistaken for a release. Only canonical dotted versions match.
 var changelogRelease = regexp.MustCompile(`(?m)^## \[(` + numericComponent + `\.` + numericComponent + `\.` + numericComponent + `)\] - (\d{4}-\d{2}-\d{2})$`)
 
+// bareUnreleased matches a Keep a Changelog Unreleased heading on its own
+// line. Trailing whitespace is allowed; a date suffix is not. A substring
+// check for "## [Unreleased]" would accept "## [Unreleased] - 2026-09-29",
+// which leaves no standalone Unreleased section for the next release cycle.
+var bareUnreleased = regexp.MustCompile(`(?m)^## \[Unreleased\][ \t]*$`)
+
 // installLine matches every version-bearing `go get` reference in a README.
 // Both forms exist: the full install instruction, and the shorthand used in
 // the pinning prose ("go get ...@v0.2.0"). Matching only the first would let
@@ -124,8 +130,34 @@ func TestSecuritySupportMatrixCoversLatestRelease(t *testing.T) {
 // The CHANGELOG's Unreleased section must exist, so a release cannot be cut
 // with no record of what accumulated since the last one.
 func TestChangelogHasUnreleasedSection(t *testing.T) {
-	if !strings.Contains(read(t, "CHANGELOG.md"), "## [Unreleased]") {
+	if !bareUnreleased.MatchString(read(t, "CHANGELOG.md")) {
 		t.Error("CHANGELOG.md: missing the '## [Unreleased]' section")
+	}
+}
+
+// A dated Unreleased heading must not count as the required bare section.
+// strings.Contains("...", "## [Unreleased]") used to accept it, and the
+// date-validation loop skipped any line containing "Unreleased".
+func TestBareUnreleasedHeading(t *testing.T) {
+	cases := []struct {
+		text string
+		want bool
+	}{
+		{"## [Unreleased]\n", true},
+		{"## [Unreleased] \n", true},
+		{"## [Unreleased]\t\n", true},
+		{"prefix\n## [Unreleased]\nsuffix\n", true},
+		{"## [Unreleased] - 2026-09-29\n", false},
+		{"## [Unreleased] - 2026-09-29\n## [0.1.0] - 2026-01-01\n", false},
+		{"## [0.1.0] - 2026-01-01\n", false},
+		{"# [Unreleased]\n", false},
+		{"### [Unreleased]\n", false},
+	}
+	for _, tc := range cases {
+		got := bareUnreleased.MatchString(tc.text)
+		if got != tc.want {
+			t.Errorf("bareUnreleased.MatchString(%q) = %v, want %v", tc.text, got, tc.want)
+		}
 	}
 }
 
@@ -133,21 +165,54 @@ func TestChangelogHasUnreleasedSection(t *testing.T) {
 // heading regex only guarantees the shape, so `## [0.2.0] - 2026-13-45` matches
 // it; checking the shape again would be vacuous, so the date is parsed.
 func TestChangelogReleaseDatesAreValid(t *testing.T) {
-	for _, m := range changelogRelease.FindAllStringSubmatch(read(t, "CHANGELOG.md"), -1) {
+	changelog := read(t, "CHANGELOG.md")
+	for _, m := range changelogRelease.FindAllStringSubmatch(changelog, -1) {
 		version, date := m[1], m[2]
 		if _, err := time.Parse(time.DateOnly, date); err != nil {
 			t.Errorf("CHANGELOG.md: release %s has an invalid date %q: %v", version, date, err)
 		}
 	}
-	// A version heading with no date would not match changelogRelease at all,
-	// so also assert none of the unparsed headings look like a release.
-	for _, line := range strings.Split(read(t, "CHANGELOG.md"), "\n") {
-		if !strings.HasPrefix(line, "## [") || strings.Contains(line, "Unreleased") {
+	for _, err := range invalidChangelogHeadings(changelog) {
+		t.Errorf("CHANGELOG.md: %s", err)
+	}
+}
+
+// invalidChangelogHeadings reports ## [ headings that are neither a bare
+// Unreleased section nor a dated canonical release.
+func invalidChangelogHeadings(changelog string) []string {
+	var errs []string
+	for _, line := range strings.Split(changelog, "\n") {
+		if !strings.HasPrefix(line, "## [") {
+			continue
+		}
+		if bareUnreleased.MatchString(line) {
+			continue
+		}
+		if strings.Contains(line, "Unreleased") {
+			errs = append(errs, "Unreleased heading "+strconv.Quote(line)+" must be exactly '## [Unreleased]' (no date suffix)")
 			continue
 		}
 		if !changelogRelease.MatchString(line) {
-			t.Errorf("CHANGELOG.md: release heading %q is missing a YYYY-MM-DD date", line)
+			errs = append(errs, "release heading "+strconv.Quote(line)+" is missing a YYYY-MM-DD date")
 		}
+	}
+	return errs
+}
+
+func TestInvalidChangelogHeadingsRejectsDatedUnreleased(t *testing.T) {
+	errs := invalidChangelogHeadings("## [Unreleased] - 2026-09-29\n## [0.1.0] - 2026-01-01\n")
+	if len(errs) != 1 {
+		t.Fatalf("got %d errors %v, want 1", len(errs), errs)
+	}
+	if !strings.Contains(errs[0], "## [Unreleased] - 2026-09-29") {
+		t.Errorf("error %q does not mention the dated Unreleased heading", errs[0])
+	}
+
+	if got := invalidChangelogHeadings("## [Unreleased]\n## [0.1.0] - 2026-01-01\n"); len(got) != 0 {
+		t.Errorf("bare Unreleased should be valid, got %v", got)
+	}
+	if got := invalidChangelogHeadings("## [Unreleased] \n"); len(got) != 0 {
+		t.Errorf("bare Unreleased with trailing space should be valid, got %v", got)
 	}
 }
 

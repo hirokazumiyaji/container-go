@@ -192,15 +192,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			// a peer's in-flight container on a not-found race.
 			return nil, err
 		}
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, errors.Join(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
 		identityErr := identityError("Docker run returned no valid immutable container ID")
-		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
-		return nil, errors.Join(identityErr, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
+			return nil, withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, identityErr
 	}
 	ctr := &Container{
 		id:              cfg.name,
@@ -215,13 +219,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		uid:             uid,
 	}
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		_ = ctr.Terminate(context.WithoutCancel(ctx))
-		return nil, err
+		return nil, ctr.rollback(ctx, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			_ = ctr.Terminate(context.WithoutCancel(ctx))
-			return nil, err
+			return nil, ctr.rollback(ctx, err)
 		}
 	}
 	return ctr, nil

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -141,7 +140,12 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 
 	mu        sync.Mutex
 	info      *engineInfo // immutable identity snapshot; dynamic data is never cached
@@ -150,6 +154,28 @@ type Container struct {
 	// discovery and failed-create cleanup. It never publishes an inspected
 	// Docker UID to a caller-visible handle.
 	nameInspect bool
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -212,15 +238,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, errors.Join(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
 		identityErr := identityError("Docker run returned no valid immutable container ID")
-		cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr)
-		return nil, errors.Join(identityErr, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
+			return nil, withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, identityErr
 	}
 
 	c := &Container{
@@ -242,8 +272,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if uid := c.immutableID(); uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -268,13 +298,15 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: without an immutable ID, Terminate refuses to
-// delete when it cannot verify the generation, and the caller must know
-// the container was left behind.
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
@@ -284,6 +316,10 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // inspect by name is used only to discover a candidate; deletion always
 // targets its validated immutable UID. A missing generation, session, or
 // reuse marker is a refusal, never permission to fall back to the name.
+//
+// Name conflicts and ownership mismatches are successes (nothing of ours to
+// remove). Every other failure is returned so callers can wrap it in a
+// CleanupError and tell a leftover container apart from a silent attempt.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
@@ -305,7 +341,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("cleanup %s: inspect: %w", cfg.name, err)
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if info == nil || info.labels[managedLabel] != "true" {
 		return nil
@@ -330,11 +368,15 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, err = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
-		return nil
+	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
+		// The container passed the ownership checks, so it exists and is
+		// ours. A failure here means it is still running.
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", target, err)
 	}
-	return fmt.Errorf("cleanup %s: delete %s: %w", cfg.name, target, err)
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary

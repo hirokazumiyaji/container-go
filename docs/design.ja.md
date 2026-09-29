@@ -387,11 +387,15 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 状態、IP、network、port binding は dynamic data として inspect のたびに更新し、cache には immutable identity のみを保持する。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
-`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモン(`DOCKER_HOST=tcp://host`)では `-p 0.0.0.0::<port>`)。
-`Host` は `127.0.0.1`(`DOCKER_HOST` が `tcp://` のときはそのホスト)、`MappedPort` は割り当てられたポートを返す。
+`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。
+リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。
+一方 `unix://`、`npipe://`、ループバックアドレス、空値はローカルのままである。
+Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではない。
+`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたホストポートを返す。
 unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミリーを維持し、明示的な IPv6 アドレスは `netip` で正規化する。
 リモートデーモンで明示または再利用された loopback 束縛は拒否する。
 その待ち受け先はリモートマシンの loopback であり、client 側の書き換えでは到達できないためである。
+`ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。
 `docker context` 経由のリモート指定は検知できない。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。

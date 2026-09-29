@@ -544,11 +544,19 @@ route to container IPs from the host, so the Docker backend defaults
 to the published-port model testcontainers uses.
 Ports declared via `WithExposedPorts` are automatically published to
 random ports: locally `-p 127.0.0.1::<port>`, on a remote daemon
-(`DOCKER_HOST=tcp://host`) `-p 0.0.0.0::<port>`.
-`Host` returns `127.0.0.1` (or the host from a `tcp://`
-`DOCKER_HOST`) and `MappedPort` the assigned host port.
+`-p 0.0.0.0::<port>` so the client can reach it. Remote means any
+`DOCKER_HOST` that does not name this machine — `tcp://host`,
+`ssh://user@host`, or a scheme-less `host:port` / hostname
+— while `unix://`, `npipe://`, loopback addresses, and an
+empty value stay local. Docker CLI client protocols are `unix`,
+`tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1` (or the remote
+hostname) and `MappedPort` the assigned host port.
 Unspecified binds resolve through loopback while preserving IPv4/IPv6
 family; explicit IPv6 addresses are canonicalized through `netip`.
+For `ssh://` that hostname must be directly dialable; the CLI's SSH
+session carries only the Docker API, so an alias behind a ProxyJump or
+bastion needs a manual `ssh -L` forward.
 An explicit or reused loopback binding on a remote daemon is rejected:
 it listens on the remote machine's loopback, which no client-side
 rewrite can reach.

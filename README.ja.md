@@ -91,16 +91,25 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
 ランダムポートへ自動公開されます(testcontainers と同じモデル)。
-ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン
-(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。
-`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、
-`MappedPort` は割り当てられたポートを返します。
+ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートの `DOCKER_HOST`
+では全IF(`-p 0.0.0.0::<port>`)に束縛します。
+リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことです。
+`tcp://host`(CI での `tcp://docker:2375` など)、`ssh://user@host`、
+スキームなしの `host:port` / ホスト名(Docker CLI と同じく `tcp://` を前置)
+が該当し、`unix://`、`npipe://`、ループバックアドレス、空値はローカルのままです。
+Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、
+`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではありません。
+`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられた
+ポートを返します。
 IPv6 の束縛先は正規化してもアドレスファミリーを維持するため、`::` は
 `[::1]` として解決します。
 リモートデーモンでは、明示的な loopback 束縛も再利用時の既存 loopback
 束縛も拒否します。
 これらをリモートの host へ書き換えても実際の待ち受け先には到達できない
 ためです。
+`ssh://` のホスト名は直接 dial 可能でなければなりません。
+CLI の SSH セッションが運ぶのは Docker API だけで、公開ポートは運ばれないため、
+ProxyJump や踏み台越しでしか届かないエイリアスは手動の `ssh -L` 転送が必要です。
 
 Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
 作成できません。

@@ -48,6 +48,14 @@ func (g *reaperGroupOwner) signal() bool {
 	if g == nil || g.pid <= 0 {
 		return false
 	}
+	if g.sentinelPID > 0 {
+		// Solaris does not expose Getpgid in package syscall. A live
+		// sentinel still pins the original process group, so do not use a
+		// saved numeric PGID after the sentinel has gone.
+		if err := syscall.Kill(g.sentinelPID, 0); err != nil {
+			return false
+		}
+	}
 	return syscall.Kill(-g.pid, syscall.SIGKILL) == nil
 }
 

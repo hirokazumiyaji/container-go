@@ -165,30 +165,3 @@ func uniqueStrings(values []string) []string {
 	}
 	return out
 }
-
-// rollbackError preserves both the readiness cause and a cleanup failure.
-// It is intentionally a typed multi-error rather than a %v interpolation so
-// errors.Is/As continue to work after a failed rollback.
-type rollbackError struct {
-	cause   error
-	cleanup error
-	id      string
-}
-
-func (e *rollbackError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	return fmt.Sprintf("%v (container %s left behind: %v)", e.cause, e.id, e.cleanup)
-}
-
-func (e *rollbackError) Unwrap() []error {
-	if e == nil {
-		return nil
-	}
-	return []error{e.cause, e.cleanup}
-}
-
-func (e *rollbackError) Is(target error) bool {
-	return errors.Is(e.cause, target) || errors.Is(e.cleanup, target)
-}

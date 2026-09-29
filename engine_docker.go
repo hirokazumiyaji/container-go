@@ -29,6 +29,7 @@ type dockerEngine struct{}
 //   - image missing: "Error response from daemon: No such image: …"
 //   - inspect missing: "error: no such object: …"
 //   - lifecycle missing: "Error response from daemon: No such container: …"
+//   - Windows daemon down: "error during connect: open \\.\pipe\docker_engine: The system cannot find the file specified."
 const (
 	dockerStderrConflict     = "conflict. the container name "
 	dockerStderrAlreadyInUse = "already in use by container"
@@ -78,6 +79,9 @@ func dockerProbeUnavailable(err error) bool {
 	if cli.IsProbeConfigurationError(err) {
 		return false
 	}
+	if dockerWindowsNpipeUnavailable(text) {
+		return true
+	}
 	for _, fragment := range []string{
 		"cannot connect to the docker daemon",
 		"is the docker daemon running",
@@ -89,6 +93,24 @@ func dockerProbeUnavailable(err error) bool {
 		}
 	}
 	return false
+}
+
+// Windows reports a stopped daemon as a missing named pipe rather than a
+// refused connection, so "error during connect" on its own is not usable
+// evidence: the same prefix introduces TLS, SSH, and proxy failures.
+// Require both halves of the real diagnostic instead — the Docker client's
+// own pipe namespace plus the OS error that opening it produced. Any other
+// pipe, or any other file-not-found, stays unclassified.
+func dockerWindowsNpipeUnavailable(text string) bool {
+	const missingFile = "the system cannot find the file specified"
+	if !strings.Contains(text, missingFile) {
+		return false
+	}
+	// Go's npipe package reports the forward-slash form while the Windows
+	// CLI spells the same path with backslashes.
+	normalized := strings.ReplaceAll(text, `\`, "/")
+	return strings.Contains(normalized, "//./pipe/docker") ||
+		strings.Contains(normalized, "getnamedpipeinfo")
 }
 
 // defaultHost honors a tcp:// DOCKER_HOST (remote daemon); everything

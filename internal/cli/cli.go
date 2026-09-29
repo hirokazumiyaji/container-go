@@ -296,6 +296,62 @@ func (e *probeOutputError) Error() string {
 
 func (e *probeOutputError) Unwrap() error { return e.err }
 
+// maxDiagnosticDepth bounds the walk over joined error trees so deeply
+// nested instrumentation cannot grow the collected text without limit.
+const maxDiagnosticDepth = 16
+
+type joinedError interface{ Unwrap() []error }
+
+// diagnosticText returns the lowercase diagnostics err carries, with the
+// CLIError argv vector left out. Container names, image references, and
+// flags reach argv from the caller, so a target such as "tls" or "proxy"
+// must not decide whether a failure is a liveness or a configuration
+// problem. Every CLIError contributes only the stderr the backend CLI
+// itself wrote, while wrapper, joined, and probe-output diagnostics stay
+// in the text.
+func diagnosticText(err error) string {
+	var text strings.Builder
+	appendDiagnosticText(&text, err, 0)
+	return strings.ToLower(text.String())
+}
+
+func appendDiagnosticText(text *strings.Builder, err error, depth int) {
+	if err == nil || depth > maxDiagnosticDepth {
+		return
+	}
+	switch node := err.(type) {
+	case joinedError:
+		for _, cause := range node.Unwrap() {
+			appendDiagnosticText(text, cause, depth+1)
+		}
+		return
+	case *probeOutputError:
+		// Captured probe output is CLI-written text, not argv.
+		appendDiagnosticLine(text, node.output)
+		appendDiagnosticText(text, node.err, depth+1)
+		return
+	case *CLIError:
+		appendDiagnosticLine(text, node.Stderr)
+		return
+	}
+	cause := errors.Unwrap(err)
+	if cause == nil {
+		appendDiagnosticLine(text, err.Error())
+		return
+	}
+	// A wrapper's own text is written by this library or by runner
+	// instrumentation, so keep it and walk the cause separately.
+	appendDiagnosticLine(text, strings.TrimSuffix(err.Error(), cause.Error()))
+	appendDiagnosticText(text, cause, depth+1)
+}
+
+func appendDiagnosticLine(text *strings.Builder, s string) {
+	if s = strings.TrimSpace(s); s != "" {
+		text.WriteString(s)
+		text.WriteByte('\n')
+	}
+}
+
 // withProbeOutput makes successful probe output available to the
 // backend-specific liveness predicates. Some CLIs report status on stdout
 // while still exiting non-zero. The original error remains the unwrap target,
@@ -327,17 +383,17 @@ func defaultProbeUnavailable(err error) bool {
 	if !errors.As(err, &cliErr) {
 		return false
 	}
-	// Error includes wrapper and joined-branch text outside the first
-	// CLIError.Stderr. Requiring a reachable CLIError keeps arbitrary
-	// application errors from becoming liveness evidence on their own.
-	return defaultProbeUnavailableText(strings.ToLower(err.Error()))
+	// The complete wrapped/joined tree is inspected so instrumentation
+	// cannot hide liveness wording in another branch. CLIError argv is
+	// excluded: it is caller-supplied, not backend-written.
+	return defaultProbeUnavailableText(diagnosticText(err))
 }
 
 func isDefinitiveProbeTimeout(err error) bool {
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return false
 	}
-	if IsProbeConfigurationError(err) || containsDefinitiveNonLivenessText(err.Error()) {
+	if IsProbeConfigurationError(err) || containsDefinitiveNonLivenessText(diagnosticText(err)) {
 		return false
 	}
 	return errorTreeHasOnlyTimeoutEvidence(err)
@@ -395,13 +451,15 @@ func defaultProbeUnavailableText(s string) bool {
 
 // IsProbeConfigurationError reports concrete transport, authentication,
 // and endpoint-configuration diagnostics that must not be classified as a
-// stopped backend. The complete wrapped/joined error text is inspected so
-// instrumentation cannot hide a configuration failure in another branch.
+// stopped backend. The complete wrapped/joined tree is inspected so
+// instrumentation cannot hide a configuration failure in another branch;
+// CLIError argv is excluded because the caller, not the backend CLI,
+// chose it.
 func IsProbeConfigurationError(err error) bool {
 	if err == nil {
 		return false
 	}
-	s := strings.ToLower(err.Error())
+	s := diagnosticText(err)
 	for _, fragment := range []string{
 		"tls",
 		"x509",
@@ -444,7 +502,7 @@ func isDefinitiveNonLivenessError(err error) bool {
 	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
 		return true
 	}
-	return containsDefinitiveNonLivenessText(err.Error())
+	return containsDefinitiveNonLivenessText(diagnosticText(err))
 }
 
 func containsDefinitiveNonLivenessText(text string) bool {
@@ -502,15 +560,12 @@ func isNonLivenessError(err error) bool {
 		return true
 	}
 	var cliErr *CLIError
-	if !errors.As(err, &cliErr) {
-		return containsNonLivenessText(strings.ToLower(err.Error()))
-	}
-	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+	if errors.As(err, &cliErr) && (cliErr.ExitCode == 126 || cliErr.ExitCode == 127) {
 		return true
 	}
 	// Wrappers and errors.Join branches can carry additional diagnostics
-	// outside the first CLIError.Stderr.
-	return containsNonLivenessText(strings.ToLower(err.Error()))
+	// outside the first CLIError.Stderr; argv cannot.
+	return containsNonLivenessText(diagnosticText(err))
 }
 
 // containsNonLivenessText also treats object/image absence diagnostics as

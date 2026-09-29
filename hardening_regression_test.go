@@ -332,9 +332,12 @@ type dockerPruneRunner struct {
 	mu         sync.Mutex
 	uid        string
 	state      string
+	reuseGroup string
+	reuse      bool
 	deleteDown bool
 	inspected  []string
 	deleted    []string
+	deleteArgs [][]string
 }
 
 func (r *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -346,11 +349,21 @@ func (r *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []by
 		r.inspected = append(r.inspected, args[len(args)-1])
 		state := r.state
 		uid := r.uid
+		reuseGroup := r.reuseGroup
+		reuse := r.reuse
 		r.mu.Unlock()
-		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":%q},"Config":{"Image":"redis","Labels":{%q:"true",%q:"0123456789abcdef"}}}]`, uid, state, managedLabel, creationLabel)), nil, nil
+		labels := fmt.Sprintf(`%q:"true",%q:"0123456789abcdef"`, managedLabel, creationLabel)
+		if reuse {
+			labels = fmt.Sprintf(`%q:"true",%q:"true",%q:"0123456789abcdef"`, managedLabel, reuseLabel, creationLabel)
+		}
+		if reuseGroup != "" {
+			labels += fmt.Sprintf(`,%q:%q`, reuseGroupLabel, reuseGroup)
+		}
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":%q},"Config":{"Image":"redis","Labels":{%s}}}]`, uid, state, labels)), nil, nil
 	case "rm":
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])
+		r.deleteArgs = append(r.deleteArgs, append([]string(nil), args...))
 		down := r.deleteDown
 		r.mu.Unlock()
 		if down {

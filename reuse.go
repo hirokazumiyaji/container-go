@@ -606,6 +606,12 @@ func deleteStoppedReuseChecked(ctx context.Context, cfg *config, info *engineInf
 	}
 	ctr := namedContainer(cfg, cfg.name)
 	ctr.creation = info.labels[creationLabel]
+	withdrawOnReturn := true
+	defer func() {
+		if withdrawOnReturn {
+			unregisterContainerReaper(cfg, ctr)
+		}
+	}()
 	// Every delete below targets a generation that was just verified
 	// stopped, so it omits --force: a generation that started in the
 	// meantime is reported as a failure and adopted by the next poll

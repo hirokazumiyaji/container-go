@@ -188,13 +188,16 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 	// automatic-delete target to the reaper.
 	if cfg.reuse {
 		if info.state == StateRunning {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: running reuse generation may already be adopted; refusing automatic deletion", cfg.name))
 		}
 		if info.state != StateStopped && info.state != StateCreated {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: reuse generation is %s; refusing automatic deletion", cfg.name, info.state))
 		}
 	}
 	if info.state == StateUnknown || info.state == "" {
+		unregisterContainerReaper(cfg, ctr)
 		return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation state is %s; refusing automatic deletion", cfg.name, info.state))
 	}
 
@@ -216,15 +219,19 @@ func recoverDockerRunOutput(ctx context.Context, cfg *config, cause error) (*Con
 			fresh, freshErr = ctr.inspectTargetFreshRetry(delCtx, ctr.immutableID())
 		}
 		if isNotFound(freshErr) {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, cause
 		}
 		if freshErr != nil {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: revalidate cleanup: %w", cfg.name, freshErr))
 		}
 		if !failedCreateOwned(cfg, fresh) || !dockerIDRE.MatchString(fresh.uid) || fresh.uid != ctr.immutableID() {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation changed before cleanup", cfg.name))
 		}
 		if fresh.state != StateStopped && fresh.state != StateCreated {
+			unregisterContainerReaper(cfg, ctr)
 			return nil, withCleanupError(cause, fmt.Errorf("recover container %s: generation became %s; refusing automatic deletion", cfg.name, fresh.state))
 		}
 		info = fresh

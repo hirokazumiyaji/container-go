@@ -124,26 +124,6 @@ run_bounded() {
   operation_pid=
   return "$operation_status"
 }
-run_capture() {
-  seconds="$1"; shift
-  set -m 2>/dev/null || true
-  "$@" 2>/dev/null &
-  operation_pid=$!
-  set +m 2>/dev/null || true
-  deadline=$(( $(date +%s) + seconds ))
-  while kill -0 "$operation_pid" 2>/dev/null; do
-    now=$(date +%s)
-    if [ "$now" -ge "$deadline" ]; then
-      terminate_operation_group
-      break
-    fi
-    sleep 0.05
-  done
-  wait "$operation_pid" 2>/dev/null
-  operation_status=$?
-  operation_pid=
-  return "$operation_status"
-}
 run_with_timeout() {
   run_bounded "$operation_timeout" "$@"
 }
@@ -877,6 +857,7 @@ func (r *reaper) spawnLocked() error {
 		return err
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdin.Close()
 		return err
 	}
 	r.generation++

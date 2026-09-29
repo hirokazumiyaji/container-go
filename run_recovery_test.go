@@ -16,12 +16,15 @@ import (
 
 type issue94MalformedDockerRecoveryRunner struct {
 	*fakeRunner
-	binary    string
-	uid       string
-	creation  string
-	state     string
-	deleteErr error
-	deleted   []string
+	binary     string
+	uid        string
+	creation   string
+	state      string
+	states     []string
+	inspects   int
+	deleteErr  error
+	deleted    []string
+	deleteArgs [][]string
 }
 
 func (r *issue94MalformedDockerRecoveryRunner) External() bool         { return true }
@@ -50,6 +53,14 @@ func (r *issue94MalformedDockerRecoveryRunner) Run(ctx context.Context, args ...
 		r.mu.Lock()
 		creation := r.creation
 		state := r.state
+		if len(r.states) > 0 {
+			index := r.inspects
+			if index >= len(r.states) {
+				index = len(r.states) - 1
+			}
+			state = r.states[index]
+			r.inspects++
+		}
 		r.mu.Unlock()
 		if state == "" {
 			state = "running"
@@ -64,6 +75,7 @@ func (r *issue94MalformedDockerRecoveryRunner) Run(ctx context.Context, args ...
 	case "rm":
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])
+		r.deleteArgs = append(r.deleteArgs, append([]string(nil), args...))
 		err := r.deleteErr
 		r.mu.Unlock()
 		if err != nil {

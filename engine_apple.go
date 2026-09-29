@@ -24,6 +24,12 @@ const (
 	appleStderrNameConflict  = "container with id"
 	appleStderrAlreadyExists = "already exists"
 	appleStderrImageNotFound = "image not found:"
+	// appleLogsGetPrefix and appleLogsOpenPrefix are the two exact markers
+	// the 1.2/1.3 logs client wraps an absent container in. They appear
+	// both in the flat spelling and as the root and cause messages of the
+	// nested internalError envelope.
+	appleLogsGetPrefix  = "failed to get logs for container "
+	appleLogsOpenPrefix = "failed to open container logs: "
 )
 
 func (appleEngine) name() string   { return "apple" }
@@ -389,10 +395,9 @@ func (appleEngine) containerMissing(err error) bool {
 		})
 	case "logs":
 		if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
-			rest, ok := strings.CutPrefix(message, "failed to get logs for container ")
-			return ok && sameCLITarget(rest, ctx.target)
+			return appleLogsEnvelopeRoot(message, ctx.target)
 		}, "notfound", func(message string) bool {
-			return appleIDMissingLine(message, ctx.target)
+			return appleIDMissingLine(message, ctx.target) || appleLogsOpenMissingLine(message, ctx.target)
 		}) {
 			return true
 		}
@@ -447,10 +452,32 @@ func appleStateMissingLine(line, target, wrapper string) bool {
 	return false
 }
 
+func appleLogsEnvelopeRoot(message, target string) bool {
+	// The 1.2/1.3 logs envelope roots at "failed to get logs for container
+	// <id>" with nothing after the ID, so an explanatory suffix (an
+	// application's own sentence) cannot satisfy the anchor.
+	rest, ok := strings.CutPrefix(message, appleLogsGetPrefix)
+	return ok && sameCLITarget(rest, target)
+}
+
+// appleLogsOpenMissingLine accepts the notFound cause of that envelope: the
+// absence reported behind the same "failed to open container logs: " marker
+// the flat spelling uses, followed by one of the known missing-ID leaves.
+// Matching stays target-scoped, and only a parsed ContainerizationError
+// whose root names the argv target reaches it, so unrelated application
+// stderr that repeats the marker is left alone.
+func appleLogsOpenMissingLine(message, target string) bool {
+	rest, ok := strings.CutPrefix(message, appleLogsOpenPrefix)
+	if !ok {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	return appleIDMissingLine(rest, target) || appleExecMissingLine(rest, target)
+}
+
 func appleLogsMissingLine(line, target string) bool {
-	const logsPrefix = "failed to get logs for container "
 	current := line
-	if rest, ok := strings.CutPrefix(current, logsPrefix); ok {
+	if rest, ok := strings.CutPrefix(current, appleLogsGetPrefix); ok {
 		rest = strings.TrimSpace(rest)
 		separator := strings.Index(rest, ":")
 		if separator < 0 {
@@ -463,10 +490,6 @@ func appleLogsMissingLine(line, target string) bool {
 		current = strings.TrimSpace(rest[separator+1:])
 	}
 
-	const (
-		openPrefix = "failed to open container logs: "
-		getPrefix  = "get failed:"
-	)
 	// Client and API versions wrap the same absence in a small, known set
 	// of prefixes. Bound the depth so arbitrary nested diagnostics cannot
 	// grow the classifier without limit.
@@ -474,11 +497,11 @@ func appleLogsMissingLine(line, target string) bool {
 		if appleIDMissingLine(current, target) || appleExecMissingLine(current, target) {
 			return true
 		}
-		if rest, ok := strings.CutPrefix(current, openPrefix); ok {
+		if rest, ok := strings.CutPrefix(current, appleLogsOpenPrefix); ok {
 			current = strings.TrimSpace(rest)
 			continue
 		}
-		if rest, ok := strings.CutPrefix(current, getPrefix); ok {
+		if rest, ok := strings.CutPrefix(current, "get failed:"); ok {
 			current = strings.TrimSpace(rest)
 			if appleContainerMissingLine(current, target) {
 				return true

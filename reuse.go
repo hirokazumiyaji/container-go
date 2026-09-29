@@ -315,7 +315,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 			// a peer's in-flight container on a not-found race.
 			return nil, operationErr
 		}
-		cleanupFailedCreate(ctx, cfg, runErr, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, runErr, classified); cleanupErr != nil {
+			return nil, joinEnvFileCleanupError(withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
+		}
 		return nil, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
@@ -353,19 +355,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 	// before the required setup has completed. Finish the bounded inspect
 	// and copy work first; any setup failure remains a failed flight.
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
-		if cleanupErr != nil {
-			return ctr, joinEnvFileCleanupError(joinEnvFileCleanupError(err, envCleanupErr), cleanupErr)
-		}
-		return nil, joinEnvFileCleanupError(err, envCleanupErr)
+		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			cleanupErr := ctr.Terminate(context.WithoutCancel(ctx))
-			if cleanupErr != nil {
-				return ctr, joinEnvFileCleanupError(joinEnvFileCleanupError(err, envCleanupErr), cleanupErr)
-			}
-			return nil, joinEnvFileCleanupError(err, envCleanupErr)
+			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
 	}
 	if envCleanupErr != nil {

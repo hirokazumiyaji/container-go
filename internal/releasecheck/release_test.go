@@ -16,10 +16,16 @@ import (
 
 const repoRoot = "../.."
 
+// numericComponent is one canonical semver / Go module numeric part: a lone
+// zero, or a non-zero digit optionally followed by more digits. Leading zeroes
+// such as "03" are rejected so a typo like 0.03.0 cannot pass release checks
+// while remaining unusable to Go tooling.
+const numericComponent = `(?:0|[1-9]\d*)`
+
 // changelogRelease matches a released section heading: "## [0.2.0] - 2026-09-02".
 // Unreleased is deliberately excluded, so an unreleased entry cannot be
-// mistaken for a release.
-var changelogRelease = regexp.MustCompile(`(?m)^## \[(\d+\.\d+\.\d+)\] - (\d{4}-\d{2}-\d{2})$`)
+// mistaken for a release. Only canonical dotted versions match.
+var changelogRelease = regexp.MustCompile(`(?m)^## \[(` + numericComponent + `\.` + numericComponent + `\.` + numericComponent + `)\] - (\d{4}-\d{2}-\d{2})$`)
 
 // installLine matches every version-bearing `go get` reference in a README.
 // Both forms exist: the full install instruction, and the shorthand used in
@@ -28,7 +34,7 @@ var changelogRelease = regexp.MustCompile(`(?m)^## \[(\d+\.\d+\.\d+)\] - (\d{4}-
 var installLine = regexp.MustCompile(`go get (?:github\.com/hirokazumiyaji/container-go|\.\.\.)@(\S+)`)
 
 // supportRow matches a SECURITY.md support-matrix row for a minor series.
-var supportRow = regexp.MustCompile(`(?m)^\|\s*(\d+\.\d+)\.x\s*\|\s*(\w+)\s*\|$`)
+var supportRow = regexp.MustCompile(`(?m)^\|\s*(` + numericComponent + `\.` + numericComponent + `)\.x\s*\|\s*(\w+)\s*\|$`)
 
 func read(t *testing.T, rel string) string {
 	t.Helper()
@@ -141,6 +147,31 @@ func TestChangelogReleaseDatesAreValid(t *testing.T) {
 		}
 		if !changelogRelease.MatchString(line) {
 			t.Errorf("CHANGELOG.md: release heading %q is missing a YYYY-MM-DD date", line)
+		}
+	}
+}
+
+// Non-canonical versions (leading zeroes in a component) must not count as
+// release headings. Go module tags require canonical form, so accepting
+// "## [0.03.0] - ..." would let checks pass for a release tooling cannot use.
+func TestChangelogRejectsNonCanonicalVersions(t *testing.T) {
+	cases := []struct {
+		heading string
+		want    bool
+	}{
+		{"## [0.3.0] - 2026-09-02", true},
+		{"## [0.0.0] - 2026-09-02", true},
+		{"## [1.0.0] - 2026-09-02", true},
+		{"## [10.20.30] - 2026-09-02", true},
+		{"## [0.03.0] - 2026-09-02", false},
+		{"## [00.3.0] - 2026-09-02", false},
+		{"## [0.3.00] - 2026-09-02", false},
+		{"## [01.2.3] - 2026-09-02", false},
+	}
+	for _, tc := range cases {
+		got := changelogRelease.MatchString(tc.heading)
+		if got != tc.want {
+			t.Errorf("changelogRelease.MatchString(%q) = %v, want %v", tc.heading, got, tc.want)
 		}
 	}
 }

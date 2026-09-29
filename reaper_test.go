@@ -459,6 +459,7 @@ func TestReaperRegistrationHonorsContextWhileWriterBlocks(t *testing.T) {
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
@@ -472,6 +473,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -484,6 +486,7 @@ func TestReaperRegisterWithCreationValidation(t *testing.T) {
 }
 
 func TestReaperGuardsDeleteByCreation(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Helper()
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -518,6 +521,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 }
 
 func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"

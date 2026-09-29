@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -175,8 +174,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, errors.Join(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
@@ -259,7 +260,9 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }

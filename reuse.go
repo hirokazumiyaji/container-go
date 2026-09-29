@@ -176,7 +176,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 			return nil, err
 		}
 		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		return nil, errors.Join(classified, cleanupErr)
+		if cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, classified
 	}
 
 	uid := cfg.eng.parseRunID(stdout)

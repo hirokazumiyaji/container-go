@@ -32,11 +32,27 @@ func TerminateContainer(ctr *Container) error {
 
 // Cleanup registers container removal via tb.Cleanup. It is nil-safe,
 // so call it right after Run, before checking Run's error.
+//
+// A removal failure is logged rather than reported, so an existing test that
+// does not care about teardown is not turned red by an unrelated backend
+// problem. Use StrictCleanup when a leftover container should fail the test.
 func Cleanup(tb testing.TB, ctr *Container) {
 	tb.Helper()
 	tb.Cleanup(func() {
 		if err := TerminateContainer(ctr); err != nil {
 			tb.Logf("container-go: cleanup %s: %v", ctr.ID(), err)
+		}
+	})
+}
+
+// StrictCleanup registers container removal like Cleanup, but reports a
+// removal failure as a test failure instead of logging it. A container that
+// outlives its test is a leak, and a green run would otherwise hide it.
+func StrictCleanup(tb testing.TB, ctr *Container) {
+	tb.Helper()
+	tb.Cleanup(func() {
+		if err := TerminateContainer(ctr); err != nil {
+			tb.Errorf("container-go: cleanup %s left the container behind: %v", ctr.ID(), err)
 		}
 	})
 }

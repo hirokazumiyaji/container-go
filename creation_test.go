@@ -63,6 +63,7 @@ func TestRunAddsCreationLabel(t *testing.T) {
 }
 
 func TestReaperSkipsReplacedGeneration(t *testing.T) {
+	requirePOSIXShell(t)
 	// Stub binary: inspect prints the *current* creation, delete logs.
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -93,6 +94,7 @@ func TestReaperSkipsReplacedGeneration(t *testing.T) {
 }
 
 func TestReaperDeletesMatchingGeneration(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/ctr"

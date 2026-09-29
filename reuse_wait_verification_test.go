@@ -266,6 +266,26 @@ func TestReuseVerifiesGenerationWithoutWait(t *testing.T) {
 	}
 }
 
+func TestReuseAcceptsPartialFreshPlatformObservation(t *testing.T) {
+	// A shared ensure flight may have been led by a caller that requested a
+	// platform, so the baseline snapshot is complete. This caller requested
+	// none, so its fresh inspect reports only the OS. The container did not
+	// change, and an incomplete observation must not be read as a change.
+	before := &engineInfo{
+		state:    StateRunning,
+		image:    "redis:7-alpine",
+		created:  "2026-08-19T01:23:45Z",
+		platform: "linux/arm64/v8",
+		labels:   reuseInspectLabels("aaaaaaaaaaaaaaaa"),
+	}
+	fresh := *before
+	fresh.platform = "linux"
+	cfg := &config{eng: appleEngine{}, name: "shared"}
+	if err := verifyReuseResult(before, &fresh, "redis:7-alpine", cfg); err != nil {
+		t.Fatalf("verifyReuseResult = %v, want unchanged generation to verify", err)
+	}
+}
+
 func TestReuseSucceedsWhenGenerationUnchangedAfterWait(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "")
 	for _, backend := range reuseBackendFixtures() {

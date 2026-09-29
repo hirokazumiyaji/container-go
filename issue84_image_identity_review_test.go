@@ -134,6 +134,31 @@ func TestIssue84ApplePinnedDigestMismatchNeverUsesMutableFallback(t *testing.T) 
 	}
 }
 
+func TestIssue84AppleIgnoresIncompleteConfigurationPlatform(t *testing.T) {
+	data := []byte(`[{"id":"` + strings.Repeat("a", 64) + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue84ImageRoot + `"},"platform":{"os":"linux"}}}]`)
+	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
+	if !exists {
+		t.Fatal("Apple image identity was not found")
+	}
+	if !identity.pinned {
+		t.Fatalf("identity = %+v, want root-descriptor identity", identity)
+	}
+	if identity.platform != "" {
+		t.Fatalf("platform = %q, want the incomplete field to be ignored", identity.platform)
+	}
+}
+
+func TestIssue84AppleSkipsUnusableVariantEntries(t *testing.T) {
+	data := []byte(`[{"id":"` + strings.Repeat("a", 64) + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue84ImageRoot + `"}},"variants":[{"digest":"` + issue84ImageVariant + `"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"` + issue84ImageVariant + `"}]}]`)
+	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "linux/arm64/v8")
+	if !exists || !identity.pinned {
+		t.Fatalf("identity = (%+v, %v), want pinned identity from the usable variant", identity, exists)
+	}
+	if identity.variantDigest != issue84ImageVariant {
+		t.Fatalf("variant digest = %q, want %q", identity.variantDigest, issue84ImageVariant)
+	}
+}
+
 func TestIssue84AppleIdentitylessDigestNeverUsesMutableFallback(t *testing.T) {
 	requested := "registry.example/team/demo:stable@" + issue84ImageRoot
 	cfg := &config{eng: appleEngine{}, allowMutableImageTag: true}

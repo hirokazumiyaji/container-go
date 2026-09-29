@@ -589,8 +589,8 @@ func verifyReuseResult(before, fresh *engineInfo, original string, cfg *config) 
 	if before.state != fresh.state || fresh.state != StateRunning {
 		return fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
 	}
-	if !samePlatform(before.platform, fresh.platform) {
-		return fmt.Errorf("reuse %s: platform changed before return", cfg.name)
+	if !platformObservationUnchanged(before.platform, fresh.platform) {
+		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
 	}
 	if cfg.platform != "" {
 		if err := checkPlatformCompatibility(cfg.platform, fresh.platform); err != nil {

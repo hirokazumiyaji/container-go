@@ -113,7 +113,10 @@ func legacyNameLockPath(name string) (string, error) {
 
 // ensurePrivateDir creates dir if needed and refuses to use a path that
 // could have been substituted by another user. The directory is kept
-// persistent; removing it would let a new inode bypass an existing flock.
+// persistent; removing it would let a new inode bypass an existing lock.
+// An owner-only directory left behind with a different mode (for example by
+// a restrictive umask or an older release) is tightened instead of making
+// name locking permanently unusable.
 func ensurePrivateDir(dir string) error {
 	if err := os.MkdirAll(dir, nameLockDirPerm); err != nil {
 		return fmt.Errorf("create lock directory %s: %w", dir, err)
@@ -125,10 +128,19 @@ func ensurePrivateDir(dir string) error {
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("lock directory %s is not a directory", dir)
 	}
-	if info.Mode().Perm() != nameLockDirPerm {
-		return fmt.Errorf("lock directory %s has permissions %04o, want %04o", dir, info.Mode().Perm(), nameLockDirPerm)
+	if err := checkLockOwner(info, "lock directory"); err != nil {
+		return err
 	}
-	return checkLockOwner(info, "lock directory")
+	perm := info.Mode().Perm()
+	if perm&0o077 != 0 {
+		return fmt.Errorf("lock directory %s is accessible beyond its owner (mode %04o)", dir, perm)
+	}
+	if perm != nameLockDirPerm {
+		if err := os.Chmod(dir, nameLockDirPerm); err != nil {
+			return fmt.Errorf("tighten lock directory %s: %w", dir, err)
+		}
+	}
+	return nil
 }
 
 func checkLockOwner(info os.FileInfo, kind string) error {
@@ -149,10 +161,16 @@ func checkLockFile(info os.FileInfo, path string) error {
 	if !info.Mode().IsRegular() {
 		return fmt.Errorf("lock file %s is not a regular file", path)
 	}
-	if info.Mode().Perm() != nameLockFilePerm {
-		return fmt.Errorf("lock file %s has permissions %04o, want %04o", path, info.Mode().Perm(), nameLockFilePerm)
+	if err := checkLockOwner(info, "lock file"); err != nil {
+		return err
 	}
-	return checkLockOwner(info, "lock file")
+	// Only the exact mode is required for correctness. Owner-only files
+	// with a different mode are tightened by openNameLockPath so a
+	// restrictive umask cannot disable the protocol.
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("lock file %s is accessible beyond its owner (mode %04o)", path, perm)
+	}
+	return nil
 }
 
 // openNameLockPath opens the stable lock inode after checking that it is a
@@ -166,6 +184,14 @@ func openNameLockPath(path string) (*os.File, error) {
 	if info, statErr := os.Lstat(path); statErr == nil {
 		if err := checkLockFile(info, path); err != nil {
 			return nil, err
+		}
+		// Tighten an owner-only file whose mode is not exactly 0600 (a
+		// restrictive umask, or an older release) before opening it, so the
+		// protocol cannot be disabled by a mode the owner controls.
+		if perm := info.Mode().Perm(); perm != nameLockFilePerm {
+			if err := os.Chmod(path, nameLockFilePerm); err != nil {
+				return nil, fmt.Errorf("tighten lock file %s: %w", path, err)
+			}
 		}
 	} else if !errors.Is(statErr, os.ErrNotExist) {
 		return nil, fmt.Errorf("stat lock file %s: %w", path, statErr)

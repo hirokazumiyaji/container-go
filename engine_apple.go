@@ -256,11 +256,12 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 		if record.Configuration.Platform.Variant != "" {
 			candidate += "/" + record.Configuration.Platform.Variant
 		}
-		parsed, ok := parseApplePlatformSelector(candidate)
-		if !ok {
-			return imageIdentity{}, true
+		// An incomplete platform field carries no usable selector. Ignore it
+		// and fall through to the root descriptor instead of discarding a
+		// record whose immutable identity is still proven.
+		if parsed, ok := parseApplePlatformSelector(candidate); ok {
+			platform = formatInspectPlatform(parsed.os, parsed.architecture, parsed.variant)
 		}
-		platform = formatInspectPlatform(parsed.os, parsed.architecture, parsed.variant)
 	}
 	rootDigest, rootOK := appleRootDescriptorDigest(record)
 	if platform != "" {
@@ -371,8 +372,11 @@ func applePlatformVariantDigest(record appleImageInspectRecord, platform string)
 	}
 	selected := ""
 	for _, variant := range record.Variants {
+		// An entry without a usable platform or digest cannot match the
+		// requested selector; it is not evidence of ambiguity. Attestation
+		// and SBOM descriptors commonly appear alongside real variants.
 		if variant.Platform.OS == "" || variant.Platform.Architecture == "" || !validImageDigest(variant.Digest) {
-			return "", false
+			continue
 		}
 		have := canonicalApplePlatform(variant.Platform.OS, variant.Platform.Architecture, variant.Platform.Variant)
 		if applePlatformsEqual(want, have) {

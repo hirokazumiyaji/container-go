@@ -56,6 +56,11 @@ func retainedFailedCreate(ctx context.Context, cfg *config, runErr, classified e
 	ctr.imageIdentity = imageFromInfo(info)
 	ctr.image = ctr.imageIdentity
 	ctr.info = info
+	// The lookup handle was identity-optional only until the ownership,
+	// generation, and image checks above succeeded. A returned KEEP result
+	// must stay bound to that generation instead of falling back to a
+	// name-addressed inspect of whatever holds the name later.
+	ctr.identityOptional = false
 	return ctr, nil
 }
 

@@ -258,6 +258,30 @@ func samePlatform(before, fresh string) bool {
 		beforeVariant == freshVariant
 }
 
+// platformObservationUnchanged reports whether a fresh platform observation
+// either matches the earlier snapshot or is a less specific report of the
+// same platform. A shared reuse flight can hand a caller a baseline that was
+// resolved for another caller's explicit platform while this caller's own
+// inspect reports only the OS; the missing components are unobserved, not
+// changed, and a concrete conflicting value is still rejected.
+func platformObservationUnchanged(before, fresh string) bool {
+	if samePlatform(before, fresh) {
+		return true
+	}
+	beforeOS, beforeArch, beforeVariant := platformParts(before)
+	freshOS, freshArch, freshVariant := platformParts(fresh)
+	if beforeOS == "" || freshOS == "" || beforeOS != freshOS {
+		return false
+	}
+	if freshArch == "" {
+		return true
+	}
+	if freshArch != beforeArch {
+		return false
+	}
+	return freshVariant == "" || freshVariant == beforeVariant
+}
+
 // platformMatches reports whether observed satisfies requested. A
 // requested OS/architecture/variant is a prefix match so callers may
 // request only the components they care about, but an observed platform

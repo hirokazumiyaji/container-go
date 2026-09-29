@@ -150,6 +150,31 @@ func TestKeepNeverReturnsUnverifiedPostCreatePlatformHandle(t *testing.T) {
 	}
 }
 
+func TestKeepRetainedFailedCreateReturnsUsableHandle(t *testing.T) {
+	t.Setenv("CONTAINERGO_KEEP", "1")
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+		inspectJSON: ownedInspectJSON("myctr"),
+	}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil || ctr == nil {
+		t.Fatalf("Run = (%v, %v), want retained handle and error", ctr, err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("KEEP issued deletion: %v", r.deleted)
+	}
+	// The retained handle is only useful if it is bound to the verified
+	// generation. A short-lived identity-optional lookup would make every
+	// name-addressed operation refuse it as replaced.
+	if err := ctr.Stop(context.Background(), nil); err != nil {
+		t.Fatalf("Stop on retained handle = %v, want usable identity-bound handle", err)
+	}
+}
+
 type unverifiedReuseRunner struct {
 	*fakeRunner
 	created bool

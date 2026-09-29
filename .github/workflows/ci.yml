@@ -7,6 +7,18 @@ on:
   workflow_dispatch:
 
 # No job here needs write access: they only check out, build, and test.
+# Declaring it explicitly means the workflow does not inherit whatever
+# default the repository happens to have.
+#
+# On the trust boundary for fork pull requests: every job here checks out
+# the PR's code and runs `go test` against it, on a runner image that also
+# has a Docker daemon. Fencing the Docker integration off a fork therefore
+# limits how hard the daemon is driven, not whether untrusted code can
+# reach it at all. The real boundaries are the ephemeral runner, the
+# read-only token, and persist-credentials: false — the token is not in
+# .git/config for the code under test to read. Isolating untrusted code
+# from a daemon needs a separate runner or workflow; that is not something
+# this file can express.
 permissions:
   contents: read
 
@@ -29,8 +41,12 @@ jobs:
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # The token is only needed to clone. Leaving it in .git/config
+          # makes it readable by any later step, including code under test.
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test ./...
@@ -43,8 +59,10 @@ jobs:
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test -race ./...
@@ -54,11 +72,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
-      - uses: golangci/golangci-lint-action@v9
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.13.0
 
@@ -66,25 +86,92 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          # Not the root go.mod. This job scans bench/ too, whose go.mod
+          # requires a newer toolchain; a Go older than that aborts the scan
+          # instead of reporting vulnerabilities. The bench toolchain also
+          # satisfies the root module.
+          go-version-file: bench/go.mod
+      # Pinned rather than @latest, so the same commit always scans the same
+      # tool version. Bump the pin deliberately.
+      #
+      # bench/ is a separate module, so the root ./... does not reach it.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+        working-directory: bench
+
+  # bench/ is a separate module, so no job above reaches it: they all run
+  # ./... from the root. Without this a Dependabot bump of bench/go.mod would
+  # merge with no signal that the module still builds.
+  bench-build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          # The module this job builds, not the root one. The root go.mod
+          # declares an older toolchain than bench/go.mod, so deriving from
+          # the root fails the build with "go.mod requires go >=" instead
+          # of building anything.
+          go-version-file: bench/go.mod
+      - run: go build ./...
+        working-directory: bench
+      - run: go test ./...
+        working-directory: bench
+
+  # actionlint validates workflow syntax, expressions, and runner labels. It
+  # does not check action pinning or job timeouts; internal/workflowcheck
+  # guards those, and runs as part of `go test ./...` so it is checked locally
+  # too.
+  workflow-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version-file: go.mod
-      - run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+      # No path argument: actionlint discovers .github/workflows itself, so a
+      # workflow added with the .yaml extension is covered too. A shell glob
+      # over *.yml would silently skip it.
+      - name: Lint workflows
+        run: go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 -shellcheck= -pyflakes=
 
-  # Docker is preinstalled on ubuntu-latest; Apple Container stays local-only.
+  # Docker is preinstalled on ubuntu-latest, and this job hands the daemon to
+  # the checked-out code. The trusted triggers are enumerated rather than
+  # negated: under pull_request_target or workflow_run a fork's code is still
+  # untrusted while the base-branch token is available, so a
+  # "not pull_request" test would pass them straight through.
+  #
+  # NOTE: fork PRs skip this job, and a skipped job reports no check run. Keep
+  # it out of the required-check set, or fork PRs will wait for a status that
+  # never arrives and can never merge. The branch is currently unprotected, so
+  # this is a constraint on future protection settings, not a live problem.
   integration-docker:
+    if: >-
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    # go test's own -timeout is per test binary and does not cover a helper
-    # process that outlives it, so cap the job as well.
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
         go-version: ['1.23.0', 'stable']
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
       - run: make integration-docker

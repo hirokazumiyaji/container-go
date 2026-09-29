@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Return usable partial handles for retained failures under
   `CONTAINERGO_KEEP=1`, and require complete ownership labels before
   automatic failed-create or stopped-reuse cleanup.
+- Never force-delete a published `WithReuse` generation after a post-create
+  failure: cleanup happens only while a fresh inspect proves the generation
+  is unadopted, and running or ambiguous generations are left in place with
+  the refusal reported in `CleanupError`. The same rule covers failed-create
+  reuse cleanup.
+- Revalidate a retained handle before returning it under
+  `CONTAINERGO_KEEP=1`; an unverifiable handle is dropped and the
+  verification failure is joined with the operation error.
+- Classify retryable reuse create failures from the primary operation branch
+  only, so a cleanup failure can no longer restart the get-or-create.
+- Hand a verified failed-create candidate to the watchdog when its automatic
+  delete fails, and withdraw it again once the delete succeeds. Shared and
+  `CONTAINERGO_KEEP=1` containers stay outside watchdog ownership.
+- Recheck the state and generation under the same per-name lock before
+  replacing a stopped reuse container.
+- Scope container-absence classification to the failing command and target,
+  and keep `ErrSystemNotRunning` from being reported as
+  `ErrContainerNotFound`.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

@@ -274,9 +274,12 @@ Every way a test process can exit has an automatic deletion path.
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
 `t.Cleanup`. For a non-reuse `Run`, mid-`Run` failures are rolled back
 by `Run` itself, including failed-create cleanup and copy/wait rollback.
-A `WithReuse` `Run` leaves an existing shared container in place on wait
-failure; newly created reuse setup follows the rollback policy until the
-shared container is established.
+A `WithReuse` `Run` never force-deletes a shared generation: the backend
+publishes it when create returns, so a peer may already have adopted it.
+Post-create reuse failures and failed-create cleanup remove a generation
+only while a fresh inspect proves this `Run` owns it and no peer adopted
+it (`created` or `stopped`); a running or otherwise ambiguous generation
+is left in place and the refusal is reported through `*CleanupError`.
 
 **Abnormal exit (SIGKILL, panic, `os.Exit`)**: neither defers nor
 `t.Cleanup` run, so an external **watchdog reaper** takes over. At
@@ -285,8 +288,11 @@ are registered by writing them down a pipe. However the parent dies,
 the pipe reaches EOF, and the reaper runs `container delete --force`
 for every registered ID and exits. While the parent lives the reaper
 does nothing (deletion belongs to the normal path; the reaper is
-insurance). This mirrors container-rs's watchdog and covers SIGKILL,
-which no signal handler can.
+insurance). A verified non-reuse failed-create candidate is registered
+with the watchdog when its automatic delete fails, and withdrawn again
+once the delete succeeds; shared and `CONTAINERGO_KEEP=1` containers are
+never watchdog-owned. This mirrors container-rs's watchdog and covers
+SIGKILL, which no signal handler can.
 
 **Session labels**: every created container carries
 
@@ -313,14 +319,18 @@ a failed create returns a retained handle only after that ownership
 check; a wait failure under `CONTAINERGO_KEEP=1` returns the shared
 handle as well. That handle refers to the shared container: callers in
 one process may receive the same handle, and callers in other processes
-refer to the same container. It is not a private ownership handle. If
+refer to the same container. It is not a private ownership handle. A
+retained handle is revalidated immediately before it is returned: if the
+generation can no longer be proven, the returned handle is nil and the
+verification failure is joined with the operation error. If
 the container is absent or ownership cannot be verified, the returned
 handle is nil. The operation error is still returned; a rollback that is
 attempted and cannot delete reports the left-behind container in that
 error. Explicit
 `Container.Terminate`, `Prune`, and `PruneReuseGroup` remain deletion
-operations. The reuse get-or-create rules, including stopped-container
-replacement, are unchanged.
+operations. The reuse get-or-create rules are unchanged; stopped-container
+replacement now re-inspects under the same per-name lock and skips a
+generation that is no longer stopped or no longer the observed one.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.
@@ -425,14 +435,18 @@ Errors are discriminable with `errors.Is`/`errors.As`.
 - `ErrSystemNotRunning`: after a CLI failure, a follow-up
   `container system status` probe failed too; the message tells the
   user to run `container system start`
-- `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrContainerNotFound`: not-found from inspect and friends. Absence is
+  classified per command and per target: another operation's or another
+  container's "not found" text does not count, and a failure reported
+  while the backend was unreachable keeps `ErrSystemNotRunning` instead
+  of becoming a missing container
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
-- `*CleanupError`: an operation failed and automatic cleanup or retained-
-  container verification also failed; `errors.As` exposes both `Err` and
-  `CleanupErr`
+- `*CleanupError`: an operation failed and automatic cleanup, an
+  automatic-deletion refusal, or retained-container verification also
+  failed; `errors.As` exposes both `Err` and `CleanupErr`
 
 When a non-reuse `Run` fails on a wait timeout, the returned error
 includes the container's log tail. By default the rollback delete

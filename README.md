@@ -171,14 +171,20 @@ Three layers make sure containers do not outlive your tests:
    before returning. If that removal also fails, the returned
    `*CleanupError` exposes both the original and cleanup errors. This
    covers failed-create, copy, and wait rollback paths. A `WithReuse`
-   `Run` does not roll back an existing shared container on wait failure;
-   newly created reuse setup follows the same rollback policy until the
-   shared container is established.
+   `Run` never force-deletes a shared generation: once the backend
+   published it, a peer may have adopted it. A post-create failure
+   removes the generation only while a fresh inspect still proves this
+   `Run` owns it and no peer has adopted it (created or stopped); a
+   running or otherwise ambiguous generation is left in place and the
+   refusal is reported in the returned `*CleanupError`. A failed-create
+   cleanup follows the same rule.
 3. A watchdog reaper (an external `/bin/sh` child) force-deletes every
    registered container when the test process dies in any way,
-   SIGKILL and panics included. The reaper needs `/bin/sh`, so it is
-   unavailable on Windows — there, cleanup relies on the first two
-   layers only.
+   SIGKILL and panics included. A verified non-reuse failed-create
+   candidate is handed to the watchdog when its automatic delete fails,
+   so it cannot be orphaned; shared and retained containers are never
+   watchdog-owned. The reaper needs `/bin/sh`, so it is unavailable on
+   Windows — there, cleanup relies on the first two layers only.
 
 `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It skips
 `Cleanup` / `TerminateContainer`, failed-create cleanup, and copy/wait
@@ -190,11 +196,14 @@ can verify its ownership labels, `Run` returns a non-nil partial
 and failures that happen before the copy CLI call. For `WithReuse`, a
 failed create returns a retained handle only after that ownership check;
 a wait failure under `CONTAINERGO_KEEP=1` returns the shared handle as
-well. That handle refers to the shared container: callers in one process
-may receive the same handle, and callers in other processes refer to the
-same container. It is not a private ownership handle. The handle can be
-used for `State`, `Logs`, `Exec`, `CopyToContainer`, and explicit
-`Terminate`; explicit termination affects every user of a shared
+well. A retained handle is revalidated before it is returned: when the
+generation can no longer be proven, `Run` returns a nil handle and joins
+the verification failure with the original error. That handle refers to
+the shared container: callers in one process may receive the same handle,
+and callers in other processes refer to the same container. It is not a
+private ownership handle. The handle can be used for `State`, `Logs`,
+`Exec`, `CopyToContainer`, and explicit `Terminate`; explicit
+termination affects every user of a shared
 container. If no container exists, or ownership cannot be verified, the
 handle is nil. Explicit `Container.Terminate`, `Prune`, and
 `PruneReuseGroup` remain deletion operations. The reuse stopped-container

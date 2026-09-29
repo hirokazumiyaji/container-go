@@ -191,13 +191,16 @@ type Strategy interface {
 
 **正常経路**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を呼ぶ。
 非 reuse の `Run` では、途中失敗時に、作成失敗後のクリーンアップやコピー・待機失敗後のロールバックを含め、`Run` 自身が削除を行う。
-`WithReuse` の `Run` は、既存の共有コンテナの待機に失敗してもコンテナを残す。
-新規に共有コンテナを作成している間は、共有コンテナが確立されるまで同じロールバック方針を適用する。
+`WithReuse` の `Run` は共有コンテナを強制削除しない。create の時点で共有コンテナは公開済みで、peer が既に引き継いでいる可能性があるためである。
+create 後の失敗と作成失敗後のクリーンアップは、再 inspect で「この `Run` が所有し、peer がまだ引き継いでいない」(`created` / `stopped`)ことを確認できた場合にだけ削除する。
+`running` など曖昧な状態は残し、拒否理由を `*CleanupError` で返す。
 
 **異常終了経路(SIGKILL、パニック、`os.Exit`)**：Go の defer も t.Cleanup も走らないため、外部プロセスによる**watchdog リーパー**を用意する。
 ライブラリ初期化時に `/bin/sh` の子プロセスを一つ起動し、標準入力のパイプ越しにコンテナ ID を登録する。
 親プロセスがどのような形で死んでもパイプは EOF になるので、リーパーはそれを契機に登録済み ID へ `container delete --force` を実行して自身も終了する。
 テストプロセス生存中はリーパーは何もしない(削除は通常経路が担い、リーパーは保険である)。
+検証済みの非 reuse 作成失敗候補は、自動削除に失敗した場合 watchdog に登録し、削除が成功したら登録を取り下げる。
+共有コンテナと保持(`CONTAINERGO_KEEP`)コンテナは watchdog の所有にしない。
 この方式は container-rs の watchdog と同じで、シグナルハンドラでは捕捉できない SIGKILL にも対応できる。
 
 **セッションラベル**：作成する全コンテナに次のラベルを付与する。
@@ -218,9 +221,10 @@ CLI にラベルフィルタがないため、孤児の掃除は `container ls -
 この handle は共有コンテナを参照し、同一プロセスの呼び出しは同じ handle を受け取る可能性がある。
 別プロセスの呼び出しも同じコンテナを参照するため、この handle は呼び出し元だけが所有する handle ではない。
 コンテナが存在しない場合、または所有権を検証できない場合は nil を返す。
+保持 handle は返す直前に再検証し、generation を証明できなくなった場合は handle を nil として、検証失敗を操作エラーと結合して返す。
 操作エラーはそのまま返すが、通常のロールバックで削除に失敗した場合は残ったコンテナをエラーに含める。
 明示的な `Container.Terminate`、`Prune`、`PruneReuseGroup` は引き続き削除する。
-`WithReuse` の get-or-create と停止済みコンテナの置き換え規則は変更しない。
+`WithReuse` の get-or-create は変更しない。停止済みコンテナの置き換えは、同じ名前ロック内で再 inspect し、停止済みでない、または観測した generation と一致しない場合は削除しない。
 
 匿名ボリュームは `--rm` でも残る仕様のため、本ライブラリは匿名ボリュームを作らない。
 ボリュームが必要な場合は名前付きで作らせ、ライフサイクルは利用者に委ねる。
@@ -277,10 +281,10 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 エラーは `errors.Is`/`errors.As` で判別できる形で返す。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
-- `ErrContainerNotFound`：inspect などの not found
+- `ErrContainerNotFound`：inspect などの not found。存在判定はコマンドと対象ごとに行う。別コマンドや別コンテナの not found テキストは証拠にならず、バックエンド到達不能として報告された失敗は `ErrSystemNotRunning` のまま保持する
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
-- `*CleanupError`：操作と自動クリーンアップ、または残留コンテナの検証が失敗した場合の error。`errors.As` で `Err` と `CleanupErr` の両方を取得できる
+- `*CleanupError`：操作と自動クリーンアップ、自動削除の拒否、または残留コンテナの検証が失敗した場合の error。`errors.As` で `Err` と `CleanupErr` の両方を取得できる
 
 非 reuse の `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返す。
 通常は続けてロールバック削除を行うが、`CONTAINERGO_KEEP=1` の場合はコンテナを残し、検証済みなら部分 handle をエラーとともに返す。

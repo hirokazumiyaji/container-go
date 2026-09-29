@@ -141,11 +141,18 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 2. 非 reuse の `Run` では、既定で途中まで作成したリソースを削除してから返ります。
    削除にも失敗した場合は、返された `*CleanupError` から元の error とクリーンアップ error の両方を取得できます。
    これは作成失敗、コピー、待機のロールバック経路に適用されます。
-   `WithReuse` の `Run` は、既存の共有コンテナの待機に失敗してもロールバックしません。
-   新規に共有コンテナを作成している間は、同じロールバック方針を適用します。
+   `WithReuse` の `Run` は共有コンテナを強制削除しません。create の時点で
+   共有コンテナは公開済みで、peer が既に引き継いでいる可能性があるためです。
+   create 後の失敗と作成失敗後のクリーンアップは、再 inspect で
+   「この `Run` が所有し、peer がまだ引き継いでいない」
+   (`created` / `stopped`)ことを確認できた場合にだけ削除します。
+   `running` など曖昧な状態はそのまま残し、拒否理由を `*CleanupError` で返します。
 3. watchdog リーパー(外部の `/bin/sh` 子プロセス)が、テストプロセスが
    どのように死んでも(SIGKILL やパニックを含む)登録済みコンテナを強制
-   削除します。リーパーは `/bin/sh` を必要とするため Windows では動かず、
+   削除します。検証済みの非 reuse 作成失敗候補は、自動削除に失敗した場合
+   watchdog に登録し、削除が成功したら登録を取り下げます。
+   共有コンテナと保持(CONTAINERGO_KEEP)コンテナは watchdog の所有にしません。
+   リーパーは `/bin/sh` を必要とするため Windows では動かず、
    Windows では前 2 層のみでクリーンアップします。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用スイッチです。
@@ -160,9 +167,12 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 この handle は呼び出し元だけが所有する handle ではありません。
 返した handle は `State`、`Logs`、`Exec`、`CopyToContainer`、明示的な `Terminate` に利用できます。
 共有コンテナの明示的な終了は、そのコンテナを使うすべての呼び出し元に影響します。
+保持 handle は返す直前に再検証します。generation を証明できなくなった場合は
+handle を nil とし、検証失敗を元のエラーと結合して返します。
 コンテナが存在しない場合、または所有権を検証できない場合は nil を返します。
 明示的な `Container.Terminate`、`Prune`、`PruneReuseGroup` は引き続き削除を行います。
-reuse の停止済みコンテナ置き換え規則は変わりません。
+reuse の停止済みコンテナ置き換えでは、同じ名前ロック内で再 inspect し、
+停止済みでない、または generation が一致しない場合は削除しません。
 
 補助 API:
 

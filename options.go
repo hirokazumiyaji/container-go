@@ -125,11 +125,15 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // handles are shared: Cleanup, TerminateContainer, and the watchdog
 // reaper do not remove them. Explicit Terminate still does, and affects
 // the shared container for every user, so use it only when no other
-// process still needs the container. If this Run creates a new shared
-// container and then fails after creation under CONTAINERGO_KEEP=1, it
-// returns a verified retained handle with the error. That handle is
-// shared too: callers in one process may receive the same pointer, and
-// callers in other processes refer to the same container.
+// process still needs the container. A shared generation this Run
+// created is never force-deleted after a post-create failure: it is
+// removed only while a fresh inspect proves no peer has adopted it, and
+// otherwise the container is left in place and the refusal is returned
+// as a CleanupError. If this Run creates a new shared container and then
+// fails after creation under CONTAINERGO_KEEP=1, it returns a verified
+// retained handle with the error. That handle is shared too: callers in
+// one process may receive the same pointer, and callers in other
+// processes refer to the same container.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

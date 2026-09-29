@@ -116,11 +116,13 @@ type Container struct {
 // container is rolled back and removed by default before returning. With
 // CONTAINERGO_KEEP=1, a non-reuse container that this Run can prove it
 // created is retained and returned alongside the error; that partial
-// handle remains usable for explicit inspection, execution, copying, and
-// Terminate. WithReuse switches to get-or-create and never rolls back a
-// shared container on wait failure; under KEEP it may return a verified
-// shared retained handle with the error. See WithReuse for the
-// shared-handle lifecycle.
+// handle is revalidated first, and a handle that can no longer be bound
+// to this Run's generation is dropped in favor of the verification
+// error. The partial handle remains usable for explicit inspection,
+// execution, copying, and Terminate. WithReuse switches to get-or-create
+// and never force-deletes a shared generation; under KEEP it may return
+// a verified shared retained handle with the error. See WithReuse for
+// the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {

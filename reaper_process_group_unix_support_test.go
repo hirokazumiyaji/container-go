@@ -437,6 +437,13 @@ func killReaperStoppedRefs(refs []reaperProcessRef) error {
 func killReaperStoppedRefsContext(ctx context.Context, refs []reaperProcessRef) error {
 	var errs []error
 	seen := make(map[int]struct{}, len(refs))
+	var forceCtx context.Context
+	var forceCancel context.CancelFunc
+	defer func() {
+		if forceCancel != nil {
+			forceCancel()
+		}
+	}()
 	for _, ref := range refs {
 		if ref.pid <= 0 {
 			errs = append(errs, fmt.Errorf("invalid stopped process pid %d", ref.pid))
@@ -448,20 +455,19 @@ func killReaperStoppedRefsContext(ctx context.Context, refs []reaperProcessRef) 
 		seen[ref.pid] = struct{}{}
 
 		matches, matchErr := reaperProcessRefMatchesContext(ctx, ref)
-		contextExpired := errors.Is(matchErr, context.DeadlineExceeded) || errors.Is(matchErr, context.Canceled)
+		if errors.Is(matchErr, context.DeadlineExceeded) || errors.Is(matchErr, context.Canceled) {
+			if forceCtx == nil {
+				forceCtx, forceCancel = context.WithTimeout(context.Background(), reaperSignalTimeout)
+			}
+			matches, matchErr = reaperProcessRefMatchesContext(forceCtx, ref)
+		}
 		if matchErr != nil {
-			if reaperProcessRefGone(matchErr) {
-				continue
-			}
-			if !contextExpired {
+			if !reaperProcessRefGone(matchErr) {
 				errs = append(errs, fmt.Errorf("verify stopped process %d: %w", ref.pid, matchErr))
-				continue
 			}
-			// The SIGSTOP succeeded before the identity context expired. A
-			// stopped process cannot exit or be recycled on its own, so the
-			// retained handle/reserved PID is the only way to guarantee that
-			// it is not left permanently stopped.
-		} else if !matches {
+			continue
+		}
+		if !matches {
 			continue
 		}
 		var err error

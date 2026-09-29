@@ -163,6 +163,31 @@ func TestDockerProbeUnavailableFailsClosedForConfiguration(t *testing.T) {
 			want:   true,
 		},
 		{
+			name:   "windows named pipe missing",
+			stderr: "error during connect: open //./pipe/docker_engine: The system cannot find the file specified.",
+			want:   true,
+		},
+		{
+			name:   "windows named pipe missing backslash spelling",
+			stderr: `error during connect: open \\.\pipe\dockerDesktopLinuxEngine: The system cannot find the file specified.`,
+			want:   true,
+		},
+		{
+			name:   "windows named pipe state missing",
+			stderr: "error during connect: GetNamedPipeInfo: The system cannot find the file specified.",
+			want:   true,
+		},
+		{
+			name:   "windows file missing outside the docker pipe namespace",
+			stderr: "error during connect: open C:/ProgramData/docker/config: The system cannot find the file specified.",
+			want:   false,
+		},
+		{
+			name:   "windows other pipe missing",
+			stderr: "error during connect: open //./pipe/otherdaemon: The system cannot find the file specified.",
+			want:   false,
+		},
+		{
 			name:   "broad connect alone",
 			stderr: "error during connect",
 			want:   false,

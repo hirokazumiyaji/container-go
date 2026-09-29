@@ -54,5 +54,45 @@
     "nameConflict": false,
     "imageMissing": false,
     "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause_get_failed",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: get failed: container myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause_wrong_target",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: container with ID other not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "container_missing_logs_wrong_root_target",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container other\" (cause: \"notFound: \"failed to open container logs: container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_logs_open_failure_on_logs",
+    "operation": "logs",
+    "stderr": "Error: application: failed to open container logs: container with ID myctr not found",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
   }
 ]

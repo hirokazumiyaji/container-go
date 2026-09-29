@@ -332,6 +332,106 @@ func TestClassifyExplicitProbePredicateOverridesBroadOriginalConfigurationText(t
 	}
 }
 
+// CLIError.Error() embeds the argv the caller supplied, so a container or
+// image named "tls" would otherwise veto ErrSystemNotRunning. The
+// diagnostics that drive that decision must come from the stderr the CLI
+// actually wrote.
+func TestProbeClassificationIgnoresCallerSuppliedArgv(t *testing.T) {
+	for _, name := range []string{"tls", "proxy", "certificate", "x509", "ssh", "config", "credential"} {
+		t.Run(name, func(t *testing.T) {
+			orig := &CLIError{
+				Args: []string{"logs", "-n", "1000", name}, ExitCode: 1,
+				Stderr: "XPC connection error: service is not registered",
+			}
+			if IsProbeConfigurationError(orig) {
+				t.Fatalf("target %q was read as a configuration diagnostic", name)
+			}
+			probeErr := &CLIError{
+				Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error",
+			}
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+
+			got := Classify(context.Background(), r, orig, appleProbe)
+			if !errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, want sentinel for target %q", got, name)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+				t.Fatalf("classified error = %v, want original and probe chains", got)
+			}
+		})
+	}
+}
+
+// Excluding argv must not exclude real transport diagnostics that reach the
+// same predicates through stderr, joined branches, or captured probe output.
+func TestProbeConfigurationDetectionSurvivesArgvExclusion(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "stderr",
+			err: &CLIError{
+				Args: []string{"version"}, ExitCode: 1,
+				Stderr: "x509: certificate signed by unknown authority",
+			},
+		},
+		{
+			name: "joined branch",
+			err: errors.Join(
+				&CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "connect failed"},
+				errors.New("tls: failed to verify certificate"),
+			),
+		},
+		{
+			name: "wrapped non-CLI cause",
+			err: fmt.Errorf("probe instrumentation: %w", errors.New("proxyconnect tcp: connection refused")),
+		},
+		{
+			name: "captured probe output",
+			err: withProbeOutput(
+				&CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "connect failed"},
+				nil, []byte("x509: certificate signed by unknown authority"),
+			),
+		},
+		{
+			name: "wrapped CLIError",
+			err: fmt.Errorf("runner: %w", &CLIError{
+				Args: []string{"version"}, ExitCode: 1,
+				Stderr: "error during connect: invalid configuration for current context",
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsProbeConfigurationError(tc.err) {
+				t.Fatalf("IsProbeConfigurationError(%v) = false, want true", tc.err)
+			}
+			if !isNonLivenessError(tc.err) {
+				t.Fatalf("isNonLivenessError(%v) = false, want true", tc.err)
+			}
+		})
+	}
+}
+
+// Wrapper-authored text is library or instrumentation output, not caller
+// argv, so it stays in the collected diagnostics.
+func TestDiagnosticTextKeepsWrapperAndJoinedWording(t *testing.T) {
+	cliErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "status failed"}
+	text := diagnosticText(fmt.Errorf("runner: %w", errors.Join(
+		fmt.Errorf("probe instrumentation: %w", errors.New("cannot connect to backend")),
+		cliErr,
+	)))
+	if !strings.Contains(text, "cannot connect to backend") {
+		t.Fatalf("diagnosticText() = %q, want joined liveness wording", text)
+	}
+	if strings.Contains(text, "system status") {
+		t.Fatalf("diagnosticText() = %q, want CLIError argv excluded", text)
+	}
+}
+
 func TestDefaultProbeUnavailableInspectsCompleteJoinedError(t *testing.T) {
 	cliErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "status failed"}
 	joined := errors.Join(

@@ -751,6 +751,119 @@ func TestAppleLogsMissingAcceptsKnownBoundedWrapperVariants(t *testing.T) {
 	}
 }
 
+// Apple 1.2/1.3 report an absent container from `container logs` as a
+// nested internalError envelope whose notFound cause sits behind the
+// "failed to open container logs: " marker. Both the root and the cause
+// name the target, so the match stays exact and target-scoped.
+func TestAppleLogsMissingAcceptsNestedOpenCauseEnvelope(t *testing.T) {
+	cases := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{
+			name:   "open cause missing id",
+			stderr: `Error: internalError: "failed to get logs for container myctr" (cause: "notFound: "failed to open container logs: container with ID myctr not found"")`,
+			want:   true,
+		},
+		{
+			name:   "open cause get failed leaf",
+			stderr: `Error: internalError: "failed to get logs for container myctr" (cause: "notFound: "failed to open container logs: get failed: container myctr not found"")`,
+			want:   true,
+		},
+		{
+			name:   "cause names another container",
+			stderr: `Error: internalError: "failed to get logs for container myctr" (cause: "notFound: "failed to open container logs: container with ID other not found"")`,
+		},
+		{
+			name:   "root names another container",
+			stderr: `Error: internalError: "failed to get logs for container other" (cause: "notFound: "failed to open container logs: container with ID myctr not found"")`,
+		},
+		{
+			name:   "unrelated application stderr",
+			stderr: "Error: application: failed to open container logs: container with ID myctr not found",
+		},
+		{
+			name:   "open cause without a missing id leaf",
+			stderr: `Error: internalError: "failed to get logs for container myctr" (cause: "notFound: "failed to open container logs: connection refused"")`,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &cli.CLIError{
+				Binary: "container", Args: []string{"logs", "-n", "1000", "myctr"},
+				ExitCode: 1, Stderr: tc.stderr,
+			}
+			if got := (appleEngine{}).containerMissing(err); got != tc.want {
+				t.Fatalf("containerMissing(%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+			if got := wrapNotFoundFor(appleEngine{}, err); errors.Is(got, ErrContainerNotFound) != tc.want {
+				t.Fatalf("wrapNotFoundFor(%q) = %v, want ErrContainerNotFound=%v", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
+// A caller-chosen name such as "tls" reaches CLIError.Args, so the
+// liveness contract reads the CLI's stderr rather than the argv it was
+// handed. A real backend outage still reports ErrSystemNotRunning, while a
+// genuine TLS or certificate diagnostic still vetoes it.
+func TestProbeClassificationIgnoresUserControlledArgv(t *testing.T) {
+	for _, target := range []string{"tls", "proxy", "ssh-cert", "config", "certificate"} {
+		t.Run(target, func(t *testing.T) {
+			original := &cli.CLIError{
+				Binary: "container", Args: []string{"logs", "-n", "1000", target},
+				ExitCode: 1, Stderr: "XPC connection error: service is not registered",
+			}
+			if cli.IsProbeConfigurationError(original) {
+				t.Fatalf("target %q was read as a configuration diagnostic", target)
+			}
+			probeErr := &cli.CLIError{
+				Binary: "container", Args: []string{"system", "status"},
+				ExitCode: 1, Stderr: "XPC connection error",
+			}
+			got := cli.Classify(
+				context.Background(),
+				&fixtureProbeRunner{err: probeErr},
+				original,
+				appleEngine{}.probe(),
+			)
+			if !errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("Classify() = %v, want ErrSystemNotRunning for target %q", got, target)
+			}
+			if !errors.Is(got, original) || !errors.Is(got, probeErr) {
+				t.Fatalf("Classify() = %v, want original and probe chains", got)
+			}
+		})
+	}
+}
+
+func TestProbeClassificationRetainsCertificateVeto(t *testing.T) {
+	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
+	original := &cli.CLIError{
+		Binary: "docker", Args: probeArgs, ExitCode: 1, Stderr: "command failed",
+	}
+	probeErr := &cli.CLIError{
+		Binary: "docker", Args: probeArgs, ExitCode: 1,
+		Stderr: "error during connect: tls: failed to verify certificate: x509: certificate signed by unknown authority",
+	}
+	got := cli.Classify(
+		context.Background(),
+		&fixtureProbeRunner{err: probeErr},
+		original,
+		dockerEngine{}.probe(),
+	)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("Classify() = %v, want certificate failure preserved", got)
+	}
+	// A certificate diagnostic joined by runner instrumentation is still
+	// configuration evidence.
+	joined := errors.Join(probeErr, errors.New("x509: certificate signed by unknown authority"))
+	if !cli.IsProbeConfigurationError(joined) {
+		t.Fatal("joined certificate diagnostic was not detected")
+	}
+}
+
 func TestProductionProbePredicatesInspectJoinedWrappedText(t *testing.T) {
 	cases := []struct {
 		name      string

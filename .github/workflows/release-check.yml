@@ -1,8 +1,12 @@
 name: Release check
 
-# Verifies a tag before it is published. The point is that a tag is never the
-# first time these run: the version invariants live in `go test ./...`, so drift
-# is caught on the change that introduces it.
+# Re-checks a release. A push of a v* tag runs only after GitHub has accepted
+# the tag, so this workflow cannot stop a bad tag from being published. The
+# pre-tag gate is `make release-check` on a clean checkout (and this same
+# workflow on pull requests); see CONTRIBUTING.md. The tag-push run is a
+# post-push safety net: if it fails, the tag already exists and a maintainer
+# must delete it and retag. The version invariants also live in
+# `go test ./...`, so drift is caught on the change that introduces it.
 on:
   push:
     tags: ['v*']

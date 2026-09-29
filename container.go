@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -100,7 +99,12 @@ type Container struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 
 	mu   sync.Mutex
 	info *engineInfo // cached first inspect; immutable fields only
@@ -120,9 +124,31 @@ func (c *Container) unregisterReaper(barriersHeld bool) {
 	}
 	id, creation := c.id, c.creation
 	if c.eng != nil && c.eng.immutableID() {
-		id, creation = c.uid, ""
+		id, creation = c.immutableID(), ""
 	}
 	unregisterFromGlobalReaper(binary, c.eng.reaperSubcommand(), id, creation, barriersHeld)
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -188,9 +214,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified)
-		if cleanupErr != nil {
-			return nil, errors.Join(classified, cleanupErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
 		}
 		return nil, classified
 	}
@@ -212,8 +237,8 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if uid := c.immutableID(); uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -261,17 +286,26 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 // the container was left behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return errors.Join(cause, fmt.Errorf("container %s left behind: %w", c.id, err))
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
 
 // cleanupFailedCreate removes the container this Run left behind after a
-// failed create. It never deletes a pre-existing same-name container: name
-// conflicts are skipped, and only a container carrying this process's
-// managed+session labels is removed. When the creation generation is known
-// it must also match. Lock setup and all backend work share one timeout;
-// failures are returned so Run cannot silently leave an owned container.
+// failed create, and reports whether it succeeded.
+//
+// It never deletes a pre-existing same-name container: name conflicts are
+// skipped, and only a container carrying this process's managed+session labels
+// is removed. When the creation generation is known it must also match. Those
+// skips are successes, because there is nothing of ours left to remove.
+//
+// Lock setup and all backend work share one timeout. Every other failure is
+// returned, so the caller can tell a caller-visible "the container is still
+// there" apart from a silent best-effort attempt. A container that cannot even
+// be inspected may still exist, so that case is a failure too rather than an
+// assumption that it is gone.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
 		return nil
@@ -293,7 +327,9 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("cleanup %s: inspect: %w", cfg.name, err)
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
 	if info.labels[managedLabel] != "true" {
 		return nil
@@ -384,10 +420,11 @@ func (c *Container) Terminate(ctx context.Context) error {
 	ctx, cancel := withDefaultTimeout(ctx, terminateTimeout)
 	defer cancel()
 	if c.eng.immutableID() {
-		if !verifiedImmutableID(c.eng, c.uid) {
+		uid := c.immutableID()
+		if !verifiedImmutableID(c.eng, uid) {
 			return fmt.Errorf("terminate %s: backend did not return a verified immutable ID", c.id)
 		}
-		err := c.delete(ctx, c.uid)
+		err := c.delete(ctx, uid)
 		if err == nil {
 			c.unregisterReaper(false)
 		}
@@ -535,9 +572,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return nil, err
 	}
 	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
-	}
+	// Delegate, so the "never downgrade a promoted value" invariant lives in
+	// one place rather than being reimplemented here.
+	c.setImmutableID(info.uid)
 	return info, nil
 }
 

@@ -82,7 +82,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {

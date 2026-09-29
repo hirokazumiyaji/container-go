@@ -378,6 +378,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -459,9 +460,8 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 }
 
 func TestReaperDeletesByImmutableID(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("watchdog reaper is unavailable on Windows")
-	}
+	requirePOSIXShell(t)
+	requireReaperLockf(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/docker"

@@ -96,10 +96,12 @@ testcontainers model. Locally this binds loopback
 (`-p 127.0.0.1::<port>`); with a remote `DOCKER_HOST` it binds all
 interfaces (`-p 0.0.0.0::<port>`) so the client can reach it. Remote
 means any `DOCKER_HOST` that does not name this machine:
-`tcp://host` (e.g. `tcp://docker:2375` in CI), `ssh://user@host`,
-`http(s)://host`, or a scheme-less `host:port`, normalized the way the
-Docker CLI normalizes it. `unix://`, `npipe://`, `fd://`, loopback
-addresses, and an empty value stay local. `Host` returns `127.0.0.1`
+`tcp://host` (e.g. `tcp://docker:2375` in CI), `ssh://user@host`, or a
+scheme-less `host:port` / hostname, normalized the way the Docker CLI
+normalizes it (`tcp://` prepended). `unix://`, `npipe://`, loopback
+addresses, and an empty value stay local. Docker CLI client protocols
+are `unix`, `tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1`
 (or the remote hostname) and `MappedPort` returns the assigned port.
 Assignment happens atomically
 in the daemon, so parallel tests do not race over ports here either.

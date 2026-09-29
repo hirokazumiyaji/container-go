@@ -19,6 +19,8 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 		"tcp://10.0.0.5:2375",
 		// A scheme-less remote host, which the CLI normalizes to tcp://.
 		"docker.example.com:2375",
+		// A bare number is a hostname to the Docker CLI, not a local port.
+		"2375",
 	}
 	for _, host := range remote {
 		t.Run(host, func(t *testing.T) {
@@ -48,7 +50,6 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 		// ports to 0.0.0.0 on the developer's own machine.
 		"127.0.0.1:2375",
 		"localhost:2375",
-		"2375",
 		"[::1]:2375",
 	}
 
@@ -116,7 +117,7 @@ func TestReviewConnectHostUsesRemoteHostName(t *testing.T) {
 // developer's own machine, which is the opposite of what the loopback default
 // is for.
 func TestReviewAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
-	for _, host := range []string{"127.0.0.1:2375", "localhost:2375", "2375", "", "unix:///var/run/d.sock"} {
+	for _, host := range []string{"127.0.0.1:2375", "localhost:2375", "", "unix:///var/run/d.sock"} {
 		t.Run(host, func(t *testing.T) {
 			t.Setenv("DOCKER_HOST", host)
 			cfg := newConfig()
@@ -134,18 +135,20 @@ func TestReviewAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
 	}
 
 	// A remote daemon is the opposite: all interfaces, so the client can
-	// reach it through defaultHost.
-	t.Run("remote", func(t *testing.T) {
-		t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
-		cfg := newConfig()
-		cfg.eng = dockerEngine{}
-		cfg.name = "myctr"
-		cfg.exposed = []portSpec{{port: 6379, proto: "tcp"}}
-		args := strings.Join((dockerEngine{}).runArgs(cfg, "redis:7-alpine", ""), " ")
-		if !strings.Contains(args, "--publish 0.0.0.0::6379/tcp") {
-			t.Errorf("run args = %s, want an all-interfaces publish for a remote daemon", args)
-		}
-	})
+	// reach it through defaultHost. A bare number is a remote hostname.
+	for _, host := range []string{"ssh://user@remote-host", "2375"} {
+		t.Run("remote/"+host, func(t *testing.T) {
+			t.Setenv("DOCKER_HOST", host)
+			cfg := newConfig()
+			cfg.eng = dockerEngine{}
+			cfg.name = "myctr"
+			cfg.exposed = []portSpec{{port: 6379, proto: "tcp"}}
+			args := strings.Join((dockerEngine{}).runArgs(cfg, "redis:7-alpine", ""), " ")
+			if !strings.Contains(args, "--publish 0.0.0.0::6379/tcp") {
+				t.Errorf("DOCKER_HOST=%q: run args = %s, want an all-interfaces publish", host, args)
+			}
+		})
+	}
 }
 
 // Auto-publish must keep binding loopback for a local daemon, including the

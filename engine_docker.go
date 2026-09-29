@@ -86,23 +86,18 @@ func (dockerEngine) defaultHost() string {
 }
 
 // normalizeDockerHost applies the same normalization the Docker CLI performs
-// before dialing: a value with no "://" is a TCP host, and a bare port means
-// this machine's default TCP port.
+// before dialing: a value with no "://" is a TCP host (hostname or host:port),
+// so "tcp://" is prepended. A bare numeric value such as "2375" is a hostname,
+// not a port — matching the Docker CLI.
 //
-// url.Parse cannot read those forms — "127.0.0.1:2375" errors outright,
-// "localhost:2375" parses as an opaque scheme with no host, and "2375" parses
-// with an empty host — so without this they would all fall through to the
-// fail-closed branch and be reported as remote. That would bind
-// auto-published ports to 0.0.0.0 on the developer's own machine.
+// url.Parse cannot read those forms — "127.0.0.1:2375" errors outright and
+// "localhost:2375" parses as an opaque scheme with no host — so without this
+// they would fall through to the fail-closed branch and be reported as remote.
+// That would bind auto-published ports to 0.0.0.0 on the developer's own
+// machine.
 func normalizeDockerHost(raw string) string {
 	if raw == "" || strings.Contains(raw, "://") {
 		return raw
-	}
-	if _, _, err := net.SplitHostPort(raw); err == nil {
-		return "tcp://" + raw
-	}
-	if n, err := strconv.Atoi(raw); err == nil && n > 0 && n <= 65535 {
-		return "tcp://127.0.0.1:" + raw
 	}
 	return "tcp://" + raw
 }

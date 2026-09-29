@@ -483,9 +483,11 @@ to the published-port model testcontainers uses. Ports declared via
 locally `-p 127.0.0.1::<port>`, on a remote daemon
 `-p 0.0.0.0::<port>` so the client can reach it. Remote means any
 `DOCKER_HOST` that does not name this machine — `tcp://host`,
-`ssh://user@host`, `http(s)://host`, or a scheme-less `host:port`
-— while `unix://`, `npipe://`, `fd://`, loopback addresses, and an
-empty value stay local. `Host` returns `127.0.0.1` (or the remote
+`ssh://user@host`, or a scheme-less `host:port` / hostname
+— while `unix://`, `npipe://`, loopback addresses, and an
+empty value stay local. Docker CLI client protocols are `unix`,
+`tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1` (or the remote
 hostname) and `MappedPort` the assigned host port. Loopback and
 unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
 binding observed on a remote daemon still resolves to the remote host.

@@ -34,6 +34,10 @@ var (
 	blockScalar = regexp.MustCompile(`^[|>][-+]?$`)
 	// jobIfKey matches a job-level if: at four-space indentation.
 	jobIfKey = regexp.MustCompile(`^    if:\s*(.*)$`)
+	// jobTimeoutKey matches a job-level timeout-minutes: at four-space indentation.
+	jobTimeoutKey = regexp.MustCompile(`^    timeout-minutes:\s*`)
+	// stepWithKey matches a step-level with: mapping key.
+	stepWithKey = regexp.MustCompile(`^(\s*)with:\s*(?:#.*)?$`)
 )
 
 // Every third-party action must be pinned to a full commit SHA. A mutable tag
@@ -105,6 +109,32 @@ func TestTimeoutBeforeJobsDoesNotExemptJobs(t *testing.T) {
 	}
 }
 
+// jobHasTimeout must require the four-space job-level key, not a comment,
+// env value, or run-script occurrence of the same literal.
+func TestJobHasTimeoutRequiresJobLevelKey(t *testing.T) {
+	lines := []string{
+		"jobs:",
+		"  build:",
+		"    runs-on: ubuntu-latest",
+		"    # timeout-minutes: 10",
+		"    env:",
+		"      NOTE: timeout-minutes: 99",
+		"    steps:",
+		"      - run: echo timeout-minutes: 1",
+		"  lint:",
+		"    runs-on: ubuntu-latest",
+		"    timeout-minutes: 5",
+		"    steps:",
+		"      - run: echo hi",
+	}
+	if jobHasTimeout(lines, "build") {
+		t.Fatal("comment/env/run timeout-minutes must not count as a job timeout")
+	}
+	if !jobHasTimeout(lines, "lint") {
+		t.Fatal("job-level timeout-minutes must count")
+	}
+}
+
 // checkout must not leave the token in .git/config, where any later step
 // (including code under test) could read it.
 func TestCheckoutDoesNotPersistCredentials(t *testing.T) {
@@ -114,10 +144,44 @@ func TestCheckoutDoesNotPersistCredentials(t *testing.T) {
 			if !strings.Contains(line, "actions/checkout@") {
 				continue
 			}
-			if !blockHas(lines, i, "persist-credentials: false") {
+			if !checkoutWithHas(lines, i, "persist-credentials: false") {
 				t.Errorf("%s:%d: checkout does not set persist-credentials: false", path, i+1)
 			}
 		}
+	}
+}
+
+// persist-credentials must appear in checkout's own with: mapping. A later
+// comment, run script, or unrelated step before the next uses: must not count.
+func TestCheckoutWithRequiresPersistCredentialsInWith(t *testing.T) {
+	missing := []string{
+		"      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567",
+		"      # persist-credentials: false",
+		"      - run: echo persist-credentials: false",
+		"      - uses: actions/setup-go@0123456789abcdef0123456789abcdef01234567",
+	}
+	if checkoutWithHas(missing, 0, "persist-credentials: false") {
+		t.Fatal("literal outside checkout with: must not count")
+	}
+
+	commentOnly := []string{
+		"      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567",
+		"        with:",
+		"          # persist-credentials: false",
+		"          fetch-depth: 1",
+	}
+	if checkoutWithHas(commentOnly, 0, "persist-credentials: false") {
+		t.Fatal("comment inside with: must not count as the option")
+	}
+
+	good := []string{
+		"      - uses: actions/checkout@0123456789abcdef0123456789abcdef01234567",
+		"        with:",
+		"          persist-credentials: false",
+		"      - uses: actions/setup-go@0123456789abcdef0123456789abcdef01234567",
+	}
+	if !checkoutWithHas(good, 0, "persist-credentials: false") {
+		t.Fatal("with: persist-credentials: false must count")
 	}
 }
 
@@ -261,10 +325,6 @@ func jobs(lines []string) []string {
 	return out
 }
 
-func jobBody(lines []string, job string) string {
-	return strings.Join(jobBodyLines(lines, job), "\n") + "\n"
-}
-
 func jobBodyLines(lines []string, job string) []string {
 	var out []string
 	inJob := false
@@ -284,7 +344,12 @@ func jobBodyLines(lines []string, job string) []string {
 }
 
 func jobHasTimeout(lines []string, job string) bool {
-	return strings.Contains(jobBody(lines, job), "timeout-minutes:")
+	for _, line := range jobBodyLines(lines, job) {
+		if jobTimeoutKey.MatchString(line) {
+			return true
+		}
+	}
+	return false
 }
 
 // hasTrustedTrigger reports whether the job-level if: matches the trusted
@@ -384,13 +449,55 @@ func leadingSpaces(s string) int {
 	return n
 }
 
-// blockHas reports whether one of the next few lines after i contains want.
-func blockHas(lines []string, i int, want string) bool {
-	for _, line := range lines[i+1:] {
-		if usesLine.MatchString(line) {
+// stepKeyIndent returns the indentation of sibling keys under the step that
+// owns usesIdx. For `- uses: ...` that is the column of `uses`; for a bare
+// `uses:` line (when name: carried the dash) it is the line's own indent.
+func stepKeyIndent(usesLine string) int {
+	trimmed := strings.TrimSpace(usesLine)
+	if !strings.HasPrefix(trimmed, "-") {
+		return leadingSpaces(usesLine)
+	}
+	dash := strings.Index(usesLine, "-")
+	rest := usesLine[dash+1:]
+	return dash + 1 + leadingSpaces(rest)
+}
+
+// checkoutWithHas reports whether the checkout step at usesIdx sets want
+// inside its with: mapping. Later steps, comments, and run scripts are ignored.
+func checkoutWithHas(lines []string, usesIdx int, want string) bool {
+	keyIndent := stepKeyIndent(lines[usesIdx])
+	listIndent := leadingSpaces(lines[usesIdx])
+	inWith := false
+	withIndent := -1
+	for _, line := range lines[usesIdx+1:] {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		indent := leadingSpaces(line)
+		trim := strings.TrimSpace(line)
+
+		// A new list item at the same (or outer) dash indent ends the step.
+		if strings.HasPrefix(trim, "-") && indent <= listIndent {
 			return false
 		}
-		if strings.Contains(line, want) {
+		if indent < keyIndent {
+			return false
+		}
+
+		if !inWith {
+			if indent == keyIndent && stepWithKey.MatchString(line) {
+				inWith = true
+				withIndent = indent
+			}
+			continue
+		}
+
+		if indent <= withIndent {
+			return false
+		}
+		// Strip a trailing comment so only a real mapping entry counts.
+		key := strings.TrimSpace(strings.SplitN(trim, "#", 2)[0])
+		if key == want {
 			return true
 		}
 	}

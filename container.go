@@ -92,6 +92,11 @@ type Container struct {
 	// and the watchdog reaper skip these so shared containers survive
 	// process exit. Explicit Terminate still removes them.
 	reused bool
+	// createdHere marks a WithReuse handle whose generation this process
+	// created during the current ensure. Only such a generation may be
+	// cleaned up automatically after a post-create failure; an attached
+	// generation belongs to its peers.
+	createdHere bool
 	// creation is the unique generation ID stored in creationLabel.
 	// Terminate and the reaper verify it before deleting so a stale
 	// handle does not remove a same-name replacement made by this
@@ -244,9 +249,13 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 // name conflicts are skipped, and only a container carrying this
 // process's managed+session labels is removed. The creation label must
 // exist and match this Run's generation; a reuse create must also carry
-// the reuse label. A missing container is already clean and returns nil;
-// any other failure to inspect or remove it is returned to Run so the
-// container left behind is visible to the caller.
+// the reuse label. A reuse generation is only removed while it is still
+// unadopted (created or stopped): a running or otherwise ambiguous
+// shared generation is refused and the refusal is returned to Run so the
+// container stays visible instead of being force-deleted under a peer.
+// A missing container is already clean and returns nil; any other
+// failure to inspect or remove it is returned to Run so the container
+// left behind is visible to the caller.
 func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if keepContainers() {
 		return nil
@@ -264,7 +273,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	ctr := namedContainer(cfg, cfg.name)
 	info, err := ctr.inspectFresh(cleanupCtx)
 	if err != nil {
-		if isNotFound(err) {
+		if isNotFoundFor(cfg.eng, cfg.name, err) {
 			return nil
 		}
 		return fmt.Errorf("cleanup container %s: inspect: %w", cfg.name, err)
@@ -272,16 +281,84 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if !failedCreateOwned(cfg, info) {
 		return nil
 	}
+	if err := checkUnadoptedReuse(cfg, info); err != nil {
+		return err
+	}
 	target := cfg.name
 	if info.uid != "" {
 		target = info.uid
 	}
+	// The candidate is verified owned and still unadopted: hand it to the
+	// watchdog before the delete so a failed or interrupted delete cannot
+	// orphan it. Shared generations and diagnostic retention are
+	// deliberately excluded.
+	watchdogBinary, watchdogTarget := failedCreateWatchdog(cfg)
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
 	if err := ctr.delete(delCtx, target); err != nil {
+		if watchdogTarget != "" {
+			protectFailedCreate(cfg, watchdogBinary, watchdogTarget)
+		}
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
+	if watchdogTarget != "" {
+		retireFailedCreateReaper(cfg, watchdogBinary, watchdogTarget)
+	}
 	return nil
+}
+
+// checkUnadoptedReuse refuses automatic deletion of a shared generation
+// that a peer may already have adopted. Only created and stopped
+// generations are unadopted; running and every other backend state are
+// ambiguous and must be left to an explicit Terminate or Prune.
+func checkUnadoptedReuse(cfg *config, info *engineInfo) error {
+	if !cfg.reuse {
+		return nil
+	}
+	switch info.state {
+	case StateCreated, StateStopped:
+		return nil
+	default:
+		return fmt.Errorf("cleanup container %s: %s reuse generation may already be adopted; refusing automatic deletion",
+			cfg.name, info.state)
+	}
+}
+
+// failedCreateWatchdog reports the identity the watchdog needs to
+// reclaim a verified failed-create candidate, or "" when the candidate
+// must not be watchdog-owned: shared generations outlive the creating
+// process by design, CONTAINERGO_KEEP=1 asks the caller to inspect the
+// container, and only real CLI children can be reaped.
+func failedCreateWatchdog(cfg *config) (binary, target string) {
+	if keepContainers() || cfg.reuse || cfg.name == "" || !creationRE.MatchString(cfg.creation) {
+		return "", ""
+	}
+	er, ok := cfg.runner.(cli.ExternalRunner)
+	if !ok || !er.External() {
+		return "", ""
+	}
+	binary = er.ExternalBinary()
+	if binary == "" {
+		binary = cfg.eng.binary()
+	}
+	// Name-addressed registration: the reaper inspects the name, matches
+	// this generation, and then deletes the backend's immutable ID when
+	// the backend reports one.
+	return binary, cfg.name
+}
+
+// protectFailedCreate hands a verified failed-create candidate to the
+// watchdog after automatic deletion failed, so the container cannot
+// outlive the process unnoticed. Best effort by design: the caller is
+// already reporting the delete failure.
+func protectFailedCreate(cfg *config, binary, target string) {
+	registerWithGlobalReaper(binary, cfg.eng.reaperSubcommand(), target, cfg.creation)
+}
+
+// retireFailedCreateReaper withdraws the candidate again once automatic
+// deletion succeeded, so the watchdog never acts on a resolved entry.
+func retireFailedCreateReaper(cfg *config, binary, target string) {
+	unregisterFromGlobalReaper(binary, cfg.eng.reaperSubcommand(), target, cfg.creation)
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -352,7 +429,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 	}
 	defer unlock()
 	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
+	if isNotFoundFor(c.eng, c.id, err) {
 		return nil
 	}
 	if err != nil {
@@ -373,7 +450,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFound(err) {
+	if err == nil || isDeleteNotFound(c.eng, target, err) {
 		return nil
 	}
 	return c.classify(ctx, err)

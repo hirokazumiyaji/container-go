@@ -40,7 +40,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
-		return nil, err
+		return reuseCompatFailure(ctx, cfg, image, base, err)
 	}
 
 	ctr := &Container{
@@ -56,11 +56,42 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		if keepContainers() {
-			return ctr, err
+			verified, verifyErr := verifyRetainedHandle(ctx, ctr)
+			if verifyErr != nil {
+				return nil, withCleanupError(err, verifyErr)
+			}
+			return verified, err
 		}
 		return nil, err
 	}
 	return ctr, nil
+}
+
+// reuseCompatFailure handles a per-caller compatibility failure observed
+// after the shared ensure.
+//
+// A generation this request created is this request's to resolve: under
+// CONTAINERGO_KEEP=1 it is retained and returned as a verified handle,
+// otherwise it is cleaned up while a fresh inspect still proves it is
+// unadopted. A generation this request merely attached to belongs to
+// every peer of that name, so it is never deleted: the compatibility
+// error is returned as is.
+func reuseCompatFailure(ctx context.Context, cfg *config, image string, base *Container, cause error) (*Container, error) {
+	if base == nil || !base.createdHere {
+		return nil, cause
+	}
+	if keepContainers() {
+		verified, verifyErr := verifyRetainedHandle(ctx, base)
+		if verifyErr != nil {
+			return nil, withCleanupError(cause, verifyErr)
+		}
+		return verified, cause
+	}
+	if err := verifyReuseCleanupIdentity(ctx, cfg, image, base); err != nil {
+		return nil, withCleanupError(cause, err)
+	}
+	cleanupErr := cleanupFailedCreate(ctx, cfg, cause, cause)
+	return nil, withCleanupError(cause, cleanupErr)
 }
 
 // reuseEnsureContainer creates or attaches to the named container
@@ -79,7 +110,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if !isNotFoundFor(cfg.eng, cfg.name, err) {
 				return nil, err
 			}
 			// Creation carries its own runTimeout budget detached from
@@ -110,7 +141,11 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// covers Apple's concurrent-create race where run reaches
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
-			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
+			// Only the primary create failure is retryable: a cleanup
+			// failure in CleanupError.CleanupErr must not be read as a
+			// peer win and must not restart this ensure.
+			primaryErr := primaryOperationError(createErr)
+			if cfg.eng.nameConflict(primaryErr) || createRaceMissing(primaryErr) {
 				time.Sleep(reusePollInterval)
 				continue
 			}
@@ -203,43 +238,151 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	}
 
 	ctr := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:          cfg.name,
+		runner:      cfg.runner,
+		eng:         cfg.eng,
+		exposed:     cfg.exposed,
+		published:   cfg.published,
+		reused:      true,
+		createdHere: true,
+		creation:    cfg.creation,
+		uid:         cfg.eng.parseRunID(stdout),
 	}
+	// The create is published the moment the backend accepts it, so a
+	// peer may attach to this generation at any point from here on.
+	// Post-create setup failures therefore never force-delete: they
+	// clean up only while the fresh inspect still proves this
+	// generation exists, is unadopted, and is owned by this request.
 	if _, err := ctr.cachedInfo(ctx); err != nil {
-		return rollbackResult(ctx, ctr, err)
+		return reuseSetupFailure(ctx, cfg, image, ctr, err)
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return rollbackResult(ctx, ctr, err)
+			return reuseSetupFailure(ctx, cfg, image, ctr, err)
 		}
 	}
 	return ctr, nil
 }
 
+// reuseSetupFailure handles a reuse create that failed after the
+// backend published the generation.
+//
+// It never deletes a shared generation blindly. It re-inspects first:
+// only a generation this request owns that is still unadopted (created
+// or stopped) is removed. A running or otherwise ambiguous generation may
+// belong to a peer, so it is left in place and reported. Under
+// CONTAINERGO_KEEP=1 no deletion is attempted at all and the handle is
+// published only after its identity has been revalidated.
+func reuseSetupFailure(ctx context.Context, cfg *config, image string, ctr *Container, cause error) (*Container, error) {
+	if keepContainers() {
+		verified, verifyErr := verifyRetainedHandle(ctx, ctr)
+		if verifyErr != nil {
+			return nil, withCleanupError(cause, verifyErr)
+		}
+		return verified, cause
+	}
+	if err := verifyReuseCleanupIdentity(ctx, cfg, image, ctr); err != nil {
+		return nil, withCleanupError(cause, err)
+	}
+	cleanupErr := cleanupFailedCreate(ctx, cfg, cause, cause)
+	return nil, withCleanupError(cause, cleanupErr)
+}
+
+// verifyReuseCleanupIdentity re-inspects a freshly created reuse
+// generation before automatic cleanup and reports whether this request
+// may still remove it. Anything ambiguous — a replaced generation, a
+// foreign container, or one a peer may already have adopted — fails
+// closed instead of authorizing a delete.
+func verifyReuseCleanupIdentity(ctx context.Context, cfg *config, image string, ctr *Container) error {
+	verifyCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	defer cancel()
+	unlock, err := lockName(verifyCtx, cfg.name)
+	if err != nil {
+		return fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
+	}
+	defer unlock()
+
+	info, err := inspectNamed(verifyCtx, cfg, cfg.name)
+	if err != nil {
+		if isNotFoundFor(cfg.eng, cfg.name, err) {
+			// Nothing left to clean up.
+			return nil
+		}
+		return fmt.Errorf("reuse %s: verify generation before cleanup: %w", cfg.name, err)
+	}
+	if !failedCreateOwned(cfg, info) {
+		return fmt.Errorf("reuse %s: refusing automatic cleanup of a generation this request does not own", cfg.name)
+	}
+	if info.labels[creationLabel] != ctr.creation {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, cfg.name)
+	}
+	if err := checkReuseOwned(info, image, cfg); err != nil {
+		return fmt.Errorf("reuse %s: refusing automatic cleanup: %w", cfg.name, err)
+	}
+	switch info.state {
+	case StateCreated, StateStopped:
+		return nil
+	default:
+		return fmt.Errorf("reuse %s: %s generation may already be adopted; refusing automatic deletion",
+			cfg.name, info.state)
+	}
+}
+
 // deleteStoppedReuse removes a stopped reuse container only after
 // verifying the managed, reuse, and creation labels on the inspected
-// container. It then binds a handle to that generation so Terminate
-// re-checks it and deletes by immutable ID. A replaced generation means
-// another process already recreated the name; the caller loops and
-// attaches to the fresh generation instead of deleting it.
+// container. The critical section then re-inspects under the same
+// per-name lock and refuses to delete unless the live generation is
+// still the one observed, still stopped, and still owned: between the
+// caller's poll and the lock a peer may have restarted this generation
+// or replaced it. A replaced generation means another process already
+// recreated the name; the caller loops and attaches to the fresh
+// generation instead of deleting it.
 func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
 	if err := checkReuseLabels(info, cfg); err != nil {
 		return err
 	}
-	ctr := namedContainer(cfg, cfg.name)
-	ctr.creation = info.labels[creationLabel]
-	err := ctr.Terminate(ctx)
-	if errors.Is(err, ErrGenerationReplaced) {
+	creation := info.labels[creationLabel]
+	unlock, err := lockName(ctx, cfg.name)
+	if err != nil {
+		return fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
+	}
+	defer unlock()
+
+	fresh, err := inspectNamed(ctx, cfg, cfg.name)
+	if isNotFoundFor(cfg.eng, cfg.name, err) {
+		// Already gone: nothing to replace.
 		return nil
 	}
-	return err
+	if err != nil {
+		return fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+	}
+	if err := checkReuseLabels(fresh, cfg); err != nil {
+		// The live container is not the owned reuse generation the
+		// caller observed (unlabeled or foreign replacement). Skip it
+		// so the caller loops and attaches to whatever now owns the
+		// name; never delete a container this request cannot prove.
+		return nil
+	}
+	if actual := fresh.labels[creationLabel]; actual != creation {
+		// A peer already replaced the name; let the caller attach to it.
+		return nil
+	}
+	if fresh.state != StateStopped {
+		// The generation is in use again; never force-delete a shared
+		// container that a peer may have adopted.
+		return nil
+	}
+	ctr := namedContainer(cfg, cfg.name)
+	ctr.reused = true
+	ctr.creation = creation
+	// Delete by the backend's immutable ID when it reports one, so a
+	// replacement created after this check is simply not found;
+	// Apple Container is name-addressed and the lock still holds.
+	target := fresh.uid
+	if target == "" {
+		target = cfg.name
+	}
+	return ctr.delete(ctx, target)
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {

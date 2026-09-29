@@ -164,22 +164,30 @@ func (r *rollbackDeleteFailureRunner) Run(ctx context.Context, args ...string) (
 	return r.fakeRunner.Run(ctx, args...)
 }
 
+// A reuse create that fails after the backend published the generation
+// must not force-delete it: the fixture's inspect reports a running
+// container, which a peer may already have adopted. Under KEEP the
+// handle is revalidated and returned; otherwise the refusal is reported.
 func TestReuseCopyFailureHonorsKeepEnv(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		keep       string
-		wantDelete bool
+		wantHandle bool
 	}{
-		{name: "rollback", keep: "0", wantDelete: true},
-		{name: "keep", keep: "1", wantDelete: false},
+		{name: "rollback", keep: "0", wantHandle: false},
+		{name: "keep", keep: "1", wantHandle: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("CONTAINERGO_KEEP", tc.keep)
 			base := newTestRunner()
 			base.imagePresent = true
 			r := &reuseSetupRunner{
-				fakeRunner:  base,
-				inspectJSON: creationInspectJSON("myctr", "1234567890abcdef"),
+				fakeRunner: base,
+				inspectJSON: inspectJSONWithStateAndLabels("myctr", "running", "redis:7-alpine", map[string]string{
+					managedLabel:  "true",
+					reuseLabel:    "true",
+					creationLabel: "1234567890abcdef",
+				}),
 			}
 			src := filepath.Join(t.TempDir(), "x")
 			if err := os.WriteFile(src, nil, 0o600); err != nil {
@@ -189,6 +197,7 @@ func TestReuseCopyFailureHonorsKeepEnv(t *testing.T) {
 				runner:   r,
 				eng:      appleEngine{},
 				name:     "myctr",
+				reuse:    true,
 				creation: "1234567890abcdef",
 				files:    []File{{HostPath: src, ContainerPath: "/x"}},
 			}
@@ -197,10 +206,10 @@ func TestReuseCopyFailureHonorsKeepEnv(t *testing.T) {
 			if err == nil {
 				t.Fatal("want copy error")
 			}
-			if got := len(r.deleted) > 0; got != tc.wantDelete {
-				t.Fatalf("deleted = %v, want deletion = %t", r.deleted, tc.wantDelete)
+			if got := len(r.deleted) > 0; got {
+				t.Fatalf("deleted = %v, want no automatic delete of a published shared generation", r.deleted)
 			}
-			if tc.keep == "1" {
+			if tc.wantHandle {
 				if ctr == nil || ctr.ID() != "myctr" {
 					t.Fatalf("container = %#v, want retained reuse handle", ctr)
 				}

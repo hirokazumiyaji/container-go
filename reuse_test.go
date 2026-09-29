@@ -534,46 +534,69 @@ func (r *reuseRollbackRunner) Run(ctx context.Context, args ...string) ([]byte, 
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestReuseInspectFailurePreservesRollbackCLIError(t *testing.T) {
+func (r *reuseRollbackRunner) deleteCalls() []string {
+	var deleted []string
+	for _, call := range r.calls {
+		if len(call) > 0 && (call[0] == "delete" || call[0] == "rm") {
+			deleted = append(deleted, call[len(call)-1])
+		}
+	}
+	return deleted
+}
+
+// A published reuse generation is never force-deleted after a
+// post-create failure: a peer may already have adopted it. The original
+// cause and the refusal both reach the caller.
+func TestReuseInspectFailurePreservesRollbackRefusal(t *testing.T) {
 	inspectErr := &cli.CLIError{Args: []string{"inspect", "reuse-rollback"}, ExitCode: 1, Stderr: "post-create inspect failed"}
-	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
 	r := &reuseRollbackRunner{
 		fakeRunner: newTestRunner(),
 		inspectErr: inspectErr,
-		deleteErr:  cleanupErr,
 	}
 
-	_, err := Run(context.Background(), "redis:7-alpine",
+	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("reuse-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
+	if ctr != nil {
+		t.Fatalf("container = %#v, want nil", ctr)
+	}
 	if got := cliErrorWithStderr(err, inspectErr.Stderr); got == nil {
 		t.Fatalf("error = %v, want original inspect CLIError", err)
 	}
-	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
-		t.Fatalf("error = %v, want rollback CLIError", err)
+	var joined *CleanupError
+	if !errors.As(err, &joined) {
+		t.Fatalf("error = %v, want CleanupError carrying the refusal", err)
+	}
+	if len(r.deleteCalls()) != 0 {
+		t.Fatalf("deleted = %v, want no delete of a published shared generation", r.deleteCalls())
 	}
 }
 
-func TestReuseCopyFailurePreservesRollbackCLIError(t *testing.T) {
+func TestReuseCopyFailurePreservesRollbackRefusal(t *testing.T) {
 	copyErr := &cli.CLIError{Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
-	cleanupErr := &cli.CLIError{Args: []string{"delete", "reuse-copy-rollback"}, ExitCode: 1, Stderr: "reuse cleanup failed"}
 	r := &reuseRollbackRunner{
 		fakeRunner: newTestRunner(),
 		copyErr:    copyErr,
-		deleteErr:  cleanupErr,
 	}
 	hostPath := filepath.Join(t.TempDir(), "input.txt")
 	if err := os.WriteFile(hostPath, []byte("input"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err := Run(context.Background(), "redis:7-alpine",
+	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("reuse-copy-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}),
 		WithFiles(File{HostPath: hostPath, ContainerPath: "/tmp/input.txt"}))
+	if ctr != nil {
+		t.Fatalf("container = %#v, want nil", ctr)
+	}
 	if got := cliErrorWithStderr(err, copyErr.Stderr); got == nil {
 		t.Fatalf("error = %v, want original copy CLIError", err)
 	}
-	if got := cliErrorWithStderr(err, cleanupErr.Stderr); got == nil {
-		t.Fatalf("error = %v, want rollback CLIError", err)
+	var joined *CleanupError
+	if !errors.As(err, &joined) {
+		t.Fatalf("error = %v, want CleanupError carrying the refusal", err)
+	}
+	if len(r.deleteCalls()) != 0 {
+		t.Fatalf("deleted = %v, want no delete of a published shared generation", r.deleteCalls())
 	}
 }
 

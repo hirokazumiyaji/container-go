@@ -33,14 +33,24 @@ import (
 // instead of the name, so a same-name replacement created after the
 // check is simply not found. Apple Container has no such ID; there the
 // delete necessarily goes by name.
+//
+// A "cancel <id> [<generation>]" line withdraws a registration the
+// parent already resolved itself. The delete snapshot is built only
+// after every line has been read, so a cancellation always wins over the
+// matching add regardless of write order.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
 ids=""
+cancels=""
 while IFS= read -r line; do
-  ids="$ids
-$line"
+  case "$line" in
+    cancel\ *) cancels="$cancels${line#cancel }
+" ;;
+    *) ids="$ids
+$line" ;;
+  esac
 done
 run_with_timeout() {
   "$@" >/dev/null 2>&1 & pid=$!
@@ -51,8 +61,12 @@ run_with_timeout() {
   wait "$killer" 2>/dev/null
   return $rc
 }
+cancelled() {
+  printf '%s\n' "$cancels" | grep -F -x -- "$1" >/dev/null 2>&1
+}
 echo "$ids" | while IFS= read -r line; do
   [ -z "$line" ] && continue
+  cancelled "$line" && continue
   id=${line%% *}
   creation=${line#* }
   [ "$id" = "$line" ] && creation=""
@@ -117,11 +131,8 @@ func newReaper(binary, subcommand string) *reaper {
 // ID from creationLabel; empty skips the generation check for
 // backward compatibility.
 func (r *reaper) register(id, creation string) error {
-	if !nameRE.MatchString(id) {
-		return fmt.Errorf("reaper: invalid container id %q", id)
-	}
-	if creation != "" && !creationRE.MatchString(creation) {
-		return fmt.Errorf("reaper: invalid creation id %q", creation)
+	if err := r.validateEntry(reaperEntry{id: id, creation: creation}); err != nil {
+		return err
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -135,12 +146,66 @@ func (r *reaper) register(id, creation string) error {
 	return r.respawnAndReplayLocked()
 }
 
+// unregister drops one generation from the kill list. The child learns
+// about it with a cancellation record so a later replay cannot resurrect
+// the entry. Registrations the child already missed are also filtered
+// from its snapshot.
+func (r *reaper) unregister(id, creation string) error {
+	if err := r.validateEntry(reaperEntry{id: id, creation: creation}); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	kept := r.entries[:0]
+	found := false
+	for _, e := range r.entries {
+		if !found && e.id == id && e.creation == creation {
+			found = true
+			continue
+		}
+		kept = append(kept, e)
+	}
+	r.entries = kept
+	if !found {
+		return nil
+	}
+	if r.stdin == nil {
+		return nil
+	}
+	if err := r.writeCancellationLocked(id, creation); err != nil {
+		return r.respawnAndReplayLocked()
+	}
+	return nil
+}
+
+func (r *reaper) validateEntry(e reaperEntry) error {
+	if !nameRE.MatchString(e.id) {
+		return fmt.Errorf("reaper: invalid container id %q", e.id)
+	}
+	if e.creation != "" && !creationRE.MatchString(e.creation) {
+		return fmt.Errorf("reaper: invalid creation id %q", e.creation)
+	}
+	return nil
+}
+
 func (r *reaper) writeLocked(e reaperEntry) error {
 	if e.creation == "" {
 		_, err := io.WriteString(r.stdin, e.id+"\n")
 		return err
 	}
 	_, err := io.WriteString(r.stdin, e.id+" "+e.creation+"\n")
+	return err
+}
+
+// writeCancellationLocked tells a live child to drop one generation from
+// its snapshot. The child only deletes on EOF, so the record keeps the
+// entry out of the snapshot it will eventually act on.
+func (r *reaper) writeCancellationLocked(id, creation string) error {
+	line := "cancel " + id
+	if creation != "" {
+		line += " " + creation
+	}
+	_, err := io.WriteString(r.stdin, line+"\n")
 	return err
 }
 
@@ -233,4 +298,28 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	}
 	globalReapersMu.Unlock()
 	_ = r.register(id, creation)
+}
+
+// unregisterFromGlobalReaper best-effort withdraws one generation from
+// the process-wide reaper after the parent resolved it, so a later
+// replay cannot act on a stale entry.
+func unregisterFromGlobalReaper(binary, subcommand, id, creation string) {
+	if runtime.GOOS == "windows" || id == "" {
+		return
+	}
+	globalReapersMu.Lock()
+	r := globalReapers[binary]
+	globalReapersMu.Unlock()
+	if r == nil {
+		return
+	}
+	_ = r.unregister(id, creation)
+}
+
+// globalReaperFor returns the process-wide reaper for a backend binary,
+// or nil when none exists yet.
+func globalReaperFor(binary string) *reaper {
+	globalReapersMu.Lock()
+	defer globalReapersMu.Unlock()
+	return globalReapers[binary]
 }

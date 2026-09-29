@@ -387,10 +387,11 @@ func TestTerminateIsIdempotent(t *testing.T) {
 		t.Fatalf("Terminate: %v", err)
 	}
 
-	// Second terminate: CLI reports not found; still success.
+	// Second terminate: CLI reports not found for the exact delete
+	// target; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {
@@ -405,6 +406,13 @@ type notFoundRunner struct {
 
 func (n *notFoundRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "delete" {
+		// Report the exact argv the library issued: absence is only
+		// evidence for the target this delete addressed.
+		if cliErr, ok := n.err.(*cli.CLIError); ok {
+			reported := *cliErr
+			reported.Args = args
+			return nil, nil, &reported
+		}
 		return nil, nil, n.err
 	}
 	return n.inner.Run(ctx, args...)

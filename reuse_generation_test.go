@@ -166,7 +166,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":
@@ -186,9 +186,11 @@ type generationStateRunner struct {
 func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
+		// The stopped-reuse path re-verifies ownership under the name
+		// lock, so the served container must carry every ownership label.
 		labels := ""
 		if g.creation != "" {
-			labels = `,"labels":{"` + creationLabel + `":"` + g.creation + `"}`
+			labels = `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}`
 		}
 		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":

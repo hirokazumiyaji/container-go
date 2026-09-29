@@ -217,11 +217,11 @@ func TestRunFailureCleanupNotFoundIsSuccess(t *testing.T) {
 	}{
 		{
 			name:       "inspect",
-			inspectErr: &cli.CLIError{Args: []string{"inspect"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			inspectErr: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `not found: "myctr"`},
 		},
 		{
 			name:      "delete",
-			deleteErr: &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			deleteErr: &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `not found: "myctr"`},
 		},
 	}
 	for _, tc := range cases {

@@ -104,7 +104,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 				didRemove, err = pruneNamedCandidate(ctx, r, eng, candidate, errKind, reuseGroup)
 			}
 		default:
-			didRemove, err = deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, reuseGroup)
+			didRemove, err = deletePruneCandidate(ctx, r, eng, id, errKind, reuseGroup)
 		}
 		if err != nil {
 			errs = append(errs, err)
@@ -141,14 +141,10 @@ func deleteImmutablePruneCandidate(ctx context.Context, r cli.Runner, eng engine
 	if !dockerIDRE.MatchString(fresh.uid) || fresh.uid != id {
 		return false, nil
 	}
-	return deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, reuseGroup)
+	return deletePruneCandidate(ctx, r, eng, id, errKind, reuseGroup)
 }
 
-func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind string) (bool, error) {
-	return deletePruneCandidateWithGroup(ctx, r, eng, id, errKind, "")
-}
-
-func deletePruneCandidateWithGroup(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
+func deletePruneCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {
 	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer dCancel()
 	args := eng.deleteArgs(id)
@@ -200,7 +196,7 @@ func pruneNamedCandidate(ctx context.Context, r cli.Runner, eng engine, candidat
 	// Apple has no immutable ID: the name lock and the exact generation
 	// revalidation above are the delete proof.  Never substitute a
 	// backend-reported UID for a name-addressed Apple operation.
-	return deletePruneCandidateWithGroup(guardCtx, r, eng, candidate.id, errKind, reuseGroup)
+	return deletePruneCandidate(guardCtx, r, eng, candidate.id, errKind, reuseGroup)
 }
 
 func applePruneCandidates(data []byte) (map[string]pruneCandidate, error) {

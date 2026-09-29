@@ -674,7 +674,7 @@ func TestMissingContainerStillReportsNotFound(t *testing.T) {
 	down := &singleErrorRunner{fakeRunner: newTestRunner(), err: missing}
 	down.probeErr = &cli.CLIError{Args: []string{"version", "--format", "x"}, ExitCode: 1, Stderr: "cannot connect"}
 	ctrDown := &Container{id: "myctr", runner: down, eng: dockerEngine{}}
-	err := ctrDown.State(context.Background())
+	_, err := ctrDown.State(context.Background())
 	if errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want the backend-down failure, not absence", err)
 	}

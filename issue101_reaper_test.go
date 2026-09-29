@@ -83,15 +83,15 @@ func TestFailedCreateReuseDeletionFailureSkipsReaper(t *testing.T) {
 		externalBinary: bin,
 		missingAtFirst: true,
 		failRunRunner: &failRunRunner{
-			fakeRunner:  newTestRunner(),
-			runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+			fakeRunner: newTestRunner(),
+			runErr:     &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
 			inspectJSON: inspectJSONWithStateAndLabels("shared", "created", "redis:7-alpine", map[string]string{
 				managedLabel:  "true",
 				reuseLabel:    "true",
 				sessionLabel:  sessionID(),
 				creationLabel: creation,
 			}),
-			deleteErr:   deleteErr,
+			deleteErr: deleteErr,
 		},
 	}
 	runner.imagePresent = true

@@ -7,8 +7,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -35,6 +37,30 @@ func TestReaperProcessSubtreeIgnoresUnrelatedEdges(t *testing.T) {
 	want := map[int][]int{100: {101}, 101: {102}}
 	if !sameReaperProcessTable(got, want) {
 		t.Fatalf("subtree = %v, want %v", got, want)
+	}
+}
+
+func TestKillReaperStoppedRefsReapsQuiescedChild(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "sleep 30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+	ref, err := captureReaperProcessIdentityContext(context.Background(), cmd.Process.Pid)
+	if err != nil {
+		t.Fatalf("capture child identity: %v", err)
+	}
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		t.Fatalf("stop child: %v", err)
+	}
+	if err := killReaperStoppedRefs([]reaperProcessRef{ref}); err != nil {
+		t.Fatalf("kill stopped refs: %v", err)
+	}
+	if err := cmd.Wait(); err == nil {
+		t.Fatal("stopped child exited successfully; want SIGKILL")
 	}
 }
 

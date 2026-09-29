@@ -171,6 +171,15 @@ Three layers make sure containers do not outlive your tests:
    unavailable on Windows — there, cleanup relies on the first two
    layers only.
 
+The watchdog also needs trusted `awk`, `ps`, `rm`, and `sleep` helpers in
+`/usr/bin` or `/bin`; `pgrep` is optional and the reaper falls back to a
+`ps` process table. A missing required helper is reported and does not
+consume the retry budget permanently. Each timed entry has a bounded helper
+cleanup budget and output cap; if that budget is exhausted, the reaper skips
+further descendant work rather than blocking. It retains at most 1024
+registrations per child, drains excess input, and reports a registration
+capacity error instead of silently abandoning a newly-created container.
+
 Extras:
 
 - `CONTAINERGO_KEEP=1` keeps containers around for debugging.

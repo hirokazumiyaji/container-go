@@ -1,7 +1,6 @@
 package container
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,7 +12,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -69,6 +67,19 @@ max_descendant_lookups=64
 helper_output_blocks=512
 cleanup_helper_budget=6
 cleanup_active=0
+consume_cleanup_budget() {
+  [ "$cleanup_active" = 1 ] || return 0
+  cleanup_budget_file="$work_dir/cleanup.budget"
+  cleanup_budget=
+  if [ -r "$cleanup_budget_file" ]; then
+    IFS= read -r cleanup_budget <"$cleanup_budget_file" || cleanup_budget=
+  fi
+  case "$cleanup_budget" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  [ "$cleanup_budget" -gt 0 ] 2>/dev/null || return 1
+  printf '%s\n' "$((cleanup_budget - 1))" >"$cleanup_budget_file" 2>/dev/null || return 1
+}
 work_dir="$5"
 awk_bin="$6"
 pgrep_bin="$7"
@@ -182,9 +193,8 @@ run_helper() {
   helper_out="$1"
   helper_err="$2"
   shift 2
-  if [ "$cleanup_active" = 1 ]; then
-    [ "$cleanup_helper_budget" -gt 0 ] || return 125
-    cleanup_helper_budget=$((cleanup_helper_budget - 1))
+  if ! consume_cleanup_budget; then
+    return 125
   fi
   : >"$helper_out" 2>/dev/null || return 125
   : >"$helper_err" 2>/dev/null || return 125
@@ -650,6 +660,7 @@ kill_pipeline() {
   kill_root_pid="$1"
   cleanup_active=1
   cleanup_helper_budget=6
+  printf '%s\n' "$cleanup_helper_budget" >"$work_dir/cleanup.budget" 2>/dev/null || cleanup_helper_budget=0
   tombstoned_pids=
   stopped_pids=
   capture_identity "$kill_root_pid" "$work_dir/identity.$kill_root_pid"
@@ -837,7 +848,6 @@ const (
 	maxReaperRegisteredEntries  = 1024
 	maxReaperSpawnFailures      = 3
 	defaultReaperTimeoutSeconds = 30
-	reaperCleanupTimeout        = 2 * time.Second
 )
 
 var errReaperRegistrationOverflow = errors.New("reaper registration capacity exceeded")
@@ -890,13 +900,14 @@ type reaper struct {
 	// (Docker); both take --force.
 	subcommand string
 
-	mu            sync.Mutex
-	cmd           *exec.Cmd
-	stdin         io.WriteCloser
-	exited        chan struct{}
-	entries       []reaperEntry
-	spawnFailures int
-	gaveUp        bool
+	mu                   sync.Mutex
+	cmd                  *exec.Cmd
+	stdin                io.WriteCloser
+	exited               chan struct{}
+	entries              []reaperEntry
+	spawnFailures        int
+	gaveUp               bool
+	registrationOverflow bool
 	// timeoutSeconds is an internal test seam; production reapers use
 	// defaultReaperTimeoutSeconds.
 	timeoutSeconds int
@@ -928,13 +939,22 @@ func (r *reaper) register(id, creation string) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	entry := reaperEntry{id: id, creation: creation}
 	if len(r.entries) >= maxReaperRegisteredEntries {
 		// The shell deliberately keeps draining its input after its bounded
-		// prefix. Give the caller an explicit ownership error rather than
-		// silently abandoning the newly-created container.
+		// prefix. Send the first rejected record once so that a writer
+		// already talking to the child is drained, then fail explicitly so
+		// the newly-created container is never silently abandoned.
+		if !r.registrationOverflow {
+			r.registrationOverflow = true
+			if r.stdin != nil {
+				if err := r.writeLocked(entry); err != nil {
+					return errors.Join(errReaperRegistrationOverflow, err)
+				}
+			}
+		}
 		return errReaperRegistrationOverflow
 	}
-	entry := reaperEntry{id: id, creation: creation}
 	r.entries = append(r.entries, entry)
 	if r.stdin != nil {
 		if r.writeLocked(entry) == nil {
@@ -1049,34 +1069,6 @@ func (r *reaper) closeStdin() {
 	if r.stdin != nil {
 		_ = r.stdin.Close()
 	}
-}
-
-// killForTest kills the reaper process group and waits until the child is
-// reaped, so fake descendants cannot survive the test and the next write
-// deterministically fails. The cleanup is bounded because a test must not
-// be able to wedge the whole suite on a stalled pgrep or an expanding tree.
-func (r *reaper) killForTest() error {
-	r.mu.Lock()
-	cmd, exited := r.cmd, r.exited
-	r.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), reaperCleanupTimeout)
-	defer cancel()
-	var cleanupErrors []error
-	if cmd != nil {
-		if err := killReaperCommand(ctx, cmd); err != nil {
-			log.Printf("container-go: reaper cleanup: %v", err)
-			cleanupErrors = append(cleanupErrors, err)
-		}
-	}
-	if exited != nil {
-		select {
-		case <-exited:
-		case <-ctx.Done():
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("reaper: cleanup timed out: %w", ctx.Err()))
-		}
-	}
-	return errors.Join(cleanupErrors...)
 }
 
 var (

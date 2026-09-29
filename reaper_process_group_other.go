@@ -2,16 +2,6 @@
 
 package container
 
-import (
-	"context"
-	"os/exec"
-)
+import "os/exec"
 
 func prepareReaperCommand(*exec.Cmd) {}
-
-func killReaperCommand(_ context.Context, cmd *exec.Cmd) error {
-	if cmd.Process == nil {
-		return nil
-	}
-	return cmd.Process.Kill()
-}

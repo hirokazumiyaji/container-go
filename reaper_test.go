@@ -107,8 +107,14 @@ func TestReaperRejectsRegistrationOverflow(t *testing.T) {
 	if err := r.register("bounded-overflow", ""); !errors.Is(err, errReaperRegistrationOverflow) {
 		t.Fatalf("overflow registration error = %v, want capacity error", err)
 	}
-	if err := r.register("bounded-after-overflow", ""); !errors.Is(err, errReaperRegistrationOverflow) {
-		t.Fatalf("post-overflow registration error = %v, want capacity error", err)
+	overflowStarted := time.Now()
+	for i := 0; i < 4096; i++ {
+		if err := r.register(fmt.Sprintf("bounded-after-%04d", i), ""); !errors.Is(err, errReaperRegistrationOverflow) {
+			t.Fatalf("post-overflow registration %d error = %v, want capacity error", i, err)
+		}
+	}
+	if elapsed := time.Since(overflowStarted); elapsed > 2*time.Second {
+		t.Fatalf("post-overflow registrations took %s, want bounded register latency", elapsed)
 	}
 	closeReaperForTestWithin(t, r, 60*time.Second)
 	waitForReaperLogLinesWithin(t, logPath, 60*time.Second,

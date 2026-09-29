@@ -328,16 +328,26 @@ entries are rejected and logged. For Apple, the reaper stores the generation,
 reads the label as a line-anchored JSON field (`"key": "value"`, never a
 substring), and skips deletion on mismatch. Each reaper entry's complete
 inspect/status-marker/filter/delete pipeline carries a bounded 30s timeout via
-pinned POSIX helpers. The timeout takes a fixed-point, quiesced descendant
-snapshot before signaling, including nested `setsid` children. On Unix,
-cleanup retains pidfd or high-resolution process-start-time identity
-(including Darwin `stime`), tombstones exited PIDs, and never falls back to a
-numeric kill after identity loss. One aggregate cleanup context and helper
-budget cover every lookup and retry. `pgrep` is optional; a pinned `ps`
-process-table fallback supplies descendants when it is unavailable. Helper
-output is capped, and helper descendants are enumerated, killed, and reaped
-when monitor mode is unavailable. Registration input is bounded to its
-prefix, so the cap does not disable cleanup.
+pinned POSIX helpers. The timeout takes a fixed-point snapshot of the target
+helper subtree, stops it, and then performs identity-checked signaling,
+including nested `setsid` children. The production reaper is the external
+shell child, not the Go process walker used by its tests: its portable
+identity is the stable `ps lstart` process-start field (never CPU time), and
+a lost identity is treated as unverifiable rather than as permission to send
+a numeric signal. A force pass still kills processes that were successfully
+stopped, and a fresh signal budget is independent of the traversal budget.
+`pgrep` is optional; a pinned `ps` process-table fallback supplies descendants
+when it is unavailable. Helper output is capped by a file-size limit, each
+helper has a one-second budget, and a timed entry may consume at most six
+helper operations. Reaching those bounds skips further cleanup work rather
+than blocking the reaper. Helper descendants are enumerated, killed, and
+reaped when monitor mode is unavailable.
+
+Registration retains and replays at most 1024 entries per reaper child. The
+shell keeps draining and discards records beyond that prefix, so a producer
+never blocks on a full registration pipe. Go registration returns an explicit
+capacity error for the first record beyond the cap (and `Run` rolls the new
+container back); it never silently drops a live container.
 The leader's own pull/create uses an independent `runTimeout` budget;
 `reuseAttachTimeout` bounds only attach polling
 for another process's container.
@@ -356,8 +366,13 @@ the library validates each entry as an Apple Container name or a full
 inspected and must resolve to a full valid ID before deletion; a name is never
 used as their fallback. A generationless Docker name is rejected and logged.
 The reaper resolves its helper executables from pinned system paths, caps
-their output, and bounds each helper process group. These layers leave no
-command injection through IDs.
+their output, and bounds each helper process group. It requires `/bin/sh`,
+`awk`, `ps`, `rm`, and `sleep` in the trusted `/usr/bin` or `/bin`
+directories; `pgrep` is optional. A missing required helper makes that
+registration fail with a logged dependency error without consuming the
+consecutive-spawn budget, so a later retry can recover. The watchdog is
+unavailable on Windows, where the normal cleanup paths are the only
+guarantee. These layers leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main

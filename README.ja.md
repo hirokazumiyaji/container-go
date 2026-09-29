@@ -192,6 +192,14 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - レジストリ認証情報は本ライブラリでは扱いません。`container registry
   login`(macOS Keychain 保存)を使ってください。
 
+watchdog は `/bin/sh` に加えて、信頼済み `/usr/bin` または `/bin` にある
+`awk`、`ps`、`rm`、`sleep` を必要とします。`pgrep` は任意で、ない場合は
+`ps` の process table へフォールバックします。必須 helper が無い場合は
+依存関係エラーとして記録し、再試行予算を永久に消費しません。各 timeout
+の helper 実行時間・出力・cleanup 予算は有限で、1 子プロセスあたり登録は
+最大 1024 件です。超過入力は読み捨てocker ，注册容量超過は暗黙に捨てずに
+明示的なエラーとして `Run` が新規コンテナを rollback します。
+
 ### 旧バージョンの reaper staging ファイル
 
 現在の watchdog は inspect 出力を構造化フィルタへ流して処理し、raw 出力を

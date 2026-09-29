@@ -43,6 +43,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -76,6 +77,7 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 }
 
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -116,6 +118,7 @@ func TestBreQuoteEscapesLabelKey(t *testing.T) {
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
@@ -129,6 +132,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()

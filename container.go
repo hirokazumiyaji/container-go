@@ -237,7 +237,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !dockerIDRE.MatchString(uid) {
-		cleanupFailedCreate(ctx, cfg, nil, nil)
+		_ = cleanupFailedCreate(ctx, cfg, nil, nil)
 		return nil, fmt.Errorf("container %s: docker run returned no valid immutable ID", cfg.name)
 	}
 
@@ -671,7 +671,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 	// supplied it. Only an exact full-ID target is self-authenticating.
 	// Delegate through setImmutableID so the never-downgrade invariant
 	// lives in one place (and under uidMu).
-	if uid == "" && requiresImmutableID(c.eng) && info.uidVerified &&
+	if uid == "" && requiresImmutableID(c.eng) &&
 		dockerIDRE.MatchString(target) && info.uid == target {
 		c.setImmutableID(info.uid)
 	}

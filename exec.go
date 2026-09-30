@@ -148,13 +148,3 @@ func (c *Container) verifyExecContainer(ctx context.Context) (State, error) {
 	}
 	return info.state, nil
 }
-
-// execContainerRunning is kept as the boolean compatibility helper for
-// package-local callers; Exec uses verifyExecContainer so inspect errors
-// are not reduced to false.
-//
-//nolint:unused
-func (c *Container) execContainerRunning(ctx context.Context) bool {
-	state, err := c.verifyExecContainer(ctx)
-	return err == nil && state == StateRunning
-}

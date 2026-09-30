@@ -143,7 +143,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 
 func (s *LogStrategy) finishScan(ctx context.Context, target Target, stream io.ReadCloser, result logScanResult, timeout time.Duration) error {
 	if result.found {
-		if terminalErr := settleTerminalStream(stream); terminalErr != nil {
+		if terminalErr := terminalStreamError(stream); terminalErr != nil {
 			return terminalLogError(ctx, s.pattern, terminalErr)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
@@ -198,10 +198,6 @@ func terminalStreamError(stream io.ReadCloser) error {
 	case <-timer.C:
 		return nil
 	}
-}
-
-func settleTerminalStream(stream io.ReadCloser) error {
-	return terminalStreamError(stream)
 }
 
 func normalizeTerminalError(err error) error {

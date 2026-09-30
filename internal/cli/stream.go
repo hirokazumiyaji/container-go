@@ -77,7 +77,6 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		stdoutRead:     stdoutRead,
 		stderrRead:     stderrRead,
 		stderrDone:     make(chan struct{}),
-		startDone:      lifecycle.startDone,
 		waitDone:       lifecycle.waitDone,
 		pumpsDone:      make(chan struct{}),
 		cancelObserved: hooks.cancelObserved,
@@ -168,11 +167,6 @@ type processStream struct {
 	stdoutRead *os.File
 	stderrRead *os.File
 	stderrDone chan struct{}
-
-	// startDone is closed after a successful Start and all process handles
-	// are published. It prevents a context callback from inspecting a
-	// half-started Cmd.
-	startDone chan struct{}
 
 	waitOnce           sync.Once
 	waitDone           chan struct{}

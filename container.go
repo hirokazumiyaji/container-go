@@ -26,8 +26,6 @@ const (
 	creationLabel   = "com.github.hirokazumiyaji.container-go.creation"
 
 	queryTimeout = 30 * time.Second
-	maxDuration  = time.Duration(1<<63 - 1)
-	minDuration  = time.Duration(-1 << 63)
 	// runTimeout also covers an implicit image pull.
 	runTimeout = 10 * time.Minute
 )
@@ -307,7 +305,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, saturatingAddDuration(queryTimeout, durationOrZero(timeout)))
+	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err = c.runner.Run(stopCtx, args...)
 	return c.classify(ctx, err)
@@ -491,16 +489,6 @@ func durationOrZero(d *time.Duration) time.Duration {
 		return 0
 	}
 	return *d
-}
-
-func saturatingAddDuration(a, b time.Duration) time.Duration {
-	if b > 0 && a > maxDuration-b {
-		return maxDuration
-	}
-	if b < 0 && a < minDuration-b {
-		return minDuration
-	}
-	return a + b
 }
 
 func sortedKeys[V any](m map[string]V) []string {

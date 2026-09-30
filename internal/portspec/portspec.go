@@ -30,28 +30,18 @@ const (
 // defaults to tcp; the protocol comparison is case-sensitive, matching the
 // grammar the public API documents.
 func Parse(s string) (Spec, error) {
-	portPart, proto, ok := strings.Cut(s, "/")
-	if !ok {
-		proto = TCP
-	}
+	portPart, proto := split(s)
 	if proto != TCP && proto != UDP {
 		return Spec{}, fmt.Errorf("invalid port %q: protocol must be tcp or udp", s)
 	}
-	n, err := strconv.Atoi(portPart)
-	if err != nil || n < 1 || n > 65535 {
-		return Spec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
-	}
-	return Spec{Port: n, Protocol: proto}, nil
+	return finish(s, portPart, proto)
 }
 
 // ParseTCP is Parse restricted to TCP. Its reasons are phrased for a TCP-only
 // caller, because "only TCP is supported" and "protocol must be tcp" are more
 // useful there than the generic message Parse produces for any non-TCP scheme.
 func ParseTCP(s string) (Spec, error) {
-	portPart, proto, ok := strings.Cut(s, "/")
-	if !ok {
-		proto = TCP
-	}
+	portPart, proto := split(s)
 	if proto != TCP {
 		reason := "protocol must be tcp"
 		if proto == UDP {
@@ -59,6 +49,18 @@ func ParseTCP(s string) (Spec, error) {
 		}
 		return Spec{}, fmt.Errorf("invalid port %q: %s", s, reason)
 	}
+	return finish(s, portPart, proto)
+}
+
+func split(s string) (portPart, proto string) {
+	portPart, proto, ok := strings.Cut(s, "/")
+	if !ok {
+		proto = TCP
+	}
+	return portPart, proto
+}
+
+func finish(s, portPart, proto string) (Spec, error) {
 	n, err := strconv.Atoi(portPart)
 	if err != nil || n < 1 || n > 65535 {
 		return Spec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)

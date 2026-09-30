@@ -161,7 +161,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 `wait` サブパッケージに次の戦略を実装する。
 
 - `wait.ForLog(s string)`：`container logs --follow` の出力に部分文字列(または `AsRegexp` で正規表現)が現れるまで待つ。`WithOccurrence(n)` で出現回数を指定できる
-- `wait.ForListeningPort(port string)`：コンテナの対象エンドポイントへ TCP 接続できた 때까지待つ。
+- `wait.ForListeningPort(port string)`：コンテナの対象エンドポイントへ TCP 接続できるまで待つ。
   指定形式は `PORT` または `PORT/tcp` だけ。
   UDP と不正な形式は `Target.Endpoint` を呼び出す前に `*wait.ConfigError` 型で返す。
   このエラーは `wait.ErrInvalidConfiguration` と一致する。

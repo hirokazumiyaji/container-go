@@ -507,7 +507,9 @@ subcommand per backend (`delete --force` for Apple, `rm --force` for
 Docker). The reaper depends on `/bin/sh` and thus does not run on
 Windows; v0.2 documents that Windows relies on the normal cleanup
 paths (`Cleanup`, rollback) only. `Prune` can use daemon-side filters
-on Docker (`--filter label=... --filter status=exited`).
+on Docker (`--filter label=... --filter status=exited --filter
+status=dead`; `dead` is a stopped container the daemon can no longer reap,
+so listing only `exited` would miss it).
 
 **Liveness detection**: the probe command switches per backend
 (`system status` for Apple, `info` for Docker).

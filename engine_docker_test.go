@@ -2,12 +2,13 @@ package container
 
 import (
 	"context"
-	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"os"
 	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 func dockerTestConfig(t *testing.T, opts ...Option) *config {
@@ -156,6 +157,56 @@ func TestDockerParseStoppedManaged(t *testing.T) {
 	}
 	if !slices.Equal(ids, []string{"one", "two"}) {
 		t.Errorf("ids = %v", ids)
+	}
+}
+
+func TestDockerListArgsIncludeStoppedStatuses(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	for _, want := range []string{"status=exited", "status=dead"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
+	for _, unwanted := range []string{"status=created", "status=running"} {
+		if slices.Contains(args, unwanted) {
+			t.Errorf("listArgs = %v, unexpectedly includes %q", args, unwanted)
+		}
+	}
+}
+
+// dockerPruneRunner serves a canned docker ps listing and records deletes.
+type dockerPruneRunner struct {
+	calls      [][]string
+	listOutput string
+}
+
+func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	d.calls = append(d.calls, args)
+	if args[0] == "ps" {
+		return []byte(d.listOutput), nil, nil
+	}
+	return nil, nil, nil
+}
+
+func TestDockerPruneRemovesExitedAndDeadOnly(t *testing.T) {
+	f := &dockerPruneRunner{listOutput: "exited\ndead\n"}
+
+	removed, err := pruneWith(context.Background(), f, dockerEngine{})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if want := []string{"exited", "dead"}; !slices.Equal(removed, want) {
+		t.Fatalf("removed = %v, want %v", removed, want)
+	}
+
+	var deleted []string
+	for _, call := range f.calls {
+		if call[0] == "rm" {
+			deleted = append(deleted, call[len(call)-1])
+		}
+	}
+	if want := []string{"exited", "dead"}; !slices.Equal(deleted, want) {
+		t.Errorf("deleted = %v, want %v", deleted, want)
 	}
 }
 

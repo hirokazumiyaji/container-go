@@ -65,11 +65,13 @@ func (appleEngine) directIP() bool { return true }
 // architecture and only accepts variants defined for that architecture.
 func validateApplePlatform(platform string) error {
 	parts := strings.Split(platform, "/")
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+	if len(parts) < 2 || len(parts) > 3 {
 		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
 	}
-	if len(parts) > 3 || (len(parts) == 3 && parts[2] == "") {
-		return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+	for _, part := range parts {
+		if part == "" {
+			return fmt.Errorf("invalid platform %q for Apple backend: expected os/arch[/variant]", platform)
+		}
 	}
 	if parts[0] != "linux" {
 		return fmt.Errorf("apple backend supports only linux platforms, got %q", platform)
@@ -115,11 +117,13 @@ type applePlatform struct {
 // and x86 aliases default to no variant.
 func parseApplePlatformSelector(platform string) (applePlatform, bool) {
 	parts := strings.Split(platform, "/")
-	if len(parts) < 2 || len(parts) > 3 || parts[0] == "" || parts[1] == "" {
+	if len(parts) < 2 || len(parts) > 3 {
 		return applePlatform{}, false
 	}
-	if len(parts) == 3 && parts[2] == "" {
-		return applePlatform{}, false
+	for _, part := range parts {
+		if part == "" {
+			return applePlatform{}, false
+		}
 	}
 
 	variant := ""
@@ -160,12 +164,6 @@ func canonicalApplePlatform(osName, architecture, variant string) applePlatform 
 		p.architecture = "arm"
 	}
 	return p
-}
-
-func applePlatformsEqual(want, have applePlatform) bool {
-	return want.os == have.os &&
-		want.architecture == have.architecture &&
-		want.variant == have.variant
 }
 
 // checkConfig applies the parts of Apple Container's CLI contract that are
@@ -240,6 +238,7 @@ func appleMemoryBytes(size string) (uint64, error) {
 
 	digits := size
 	multiplier := uint64(1)
+	// memoryRE has already restricted the optional suffix to K/M/G/T/P.
 	if last := size[len(size)-1]; last < '0' || last > '9' {
 		digits = size[:len(size)-1]
 		switch last {
@@ -253,8 +252,6 @@ func appleMemoryBytes(size string) (uint64, error) {
 			multiplier = 1 << 40
 		case 'P':
 			multiplier = 1 << 50
-		default:
-			return 0, fmt.Errorf("invalid Apple memory unit in %q", size)
 		}
 	}
 
@@ -436,8 +433,7 @@ func (appleEngine) parseImageExists(data []byte, platform string) bool {
 			return true
 		}
 		for _, v := range img.Variants {
-			have := canonicalApplePlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant)
-			if applePlatformsEqual(want, have) {
+			if canonicalApplePlatform(v.Platform.Os, v.Platform.Architecture, v.Platform.Variant) == want {
 				return true
 			}
 		}

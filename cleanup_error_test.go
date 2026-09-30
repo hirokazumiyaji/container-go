@@ -102,7 +102,7 @@ func TestReviewFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
 	r := &cleanupErrRunner{
 		fakeRunner:  newTestRunner(),
 		failInspect: true,
-		inspectErr:  &cli.CLIError{Args: []string{"inspect"}, ExitCode: 1, Stderr: "No such container: myctr"},
+		inspectErr:  &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "Error: container not found: myctr"},
 	}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -297,7 +297,7 @@ func (r *reuseRollbackCleanupRunner) Run(ctx context.Context, args ...string) ([
 		if first {
 			// The adoption probe: not there yet, so a create follows.
 			return nil, nil, &cli.CLIError{
-				Args: args, ExitCode: 1, Stderr: "No such container: " + args[len(args)-1],
+				Args: args, ExitCode: 1, Stderr: "Error: container not found: " + args[len(args)-1],
 			}
 		}
 		name := args[len(args)-1]

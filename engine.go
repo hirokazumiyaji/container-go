@@ -6,6 +6,14 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+type inspectTargetNotFoundError struct {
+	id string
+}
+
+func (e *inspectTargetNotFoundError) Error() string {
+	return "container " + e.id + " not in inspect output"
+}
+
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
 	state  State
@@ -69,6 +77,9 @@ type engine interface {
 	// nameConflict reports whether a failed run means the container
 	// name is already taken by another create.
 	nameConflict(err error) bool
+	// containerMissing reports whether a command-specific backend
+	// response means that the addressed container does not exist.
+	containerMissing(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
 	// runs as `<binary> <subcommand> --force <id>`.
 	reaperSubcommand() string

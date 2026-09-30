@@ -2,7 +2,6 @@ package container
 
 import (
 	"encoding/json"
-	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -22,20 +21,21 @@ import (
 type dockerEngine struct{}
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
-// Stderr substrings below are matched case-insensitively on CLIError.Stderr.
+// Matchers are command- and binary-aware. Docker's inspect path uses
+// "no such object", while exec/stop/rm/logs use "no such container".
+// Generic application/configuration wording is deliberately not a match.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
 //   - image missing: "Error response from daemon: No such image: …"
-//   - container missing: "error: no such object: …" (also historically
-//     "No such container" / "not found")
+//   - inspect missing: "error: no such object: …"
+//   - lifecycle missing: "Error response from daemon: No such container: …"
+//   - Windows daemon down: "error during connect: open \\.\pipe\docker_engine: The system cannot find the file specified."
 const (
-	dockerStderrConflict     = "conflict"
-	dockerStderrAlreadyInUse = "already in use"
-	dockerStderrName         = "name"
-	dockerStderrNoSuchImage  = "no such image"
-	dockerStderrNotFound     = "not found"
-	dockerStderrNoSuchObj    = "no such object"
-	dockerStderrNoSuchCtr    = "no such container"
+	dockerStderrConflict     = "conflict. the container name "
+	dockerStderrAlreadyInUse = "already in use by container"
+	dockerStderrNoSuchImage  = "no such image:"
+	dockerStderrNoSuchObj    = "no such object:"
+	dockerStderrNoSuchCtr    = "no such container:"
 )
 
 func (dockerEngine) name() string   { return "docker" }
@@ -62,9 +62,55 @@ func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
 	return cli.Probe{
-		Args: []string{"version", "--format", "{{.Server.Version}}"},
-		Hint: "start the Docker daemon",
+		Args:          []string{"version", "--format", "{{.Server.Version}}"},
+		Hint:          "start the Docker daemon",
+		IsUnavailable: dockerProbeUnavailable,
 	}
+}
+
+func dockerProbeUnavailable(err error) bool {
+	text, ok := backendCLIErrorText(err, "docker", "version")
+	if !ok {
+		return false
+	}
+	// A reachable daemon can fail the client for TLS, certificate, SSH,
+	// proxy, authentication, or endpoint-configuration reasons. None of
+	// those failures prove that the daemon is stopped.
+	if cli.IsProbeConfigurationError(err) {
+		return false
+	}
+	if dockerWindowsNpipeUnavailable(text) {
+		return true
+	}
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"docker desktop is unable to start",
+		"connection refused",
+	} {
+		if strings.Contains(text, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+// Windows reports a stopped daemon as a missing named pipe rather than a
+// refused connection, so "error during connect" on its own is not usable
+// evidence: the same prefix introduces TLS, SSH, and proxy failures.
+// Require both halves of the real diagnostic instead — the Docker client's
+// own pipe namespace plus the OS error that opening it produced. Any other
+// pipe, or any other file-not-found, stays unclassified.
+func dockerWindowsNpipeUnavailable(text string) bool {
+	const missingFile = "the system cannot find the file specified"
+	if !strings.Contains(text, missingFile) {
+		return false
+	}
+	// Go's npipe package reports the forward-slash form while the Windows
+	// CLI spells the same path with backslashes.
+	normalized := strings.ReplaceAll(text, `\`, "/")
+	return strings.Contains(normalized, "//./pipe/docker") ||
+		strings.Contains(normalized, "getnamedpipeinfo")
 }
 
 // defaultHost returns the address the client should dial to reach the
@@ -268,7 +314,7 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	if len(containers) == 0 {
-		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
+		return nil, &inspectTargetNotFoundError{id: id}
 	}
 	c := containers[0]
 
@@ -403,9 +449,17 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 	return []string{"pull", image}
 }
 
-// imageMissing matches the daemon's response for an absent image.
+// imageMissing matches only Docker's image-inspect response. Pull errors
+// and arbitrary application output are not local-store absence evidence.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
+	ctx, ok := backendCLIError(err, "docker")
+	if !ok || ctx.operation != "image inspect" || !hasParsedCLITarget(ctx) {
+		return false
+	}
+	return hasCLIErrorLine(err, func(line string) bool {
+		rest, ok := strings.CutPrefix(line, dockerStderrNoSuchImage)
+		return ok && cliTargetListMatches(rest, ctx.target)
+	})
 }
 
 func (dockerEngine) parseImageExists(data []byte, _ string) bool {
@@ -428,36 +482,60 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 	return splitNonEmptyLines(data), nil
 }
 
-// nameConflict matches Docker's duplicate container name error.
+// nameConflict matches Docker's duplicate container name error on a
+// create/run command. A delete or application command containing the same
+// words is not evidence that this library lost a name race.
 func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
+	ctx, ok := backendCLIError(err, "docker")
+	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
-	return strings.Contains(s, dockerStderrConflict) ||
-		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
+	return hasCLIErrorLine(err, func(line string) bool {
+		return dockerNameConflictLine(line, ctx.target)
+	})
 }
 
-// containerMissing matches a CLI failure for an absent container.
+func dockerNameConflictLine(line, target string) bool {
+	if strings.TrimSpace(target) == "" || !strings.HasPrefix(line, dockerStderrConflict) ||
+		!strings.Contains(line, dockerStderrAlreadyInUse) {
+		return false
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, dockerStderrConflict))
+	if len(rest) < 2 || rest[0] != '"' {
+		return false
+	}
+	rest = rest[1:]
+	if end := strings.IndexByte(rest, '"'); end >= 0 {
+		rest = rest[:end]
+	}
+	return sameDockerContainerName(rest, target)
+}
+
+func sameDockerContainerName(got, want string) bool {
+	got = strings.TrimPrefix(strings.Trim(strings.TrimSpace(got), `"'`), "/")
+	want = strings.TrimPrefix(strings.Trim(strings.TrimSpace(want), `"'`), "/")
+	return strings.EqualFold(got, want)
+}
+
+// containerMissing matches Docker's command-specific absent-container
+// response. Docker uses "no such object" for inspect and "no such
+// container" for the lifecycle/stream commands.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
+	ctx, ok := backendCLIError(err, "docker")
+	if !ok || !hasParsedCLITarget(ctx) {
 		return false
 	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
-}
-
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
+	prefix := ""
+	switch ctx.operation {
+	case "inspect":
+		prefix = dockerStderrNoSuchObj
+	case "exec", "stop", "rm", "logs":
+		prefix = dockerStderrNoSuchCtr
+	default:
+		return false
 	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
+	return hasCLIErrorLine(err, func(line string) bool {
+		rest, ok := strings.CutPrefix(line, prefix)
+		return ok && cliTargetListMatches(rest, ctx.target)
+	})
 }

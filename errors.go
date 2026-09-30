@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -12,8 +13,8 @@ import (
 // an internal package.
 type CLIError = cli.CLIError
 
-// ErrSystemNotRunning reports that the Apple Container system service is
-// not running. Start it with `container system start`.
+// ErrSystemNotRunning reports that the selected container backend is not
+// running. Start the Apple service or Docker daemon as appropriate.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrPortNotExposed reports a port that was not declared via
@@ -30,24 +31,100 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// commandContextError returns a cancellation/deadline error that must veto
+// backend-derived success or absence verdicts. The error chain is checked in
+// addition to ctx.Err so a joined CommandRunError remains authoritative
+// even when a derived operation context has already been detached.
+func commandContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if err == nil {
+			return ctxErr
+		}
+		if errors.Is(err, ctxErr) {
+			return err
+		}
+		return errors.Join(err, ctxErr)
+	}
+	if isContextError(err) {
+		return err
+	}
+	return nil
+}
+
 // ErrGenerationReplaced reports that Terminate refused to delete because
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
 // isNotFound reports whether a CLI failure means the container does not
-// exist. Matching substrings live on each engine (see engine_*.go).
+// exist. It is retained for callers that do not have an engine context;
+// the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
+	if err == nil || isContextError(err) {
+		return false
+	}
 	if errors.Is(err, ErrContainerNotFound) {
 		return true
 	}
-	return appleEngine{}.containerMissing(err) || dockerEngine{}.containerMissing(err)
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	if cliErr.Binary != "" {
+		if cliBinaryMatches(cliErr.Binary, "docker") {
+			return (dockerEngine{}).containerMissing(err)
+		}
+		return (appleEngine{}).containerMissing(err)
+	}
+	// Empty Binary is the historical default `container` executable.
+	return (appleEngine{}).containerMissing(err)
+}
+
+// isNotFoundFor applies the selected backend's classifier. Keeping this
+// separate from isNotFound prevents a Docker error from being accepted by
+// an Apple operation (and vice versa) when callers do have engine context.
+func isNotFoundFor(eng engine, err error) bool {
+	if err == nil || isContextError(err) {
+		return false
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		return true
+	}
+	if eng == nil {
+		return isNotFound(err)
+	}
+	return eng.containerMissing(err)
 }
 
 // wrapNotFound converts a classified CLI not-found failure into
 // ErrContainerNotFound so errors.Is works from the root package.
 func wrapNotFound(err error) error {
-	if err == nil || !isNotFound(err) || errors.Is(err, ErrContainerNotFound) {
+	return wrapNotFoundFor(nil, err)
+}
+
+func wrapNotFoundFor(eng engine, err error) error {
+	if err == nil || !isNotFoundFor(eng, err) || errors.Is(err, ErrContainerNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+// classifyError applies the backend liveness contract, while refusing to
+// probe an ambiguous application message such as a generic "container not
+// found" from a run/exec process. The original CLIError is then returned
+// unchanged even if a runner would report its probe as unavailable.
+func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) error {
+	if err == nil {
+		return commandContextError(ctx, nil)
+	}
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return contextErr
+	}
+	if eng == nil || isAmbiguousApplicationError(eng, err) {
+		return err
+	}
+	return cli.Classify(ctx, r, err, eng.probe())
 }

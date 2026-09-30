@@ -1,0 +1,130 @@
+[
+  {
+    "name": "name_conflict",
+    "operation": "run",
+    "stderr": "Error: exists: \"container with id myctr already exists\"",
+    "nameConflict": true,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "image_missing",
+    "operation": "image inspect",
+    "stderr": "Error: notFound: \"image not found: redis:7-alpine\"",
+    "nameConflict": false,
+    "imageMissing": true,
+    "containerMissing": false
+  },
+  {
+    "name": "container_missing_inspect",
+    "operation": "inspect",
+    "stderr": "Error: notFound: \"container not found: myctr\"",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_exec",
+    "operation": "exec",
+    "stderr": "Error: notFound: \"get failed: container myctr not found\"",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_stop",
+    "operation": "stop",
+    "stderr": "Error: internalError: \"failed to stop container\" (cause: \"notFound: \"container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_delete",
+    "operation": "delete",
+    "stderr": "Error: internalError: \"failed to delete container\" (cause: \"notFound: \"container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause_get_failed",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: get failed: container myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs_open_cause_wrong_target",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \"failed to open container logs: container with ID other not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "container_missing_logs_wrong_root_target",
+    "operation": "logs",
+    "stderr": "Error: internalError: \"failed to get logs for container other\" (cause: \"notFound: \"failed to open container logs: container with ID myctr not found\"\")",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_logs_open_failure_on_logs",
+    "operation": "logs",
+    "stderr": "Error: application: failed to open container logs: container with ID myctr not found",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_container_not_found_on_run",
+    "operation": "run",
+    "stderr": "Error: application: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_container_not_found_on_delete",
+    "operation": "delete",
+    "stderr": "Error: application: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_containerization_envelope_on_run",
+    "operation": "run",
+    "stderr": "Error: unknown: \"application: container not found: myctr\"",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "docker_wording_on_apple",
+    "operation": "inspect",
+    "stderr": "Error response from daemon: No such container: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  }
+]

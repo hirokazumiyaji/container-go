@@ -82,67 +82,157 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	// A canceled ExecRunner can join a command exit with the caller
+	// context. Preserve both but prioritize cancellation as an API error;
+	// otherwise the exit code could be mistaken for a workload result or
+	// an object-absence diagnostic.
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return 0, nil, contextErr
+	}
 	if err == nil {
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
-	if !isNotFound(err) && !maybeInfraExecErr(err) {
+	if !isNotFoundFor(c.eng, err) && !maybeInfraExecErr(c.eng, err) {
+		if contextErr := commandContextError(ctx, nil); contextErr != nil {
+			return 0, nil, errors.Join(err, contextErr)
+		}
 		return cliErr.ExitCode, output, nil
 	}
-	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, output, nil
+	inspection := c.inspectExecTarget(ctx)
+	// Verification uses a derived timeout. Recheck the caller and returned
+	// inspection chain so cancellation remains authoritative at this boundary.
+	if contextErr := commandContextError(ctx, inspection.err); contextErr != nil {
+		return 0, nil, errors.Join(err, contextErr)
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	switch inspection.state {
+	case execTargetRunning:
+		if contextErr := commandContextError(ctx, nil); contextErr != nil {
+			return 0, nil, errors.Join(err, contextErr)
+		}
+		return cliErr.ExitCode, output, nil
+	case execTargetNotFound:
+		cause := error(err)
+		if inspection.err != nil {
+			cause = errors.Join(err, inspection.err)
+		}
+		return 0, nil, fmt.Errorf("%w: %w", ErrContainerNotFound, cause)
+	case execTargetStopped:
+		return 0, nil, err
+	default:
+		inspectErr := inspection.err
+		if maybeInfraInspectErr(c.eng, inspectErr) {
+			inspectErr = c.classify(ctx, inspectErr)
+		}
+		return 0, nil, errors.Join(err, inspectErr)
+	}
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
-func maybeInfraExecErr(err error) bool {
-	s, ok := execCLIStderr(err)
+func maybeInfraExecErr(eng engine, err error) bool {
+	ctx, ok := backendCLIError(err, eng.binary())
+	if !ok || ctx.operation != "exec" {
+		return false
+	}
+	lines, ok := cliErrorLines(err)
 	if !ok {
 		return true
 	}
-	for _, sub := range []string{
-		"daemon", "cannot connect", "connection refused", "xpc",
-		"backend", "socket", "is not running", "not running",
-		"stopped", "paused", "restarting", "removing", "no such",
-	} {
-		if strings.Contains(s, sub) {
-			return true
+	for _, line := range lines {
+		for _, sub := range []string{
+			"daemon", "cannot connect", "connection refused", "xpc",
+			"backend", "socket", "system is not running", "is not running",
+			"stopped", "paused", "restarting", "removing",
+		} {
+			if strings.Contains(line, sub) {
+				return true
+			}
 		}
 	}
 	return false
 }
 
-func execCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
+// maybeInfraInspectErr reports whether a failed verification inspect still
+// carries backend-reachability evidence worth classifying. Object mismatch,
+// application, parse, TLS, and endpoint-configuration errors are not probe
+// failures and remain ordinary diagnostic errors.
+func maybeInfraInspectErr(eng engine, err error) bool {
+	if cli.IsProbeConfigurationError(err) {
+		return false
 	}
-	return strings.ToLower(cliErr.Stderr), true
+	ctx, ok := backendCLIError(err, eng.binary())
+	if !ok || ctx.operation != "inspect" {
+		return false
+	}
+	lines, ok := cliErrorLines(err)
+	if !ok {
+		return true
+	}
+	for _, line := range lines {
+		for _, sub := range []string{
+			"daemon", "cannot connect", "connection refused", "xpc",
+			"backend", "socket", "system is not running", "is not running",
+		} {
+			if strings.Contains(line, sub) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context) bool {
+type execTargetState uint8
+
+const (
+	execTargetInspectionFailed execTargetState = iota
+	execTargetRunning
+	execTargetStopped
+	execTargetNotFound
+)
+
+type execTargetInspection struct {
+	state execTargetState
+	err   error
+}
+
+// inspectExecTarget distinguishes a reachable running/stopped target from
+// a target-matched absence and from an inspect failure. A TLS, parsing, or
+// application error is never collapsed into "not found".
+func (c *Container) inspectExecTarget(ctx context.Context) execTargetInspection {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return execTargetInspection{state: execTargetInspectionFailed, err: contextErr}
+	}
 	if err != nil {
-		return false
+		if !cli.IsProbeConfigurationError(err) && isNotFoundFor(c.eng, err) {
+			return execTargetInspection{state: execTargetNotFound, err: err}
+		}
+		return execTargetInspection{state: execTargetInspectionFailed, err: err}
 	}
 	info, err := c.eng.parseInspect(stdout, c.id)
-	if err != nil {
-		return false
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return execTargetInspection{state: execTargetInspectionFailed, err: contextErr}
 	}
-	return info.state == StateRunning
+	if err != nil {
+		var missing *inspectTargetNotFoundError
+		if errors.As(err, &missing) && missing.id == c.id {
+			return execTargetInspection{state: execTargetNotFound, err: err}
+		}
+		return execTargetInspection{state: execTargetInspectionFailed, err: err}
+	}
+	if info.state == StateRunning {
+		return execTargetInspection{state: execTargetRunning}
+	}
+	return execTargetInspection{state: execTargetStopped}
 }

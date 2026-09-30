@@ -145,6 +145,91 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 }
 
+func TestDockerProbeUnavailableFailsClosedForConfiguration(t *testing.T) {
+	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
+	cases := []struct {
+		name   string
+		stderr string
+		want   bool
+	}{
+		{
+			name:   "daemon unavailable",
+			stderr: "Cannot connect to the Docker daemon. Is the docker daemon running?",
+			want:   true,
+		},
+		{
+			name:   "connection refused",
+			stderr: "dial unix /var/run/docker.sock: connect: connection refused",
+			want:   true,
+		},
+		{
+			name:   "windows named pipe missing",
+			stderr: "error during connect: open //./pipe/docker_engine: The system cannot find the file specified.",
+			want:   true,
+		},
+		{
+			name:   "windows named pipe missing backslash spelling",
+			stderr: `error during connect: open \\.\pipe\dockerDesktopLinuxEngine: The system cannot find the file specified.`,
+			want:   true,
+		},
+		{
+			name:   "windows named pipe state missing",
+			stderr: "error during connect: GetNamedPipeInfo: The system cannot find the file specified.",
+			want:   true,
+		},
+		{
+			name:   "windows file missing outside the docker pipe namespace",
+			stderr: "error during connect: open C:/ProgramData/docker/config: The system cannot find the file specified.",
+			want:   false,
+		},
+		{
+			name:   "windows other pipe missing",
+			stderr: "error during connect: open //./pipe/otherdaemon: The system cannot find the file specified.",
+			want:   false,
+		},
+		{
+			name:   "broad connect alone",
+			stderr: "error during connect",
+			want:   false,
+		},
+		{
+			name:   "unknown certificate authority",
+			stderr: "error during connect: x509: certificate signed by unknown authority",
+			want:   false,
+		},
+		{
+			name:   "TLS failure",
+			stderr: "error during connect: tls: failed to verify certificate",
+			want:   false,
+		},
+		{
+			name:   "SSH failure",
+			stderr: "error during connect: ssh: handshake failed",
+			want:   false,
+		},
+		{
+			name:   "proxy failure",
+			stderr: "error during connect: proxyconnect tcp: connection refused",
+			want:   false,
+		},
+		{
+			name:   "configuration failure",
+			stderr: "error during connect: invalid configuration for current context",
+			want:   false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := &cli.CLIError{
+				Binary: "docker", Args: probeArgs, ExitCode: 1, Stderr: tc.stderr,
+			}
+			if got := dockerProbeUnavailable(err); got != tc.want {
+				t.Fatalf("dockerProbeUnavailable(%q) = %v, want %v", tc.stderr, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {

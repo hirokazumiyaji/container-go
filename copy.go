@@ -46,6 +46,9 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return contextErr
+	}
 	return c.classify(ctx, err)
 }
 
@@ -67,7 +70,14 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
+		if contextErr := commandContextError(qCtx, err); contextErr != nil {
+			return nil, contextErr
+		}
 		return nil, c.classify(ctx, err)
+	}
+	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
+		_ = os.RemoveAll(dir)
+		return nil, contextErr
 	}
 	info, err := os.Stat(dst)
 	if err != nil {

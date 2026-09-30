@@ -65,15 +65,12 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 	for {
 		if err := ctx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, reuseContextError(cfg.name, err)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
+			if !isNotFoundFor(cfg.eng, err) {
 				return nil, err
 			}
 			// Creation carries its own runTimeout budget detached from
@@ -88,7 +85,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
-				time.Sleep(reusePollInterval)
+				if err := waitReusePoll(ctx); err != nil {
+					return nil, reuseContextError(cfg.name, err)
+				}
 				continue
 			}
 			return nil, createErr
@@ -96,7 +95,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, reuseContextError(cfg.name, err)
+			}
 			continue
 		case StateStopped:
 			if recreated {
@@ -125,8 +126,28 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				uid:       info.uid,
 			}, nil
 		default:
-			time.Sleep(reusePollInterval)
+			if err := waitReusePoll(ctx); err != nil {
+				return nil, reuseContextError(cfg.name, err)
+			}
 		}
+	}
+}
+
+func reuseContextError(name string, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, err)
+	}
+	return err
+}
+
+func waitReusePoll(ctx context.Context) error {
+	timer := time.NewTimer(reusePollInterval)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
 	}
 }
 
@@ -152,8 +173,16 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, err
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
+	if contextErr := commandContextError(runCtx, err); contextErr != nil {
+		if err == nil {
+			if cleanupErr := cleanupFailedCreate(ctx, cfg, nil, contextErr); cleanupErr != nil {
+				return nil, withCleanupError(contextErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+			}
+		}
+		return nil, contextErr
+	}
 	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		classified := classifyError(ctx, cfg.runner, err, cfg.eng)
 		if cfg.eng.nameConflict(err) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(err) || createRaceMissing(classified) {
 			// Leave attach/retry to reuseEnsureContainer; do not delete
@@ -183,6 +212,12 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
 			return nil, ctr.rollback(ctx, err)
 		}
+	}
+	if contextErr := commandContextError(runCtx, nil); contextErr != nil {
+		if cleanupErr := ctr.Terminate(context.WithoutCancel(ctx)); cleanupErr != nil {
+			return nil, errors.Join(contextErr, fmt.Errorf("cleanup reused failed create: %w", cleanupErr))
+		}
+		return nil, contextErr
 	}
 	return ctr, nil
 }
@@ -230,19 +265,38 @@ func namedContainer(cfg *config, id string) *Container {
 	}
 }
 
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
+// createRaceMissing reports only Apple's anchored concurrent-create form:
+// a run command that reaches bootstrap and then loses the named object.
+// Generic "container not found" output is deliberately excluded because
+// it is commonly emitted by the application process and must remain an
+// ordinary original error.
 func createRaceMissing(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	ctx, ok := backendCLIError(err, "container")
+	if !ok || ctx.operation != "run" || !hasParsedCLITarget(ctx) {
 		return false
 	}
-	s := strings.ToLower(cliErr.Stderr)
-	if strings.Contains(s, "container with id") && strings.Contains(s, "not found") {
+	if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+		return message == "failed to bootstrap container" || message == "failed to run container"
+	}, "notfound", func(message string) bool {
+		return appleIDMissingLine(message, ctx.target)
+	}) {
 		return true
 	}
-	return strings.Contains(s, "container not found")
+	return hasCLIErrorLine(err, func(line string) bool {
+		if appleIDMissingLine(line, ctx.target) {
+			return true
+		}
+		for _, wrapper := range []string{
+			"failed to bootstrap container:",
+			"failed to run container:",
+		} {
+			rest, found := strings.CutPrefix(line, wrapper)
+			if found && appleIDMissingLine(strings.TrimSpace(rest), ctx.target) {
+				return true
+			}
+		}
+		return false
+	})
 }
 
 // checkReuseOwned reports whether a stopped container may be deleted

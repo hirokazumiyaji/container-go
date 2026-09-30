@@ -32,7 +32,7 @@ Go のテストコードから使い捨てのコンテナを起動し、接続�
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。
 - `--rm` で削除しても匿名ボリュームは残る。
-- エラー分類は `engine_apple.go` が持つ CLI stderr 部分文字列に依存する(名前衝突、image/container missing)。ライブ CLI に対する回帰は `cli_compat_integration_test.go` で確認する。
+- エラー分類は `engine_apple.go` と `engine_docker.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。
 
 ## 実現方式の選定
 

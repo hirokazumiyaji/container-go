@@ -47,8 +47,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 		args = append(args[:len(args)-1], append(extra, args[len(args)-1])...)
 	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	// docker logs splits the container's streams across the CLI's
 	// stdout and stderr; a snapshot carries both.
@@ -63,5 +66,12 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		if stream != nil {
+			_ = stream.Close()
+		}
+		return nil, contextErr
+	}
+	return stream, err
 }

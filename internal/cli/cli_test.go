@@ -1,10 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -129,6 +133,44 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
 	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want joined *CLIError", err)
+	}
+	if cliErr.ExitCode == 0 || !slices.Equal(cliErr.Args, []string{"logs", "--follow", "x"}) {
+		t.Errorf("CLIError exit/args = %d %v", cliErr.ExitCode, cliErr.Args)
+	}
+}
+
+func TestCommandRunErrorCancellationRacePreservesExitAndContext(t *testing.T) {
+	binary := writeStub(t, `echo cancel-race >&2; exit 7`)
+	cmd := exec.Command(binary)
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	exitErr := cmd.Run()
+	if exitErr == nil {
+		t.Fatal("stub command unexpectedly succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := commandRunError(ctx, binary, []string{"exec", "myctr", "query"}, stderr.Bytes(), exitErr)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context cancellation", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want joined *CLIError", err)
+	}
+	if cliErr.ExitCode != 7 {
+		t.Errorf("ExitCode = %d, want 7", cliErr.ExitCode)
+	}
+	if cliErr.Binary != binary || !slices.Equal(cliErr.Args, []string{"exec", "myctr", "query"}) {
+		t.Errorf("CLIError command = %q %v", cliErr.Binary, cliErr.Args)
+	}
+	if !strings.Contains(cliErr.Stderr, "cancel-race") {
+		t.Errorf("Stderr = %q, want command diagnostic", cliErr.Stderr)
+	}
 }
 
 func TestCLIErrorIncludesBinaryName(t *testing.T) {
@@ -175,7 +217,7 @@ var appleProbe = Probe{Args: []string{"system", "status"}, Hint: "run `container
 func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "XPC connection error"}
 	r := &fakeRunner{results: map[string]fakeResult{
-		"system status": {err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1}},
+		"system status": {err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}},
 	}}
 
 	err := Classify(context.Background(), r, orig, appleProbe)
@@ -191,7 +233,7 @@ func TestClassifyUsesProbeSpecificHint(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
 	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
 	r := &fakeRunner{results: map[string]fakeResult{
-		strings.Join(probeArgs, " "): {err: &CLIError{Args: probeArgs, ExitCode: 1}},
+		strings.Join(probeArgs, " "): {err: &CLIError{Args: probeArgs, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}},
 	}}
 
 	err := Classify(context.Background(), r, orig, Probe{Args: probeArgs, Hint: "start the Docker daemon"})
@@ -215,6 +257,280 @@ func TestClassifyKeepsOriginalErrorWhenSystemIsRunning(t *testing.T) {
 	}
 	if errors.Is(err, ErrSystemNotRunning) {
 		t.Error("error wrongly classified as ErrSystemNotRunning")
+	}
+}
+
+func TestClassifyPreservesNonLivenessOriginalAndProbeErrors(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "permission denied: image config rejected"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and probe errors", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatal("permission failure was classified as daemon down")
+	}
+	var gotCLI *CLIError
+	if !errors.As(got, &gotCLI) || gotCLI != orig {
+		t.Fatalf("errors.As(*CLIError) = %v, want original CLIError", gotCLI)
+	}
+}
+
+func TestClassifyDoesNotCallAmbiguousMissingDaemonDown(t *testing.T) {
+	orig := &CLIError{Args: []string{"run", "--name", "ctr"}, ExitCode: 1, Stderr: "container not found: ctr"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want both errors", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatal("ambiguous missing message was classified as daemon down")
+	}
+}
+
+func TestClassifyUsesProbePredicateAndPreservesChains(t *testing.T) {
+	orig := &CLIError{Args: []string{"inspect", "ctr"}, ExitCode: 1, Stderr: "command failed"}
+	probeErr := &CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "transport unavailable"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"version": {err: probeErr},
+	}}
+	probe := Probe{
+		Args: []string{"version"}, Hint: "start the daemon",
+		IsUnavailable: func(error) bool { return true },
+	}
+
+	got := Classify(context.Background(), r, orig, probe)
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want both errors", got)
+	}
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, want sentinel from explicit probe predicate", got)
+	}
+}
+
+func TestClassifyExplicitProbePredicateOverridesBroadOriginalConfigurationText(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "configuration changed while the command was running"}
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+	probe := appleProbe
+	probe.IsUnavailable = func(error) bool { return true }
+
+	got := Classify(context.Background(), r, orig, probe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, want authoritative probe sentinel", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and probe errors", got)
+	}
+}
+
+// CLIError.Error() embeds the argv the caller supplied, so a container or
+// image named "tls" would otherwise veto ErrSystemNotRunning. The
+// diagnostics that drive that decision must come from the stderr the CLI
+// actually wrote.
+func TestProbeClassificationIgnoresCallerSuppliedArgv(t *testing.T) {
+	for _, name := range []string{"tls", "proxy", "certificate", "x509", "ssh", "config", "credential"} {
+		t.Run(name, func(t *testing.T) {
+			orig := &CLIError{
+				Args: []string{"logs", "-n", "1000", name}, ExitCode: 1,
+				Stderr: "XPC connection error: service is not registered",
+			}
+			if IsProbeConfigurationError(orig) {
+				t.Fatalf("target %q was read as a configuration diagnostic", name)
+			}
+			probeErr := &CLIError{
+				Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error",
+			}
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+
+			got := Classify(context.Background(), r, orig, appleProbe)
+			if !errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, want sentinel for target %q", got, name)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+				t.Fatalf("classified error = %v, want original and probe chains", got)
+			}
+		})
+	}
+}
+
+// Excluding argv must not exclude real transport diagnostics that reach the
+// same predicates through stderr, joined branches, or captured probe output.
+func TestProbeConfigurationDetectionSurvivesArgvExclusion(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+	}{
+		{
+			name: "stderr",
+			err: &CLIError{
+				Args: []string{"version"}, ExitCode: 1,
+				Stderr: "x509: certificate signed by unknown authority",
+			},
+		},
+		{
+			name: "joined branch",
+			err: errors.Join(
+				&CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "connect failed"},
+				errors.New("tls: failed to verify certificate"),
+			),
+		},
+		{
+			name: "wrapped non-CLI cause",
+			err:  fmt.Errorf("probe instrumentation: %w", errors.New("proxyconnect tcp: connection refused")),
+		},
+		{
+			name: "captured probe output",
+			err: withProbeOutput(
+				&CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: "connect failed"},
+				nil, []byte("x509: certificate signed by unknown authority"),
+			),
+		},
+		{
+			name: "wrapped CLIError",
+			err: fmt.Errorf("runner: %w", &CLIError{
+				Args: []string{"version"}, ExitCode: 1,
+				Stderr: "error during connect: invalid configuration for current context",
+			}),
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if !IsProbeConfigurationError(tc.err) {
+				t.Fatalf("IsProbeConfigurationError(%v) = false, want true", tc.err)
+			}
+			if !isNonLivenessError(tc.err) {
+				t.Fatalf("isNonLivenessError(%v) = false, want true", tc.err)
+			}
+		})
+	}
+}
+
+// Wrapper-authored text is library or instrumentation output, not caller
+// argv, so it stays in the collected diagnostics.
+func TestDiagnosticTextKeepsWrapperAndJoinedWording(t *testing.T) {
+	cliErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "status failed"}
+	text := diagnosticText(fmt.Errorf("runner: %w", errors.Join(
+		fmt.Errorf("probe instrumentation: %w", errors.New("cannot connect to backend")),
+		cliErr,
+	)))
+	if !strings.Contains(text, "cannot connect to backend") {
+		t.Fatalf("diagnosticText() = %q, want joined liveness wording", text)
+	}
+	if strings.Contains(text, "system status") {
+		t.Fatalf("diagnosticText() = %q, want CLIError argv excluded", text)
+	}
+}
+
+func TestDefaultProbeUnavailableInspectsCompleteJoinedError(t *testing.T) {
+	cliErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "status failed"}
+	joined := errors.Join(
+		fmt.Errorf("probe instrumentation: %w", errors.New("cannot connect to backend")),
+		cliErr,
+	)
+	wrapped := fmt.Errorf("runner: %w", joined)
+
+	if !defaultProbeUnavailable(wrapped) {
+		t.Fatal("wrapped joined liveness evidence was not classified")
+	}
+	if defaultProbeUnavailable(errors.New("cannot connect to backend")) {
+		t.Fatal("plain application error without CLI evidence was classified")
+	}
+}
+
+func TestClassifyRejectsProbeConfigurationBeforeExplicitPredicate(t *testing.T) {
+	diagnostics := []string{
+		"error during connect: x509: certificate signed by unknown authority",
+		"error during connect: tls: failed to verify certificate",
+		"error during connect: proxyconnect tcp: connection refused",
+		"error during connect: ssh: handshake failed",
+		"error during connect: invalid configuration for current context",
+		"error during connect: authentication required",
+	}
+	for _, diagnostic := range diagnostics {
+		t.Run(diagnostic, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+			cliProbeErr := &CLIError{Args: []string{"version"}, ExitCode: 1, Stderr: diagnostic}
+			probeErr := errors.Join(cliProbeErr, errors.New("runner attached context"))
+			r := &fakeRunner{results: map[string]fakeResult{
+				"version": {err: probeErr},
+			}}
+			probe := Probe{
+				Args: []string{"version"}, Hint: "start the daemon",
+				IsUnavailable: func(error) bool { return true },
+			}
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, configuration failure marked daemon down", got)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, cliProbeErr) {
+				t.Fatalf("classified error = %v, want original and probe chains", got)
+			}
+		})
+	}
+}
+
+func TestClassifyJoinedProbeConfigurationVetoesJoinedLivenessText(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	cliProbeErr := &CLIError{
+		Args: []string{"version"}, ExitCode: 1,
+		Stderr: "cannot connect to the docker daemon",
+	}
+	probeErr := errors.Join(cliProbeErr, errors.New("x509: certificate signed by unknown authority"))
+	r := &fakeRunner{results: map[string]fakeResult{
+		"version": {err: probeErr},
+	}}
+	probe := Probe{
+		Args: []string{"version"}, Hint: "start the daemon",
+		IsUnavailable: func(error) bool { return true },
+	}
+
+	got := Classify(context.Background(), r, orig, probe)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, joined configuration branch was ignored", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, cliProbeErr) {
+		t.Fatalf("classified error = %v, want original and probe chains", got)
+	}
+}
+
+func TestClassifyExplicitProbePredicateDoesNotOverrideDefinitiveOriginalFailure(t *testing.T) {
+	cases := []string{
+		"permission denied while opening the backend endpoint",
+		"invalid context: production does not exist",
+		"operation canceled by the caller",
+	}
+	for _, stderr := range cases {
+		t.Run(stderr, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: stderr}
+			probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, definitive original failure marked daemon down", got)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+				t.Fatalf("classified error = %v, want original and probe errors", got)
+			}
+		})
 	}
 }
 
@@ -253,6 +569,184 @@ func TestClassifyProbeTimesOut(t *testing.T) {
 	}
 }
 
+type definiteErrorAtProbeDeadlineRunner struct {
+	err *CLIError
+}
+
+func (r *definiteErrorAtProbeDeadlineRunner) Run(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+	<-ctx.Done()
+	return nil, nil, r.err
+}
+
+func TestClassifyDoesNotTreatExpiredProbeContextAsReturnedTimeout(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	probeErr := &CLIError{
+		Args: []string{"system", "status"}, ExitCode: 1,
+		Stderr: "permission denied: configuration cannot be loaded",
+	}
+	start := time.Now()
+	got := Classify(context.Background(), &definiteErrorAtProbeDeadlineRunner{err: probeErr}, orig, appleProbe)
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("Classify took %v, want finite probe timeout", elapsed)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, probe context state raced a definite failure", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and returned probe error", got)
+	}
+}
+
+func TestClassifyReturnedTimeoutRequiresOnlyTimeoutOrCommandExitCauses(t *testing.T) {
+	causes := []struct {
+		name  string
+		cause error
+	}{
+		{name: "permission", cause: os.ErrPermission},
+		{name: "cancellation", cause: context.Canceled},
+		{name: "configuration", cause: errors.New("x509: certificate signed by unknown authority")},
+	}
+	for _, tc := range causes {
+		t.Run(tc.name, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+			probeErr := errors.Join(context.DeadlineExceeded, tc.cause)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, joined non-timeout cause was ignored", got)
+			}
+			if !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, tc.cause) {
+				t.Fatalf("classified error = %v, want timeout and joined cause", got)
+			}
+		})
+	}
+
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	probeErr := errors.Join(
+		context.DeadlineExceeded,
+		fmt.Errorf("wrapped probe timeout: %w", context.DeadlineExceeded),
+	)
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, pure joined timeout should be liveness", got)
+	}
+}
+
+func TestClassifyJoinedCLIErrorAndDeadlineUsesTimeoutLiveness(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+	probeErr := &CLIError{
+		Args: []string{"system", "status"}, ExitCode: 1, Stderr: "probe command timed out",
+	}
+	returned := errors.Join(probeErr, context.DeadlineExceeded)
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: returned},
+	}}
+
+	got := Classify(context.Background(), r, orig, appleProbe)
+	if !errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, want ErrSystemNotRunning from definitive timeout", got)
+	}
+	for _, cause := range []error{orig, probeErr, context.DeadlineExceeded} {
+		if !errors.Is(got, cause) {
+			t.Fatalf("classified error = %v, want chain %v", got, cause)
+		}
+	}
+}
+
+func TestClassifyJoinedCLIErrorAndDeadlineStillVetoesNonLiveness(t *testing.T) {
+	diagnostics := []string{
+		"permission denied while opening the endpoint",
+		"proxy configuration is invalid",
+		"tls certificate verification failed",
+		"context canceled by the probe",
+	}
+	for _, diagnostic := range diagnostics {
+		t.Run(diagnostic, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command failed"}
+			probeErr := &CLIError{
+				Args: []string{"system", "status"}, ExitCode: 1, Stderr: diagnostic,
+			}
+			returned := errors.Join(probeErr, context.DeadlineExceeded)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: returned},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, non-liveness diagnostic marked daemon down", got)
+			}
+			if !errors.Is(got, orig) || !errors.Is(got, probeErr) || !errors.Is(got, context.DeadlineExceeded) {
+				t.Fatalf("classified error = %v, want original, probe, and timeout chains", got)
+			}
+		})
+	}
+}
+
+func TestClassifyTimeoutTextVetoesConfigurationAndPermission(t *testing.T) {
+	diagnostics := []string{
+		"configuration load failed",
+		"permission denied",
+		"proxy connection failed",
+		"tls certificate verification failed",
+	}
+	for _, diagnostic := range diagnostics {
+		t.Run(diagnostic, func(t *testing.T) {
+			orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+			probeErr := fmt.Errorf("%s: %w", diagnostic, context.DeadlineExceeded)
+			r := &fakeRunner{results: map[string]fakeResult{
+				"system status": {err: probeErr},
+			}}
+			probe := appleProbe
+			probe.IsUnavailable = func(error) bool { return true }
+
+			got := Classify(context.Background(), r, orig, probe)
+			if errors.Is(got, ErrSystemNotRunning) {
+				t.Fatalf("classified error = %v, timeout text was ignored", got)
+			}
+			if !errors.Is(got, context.DeadlineExceeded) || !strings.Contains(got.Error(), diagnostic) {
+				t.Fatalf("classified error = %v, want timeout and diagnostic", got)
+			}
+		})
+	}
+}
+
+func TestClassifyPreservesCallerCancellationDuringPredicate(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	probeErr := &CLIError{
+		Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error",
+	}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	probe := appleProbe
+	probe.IsUnavailable = func(error) bool {
+		cancel()
+		return true
+	}
+
+	got := Classify(ctx, r, orig, probe)
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("classified error = %v, cancellation during predicate was ignored", got)
+	}
+	if !errors.Is(got, context.Canceled) {
+		t.Fatalf("classified error = %v, want caller cancellation", got)
+	}
+	if !errors.Is(got, orig) || !errors.Is(got, probeErr) {
+		t.Fatalf("classified error = %v, want original and probe errors", got)
+	}
+}
+
 func TestClassifyRespectsCallerCancel(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
 	r := &hangingProbeRunner{started: make(chan struct{})}
@@ -261,6 +755,35 @@ func TestClassifyRespectsCallerCancel(t *testing.T) {
 	err := Classify(ctx, r, orig, appleProbe)
 	if !errors.Is(err, orig) {
 		t.Fatalf("error = %v, want original preserved on cancel", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want caller cancellation preserved", err)
+	}
+	select {
+	case <-r.started:
+		t.Fatal("probe ran for an already-canceled caller")
+	default:
+	}
+}
+
+type successfulCancelingProbeRunner struct {
+	cancel context.CancelFunc
+}
+
+func (r *successfulCancelingProbeRunner) Run(context.Context, ...string) ([]byte, []byte, error) {
+	r.cancel()
+	return nil, nil, nil
+}
+
+func TestClassifyCallerCancellationAfterSuccessfulProbeWins(t *testing.T) {
+	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "boom"}
+	ctx, cancel := context.WithCancel(context.Background())
+	got := Classify(ctx, &successfulCancelingProbeRunner{cancel: cancel}, orig, appleProbe)
+	if !errors.Is(got, orig) || !errors.Is(got, context.Canceled) {
+		t.Fatalf("error = %v, want original and caller cancellation", got)
+	}
+	if errors.Is(got, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, successful probe was relabeled as daemon down", got)
 	}
 }
 
@@ -274,8 +797,8 @@ func TestClassifyPreservesOriginalWhenParentCancelsDuringProbe(t *testing.T) {
 	}()
 	start := time.Now()
 	err := Classify(ctx, r, orig, appleProbe)
-	if !errors.Is(err, orig) {
-		t.Fatalf("error = %v, want original when parent cancels mid-probe", err)
+	if !errors.Is(err, orig) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want original and caller cancellation", err)
 	}
 	if elapsed := time.Since(start); elapsed > 4*time.Second {
 		t.Fatalf("Classify took %v, want fast return on parent cancel", elapsed)

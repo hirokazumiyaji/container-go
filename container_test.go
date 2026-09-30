@@ -35,6 +35,7 @@ type fakeRunner struct {
 	envFiles    []string // contents of --env-file captured at call time
 	inspectJSON string
 	failPrefix  string // fail calls whose first arg matches
+	failStderr  string // stderr used for failPrefix calls
 	systemUp    bool
 
 	imagePresent bool // image in the local store (image inspect/pull)
@@ -90,7 +91,11 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		return nil, nil, nil
 	}
 	if f.failPrefix != "" && args[0] == f.failPrefix {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+		stderr := f.failStderr
+		if stderr == "" {
+			stderr = "injected failure"
+		}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: stderr}
 	}
 	switch args[0] {
 	case "run":

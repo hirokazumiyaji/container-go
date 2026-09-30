@@ -1,7 +1,6 @@
 package container
 
 import (
-	"fmt"
 	"net/netip"
 	"regexp"
 	"strconv"
@@ -37,6 +36,14 @@ type config struct {
 	reuse        bool
 	reuseGroup   string
 	creation     string
+	// diagnosticSecrets are values supplied by the caller that may be
+	// echoed by a backend or by a readiness log tail. They are kept out
+	// of formatted errors and diagnostics.
+	diagnosticSecrets []string
+	// waitDiagnosticSecrets is a snapshot of values exposed by the
+	// optional wait strategy. It is refreshed whenever the strategy is
+	// observed at a public diagnostic boundary.
+	waitDiagnosticSecrets []string
 }
 
 func newConfig() *config {
@@ -138,10 +145,10 @@ func WithReuse() Option {
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
 		if group == "" {
-			return fmt.Errorf("reuse group must not be empty")
+			return invalidOption("reuse group", "must not be empty")
 		}
 		if len(group) > 128 || !labelKeyRE.MatchString(group) {
-			return fmt.Errorf("invalid reuse group %q", group)
+			return invalidOption("reuse group", "must be a valid label component")
 		}
 		c.reuseGroup = group
 		return nil
@@ -180,7 +187,7 @@ func withEngine(e engine) Option {
 func WithName(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid container name %q: must match %s", name, nameRE)
+			return invalidOption("container name", "must be 1-63 letters, digits, underscores, periods, or hyphens")
 		}
 		c.name = name
 		return nil
@@ -188,16 +195,22 @@ func WithName(name string) Option {
 }
 
 // WithEnv adds environment variables. They are passed to the CLI via a
-// temporary env file so values never appear in the process table.
+// temporary env file so values never appear in the process table. Values whose
+// raw or escaped forms exceed the bounded diagnostic stream size are rejected.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") {
-				return fmt.Errorf("invalid environment variable name %q", k)
+				return invalidOption("environment variable name", "must not be empty or contain '=', newline, or NUL")
 			}
 			if strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("environment variable %s: value must not contain newlines", k)
+				return invalidOption("environment variable value", "must not contain newline or NUL")
 			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("environment variable value", "is too large to redact safely from streamed diagnostics")
+			}
+		}
+		for k, v := range env {
 			c.env[k] = v
 		}
 		return nil
@@ -218,7 +231,7 @@ func WithCmd(cmd ...string) Option {
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
 		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
-			return fmt.Errorf("invalid entrypoint %q", entrypoint)
+			return invalidOption("entrypoint", "must be a non-empty single token without newline or NUL")
 		}
 		c.entrypoint = entrypoint
 		return nil
@@ -260,18 +273,20 @@ func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
-				return fmt.Errorf("invalid label key %q", k)
+				return invalidOption("label key", "must be a valid OCI label key")
 			}
 			switch k {
 			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
-				return fmt.Errorf("label key %q is reserved", k)
+				return invalidOption("label key", "is reserved")
 			}
 			if len(k)+len(v)+1 > 4096 {
-				return fmt.Errorf("label %s: key=value exceeds 4096 bytes", k)
+				return invalidOption("label", "key=value exceeds 4096 bytes")
 			}
 			if strings.ContainsAny(v, "\x00") {
-				return fmt.Errorf("label %s: value must not contain NUL", k)
+				return invalidOption("label value", "must not contain NUL")
 			}
+		}
+		for k, v := range labels {
 			c.labels[k] = v
 		}
 		return nil
@@ -295,7 +310,7 @@ func WithMounts(mounts ...Mount) Option {
 func WithCPUs(n int) Option {
 	return func(c *config) error {
 		if n < 1 {
-			return fmt.Errorf("cpus must be >= 1, got %d", n)
+			return invalidOption("CPU count", "must be at least 1")
 		}
 		c.cpus = n
 		return nil
@@ -309,7 +324,7 @@ var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
 func WithMemory(size string) Option {
 	return func(c *config) error {
 		if !memoryRE.MatchString(size) {
-			return fmt.Errorf("invalid memory size %q", size)
+			return invalidOption("memory size", "must be a positive size with an optional K, M, G, T, or P suffix")
 		}
 		c.memory = size
 		return nil
@@ -323,7 +338,7 @@ var userRE = regexp.MustCompile(`^[a-zA-Z0-9._][a-zA-Z0-9._-]*(:[a-zA-Z0-9._-]+)
 func WithUser(u string) Option {
 	return func(c *config) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid user %q", u)
+			return invalidOption("user", "must be a name, uid, or uid:gid value")
 		}
 		c.user = u
 		return nil
@@ -334,7 +349,7 @@ func WithUser(u string) Option {
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("working directory %q must be an absolute path", dir)
+			return invalidOption("working directory", "must be an absolute path without newline or NUL")
 		}
 		c.workdir = dir
 		return nil
@@ -346,7 +361,7 @@ func WithWorkingDir(dir string) Option {
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid network name %q", name)
+			return invalidOption("network name", "must match the container-name character rules")
 		}
 		c.network = name
 		return nil
@@ -361,7 +376,7 @@ var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
 func WithPlatform(p string) Option {
 	return func(c *config) error {
 		if !platformRE.MatchString(p) {
-			return fmt.Errorf("invalid platform %q", p)
+			return invalidOption("platform", "must be an OS or OS/architecture[/variant] value")
 		}
 		c.platform = p
 		return nil
@@ -390,24 +405,26 @@ type Mount struct {
 
 func (m Mount) validate() error {
 	if strings.ContainsAny(m.Source, ",=\x00") || strings.ContainsAny(m.Target, ",=\x00") {
-		return fmt.Errorf("mount %q -> %q: paths must not contain ',' or '='", m.Source, m.Target)
+		return invalidOption("mount", "paths must not contain ',', '=', or NUL")
 	}
 	if !strings.HasPrefix(m.Target, "/") {
-		return fmt.Errorf("mount target %q must be absolute", m.Target)
+		return invalidOption("mount target", "must be absolute")
 	}
 	switch m.Type {
 	case MountBind:
 		if !strings.HasPrefix(m.Source, "/") {
-			return fmt.Errorf("bind mount source %q must be an absolute host path", m.Source)
+			return invalidOption("bind mount source", "must be an absolute host path")
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+			return invalidOption("volume mount", "needs a named volume")
 		}
 	case MountTmpfs:
 		if m.Source != "" {
-			return fmt.Errorf("tmpfs mount for %q must not have a source", m.Target)
+			return invalidOption("tmpfs mount", "must not have a source")
 		}
+	default:
+		return invalidOption("mount type", "is unknown")
 	}
 	return nil
 }
@@ -442,11 +459,11 @@ func parsePortSpec(s string) (portSpec, error) {
 		proto = "tcp"
 	}
 	if proto != "tcp" && proto != "udp" {
-		return portSpec{}, fmt.Errorf("invalid port %q: protocol must be tcp or udp", s)
+		return portSpec{}, invalidOption("port", "protocol must be tcp or udp")
 	}
 	n, err := strconv.Atoi(portPart)
 	if err != nil || n < 1 || n > 65535 {
-		return portSpec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
+		return portSpec{}, invalidOption("port", "port must be 1-65535")
 	}
 	return portSpec{port: n, proto: proto}, nil
 }
@@ -464,7 +481,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 	rest := s
 	if portsPart, proto, ok := strings.Cut(s, "/"); ok {
 		if proto != "tcp" && proto != "udp" {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q: protocol must be tcp or udp", s)
+			return publishSpec{}, invalidOption("published port", "protocol must be tcp or udp")
 		}
 		spec.proto = proto
 		rest = portsPart
@@ -474,7 +491,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		// Bracketed IPv6 host: [addr]:host-port:container-port
 		end := strings.Index(rest, "]:")
 		if end < 0 {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q", s)
+			return publishSpec{}, invalidOption("published port", "bracketed IPv6 form is malformed")
 		}
 		spec.hostAddr = rest[1:end]
 		rest = rest[end+2:]
@@ -484,20 +501,20 @@ func parsePublishSpec(s string) (publishSpec, error) {
 	}
 	if spec.hostAddr != "" {
 		if _, err := netip.ParseAddr(spec.hostAddr); err != nil {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
+			return publishSpec{}, invalidOption("published port", "host address must be an IP literal")
 		}
 	}
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")
 	if !ok || strings.Contains(ctrPart, ":") {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: want [host-ip:]host-port:container-port[/proto]", s)
+		return publishSpec{}, invalidOption("published port", "want [host-ip:]host-port:container-port[/proto]")
 	}
 	var err error
 	if spec.hostPort, err = parsePortNumber(hostPart); err != nil {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: %w", s, err)
+		return publishSpec{}, err
 	}
 	if spec.containerPort, err = parsePortNumber(ctrPart); err != nil {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: %w", s, err)
+		return publishSpec{}, err
 	}
 	return spec, nil
 }
@@ -505,7 +522,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 func parsePortNumber(s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 || n > 65535 {
-		return 0, fmt.Errorf("port %q must be 1-65535", s)
+		return 0, invalidOption("port", "must be 1-65535")
 	}
 	return n, nil
 }

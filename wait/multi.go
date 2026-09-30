@@ -26,7 +26,20 @@ func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 	return s
 }
 
+// DiagnosticValues recursively snapshots all child strategy values.
+func (s *AllStrategy) DiagnosticValues() []string {
+	values := make([]string, 0, len(s.strategies))
+	for _, strategy := range s.strategies {
+		values = append(values, DiagnosticValues(strategy)...)
+	}
+	return values
+}
+
+// DiagnosticSecrets is an alias for DiagnosticValues.
+func (s *AllStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	values := DiagnosticValues(s)
 	if s.startupTimeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.startupTimeout)
@@ -35,15 +48,15 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	for i, strategy := range s.strategies {
 		if err := ctx.Err(); err != nil {
 			if s.startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err)
+				return safeDiagnosticError(fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err), values...)
 			}
-			return err
+			return safeDiagnosticError(err, values...)
 		}
 		if err := strategy.WaitUntilReady(ctx, target); err != nil {
 			if s.startupTimeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err)
+				return safeDiagnosticError(fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err), values...)
 			}
-			return err
+			return safeDiagnosticError(err, values...)
 		}
 	}
 	return nil
@@ -68,7 +81,20 @@ func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	return s
 }
 
+// DiagnosticValues recursively snapshots all child strategy values.
+func (s *AnyStrategy) DiagnosticValues() []string {
+	values := make([]string, 0, len(s.strategies))
+	for _, strategy := range s.strategies {
+		values = append(values, DiagnosticValues(strategy)...)
+	}
+	return values
+}
+
+// DiagnosticSecrets is an alias for DiagnosticValues.
+func (s *AnyStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	values := DiagnosticValues(s)
 	if len(s.strategies) == 0 {
 		return nil
 	}
@@ -94,8 +120,8 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			}
 			errs = append(errs, err)
 		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+			return safeDiagnosticError(errors.Join(append(errs, ctx.Err())...), values...)
 		}
 	}
-	return errors.Join(errs...)
+	return safeDiagnosticError(errors.Join(errs...), values...)
 }

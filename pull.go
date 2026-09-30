@@ -34,7 +34,7 @@ const (
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {
-			return fmt.Errorf("invalid pull policy %d", policy)
+			return invalidOption("pull policy", "must be PullMissing, PullAlways, or PullNever")
 		}
 		c.pullPolicy = policy
 		return nil
@@ -47,13 +47,13 @@ func WithPullPolicy(policy PullPolicy) Option {
 // the others.
 func Pull(ctx context.Context, image string) error {
 	if !imageRE.MatchString(image) {
-		return fmt.Errorf("invalid image reference %q", image)
+		return safePublicError(invalidOption("image reference", "must contain only registry, repository, tag, or digest characters"))
 	}
 	eng, err := detectEngine()
 	if err != nil {
-		return err
+		return safePublicError(err)
 	}
-	return pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image)
+	return safePublicError(pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image))
 }
 
 // pullWith is the fake-runner-driven core of Pull: the flight shares one

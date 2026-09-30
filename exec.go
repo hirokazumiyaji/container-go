@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"os"
 	"strings"
@@ -21,14 +20,20 @@ type execConfig struct {
 	workdir string
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. Values whose raw or escaped forms exceed the bounded
+// diagnostic stream size are rejected.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
 		for k, v := range env {
 			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("invalid exec environment variable %q", k)
+				return invalidOption("exec environment variable", "name and value contain an invalid character")
 			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("exec environment variable", "value is too large to redact safely from streamed diagnostics")
+			}
+		}
+		for k, v := range env {
 			c.env[k] = v
 		}
 		return nil
@@ -39,7 +44,7 @@ func WithExecEnv(env map[string]string) ExecOption {
 func WithExecUser(u string) ExecOption {
 	return func(c *execConfig) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid exec user %q", u)
+			return invalidOption("exec user", "must be a name, uid, or uid:gid value")
 		}
 		c.user = u
 		return nil
@@ -50,7 +55,7 @@ func WithExecUser(u string) ExecOption {
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("exec working directory %q must be an absolute path", dir)
+			return invalidOption("exec working directory", "must be an absolute path without newline or NUL")
 		}
 		c.workdir = dir
 		return nil
@@ -61,12 +66,12 @@ func WithExecWorkDir(dir string) ExecOption {
 // combined output. A non-zero exit code is a result, not an error.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
 	if len(cmd) == 0 {
-		return 0, nil, errors.New("exec: command must not be empty")
+		return 0, nil, c.redactError(errors.New("exec: command must not be empty"), cmd...)
 	}
 	cfg := &execConfig{env: map[string]string{}}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return 0, nil, err
+			return 0, nil, c.redactError(optionBoundaryError(err), execDiagnosticValues(cfg, cmd)...)
 		}
 	}
 
@@ -74,7 +79,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
 		if err != nil {
-			return 0, nil, err
+			return 0, nil, c.redactError(err, execDiagnosticValues(cfg, cmd)...)
 		}
 		defer os.RemoveAll(dir)
 		envFile = path
@@ -86,7 +91,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, wrapNotFound(c.classifyWithSecrets(ctx, err, execDiagnosticValues(cfg, cmd)...))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -99,7 +104,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if c.execContainerRunning(ctx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, wrapNotFound(c.classifyWithSecrets(ctx, err, execDiagnosticValues(cfg, cmd)...))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

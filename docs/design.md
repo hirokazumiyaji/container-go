@@ -245,7 +245,8 @@ provides:
 Every strategy carries `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms). If the container transitions to
 stopped while waiting, the wait fails immediately (no timeout burn)
-and the error carries a log tail capped at 1MiB for diagnosis.
+and the error carries a redacted, control-character-sanitized log tail
+capped at 1MiB for diagnosis.
 
 The strategy interface:
 
@@ -361,7 +362,44 @@ future CLI changes.
 the library has no credential input path.
 
 **No secrets in logs**. Debug logging of CLI argv never includes
-env-file contents.
+env-file contents. `CLIError.Error()` and readiness log tails additionally
+redact configured and secret-shaped values and escape terminal control
+characters (including U+2028/U+2029) before they reach CI output; callers
+that need the original CLI diagnostic must explicitly use `RawError()`.
+The wait package exposes an optional diagnostic-value provider. HTTP
+headers and Basic-auth material, individual cookie names/values (including
+URL/base64 forms), log patterns, exec commands, and requested ports are
+collected recursively (including `ForAll`/`ForAny`) and supplied to both
+normal and reuse log-tail diagnostics. Stderr and log tails use bounded
+streaming redaction with cross-chunk overlap; the safe ring is redacted and
+sanitized before its final 1MiB truncation, so a secret split by an earlier
+boundary cannot survive as a suffix. A finite log stream is also processed
+without a `Scanner` line buffer, and terminal read errors are retained.
+
+Rejected options are rendered through value-free `ValidationError` or
+`OptionError` values at the public boundary; their original causes remain
+available through the explicit `UnwrapRaw` escape hatch.
+
+Structural detection covers underscore/dotted secret names, empty-user
+credential URLs, Basic base64, quoted and PEM multiline values, complete
+compact 3-segment JWS and 5-segment JWE values (including an empty JWE
+encrypted-key segment), cookies/signatures, and attached or aliased `-e`,
+volume, mount, publish, and filter arguments. Known values use boundary-aware
+replacement, while operation-context values are replaced even when adjacent
+to log text. Redactors are composable so a public-boundary context is never
+discarded by a later container or wait wrapper. Long-lived handles retain a
+hashed, closeable matcher rather than plaintext; `Terminate` drops that
+matcher reference and clears the internal compatibility fallback.
+
+`CLIError` remains an alias of the internal CLI type, preserving its
+keyed exported fields and `errors.As` identity. Safe wrappers carry
+unexported redactor/original state; this deliberately means external
+packages must use keyed `CLIError` literals rather than unkeyed literals.
+Safe wrappers have no ordinary `Unwrap` that could expose raw diagnostics:
+`errors.As` returns a redacted `*CLIError` or redacted
+`*SystemNotRunningError`, while `RawError()`/`UnwrapRaw()` are explicit
+unredacted escape hatches. `ErrSystemNotRunning` retains the original
+operation and failed liveness-probe errors in its safe multi-error chain.
 
 ## Performance design
 
@@ -382,7 +420,9 @@ bounded only by host resources.
 
 **Keep streams finite**. `Logs` returns the `container logs --follow`
 child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+reliably kills the process. Diagnostic snapshots and ForLog matching use
+fixed-size streaming buffers/rings; a huge line cannot grow memory without
+bound.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
@@ -393,13 +433,16 @@ cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 Errors are discriminable with `errors.Is`/`errors.As`.
 
 - `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
+  `container system status` probe failed too; the typed classification
+  retains both the original and probe errors in its `errors.Is`/`As`
+  chain, while the message tells the user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+  code, and stderr (capped at 64KiB). Its `Error()` rendering redacts
+  configured and secret-shaped values and escapes control characters;
+  `RawError()` is the explicit unredacted local-debugging path.
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.
@@ -420,8 +463,9 @@ container-go/
 ├── logs.go           // Logs
 ├── copy.go           // CopyToContainer, CopyFileFromContainer
 ├── errors.go         // error types
-├── internal/cli/     // CLI runner (argv assembly, execution, timeouts)
-├── internal/inspect/ // inspect JSON models and decoding
+├── internal/cli/         // CLI runner (argv assembly, execution, timeouts)
+├── internal/diagnostic/ // redaction and control-character sanitization
+├── internal/inspect/     // inspect JSON models and decoding
 └── wait/             // wait strategies
 ```
 

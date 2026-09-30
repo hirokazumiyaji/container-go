@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -34,54 +35,54 @@ func WithFiles(files ...File) Option {
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return err
+		return c.redactError(err, hostPath, containerPath)
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
-		return err
+		return c.redactError(err, hostPath, containerPath)
 	}
 	if _, err := os.Stat(abs); err != nil {
-		return fmt.Errorf("copy to container: %w", err)
+		return c.redactError(fmt.Errorf("copy to container: %w", err), abs)
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return c.classifyWithSecrets(ctx, err, abs, containerPath)
 }
 
 // CopyFileFromContainer copies one file out of the running container
 // and returns its content. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
-		return nil, err
+		return nil, c.redactError(err, containerPath)
 	}
 	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
+		return nil, c.redactError(errors.New("copy file from container: cannot copy a directory or root as a single file"), containerPath)
 	}
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err, containerPath)
 	}
 	dst := filepath.Join(dir, filepath.Base(containerPath))
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, c.classify(ctx, err)
+		return nil, c.classifyWithSecrets(ctx, err, containerPath, dst)
 	}
 	info, err := os.Stat(dst)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, c.redactError(err, containerPath, dst)
 	}
 	if info.IsDir() {
 		_ = os.RemoveAll(dir)
-		return nil, fmt.Errorf("copy file from container %q: target is a directory", containerPath)
+		return nil, c.redactError(errors.New("copy file from container: target is a directory"), containerPath)
 	}
 	f, err := os.Open(dst)
 	if err != nil {
 		_ = os.RemoveAll(dir)
-		return nil, err
+		return nil, c.redactError(err, containerPath, dst)
 	}
 	return &tempFileReader{File: f, dir: dir}, nil
 }
@@ -101,10 +102,10 @@ func (r *tempFileReader) Close() error {
 // relies on: absolute, valid UTF-8, and free of NUL bytes.
 func validateContainerPath(p string) error {
 	if !strings.HasPrefix(p, "/") {
-		return fmt.Errorf("container path %q must be absolute", p)
+		return invalidOption("container path", "must be absolute")
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
-		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)
+		return invalidOption("container path", "must be valid UTF-8 without NUL bytes")
 	}
 	return nil
 }

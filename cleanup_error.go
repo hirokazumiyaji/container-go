@@ -25,6 +25,10 @@ func (e *CleanupError) Error() string {
 
 func (e *CleanupError) Unwrap() error { return e.Err }
 
+// DiagnosticSafe marks CleanupError as recoverable through a publicError
+// boundary. The Err field must already be redacted when constructed.
+func (*CleanupError) DiagnosticSafe() {}
+
 // withCleanupError attaches a cleanup failure to the error that caused it. The
 // original stays first in the chain, so errors.Is on the operation error still
 // works, and the cleanup failure is appended rather than replacing it.

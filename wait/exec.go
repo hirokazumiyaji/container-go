@@ -44,6 +44,19 @@ func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
 	return s
 }
 
+// DiagnosticValues returns every command token, plus its joined rendering,
+// because a backend may echo either form in an error.
+func (s *ExecStrategy) DiagnosticValues() []string {
+	values := append([]string(nil), s.cmd...)
+	if len(s.cmd) > 0 {
+		values = append(values, fmt.Sprint(s.cmd))
+	}
+	return values
+}
+
+// DiagnosticSecrets is an alias for DiagnosticValues.
+func (s *ExecStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if len(s.cmd) == 0 {
 		return errors.New("wait for exec: command must not be empty")
@@ -71,5 +84,5 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("exit code %d not accepted", code)
 		}
 		return nil
-	}, false)
+	}, false, s.DiagnosticValues()...)
 }

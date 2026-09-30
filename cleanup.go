@@ -58,7 +58,7 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
-		return nil, err
+		return nil, safePublicError(err)
 	}
 	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
 }
@@ -69,16 +69,17 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 
 // pruneListed lists containers with listArgs, parses IDs, and force-deletes
 // each one. errKind prefixes per-ID delete failures ("prune", …).
-func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
+func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, values ...string) ([]string, error) {
+	redactor := cli.NewHashedContextRedactor(values...)
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
+		return nil, cli.WithRedactor(cli.Classify(ctx, r, err, eng.probe()), redactor)
 	}
 	ids, err := parse(stdout)
 	if err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, redactor)
 	}
 
 	var removed []string
@@ -88,10 +89,10 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 		_, _, err := r.Run(dCtx, eng.deleteArgs(id)...)
 		dCancel()
 		if err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf("%s %s: %w", errKind, id, err))
+			errs = append(errs, cli.WithRedactor(fmt.Errorf("%s %s: %w", errKind, id, err), redactor))
 			continue
 		}
 		removed = append(removed, id)
 	}
-	return removed, errors.Join(errs...)
+	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
 }

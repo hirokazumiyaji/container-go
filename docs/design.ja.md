@@ -167,7 +167,7 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`(既定 100 ミリ秒)を持つ。
-待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用にログ末尾(上限 1MiB)を添えてエラーを返す。
+待機中にコンテナが停止状態へ遷移した場合は、タイムアウトを待たずに失敗とし、診断用に秘匿情報をマスクして制御文字をエスケープしたログ末尾(上限 1MiB)を添えてエラーを返す。
 
 戦略のインターフェースは次のとおり。
 
@@ -230,6 +230,14 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 
 **ログに秘密を書かない**。
 デバッグログ(`WithLogger` で注入)に CLI の argv を出す場合、env-file の中身は出力しない。
+`CLIError.Error()` と readiness log tail は設定値と secret らしい値をマスクし、制御文字(U+2028/U+2029 を含む)をエスケープする。元の CLI 診断が必要なら `RawError()` を明示的に呼び出す。
+
+`wait` パッケージは任意の diagnostic-value provider を提供する。HTTP ヘッダーと Basic 認証、個々の cookie 名/値(URL/base64 の encoded form を含む)、ログパターン、exec コマンド、要求ポートを `ForAll`/`ForAny` も含めて再帰的に収集し、通常のログ末尾と reuse の診断へ渡す。stderr とログ末尾はチャンクをまたぐ overlap を持つ bounded streaming redaction を使い、最後に 1MiB のリングへ入れるため、巨大な行や出力でもメモリが無限に増えない。終端の read error も保持する。
+
+
+構造的な検出対象には underscore/dotted な secret 名、空ユーザー URL、Basic base64、引用付き/PEM の複数行、3 セグメント JWS と 5 セグメント JWE(JWE の空 encrypted-key segment を含む)、cookie/signature、添付・別名付きの `-e`/volume/mount/publish/filter 引数を含む。token は全体の compact form だけを検出し、prefix の部分一致で誤検出しない。redactor は合成可能で、後段の container/wrap 処理でも最初の公開境界文脈を捨てない。handle は平文ではなく hash 化した closeable matcher を保持し、`Terminate` でその参照と内部の互換 fallback をクリアする。
+
+`CLIError` は内部 CLI 型の alias のままなので、exported field の keyed literal と `errors.As` の同一性を保つ。safe wrapper には非公開の redactor/original state を持たせるため、外部 package では unkeyed literal ではなく keyed literal を使うという互換性上の取舍を明示する。safe wrapper は raw diagnostic へ戻る通常の `Unwrap` を持たず、`errors.As` は redact 済み `*CLIError`/`*SystemNotRunningError` を返す。元の値が必要な場合は `RawError()`/`UnwrapRaw()` を明示的に使う。`ErrSystemNotRunning` は元の操作と liveness probe の両方を redact 済み multi-error chain に保持する。
 
 ## パフォーマンス設計
 
@@ -247,7 +255,7 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
-ForLog が診断用に保持するログは 1MiB を上限とする。
+ForLog の matcher と log-tail 診断は固定サイズの streaming buffer/ring を使い、巨大な行でもメモリが無限に増えない。終端の read error は保持する。
 
 **すべての CLI 呼び出しに期限を付ける**。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
@@ -257,10 +265,10 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 エラーは `errors.Is`/`errors.As` で判別できる形で返す。
 
-- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
+- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。typed classification は元の操作と probe の両方を `errors.Is`/`As` chain に保持し、メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する。`Error()` は秘匿情報をマスクして制御文字をエスケープし、`RawError()` は明示的な未マスクのデバッグ経路
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 
@@ -279,8 +287,9 @@ container-go/
 ├── logs.go           // Logs
 ├── copy.go           // CopyToContainer、CopyFileFromContainer
 ├── errors.go         // エラー型
-├── internal/cli/     // CLI ランナー(コマンド組み立て、実行、タイムアウト)
-├── internal/inspect/ // inspect JSON モデルとデコード
+├── internal/cli/         // CLI ランナー(コマンド組み立て、実行、タイムアウト)
+├── internal/diagnostic/ // 秘匿情報と制御文字のサニタイズ
+├── internal/inspect/     // inspect JSON モデルとデコード
 └── wait/             // 待機戦略
 ```
 

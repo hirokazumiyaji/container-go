@@ -3,6 +3,9 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
+	"io"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -52,6 +55,25 @@ func TestStreamMergesStderrIntoStream(t *testing.T) {
 	joined := strings.Join(lines, "\n")
 	if !strings.Contains(joined, "out-line") || !strings.Contains(joined, "err-line") {
 		t.Errorf("stream = %q, want both stdout and stderr lines", joined)
+	}
+}
+
+func TestSnapshotStreamPropagatesChildWaitErrorAtEOF(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'snapshot output\n'; exit 7`)}
+
+	stream, err := r.StreamSnapshot(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("StreamSnapshot: %v", err)
+	}
+	defer stream.Close()
+
+	output, err := io.ReadAll(stream)
+	if string(output) != "snapshot output\n" {
+		t.Fatalf("output = %q", output)
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 7 {
+		t.Fatalf("ReadAll error = %v, want child exit code 7", err)
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -103,6 +104,27 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 	return s
 }
 
+// DiagnosticValues returns the request values that may be echoed in a
+// readiness failure. Header names are included as well as values so a
+// backend that renders a complete request remains safe.
+func (s *HTTPStrategy) DiagnosticValues() []string {
+	values := []string{s.path, s.port, s.method, s.username, s.password}
+	for key, value := range s.headers {
+		values = append(values, key, value, key+": "+value, key+"="+value)
+		if strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2") {
+			values = append(values, cookieDiagnosticValues(value)...)
+		}
+	}
+	if s.basicAuth {
+		values = append(values, basicAuthValues(s.username, s.password)...)
+	}
+	return values
+}
+
+// DiagnosticSecrets is an alias retained for custom integrations that use
+// the secret-oriented interface name.
+func (s *HTTPStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	matcher := s.statusMatcher
 	if matcher == nil {
@@ -124,6 +146,7 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		scheme = "https"
 	}
 
+	values := s.DiagnosticValues()
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for HTTP %s %s", s.method, s.path), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {
@@ -148,5 +171,5 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("status %d not accepted", resp.StatusCode)
 		}
 		return nil
-	}, true)
+	}, true, values...)
 }

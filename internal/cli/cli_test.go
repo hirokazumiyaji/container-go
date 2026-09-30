@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
 )
 
 // writeStub creates an executable shell script and returns its path. It skips
@@ -56,6 +58,42 @@ func TestExecRunnerNonZeroExitReturnsCLIError(t *testing.T) {
 	}
 	if cliErr.Binary == "" || !strings.Contains(cliErr.Error(), cliErr.Binary) {
 		t.Errorf("Binary = %q, Error() = %q", cliErr.Binary, cliErr.Error())
+	}
+}
+
+func TestExecRunnerRedactsSplitStderrBeforeCap(t *testing.T) {
+	const secret = "split-stderr-secret-117"
+	r := &ExecRunner{Binary: writeStub(t, `printf 'password=' >&2; printf '%s\\n' '`+secret+`' >&2; exit 1`)}
+
+	_, stderr, err := r.Run(context.Background(), "run")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if strings.Contains(cliErr.Stderr, secret) || !strings.Contains(cliErr.Stderr, "[REDACTED]") {
+		t.Fatalf("CLIError.Stderr = %q, want streamed redaction", cliErr.Stderr)
+	}
+	if !strings.Contains(cliErr.RawError(), secret) {
+		t.Fatalf("RawError() = %q, want explicit raw stderr", cliErr.RawError())
+	}
+	if len(stderr) <= len(secret) {
+		t.Fatalf("raw returned stderr = %q, want complete output", stderr)
+	}
+}
+
+func TestExecRunnerDropsOversizedStructuralStderr(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `(printf 'password="'; head -c 1048577 /dev/zero; printf '"\n') >&2; exit 1`)}
+
+	_, stderr, err := r.Run(context.Background(), "run")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if strings.Contains(cliErr.Stderr, "password") || strings.Contains(cliErr.Stderr, strings.Repeat(`\x00`, 32)) {
+		t.Fatalf("CLIError.Stderr leaked an oversized structural value: len=%d", len(cliErr.Stderr))
+	}
+	if len(stderr) <= diagnostic.MaxStreamOverlap {
+		t.Fatalf("raw stderr length = %d, want oversized fixture", len(stderr))
 	}
 }
 

@@ -36,6 +36,13 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 	return s
 }
 
+// DiagnosticValues returns the requested port that may be echoed in a
+// readiness failure.
+func (s *HostPortStrategy) DiagnosticValues() []string { return []string{s.port} }
+
+// DiagnosticSecrets is an alias for DiagnosticValues.
+func (s *HostPortStrategy) DiagnosticSecrets() []string { return s.DiagnosticValues() }
+
 func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for listening port %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
@@ -48,5 +55,5 @@ func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) er
 			return err
 		}
 		return conn.Close()
-	}, true)
+	}, true, s.DiagnosticValues()...)
 }

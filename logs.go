@@ -61,7 +61,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
-		return nil, errors.New("logs: runner does not support streaming")
+		return nil, c.redactError(errors.New("logs: runner does not support streaming"))
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	stream, err := s.Stream(ctx, c.eng.logsArgs(c.id, true)...)
+	if err != nil {
+		return nil, c.redactError(err)
+	}
+	return stream, nil
 }

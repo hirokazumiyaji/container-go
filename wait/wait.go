@@ -188,13 +188,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			return nil
 		}
 
-		if terminalErr := terminationErr(); terminalErr != nil {
-			return terminalErr
-		}
 		if checkRunning && time.Since(lastStateCheck) >= stateCheckInterval {
-			if terminalErr := terminationErr(); terminalErr != nil {
-				return terminalErr
-			}
 			lastStateCheck = time.Now()
 			running, err := target.Running(waitCtx)
 			if terminalErr := terminationErr(); terminalErr != nil {

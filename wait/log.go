@@ -110,12 +110,6 @@ func handleLogScanResult(callerCtx, waitCtx context.Context, timeout time.Durati
 		return nil
 	}
 
-	// The stream ended before the pattern appeared. Check the context
-	// again immediately before the diagnostic probe so a cancellation that
-	// raced with EOF cannot start a new probe.
-	if contextErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, result.err); contextErr != nil {
-		return contextErr
-	}
 	// Keep the caller's context as the probe base so a later cancellation or
 	// deadline also bounds diagnostics.
 	probeCtx, probeCancel := context.WithTimeout(callerCtx, 5*time.Second)

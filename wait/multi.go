@@ -51,47 +51,62 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		return callerHasDeadline && !callerDeadline.After(startupDeadline)
 	}
 	terminationCause := func(waitErr error) error {
-		if callerErr := callerCtx.Err(); callerErr != nil && (errors.Is(waitErr, context.Canceled) || callerOwnsTermination(waitErr)) {
+		if !callerOwnsTermination(waitErr) {
+			return waitErr
+		}
+		if callerErr := callerCtx.Err(); callerErr != nil {
 			return callerErr
 		}
-		if callerOwnsTermination(waitErr) {
-			if errors.Is(waitErr, context.Canceled) {
-				return context.Canceled
-			}
-			return context.DeadlineExceeded
+		if errors.Is(waitErr, context.Canceled) {
+			return context.Canceled
 		}
-		return waitErr
+		return context.DeadlineExceeded
+	}
+
+	// wrap classifies waitCtx termination for one phase of the loop
+	// ("before"/"in"/"after"). phaseTail is the substring following the
+	// classification label ("before strategy %d ran", "in strategy %d",
+	// "after strategy %d"). childErr, when set, is the strategy's own
+	// error and joins both the message tail and the cause list; only
+	// the "in" phase passes one.
+	wrap := func(phaseTail string, i int, childErr error) error {
+		waitErr := waitCtx.Err()
+		var extra []error
+		suffix := ""
+		if childErr != nil {
+			suffix = fmt.Sprintf(": %v", childErr)
+			extra = []error{childErr}
+		}
+		switch {
+		case callerOwnsTermination(waitErr):
+			label := "caller deadline elapsed"
+			if errors.Is(waitErr, context.Canceled) {
+				label = "caller context ended"
+			}
+			return newWaitError(fmt.Sprintf("wait for all: %s %s%s", label, phaseTail, suffix),
+				append([]error{terminationCause(waitErr)}, extra...)...)
+		case s.startupTimeout > 0 && errors.Is(waitErr, context.DeadlineExceeded):
+			return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed %s%s", s.startupTimeout, phaseTail, suffix),
+				append([]error{waitErr}, extra...)...)
+		case childErr != nil:
+			return newWaitError(fmt.Sprintf("wait for all: strategy %d%s", i, suffix),
+				append([]error{waitErr}, extra...)...)
+		default:
+			return newWaitError(fmt.Sprintf("wait for all: context ended %s", phaseTail), waitErr)
+		}
 	}
 
 	for i, strategy := range s.strategies {
-		if waitErr := waitCtx.Err(); waitErr != nil {
-			if callerOwnsTermination(waitErr) {
-				if errors.Is(waitErr, context.Canceled) {
-					return newWaitError(fmt.Sprintf("wait for all: caller context ended before strategy %d ran", i), terminationCause(waitErr))
-				}
-				return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed before strategy %d ran", i), terminationCause(waitErr))
-			}
-			if s.startupTimeout > 0 && errors.Is(waitErr, context.DeadlineExceeded) {
-				return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed before strategy %d ran", s.startupTimeout, i), waitErr)
-			}
-			return newWaitError(fmt.Sprintf("wait for all: context ended before strategy %d ran", i), waitErr)
+		if waitCtx.Err() != nil {
+			return wrap(fmt.Sprintf("before strategy %d ran", i), i, nil)
 		}
 		if err := callerCtx.Err(); err != nil {
 			return newWaitError(fmt.Sprintf("wait for all: caller context ended before strategy %d ran", i), err)
 		}
 
 		if err := strategy.WaitUntilReady(waitCtx, target); err != nil {
-			if waitErr := waitCtx.Err(); waitErr != nil {
-				if callerOwnsTermination(waitErr) {
-					if errors.Is(waitErr, context.Canceled) {
-						return newWaitError(fmt.Sprintf("wait for all: caller context ended in strategy %d: %v", i, err), terminationCause(waitErr), err)
-					}
-					return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed in strategy %d: %v", i, err), terminationCause(waitErr), err)
-				}
-				if s.startupTimeout > 0 && errors.Is(waitErr, context.DeadlineExceeded) {
-					return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in strategy %d: %v", s.startupTimeout, i, err), waitErr, err)
-				}
-				return newWaitError(fmt.Sprintf("wait for all: strategy %d: %v", i, err), waitErr, err)
+			if waitCtx.Err() != nil {
+				return wrap(fmt.Sprintf("in strategy %d", i), i, err)
 			}
 			if callerErr := callerCtx.Err(); callerErr != nil {
 				return newWaitError(fmt.Sprintf("wait for all: caller context ended in strategy %d: %v", i, err), callerErr, err)
@@ -99,17 +114,8 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			return err
 		}
 
-		if waitErr := waitCtx.Err(); waitErr != nil {
-			if callerOwnsTermination(waitErr) {
-				if errors.Is(waitErr, context.Canceled) {
-					return newWaitError(fmt.Sprintf("wait for all: caller context ended after strategy %d", i), terminationCause(waitErr))
-				}
-				return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed after strategy %d", i), terminationCause(waitErr))
-			}
-			if s.startupTimeout > 0 && errors.Is(waitErr, context.DeadlineExceeded) {
-				return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed after strategy %d", s.startupTimeout, i), waitErr)
-			}
-			return newWaitError(fmt.Sprintf("wait for all: context ended after strategy %d", i), waitErr)
+		if waitCtx.Err() != nil {
+			return wrap(fmt.Sprintf("after strategy %d", i), i, nil)
 		}
 		if err := callerCtx.Err(); err != nil {
 			return newWaitError(fmt.Sprintf("wait for all: caller context ended after strategy %d", i), err)

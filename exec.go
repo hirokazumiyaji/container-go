@@ -271,13 +271,3 @@ func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 	}
 	return execInspection{state: info.state}
 }
-
-// execContainerRunning is retained for package-local compatibility. New
-// verification paths use verifyExecContainer so they do not lose the
-// typed state or error.
-//
-//nolint:unused
-func (c *Container) execContainerRunning(ctx context.Context) bool {
-	result := c.verifyExecContainer(ctx)
-	return result.err == nil && result.state == StateRunning
-}

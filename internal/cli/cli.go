@@ -705,13 +705,6 @@ func classificationText(err error) string {
 	return endpointURI.ReplaceAllString(diagnosticText(err), " ")
 }
 
-// IsNonLivenessError reports whether err identifies a client-side
-// failure that must not be relabeled as a stopped backend. It is used
-// by backend-specific probe predicates as well as Classify.
-func IsNonLivenessError(err error) bool {
-	return isNonLivenessError(err)
-}
-
 // IsDefinitiveNonLivenessError reports a concrete client-side failure
 // that must veto backend object-absence and liveness classification. It
 // deliberately excludes ambiguous object wording so a verified backend

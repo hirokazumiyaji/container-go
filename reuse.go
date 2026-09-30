@@ -175,7 +175,9 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if contextErr := commandContextError(runCtx, err); contextErr != nil {
 		if err == nil {
-			cleanupFailedCreate(ctx, cfg, nil, contextErr)
+			if cleanupErr := cleanupFailedCreate(ctx, cfg, nil, contextErr); cleanupErr != nil {
+				return nil, withCleanupError(contextErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+			}
 		}
 		return nil, contextErr
 	}

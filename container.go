@@ -188,7 +188,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if contextErr := commandContextError(runCtx, err); contextErr != nil {
-		cleanupFailedCreate(ctx, cfg, err, contextErr)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, contextErr); cleanupErr != nil {
+			return nil, withCleanupError(contextErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, contextErr
 	}
 	if err != nil {

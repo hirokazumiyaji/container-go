@@ -7,6 +7,20 @@ import (
 	"time"
 )
 
+// cachedInfoInspectJSON is the docker inspect payload the cachedInfo
+// tests replay: id "aaaa", one bound tcp/80 mapping, one bridge IP.
+const cachedInfoInspectJSON = `[{
+  "Id": "aaaa",
+  "Name": "/c1",
+  "State": {"Status": "running"},
+  "Config": {"Image": "redis:7-alpine", "Labels": {}},
+  "NetworkSettings": {
+    "IPAddress": "",
+    "Ports": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49154"}]},
+    "Networks": {"bridge": {"IPAddress": "172.17.0.2"}}
+  }
+}]`
+
 // slowInspectRunner answers inspect only after the gate is released, and
 // records how many inspect calls it received. It stands in for a
 // backend that takes seconds to answer.
@@ -32,17 +46,7 @@ func (r *slowInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		case <-ctx.Done():
 			return nil, nil, ctx.Err()
 		}
-		return []byte(`[{
-  "Id": "aaaa",
-  "Name": "/c1",
-  "State": {"Status": "running"},
-  "Config": {"Image": "redis:7-alpine", "Labels": {}},
-  "NetworkSettings": {
-    "IPAddress": "",
-    "Ports": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49154"}]},
-    "Networks": {"bridge": {"IPAddress": "172.17.0.2"}}
-  }
-}]`), nil, nil
+		return []byte(cachedInfoInspectJSON), nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }

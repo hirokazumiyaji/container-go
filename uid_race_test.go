@@ -10,7 +10,6 @@ import (
 // ID, and records how many inspect calls it served.
 type uidReportingRunner struct {
 	*fakeRunner
-	uid string
 
 	mu    sync.Mutex
 	calls int
@@ -21,17 +20,7 @@ func (r *uidReportingRunner) Run(ctx context.Context, args ...string) ([]byte, [
 		r.mu.Lock()
 		r.calls++
 		r.mu.Unlock()
-		return []byte(`[{
-  "Id": "aaaa",
-  "Name": "/c1",
-  "State": {"Status": "running"},
-  "Config": {"Image": "redis:7-alpine", "Labels": {}},
-  "NetworkSettings": {
-    "IPAddress": "",
-    "Ports": {"80/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49154"}]},
-    "Networks": {"bridge": {"IPAddress": "172.17.0.2"}}
-  }
-}]`), nil, nil
+		return []byte(cachedInfoInspectJSON), nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
@@ -53,7 +42,7 @@ func (r *uidReportingRunner) inspectCalls() int {
 // resolve returns a declared publish spec without inspecting, so the
 // handle is built with only WithExposedPorts.
 func TestContainerUIDIsRaceFreeAcrossEndpointAndTerminate(t *testing.T) {
-	runner := &uidReportingRunner{uid: "aaaa", fakeRunner: newTestRunner()}
+	runner := &uidReportingRunner{fakeRunner: newTestRunner()}
 	ctr := &Container{
 		id:      "c1",
 		runner:  runner,
@@ -107,41 +96,10 @@ func TestContainerImmutableIDNeverDowngrades(t *testing.T) {
 	}
 }
 
-// TestCachedInfoDoesNotSerializeConcurrentCallers covers the other half
-// of the issue. The inspect is a subprocess that can take up to
-// queryTimeout; running it while holding the cache lock blocks every
-// other Endpoint/ContainerIP caller for that whole window. The
-// singleflight below is what makes concurrent callers wait for the one
-// inspect rather than each starting their own.
-func TestCachedInfoDoesNotSerializeConcurrentCallers(t *testing.T) {
-	runner := &uidReportingRunner{uid: "aaaa", fakeRunner: newTestRunner()}
-	ctr := &Container{id: "c1", runner: runner, eng: dockerEngine{}}
-
-	ctx := context.Background()
-	var wg sync.WaitGroup
-	const callers = 16
-	wg.Add(callers)
-	for range callers {
-		go func() {
-			defer wg.Done()
-			if _, err := ctr.cachedInfo(ctx); err != nil {
-				t.Errorf("cachedInfo: %v", err)
-			}
-		}()
-	}
-	wg.Wait()
-
-	// Every concurrent caller is satisfied by the same inspect. Without
-	// the singleflight each one would run its own.
-	if got := runner.inspectCalls(); got != 1 {
-		t.Errorf("inspect ran %d times for %d concurrent callers, want 1", got, callers)
-	}
-}
-
 // TestCachedInfoReusesTheResultAfterTheFirstInspect keeps the cache
 // itself intact: a second call must not re-inspect.
 func TestCachedInfoReusesTheResultAfterTheFirstInspect(t *testing.T) {
-	runner := &uidReportingRunner{uid: "aaaa", fakeRunner: newTestRunner()}
+	runner := &uidReportingRunner{fakeRunner: newTestRunner()}
 	ctr := &Container{id: "c1", runner: runner, eng: dockerEngine{}}
 
 	ctx := context.Background()
@@ -149,24 +107,6 @@ func TestCachedInfoReusesTheResultAfterTheFirstInspect(t *testing.T) {
 		if _, err := ctr.cachedInfo(ctx); err != nil {
 			t.Fatalf("cachedInfo: %v", err)
 		}
-	}
-	if got := runner.inspectCalls(); got != 1 {
-		t.Errorf("inspect ran %d times, want 1", got)
-	}
-}
-
-// TestCachedInfoDoesNotCacheAFailure keeps a failed inspect from
-// poisoning the handle: the next caller retries.
-func TestCachedInfoDoesNotCacheAFailure(t *testing.T) {
-	runner := &uidReportingRunner{uid: "aaaa", fakeRunner: newTestRunner()}
-	ctr := &Container{id: "c1", runner: runner, eng: dockerEngine{}}
-
-	ctx := context.Background()
-	if _, err := ctr.cachedInfo(context.Background()); err != nil {
-		t.Fatalf("first cachedInfo: %v", err)
-	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
-		t.Fatalf("second cachedInfo: %v", err)
 	}
 	if got := runner.inspectCalls(); got != 1 {
 		t.Errorf("inspect ran %d times, want 1", got)

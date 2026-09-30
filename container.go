@@ -509,7 +509,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if info := c.loadInfo(); info != nil {
 		return info, nil
 	}
-	return c.infoFlight.do(ctx, cachedInfoFlightKey, func() (*engineInfo, error) {
+	// The flight group is per-Container, so any constant key names the
+	// one inspect that can be in flight.
+	return c.infoFlight.do(ctx, "", func() (*engineInfo, error) {
 		// Re-check: a caller that queued behind the flight's inspect
 		// would otherwise run a second one.
 		if info := c.loadInfo(); info != nil {
@@ -534,11 +536,6 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 		return info, nil
 	})
 }
-
-// cachedInfoFlightKey is the single key for a Container's own
-// cachedInfo flight. The group is per-Container, so one constant key
-// identifies the one inspect that can be in flight.
-const cachedInfoFlightKey = "cachedInfo"
 
 func (c *Container) loadInfo() *engineInfo {
 	c.mu.Lock()

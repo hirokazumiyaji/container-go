@@ -372,12 +372,6 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if c.reused {
 		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
 	}
-	return c.stop(ctx, timeout)
-}
-
-// stop is the unguarded stop. Terminate and the rollback paths use it
-// directly, since they own the container and are not racing a peer.
-func (c *Container) stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)

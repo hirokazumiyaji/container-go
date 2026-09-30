@@ -489,8 +489,9 @@ binding observed on a remote daemon still resolves to the remote host.
 An explicit `WithPublishedPort` loopback bind on a remote daemon is
 rejected by `Run`: Docker would listen on the remote machine's loopback,
 which no client-side rewrite can reach. Bind mounts are supported for a
-local Docker daemon, including Windows Docker Desktop. For a non-loopback
-TCP `DOCKER_HOST`, `Run` rejects `MountBind` with
+local Docker daemon, including Windows Docker Desktop. When `DOCKER_HOST`
+selects a remote daemon (any non-local transport, including `tcp://`,
+`ssh://`, `http(s)://`), `Run` rejects `MountBind` with
 `ErrUnsupportedCapability` before image pulling or container creation:
 Docker resolves the source on the daemon host, and the library cannot
 verify that a client path exists there or has compatible OS syntax. Only

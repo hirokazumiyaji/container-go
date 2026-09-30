@@ -363,11 +363,7 @@ func TestIsRemoteDockerHostCoversNonTCPRemoteSchemes(t *testing.T) {
 		"ssh://user@10.0.0.5",
 		"http://10.0.0.5:2375",
 		"https://10.0.0.5:2376",
-		"npipe:////./pipe/docker_engine",
 	} {
-		if host == "npipe:////./pipe/docker_engine" {
-			continue // a named pipe is local even on Windows
-		}
 		t.Setenv("DOCKER_HOST", host)
 		if !isRemoteDockerHost() {
 			t.Errorf("DOCKER_HOST=%q: want remote", host)

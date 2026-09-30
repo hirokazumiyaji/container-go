@@ -93,7 +93,7 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。割り当てはデーモンが起動時に原子的に行うため、こちらでも並列テストがポートを奪い合うことはありません。
 
 Bind mount はローカルの Docker daemon(Windows Docker Desktop を含む)で利用できます。
-`DOCKER_HOST` が非ループバックの TCP daemon を指す場合、`Run` は `MountBind` を `ErrUnsupportedCapability` 付きで拒否します。
+`DOCKER_HOST` がリモート daemon(`tcp://` / `ssh://` / `http(s)://` などローカルでない transport すべて)を指す場合、`Run` は `MountBind` を `ErrUnsupportedCapability` 付きで拒否します。
 Docker は source を daemon host 側で解決するため、このライブラリはクライアントのパスがそのホストに存在するか、互換性のある OS 構文かを保証できません。
 拒否は image pull や container creation より前に行われます。
 `errors.Is(err, container.ErrUnsupportedCapability)` で判定できます。

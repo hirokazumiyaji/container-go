@@ -108,12 +108,12 @@ func (dockerEngine) defaultHost() string {
 // the daemon would resolve in the wrong place.
 func isRemoteDockerHost() bool {
 	raw := os.Getenv("DOCKER_HOST")
-	switch raw {
-	case "":
+	if raw == "" {
 		return false
 	}
+	lower := strings.ToLower(raw)
 	for _, local := range []string{"unix://", "npipe://"} {
-		if strings.HasPrefix(strings.ToLower(raw), local) {
+		if strings.HasPrefix(lower, local) {
 			return false
 		}
 	}

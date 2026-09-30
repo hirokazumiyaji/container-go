@@ -328,7 +328,7 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 loopback/unspecified の束縛は `defaultHost()` に読み替える。
 リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。
 Bind mount はローカルの Docker daemon(Windows Docker Desktop を含む)で利用できる。
-非ループバックの TCP `DOCKER_HOST` では `Run` が image pull や container creation より前に `ErrUnsupportedCapability` 付きで `MountBind` を拒否する。
+リモート daemon を指す `DOCKER_HOST`(`tcp://` / `ssh://` / `http(s)://` などローカルでない transport すべて)では `Run` が image pull や container creation より前に `ErrUnsupportedCapability` 付きで `MountBind` を拒否する。
 Docker は source を daemon host 側で解決し、このライブラリはクライアントのパスがそのホストに存在するか、互換性のある OS 構文かを保証できないためである。
 `DOCKER_HOST` だけが対象で、`docker context` 経由のリモート指定は検知できない。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。

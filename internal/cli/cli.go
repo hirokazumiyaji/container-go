@@ -132,13 +132,6 @@ func RunTo(r Runner, ctx context.Context, stdout, stderr io.Writer, args ...stri
 	if stderr == nil {
 		stderr = io.Discard
 	}
-	stats := OutputStats{
-		StdoutBytes:     int64(len(dataOut)),
-		StderrBytes:     int64(len(dataErr)),
-		StdoutTruncated: writerTruncated(stdout),
-		StderrTruncated: writerTruncated(stderr),
-	}
-
 	// Try both streams even if the first sink fails. Both failures are
 	// useful to a caller, and observing stderr does not change the
 	// already-materialized legacy-runner result.
@@ -149,9 +142,12 @@ func RunTo(r Runner, ctx context.Context, stdout, stderr io.Writer, args ...stri
 	if err := writeOutput(stderr, dataErr); err != nil {
 		deliveryErr = joinErrors(deliveryErr, &OutputError{Stream: "stderr", Err: err})
 	}
-	stats.StdoutTruncated = writerTruncated(stdout)
-	stats.StderrTruncated = writerTruncated(stderr)
-	return stats, joinErrors(runErr, deliveryErr)
+	return OutputStats{
+		StdoutBytes:     int64(len(dataOut)),
+		StderrBytes:     int64(len(dataErr)),
+		StdoutTruncated: writerTruncated(stdout),
+		StderrTruncated: writerTruncated(stderr),
+	}, joinErrors(runErr, deliveryErr)
 }
 
 func writeOutput(dst io.Writer, data []byte) error {

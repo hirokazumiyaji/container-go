@@ -76,18 +76,6 @@ func (c *Container) logTail(ctx context.Context) string {
 	return tail.String()
 }
 
-// lastNBytes keeps only the trailing n bytes of r using a fixed-size
-// ring buffer.
-func lastNBytes(r io.Reader, n int) string {
-	if n <= 0 {
-		_, _ = io.Copy(io.Discard, r)
-		return ""
-	}
-	tail := newTailWriter(n)
-	_, _ = io.Copy(tail, r)
-	return tail.String()
-}
-
 type tailWriter struct {
 	mu   sync.Mutex
 	buf  []byte

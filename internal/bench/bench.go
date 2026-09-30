@@ -173,7 +173,7 @@ func Table(summaries []Summary) string {
 	// from the header too.
 	spawnW := max(len("SPAWN"), len(unmeasuredSubprocesses))
 
-	pattern := fmt.Sprintf("%%-%ds %%%ds %%%ds %%%ds %%4s %%10s %%10s %%10s %%-%ds\n",
+	pattern := fmt.Sprintf("%%-%ds %%-%ds %%-%ds %%-%ds %%4s %%10s %%10s %%10s %%-%ds\n",
 		backendW, libraryW, imageW, scenarioW, spawnW)
 	var b strings.Builder
 	fmt.Fprintf(&b, pattern, "BACKEND", "LIBRARY", "IMAGE", "SCENARIO", "N", "MEDIAN", "MIN", "MAX", "SPAWN")

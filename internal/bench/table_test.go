@@ -1,7 +1,6 @@
 package bench
 
 import (
-	"bytes"
 	"strings"
 	"testing"
 	"time"
@@ -105,7 +104,7 @@ func TestTableShowsUnmeasuredSubprocessesAsNA(t *testing.T) {
 	if !strings.HasSuffix(strings.TrimRight(rows[2], " "), "7") {
 		t.Errorf("measured spawn column = %q, want 7:\n%s", rows[2], table)
 	}
-	if bytes.Contains([]byte(table), []byte(" 0\n")) {
+	if strings.Contains(table, " 0\n") {
 		t.Errorf("a bare 0 appears in the spawn column; unmeasured must not read as measured:\n%s", table)
 	}
 }

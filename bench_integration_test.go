@@ -180,7 +180,6 @@ func TestIntegrationBenchCounting(t *testing.T) {
 // termination stay outside the measured interval.
 func benchMulti(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, image string) {
 	t.Helper()
-	b.EnsureImage(t, image)
 	policy, ok := bench.ScenarioPolicyForKey(b.Name, bench.LibraryContainerGo, "run/multi-5")
 	if !ok {
 		t.Fatal("no benchmark policy for run/multi-5")

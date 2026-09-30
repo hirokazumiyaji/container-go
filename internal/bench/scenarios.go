@@ -26,8 +26,6 @@ const (
 	PinnedNginxImageDigest              = NginxImageDigest
 	PinnedTestcontainersRyukImage       = TestcontainersRyukImage
 	PinnedTestcontainersRyukImageDigest = TestcontainersRyukImageDigest
-	PinnedRyukImage                     = TestcontainersRyukImage
-	PinnedRyukImageDigest               = TestcontainersRyukImageDigest
 
 	// DefaultIterations is the repetition count for ordinary scenarios.
 	DefaultIterations = 5

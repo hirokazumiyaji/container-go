@@ -53,10 +53,6 @@ const (
 	TestcontainersRyukImageDigest       = ibench.TestcontainersRyukImageDigest
 	PinnedTestcontainersRyukImage       = ibench.PinnedTestcontainersRyukImage
 	PinnedTestcontainersRyukImageDigest = ibench.PinnedTestcontainersRyukImageDigest
-	PinnedRyukImage                     = ibench.PinnedRyukImage
-	PinnedRyukImageDigest               = ibench.PinnedRyukImageDigest
-	RyukImage                           = ibench.TestcontainersRyukImage
-	RyukImageDigest                     = ibench.TestcontainersRyukImageDigest
 	CacheStateCold                      = ibench.CacheStateCold
 	CacheStateWarm                      = ibench.CacheStateWarm
 	DefaultIterations                   = ibench.DefaultIterations

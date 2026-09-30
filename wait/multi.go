@@ -27,23 +27,98 @@ func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 }
 
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	callerCtx := ctx
+	waitCtx := ctx
+	var startupDeadline time.Time
 	if s.startupTimeout > 0 {
+		startupDeadline = time.Now().Add(s.startupTimeout)
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.startupTimeout)
+		waitCtx, cancel = context.WithDeadline(ctx, startupDeadline)
 		defer cancel()
 	}
+	callerDeadline, callerHasDeadline := callerCtx.Deadline()
+
+	// A derived context only exposes whichever deadline wins. Compare the
+	// caller's configured deadline with the independent startup deadline
+	// so equal or near-equal timers cannot be mislabeled at the boundary.
+	callerOwnsTermination := func(waitErr error) bool {
+		if errors.Is(waitErr, context.Canceled) {
+			return true
+		}
+		if s.startupTimeout <= 0 || !errors.Is(waitErr, context.DeadlineExceeded) {
+			return false
+		}
+		return callerHasDeadline && !callerDeadline.After(startupDeadline)
+	}
+	terminationCause := func(waitErr error) error {
+		if !callerOwnsTermination(waitErr) {
+			return waitErr
+		}
+		if callerErr := callerCtx.Err(); callerErr != nil {
+			return callerErr
+		}
+		if errors.Is(waitErr, context.Canceled) {
+			return context.Canceled
+		}
+		return context.DeadlineExceeded
+	}
+
+	// wrap classifies waitCtx termination for one phase of the loop
+	// ("before"/"in"/"after"). phaseTail is the substring following the
+	// classification label ("before strategy %d ran", "in strategy %d",
+	// "after strategy %d"). childErr, when set, is the strategy's own
+	// error and joins both the message tail and the cause list; only
+	// the "in" phase passes one.
+	wrap := func(phaseTail string, i int, childErr error) error {
+		waitErr := waitCtx.Err()
+		var extra []error
+		suffix := ""
+		if childErr != nil {
+			suffix = fmt.Sprintf(": %v", childErr)
+			extra = []error{childErr}
+		}
+		switch {
+		case callerOwnsTermination(waitErr):
+			label := "caller deadline elapsed"
+			if errors.Is(waitErr, context.Canceled) {
+				label = "caller context ended"
+			}
+			return newWaitError(fmt.Sprintf("wait for all: %s %s%s", label, phaseTail, suffix),
+				append([]error{terminationCause(waitErr)}, extra...)...)
+		case s.startupTimeout > 0 && errors.Is(waitErr, context.DeadlineExceeded):
+			return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed %s%s", s.startupTimeout, phaseTail, suffix),
+				append([]error{waitErr}, extra...)...)
+		case childErr != nil:
+			return newWaitError(fmt.Sprintf("wait for all: strategy %d%s", i, suffix),
+				append([]error{waitErr}, extra...)...)
+		default:
+			return newWaitError(fmt.Sprintf("wait for all: context ended %s", phaseTail), waitErr)
+		}
+	}
+
 	for i, strategy := range s.strategies {
-		if err := ctx.Err(); err != nil {
-			if s.startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err)
+		if waitCtx.Err() != nil {
+			return wrap(fmt.Sprintf("before strategy %d ran", i), i, nil)
+		}
+		if err := callerCtx.Err(); err != nil {
+			return newWaitError(fmt.Sprintf("wait for all: caller context ended before strategy %d ran", i), err)
+		}
+
+		if err := strategy.WaitUntilReady(waitCtx, target); err != nil {
+			if waitCtx.Err() != nil {
+				return wrap(fmt.Sprintf("in strategy %d", i), i, err)
+			}
+			if callerErr := callerCtx.Err(); callerErr != nil {
+				return newWaitError(fmt.Sprintf("wait for all: caller context ended in strategy %d: %v", i, err), callerErr, err)
 			}
 			return err
 		}
-		if err := strategy.WaitUntilReady(ctx, target); err != nil {
-			if s.startupTimeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err)
-			}
-			return err
+
+		if waitCtx.Err() != nil {
+			return wrap(fmt.Sprintf("after strategy %d", i), i, nil)
+		}
+		if err := callerCtx.Err(); err != nil {
+			return newWaitError(fmt.Sprintf("wait for all: caller context ended after strategy %d", i), err)
 		}
 	}
 	return nil
@@ -72,30 +147,65 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if len(s.strategies) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
+	callerCtx := ctx
+	if err := callerCtx.Err(); err != nil {
+		return newWaitError("wait for any: caller context ended", err)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	waitCtx := runCtx
 
 	if s.startupTimeout > 0 {
 		var timeoutCancel context.CancelFunc
-		ctx, timeoutCancel = context.WithTimeout(ctx, s.startupTimeout)
+		waitCtx, timeoutCancel = context.WithTimeout(runCtx, s.startupTimeout)
 		defer timeoutCancel()
 	}
 
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
-		go func() { results <- strategy.WaitUntilReady(ctx, target) }()
+		go func() { results <- strategy.WaitUntilReady(waitCtx, target) }()
 	}
+
 	var errs []error
-	for range s.strategies {
+	remaining := len(s.strategies)
+	var terminalErr error
+	terminationErr := func() error {
+		if err := callerCtx.Err(); err != nil {
+			return err
+		}
+		return waitCtx.Err()
+	}
+	for remaining > 0 {
+		if terminalErr != nil {
+			// A context-aware strategy must publish its final error
+			// after cancellation. Drain every result so its last cause
+			// is not lost to ForAny's earlier context select.
+			err := <-results
+			remaining--
+			if err != nil {
+				errs = append(errs, err)
+			}
+			continue
+		}
+
 		select {
 		case err := <-results:
-			if err == nil {
+			remaining--
+			if termErr := terminationErr(); termErr != nil {
+				terminalErr = termErr
+			}
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if terminalErr == nil && err == nil {
 				return nil
 			}
-			errs = append(errs, err)
-		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+		case <-waitCtx.Done():
+			terminalErr = terminationErr()
 		}
+	}
+	if terminalErr != nil {
+		errs = append(errs, terminalErr)
 	}
 	return errors.Join(errs...)
 }

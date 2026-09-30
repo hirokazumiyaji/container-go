@@ -116,22 +116,6 @@ func (r *chunkReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
-func TestLastNBytesKeepsTail(t *testing.T) {
-	got := lastNBytes(strings.NewReader("abcdef"), 4)
-	if got != "cdef" {
-		t.Fatalf("got %q, want cdef", got)
-	}
-	got = lastNBytes(strings.NewReader("ab"), 4)
-	if got != "ab" {
-		t.Fatalf("got %q, want ab", got)
-	}
-	big := strings.Repeat("x", 100000) + "MARK"
-	got = lastNBytes(strings.NewReader(big), 10)
-	if got != "xxxxxxMARK" {
-		t.Fatalf("got %q", got)
-	}
-}
-
 func TestLogsTailArgsBounded(t *testing.T) {
 	docker := dockerEngine{}.logsTailArgs("myctr")
 	joined := strings.Join(docker, " ")

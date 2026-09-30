@@ -10,7 +10,7 @@ import (
 )
 
 func TestTerminateRefusesReplacedGeneration(t *testing.T) {
-	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	// Handle knows creation A, but live container reports creation B.
 	ctr.runner = &generationRunner{
 		creation: "bbbbbbbbbbbbbbbb",
@@ -42,7 +42,7 @@ func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 }
 
 func TestTerminateAllowsMatchingGeneration(t *testing.T) {
-	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	ctr.runner = &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for matching generation", err)
@@ -101,7 +101,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
 	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
-	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)
 	}
@@ -112,7 +112,7 @@ func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
 
 func TestTerminateFailsClosedWhenInspectFails(t *testing.T) {
 	r := &inspectErrorRunner{stderr: "daemon unavailable"}
-	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
 	err := ctr.Terminate(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "verify generation") {
 		t.Fatalf("Terminate = %v, want verify-generation failure", err)

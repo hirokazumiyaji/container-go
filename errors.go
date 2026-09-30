@@ -34,6 +34,15 @@ var ErrContainerNotFound = errors.New("container not found")
 // the live container's creation label no longer matches this handle.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrSharedContainer reports that a destructive operation was refused
+// because the handle came from WithReuse, so the container is shared
+// with other Run calls in this process and with other processes using
+// the same name. Stopping or rewriting it would break them, and the
+// failure would surface on their side as an unrelated connection
+// error. Use Container.Shared to opt in, or Container.Terminate to
+// remove the shared container outright.
+var ErrSharedContainer = errors.New("refusing to modify a shared WithReuse container")
+
 // isNotFound reports whether a CLI failure means the container does not
 // exist. Matching substrings live on each engine (see engine_*.go).
 func isNotFound(err error) bool {

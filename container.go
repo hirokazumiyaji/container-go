@@ -85,20 +85,35 @@ type Container struct {
 	published []publishSpec
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
-	// process exit. Explicit Terminate still removes them.
+	// process exit, and Stop/CopyToContainer/CopyFileFromContainer
+	// refuse with ErrSharedContainer so this process cannot disturb the
+	// peers sharing the container. Explicit Terminate still removes it,
+	// and Container.Shared lifts the refusals; see WithReuse.
 	reused bool
 	// creation is the unique generation ID stored in creationLabel.
 	// Terminate and the reaper verify it before deleting so a stale
 	// handle does not remove a same-name replacement made by this
 	// library; see Terminate for the limits of the name-based path.
 	creation string
+	// state is the handle's mutable state, behind a pointer so Shared can
+	// hand out a second handle onto the same container without copying a
+	// lock. Both handles then share the immutable ID and the inspect
+	// cache, so an inspect started through either is visible to both.
+	state *containerState
+}
+
+// containerState is the part of a Container that changes after the
+// handle is published. It is a separate object so a guard-relaxed
+// handle can share it instead of copying its locks.
+type containerState struct {
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	//
-	// It is promoted from the first inspect, so it is written long after the
-	// handle is published. Guarded by uidMu rather than mu, because readers
-	// on the Terminate path must not hold the inspect lock.
+	// It is promoted from the first inspect, so it is written long after
+	// the handle is published. Guarded by its own mutex rather than mu,
+	// because readers on the Terminate path must not hold the inspect
+	// lock.
 	uid   string
 	uidMu sync.RWMutex
 
@@ -110,9 +125,9 @@ type Container struct {
 // backend has none. The ID is only ever promoted from empty to a real value,
 // so a caller that observes "" may re-read after a failed operation.
 func (c *Container) immutableID() string {
-	c.uidMu.RLock()
-	defer c.uidMu.RUnlock()
-	return c.uid
+	c.state.uidMu.RLock()
+	defer c.state.uidMu.RUnlock()
+	return c.state.uid
 }
 
 // setImmutableID records the backend's immutable container ID. It never
@@ -121,11 +136,11 @@ func (c *Container) setImmutableID(uid string) {
 	if uid == "" {
 		return
 	}
-	c.uidMu.Lock()
-	if c.uid == "" {
-		c.uid = uid
+	c.state.uidMu.Lock()
+	if c.state.uid == "" {
+		c.state.uid = uid
 	}
-	c.uidMu.Unlock()
+	c.state.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -201,7 +216,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		exposed:   cfg.exposed,
 		published: cfg.published,
 		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		state:     &containerState{uid: cfg.eng.parseRunID(stdout)},
 	}
 	// The reaper only backs real CLI containers; with an injected
 	// test runner there is nothing external to clean up. With an
@@ -219,7 +234,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	}
 
 	for _, f := range cfg.files {
-		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := c.copyTo(ctx, f.HostPath, f.ContainerPath); err != nil {
 			return nil, c.rollback(ctx, err)
 		}
 	}
@@ -347,11 +362,44 @@ func (c *Container) State(ctx context.Context) (State, error) {
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
 // period before the process is killed.
+//
+// It returns ErrSharedContainer on a WithReuse handle. Stopping a
+// shared container breaks every other Run call sharing it, and the
+// breakage surfaces on their side as an unrelated connection failure
+// rather than as anything they can attribute. Use Shared to opt in
+// deliberately, or Terminate to remove the shared container outright.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	if c.reused {
+		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
 	return c.classify(ctx, err)
+}
+
+// Shared returns a handle to the same container with the destructive
+// operations unguarded: Stop, CopyToContainer, and
+// CopyFileFromContainer. The returned handle shares the container's
+// identity, cache, and generation, so the two handles are the same
+// container and either can be used to reach it.
+//
+// Only the returned handle is unguarded; the receiver keeps its guard,
+// so a shared handle stays protected by default. The opt-in exists for
+// the case where this process owns the shared container's lifecycle
+// (a suite-wide database it started and intends to stop) and the reuse
+// exists to avoid duplicate starts rather than to share ownership.
+//
+// Cleanup and TerminateContainer still skip a reused handle regardless
+// of this flag: the guard is about explicit calls, not about
+// teardown.
+func (c *Container) Shared() *Container {
+	if c == nil {
+		return nil
+	}
+	unguarded := *c
+	unguarded.reused = false
+	return &unguarded
 }
 
 // Terminate force-removes the container. Removing a container that no
@@ -494,16 +542,16 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 // that cannot change while the container exists (labels, network
 // address, port bindings) should be read from it.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	c.state.mu.Lock()
+	defer c.state.mu.Unlock()
+	if c.state.info != nil {
+		return c.state.info, nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
+	c.state.info = info
 	// Delegate, so the "never downgrade a promoted value" invariant lives in
 	// one place rather than being reimplemented here.
 	c.setImmutableID(info.uid)

@@ -60,7 +60,7 @@ func TestTerminateRefusesReplacedContainer(t *testing.T) {
 	g := &genRunner{fakeRunner: base, inspectJSON: creationInspectJSON("myctr", newCreation)}
 	ctr := &Container{
 		id: "myctr", runner: g, eng: appleEngine{},
-		creation: oldCreation,
+		creation: oldCreation, state: &containerState{},
 	}
 	if err := ctr.Terminate(context.Background()); err == nil {
 		t.Fatal("want error for replaced container")
@@ -78,7 +78,7 @@ func TestTerminateDeletesSameGeneration(t *testing.T) {
 	g := &genRunner{fakeRunner: base, inspectJSON: creationInspectJSON("myctr", creation)}
 	ctr := &Container{
 		id: "myctr", runner: g, eng: appleEngine{},
-		creation: creation,
+		creation: creation, state: &containerState{},
 	}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate: %v", err)

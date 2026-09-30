@@ -190,8 +190,8 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d)
-	if ctr.uid != dockerFixtureID {
-		t.Fatalf("uid = %q, want the ID docker run printed", ctr.uid)
+	if got := ctr.immutableID(); got != dockerFixtureID {
+		t.Fatalf("immutableID = %q, want the ID docker run printed", got)
 	}
 	inspects := len(d.calls)
 	if err := ctr.Terminate(context.Background()); err != nil {

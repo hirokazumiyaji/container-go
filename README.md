@@ -221,6 +221,17 @@ Contract:
 - `Cleanup`, `TerminateContainer`, and the watchdog reaper skip reused
   handles so other packages keep working. Explicit `ctr.Terminate` still
   removes the shared container — only do that when nothing else needs it.
+- Operations that would change what a peer sees are refused on a reused
+  handle with `ErrSharedContainer`: `Stop`, `CopyToContainer`, and
+  `CopyFileFromContainer`. Without the guard, one package's `Stop` would
+  take down a container the others are still using, and the damage would
+  surface on their side as an unrelated connection failure. Reads
+  (`Endpoint`, `State`, `Exec`, `Logs`, …) are unaffected. Call
+  `ctr.Shared()` to get a handle with the refusals lifted, for when this
+  process owns the shared container's lifecycle; `Cleanup` and
+  `TerminateContainer` still skip it. `WithFiles` is applied during
+  create, before the handle is shared, so it is not subject to the
+  guard.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). Ordinary `Prune` still
   only deletes stopped managed containers.

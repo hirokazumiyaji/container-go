@@ -175,6 +175,15 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
+- reused ハンドルでは、peer の観測結果を変えてしまう操作を
+  `ErrSharedContainer` で拒否する: `Stop`、`CopyToContainer`、
+  `CopyFileFromContainer`。ガードがなければ 1 パッケージの `Stop` が
+  他パッケージが使用中のコンテナを停止し、被害は对方側では原因の
+  特定できない接続失敗として現れる。読み取り系(`Endpoint`、`State`、
+  `Exec`、`Logs` など)は対象外。共有コンテナの lifecycle を自プロセスが
+  掌控する場合は `ctr.Shared()` で拒否を解除したハンドルを得る。
+  `Cleanup` / `TerminateContainer` は依然として reused ハンドルを消す。
+  `WithFiles` は共有前に create 時に適用されるため、ガードの対象外。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
   コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
 

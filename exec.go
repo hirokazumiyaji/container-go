@@ -16,9 +16,10 @@ import (
 type ExecOption func(*execConfig) error
 
 type execConfig struct {
-	env     map[string]string
-	user    string
-	workdir string
+	env      map[string]string
+	user     string
+	workdir  string
+	maxBytes int64
 }
 
 // WithExecEnv sets environment variables for the exec'd process,
@@ -57,49 +58,158 @@ func WithExecWorkDir(dir string) ExecOption {
 	}
 }
 
+// WithExecMaxBytes caps the combined stdout+stderr retained by Exec or
+// ExecTo. It retains the prefix observed from the CLI, not a byte tail.
+// The limit must be positive; leaving the option unset keeps the
+// historical full-output behavior. Streaming paths merge the two
+// streams in arrival order.
+func WithExecMaxBytes(maxBytes int64) ExecOption {
+	return func(c *execConfig) error {
+		if maxBytes <= 0 {
+			return fmt.Errorf("exec MaxBytes must be greater than zero, got %d", maxBytes)
+		}
+		c.maxBytes = maxBytes
+		return nil
+	}
+}
+
 // Exec runs a command in the container and returns its exit code and
-// combined output. A non-zero exit code is a result, not an error.
+// combined output. A non-zero exit code is a result, not an error. The
+// historical full-output behavior remains when WithExecMaxBytes is not
+// supplied; bounded callers should set that option. If the backend,
+// context, or CLI launch fails, output still contains the bytes observed
+// before the failure; bounded readers expose whether their prefix was
+// truncated.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+	cfg, envFile, cleanup, err := prepareExec(cmd, opts)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer cleanup()
+
+	args := c.eng.execArgs(c.id, cfg, envFile, cmd)
+	var output io.Reader
+	if cfg.maxBytes > 0 {
+		capture := newBoundedBuffer(cfg.maxBytes)
+		_, err = cli.RunTo(c.runner, ctx, capture, capture, args...)
+		output = capture.reader()
+	} else {
+		var stdout, stderr []byte
+		stdout, stderr, err = c.runner.Run(ctx, args...)
+		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	}
+
+	code, resolvedErr := c.resolveExecError(ctx, err)
+	if resolvedErr != nil {
+		return code, output, resolvedErr
+	}
+	return code, output, nil
+}
+
+// ExecTo runs a command and streams its combined stdout+stderr to
+// output while the command is running. WithExecMaxBytes applies a hard
+// prefix limit to that stream; bytes beyond it are drained and discarded.
+// The returned stats count all bytes observed, not just bytes forwarded.
+// A sink failure is returned with the CLI's terminal error, if any.
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error) {
+	cfg, envFile, cleanup, err := prepareExec(cmd, opts)
+	if err != nil {
+		return 0, OutputStats{}, err
+	}
+	defer cleanup()
+
+	tracked := newOutputTrackingWriter(output)
+	var sink io.Writer
+	var limited *limitedWriter
+	if cfg.maxBytes > 0 {
+		limited = limitedStreamWriter(tracked, cfg.maxBytes)
+		sink = limited
+	} else {
+		sink = streamWriter(tracked)
+	}
+	stats, runErr := cli.RunTo(c.runner, ctx, sink, sink, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	runErr = preserveOutputDeliveryError(runErr, tracked)
+	result := OutputStats{
+		Bytes:     stats.StdoutBytes + stats.StderrBytes,
+		Truncated: stats.Truncated(),
+	}
+	if limited != nil {
+		result.Truncated = result.Truncated || limited.Truncated()
+	}
+	code, resolvedErr := c.resolveExecError(ctx, runErr)
+	if resolvedErr != nil {
+		return code, result, resolvedErr
+	}
+	return code, result, nil
+}
+
+func prepareExec(cmd []string, opts []ExecOption) (*execConfig, string, func(), error) {
 	if len(cmd) == 0 {
-		return 0, nil, errors.New("exec: command must not be empty")
+		return nil, "", func() {}, errors.New("exec: command must not be empty")
 	}
 	cfg := &execConfig{env: map[string]string{}}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return 0, nil, err
+			return nil, "", func() {}, err
 		}
 	}
 
-	var envFile string
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return 0, nil, err
-		}
-		defer os.RemoveAll(dir)
-		envFile = path
+	if len(cfg.env) == 0 {
+		return cfg, "", func() {}, nil
 	}
+	path, dir, err := writeEnvFile(cfg.env)
+	if err != nil {
+		return nil, "", func() {}, err
+	}
+	return cfg, path, func() { _ = os.RemoveAll(dir) }, nil
+}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+// resolveExecError preserves application exit results while retaining
+// the existing infrastructure/not-found classification behavior. When a
+// runner joins a sink failure to a command exit, the joined error is not
+// converted into a successful result.
+func (c *Container) resolveExecError(ctx context.Context, err error) (int, error) {
 	if err == nil {
-		return 0, output, nil
-	}
-	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil
 	}
 	var cliErr *cli.CLIError
-	errors.As(err, &cliErr)
+	if !errors.As(err, &cliErr) {
+		return 0, preserveError(wrapNotFound(c.classify(ctx, err)), err)
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// A command can finish with an exit status just as its context
+		// is canceled. Keep both facts instead of treating the status
+		// as a clean application result.
+		return cliErr.ExitCode, errors.Join(err, ctxErr)
+	}
+
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
-	// results return immediately with no extra CLI call.
+	// results return immediately with no extra CLI call. A direct
+	// *CLIError is the only error shape that can be a successful result;
+	// wrappers and joined sink errors must remain observable.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, output, nil
+		if directCLIError(err) {
+			return cliErr.ExitCode, nil
+		}
+		return cliErr.ExitCode, err
 	}
 	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, output, nil
+		if directCLIError(err) {
+			return cliErr.ExitCode, nil
+		}
+		return cliErr.ExitCode, err
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+
+	// Preserve the backend exit code even when verification classifies
+	// the failure as infrastructure, cancellation, or missing-container.
+	classified := wrapNotFound(c.classify(ctx, err))
+	return cliErr.ExitCode, preserveError(classified, err)
+}
+
+func directCLIError(err error) bool {
+	_, ok := err.(*cli.CLIError)
+	return ok
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the

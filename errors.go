@@ -16,6 +16,11 @@ type CLIError = cli.CLIError
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrOutputDelivery reports that CLI output could not be delivered to a
+// caller-provided sink. The original writer error remains in the chain
+// for errors.Is/errors.As checks.
+var ErrOutputDelivery = cli.ErrOutputDelivery
+
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts.
 var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
@@ -50,4 +55,20 @@ func wrapNotFound(err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+// preserveError keeps the original failure in a classified chain. A
+// classifier may add context or a sentinel, but it must not erase a CLI
+// exit, cancellation, or caller-sink error that led to the classification.
+func preserveError(classified, original error) error {
+	if original == nil {
+		return classified
+	}
+	if classified == nil {
+		return original
+	}
+	if errors.Is(classified, original) {
+		return classified
+	}
+	return errors.Join(classified, original)
 }

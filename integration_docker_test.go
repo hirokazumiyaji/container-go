@@ -3,6 +3,7 @@
 package container_test
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -26,6 +27,15 @@ import (
 func requireDocker(t *testing.T) {
 	t.Helper()
 	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
+}
+
+type countOnlyWriter struct {
+	bytes int64
+}
+
+func (w *countOnlyWriter) Write(p []byte) (int, error) {
+	w.bytes += int64(len(p))
+	return len(p), nil
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -501,6 +511,107 @@ func TestIntegrationDockerExecPreservesLargeFailureOutput(t *testing.T) {
 	}
 	if n, _ := io.ReadAll(out); len(n) != 131072 {
 		t.Fatalf("len(output) = %d, want 131072", len(n))
+	}
+}
+
+// TestIntegrationDockerExecStreamsLargeOutputBounded exercises the
+// direct RunTo path with at least 256 MiB of CLI output. The count-only
+// sink retains no emitted bytes, while the child is fully drained. Cleanup
+// is registered before the error check so a deadline failure also removes
+// the container and any still-running exec process.
+func TestIntegrationDockerExecStreamsLargeOutputBounded(t *testing.T) {
+	requireDocker(t)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelRun()
+	ctr, err := container.Run(runCtx, integrationAlpine,
+		container.WithCmd("sleep", "300"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var output countOnlyWriter
+	const (
+		maxBytes     = 1024
+		emittedBytes = 256 * 1024 * 1024
+	)
+	execCtx, cancelExec := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelExec()
+	code, stats, err := ctr.ExecTo(execCtx,
+		[]string{"sh", "-c", fmt.Sprintf("head -c %d /dev/zero", emittedBytes)},
+		&output,
+		container.WithExecMaxBytes(maxBytes),
+	)
+	if err != nil {
+		t.Fatalf("ExecTo: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if output.bytes != maxBytes {
+		t.Fatalf("forwarded bytes = %d, want %d", output.bytes, maxBytes)
+	}
+	if stats.Bytes < emittedBytes || !stats.Truncated {
+		t.Fatalf("stats = %+v, want >=%d bytes observed and truncation", stats, emittedBytes)
+	}
+}
+
+// TestIntegrationDockerExecStreamsLargeStderrBounded covers the stderr
+// half of the same direct-streaming path.
+func TestIntegrationDockerExecStreamsLargeStderrBounded(t *testing.T) {
+	requireDocker(t)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelRun()
+	ctr, err := container.Run(runCtx, integrationAlpine,
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	var output bytes.Buffer
+	const (
+		maxBytes     = 1024
+		emittedBytes = 8 * 1024 * 1024
+	)
+	execCtx, cancelExec := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancelExec()
+	code, stats, err := ctr.ExecTo(execCtx,
+		[]string{"sh", "-c", fmt.Sprintf("head -c %d /dev/zero >&2", emittedBytes)},
+		&output,
+		container.WithExecMaxBytes(maxBytes),
+	)
+	if err != nil {
+		t.Fatalf("ExecTo: %v", err)
+	}
+	if code != 0 {
+		t.Fatalf("code = %d, want 0", code)
+	}
+	if output.Len() != maxBytes {
+		t.Fatalf("retained stderr bytes = %d, want %d", output.Len(), maxBytes)
+	}
+	if stats.Bytes < emittedBytes || !stats.Truncated {
+		t.Fatalf("stats = %+v, want >=%d observed and truncation", stats, emittedBytes)
+	}
+}
+
+// TestIntegrationDockerForExecDrainsLargeStderr verifies that the wait
+// adapter's discard sink also drains stderr-heavy command output.
+func TestIntegrationDockerForExecDrainsLargeStderr(t *testing.T) {
+	requireDocker(t)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelRun()
+	ctr, err := container.Run(runCtx, integrationAlpine,
+		container.WithCmd("sleep", "60"),
+		container.WithWaitStrategy(wait.ForExec([]string{
+			"sh", "-c", "head -c 4194304 /dev/zero >&2",
+		}).WithStartupTimeout(30*time.Second)),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run with ForExec: %v", err)
 	}
 }
 

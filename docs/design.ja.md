@@ -127,7 +127,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error)
 func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
+func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
@@ -136,6 +139,18 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
+
+### 出力の契約
+
+CLI の出力には、全量を保持する互換モードと、caller の sink へ直接流す bounded/streaming モードがある。`Exec` で `WithExecMaxBytes` を指定しない場合、`Logs`、`LogsOptions.MaxBytes` が 0 の場合は、既存呼び出しとの互換性のため全量を保持する。この経路は信頼できない出力に対しては deprecated とし、新コードでは正の `WithExecMaxBytes` / `LogsOptions.MaxBytes` または `ExecTo` / `LogsTo` を使う。
+
+`LogsOptions.Tail` は backend の行単位の末尾(`--tail`)で、`Since` は backend の timestamp filter である。`MaxBytes` はその後に適用される**先頭 byte の prefix 上限**であり、byte 単位の tail ではない。stdout/stderr の結合到着ストリームの先頭を保持する。同じ prefix ポリシーを `WithExecMaxBytes` と `LogsTo` にも適用する。wait 失敗時のログ診断だけは、直近の診断を残すため意図的に異なる末尾 1MiB のリングを使う。旧 unbounded reader は stdout の後に stderr を連結する。bounded/streaming capture は観測した到着順を使う。
+
+正の制限値は stdout と stderr の合計に適用する。保持上限に達した後も CLI 子プロセスは排水され続けるため、pipe が詰まって停止しない。bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の terminal read error として `ErrOutputTruncated` を返す。`OutputStats` は破棄されたデータを含む観測バイト数と truncation を表す。`FollowLogs` は長期ストリームであり、byte 上限を意図的に設けない。sink の書き込みエラーは成功結果に変換せず、`RunTo`、`ExecTo`、`LogsTo` は CLI の終端エラーを保持する。bounded snapshot API は infrastructure、cancellation、launch、missing-container エラー時も partial reader と truncation state を返す。
+
+wait adapter は `ForExec` の出力を `io.Discard` へ送り、失敗診断のログだけを固定長 1MiB の末尾リングへ保持する。CLI runner は `RunTo` でこの契約を提供する。旧 `Run` しか実装しない runner は互換 adapter を使うが、`Run` が戻る前に大きな slice を作るため peak memory の上限は保証できない。大きな出力の integration test は bounded forwarding と draining を確認するだけで、peak host memory を測定するものではない。RSS の測定には外部 sampler が必要である。
+
+`LogsOptions` に `Tail` と `Since` に加えて `MaxBytes` を追加した。Go の構造体にはフィールドを追加しても旧 unkeyed literal を維持する仕組みがないため、この pre-1.0 リリースでは source break を明示的に受け入れる。呼び出しは keyed `LogsOptions` literal へ移行する。微妙に異なる二重の options 表現を維持するより、この選択の方が明確である。internal CLI diagnostic はさらに別で、各失敗 invocation の `CLIError` には stderr の末尾最大 64KiB だけを保持し、`Run` の全量出力と caller-owned `RunTo` sink の動作は変えない。
 
 ## 接続エンドポイントの設計
 
@@ -246,8 +261,7 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 ホストポートを消費しない既定設計により、並列数の上限はホストのリソースだけで決まる。
 
 **ストリームを有限に保つ**。
-`Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
-ForLog が診断用に保持するログは 1MiB を上限とする。
+`FollowLogs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。これは長期ストリームであり、意図的に byte 上限を設けない。snapshot と exec は `RunTo` で子プロセスの出力を直接 sink へ送る。`ForExec` は出力を破棄し、ForLog の診断ログは 1MiB を上限とする。bounded capture は `Truncated` と `ErrOutputTruncated` で truncation を通知する。
 
 **すべての CLI 呼び出しに期限を付ける**。
 各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
@@ -259,6 +273,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
+- `ErrOutputDelivery`：caller-owned output sink が CLI output を拒否した場合。元の writer error は chain に残る
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 
@@ -275,8 +290,9 @@ container-go/
 ├── options.go        // functional options
 ├── cleanup.go        // Cleanup、TerminateContainer、Prune
 ├── reaper.go         // watchdog リーパー
-├── exec.go           // Exec
-├── logs.go           // Logs
+├── exec.go           // Exec、ExecTo
+├── logs.go           // Logs、LogsTo、bounded snapshot
+├── output.go         // bounded reader、sink、truncation error
 ├── copy.go           // CopyToContainer、CopyFileFromContainer
 ├── errors.go         // エラー型
 ├── internal/cli/     // CLI ランナー(コマンド組み立て、実行、タイムアウト)
@@ -289,6 +305,11 @@ container-go/
 ```go
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+type WriterRunner interface {
+    Runner
+    RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error)
 }
 ```
 

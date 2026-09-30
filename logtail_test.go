@@ -47,19 +47,27 @@ func TestLogTailContainsTrailingMarker(t *testing.T) {
 	}
 }
 
-func TestLastNBytesKeepsTail(t *testing.T) {
-	got := lastNBytes(strings.NewReader("abcdef"), 4)
-	if got != "cdef" {
-		t.Fatalf("got %q, want cdef", got)
+func TestTailWriterKeepsTrailingBytes(t *testing.T) {
+	cases := []struct {
+		name  string
+		input string
+		n     int
+		want  string
+	}{
+		{name: "trims_prefix", input: "abcdef", n: 4, want: "cdef"},
+		{name: "shorter_than_limit", input: "ab", n: 4, want: "ab"},
+		{name: "large_input", input: strings.Repeat("x", 100000) + "MARK", n: 10, want: "xxxxxxMARK"},
 	}
-	got = lastNBytes(strings.NewReader("ab"), 4)
-	if got != "ab" {
-		t.Fatalf("got %q, want ab", got)
-	}
-	big := strings.Repeat("x", 100000) + "MARK"
-	got = lastNBytes(strings.NewReader(big), 10)
-	if got != "xxxxxxMARK" {
-		t.Fatalf("got %q", got)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tw := newTailWriter(tc.n)
+			if _, err := tw.Write([]byte(tc.input)); err != nil {
+				t.Fatalf("Write: %v", err)
+			}
+			if got := tw.String(); got != tc.want {
+				t.Fatalf("got %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -171,8 +171,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error)
 func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
@@ -181,9 +183,64 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Exec` returns the exit code with combined stdout+stderr (a non-zero
 exit is a result, not an error); this is kept for v1 compatibility.
-`LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
-containers. `Terminate` is generation-guarded: it refuses to delete a
-name recycled by another process (see Reuse below).
+`LogsWithOptions{Tail, Since}` selects a snapshot window for long-lived
+reuse containers; `MaxBytes` can additionally bound its response.
+`Terminate` is generation-guarded: it refuses to delete a name recycled
+by another process (see Reuse below).
+
+### Output policy
+
+CLI-backed output has two explicit modes. The historical snapshot and
+reader APIs (`Exec` without `WithExecMaxBytes`, `Logs`, and a zero
+`LogsOptions.MaxBytes`) keep their complete-output behavior during the
+compatibility period. They are retained for existing callers but are
+deprecated for output that is not trusted; a future minor release may
+change their default. New code should use a positive
+`WithExecMaxBytes` or `LogsOptions.MaxBytes`, or stream directly with
+`ExecTo` / `LogsTo`.
+
+`LogsOptions.Tail` is a backend line-based tail (`--tail`) and
+`Since` is a backend timestamp filter. `MaxBytes` is applied after
+that selection and is a **prefix** cap: it retains the first bytes of
+the combined stdout/stderr arrival stream, not a byte tail. The same
+prefix policy applies to `WithExecMaxBytes` and to `LogsTo`. The wait
+failure log path is intentionally different: it keeps a trailing
+1 MiB ring so the latest diagnostic survives. Legacy unbounded readers
+retain stdout-then-stderr concatenation; bounded and streaming captures
+use observed arrival order when the runner implements `RunTo`, while the
+compatibility adapter for a legacy-only runner writes stdout then stderr.
+
+A positive byte limit applies to combined stdout and stderr. The child
+process is drained after the retained prefix is full, so truncation
+cannot leave it blocked on a pipe. Bounded readers expose
+`Truncated() bool` and return `ErrOutputTruncated` as their terminal
+read error after yielding the retained prefix. `OutputStats` reports
+both total observed bytes and whether a limit discarded data.
+`FollowLogs` is deliberately an uncapped long-lived stream; its caller
+controls the reader and backpressure. A sink failure is never converted
+into a successful result: `RunTo`, `ExecTo`, and `LogsTo` preserve a
+writer error alongside any CLI terminal error, and bounded snapshot
+APIs return a partial reader on infrastructure, cancellation, launch,
+and missing-container failures.
+
+The wait adapter never materializes `ForExec` output: it sends both
+streams to `io.Discard` and keeps only a fixed 1 MiB trailing log ring
+for failure diagnostics. The CLI runner exposes this behavior through
+`RunTo`; runners implementing only the historical `Run` interface are
+adapted for compatibility, but such adapters cannot provide a hard
+peak-memory bound before their own `Run` returns. The large-output
+integration check verifies bounded forwarding and draining, not peak
+host memory; RSS measurement would require an external sampler.
+
+`LogsOptions` now contains `MaxBytes` in addition to `Tail` and
+`Since`. Go cannot extend a struct without breaking old unkeyed
+literals, so this pre-1.0 release makes the source break explicit:
+callers must use keyed `LogsOptions` literals. This is preferable to
+maintaining a second, subtly different options representation. The
+internal ExecRunner diagnostic is separate again: each failed
+invocation keeps at most the trailing 64 KiB of stderr for `CLIError`,
+while `Run` and caller-owned `RunTo` sinks retain their own documented
+behavior.
 
 `Terminate` maps to `container delete --force` and is idempotent
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
@@ -380,9 +437,13 @@ lock (reaper ID registration takes a mutex for a one-line write).
 Because the default design consumes no host ports, parallelism is
 bounded only by host resources.
 
-**Keep streams finite**. `Logs` returns the `container logs --follow`
-child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+**Keep streams finite**. `FollowLogs` returns the `container logs
+--follow` child as an `io.ReadCloser` whose `Close` (or context
+cancellation) reliably kills the process; it is intentionally not
+byte-capped. Snapshot and exec paths use `RunTo` to send child output
+directly to a caller-owned or fixed-size sink. `ForExec` discards its
+output, and ForLog's diagnostic buffer caps at 1MiB. Bounded captures
+report truncation through `Truncated` and `ErrOutputTruncated`.
 
 **Deadline every CLI call**. Every call honors `context` and carries a
 default timeout (30s for queries, 10min for pull-bearing runs). On
@@ -396,6 +457,8 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
+  the original writer error remains in the chain
 - `ErrPortNotExposed`: querying a port not declared via
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
@@ -416,8 +479,9 @@ container-go/
 ├── options.go        // functional options
 ├── cleanup.go        // Cleanup, TerminateContainer, Prune
 ├── reaper.go         // watchdog reaper
-├── exec.go           // Exec
-├── logs.go           // Logs
+├── exec.go           // Exec and ExecTo
+├── logs.go           // Logs, LogsTo, and bounded snapshots
+├── output.go         // bounded readers, sinks, and truncation errors
 ├── copy.go           // CopyToContainer, CopyFileFromContainer
 ├── errors.go         // error types
 ├── internal/cli/     // CLI runner (argv assembly, execution, timeouts)
@@ -430,6 +494,11 @@ The `internal/cli` runner is an interface; tests inject a fake.
 ```go
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+type WriterRunner interface {
+    Runner
+    RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error)
 }
 ```
 

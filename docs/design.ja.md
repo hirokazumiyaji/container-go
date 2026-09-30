@@ -134,6 +134,26 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
+`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr
+を返す(非ゼロ終了は結果であり error ではない)。caller の context に
+deadline がない場合は 30 秒の既定 deadline を適用する。正の
+`WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の
+deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline
+のみを無効化し、caller の deadline は取り除かない。
+長寿命のプロセスは通常 `WithCmd` で本体的コマンドとして起動し、出力は
+`FollowLogs` で取得する(Long-open な Exec は避ける)。
+backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error と 함께返す。
+CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。
+command の起動中 실제로 context error が競合した場合だけ、その分類は終了コードに依存しません。
+Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
+後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
+context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
+Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。
+Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。
+process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。
+したがって error が non-nil でも reader を読む。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
 `Terminate` は `container delete --force` に対応し、冪等である(既に存在しない場合も成功扱い)。
 `Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーで、testcontainers-go と同じく「エラーチェックの前に defer できる」使い方を保証する。
 
@@ -247,11 +267,25 @@ ForListeningPort と ForHTTP は CLI を呼ばず、コンテナ IP へ直接 TC
 
 **ストリームを有限に保つ**。
 `Logs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返し、`Close` またはコンテキスト取消で確実にプロセスを終了させる。
+Unix では stable process identity で child state を確認できる target だけ process group を使い、他の target では直接の子 handle を使う。
+直接 child の終了後に descendant が stdout/stderr を保持しても、stream は制限時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
+`ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
+cancel 後に caller context から外した state probe を開始しません。
 ForLog が診断用に保持するログは 1MiB を上限とする。
 
-**すべての CLI 呼び出しに期限を付ける**。
-各呼び出しは `context` を尊重し、既定タイムアウト(照会系 30 秒、pull を伴う run は 10 分)を持つ。
-コンテキスト取消時は子プロセスへ SIGKILL を送って回収し、ゾンビとハングを残さない。
+**有限の CLI 呼び出しに期限を付ける**。
+各呼び出しは `context` を尊重し、既定タイムアウト(照会系と public Exec は 30 秒、pull を伴う run は 10 分)を持つ。
+timeout の分類は structured context、`Timeout() bool`、signal、`CLIError.OperationTimeout` の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。
+`Exec` は有限・バッファリング操作であり、`WithExecTimeout(0)` は意図的な
+長時間実行 command のための明示的な escape hatch とする(その場合でも
+cancellable な context を併用する)。正の `WithExecTimeout` は指定値と
+caller の deadline の早い方を用いる。
+ストリームは `FollowLogs` が `io.ReadCloser` を返した後に `Read` される。
+`Close` または context cancel は直接の CLI 子プロセスを終了して回収する。
+Unix の process group 終了は直接の process handle を所有している間だけ
+ゲートされ、Windows は lifecycle-owned Job Object handle を使い、割り当て
+できない場合は直接の子だけを対象にする。デタッチされた子孫は回収も保証も
+しない。
 
 ## エラー処理
 
@@ -261,6 +295,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 - `ErrContainerNotFound`：inspect などの not found
 - `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：報告された local の終了コードにかかわらず、context の期限切れまたは取消によって local CLI が終了した場合。backend 側 exec process は残っている可能性がある
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
 

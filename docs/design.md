@@ -179,8 +179,52 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Exec` returns the exit code with combined stdout+stderr (a non-zero
-exit is a result, not an error); this is kept for v1 compatibility.
+`Exec` is a finite, buffered operation. It returns the exit code with
+combined stdout+stderr (a non-zero exit is a result, not an error);
+this is kept for v1 compatibility. When the caller's context has no
+deadline, Exec applies a 30-second default. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default for a deliberately long-running command; it does not remove a
+caller deadline. Start persistent processes as the container's main
+command (`WithCmd`) and use `FollowLogs` for their output rather than
+holding an Exec call open.
+
+On backend, timeout, or cancellation errors, Exec retains partial
+stdout+stderr in its reader and returns the classified error; a
+CLI-reported exit status, when available, remains in the first return
+value. A context error that actually races with a launched command is
+classified independently of that status. This matters on Windows, where
+`Process.Kill` can report the killed process with exit code `1`; the
+status remains observable but does not suppress the typed error. A
+later verification inspect that consumes the deadline does not by itself
+produce `ExecTerminationError`.
+Cancellation is owned by the local command lifecycle. On Unix targets with a
+stable process identity, process-group termination is attempted only while the
+direct child handle still owns the process. On Linux, the numeric group signal
+also requires `waitid(WSTOPPED|WNOWAIT)` to confirm the stopped state; if that
+ownership proof is lost, the pidfd is used directly and the former PGID is
+never signaled. The direct child is also killed after a successful group signal
+because it may have changed process groups. Unix targets without that identity
+use the direct child handle conservatively. After
+the child is reaped, no former numeric group ID is used. Windows uses a
+lifecycle-owned Job Object handle, with direct-child fallback when assignment
+is unavailable. Assignment occurs after `Start`; descendants created during
+that short post-Start attachment window are outside the Job Object boundary.
+The supported backend CLIs do not expose a common exec-instance kill
+operation, so when active-child evidence is available Exec returns
+`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
+rather than claiming that the daemon-side process stopped. A conservative
+direct-handle fallback may return only the context error. A successful
+empty-job or already-finished-child termination is not treated as
+active-process evidence. Callers must terminate the container or use
+backend-specific cleanup. Callers must read the output reader even when the
+error is non-nil. On Linux the stable identity is a pidfd-backed process
+reference; kernels without pidfd support use the same conservative direct-handle
+fallback as other Unix targets.
+Windows-specific lifecycle tests are build-constrained. This development
+environment cross-compiles and vets Windows packages but cannot execute the
+Windows Job Object runtime tests, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -380,13 +424,37 @@ lock (reaper ID registration takes a mutex for a one-line write).
 Because the default design consumes no host ports, parallelism is
 bounded only by host resources.
 
-**Keep streams finite**. `Logs` returns the `container logs --follow`
-child as an `io.ReadCloser` whose `Close` (or context cancellation)
-reliably kills the process. ForLog's diagnostic buffer caps at 1MiB.
+**Keep streams finite**. `FollowLogs` returns the `container logs --follow`
+child as an `io.ReadCloser`; `Close` or context cancellation terminates
+and reaps the direct CLI child. Unix process-group termination is used only
+where a stable process identity can establish the child state; other Unix targets
+use the direct child handle. Windows uses a lifecycle-owned Job Object handle
+with direct-child fallback. The library does not reap
+detached descendants, and detached/reparented helpers are outside the
+boundary. After the direct child exits, stream endpoint pumps receive a
+bounded drain window and are then closed, so descendants retaining
+stdout/stderr cannot block EOF indefinitely. ForLog observes a terminal
+stream error before accepting a match and preserves context/terminal
+errors with `errors.Join`/`%w`. Its diagnostic buffer caps at 1MiB.
 
-**Deadline every CLI call**. Every call honors `context` and carries a
-default timeout (30s for queries, 10min for pull-bearing runs). On
-cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
+A stream has two error phases. `Stream` (and the public `FollowLogs`
+wrapper) returns startup errors. Once a stream has been returned, a
+terminal CLI failure is delivered by `Read`; callers must read the stream
+to observe `CLIError` details. `Close` and context cancellation are
+intentional terminal paths and may instead produce EOF or a context error.
+ForLog uses the caller's context for its bounded state probe and does not
+start a detached probe after cancellation.
+
+**Deadline every finite CLI call**. Every call honors `context` and
+carries a default timeout (30s for queries and public Exec, 10min for
+pull-bearing runs). `Exec` is finite and buffered by design;
+`WithExecTimeout(0)` is the explicit escape hatch for an intentional
+long-running command, which should still use a cancellable context.
+A positive `WithExecTimeout` uses the earlier of its value and the
+caller's deadline. Timeout classification uses structured context,
+`Timeout() bool`, signal, or `CLIError.OperationTimeout` evidence; arbitrary workload
+stderr is never interpreted as a timeout. This local process-tree
+ownership does not imply that a remote exec process was killed.
 
 ## Error handling
 
@@ -400,6 +468,10 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `WithExposedPorts`
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and stderr (capped at 64KiB)
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
+  expiry or cancellation terminated the local CLI, regardless of any
+  reported local exit status; the backend-side exec process may still be
+  running
 
 When `Run` fails on a wait timeout, the returned error includes the
 container's log tail, and the rollback delete follows.

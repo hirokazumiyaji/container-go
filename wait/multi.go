@@ -68,34 +68,89 @@ func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	return s
 }
 
+// compositeDrainTimeout bounds collection of child results after a
+// composite context ends; non-cooperative children cannot hold the caller.
+const compositeDrainTimeout = 100 * time.Millisecond
+
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if len(s.strategies) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waitCtx := runCtx
 	if s.startupTimeout > 0 {
 		var timeoutCancel context.CancelFunc
-		ctx, timeoutCancel = context.WithTimeout(ctx, s.startupTimeout)
+		waitCtx, timeoutCancel = context.WithTimeout(waitCtx, s.startupTimeout)
 		defer timeoutCancel()
 	}
 
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
-		go func() { results <- strategy.WaitUntilReady(ctx, target) }()
+		go func(strategy Strategy) {
+			results <- strategy.WaitUntilReady(waitCtx, target)
+		}(strategy)
 	}
+
 	var errs []error
-	for range s.strategies {
+	remaining := len(s.strategies)
+	for remaining > 0 {
 		select {
 		case err := <-results:
+			remaining--
+			if err != nil {
+				errs = append(errs, err)
+			}
+			if waitCtx.Err() != nil {
+				terminalErr := waitCtx.Err()
+				if terminalErr == nil {
+					terminalErr = context.Canceled
+				}
+				cancel()
+				childErrs := drainCompositeResults(results, remaining)
+				return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
+			}
 			if err == nil {
+				// ForAny's success contract is first-success-wins. Cancel
+				// the other strategies, but give their lifecycle paths a
+				// bounded grace period to finish before returning.
+				cancel()
+				_ = drainCompositeResults(results, remaining)
 				return nil
 			}
-			errs = append(errs, err)
-		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+		case <-waitCtx.Done():
+			terminalErr := waitCtx.Err()
+			if terminalErr == nil {
+				terminalErr = context.Canceled
+			}
+			cancel()
+			childErrs := drainCompositeResults(results, remaining)
+			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func drainCompositeResults(results <-chan error, count int) []error {
+	if count <= 0 {
+		return nil
+	}
+	childErrs := make([]error, 0, count)
+	timer := time.NewTimer(compositeDrainTimeout)
+	defer timer.Stop()
+	for received := 0; received < count; received++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				childErrs = append(childErrs, err)
+			}
+		case <-timer.C:
+			return childErrs
+		}
+	}
+	return childErrs
 }

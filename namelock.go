@@ -4,10 +4,8 @@ package container
 
 import (
 	"context"
-	"errors"
 	"os"
 	"path/filepath"
-	"syscall"
 	"time"
 )
 
@@ -29,14 +27,14 @@ func lockName(ctx context.Context, name string) (unlock func(), err error) {
 		return nil, err
 	}
 	for {
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := flockFile(int(f.Fd()), lockExclusiveNonBlocking)
 		if err == nil {
 			return func() {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = flockFile(int(f.Fd()), lockUnlock)
 				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) {
+		if !lockWouldBlock(err) {
 			_ = f.Close()
 			return nil, err
 		}

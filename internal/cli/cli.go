@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 	"time"
@@ -62,6 +63,10 @@ type CLIError struct {
 	Args     []string
 	ExitCode int
 	Stderr   string
+	// OperationTimeout is structured evidence supplied by the lifecycle or
+	// runner. Free-form stderr is application output and is not used to
+	// classify an operation timeout.
+	OperationTimeout bool
 }
 
 func (e *CLIError) Error() string {
@@ -77,7 +82,9 @@ func (e *CLIError) Error() string {
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
-// argv vector; no shell is involved.
+// argv vector; no shell is involved. Cancellation terminates the lifecycle-
+// owned local process tree; it does not claim to terminate a process inside
+// a backend.
 type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
@@ -94,6 +101,9 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	configureProcessTree(cmd)
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	cmd.Cancel = lifecycle.cancel
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -101,32 +111,105 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		lifecycle.failStart()
+		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
+	}
+	// On Windows, newProcessTree attaches the Job Object after Start; the
+	// short attachment-window limitation is documented by that platform
+	// implementation.
+	tree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		// A platform tree is an enhancement. The direct process handle
+		// remains a safe cancellation path when attachment is unavailable.
+		tree = directProcessTree{}
+	}
+	lifecycle.publishStart(tree)
+
+	// Run owns the sole Wait call through the same lifecycle used by Stream.
+	// This keeps context cancellation and the eventual reap from racing a
+	// stale numeric process-group signal.
+	err := lifecycle.result()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
-	if err != nil {
-		if ctx.Err() != nil {
-			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
-		}
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return stdout.Bytes(), stderr.Bytes(), &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
-			}
-		}
-		return stdout.Bytes(), stderr.Bytes(), err
-	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	commandErr := commandError(ctx, bin, args, stderr.Bytes(), err)
+	return stdout.Bytes(), stderr.Bytes(), markRunStatus(commandErr, lifecycle.status())
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
+func commandError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		exitCode := exitErr.ExitCode()
+		if ctxErr := ctx.Err(); ctxErr != nil && exitCode < 0 {
+			// A Unix signal has no usable application status. Preserve the
+			// context contract while the lifecycle status records whether
+			// local cancellation actually terminated the process.
+			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+		}
+		operationTimeout := errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.Is(ctx.Err(), os.ErrDeadlineExceeded)
+		cliErr := &CLIError{
+			Binary:           bin,
+			Args:             args,
+			ExitCode:         exitCode,
+			Stderr:           truncateStderr(string(stderr)),
+			OperationTimeout: operationTimeout,
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			// The process did produce an exit status, but cancellation
+			// raced with its completion. Keep both facts observable.
+			return errors.Join(cliErr, ctxErr)
+		}
+		return cliErr
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+	}
+	return err
+}
+
+// IsOperationTimeoutError reports whether err has structured timeout,
+// cancellation, or signal evidence rather than an application result.
+// Free-form command stderr is never used as timeout evidence.
+func IsOperationTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		// A non-CLI error has no structured timeout evidence. Do not infer
+		// one from its free-form Error text.
+		return false
+	}
+	// A negative status is the standard-library representation of a
+	// signal. It is not an application exit result.
+	if cliErr.ExitCode < 0 {
+		return true
+	}
+	// The lifecycle may attach structured timeout evidence while preserving
+	// a positive application exit status. Never infer classification from
+	// arbitrary workload stderr.
+	return cliErr.OperationTimeout
+}
+
+// truncateStderr bounds the diagnostic copy kept in CLIError. Keep the
+// tail so a final timeout or daemon diagnostic is not hidden behind a
+// large amount of preceding application output.
 func truncateStderr(s string) string {
 	if len(s) > maxStderr {
-		return s[:maxStderr]
+		return s[len(s)-maxStderr:]
 	}
 	return s
 }
@@ -158,6 +241,12 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if ctx.Err() != nil {
 		// Caller already gave up; preserve the original failure
 		// instead of masking it with a probe cancellation.
+		return err
+	}
+	// A timeout or signal reported by the operation itself is already a
+	// known termination result. Probing the backend after it would turn
+	// a useful operation error into a second, misleading operation.
+	if IsOperationTimeoutError(err) {
 		return err
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)

@@ -3,6 +3,9 @@ package cli
 import (
 	"bufio"
 	"context"
+	"errors"
+	"io"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -93,5 +96,166 @@ func TestStreamCloseIsIdempotent(t *testing.T) {
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestStreamReapsChildAfterExitWithoutReadOrClose(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'line\n'`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped without Read or Close")
+	}
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
+	}
+}
+
+func TestTerminalErrorDrainsStderrWithoutPublicReader(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'first stderr\\n' >&2; sleep 0.05; printf 'terminal stderr\\n' >&2; exit 17`)}
+	stream, err := r.Stream(context.Background(), "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	terminal := ps.TerminalError()
+	var cliErr *CLIError
+	if !errors.As(terminal, &cliErr) || cliErr.ExitCode != 17 {
+		t.Fatalf("terminal error = %v, want CLIError status 17", terminal)
+	}
+	if !strings.Contains(cliErr.Stderr, "terminal stderr") {
+		t.Fatalf("terminal stderr = %q, want drained final diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestStreamReadPreservesCLIErrorWhenCancellationRacesExit(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ExecRunner{Binary: writeStub(t, `printf 'terminal stderr\\n' >&2; exit 17`)}
+	stream, err := r.Stream(ctx, "logs", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped")
+	}
+
+	// Model the context callback winning the publication boundary just as
+	// Wait returns a real positive CLI status. The stream must retain both
+	// facts rather than replacing CLIError with a bare context error.
+	ps.stateMu.Lock()
+	ps.cancelled = true
+	ps.stateMu.Unlock()
+	ps.lifecycle.mu.Lock()
+	ps.lifecycle.ctxErr = context.Canceled
+	ps.lifecycle.mu.Unlock()
+
+	data, readErr := io.ReadAll(stream)
+	if !strings.Contains(string(data), "terminal stderr") {
+		t.Fatalf("stream data = %q, want terminal output", data)
+	}
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) || cliErr.ExitCode != 17 {
+		t.Fatalf("read error = %v, want CLIError status 17", readErr)
+	}
+	if !errors.Is(readErr, context.Canceled) {
+		t.Fatalf("read error = %v, want context.Canceled", readErr)
+	}
+}
+
+func TestStreamCancellationReapsAndClosesWithoutClose(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	r := &ExecRunner{Binary: writeStub(t, `while true; do printf 'line\\n'; done`)}
+
+	stream, err := r.Stream(ctx, "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	t.Cleanup(func() { _ = stream.Close() })
+
+	cancel()
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped after cancellation without Close")
+	}
+	if ps.cmd.ProcessState == nil {
+		t.Fatal("child was not waited after cancellation")
+	}
+	if got := ps.waitCalls.Load(); got != 1 {
+		t.Fatalf("wait calls = %d, want exactly one", got)
+	}
+
+	if _, err := io.ReadAll(stream); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
+	}
+	select {
+	case <-ps.pumpsDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("source pipes remained blocked after cancellation")
+	}
+	if _, err := ps.stdoutRead.Stat(); err == nil {
+		t.Fatal("stdout source descriptor remained open after cancellation")
+	}
+	if _, err := ps.stderrRead.Stat(); err == nil {
+		t.Fatal("stderr source descriptor remained open after cancellation")
+	}
+}
+
+func TestStreamCancellationDuringStartUsesImmutableEndpointOwnership(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	terminateEntered := make(chan struct{})
+	releaseTerminate := make(chan struct{})
+	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
+	hooks := streamHooks{
+		afterStart: func(*processStream) {
+			cancel()
+			select {
+			case <-terminateEntered:
+			case <-time.After(5 * time.Second):
+				t.Errorf("context cancellation did not reach process termination")
+			}
+		},
+		terminate: func(cmd *exec.Cmd) error {
+			close(terminateEntered)
+			<-releaseTerminate
+			return killProcessGroup(cmd)
+		},
+	}
+
+	stream, err := r.stream(ctx, hooks, "logs", "--follow", "x")
+	close(releaseTerminate)
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	ps := stream.(*processStream)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped after cancellation during start")
+	}
+	if _, err := io.ReadAll(stream); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
 	}
 }

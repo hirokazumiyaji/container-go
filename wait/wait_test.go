@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -149,14 +150,369 @@ func TestForLogAsRegexp(t *testing.T) {
 	}
 }
 
+type terminalLogStream struct {
+	io.ReadCloser
+	done     chan struct{}
+	terminal error
+}
+
+func (s *terminalLogStream) Close() error          { return s.ReadCloser.Close() }
+func (s *terminalLogStream) Done() <-chan struct{} { return s.done }
+func (s *terminalLogStream) TerminalError() error  { return s.terminal }
+
+func TestForLogObservesTerminalStreamErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("logs CLI exited after emitting match")
+	done := make(chan struct{})
+	close(done)
+	target := newFakeTarget()
+	target.logs = &terminalLogStream{
+		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
+		done:       done,
+		terminal:   terminal,
+	}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want terminal stream error", err)
+	}
+}
+
+type delayedTerminalLogReader struct {
+	reader    io.Reader
+	done      chan struct{}
+	closeOnce sync.Once
+	terminal  error
+}
+
+func (r *delayedTerminalLogReader) Read(p []byte) (int, error) {
+	return r.reader.Read(p)
+}
+func (r *delayedTerminalLogReader) Close() error          { return nil }
+func (r *delayedTerminalLogReader) Done() <-chan struct{} { return r.done }
+func (r *delayedTerminalLogReader) TerminalError() error  { return r.terminal }
+func (r *delayedTerminalLogReader) finish()               { r.closeOnce.Do(func() { close(r.done) }) }
+
+func TestForLogSettlesTerminalErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("terminal CLI failure after match")
+	reader := &delayedTerminalLogReader{
+		reader:   strings.NewReader("ready\n"),
+		done:     make(chan struct{}),
+		terminal: terminal,
+	}
+	time.AfterFunc(time.Millisecond, reader.finish)
+	target := newFakeTarget()
+	target.logs = reader
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want terminal error", err)
+	}
+}
+
+type delayedTerminalErrorStream struct {
+	reader        io.Reader
+	done          chan struct{}
+	terminalReady chan struct{}
+	terminal      error
+}
+
+func (s *delayedTerminalErrorStream) Read(p []byte) (int, error) {
+	return s.reader.Read(p)
+}
+func (s *delayedTerminalErrorStream) Close() error          { return nil }
+func (s *delayedTerminalErrorStream) Done() <-chan struct{} { return s.done }
+func (s *delayedTerminalErrorStream) TerminalError() error {
+	select {
+	case <-s.terminalReady:
+		return s.terminal
+	default:
+		return nil
+	}
+}
+
+func TestForLogPreservesDelayedTerminalErrorAfterMatch(t *testing.T) {
+	terminal := errors.New("terminal CLI failure arrived after settle")
+	stream := &delayedTerminalErrorStream{
+		reader:        strings.NewReader("ready\n"),
+		done:          make(chan struct{}),
+		terminalReady: make(chan struct{}),
+		terminal:      terminal,
+	}
+	time.AfterFunc(time.Millisecond, func() { close(stream.done) })
+	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
+	target := newFakeTarget()
+	target.logs = stream
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want delayed terminal error", err)
+	}
+}
+
+type cancelDelayedTerminalStream struct {
+	data          []byte
+	dataRead      chan struct{}
+	closed        chan struct{}
+	closeOnce     sync.Once
+	done          chan struct{}
+	terminalReady chan struct{}
+	readErr       error
+	terminal      error
+}
+
+func (s *cancelDelayedTerminalStream) Read(p []byte) (int, error) {
+	if len(s.data) > 0 {
+		n := copy(p, s.data)
+		s.data = s.data[n:]
+		close(s.dataRead)
+		return n, nil
+	}
+	<-s.closed
+	return 0, s.readErr
+}
+func (s *cancelDelayedTerminalStream) Close() error {
+	s.closeOnce.Do(func() {
+		close(s.closed)
+		close(s.done)
+	})
+	return nil
+}
+func (s *cancelDelayedTerminalStream) Done() <-chan struct{} { return s.done }
+func (s *cancelDelayedTerminalStream) TerminalError() error {
+	select {
+	case <-s.terminalReady:
+		return s.terminal
+	default:
+		return nil
+	}
+}
+
+func TestForLogJoinsCancellationWithDelayedReaderAndTerminalErrors(t *testing.T) {
+	readErr := errors.New("reader failed after cancellation")
+	terminal := errors.New("terminal failed after cancellation")
+	stream := &cancelDelayedTerminalStream{
+		data:          []byte("ready\n"),
+		dataRead:      make(chan struct{}),
+		closed:        make(chan struct{}),
+		done:          make(chan struct{}),
+		terminalReady: make(chan struct{}),
+		readErr:       readErr,
+		terminal:      terminal,
+	}
+	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
+	target := newFakeTarget()
+	target.logs = stream
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	go func() {
+		result <- ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	}()
+	<-stream.dataRead
+	cancel()
+
+	err := <-result
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, readErr) || !errors.Is(err, terminal) {
+		t.Fatalf("ForLog error = %v, want context, reader, and terminal errors", err)
+	}
+}
+
+func TestForLogPreservesTerminalAndContextErrors(t *testing.T) {
+	terminal := errors.New("terminal CLI failure")
+	done := make(chan struct{})
+	close(done)
+	target := newFakeTarget()
+	target.logs = &terminalLogStream{
+		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
+		done:       done,
+		terminal:   terminal,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, terminal) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForLog error = %v, want terminal and context errors", err)
+	}
+}
+
+type errorAfterLogReader struct {
+	io.Reader
+	err error
+}
+
+func (r *errorAfterLogReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	if errors.Is(err, io.EOF) {
+		return n, r.err
+	}
+	return n, err
+}
+func (r *errorAfterLogReader) Close() error { return nil }
+
+func TestForLogPreservesReaderErrorAfterMatch(t *testing.T) {
+	readErr := errors.New("log reader failed after matching line")
+	target := newFakeTarget()
+	target.logs = &errorAfterLogReader{Reader: strings.NewReader("ready\n"), err: readErr}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want reader error", err)
+	}
+}
+
+type delayedReaderErrorStream struct {
+	data      []byte
+	closeOnce sync.Once
+	closed    chan struct{}
+	err       error
+}
+
+func (s *delayedReaderErrorStream) Read(p []byte) (int, error) {
+	if len(s.data) > 0 {
+		n := copy(p, s.data)
+		s.data = s.data[n:]
+		return n, nil
+	}
+	<-s.closed
+	return 0, s.err
+}
+
+func (s *delayedReaderErrorStream) Close() error {
+	s.closeOnce.Do(func() { close(s.closed) })
+	return nil
+}
+
+func TestForLogPreservesDelayedReaderErrorAfterMatch(t *testing.T) {
+	readErr := errors.New("log reader failed after delayed close")
+	target := newFakeTarget()
+	target.logs = &delayedReaderErrorStream{
+		data:   []byte("ready\n"),
+		closed: make(chan struct{}),
+		err:    readErr,
+	}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want delayed reader error", err)
+	}
+}
+
+func TestForLogDoesNotProbeAfterReaderFailure(t *testing.T) {
+	readErr := errors.New("log reader failed")
+	target := newFakeTarget()
+	target.logs = &errorAfterLogReader{Reader: strings.NewReader("not ready\n"), err: readErr}
+
+	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("ForLog error = %v, want reader error", err)
+	}
+	if calls := target.runningCalls.Load(); calls != 0 {
+		t.Fatalf("Running calls after reader failure = %d, want 0", calls)
+	}
+}
+
+type forLogCancelProbeTarget struct {
+	*fakeTarget
+	cancel   context.CancelFunc
+	probeErr error
+}
+
+func (t *forLogCancelProbeTarget) Running(context.Context) (bool, error) {
+	t.cancel()
+	return false, t.probeErr
+}
+
+func TestForLogJoinsCallerCancellationAfterFinalProbe(t *testing.T) {
+	probeErr := errors.New("state probe failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	target := &forLogCancelProbeTarget{fakeTarget: newFakeTarget(), cancel: cancel, probeErr: probeErr}
+	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, probeErr) || !errors.Is(err, context.Canceled) {
+		t.Fatalf("ForLog error = %v, want probe and caller cancellation", err)
+	}
+}
+
+type forLogDeadlineProbeTarget struct {
+	*fakeTarget
+}
+
+func (t *forLogDeadlineProbeTarget) Running(ctx context.Context) (bool, error) {
+	t.runningCalls.Add(1)
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+
+func TestForLogJoinsCallerDeadlineAfterFinalProbe(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	target := &forLogDeadlineProbeTarget{fakeTarget: newFakeTarget()}
+	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForLog error = %v, want caller deadline", err)
+	}
+	if target.runningCalls.Load() == 0 {
+		t.Fatal("final Running probe was not called")
+	}
+}
+
+type cancelAwareLogStream struct {
+	ctx    context.Context
+	closed chan struct{}
+}
+
+func (s *cancelAwareLogStream) Read([]byte) (int, error) {
+	<-s.ctx.Done()
+	return 0, s.ctx.Err()
+}
+func (s *cancelAwareLogStream) Close() error {
+	select {
+	case <-s.closed:
+	default:
+		close(s.closed)
+	}
+	return nil
+}
+
+type forLogProbeTarget struct {
+	*fakeTarget
+	streamStarted chan struct{}
+}
+
+func (t *forLogProbeTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	stream := &cancelAwareLogStream{ctx: ctx, closed: make(chan struct{})}
+	close(t.streamStarted)
+	return stream, nil
+}
+
+func TestForAnyCancellationDoesNotStartDetachedRunningProbe(t *testing.T) {
+	target := &forLogProbeTarget{fakeTarget: newFakeTarget(), streamStarted: make(chan struct{})}
+	loser := ForLog("never").WithStartupTimeout(5 * time.Second)
+	winner := &issue116ForAnyWinner{loserStarted: target.streamStarted}
+
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), target); err != nil {
+		t.Fatalf("ForAny: %v", err)
+	}
+	if calls := target.runningCalls.Load(); calls != 0 {
+		t.Fatalf("Running calls after canceled ForLog loser = %d, want 0", calls)
+	}
+}
+
 func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target := newFakeTarget()
 	pr, _ := io.Pipe() // never written, never closed
 	target.logs = pr
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
-	if err := s.WaitUntilReady(context.Background(), target); err == nil {
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
 		t.Fatal("want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -438,6 +794,95 @@ func TestForAnySucceedsWhenOneSucceeds(t *testing.T) {
 	)
 	if err := s.WaitUntilReady(context.Background(), target); err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)
+	}
+}
+
+type issue116ForAnyLoser struct {
+	started  chan struct{}
+	returned chan struct{}
+}
+
+func (s *issue116ForAnyLoser) WaitUntilReady(ctx context.Context, _ Target) error {
+	close(s.started)
+	<-ctx.Done()
+	close(s.returned)
+	return errors.New("losing exec was canceled")
+}
+
+type issue116ForAnyWinner struct {
+	loserStarted <-chan struct{}
+}
+
+func (s *issue116ForAnyWinner) WaitUntilReady(ctx context.Context, _ Target) error {
+	select {
+	case <-s.loserStarted:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func TestForAnyDrainsCanceledLosersBeforeSuccess(t *testing.T) {
+	loser := &issue116ForAnyLoser{
+		started:  make(chan struct{}),
+		returned: make(chan struct{}),
+	}
+	winner := &issue116ForAnyWinner{loserStarted: loser.started}
+
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
+		t.Fatalf("ForAny success = %v, want nil", err)
+	}
+	select {
+	case <-loser.returned:
+		// The success result was returned only after the canceled loser
+		// completed its lifecycle path.
+	default:
+		t.Fatal("ForAny returned before the canceled loser finished")
+	}
+}
+
+type issue116NonCooperativeStrategy struct {
+	started chan struct{}
+	release chan struct{}
+}
+
+func (s *issue116NonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
+	close(s.started)
+	<-s.release
+	return nil
+}
+
+func TestForAnyBoundsNonCooperativeLoserDrain(t *testing.T) {
+	loser := &issue116NonCooperativeStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(loser.release) })
+
+	winner := &issue116ForAnyWinner{loserStarted: loser.started}
+	started := time.Now()
+	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
+		t.Fatalf("ForAny success = %v, want nil", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForAny success took %v with non-cooperative loser", elapsed)
+	}
+}
+
+func TestForAnyBoundsNonCooperativeDrainAfterTimeout(t *testing.T) {
+	strategy := &issue116NonCooperativeStrategy{
+		started: make(chan struct{}),
+		release: make(chan struct{}),
+	}
+	t.Cleanup(func() { close(strategy.release) })
+
+	started := time.Now()
+	err := ForAny(strategy).WithStartupTimeout(20*time.Millisecond).WaitUntilReady(context.Background(), newFakeTarget())
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ForAny error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForAny timeout took %v with non-cooperative strategy", elapsed)
 	}
 }
 

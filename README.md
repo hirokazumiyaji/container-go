@@ -149,6 +149,70 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 
+## Exec timeout and long-running commands
+
+`Container.Exec` is a finite, buffered operation. When the caller's
+context has no deadline, Exec applies a 30-second default so a hung
+backend cannot block a test indefinitely. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default; it does not remove a caller deadline. Use zero only for a
+deliberately long-running command and pair it with a cancellable
+context (prefer a deadline). Long-lived processes should normally be
+the container's main command (`WithCmd`) with `FollowLogs` for output
+rather than a long-lived `Exec` call.
+
+Exec keeps the existing `(exitCode, output, error)` contract: a
+command's non-zero exit is a result, while a backend, timeout, or
+cancellation error is returned with the classified error. A CLI-reported
+exit status, when available, is retained in `exitCode` even alongside
+that error. In either error case, read `output` to retain partial stdout
+and stderr produced before the failure.
+
+Cancellation is owned by the local command lifecycle. On Unix-like systems a
+best-effort process-group termination is attempted only on targets with a
+stable process identity and while the direct child handle still owns the
+process. On Linux, a numeric group signal additionally requires a
+`waitid(WSTOPPED|WNOWAIT)` stopped-state check; if that ownership proof is lost,
+termination uses the pidfd directly and never signals the former PGID. The
+direct child is also killed after a successful group signal because it may have
+changed process groups. Other Unix targets conservatively use the direct child
+handle. Once that child is reaped, no former numeric process-group ID is used.
+On Windows, a lifecycle-owned Job Object handle provides the descendant
+boundary, with direct-child fallback when assignment is unavailable. Job
+assignment happens after `Start`; descendants created during that short
+post-Start attachment window are outside the job boundary. Neither boundary
+claims remote container-process termination.
+Windows-specific lifecycle tests are build-constrained. The development
+environment cross-compiles and vets the Windows packages but cannot execute
+Windows Job Object runtime tests, including the exit-259 active-child case.
+
+Neither supported backend CLI exposes a common kill operation for an exec
+instance. When active-child evidence is available and a context error actually
+races with a launched command, Exec returns an `*ExecTerminationError`
+(`errors.Is(err, ErrExecTerminationUnsupported)`) instead of claiming that
+the container-side process stopped. A conservative direct-handle fallback may
+return the context error without that remote-termination claim. A successful
+empty-job or already-finished child termination is not active-process
+evidence. Classification does not depend on the local exit status: in
+particular, Windows `Process.Kill` may report the killed process as exit code
+`1`, and that status remains visible without suppressing the typed error. A
+deadline consumed later by a verification inspect does not by itself produce
+`ExecTerminationError`. The backend-side process may still be running; callers
+must terminate the container or use a backend-specific cleanup path.
+
+`FollowLogs` returns startup failures directly. After a stream is returned,
+read it to EOF: terminal CLI failures (including a CLI status racing context
+cancellation) are reported by `Read`. `Close` and context cancellation are
+intentional termination paths and may instead produce EOF or a context error.
+If a descendant retains stdout/stderr after the direct child exits, the stream
+uses a bounded drain and then closes its endpoints so EOF cannot wait forever.
+`ForLog` observes terminal stream errors before accepting a match, preserves
+terminal/context errors with `errors.Join`/`%w`, and does not detach a state
+probe after cancellation. Timeout classification uses structured context,
+`Timeout() bool`, signal, or `CLIError.OperationTimeout` evidence; arbitrary
+workload stderr is treated as application output.
+
 ## Image pulls
 
 `Run` checks the image before starting and fetches it when missing

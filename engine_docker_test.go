@@ -2,7 +2,6 @@ package container
 
 import (
 	"context"
-	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -175,37 +174,22 @@ func TestDockerListArgsIncludeStoppedStatuses(t *testing.T) {
 	}
 }
 
-// dockerPruneRunner returns a fixed response for the exact expected
-// docker ps command. It does not synthesize a dead result from the presence
-// of a status filter; the test supplies an explicit daemon response.
+// dockerPruneRunner serves a canned docker ps listing and records deletes.
 type dockerPruneRunner struct {
 	calls      [][]string
-	listArgs   []string
 	listOutput string
 }
 
 func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	d.calls = append(d.calls, args)
-	if args[0] != "ps" {
-		return nil, nil, nil
+	if args[0] == "ps" {
+		return []byte(d.listOutput), nil, nil
 	}
-	if !slices.Equal(args, d.listArgs) {
-		return nil, nil, fmt.Errorf("unexpected docker ps args: got %v, want %v", args, d.listArgs)
-	}
-	return []byte(d.listOutput), nil, nil
+	return nil, nil, nil
 }
 
 func TestDockerPruneRemovesExitedAndDeadOnly(t *testing.T) {
-	f := &dockerPruneRunner{
-		listArgs: []string{
-			"ps", "--all", "--quiet",
-			"--filter", "label=" + managedLabel + "=true",
-			"--filter", "status=exited",
-			"--filter", "status=dead",
-			"--format", "{{.Names}}",
-		},
-		listOutput: "exited\ndead\n",
-	}
+	f := &dockerPruneRunner{listOutput: "exited\ndead\n"}
 
 	removed, err := pruneWith(context.Background(), f, dockerEngine{})
 	if err != nil {

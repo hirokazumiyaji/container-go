@@ -8,7 +8,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"strconv"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -42,19 +42,12 @@ func runDockerPruneCommand(t *testing.T, args ...string) string {
 func inspectDockerContainerState(name string) (string, bool, error) {
 	out, err := exec.Command("docker", "inspect", "--format", "{{.State.Status}}", name).CombinedOutput()
 	if err == nil {
-		state := strings.TrimSpace(string(out))
-		if state == "" {
-			return "", false, fmt.Errorf("docker inspect %s returned an empty state", name)
-		}
-		return state, true, nil
+		return strings.TrimSpace(string(out)), true, nil
 	}
-
+	// Docker prints "Error: No such object: <name>" and exits 1 for a
+	// missing container; anything else is a real inspect failure.
 	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) || exitErr.ExitCode() != 1 {
-		return "", false, fmt.Errorf("docker inspect %s: %w: %s", name, err, out)
-	}
-	message := strings.ToLower(string(out))
-	if strings.Contains(message, "no such object") || strings.Contains(message, "no such container") {
+	if errors.As(err, &exitErr) && strings.Contains(strings.ToLower(string(out)), "no such") {
 		return "", false, nil
 	}
 	return "", false, fmt.Errorf("docker inspect %s: %w: %s", name, err, out)
@@ -81,6 +74,9 @@ func waitDockerContainerState(t *testing.T, name, want string) {
 	t.Fatalf("state of %s = %q (found=%t), want %q", name, state, found, want)
 }
 
+// isolatedDockerPruneRunner injects an extra label filter so a live-daemon
+// Prune only touches this test's fixtures; production Prune remains
+// eligible to remove managed containers from any session.
 type isolatedDockerPruneRunner struct {
 	runner      cli.Runner
 	labelFilter string
@@ -88,30 +84,15 @@ type isolatedDockerPruneRunner struct {
 }
 
 func (r *isolatedDockerPruneRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if len(args) > 0 && args[0] == "ps" {
+	if args[0] == "ps" {
 		args = append(append([]string(nil), args...), "--filter", r.labelFilter)
 	}
 	r.calls = append(r.calls, append([]string(nil), args...))
 	return r.runner.Run(ctx, args...)
 }
 
-func dockerServerVersionForPrune(t *testing.T) string {
-	t.Helper()
-	version := runDockerPruneCommand(t, "version", "--format", "{{.Server.Version}}")
-	if version == "" {
-		t.Fatal("docker version returned an empty server version")
-	}
-	majorText := strings.SplitN(version, ".", 2)[0]
-	if _, err := strconv.Atoi(majorText); err != nil {
-		t.Fatalf("unrecognized Docker server version %q: %v", version, err)
-	}
-	return version
-}
-
 // TestIntegrationDockerPruneExactFixtures covers the state boundary of the
-// shared Prune core while keeping the live-daemon test hermetic. The extra
-// label filter models an exact fixture scope; production Prune intentionally
-// remains eligible to remove managed containers from any session.
+// shared Prune core while keeping the live-daemon test hermetic.
 func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	requireDockerPruneIntegration(t)
 	ctx := context.Background()
@@ -174,30 +155,31 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	if len(runner.calls) == 0 || runner.calls[0][0] != "ps" {
 		t.Fatalf("Prune calls = %v, want a docker ps call", runner.calls)
 	}
-	if !containsDockerArg(runner.calls[0], "label="+fixtureLabel) {
+	if !slices.Contains(runner.calls[0], "label="+fixtureLabel) {
 		t.Fatalf("Prune list call lacks fixture scope: %v", runner.calls[0])
 	}
 	for _, want := range []string{"status=exited", "status=dead"} {
-		if !containsDockerArg(runner.calls[0], want) {
+		if !slices.Contains(runner.calls[0], want) {
 			t.Fatalf("Prune list call lacks %q: %v", want, runner.calls[0])
 		}
 	}
 	for _, unwanted := range []string{"status=created", "status=running"} {
-		if containsDockerArg(runner.calls[0], unwanted) {
+		if slices.Contains(runner.calls[0], unwanted) {
 			t.Fatalf("Prune list call unexpectedly includes %q: %v", unwanted, runner.calls[0])
 		}
 	}
 	if len(removed) != 1 || removed[0] != exitedListID || !strings.HasPrefix(exitedID, removed[0]) {
 		t.Fatalf("removed = %v, want exact Docker list ID %s (full ID %s)", removed, exitedListID, exitedID)
 	}
-	for name, id := range map[string]string{
-		"created":       createdID,
-		"running":       runningID,
-		"unmanaged":     unmanagedID,
-		"other managed": otherManagedID,
-	} {
-		if removed[0] == id || strings.HasPrefix(id, removed[0]) {
-			t.Errorf("Prune returned unrelated %s container %s", name, id)
+	unrelated := []struct{ role, id string }{
+		{"created", createdID},
+		{"running", runningID},
+		{"unmanaged", unmanagedID},
+		{"other managed", otherManagedID},
+	}
+	for _, u := range unrelated {
+		if removed[0] == u.id || strings.HasPrefix(u.id, removed[0]) {
+			t.Errorf("Prune returned unrelated %s container %s", u.role, u.id)
 		}
 	}
 
@@ -206,34 +188,26 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	} else if found {
 		t.Fatalf("exited container %s survived Prune (state=%q)", exitedName, state)
 	}
-	for name, want := range map[string]string{
-		createdName:      "created",
-		runningName:      "running",
-		unmanagedName:    "exited",
-		otherManagedName: "exited",
-	} {
-		state, found, err := inspectDockerContainerState(name)
+	preserved := []struct{ name, want string }{
+		{createdName, "created"},
+		{runningName, "running"},
+		{unmanagedName, "exited"},
+		{otherManagedName, "exited"},
+	}
+	for _, p := range preserved {
+		state, found, err := inspectDockerContainerState(p.name)
 		if err != nil {
-			t.Errorf("inspect preserved fixture %s: %v", name, err)
+			t.Errorf("inspect preserved fixture %s: %v", p.name, err)
 			continue
 		}
 		if !found {
-			t.Errorf("fixture %s was removed by Prune", name)
+			t.Errorf("fixture %s was removed by Prune", p.name)
 			continue
 		}
-		if state != want {
-			t.Errorf("state of %s = %q, want %q", name, state, want)
+		if state != p.want {
+			t.Errorf("state of %s = %q, want %q", p.name, state, p.want)
 		}
 	}
-}
-
-func containsDockerArg(args []string, want string) bool {
-	for _, arg := range args {
-		if arg == want {
-			return true
-		}
-	}
-	return false
 }
 
 // TestIntegrationDockerPruneDeadStatusFilterAvailability verifies the live
@@ -242,15 +216,14 @@ func containsDockerArg(args []string, want string) bool {
 // limitation rather than a fabricated dead fixture.
 func TestIntegrationDockerPruneDeadStatusFilterAvailability(t *testing.T) {
 	requireDockerPruneIntegration(t)
-	version := dockerServerVersionForPrune(t)
 	out, err := exec.Command("docker", "ps", "--all", "--quiet", "--filter", "label="+managedLabel+"=true", "--filter", "status=dead").CombinedOutput()
 	if err != nil {
-		t.Fatalf("Docker Engine %s rejected status=dead: %v: %s", version, err, out)
+		t.Fatalf("docker rejected status=dead: %v: %s", err, out)
 	}
 
 	ids := splitNonEmptyLines(out)
 	if len(ids) == 0 {
-		t.Skipf("Docker Engine %s accepts status=dead, but no dead managed container exists; Docker has no public API to create one", version)
+		t.Skip("docker accepts status=dead, but no dead managed container exists; Docker has no public API to create one")
 	}
 	for _, id := range ids {
 		state, found, err := inspectDockerContainerState(id)

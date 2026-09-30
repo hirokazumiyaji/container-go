@@ -116,7 +116,8 @@ func newReaper(binary, subcommand string) *reaper {
 // respawning the reaper process as needed. Apple targets are names;
 // Docker targets may be the full 64-hex ID returned by docker run.
 // creation is the generation ID from creationLabel; empty skips the
-// generation check for backward compatibility.
+// generation check, which is safe when the target is already an
+// immutable ID that no replacement can share.
 func (r *reaper) register(id, creation string) error {
 	if !nameRE.MatchString(id) && !dockerIDRE.MatchString(id) {
 		return fmt.Errorf("reaper: invalid container id %q", id)

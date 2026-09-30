@@ -5,6 +5,7 @@ package container
 import (
 	"errors"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/sys/unix"
 )
@@ -40,11 +41,7 @@ func openCopySourceAt(parent *os.File, name string) (*os.File, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	return os.NewFile(uintptr(fd), filepathJoinHandleName(parent, name)), false, nil
-}
-
-func filepathJoinHandleName(parent *os.File, name string) string {
-	return parent.Name() + string(os.PathSeparator) + name
+	return os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name)), false, nil
 }
 
 func isCopySourceLinkError(err error) bool {

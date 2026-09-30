@@ -185,8 +185,8 @@ func copySourceBase(source string) string {
 // back to the source, working directory, home, or system temp path. Ancestry
 // is checked through opened directory identities, not the caller's path.
 func newCopyStagingDir(source *openedCopySource) (string, error) {
-	if source == nil || (source.info.Mode().IsDir() && filepath.Dir(source.path) == source.path) {
-		return "", unsupportedCopySource(sourcePath(source))
+	if source.info.Mode().IsDir() && filepath.Dir(source.path) == source.path {
+		return "", unsupportedCopySource(source.path)
 	}
 	root, err := prepareCopyStagingRootForSource(source)
 	if err != nil {
@@ -204,13 +204,6 @@ func newCopyStagingDir(source *openedCopySource) (string, error) {
 		return "", errors.Join(err, cleanupCopyStagingDir(dir))
 	}
 	return dir, nil
-}
-
-func sourcePath(source *openedCopySource) string {
-	if source == nil {
-		return "source"
-	}
-	return source.path
 }
 
 // ensureCopyStagingOutsideSource walks directory handles from the staging
@@ -324,7 +317,7 @@ func (s *copySnapshotState) enter(source string, depth int) error {
 		return tooManyCopySourceEntries(source, s.limits.maxEntries)
 	}
 	metadata := int64(len(source))
-	if metadata < 0 || metadata > s.limits.maxMetadataBytes-s.metadataBytes {
+	if metadata > s.limits.maxMetadataBytes-s.metadataBytes {
 		return copySourceMetadataTooLarge(source, s.limits.maxMetadataBytes)
 	}
 	s.entries++
@@ -339,9 +332,6 @@ func snapshotCopyEntry(ctx context.Context, source, staged string, src *openedCo
 	}
 	if err := state.enter(source, depth); err != nil {
 		return err
-	}
-	if src.reparse || src.info.Mode()&os.ModeSymlink != 0 {
-		return unsupportedCopySource(source)
 	}
 	var snapshotErr error
 	switch {
@@ -454,31 +444,15 @@ func snapshotCopyDirectory(ctx context.Context, source, staged string, src *open
 
 func openVerifiedCopySource(path string, open copySourceOpenFunc) (*openedCopySource, error) {
 	file, reparse, err := open(path)
-	if err != nil {
-		return nil, classifyCopySourceOpenError(path, err)
-	}
-	info, err := file.Stat()
-	if err != nil {
-		_ = file.Close()
-		if errors.Is(err, fs.ErrNotExist) {
-			return nil, changedCopySource(path, err)
-		}
-		return nil, fmt.Errorf("copy to container: inspect opened source %q: %w", path, err)
-	}
-	if reparse || info.Mode()&os.ModeSymlink != 0 || (!info.Mode().IsRegular() && !info.Mode().IsDir()) {
-		_ = file.Close()
-		return nil, unsupportedCopySource(path)
-	}
-	identity, err := copySourceFileIdentity(file)
-	if err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("copy to container: identify opened source %q: %w", path, err)
-	}
-	return &openedCopySource{file: file, path: path, info: info, identity: identity, reparse: reparse}, nil
+	return verifiedCopySource(path, file, reparse, err)
 }
 
 func openVerifiedCopySourceAt(parent *os.File, path, name string, open copySourceOpenAtFunc) (*openedCopySource, error) {
 	file, reparse, err := open(parent, name)
+	return verifiedCopySource(path, file, reparse, err)
+}
+
+func verifiedCopySource(path string, file *os.File, reparse bool, err error) (*openedCopySource, error) {
 	if err != nil {
 		return nil, classifyCopySourceOpenError(path, err)
 	}

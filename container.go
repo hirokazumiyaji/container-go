@@ -503,15 +503,12 @@ func (c *Container) updateIdentityLocked(info *engineInfo) error {
 	if c.uid != "" && c.uid != identity.uid {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if c.uid == "" && cached != nil && cached.uid != "" && cached.uid != identity.uid {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-	}
 	if c.creation != "" {
 		actual := identity.labels[creationLabel]
 		if c.uid == "" {
 			// A name-only handle cannot verify ownership without the
 			// generation label, including on its first inspect.
-			if actual == "" || actual != c.creation {
+			if actual != c.creation {
 				return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 			}
 		} else if actual != "" && actual != c.creation {
@@ -520,8 +517,6 @@ func (c *Container) updateIdentityLocked(info *engineInfo) error {
 	}
 	if cached == nil {
 		c.info = identity
-	} else {
-		c.info = mergeImmutableInfo(cached, identity)
 	}
 	if c.uid == "" {
 		c.uid = identity.uid
@@ -542,25 +537,6 @@ func sameImmutableInfo(a, b *engineInfo) bool {
 		}
 	}
 	return true
-}
-
-func mergeImmutableInfo(old, current *engineInfo) *engineInfo {
-	merged := immutableInfo(old)
-	if merged.uid == "" {
-		merged.uid = current.uid
-	}
-	if merged.image == "" {
-		merged.image = current.image
-	}
-	if len(current.labels) > 0 && merged.labels == nil {
-		merged.labels = make(map[string]string, len(current.labels))
-	}
-	for key, value := range current.labels {
-		if _, ok := merged.labels[key]; !ok {
-			merged.labels[key] = value
-		}
-	}
-	return merged
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

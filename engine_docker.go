@@ -8,7 +8,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -213,9 +213,8 @@ func (dockerEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 				networkNames = append(networkNames, name)
 			}
 		}
-		sort.Strings(networkNames)
 		if len(networkNames) > 0 {
-			info.ip = c.NetworkSettings.Networks[networkNames[0]].IPAddress
+			info.ip = c.NetworkSettings.Networks[slices.Min(networkNames)].IPAddress
 		}
 	}
 	for portProto, bindings := range c.NetworkSettings.Ports {

@@ -37,10 +37,10 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 }
 
 func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
-	// One dialer for every poll iteration; it holds no per-connection
-	// state, so rebuilding it per iteration only allocated.
-	var d net.Dialer
-	d.Timeout = time.Second
+	// One dialer shared by every poll iteration; it holds no
+	// per-connection state, so rebuilding it per iteration only
+	// wasted an allocation.
+	d := net.Dialer{Timeout: time.Second}
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for listening port %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)
 		if err != nil {

@@ -104,6 +104,8 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 func TestLogsWithOptionsBackendMatrix(t *testing.T) {
 	since := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
 	sinceArg := since.Format(time.RFC3339)
+	const testDockerUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const testCreation = "bbbbbbbbbbbbbbbb"
 	tests := []struct {
 		name            string
 		eng             engine
@@ -115,16 +117,19 @@ func TestLogsWithOptionsBackendMatrix(t *testing.T) {
 		{name: "apple since only", eng: appleEngine{}, opts: LogsOptions{Since: since}, wantUnsupported: true},
 		{name: "apple tail and since", eng: appleEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantUnsupported: true},
 		{name: "apple neither", eng: appleEngine{}, wantArgs: []string{"logs", "myctr"}},
-		{name: "docker tail only", eng: dockerEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "--tail", "50", "myctr"}},
-		{name: "docker since only", eng: dockerEngine{}, opts: LogsOptions{Since: since}, wantArgs: []string{"logs", "--since", sinceArg, "myctr"}},
-		{name: "docker tail and since", eng: dockerEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantArgs: []string{"logs", "--tail", "50", "--since", sinceArg, "myctr"}},
-		{name: "docker neither", eng: dockerEngine{}, wantArgs: []string{"logs", "myctr"}},
+		{name: "docker tail only", eng: dockerEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "--tail", "50", testDockerUID}},
+		{name: "docker since only", eng: dockerEngine{}, opts: LogsOptions{Since: since}, wantArgs: []string{"logs", "--since", sinceArg, testDockerUID}},
+		{name: "docker tail and since", eng: dockerEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantArgs: []string{"logs", "--tail", "50", "--since", sinceArg, testDockerUID}},
+		{name: "docker neither", eng: dockerEngine{}, wantArgs: []string{"logs", testDockerUID}},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newTestRunner()
-			ctr := &Container{id: "myctr", runner: f, eng: tc.eng}
+			ctr := &Container{id: "myctr", creation: testCreation, runner: f, eng: tc.eng}
+			if _, ok := tc.eng.(dockerEngine); ok {
+				ctr.setImmutableID(testDockerUID)
+			}
 
 			rc, err := ctr.LogsWithOptions(context.Background(), tc.opts)
 			if tc.wantUnsupported {

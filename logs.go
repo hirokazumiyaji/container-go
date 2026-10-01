@@ -28,12 +28,16 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 // prefer Tail for diagnostics. It returns ErrUnsupportedCapability
 // without invoking the backend when the backend cannot honor opts.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
-	args, err := c.eng.logsArgsWithOptions(c.id, opts)
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return nil, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
+	args, err := c.eng.logsArgsWithOptions(target, opts)
+	if err != nil {
+		return nil, err
+	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
@@ -47,9 +51,13 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // or the context is cancelled. Close terminates the underlying CLI
 // process.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsFollowArgs(c.id)...)
+	return s.Stream(ctx, c.eng.logsFollowArgs(target)...)
 }

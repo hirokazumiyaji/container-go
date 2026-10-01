@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/portspec"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -447,18 +448,11 @@ type portSpec struct {
 func (p portSpec) String() string { return strconv.Itoa(p.port) + "/" + p.proto }
 
 func parsePortSpec(s string) (portSpec, error) {
-	portPart, proto, ok := strings.Cut(s, "/")
-	if !ok {
-		proto = "tcp"
+	spec, err := portspec.Parse(s)
+	if err != nil {
+		return portSpec{}, err
 	}
-	if proto != "tcp" && proto != "udp" {
-		return portSpec{}, fmt.Errorf("invalid port %q: protocol must be tcp or udp", s)
-	}
-	n, err := strconv.Atoi(portPart)
-	if err != nil || n < 1 || n > 65535 {
-		return portSpec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
-	}
-	return portSpec{port: n, proto: proto}, nil
+	return portSpec{port: spec.Port, proto: spec.Protocol}, nil
 }
 
 type publishSpec struct {

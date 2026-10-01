@@ -14,6 +14,7 @@ type HTTPStrategy struct {
 	options
 	path          string
 	port          string
+	explicitPort  bool
 	method        string
 	statusMatcher func(int) bool
 	headers       map[string]string
@@ -34,6 +35,7 @@ func ForHTTP(path string) *HTTPStrategy {
 // WithPort probes a specific declared port instead of the first one.
 func (s *HTTPStrategy) WithPort(port string) *HTTPStrategy {
 	s.port = port
+	s.explicitPort = true
 	return s
 }
 
@@ -117,6 +119,14 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			}
 		} else {
 			client = &http.Client{Timeout: 3 * time.Second}
+		}
+	}
+	// A malformed or udp port specification is static configuration, so it
+	// must fail immediately rather than being retried until the startup
+	// timeout. It carries the same sentinel as the other config errors.
+	if s.explicitPort {
+		if err := validateTCPPortSpec("ForHTTP", s.port); err != nil {
+			return err
 		}
 	}
 	scheme := "http"

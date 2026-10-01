@@ -187,6 +187,17 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
 
+`ForListeningPort` and port declarations have different protocol support:
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | Supported | Supported |
+| `wait.ForListeningPort` | `6379` or `6379/tcp` | `*wait.ConfigError` before probing |
+
+`ForListeningPort` also returns `*wait.ConfigError` for malformed port
+specifications. Use `errors.Is(err, wait.ErrInvalidConfiguration)` to
+classify either configuration error without matching its message.
+
 ## Image pulls
 
 `Run` checks the image before starting and fetches it when missing

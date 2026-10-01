@@ -4,12 +4,14 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -26,6 +28,127 @@ import (
 func requireDocker(t *testing.T) {
 	t.Helper()
 	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
+}
+
+func dockerServerOS(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Os}}").Output()
+	if err != nil {
+		t.Skipf("cannot determine Docker server OS: %v", err)
+	}
+	serverOS := strings.ToLower(strings.TrimSpace(string(out)))
+	if serverOS == "" {
+		t.Skip("Docker server did not report an OS")
+	}
+	return serverOS
+}
+
+func dockerHostNetworkUnavailable(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "host") &&
+		(strings.Contains(message, "not supported") ||
+			strings.Contains(message, "not enabled") ||
+			strings.Contains(message, "unable to start") ||
+			strings.Contains(message, "not available"))
+}
+
+func TestIntegrationDockerHostNetworkNoPublish(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("host networking integration requires a Linux daemon, got %q", serverOS)
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("host"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		if dockerHostNetworkUnavailable(err) {
+			t.Skipf("Docker host networking is unavailable: %v", err)
+		}
+		t.Fatalf("host-mode Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil {
+		t.Fatalf("host-mode Host: %v", err)
+	}
+	if host == "" {
+		t.Fatal("host-mode Host returned an empty address")
+	}
+	if _, err := ctr.Endpoint(ctx, "80/tcp"); !errors.Is(err, container.ErrPortNotExposed) {
+		t.Fatalf("host-mode Endpoint error = %v, want ErrPortNotExposed", err)
+	}
+}
+
+func TestIntegrationDockerHostAndNonePublishRejectedBeforeCreate(t *testing.T) {
+	requireDocker(t)
+	for _, network := range []string{"host", "none"} {
+		t.Run(network, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-reject-%s-%d", network, time.Now().UnixNano())
+			ctr, err := container.Run(context.Background(), integrationAlpine,
+				container.WithName(name),
+				container.WithNetwork(network),
+				container.WithPublishedPort("127.0.0.1:18080:80/tcp"),
+			)
+			container.Cleanup(t, ctr)
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) || configErr.Network != network {
+				t.Fatalf("Run error = %v, want *ConfigError for %s", err, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Fatalf("container was created despite %s publish rejection: %s", network, out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerNoneNetwork(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("none-network integration requires a Linux daemon, got %q", serverOS)
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("none"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("none-mode Run: %v", err)
+	}
+	if _, err := ctr.Host(ctx); !errors.Is(err, container.ErrNoReachableHost) {
+		t.Fatalf("none-mode Host error = %v, want ErrNoReachableHost", err)
+	}
+}
+
+func TestIntegrationDockerWindowsNATDefault(t *testing.T) {
+	requireDocker(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows Docker integration")
+	}
+	if serverOS := dockerServerOS(t); serverOS != "windows" {
+		t.Skipf("Windows NAT integration requires a Windows daemon, got %q", serverOS)
+	}
+	image := os.Getenv("CONTAINERGO_WINDOWS_TEST_IMAGE")
+	if image == "" {
+		t.Skip("set CONTAINERGO_WINDOWS_TEST_IMAGE to a small Windows image")
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, image,
+		container.WithNetwork("nat"),
+		container.WithCmd("cmd", "/C", "ping -n 10 127.0.0.1 >NUL"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Windows NAT Run: %v", err)
+	}
+	if host, err := ctr.Host(ctx); err != nil || host == "" {
+		t.Fatalf("Windows NAT Host = %q, err = %v", host, err)
+	}
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -104,6 +227,95 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
 	}
+}
+
+func TestIntegrationDockerRejectsInternalNetworkEndpoints(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	network := fmt.Sprintf("containergo-internal-%d", os.Getpid())
+	if out, err := exec.Command("docker", "network", "create", "--internal", network).CombinedOutput(); err != nil {
+		t.Fatalf("docker network create --internal: %v: %s", err, out)
+	}
+	defer func() {
+		if out, err := exec.Command("docker", "network", "rm", network).CombinedOutput(); err != nil {
+			t.Errorf("docker network rm %s: %v: %s", network, err, out)
+		}
+	}()
+
+	for i, option := range []struct {
+		name string
+		opt  container.Option
+	}{
+		{name: "exposed", opt: container.WithExposedPorts("6379/tcp")},
+		{name: "published", opt: container.WithPublishedPort("127.0.0.1:18080:6379/tcp")},
+	} {
+		t.Run(option.name, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-internal-ctr-%d-%d", os.Getpid(), i)
+			ctr, err := container.Run(ctx, integrationRedis,
+				container.WithName(name),
+				container.WithNetwork(network),
+				option.opt,
+			)
+			container.Cleanup(t, ctr)
+			if err == nil {
+				t.Fatal("Run succeeded; want typed isolated-network configuration error")
+			}
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("Run error = %v, want *ConfigError", err)
+			}
+			if configErr.Backend != "docker" || configErr.Network != network {
+				t.Errorf("ConfigError = %+v, want Docker network %q", configErr, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Errorf("container was created despite configuration rejection: %s", out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerIPv6PublishedEndpoint(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expanded loopback input must canonicalize without changing family.
+	spec := fmt.Sprintf("[0:0:0:0:0:0:0:1]:%d:6379/tcp", port)
+	ctr, err := container.Run(ctx, integrationRedis,
+		container.WithExposedPorts("6379/tcp"),
+		container.WithPublishedPort(spec),
+		container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil || host != "::1" {
+		t.Fatalf("Host = %q, err = %v; want ::1", host, err)
+	}
+	endpoint, err := ctr.Endpoint(ctx, "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if endpoint != fmt.Sprintf("[::1]:%d", port) {
+		t.Fatalf("Endpoint = %q, want [::1]:%d", endpoint, port)
+	}
+	conn, err := net.DialTimeout("tcp6", endpoint, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", endpoint, err)
+	}
+	_ = conn.Close()
 }
 
 func TestIntegrationDockerParallelStarts(t *testing.T) {
@@ -443,9 +655,11 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+	// Docker's stale handle retains the old immutable ID. A second
+	// termination is therefore an idempotent no-op, while the
+	// same-name replacement must survive.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("stale Docker Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)

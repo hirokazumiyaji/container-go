@@ -103,17 +103,55 @@ addresses, and an empty value stay local. Docker CLI client protocols
 are `unix`, `tcp`, `npipe`, and `ssh`; other schemes are not usable
 `DOCKER_HOST` endpoints. `Host` returns `127.0.0.1`
 (or the remote hostname) and `MappedPort` returns the assigned port.
-Assignment happens atomically
-in the daemon, so parallel tests do not race over ports here either.
-For `ssh://` the remote hostname must be directly dialable: the CLI's
-SSH session carries only the Docker API, not published ports, so an
-alias reachable only through a ProxyJump or bastion needs a manual
-`ssh -L` forward.
-With a remote daemon, an explicit `WithPublishedPort` bound to loopback
-(`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
-on the remote machine.
-Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected.
+IPv6 bindings are canonicalized without changing address family: an
+unspecified `::` endpoint resolves to `[::1]`, for example. Assignment
+happens atomically in the daemon, so parallel tests do not race over
+ports here either. For `ssh://` the remote hostname must be directly
+dialable: the CLI's SSH session carries only the Docker API, not
+published ports, so an alias reachable only through a ProxyJump or
+bastion needs a manual `ssh -L` forward. With a remote daemon, an
+explicit `WithPublishedPort` bound to loopback (`127.0.0.1:...`,
+`[::1]:...`) is rejected, since it would only listen on the remote
+machine. Reuse also rejects an existing remote-daemon loopback binding
+instead of rewriting it to an unreachable host address.
+
+Docker's `host` and `none` modes cannot create library-managed port
+bindings. Externally isolated networks (`Internal: true` or an isolated
+bridge gateway mode) are rejected as well. For an explicitly selected
+non-default network, `Run` inspects it before pulling or creating anything
+and returns a `*ConfigError` (matching `ErrInvalidConfig`) when either
+`WithExposedPorts` or `WithPublishedPort` is combined with one of these
+networks. `host` and `none` publish combinations are rejected before any
+image or container command.
+
+Host mode remains available without port options. `Host` returns the
+client-facing daemon host, but `MappedPort` and `Endpoint` do not invent
+a host-namespace service port: they require a port declared and bound by
+this library. `none` mode has no reachable host, so `Host` returns an
+error matching `ErrNoReachableHost`. If a Docker installation disables
+host networking, the backend CLI start error is returned rather than a
+fabricated endpoint. Runtime network mismatches match
+`ErrNetworkMismatch`.
+
+When `WithNetwork` is omitted, the Docker CLI is left without a
+`--network` argument so the daemon chooses its platform default (`bridge`
+on Linux, `nat` on native Windows). Endpoint and Host resolution uses the
+actual mode and `NetworkSettings.Networks` from inspect; a pre-existing
+container reporting Docker's special `default` mode is canonicalized
+against that actual network. Compatibility also uses the daemon's
+reported server platform to identify its authoritative default, so a
+user-defined `bridge` or `nat` is not mistaken for that default. If the
+identity is unavailable or ambiguous, the operation fails with
+`ErrNetworkMismatch`. `WithReuse` is therefore compatible with a matching
+daemon default, but never treats an omitted option as a wildcard for
+`host`, `none`, or an arbitrary named network. Docker handles retain
+the immutable container ID returned by `run`, and endpoint, Host, lifecycle,
+and reuse operations inspect that ID; dynamic network, IP, and binding
+data are refreshed on every operation rather than served from a stale
+snapshot.
+
+Only `DOCKER_HOST` is honored for host reachability; a `docker context`
+pointing at a remote daemon is not used to rewrite endpoint hosts.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:
@@ -212,9 +250,13 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Only image and ports are compared; `env` / `cmd` / `mounts`
-  differences attach silently by design (use distinct names when they
-  matter).
+  Docker also requires the requested network identity to match. Omitted
+  `WithNetwork` means the daemon default; inspect's `default` mode is
+  resolved against `NetworkSettings.Networks` (`bridge` on Linux, `nat` on
+  native Windows). `host`, `none`, and named networks are not wildcards.
+  Reuse re-inspects by immutable UID before compatibility checks and before
+  returning the handle. `env` / `cmd` / `mounts` differences still attach
+  silently by design (use distinct names when they matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

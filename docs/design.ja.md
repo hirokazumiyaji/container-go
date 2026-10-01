@@ -110,7 +110,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
-- `WithNetwork(name string)`：接続先ネットワーク
+- `WithNetwork(name string)`：接続先ネットワーク。Docker で省略した場合は daemon が選ぶ既定 network (Linux では `bridge`、native Windows では `nat`)
 - `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
 
 `WithHostname` や `WithPrivileged` などのオプションは、Apple Container CLI に対応するフラグが存在しないため意図的に提供しない(両バックエンド共通でサポート可能な機能に限定する方針)。ログ転送には `FollowLogs` を直接利用する。
@@ -152,8 +152,69 @@ Apple Container ではこの方式を既定にしない。
 `localhost` 固定の接続先が必要な場合(コンテナ IP へ到達できない環境や、接続文字列に localhost を要求するクライアント)に限り、`WithPublishedPort("127.0.0.1:15432:5432")` で明示的に公開する。
 公開した場合、`Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
 
-`MappedPort` は `WithExposedPorts` で宣言されていないポートに対してエラーを返す。
-宣言は待機戦略(ForListeningPort の既定ポートなど)にも使う。
+Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
+作成できません。
+`Internal: true` または isolated bridge gateway mode の外部遮断
+ネットワークも、同じ endpoint 契約の対象です。
+明示的に指定した default 以外の network では、`Run` は image やコンテナを
+操作する前に指定 network を inspect し、これらの network と
+`WithExposedPorts` または `WithPublishedPort` を組み合わせた場合は
+`*ConfigError` を返します。
+`host` と `none` の publish 組み合わせは起動前に拒否されます。
+
+ポート指定なしの host モードは利用できます。
+`Host` はクライアントから見たデーモンの host を返しますが、
+`MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
+none モードには到達可能な host がないため、`Host` は
+`ErrNoReachableHost` と一致するエラーを返します。
+endpoint 解決は、要求した publish 文字列ではなく、要求した mode と inspect
+の実際の network mode、host binding を照合します。
+実行時の network 不一致は `ErrNetworkMismatch` で判別できます。
+
+`WithNetwork` を省略した場合は `--network bridge` を合成せず、daemon の
+platform default (Linux では `bridge`、native Windows では `nat`) に委譲します。
+inspect の特別な `HostConfig.NetworkMode == "default"` は
+`NetworkSettings.Networks` の具体的な network 名と照合するため、既存の
+default コンテナを再利用できても、省略指定を `host`、`none`、任意の名前付き
+network の wildcard にはしません。
+daemon の server OS から authoritative な platform default も取得するため、
+Linux の user-defined `nat` や Windows の user-defined `bridge` を default と
+誤認しません。identity を取得できない場合は `ErrNetworkMismatch` で fail closed
+します。
+
+Docker の handle は `docker run --detach` が返した immutable な container ID
+を保持します。Host、endpoint、lifecycle、reuse の inspect はその ID を対象
+にして返された identity を検証します。network、IP、port binding は dynamic
+data であり、操作ごとに更新されます。cache するのは UID、image、label などの
+immutable identity だけです。
+
+IP アドレスは `netip` で正規化します。
+展開した IPv6 loopback や `::` は Docker inspect の出力と正しく
+一致し、unspecified IPv6 bind はアドレスファミリーを保つ `::1` に
+解決します。
+リモートデーモンで loopback 束縛を inspect した場合は
+`ErrEndpointUnreachable` を返します。
+remote host へ書き換えても、デーモン側の loopback には到達できないためです。
+
+`MappedPort` と `Endpoint` は、`WithExposedPorts` または
+`WithPublishedPort` で宣言のないポート、および利用可能な host binding の
+ないポートに対して `ErrPortNotExposed` を返します。
+宣言は待機戦略(ForListeningPort の既定ポートなど)にも使います。
+
+### Reuse の network 互換性
+
+Docker の `WithReuse` は、image、宣言済み port、`WithNetwork` の network
+identity を比較します。
+`WithNetwork` 省略時の identity は daemon の platform default であり、
+inspect の `default` mode を実際の network 名 (`bridge` または `nat`) と
+照合します。
+`host`、`none`、名前付き network の wildcard ではありません。
+互換性チェックの直前と handle を返す直前に immutable Docker UID で
+再 inspect します。
+inspect に network mode が無い場合も互換性なしとして拒否します。
+リモートデーモンの既存 loopback binding は
+`ErrEndpointUnreachable` として拒否します。
+`env`、`cmd`、`mounts` の差は従来どおり attach 時に無視します。
 
 ## 待機戦略
 
@@ -259,7 +320,9 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
-- `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
+- `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
+- `ErrPortNotExposed`：未宣言、または利用可能な host binding がない port
+- `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 
 `Run` が待機戦略のタイムアウトで失敗した場合は、コンテナのログ末尾を含むエラーを返してから、ロールバック削除を行う。
@@ -320,10 +383,20 @@ API 直叩きは tar 生成、ログストリームの逆多重化、レジス�
 
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
 プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
-正規化した情報は、状態(running / stopped / stopping / unknown への写像)、ラベル、コンテナ IP、公開ポートの束縛(コンテナポート → ホストアドレスとポート)の 4 つである。
+正規化した情報には、状態(running / stopped / stopping / unknown への写像)、ラベル、immutable identity、image、コンテナ IP、Docker network mode、公開ポートの束縛(コンテナポート → ホストアドレスとポート)を含める。
+状態、IP、network、port binding は dynamic data として inspect のたびに更新し、cache には immutable identity のみを保持する。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
-`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。一方 `unix://`、`npipe://`、ループバックアドレス、空値はローカルのままである。Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではない。`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたホストポートを返す。loopback/unspecified の束縛は `defaultHost()` に読み替える。リモートデーモンでループバックを明示した `WithPublishedPort` は、リモート側のループバックでしか待ち受けられずクライアント側の読み替えでは届かないため `Run` が拒否する。`ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。`docker context` 経由のリモート指定は検知できない。
+`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。
+リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。
+一方 `unix://`、`npipe://`、ループバックアドレス、空値はローカルのままである。
+Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではない。
+`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたホストポートを返す。
+unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミリーを維持し、明示的な IPv6 アドレスは `netip` で正規化する。
+リモートデーモンで明示または再利用された loopback 束縛は拒否する。
+その待ち受け先はリモートマシンの loopback であり、client 側の書き換えでは到達できないためである。
+`ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。
+`docker context` 経由のリモート指定は検知できない。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 
@@ -337,7 +410,7 @@ v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、�
 ## スコープ外
 
 - `container build` / `docker build` による Dockerfile ビルド
-- ネットワークの作成と管理(既定ネットワークのみ使う)
+- ネットワークの作成と管理(`WithNetwork` で既存の Docker network へ接続できる)
 - ボリュームの作成と管理
 - testcontainers のモジュール群(postgres など)に相当する高水準パッケージ(コア安定後に検討)
 - Docker Engine API の直接クライアント(CLI ラッパーで足りなくなったら再検討)

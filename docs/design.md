@@ -397,10 +397,11 @@ As a library that spawns subprocesses, these rules hold.
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats
 word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions), and the library validates every ID against Apple
-Container's name rule `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` before
-writing it to the pipe. The two layers together leave no command
-injection through IDs.
+expansions), and the library validates each target before writing it to
+the pipe. Apple Container names must match
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs must be lowercase
+64-character hexadecimal strings matching `^[0-9a-f]{64}$`. The two
+layers together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main

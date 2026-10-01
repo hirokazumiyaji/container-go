@@ -155,14 +155,21 @@ func (r *reaper) writeLocked(e reaperEntry) error {
 // every known ID with it. Success resets the consecutive-failure count;
 // giving up logs once so a permanently broken reaper is visible.
 func (r *reaper) respawnAndReplayLocked() error {
+	// Keep the last failure so the give-up reason carries a root cause
+	// instead of a bare "repeated spawn failures": an operator otherwise
+	// sees two log lines for one event and neither says why the reaper
+	// could not start.
+	var lastErr error
 	for r.spawnFailures < maxReaperSpawnFailures {
 		if err := r.spawnLocked(); err != nil {
+			lastErr = err
 			r.spawnFailures++
 			continue
 		}
 		replayed := true
 		for _, e := range r.entries {
-			if r.writeLocked(e) != nil {
+			if err := r.writeLocked(e); err != nil {
+				lastErr = err
 				replayed = false
 				break
 			}
@@ -176,6 +183,9 @@ func (r *reaper) respawnAndReplayLocked() error {
 	if !r.gaveUp {
 		r.gaveUp = true
 		log.Printf("container-go: reaper giving up after %d consecutive spawn failures (binary=%q)", maxReaperSpawnFailures, r.binary)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("reaper: giving up after %d consecutive spawn failures: %w", maxReaperSpawnFailures, lastErr)
 	}
 	return errors.New("reaper: giving up after repeated spawn failures")
 }
@@ -225,9 +235,9 @@ var (
 )
 
 // registerWithGlobalReaper best-effort registers a container with the
-// process-wide reaper for its backend binary. Reaper trouble never
-// fails container startup. The reaper needs /bin/sh, so on Windows
-// this is a no-op and cleanup relies on the normal paths.
+// process-wide reaper for its backend binary. Reaper trouble is logged
+// but never fails container startup. The reaper needs /bin/sh, so on
+// Windows this is a no-op and cleanup relies on the normal paths.
 func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 	if runtime.GOOS == "windows" {
 		return
@@ -239,5 +249,7 @@ func registerWithGlobalReaper(binary, subcommand, id, creation string) {
 		globalReapers[binary] = r
 	}
 	globalReapersMu.Unlock()
-	_ = r.register(id, creation)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
+	}
 }

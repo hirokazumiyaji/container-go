@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -12,13 +13,25 @@ type engineInfo struct {
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
-	// (Apple Container), where a delete cannot be bound to a generation.
+	// (Apple Container), where operations remain name-based.
 	uid string
 	// image is the image reference the container was created from.
 	image string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
+	// networkMode is the backend's reported network mode. Docker uses
+	// this to distinguish a real host binding from a request that the
+	// daemon discarded (for example, -p with host networking).
+	networkMode string
+	// networkNames contains the actual attached network names reported by
+	// Docker. It resolves the API's special "default" mode to the daemon's
+	// concrete default network (bridge on Linux, nat on Windows).
+	networkNames []string
+	// defaultNetwork is the authoritative Docker daemon default identity
+	// (bridge on Linux, nat on Windows). It is daemon metadata rather than
+	// container identity, so it is not cached with the immutable fields.
+	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort
@@ -40,7 +53,7 @@ type engine interface {
 	probe() cli.Probe
 	// checkConfig rejects option combinations this backend cannot
 	// honor before anything is created.
-	checkConfig(cfg *config) error
+	checkConfig(ctx context.Context, cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).

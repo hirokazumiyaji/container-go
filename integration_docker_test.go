@@ -229,6 +229,14 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	}
 }
 
+func TestIntegrationDockerStopTimeoutRoundsUp(t *testing.T) {
+	requireDocker(t)
+	runStopTimingIntegration(t, "docker", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)
+}
+
+func TestIntegrationDockerStopTimeoutZeroIsImmediate(t *testing.T) {
+	requireDocker(t)
+	runStopTimingIntegration(t, "docker-zero", 0, 0, dockerStopImmediateMaxElapsed)
 func TestIntegrationDockerRejectsInternalNetworkEndpoints(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()

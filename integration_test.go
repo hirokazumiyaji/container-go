@@ -105,6 +105,16 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	}
 }
 
+func TestIntegrationStopTimeoutRoundsUp(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)
+}
+
+func TestIntegrationStopTimeoutZeroIsImmediate(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple-zero", 0, 0, appleStopImmediateMaxElapsed)
+}
+
 func TestIntegrationPublishedPort(t *testing.T) {
 	requireSystem(t)
 	ctx := context.Background()

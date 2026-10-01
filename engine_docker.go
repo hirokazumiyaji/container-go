@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"os"
 	"regexp"
@@ -21,6 +22,11 @@ import (
 // Desktop), so on publishable network modes exposed ports are published
 // to daemon-assigned loopback ports and endpoints resolve to those.
 type dockerEngine struct{}
+
+// Docker parses stop --time through a signed integer. Cap the value at
+// MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
+// ones; the daemon's duration conversion is also safe at this limit.
+const maxDockerStopSeconds int64 = math.MaxInt32
 
 // Verified against Docker Engine / CLI 29.x (local: 29.7.2).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
@@ -685,12 +691,8 @@ func dockerState(s string) State {
 	}
 }
 
-func (dockerEngine) stopArgs(id string, timeout *time.Duration) []string {
-	args := []string{"stop"}
-	if timeout != nil {
-		args = append(args, "--time", strconv.Itoa(int(timeout.Seconds())))
-	}
-	return append(args, id)
+func (dockerEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
+	return stopArgsFor(id, timeout, maxDockerStopSeconds)
 }
 
 func (dockerEngine) deleteArgs(id string) []string {

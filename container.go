@@ -416,7 +416,11 @@ func (c *Container) State(ctx context.Context) (State, error) {
 }
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
-// period before the process is killed.
+// period before the process is killed. A non-nil timeout must be non-negative
+// and its rounded-up seconds must fit the backend's supported range. The
+// backend-specific limit is checked before invoking its CLI. Because both
+// backends accept whole seconds, positive sub-second timeouts are rounded up;
+// zero requests immediate termination.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
@@ -424,7 +428,11 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return err
 	}
-	_, _, err = c.runner.Run(stopCtx, c.eng.stopArgs(target, timeout)...)
+	args, err := c.eng.stopArgs(target, timeout)
+	if err != nil {
+		return fmt.Errorf("stop %s: %w", c.id, err)
+	}
+	_, _, err = c.runner.Run(stopCtx, args...)
 	return c.classify(ctx, err)
 }
 

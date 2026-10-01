@@ -121,11 +121,19 @@ func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []st
 	return append(args, cmd...)
 }
 
-func (appleEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
+func (appleEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
+}
+
+func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	if !opts.Since.IsZero() {
+		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
 	}
-	return []string{"logs", id}
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Tail))
+	}
+	return append(args, id), nil
 }
 
 func (appleEngine) logsTailArgs(id string) []string {

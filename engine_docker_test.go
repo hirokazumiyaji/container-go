@@ -171,8 +171,8 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	if e.reaperSubcommand() != "rm" {
 		t.Errorf("reaperSubcommand = %q", e.reaperSubcommand())
 	}
-	if got := e.logsArgs("myctr", true); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
-		t.Errorf("logsArgs = %v", got)
+	if got := e.logsFollowArgs("myctr"); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
+		t.Errorf("logsFollowArgs = %v", got)
 	}
 	execArgs := e.execArgs("myctr", &execConfig{user: "u", workdir: "/w"}, "/tmp/env", []string{"id"})
 	if !slices.Equal(execArgs, []string{"exec", "--env-file", "/tmp/env", "--user", "u", "--workdir", "/w", "myctr", "id"}) {

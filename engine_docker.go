@@ -722,11 +722,19 @@ func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []s
 	return append(args, cmd...)
 }
 
-func (dockerEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
+func (dockerEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
+}
+
+func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "--tail", strconv.Itoa(opts.Tail))
 	}
-	return []string{"logs", id}
+	if !opts.Since.IsZero() {
+		args = append(args, "--since", opts.Since.Format(time.RFC3339))
+	}
+	return append(args, id), nil
 }
 
 // logsTailArgs bounds diagnostics at the CLI: last 1000 lines, then

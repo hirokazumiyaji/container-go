@@ -80,7 +80,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.operationTarget(), cfg, envFile, cmd)...)
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
@@ -134,14 +138,7 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	target := c.operationTarget()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return false
 	}

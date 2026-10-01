@@ -41,7 +41,11 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	args := c.eng.logsArgs(c.operationTarget(), false)
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return nil, err
+	}
+	args := c.eng.logsArgs(target, false)
 	if extra := opts.args(); len(extra) > 0 {
 		// Insert --tail/--since before the container ID (last arg).
 		args = append(args[:len(args)-1], append(extra, args[len(args)-1])...)
@@ -56,15 +60,16 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 }
 
 // FollowLogs streams the container's log output until Close is called
-// or the context is cancelled. The built-in runner starts the CLI
-// asynchronously: a process that exits after start reports its terminal
-// stderr on the returned stream and then reaches EOF, so that terminal
-// failure is not returned synchronously by FollowLogs. Close terminates
-// the underlying CLI process.
+// or the context is cancelled. Close terminates the underlying CLI
+// process.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	return s.Stream(ctx, c.eng.logsArgs(c.operationTarget(), true)...)
+	return s.Stream(ctx, c.eng.logsArgs(target, true)...)
 }

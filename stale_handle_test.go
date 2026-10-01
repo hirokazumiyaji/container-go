@@ -200,12 +200,13 @@ func assertUIDTargets(t *testing.T, calls [][]string, uid string) {
 func TestAppleHandleKeepsLogicalNameTarget(t *testing.T) {
 	runner := newTestRunner()
 	ctr := &Container{
-		id:     "apple-handle",
-		eng:    appleEngine{},
-		runner: runner,
+		id:       "apple-handle",
+		creation: strings.Repeat("c", 16),
+		eng:      appleEngine{},
+		runner:   runner,
 	}
-	if got := ctr.operationTarget(); got != "apple-handle" {
-		t.Fatalf("operationTarget() = %q, want logical name", got)
+	if got, err := ctr.verifiedOperationTarget(context.Background()); err != nil || got != "apple-handle" {
+		t.Fatalf("verifiedOperationTarget() = %q, %v, want logical name", got, err)
 	}
 	if got := ctr.ID(); got != "apple-handle" {
 		t.Fatalf("ID() = %q, want logical name", got)

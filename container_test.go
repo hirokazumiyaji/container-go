@@ -12,11 +12,27 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
 func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
 	// another backend; tests opting in use t.Setenv.
+	//
+	// Record the value before clearing it: a preflight still has to honor an
+	// explicit selection, and a typo must be reported rather than silently
+	// ignored. REQUIRE_BACKEND is left alone, because it is CI's signal that
+	// a missing backend must fail rather than skip.
+	//
+	// Everything that decides which backend to run must read the recorded
+	// value (integrationtest.SelectedBackend), not the environment: the
+	// unset below runs before any test, so an os.Getenv in a skip guard
+	// would always see "" and never skip. That is what made
+	// `make integration CONTAINERGO_BACKEND=docker` run the Apple
+	// scenarios too. The unit tests that depend on the library's own
+	// detection pin the engine explicitly instead of relying on the
+	// environment being absent.
+	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
 	os.Exit(m.Run())
 }
@@ -105,7 +121,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {

@@ -8,6 +8,22 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+func TestErrPortNotExposedDescribesAllFailureCases(t *testing.T) {
+	const want = "port is not declared or has no usable host binding"
+	if got := ErrPortNotExposed.Error(); got != want {
+		t.Fatalf("ErrPortNotExposed = %q, want %q", got, want)
+	}
+}
+
+func TestDockerNetworkErrorsAreDiscriminable(t *testing.T) {
+	if err := dockerNetworkModeError("bridge", "host", nil); !errors.Is(err, ErrNetworkMismatch) {
+		t.Fatalf("mode error = %v, want ErrNetworkMismatch", err)
+	}
+	if err := dockerNetworkEndpointError("none"); !errors.Is(err, ErrPortNotExposed) || !errors.Is(err, ErrNoReachableHost) {
+		t.Fatalf("none endpoint error = %v, want port and host sentinels", err)
+	}
+}
+
 func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

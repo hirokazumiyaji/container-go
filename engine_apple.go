@@ -1,10 +1,12 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -40,7 +42,7 @@ func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-func (appleEngine) checkConfig(*config) error { return nil }
+func (appleEngine) checkConfig(context.Context, *config) error { return nil }
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
@@ -78,13 +80,13 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
 				proto:         p.Proto,
-				hostAddr:      p.HostAddress,
+				hostAddr:      canonicalIP(p.HostAddress),
 				hostPort:      p.HostPort,
 			})
 		}
 		return info, nil
 	}
-	return nil, fmt.Errorf("container %s not in inspect output", id)
+	return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
@@ -120,11 +122,19 @@ func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []st
 	return append(args, cmd...)
 }
 
-func (appleEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
+func (appleEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
+}
+
+func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	if !opts.Since.IsZero() {
+		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
 	}
-	return []string{"logs", id}
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Tail))
+	}
+	return append(args, id), nil
 }
 
 func (appleEngine) logsTailArgs(id string) []string {

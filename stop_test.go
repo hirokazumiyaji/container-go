@@ -134,7 +134,11 @@ func TestStopTimeout(t *testing.T) {
 					if tc.wantFlag {
 						want = append(want, "--time", tc.wantSeconds)
 					}
-					want = append(want, "myctr")
+					wantTarget := "myctr"
+					if _, ok := backend.engine.(dockerEngine); ok {
+						wantTarget = dockerFixtureID
+					}
+					want = append(want, wantTarget)
 					if got := runner.callWith("stop"); !slices.Equal(got, want) {
 						t.Errorf("stop args = %v, want %v", got, want)
 					}

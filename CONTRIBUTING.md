@@ -18,6 +18,10 @@ public ECR Docker Hub mirror (`public.ecr.aws/docker/library/...`) to avoid
 anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
 and singleflight cases (`make bench-integration` covers those). Set
 `CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
+The root test binary records that value in `TestMain` and then unsets it,
+so the other backend's suites skip correctly; guards read it through
+`integrationtest.SelectedBackend` rather than `os.Getenv`, which would
+always see the empty value.
 Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
 pull other Hub images locally.
 

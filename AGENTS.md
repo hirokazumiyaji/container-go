@@ -15,6 +15,8 @@
 - `make integration` runs tagged integration tests against the available default backend (skips pull-heavy bench/singleflight cases); `make integration-docker` limits them to Docker; `make bench-integration` runs the pull-heavy scenarios. These require the relevant CLI and daemon/service. Integration images use the AWS public ECR Docker Hub mirror to avoid anonymous pull rate limits. Set `CONTAINERGO_BACKEND` to skip the other backend's tests.
 - `go fmt ./...` formats all packages.
 
+Backend selection in tests is read through `integrationtest.SelectedBackend`, never `os.Getenv`. The root test binary's `TestMain` unsets `CONTAINERGO_BACKEND` before any test runs so a developer's shell cannot redirect fixture-backed tests, which means a guard reading the environment sees `""` and can never skip. `TestMain` records the value first; anything deciding which backend to run must go through `SelectedBackend`. A test that needs a specific engine pins it explicitly (e.g. `withEngine(appleEngine{})`) rather than relying on the environment being absent.
+
 ## Coding Style & Naming
 
 Use standard `gofmt` formatting and idiomatic Go names: mixedCaps for identifiers, short package names, and `TestXxx` test functions. Keep APIs and implementations simple, and write comments only to explain intent. Do not add defensive nil handling unless nil is a valid runtime state or API contract; tests should provide the dependencies production code expects.

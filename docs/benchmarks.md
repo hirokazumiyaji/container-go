@@ -97,9 +97,16 @@ running; the scenarios skip cleanly without it.
 | docker  | container-go       | run/forexec    | 188ms  | 4 |
 | docker  | container-go       | run/no-wait    | 145ms  | 3 |
 | docker  | container-go       | run/parallel-8 | 420ms  | 17 |
-| docker  | testcontainers-go  | tc/session-init| 0.5s warm / 14.7s cold | 0 |
-| docker  | testcontainers-go  | tc/single      | 335ms  | 0 |
-| docker  | testcontainers-go  | tc/multi-5     | 1.69s (5 ctrs) | 0 |
+| docker  | testcontainers-go  | tc/session-init| 0.5s warm / 14.7s cold | not measured |
+| docker  | testcontainers-go  | tc/single      | 335ms  | not measured |
+| docker  | testcontainers-go  | tc/multi-5     | 1.69s (5 ctrs) | not measured |
+
+The testcontainers-go spawn column was previously printed as `0`, which
+is what the schema records when a scenario does not count subprocesses.
+That made an unmeasured column indistinguishable from a measured zero,
+and the two are not comparable: only the container-go side of the
+spawn counts below was ever measured. The renderer now prints `n/a` for
+an unmeasured count.
 
 Changes observed when the pull singleflight landed (#18), against the
 pre-#18 numbers from PR #23:
@@ -110,7 +117,8 @@ pre-#18 numbers from PR #23:
   own registry round-trip.
 - warm shapes pay exactly one extra spawn for the image existence
   check (2 → 3 for plain Run); in exchange concurrent Runs of a
-  missing image pull once instead of racing.
+  missing image pull once instead of racing. Both sides of that
+  comparison are container-go measurements.
 - testcontainers-go's `tc/session-init` depends on whether the Ryuk
   sidecar image is cached: 14.7s on first-ever use, ~0.5s warm.
 

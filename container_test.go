@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -327,16 +328,19 @@ func TestRunPassesResourceAndProcessFlags(t *testing.T) {
 
 func TestRunPassesMounts(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "host", "data")
 	runTestContainer(t, f,
 		WithMounts(
-			Mount{Type: MountBind, Source: "/host/data", Target: "/data", ReadOnly: true},
+			Mount{Type: MountBind, Source: source, Target: "/data", ReadOnly: true},
 			Mount{Type: MountTmpfs, Target: "/scratch"},
 		))
 
-	joined := strings.Join(f.callWith("run"), " ")
-	if !strings.Contains(joined, "--mount type=bind,source=/host/data,target=/data,readonly") {
-		t.Errorf("bind mount missing: %s", joined)
+	runCall := f.callWith("run")
+	wantBind := "type=bind,source=" + source + ",target=/data,readonly"
+	if !slices.Contains(runCall, wantBind) {
+		t.Errorf("bind mount argv missing %q: %v", wantBind, runCall)
 	}
+	joined := strings.Join(runCall, " ")
 	if !strings.Contains(joined, "--mount type=tmpfs,target=/scratch") {
 		t.Errorf("tmpfs mount missing: %s", joined)
 	}
@@ -344,10 +348,27 @@ func TestRunPassesMounts(t *testing.T) {
 
 func TestRunRejectsMountWithComma(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "a,b")
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
-		WithMounts(Mount{Type: MountBind, Source: "/a,b", Target: "/data"}), withRunner(f))
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
 	if err == nil {
 		t.Fatal("want error for comma in mount source")
+	}
+}
+
+func TestRunRejectsRelativeBindMountSource(t *testing.T) {
+	f := newTestRunner()
+	source := filepath.Join("relative", "data")
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
+	if err == nil {
+		t.Fatal("want error for relative bind mount source")
+	}
+	if !strings.Contains(err.Error(), "absolute host path") {
+		t.Errorf("error = %q, want absolute host path error", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("run must not be issued: %v", f.callWith("run"))
 	}
 }
 

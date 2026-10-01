@@ -93,6 +93,18 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 		}
 	}
 	if isRemoteDockerHost() {
+		// The CLI does not expose the daemon OS or shared filesystem, so reject
+		// every remote bind mount conservatively: Docker resolves the source
+		// on the daemon host, and this library cannot verify that a client
+		// path exists there or has compatible OS syntax.
+		for _, m := range cfg.mounts {
+			if m.Type == MountBind {
+				return fmt.Errorf(
+					"%w: bind mount source %q on a remote Docker daemon is resolved on the daemon host; use a local Docker daemon or copy the data into the container",
+					ErrUnsupportedCapability, m.Source,
+				)
+			}
+		}
 		// hostAddr is validated and canonicalized by parsePublishSpec.
 		for _, p := range cfg.published {
 			if ipIsLoopback(p.hostAddr) {

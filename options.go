@@ -50,6 +50,10 @@ type config struct {
 	reuse           bool
 	reuseGroup      string
 	creation        string
+	// imageCache reuses image-presence answers across Runs when
+	// WithImagePresenceCache enabled it. Nil means no cache, which is the
+	// default and preserves one inspect per Run.
+	imageCache *imageCache
 
 	// imagePrepared is set when a reuse caller has completed its own
 	// PullAlways fetch before entering the shared ensure flight.

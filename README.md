@@ -620,6 +620,23 @@ The example registers cleanup before checking either `Run` error. On the
 current checkout, `PullNever`'s `ErrImageNotFound` is backend-specific and
 best-effort on Apple; it is not an unconditional no-fetch guarantee (#112).
 
+That existence check is a daemon round trip on every `Run`. When the
+backend's store is known to be stable for the length of the test run,
+`WithImagePresenceCache` reuses a "present" answer for a TTL so later
+`Run`s of the same image skip it:
+
+```go
+container.Run(ctx, "redis:7-alpine",
+    container.WithImagePresenceCache(5*time.Minute))
+```
+
+It is off by default, and only "present" answers are cached: caching an
+absence would have to be invalidated by the pull it triggered. An image
+removed out of band is not re-pulled until the entry expires, so callers
+who need certainty on every `Run` should leave it off. `PullNever` always
+inspects regardless, since its contract is to fail when the image is
+absent.
+
 ## Cleanup contract
 
 The normal, rollback, failed-create, and abnormal-exit paths have

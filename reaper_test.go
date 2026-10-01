@@ -1,6 +1,8 @@
 package container
 
 import (
+	"bytes"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -43,6 +45,7 @@ func waitForLogLines(t *testing.T, path string, wants ...string) {
 }
 
 func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -60,12 +63,61 @@ func TestReaperDeletesRegisteredContainersOnEOF(t *testing.T) {
 	waitForLogLines(t, logPath, "delete --force ctr-one", "delete --force ctr-two")
 }
 
+func TestReaperDeletesRegisteredDockerIDOnEOF(t *testing.T) {
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "rm")
+	id := strings.Repeat("ab", 32)
+
+	if err := r.register(id, ""); err != nil {
+		t.Fatalf("register Docker ID: %v", err)
+	}
+	r.closeStdin()
+
+	waitForLogLines(t, logPath, "rm --force "+id)
+}
+
+func TestRegisterWithGlobalReaperLogsValidationFailure(t *testing.T) {
+	binary := filepath.Join(t.TempDir(), "docker")
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, binary)
+		globalReapersMu.Unlock()
+	})
+
+	var logs bytes.Buffer
+	previousWriter := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(previousWriter) })
+
+	registerWithGlobalReaper(binary, "rm", "bad id", "")
+
+	for _, want := range []string{
+		"container-go: reaper registration failed",
+		`invalid container id "bad id"`,
+	} {
+		if !strings.Contains(logs.String(), want) {
+			t.Errorf("log = %q, want %q", logs.String(), want)
+		}
+	}
+}
+
 func TestReaperRejectsInvalidID(t *testing.T) {
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
 
-	for _, id := range []string{"", "bad id", "a;b", "x\ny", "-leading"} {
+	for _, id := range []string{
+		"",
+		"bad id",
+		"\t",
+		"a;b",
+		"x\ny",
+		"\n",
+		"-leading",
+		strings.Repeat("a", 65),
+		strings.Repeat("A", 64),
+		strings.Repeat("g", 64),
+	} {
 		if err := r.register(id, ""); err == nil {
 			t.Errorf("register(%q): want error", id)
 		}
@@ -75,7 +127,29 @@ func TestReaperRejectsInvalidID(t *testing.T) {
 	}
 }
 
+func TestReaperAcceptsDockerImmutableID(t *testing.T) {
+	bin, _ := writeReaperStub(t)
+	uid := strings.Repeat("ab", 32)
+
+	dockerReaper := newReaper(bin, "rm")
+	if err := dockerReaper.register(uid, ""); err != nil {
+		t.Fatalf("register Docker UID: %v", err)
+	}
+	dockerReaper.closeStdin()
+
+	if err := dockerReaper.register(strings.ToUpper(uid), ""); err == nil {
+		t.Error("uppercase Docker UID accepted; want lowercase-only validation")
+	}
+
+	nameReaper := newReaper(bin, "delete")
+	if err := nameReaper.register(uid, ""); err != nil {
+		t.Errorf("full Docker UID rejected by generic reaper validator: %v", err)
+	}
+	nameReaper.closeStdin()
+}
+
 func TestReaperRespawnsAndReRegisters(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, logPath := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 
@@ -116,6 +190,7 @@ func TestBreQuoteEscapesLabelKey(t *testing.T) {
 }
 
 func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	r.spawnFailures = 2
@@ -129,6 +204,7 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 }
 
 func TestReaperRegisterWithCreationValidation(t *testing.T) {
+	requirePOSIXShell(t)
 	bin, _ := writeReaperStub(t)
 	r := newReaper(bin, "delete")
 	defer r.closeStdin()
@@ -141,6 +217,7 @@ func TestReaperRegisterWithCreationValidation(t *testing.T) {
 }
 
 func TestReaperGuardsDeleteByCreation(t *testing.T) {
+	requirePOSIXShell(t)
 	t.Helper()
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
@@ -173,6 +250,7 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 }
 
 func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/container"
@@ -208,6 +286,7 @@ func TestReaperRejectsLabelValueContainingAssociation(t *testing.T) {
 }
 
 func TestReaperDeletesByImmutableID(t *testing.T) {
+	requirePOSIXShell(t)
 	dir := t.TempDir()
 	logPath := dir + "/calls.log"
 	binPath := dir + "/docker"

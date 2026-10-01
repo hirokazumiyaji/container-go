@@ -46,7 +46,11 @@ func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
 
 func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if len(s.cmd) == 0 {
-		return errors.New("wait for exec: command must not be empty")
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "command",
+			Reason:   "command must not be empty",
+		}
 	}
 	matcher := s.exitMatcher
 	if matcher == nil {

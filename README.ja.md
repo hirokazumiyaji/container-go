@@ -90,15 +90,72 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 
 **Docker バックエンド**: コンテナ IP にはホストから届かないことが多いため
 (Docker Desktop)、`WithExposedPorts` で宣言したポートはデーモンが割り当てる
-ランダムポートへ自動公開されます(testcontainers と同じモデル)。ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートデーモン(`DOCKER_HOST=tcp://host`)では全IF(`-p 0.0.0.0::<port>`)に束縛します。`Host` は `127.0.0.1`(`tcp://` の `DOCKER_HOST` 設定時はそのホスト)、`MappedPort` は割り当てられたポートを返します。リモートデーモンでは、ループバック(`127.0.0.1:...`、`[::1]:...`)を明示した `WithPublishedPort` はリモート側でしか待ち受けられないため拒否します。割り当てはデーモンが起動時に原子的に行うため、こちらでも並列テストがポートを奪い合うことはありません。
+ランダムポートへ自動公開されます(testcontainers と同じモデル)。
+ローカルはループバック(`-p 127.0.0.1::<port>`)、リモートの `DOCKER_HOST`
+では全IF(`-p 0.0.0.0::<port>`)に束縛します。
+リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことです。
+`tcp://host`(CI での `tcp://docker:2375` など)、`ssh://user@host`、
+スキームなしの `host:port` / ホスト名(Docker CLI と同じく `tcp://` を前置)
+が該当し、`unix://`、`npipe://`、ループバックアドレス、空値はローカルのままです。
+Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、
+`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではありません。
+`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられた
+ポートを返します。
+IPv6 の束縛先は正規化してもアドレスファミリーを維持するため、`::` は
+`[::1]` として解決します。
+リモートデーモンでは、明示的な loopback 束縛も再利用時の既存 loopback
+束縛も拒否します。
+これらをリモートの host へ書き換えても実際の待ち受け先には到達できない
+ためです。
+`ssh://` のホスト名は直接 dial 可能でなければなりません。
+CLI の SSH セッションが運ぶのは Docker API だけで、公開ポートは運ばれないため、
+ProxyJump や踏み台越しでしか届かないエイリアスは手動の `ssh -L` 転送が必要です。
 
-Bind mount はローカルの Docker daemon(Windows Docker Desktop を含む)で利用できます。
-`DOCKER_HOST` がリモート daemon(`tcp://` / `ssh://` / `http(s)://` などローカルでない transport すべて)を指す場合、`Run` は `MountBind` を `ErrUnsupportedCapability` 付きで拒否します。
-Docker は source を daemon host 側で解決するため、このライブラリはクライアントのパスがそのホストに存在するか、互換性のある OS 構文かを保証できません。
-拒否は image pull や container creation より前に行われます。
-`errors.Is(err, container.ErrUnsupportedCapability)` で判定できます。
-ローカル daemon を使うか、container へデータをコピーしてください。
-`DOCKER_HOST` だけが対象で、`docker context` 経由のリモート指定は検知しません。
+Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
+作成できません。
+`Internal: true` または isolated bridge gateway mode の外部遮断
+ネットワークも同じです。
+明示的に指定した default 以外の network では、`Run` は image の pull や
+コンテナ作成より先にその network を inspect し、これらのネットワークと
+`WithExposedPorts` または `WithPublishedPort` を組み合わせた場合は
+`*ConfigError` を返します。
+このエラーは `ErrInvalidConfig` と一致します。
+`host` と `none` の publish 組み合わせは、image やコンテナを起動する前に
+拒否されます。
+
+ポート指定なしの host モードは利用できます。
+`Host` はクライアントから見たデーモンの host を返しますが、
+`MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
+ライブラリが宣言して束縛したポートが必要です。
+`none` モードには到達可能な host がないため、`Host` は
+`ErrNoReachableHost` と一致するエラーを返します。
+Docker 側で host networking が無効な場合は、推測した endpoint ではなく
+バックエンド CLI の開始エラーを返します。
+実行時の network 不一致は `ErrNetworkMismatch` で判別できます。
+
+`WithNetwork` を省略した場合、Docker CLI に `--network` を渡さず、
+daemon の platform デフォルトに委譲します
+(Linux では `bridge`、native Windows では `nat`)。
+`Host` と endpoint 解決では inspect の実際の mode と
+`NetworkSettings.Networks` を使います。
+既存のコンテナが Docker の特別な `default` mode を返す場合も、実際の
+network 名に正規化して再利用します。
+互換性判定では daemon の server platform も取得し、authoritative な
+default を確定します。そのため user-defined な `bridge` や `nat` を
+default と誤認しません。identity を取得できない場合や曖昧な場合は
+`ErrNetworkMismatch` で失敗します。
+`WithReuse` は一致する daemon default を受け付けますが、省略指定を
+`host`、`none`、任意の名前付き network の wildcard にはしません。
+Docker の handle は `run` が返した immutable な container ID を保持し、
+endpoint、Host、lifecycle、reuse の inspect はその ID を対象にします。
+network、IP、binding などの dynamic データは毎回更新され、古い snapshot
+は再利用されません。
+
+`DOCKER_HOST` のみを host reachability の判定に使用します。
+`docker context` 経由のリモート daemon は endpoint host の書き換えには
+使用しません。
+割り当てはデーモンが起動時に原子的に行うため、並列テストがポートを奪い合う
+こともありません。
 
 クライアントが `localhost` を要求する場合(または構成上コンテナ IP に
 届かない場合)は、明示的に公開します。
@@ -132,6 +189,16 @@ wait.ForAll(...), wait.ForAny(...)           // 合成; .WithStartupTimeout
 すべての戦略は `WithStartupTimeout`(既定 60 秒)と `WithPollInterval`
 (既定 100 ミリ秒)を持ちます(`ForAll` / `ForAny` は `WithStartupTimeout` で合成全体のタイムアウトを設定可)。待機中にコンテナが停止すると即座に失敗し、
 待機に失敗した場合はロールバック削除のうえ、エラーにログ末尾が添付されます。
+
+`ForListeningPort` とポート宣言では、対応プロトコルが異なります。
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | 対応 | 対応 |
+| `wait.ForListeningPort` | `6379` または `6379/tcp` | 接続を試みる前に `*wait.ConfigError` |
+
+`ForListeningPort` は、不正なポート指定にも `*wait.ConfigError` を返します。
+エラーメッセージを比較せず分類する場合は、`errors.Is(err, wait.ErrInvalidConfiguration)` を使えます。
 
 ## クリーンアップの契約
 
@@ -177,7 +244,13 @@ container.Cleanup(t, ctr) // reused ハンドルでは何もしない
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
-- image / port が既存と不一致なら分かりやすいエラーを返す。互換性チェックは image と port のみが対象。`env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様。
+- image / port が既存と不一致なら分かりやすいエラーを返す。
+  Docker では network も一致する必要があります。
+  `WithNetwork` 省略時は daemon の platform default を `default` として
+  扱い、inspect の `NetworkSettings.Networks` から `bridge` (Linux) または
+  `nat` (native Windows) を照合します。`host`、`none`、名前付き network は
+  wildcard にしません。
+  `env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様です。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。

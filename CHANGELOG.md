@@ -9,13 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `ConfigError` / `ErrInvalidConfig` for backend-incompatible options,
+  `ErrEndpointUnreachable` for unusable inspected bindings, and
+  `ErrNetworkMismatch` / `ErrNoReachableHost` for runtime network failures.
 - Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
   versions; centralize stderr matchers on each engine with source comments;
   add live CLI compatibility integration tests; add Apple inspect fixture
   for 1.3.0.
+- `StrictCleanup`, which reports a container-teardown failure as a test
+  failure instead of logging it. `Cleanup` still logs, so an unrelated
+  backend problem does not turn an unrelated test red.
+- `internal/integrationtest`, the shared backend preflight for the tagged
+  suites: a required CI run fails when the backend is unavailable or when
+  `CONTAINERGO_BACKEND` names the other backend, a `CONTAINERGO_BACKEND`
+  typo always fails, and a cross-process helper enforces its deadline while
+  blocked and returns the child's partial output on timeout.
+- `internal/releasecheck`, the release invariants as a test: the README
+  install lines, the `SECURITY.md` support matrix, and the newest dated
+  `CHANGELOG` release must name the same version.
+- A `release-check` workflow and a `make release-check` target that run the
+  full gate — build, vet, test, `go mod verify`, a `go mod tidy` check, and
+  the separate `bench` module. `make release-check` and the pull-request
+  run are the pre-tag gate. The tag-push run is a post-push safety net: the
+  tag already exists, and a failing run means a maintainer must delete it
+  and retag.
+
+### Fixed
+
+- Cleanup failures are no longer discarded. A failed-create, reuse
+  inspect/copy rollback, or public `Cleanup` that could not remove the
+  container now joins the cleanup failure onto the operation error, so
+  `errors.Is` still matches the operation error and `errors.As` reaches the
+  new exported `CleanupError` to learn that a container was left behind. An
+  already-absent container and a name conflict remain idempotent successes,
+  and a successful inspect that lists no container is treated as proof of
+  absence rather than reported as a leak (#86).
+- The Docker integration CI job can no longer report success with zero tests
+  run: a missing backend, a misconfigured backend, or a `-run` pattern that
+  selects nothing all fail the job (#106).
 
 ### Changed
 
+- Reject Docker host, none, internal, and isolated networks before
+  published endpoint creation; leave omitted `WithNetwork` to the
+  daemon default and resolve Docker's `default` mode from actual
+  `NetworkSettings.Networks` and the daemon's authoritative platform
+  default; user-defined `bridge`/`nat` names no longer impersonate an
+  omitted default. Refresh dynamic inspect data through the immutable
+  Docker UID for endpoint, Host, lifecycle, and reuse operations.
+- Canonicalize IPv6 bindings and preserve address family in endpoint
+  resolution, including fail-closed remote-daemon loopback handling.
+- Accept full lowercase Docker UIDs in the reaper while retaining strict
+  logical-name validation.
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`

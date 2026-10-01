@@ -93,26 +93,65 @@ binding's address when several publish host-IPs differ.
 the host (Docker Desktop), so ports declared via `WithExposedPorts` are
 automatically published to daemon-assigned ports — the classic
 testcontainers model. Locally this binds loopback
-(`-p 127.0.0.1::<port>`); with `DOCKER_HOST=tcp://host` (remote daemon,
-e.g. `tcp://docker:2375` in CI) it binds all interfaces
-(`-p 0.0.0.0::<port>`) so the client can reach it. `Host` returns
-`127.0.0.1` (or the host from a `tcp://` `DOCKER_HOST`) and
-`MappedPort` returns the assigned port. Assignment happens atomically
-in the daemon, so parallel tests do not race over ports here either.
-With a remote daemon, an explicit `WithPublishedPort` bound to loopback
-(`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only listen
-on the remote machine.
+(`-p 127.0.0.1::<port>`); with a remote `DOCKER_HOST` it binds all
+interfaces (`-p 0.0.0.0::<port>`) so the client can reach it. Remote
+means any `DOCKER_HOST` that does not name this machine:
+`tcp://host` (e.g. `tcp://docker:2375` in CI), `ssh://user@host`, or a
+scheme-less `host:port` / hostname, normalized the way the Docker CLI
+normalizes it (`tcp://` prepended). `unix://`, `npipe://`, loopback
+addresses, and an empty value stay local. Docker CLI client protocols
+are `unix`, `tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1`
+(or the remote hostname) and `MappedPort` returns the assigned port.
+IPv6 bindings are canonicalized without changing address family: an
+unspecified `::` endpoint resolves to `[::1]`, for example. Assignment
+happens atomically in the daemon, so parallel tests do not race over
+ports here either. For `ssh://` the remote hostname must be directly
+dialable: the CLI's SSH session carries only the Docker API, not
+published ports, so an alias reachable only through a ProxyJump or
+bastion needs a manual `ssh -L` forward. With a remote daemon, an
+explicit `WithPublishedPort` bound to loopback (`127.0.0.1:...`,
+`[::1]:...`) is rejected, since it would only listen on the remote
+machine. Reuse also rejects an existing remote-daemon loopback binding
+instead of rewriting it to an unreachable host address.
 
-Bind mounts are supported with a local Docker daemon, including Windows
-Docker Desktop. When `DOCKER_HOST` selects a remote daemon (any non-local
-transport, including `tcp://`, `ssh://`, `http(s)://`), `Run` rejects
-`MountBind` with `ErrUnsupportedCapability`: Docker resolves
-the source on the daemon host, and this library cannot verify that a client
-path exists there or has compatible OS syntax. The rejection happens before
-image pulling or container creation. Use a local daemon or copy data into
-the container. Callers can detect it with
-`errors.Is(err, container.ErrUnsupportedCapability)`. Only `DOCKER_HOST` is
-honored; a `docker context` pointing at a remote daemon is not detected.
+Docker's `host` and `none` modes cannot create library-managed port
+bindings. Externally isolated networks (`Internal: true` or an isolated
+bridge gateway mode) are rejected as well. For an explicitly selected
+non-default network, `Run` inspects it before pulling or creating anything
+and returns a `*ConfigError` (matching `ErrInvalidConfig`) when either
+`WithExposedPorts` or `WithPublishedPort` is combined with one of these
+networks. `host` and `none` publish combinations are rejected before any
+image or container command.
+
+Host mode remains available without port options. `Host` returns the
+client-facing daemon host, but `MappedPort` and `Endpoint` do not invent
+a host-namespace service port: they require a port declared and bound by
+this library. `none` mode has no reachable host, so `Host` returns an
+error matching `ErrNoReachableHost`. If a Docker installation disables
+host networking, the backend CLI start error is returned rather than a
+fabricated endpoint. Runtime network mismatches match
+`ErrNetworkMismatch`.
+
+When `WithNetwork` is omitted, the Docker CLI is left without a
+`--network` argument so the daemon chooses its platform default (`bridge`
+on Linux, `nat` on native Windows). Endpoint and Host resolution uses the
+actual mode and `NetworkSettings.Networks` from inspect; a pre-existing
+container reporting Docker's special `default` mode is canonicalized
+against that actual network. Compatibility also uses the daemon's
+reported server platform to identify its authoritative default, so a
+user-defined `bridge` or `nat` is not mistaken for that default. If the
+identity is unavailable or ambiguous, the operation fails with
+`ErrNetworkMismatch`. `WithReuse` is therefore compatible with a matching
+daemon default, but never treats an omitted option as a wildcard for
+`host`, `none`, or an arbitrary named network. Docker handles retain
+the immutable container ID returned by `run`, and endpoint, Host, lifecycle,
+and reuse operations inspect that ID; dynamic network, IP, and binding
+data are refreshed on every operation rather than served from a stale
+snapshot.
+
+Only `DOCKER_HOST` is honored for host reachability; a `docker context`
+pointing at a remote daemon is not used to rewrite endpoint hosts.
 
 When a client insists on `localhost` (or the container IP is not
 reachable in your setup), publish the port explicitly:
@@ -147,6 +186,17 @@ Every strategy accepts `WithStartupTimeout` (default 60s) and
 `WithPollInterval` (default 100ms; `ForAll` / `ForAny` accept `WithStartupTimeout` to bound the composition). Waiting fails fast if the container
 stops, and a failed wait rolls the container back with a tail of its
 logs attached to the error.
+
+`ForListeningPort` and port declarations have different protocol support:
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | Supported | Supported |
+| `wait.ForListeningPort` | `6379` or `6379/tcp` | `*wait.ConfigError` before probing |
+
+`ForListeningPort` also returns `*wait.ConfigError` for malformed port
+specifications. Use `errors.Is(err, wait.ErrInvalidConfiguration)` to
+classify either configuration error without matching its message.
 
 ## Image pulls
 
@@ -211,9 +261,13 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Only image and ports are compared; `env` / `cmd` / `mounts`
-  differences attach silently by design (use distinct names when they
-  matter).
+  Docker also requires the requested network identity to match. Omitted
+  `WithNetwork` means the daemon default; inspect's `default` mode is
+  resolved against `NetworkSettings.Networks` (`bridge` on Linux, `nat` on
+  native Windows). `host`, `none`, and named networks are not wildcards.
+  Reuse re-inspects by immutable UID before compatibility checks and before
+  returning the handle. `env` / `cmd` / `mounts` differences still attach
+  silently by design (use distinct names when they matter).
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.

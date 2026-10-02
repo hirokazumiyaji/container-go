@@ -4,12 +4,14 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,24 +19,136 @@ import (
 	"time"
 
 	container "github.com/hirokazumiyaji/container-go"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-// requireDocker skips unless the docker CLI and daemon are available,
-// and routes this test to the Docker backend. When CONTAINERGO_BACKEND
-// is set to a non-docker value, Docker integration tests are skipped.
+// requireDocker routes this test to the Docker backend, or skips/fails per
+// backendPreflight.
 func requireDocker(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
+	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
+}
+
+func dockerServerOS(t *testing.T) string {
+	t.Helper()
+	out, err := exec.Command("docker", "version", "--format", "{{.Server.Os}}").Output()
+	if err != nil {
+		t.Skipf("cannot determine Docker server OS: %v", err)
 	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker CLI not installed")
+	serverOS := strings.ToLower(strings.TrimSpace(string(out)))
+	if serverOS == "" {
+		t.Skip("Docker server did not report an OS")
 	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon not running")
+	return serverOS
+}
+
+func dockerHostNetworkUnavailable(err error) bool {
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "host") &&
+		(strings.Contains(message, "not supported") ||
+			strings.Contains(message, "not enabled") ||
+			strings.Contains(message, "unable to start") ||
+			strings.Contains(message, "not available"))
+}
+
+func TestIntegrationDockerHostNetworkNoPublish(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("host networking integration requires a Linux daemon, got %q", serverOS)
 	}
-	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("host"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		if dockerHostNetworkUnavailable(err) {
+			t.Skipf("Docker host networking is unavailable: %v", err)
+		}
+		t.Fatalf("host-mode Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil {
+		t.Fatalf("host-mode Host: %v", err)
+	}
+	if host == "" {
+		t.Fatal("host-mode Host returned an empty address")
+	}
+	if _, err := ctr.Endpoint(ctx, "80/tcp"); !errors.Is(err, container.ErrPortNotExposed) {
+		t.Fatalf("host-mode Endpoint error = %v, want ErrPortNotExposed", err)
+	}
+}
+
+func TestIntegrationDockerHostAndNonePublishRejectedBeforeCreate(t *testing.T) {
+	requireDocker(t)
+	for _, network := range []string{"host", "none"} {
+		t.Run(network, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-reject-%s-%d", network, time.Now().UnixNano())
+			ctr, err := container.Run(context.Background(), integrationAlpine,
+				container.WithName(name),
+				container.WithNetwork(network),
+				container.WithPublishedPort("127.0.0.1:18080:80/tcp"),
+			)
+			container.Cleanup(t, ctr)
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) || configErr.Network != network {
+				t.Fatalf("Run error = %v, want *ConfigError for %s", err, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Fatalf("container was created despite %s publish rejection: %s", network, out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerNoneNetwork(t *testing.T) {
+	requireDocker(t)
+	if serverOS := dockerServerOS(t); serverOS != "linux" {
+		t.Skipf("none-network integration requires a Linux daemon, got %q", serverOS)
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithNetwork("none"),
+		container.WithCmd("sleep", "30"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("none-mode Run: %v", err)
+	}
+	if _, err := ctr.Host(ctx); !errors.Is(err, container.ErrNoReachableHost) {
+		t.Fatalf("none-mode Host error = %v, want ErrNoReachableHost", err)
+	}
+}
+
+func TestIntegrationDockerWindowsNATDefault(t *testing.T) {
+	requireDocker(t)
+	if runtime.GOOS != "windows" {
+		t.Skip("native Windows Docker integration")
+	}
+	if serverOS := dockerServerOS(t); serverOS != "windows" {
+		t.Skipf("Windows NAT integration requires a Windows daemon, got %q", serverOS)
+	}
+	image := os.Getenv("CONTAINERGO_WINDOWS_TEST_IMAGE")
+	if image == "" {
+		t.Skip("set CONTAINERGO_WINDOWS_TEST_IMAGE to a small Windows image")
+	}
+	ctx := context.Background()
+	ctr, err := container.Run(ctx, image,
+		container.WithNetwork("nat"),
+		container.WithCmd("cmd", "/C", "ping -n 10 127.0.0.1 >NUL"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Windows NAT Run: %v", err)
+	}
+	if host, err := ctr.Host(ctx); err != nil || host == "" {
+		t.Fatalf("Windows NAT Host = %q, err = %v", host, err)
+	}
 }
 
 func TestIntegrationDockerRedisLifecycle(t *testing.T) {
@@ -88,14 +202,32 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
 	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
+	if err != nil && copyOutUnsupportedOnThisToolchain {
+		if rc != nil {
+			_ = rc.Close()
+			t.Fatalf("CopyFileFromContainer returned a reader with unsupported error: %v", err)
+		}
+		if !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+			t.Fatalf("CopyFileFromContainer: got %v, want documented unsupported error", err)
+		}
+		t.Logf("CopyFileFromContainer is intentionally unsupported on this Windows toolchain: %v", err)
+	} else {
+		if err != nil {
+			t.Fatalf("CopyFileFromContainer: %v", err)
+		}
+		if rc == nil {
+			t.Fatal("CopyFileFromContainer returned a nil reader")
+		}
+		defer rc.Close()
+		round, readErr := io.ReadAll(rc)
+		if readErr != nil {
+			t.Fatalf("read round-tripped content: %v", readErr)
+		}
+		if string(round) != "hello docker" {
+			t.Errorf("round-tripped content = %q", round)
+		}
 	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello docker" {
-		t.Errorf("round-tripped content = %q", round)
-	}
+	assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 
 	logs, err := ctr.Logs(ctx)
 	if err != nil {
@@ -113,6 +245,103 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
 	}
+}
+
+func TestIntegrationDockerStopTimeoutRoundsUp(t *testing.T) {
+	requireDocker(t)
+	runStopTimingIntegration(t, "docker", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)
+}
+
+func TestIntegrationDockerStopTimeoutZeroIsImmediate(t *testing.T) {
+	requireDocker(t)
+	runStopTimingIntegration(t, "docker-zero", 0, 0, dockerStopImmediateMaxElapsed)
+func TestIntegrationDockerRejectsInternalNetworkEndpoints(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	network := fmt.Sprintf("containergo-internal-%d", os.Getpid())
+	if out, err := exec.Command("docker", "network", "create", "--internal", network).CombinedOutput(); err != nil {
+		t.Fatalf("docker network create --internal: %v: %s", err, out)
+	}
+	defer func() {
+		if out, err := exec.Command("docker", "network", "rm", network).CombinedOutput(); err != nil {
+			t.Errorf("docker network rm %s: %v: %s", network, err, out)
+		}
+	}()
+
+	for i, option := range []struct {
+		name string
+		opt  container.Option
+	}{
+		{name: "exposed", opt: container.WithExposedPorts("6379/tcp")},
+		{name: "published", opt: container.WithPublishedPort("127.0.0.1:18080:6379/tcp")},
+	} {
+		t.Run(option.name, func(t *testing.T) {
+			name := fmt.Sprintf("containergo-internal-ctr-%d-%d", os.Getpid(), i)
+			ctr, err := container.Run(ctx, integrationRedis,
+				container.WithName(name),
+				container.WithNetwork(network),
+				option.opt,
+			)
+			container.Cleanup(t, ctr)
+			if err == nil {
+				t.Fatal("Run succeeded; want typed isolated-network configuration error")
+			}
+			if !errors.Is(err, container.ErrInvalidConfig) {
+				t.Fatalf("Run error = %v, want ErrInvalidConfig", err)
+			}
+			var configErr *container.ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("Run error = %v, want *ConfigError", err)
+			}
+			if configErr.Backend != "docker" || configErr.Network != network {
+				t.Errorf("ConfigError = %+v, want Docker network %q", configErr, network)
+			}
+			if out, inspectErr := exec.Command("docker", "container", "inspect", name).CombinedOutput(); inspectErr == nil {
+				t.Errorf("container was created despite configuration rejection: %s", out)
+			}
+		})
+	}
+}
+
+func TestIntegrationDockerIPv6PublishedEndpoint(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	listener, err := net.Listen("tcp6", "[::1]:0")
+	if err != nil {
+		t.Skipf("IPv6 loopback unavailable: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Expanded loopback input must canonicalize without changing family.
+	spec := fmt.Sprintf("[0:0:0:0:0:0:0:1]:%d:6379/tcp", port)
+	ctr, err := container.Run(ctx, integrationRedis,
+		container.WithExposedPorts("6379/tcp"),
+		container.WithPublishedPort(spec),
+		container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	host, err := ctr.Host(ctx)
+	if err != nil || host != "::1" {
+		t.Fatalf("Host = %q, err = %v; want ::1", host, err)
+	}
+	endpoint, err := ctr.Endpoint(ctx, "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	if endpoint != fmt.Sprintf("[::1]:%d", port) {
+		t.Fatalf("Endpoint = %q, want [::1]:%d", endpoint, port)
+	}
+	conn, err := net.DialTimeout("tcp6", endpoint, 5*time.Second)
+	if err != nil {
+		t.Fatalf("dial %s: %v", endpoint, err)
+	}
+	_ = conn.Close()
 }
 
 func TestIntegrationDockerParallelStarts(t *testing.T) {
@@ -143,6 +372,9 @@ func TestIntegrationDockerParallelStarts(t *testing.T) {
 }
 
 func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("watchdog reaper is unavailable on Windows")
+	}
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		// The child's TestMain unsets CONTAINERGO_BACKEND, so the
 		// env-passed selection never reaches Run; pin it here.
@@ -217,6 +449,33 @@ func TestIntegrationDockerReaperSurvivesSIGKILL(t *testing.T) {
 	t.Fatalf("container %s still present 60s after SIGKILL; reaper did not fire", name)
 }
 
+func TestIntegrationDockerExplicitCleanup(t *testing.T) {
+	requireDocker(t)
+	ctx := context.Background()
+	name := fmt.Sprintf("containergo-cleanup-%d", os.Getpid())
+	_ = exec.Command("docker", "rm", "--force", name).Run()
+
+	ctr, err := container.Run(ctx, integrationAlpine,
+		container.WithName(name),
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if err := ctr.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+
+	out, err := exec.Command("docker", "ps", "--all", "--format", "{{.Names}}").Output()
+	if err != nil {
+		t.Fatalf("docker ps: %v", err)
+	}
+	if strings.Contains(string(out), name) {
+		t.Fatalf("container %s still exists after explicit cleanup: %s", name, out)
+	}
+}
+
 // TestIntegrationDockerLazyInspectStateAndWaitRollback covers #20 for
 // the Docker backend: deferred first inspect still exposes State, and a
 // failing connection wait rolls the container back.
@@ -265,13 +524,20 @@ func TestIntegrationDockerLazyInspectStateAndWaitRollback(t *testing.T) {
 // processes that WithReuse the same name and checks they share one
 // container.
 func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
+	// Scoped per run so two concurrent runs of this suite cannot prune or
+	// delete each other's containers.
+	group := os.Getenv("CONTAINERGO_REUSE_GROUP")
+	if group == "" {
+		group = "integration-reuse-" + integrationtest.Nonce()
+	}
+
 	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
 		requireDocker(t)
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
 			container.WithReuse(),
-			container.WithReuseGroup("integration-reuse"),
+			container.WithReuseGroup(group),
 			container.WithExposedPorts("6379/tcp"),
 			container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
 		)
@@ -289,10 +555,13 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	}
 
 	requireDocker(t)
-	name := fmt.Sprintf("containergo-reuse-%d", os.Getpid())
+	name := fmt.Sprintf("containergo-reuse-%d-%s", os.Getpid(), integrationtest.Nonce())
 	defer func() {
-		_, _ = container.PruneReuseGroup(context.Background(), "integration-reuse")
-		_ = exec.Command("docker", "rm", "--force", name).Run()
+		// A teardown failure must not be discarded: a leaked container
+		// otherwise survives a green run unnoticed.
+		if _, err := container.PruneReuseGroup(context.Background(), group); err != nil {
+			t.Errorf("prune reuse group %s: %v", group, err)
+		}
 	}()
 
 	startChild := func() *exec.Cmd {
@@ -300,6 +569,7 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_BACKEND=docker",
 			"CONTAINERGO_REUSE_CHILD=1",
+			"CONTAINERGO_REUSE_GROUP="+group,
 			"CONTAINERGO_REUSE_NAME="+name)
 		return cmd
 	}
@@ -313,39 +583,29 @@ func TestIntegrationDockerReuseSharedAcrossProcesses(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
+	// Track each child as it starts, so a failure on the second start still
+	// reaps the first.
+	children := &integrationtest.ChildGroup{}
+	defer children.Kill()
 	if err := c1.Start(); err != nil {
 		t.Fatal(err)
 	}
+	children.Track(c1)
 	if err := c2.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = c1.Process.Kill()
-		_ = c2.Process.Kill()
-		_, _ = c1.Process.Wait()
-		_, _ = c2.Process.Wait()
-	}()
+	children.Track(c2)
 
-	readReady := func(r io.Reader) string {
-		buf := make([]byte, 4096)
-		var acc string
-		deadline := time.After(3 * time.Minute)
-		for {
-			select {
-			case <-deadline:
-				return acc
-			default:
-			}
-			n, err := r.Read(buf)
-			acc += string(buf[:n])
-			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				return acc
-			}
-		}
+	// The partial output is reported with the error: a hang is exactly when
+	// it is the only diagnostic available.
+	o1, err := integrationtest.ReadReady(out1, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child1: %v (output so far: %q)", err, o1)
 	}
-
-	o1 := readReady(out1)
-	o2 := readReady(out2)
+	o2, err := integrationtest.ReadReady(out2, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child2: %v (output so far: %q)", err, o2)
+	}
 	if !strings.Contains(o1, "READY:") {
 		t.Fatalf("child1: %q", o1)
 	}
@@ -420,9 +680,8 @@ func TestIntegrationDockerRunFailurePreservesConflict(t *testing.T) {
 	}
 }
 
-// TestIntegrationDockerStaleHandlePreservesReplacement covers the current
-// Docker deletion contract: an old handle must not delete a same-name
-// replacement. Broader stale-operation targeting is tracked by #74.
+// TestIntegrationDockerStaleHandlePreservesReplacement covers #49: an
+// old handle must not delete a same-name replacement.
 func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
@@ -452,11 +711,11 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// A stale Docker handle still targets its old immutable ID. Terminate
-	// is idempotent when that ID is gone, and it cannot delete the
-	// same-name replacement.
+	// Docker's stale handle retains the old immutable ID. A second
+	// termination is therefore an idempotent no-op, while the
+	// same-name replacement must survive.
 	if err := oldCtr.Terminate(ctx); err != nil {
-		t.Fatalf("stale Terminate = %v, want idempotent success", err)
+		t.Fatalf("stale Docker Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)

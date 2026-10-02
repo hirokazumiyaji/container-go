@@ -36,6 +36,8 @@ Go 1.23 以降が必要で、nested `bench/` モジュールには Go 1.25 以�
 開発版追加です。基本の `Run`、options、lifecycle、endpoint、`Exec`、
 `Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、backend 選択、
 元の wait strategy は `v0.2.0` に存在しています。
+作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
+対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS。copy-out には client/server 29.7.0 以上)、Go 1.23 以降
 
 ## 目的
 
@@ -66,6 +68,13 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 - ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチは存在しない。必要な動作はクライアント側で実装する。
 - `--label` は存在するが、ラベルの絞り込みは JSON 出力をクライアント側で行う必要がある。ラベルキーは小文字の Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナにだけ使える。
+- 各コンテナは軽量 VM として起動し、vmnet ブリッジ(既定は `default`、`192.168.64.0/24`)上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開(`--publish`)は必須ではない。
+- すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返す(追加フィールドは `internal/inspect` が無視する)。
+- CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗する。起動状態は `container system status` で確認できる。
+- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない。
+- Docker にある次の機能が存在しない：ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチ。これらに相当する挙動はクライアント側で実装する必要がある。
+- `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
+- `container cp` は実行中のコンテナに対してのみ使える。copy-out には型を保持し symlink を追跡しないモードがなく、確認したバージョンでは host 側の検証前に symlink、FIFO、device node を dereference/consume することがある。そのため `CopyFileFromContainer` は Apple Container では `ErrCopyFileFromContainerUnsupported` を返し fail closed する。Docker では型を保持する extractor を利用するため client/server の両方が 29.7.0 以上を必要とし、必要な flag を host が扱える場合に host 側の Lstat/open 検査を維持する。どちらの条件も満たさない場合は fail closed する。
 - `--rm` で削除しても匿名ボリュームは残る。
 - エラー分類は `engine_apple.go` が保持する CLI stderr の部分文字列に依存する（名前衝突、イメージやコンテナの不在）。ライブ CLI に対する回帰テストは `cli_compat_integration_test.go` にある。
 
@@ -171,6 +180,19 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。
 - `WithPlatform(p string)`：`linux/amd64` のようなイメージプラットフォームを指定する（Apple Container では Rosetta を含む）。
+- `WithExposedPorts(ports ...string)`：接続対象のコンテナポート(`"6379/tcp"` 形式)を宣言する
+- `WithEnv(env map[string]string)`：環境変数
+- `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`：コマンドとエントリポイントの上書き。entrypoint は `docker run --entrypoint` の仕様上 1 トークン。複数トークンは `WithCmd` に寄せる
+- `WithWaitStrategy(s wait.Strategy)`：起動完了の判定
+- `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
+- `WithLabels(labels map[string]string)`：追加ラベル
+- `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
+- `WithFiles(files ...File)`：起動後にコンテナへコピーするファイル
+- `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
+- `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
+- `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
+- `WithNetwork(name string)`：接続先ネットワーク。Docker で省略した場合は daemon が選ぶ既定 network (Linux では `bridge`、native Windows では `nat`)
+- `WithPlatform(p string)`：`linux/amd64` 指定(Rosetta 利用)など
 
 バックエンド中立の CLI 面にないオプションは意図的に提供しない。
 公開 API にログ注入用のフックはない。
@@ -214,6 +236,8 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。
 
+`CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
+
 ## 接続エンドポイントの設計
 
 testcontainers の Docker 実装ではコンテナポートをホストのランダムポートへ公開し、`localhost:<mapped>` へ接続する。
@@ -237,6 +261,69 @@ endpoint の結果には古い値が含まれることがある。これは immu
 ではなく snapshot の動作であり、動的データの更新は #85 が担当する。Docker が
 複数 network を報告し top-level address がない場合、現在の network selection は
 決定的な first-network contract ではなく unspecified である。
+Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
+作成できません。
+`Internal: true` または isolated bridge gateway mode の外部遮断
+ネットワークも、同じ endpoint 契約の対象です。
+明示的に指定した default 以外の network では、`Run` は image やコンテナを
+操作する前に指定 network を inspect し、これらの network と
+`WithExposedPorts` または `WithPublishedPort` を組み合わせた場合は
+`*ConfigError` を返します。
+`host` と `none` の publish 組み合わせは起動前に拒否されます。
+
+ポート指定なしの host モードは利用できます。
+`Host` はクライアントから見たデーモンの host を返しますが、
+`MappedPort` と `Endpoint` は host namespace のサービスポートを推測しません。
+none モードには到達可能な host がないため、`Host` は
+`ErrNoReachableHost` と一致するエラーを返します。
+endpoint 解決は、要求した publish 文字列ではなく、要求した mode と inspect
+の実際の network mode、host binding を照合します。
+実行時の network 不一致は `ErrNetworkMismatch` で判別できます。
+
+`WithNetwork` を省略した場合は `--network bridge` を合成せず、daemon の
+platform default (Linux では `bridge`、native Windows では `nat`) に委譲します。
+inspect の特別な `HostConfig.NetworkMode == "default"` は
+`NetworkSettings.Networks` の具体的な network 名と照合するため、既存の
+default コンテナを再利用できても、省略指定を `host`、`none`、任意の名前付き
+network の wildcard にはしません。
+daemon の server OS から authoritative な platform default も取得するため、
+Linux の user-defined `nat` や Windows の user-defined `bridge` を default と
+誤認しません。identity を取得できない場合は `ErrNetworkMismatch` で fail closed
+します。
+
+Docker の handle は `docker run --detach` が返した immutable な container ID
+を保持します。Host、endpoint、lifecycle、reuse の inspect はその ID を対象
+にして返された identity を検証します。network、IP、port binding は dynamic
+data であり、操作ごとに更新されます。cache するのは UID、image、label などの
+immutable identity だけです。
+
+IP アドレスは `netip` で正規化します。
+展開した IPv6 loopback や `::` は Docker inspect の出力と正しく
+一致し、unspecified IPv6 bind はアドレスファミリーを保つ `::1` に
+解決します。
+リモートデーモンで loopback 束縛を inspect した場合は
+`ErrEndpointUnreachable` を返します。
+remote host へ書き換えても、デーモン側の loopback には到達できないためです。
+
+`MappedPort` と `Endpoint` は、`WithExposedPorts` または
+`WithPublishedPort` で宣言のないポート、および利用可能な host binding の
+ないポートに対して `ErrPortNotExposed` を返します。
+宣言は待機戦略(ForListeningPort の既定ポートなど)にも使います。
+
+### Reuse の network 互換性
+
+Docker の `WithReuse` は、image、宣言済み port、`WithNetwork` の network
+identity を比較します。
+`WithNetwork` 省略時の identity は daemon の platform default であり、
+inspect の `default` mode を実際の network 名 (`bridge` または `nat`) と
+照合します。
+`host`、`none`、名前付き network の wildcard ではありません。
+互換性チェックの直前と handle を返す直前に immutable Docker UID で
+再 inspect します。
+inspect に network mode が無い場合も互換性なしとして拒否します。
+リモートデーモンの既存 loopback binding は
+`ErrEndpointUnreachable` として拒否します。
+`env`、`cmd`、`mounts` の差は従来どおり attach 時に無視します。
 
 ## 待機戦略
 
@@ -249,6 +336,14 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。
 - `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。
+- `wait.ForLog(s string)`：`container logs --follow` の出力に部分文字列(または `AsRegexp` で正規表現)が現れるまで待つ。`WithOccurrence(n)` で出現回数を指定できる
+- `wait.ForListeningPort(port string)`：コンテナの対象エンドポイントへ TCP 接続できるまで待つ。
+  指定形式は `PORT` または `PORT/tcp` だけ。
+  UDP と不正な形式は `Target.Endpoint` を呼び出す前に `*wait.ConfigError` 型で返す。
+  このエラーは `wait.ErrInvalidConfiguration` と一致する。
+- `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
+- `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
 
 基本 strategy の起動タイムアウトは既定 60 秒である。
 `ForListeningPort`、`ForExposedPort`、`ForHTTP` は既定 100 ミリ秒で poll し、`ForExec` は既定 250 ミリ秒で poll する。
@@ -393,10 +488,20 @@ attach polling だけを制限する。
 外部プロセスを起動するライブラリとして、次の原則は security boundary を表す。ただし #111 の reaper staging exception があるため、「情報漏洩がない」という end-to-end 保証ではない。
 
 **シェルを経由しない**。すべての CLI 呼び出しは `exec.Command` に引数配列を渡し、シェル文字列を組み立てない。唯一の例外は watchdog reaper の shell script である。本文は固定文字列で、container ID は stdin data としてだけ渡す。script は `set -f`、`IFS=`、`read -r`、変数の quote で word splitting と glob 展開を封じる。現在の base では、name-addressed reaper entry に共有 library guard `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`（1～63 文字）を適用してから pipe へ書く。この shared guard は Apple Container の完全な契約ではない。Apple の CLI は `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` の 2～63 文字を要求し、現在の checkout はその backend 固有の preflight check を適用しない（#112）。issue #73 適用後は、reaper は完全な小文字 64 桁 hex Docker ID も別々に受け付ける。reaper 登録 error は無視する。二重の防御により、登録された ID 経由の command injection を成立させない。
+**シェルを経由しない**。
+すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
+唯一の例外は watchdog リーパーのシェルスクリプトである。
+ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
+スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+ライブラリは、パイプへ書く前の ID を検証し、Apple Container の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または Docker の完全な小文字 64 桁の 16 進数 ID `^[0-9a-f]{64}$` だけを受け入れる。
+二重の防御により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。`--env key=value` を使うと、値がプロセス一覧（`ps`）から見える。データベースパスワードなど秘密情報を環境変数で渡す用途による情報漏洩を避けるため、ライブラリは `os.MkdirTemp` の mode 0600 ファイルへ環境変数を書き、`--env-file` で渡して起動後に削除する。
 
 **Reaper staging**。現在の reaper は full `inspect` output を namespace のない `mktemp` file へ書き込んでから削除する。kill された場合、環境 data を含む file が残るため、#111 の mitigation を参照する。
+**入力を検証する**。
+コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、環境変数キーは `=` と NUL を含まないこと、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。
+CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
 
 **入力を検証する**。共有 `WithName` guard と name-addressed reaper check は前述の規則を使い、ラベルキー（CLI と同じ Docker/OCI 形式）、ポート（数値範囲と `tcp`/`udp`）、環境変数キー（`=` と NUL を含まない）、コンテナ内コピー先パス（絶対パス、有効な UTF-8、NUL なし）も CLI へ渡す前に検証する。この library-side guard は backend の完全な name validation を意味しない。Apple のより厳密な minimum は現在の checkout では強制されない（#112）。ホスト側コピー元パスは絶対パスへ解決する。CLI にも検証はあるが、先にライブラリで落とすことでエラーメッセージを明確にし、将来の CLI の変化に依存しない。public option の validation は部分的で、negative `LogsOptions.Tail`、zero memory、unknown mount type、reuse-group grammar は backend work 前に一様に reject されない（#102）。
 
@@ -427,6 +532,15 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。現在の reuse 経路には readiness 後の最終 check（#83、#84）がない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。現在の `ErrSystemNotRunning` 分類は元の error を text に flatten する場合がある（#104）。
 - `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
+- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
+- `ErrContainerNotFound`：inspect などの not found
+- `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
+- `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない
+- `ErrCopyFileFromContainerUnsupported`：選択した backend または host が型安全な copy-out を実装していない(Apple Container、Docker client/server が 29.7.0 未満、必要な open flag がない host、または Windows Go 1.23 から 1.25)
+- `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
+- `ErrPortNotExposed`：未宣言、または利用可能な host binding がない port
+- `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 
 backend の `run` が成功した後に非 reuse `Run` が失敗した場合、作成後の rollback error を返す。rollback 削除にも失敗すると、コンテナが残ったことを message に含める。backend の `run` 自体の失敗は別の best-effort `cleanupFailedCreate` 経路を使い、その cleanup error は元の classified error に連結しない。reaper の登録・削除 error も返さない。Reuse は wait error を返し、共有コンテナは残す。
 
@@ -480,6 +594,9 @@ type Runner interface {
 **統合テスト**は `integration` build tag を使う。root のテストスイートには Apple Container と Docker のライフサイクル、接続、exec、copy、cleanup、Reuse、watchdog のケースがある。各バックエンドの helper は先に CLI とサービスを確認し、利用できなければ skip する。`make integration` は両バックエンドを実行して pull が重い bench と singleflight を除外し、`make integration-docker` は Docker を選択する。`make bench-integration` は pull が重いシナリオと独立したベンチマークモジュールを実行する（nested `bench/` module は Go 1.25+）。
 
 **CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.23.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck` を実行する。同じ runner で Docker 統合テストの行列も実行する。Apple Container 統合テストは意図的にローカル専用である。GitHub の Linux runner には Apple Container サービスと必要なホスト環境がない。ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
+**統合テスト**：ビルドタグ `integration` で分離し、実機 backend に対して実行する。Apple test は macOS 26 と起動済みの Apple Container を、Docker test は稼働中の daemon を必要とする。Apple の watchdog test は Darwin 専用で、リポジトリの Linux 限定 CI job では Windows runtime integration を実行しない。最初に backend の利用可否を確認し、daemon/service が停止していれば skip する。起動、接続、exec、コピー、通常のクリーンアップ、Darwin の watchdog を検証する。Windows の copy-out は Go 1.26 以上と Docker client/server 29.7.0 以上を使って手動検証する。
+
+**CI**：unit、race、vet、lint、Docker integration job は Ubuntu で実行する。Apple integration は service と host の条件が満たされないためローカルで実行し、Windows runtime job は設定されていない。
 
 ## バックエンド（v0.2 と現在の開発版）
 
@@ -493,6 +610,24 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 **内部構造**：バックエンドは argv 組み立てと inspect 正規化だけを持つ内部 interface にする。プロセス実行（runner）、待機戦略、cleanup、検証は両バックエンドで共有する。正規化した記録には state（running / stopped / stopping / created / unknown へ写像）、label、image 参照、利用できる場合の backend ID、コンテナ IP、host 側 port binding（コンテナポートから host アドレスとポートへ）を持つ。backend ID が stable identity で、IP と binding は動的である。現在の endpoint cache は後者を保持する。
 
 **Image 処理**：両バックエンドとも、明示的な image inspect と pull コマンドで pull policy を実装する。Docker の run argv は `--pull=never` を追加し、Apple Container も同じ明示的な policy 経路を使う。並行 pull は同一プロセス内で、backend、image、platform、操作が同じ場合だけ集約する。
+**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
+プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
+正規化した情報には、状態(running / stopped / stopping / unknown への写像)、ラベル、immutable identity、image、コンテナ IP、Docker network mode、公開ポートの束縛(コンテナポート → ホストアドレスとポート)を含める。
+状態、IP、network、port binding は dynamic data として inspect のたびに更新し、cache には immutable identity のみを保持する。
+
+**接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
+`WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。
+リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。
+一方 `unix://`、`npipe://`、ループバックアドレス、空値はローカルのままである。
+Docker CLI が受け付けるクライアントプロトコルは `unix`、`tcp`、`npipe`、`ssh` であり、それ以外のスキームは利用可能な `DOCKER_HOST` ではない。
+`Host` は `127.0.0.1`(リモート時はそのホスト名)、`MappedPort` は割り当てられたホストポートを返す。
+unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミリーを維持し、明示的な IPv6 アドレスは `netip` で正規化する。
+リモートデーモンで明示または再利用された loopback 束縛は拒否する。
+その待ち受け先はリモートマシンの loopback であり、client 側の書き換えでは到達できないためである。
+`ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。
+`docker context` 経由のリモート指定は検知できない。
+ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
+Apple Container バックエンドの既定(直接 IP)は変えない。
 
 **接続エンドポイントの違い**：Docker Desktop（macOS / Windows）ではホストからコンテナ IP に到達できないため、Docker バックエンドは testcontainers と同じ公開ポート方式を既定にする。
 `WithExposedPorts` で宣言したポートは自動公開される。
@@ -516,6 +651,11 @@ Apple バックエンドの直接 IP の既定は変えない。
 - ボリュームの作成とライフサイクル管理。`WithMounts` は bind、名前付きボリューム、tmpfs を使えるが、ライフサイクルは呼び出し元が管理する。現在の bind source validation は Unix-style で、Windows と remote Docker の bind-source semantics は #76 に残る。
 - postgres などの testcontainers module に相当する高水準パッケージ（コアが安定してから再検討）。
 - Docker Engine API の直接クライアント。現在の transport は CLI ラッパーであり、直接クライアントは隠れた fallback ではなく将来的な決定事項である。
+- `container build` / `docker build` による Dockerfile ビルド
+- ネットワークの作成と管理(`WithNetwork` で既存の Docker network へ接続できる)
+- ボリュームの作成と管理
+- testcontainers のモジュール群(postgres など)に相当する高水準パッケージ(コア安定後に検討)
+- Docker Engine API の直接クライアント(CLI ラッパーで足りなくなったら再検討)
 
 ## 未解決の製品上の決定
 

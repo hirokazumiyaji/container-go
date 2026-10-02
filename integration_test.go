@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +20,7 @@ import (
 	"time"
 
 	container "github.com/hirokazumiyaji/container-go"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -26,15 +29,7 @@ import (
 // non-apple value, Apple integration tests are skipped.
 func requireSystem(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "apple" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Apple integration", backend)
-	}
-	if _, err := exec.LookPath("container"); err != nil {
-		t.Skip("container CLI not installed")
-	}
-	if err := exec.Command("container", "system", "status").Run(); err != nil {
-		t.Skip("apple container system service not running; run `container system start`")
-	}
+	integrationtest.Preflight(t, "apple", integrationtest.AppleUnavailable)
 }
 
 func TestIntegrationRedisLifecycle(t *testing.T) {
@@ -74,7 +69,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 		t.Errorf("redis-cli ping: code=%d out=%q", code, data)
 	}
 
-	// Copy a file in and read it back.
+	// Copy a file in; Apple Container copy-out is intentionally fail-closed.
 	src := filepath.Join(t.TempDir(), "hello.txt")
 	if err := os.WriteFile(src, []byte("hello from host"), 0o600); err != nil {
 		t.Fatal(err)
@@ -82,14 +77,8 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if err := ctr.CopyToContainer(ctx, src, "/tmp/hello.txt"); err != nil {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
-	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
-	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello from host" {
-		t.Errorf("round-tripped content = %q", round)
+	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt"); !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("CopyFileFromContainer error = %v, want ErrCopyFileFromContainerUnsupported", err)
 	}
 
 	// Logs snapshot.
@@ -110,6 +99,16 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
 	}
+}
+
+func TestIntegrationStopTimeoutRoundsUp(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)
+}
+
+func TestIntegrationStopTimeoutZeroIsImmediate(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple-zero", 0, 0, appleStopImmediateMaxElapsed)
 }
 
 func TestIntegrationPublishedPort(t *testing.T) {
@@ -177,6 +176,9 @@ func TestIntegrationParallelStarts(t *testing.T) {
 // child (no defers, no signal handlers run) and then watches the
 // watchdog reaper remove the container.
 func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple watchdog integration requires Darwin")
+	}
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationAlpine,
@@ -299,13 +301,20 @@ func TestIntegrationLazyInspectStateAndWaitRollback(t *testing.T) {
 }
 
 func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
+	// Scoped per run so two concurrent runs of this suite cannot prune or
+	// delete each other's containers.
+	group := os.Getenv("CONTAINERGO_REUSE_GROUP")
+	if group == "" {
+		group = "integration-reuse-" + integrationtest.Nonce()
+	}
+
 	if os.Getenv("CONTAINERGO_REUSE_CHILD") == "1" {
 		requireSystem(t)
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationRedis,
 			container.WithName(os.Getenv("CONTAINERGO_REUSE_NAME")),
 			container.WithReuse(),
-			container.WithReuseGroup("integration-reuse"),
+			container.WithReuseGroup(group),
 			container.WithExposedPorts("6379/tcp"),
 			container.WithWaitStrategy(wait.ForListeningPort("6379/tcp").WithStartupTimeout(2*time.Minute)),
 		)
@@ -323,16 +332,20 @@ func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
 	}
 
 	requireSystem(t)
-	name := fmt.Sprintf("containergo-reuse-%d", os.Getpid())
+	name := fmt.Sprintf("containergo-reuse-%d-%s", os.Getpid(), integrationtest.Nonce())
 	defer func() {
-		_, _ = container.PruneReuseGroup(context.Background(), "integration-reuse")
-		_ = exec.Command("container", "delete", "--force", name).Run()
+		// A teardown failure must not be discarded: a leaked container
+		// otherwise survives a green run unnoticed.
+		if _, err := container.PruneReuseGroup(context.Background(), group); err != nil {
+			t.Errorf("prune reuse group %s: %v", group, err)
+		}
 	}()
 
 	startChild := func() *exec.Cmd {
 		cmd := exec.Command(os.Args[0], "-test.run", "^TestIntegrationReuseSharedAcrossProcesses$")
 		cmd.Env = append(os.Environ(),
 			"CONTAINERGO_REUSE_CHILD=1",
+			"CONTAINERGO_REUSE_GROUP="+group,
 			"CONTAINERGO_REUSE_NAME="+name)
 		return cmd
 	}
@@ -346,39 +359,29 @@ func TestIntegrationReuseSharedAcrossProcesses(t *testing.T) {
 	if err2 != nil {
 		t.Fatal(err2)
 	}
+	// Track each child as it starts, so a failure on the second start still
+	// reaps the first.
+	children := &integrationtest.ChildGroup{}
+	defer children.Kill()
 	if err := c1.Start(); err != nil {
 		t.Fatal(err)
 	}
+	children.Track(c1)
 	if err := c2.Start(); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = c1.Process.Kill()
-		_ = c2.Process.Kill()
-		_, _ = c1.Process.Wait()
-		_, _ = c2.Process.Wait()
-	}()
+	children.Track(c2)
 
-	readReady := func(r io.Reader) string {
-		buf := make([]byte, 4096)
-		var acc string
-		deadline := time.After(3 * time.Minute)
-		for {
-			select {
-			case <-deadline:
-				return acc
-			default:
-			}
-			n, err := r.Read(buf)
-			acc += string(buf[:n])
-			if strings.Contains(acc, "READY:") || strings.Contains(acc, "CHILD-ERROR:") || err != nil {
-				return acc
-			}
-		}
+	// The partial output is reported with the error: a hang is exactly when
+	// it is the only diagnostic available.
+	o1, err := integrationtest.ReadReady(out1, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child1: %v (output so far: %q)", err, o1)
 	}
-
-	o1 := readReady(out1)
-	o2 := readReady(out2)
+	o2, err := integrationtest.ReadReady(out2, integrationtest.ChildReadyTimeout)
+	if err != nil {
+		t.Fatalf("child2: %v (output so far: %q)", err, o2)
+	}
 	if !strings.Contains(o1, "READY:") {
 		t.Fatalf("child1: %q", o1)
 	}

@@ -92,17 +92,16 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint triggers the deferred inspect once; later reads reuse it.
-	// This pins the current cache behavior, not dynamic freshness; #85
-	// tracks refreshing endpoint data.
+	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
+	// intentionally not cached.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 3 {
-		t.Fatalf("after cached Endpoint: calls = %d, want 3", got)
+	if got := r.count(); got != 4 {
+		t.Fatalf("after refreshed Endpoint: calls = %d, want 4", got)
 	}
 
 	// The wrapper forwards results unchanged.

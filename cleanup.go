@@ -10,10 +10,8 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// keepContainers reports whether CONTAINERGO_KEEP=1 skips the
-// automatic cleanup helpers and watchdog registration. Explicit
-// Container.Terminate, Run rollback, failed-create cleanup, Prune,
-// PruneReuseGroup, and reuse replacement are not changed.
+// keepContainers reports whether CONTAINERGO_KEEP=1 disables all
+// automatic cleanup (for debugging).
 func keepContainers() bool {
 	return os.Getenv("CONTAINERGO_KEEP") == "1"
 }
@@ -30,6 +28,10 @@ func TerminateContainer(ctr *Container) error {
 
 // Cleanup registers container removal via tb.Cleanup. It is nil-safe,
 // so call it right after Run, before checking Run's error.
+//
+// A removal failure is logged rather than reported, so an existing test that
+// does not care about teardown is not turned red by an unrelated backend
+// problem. Use StrictCleanup when a leftover container should fail the test.
 func Cleanup(tb testing.TB, ctr *Container) {
 	tb.Helper()
 	tb.Cleanup(func() {
@@ -39,15 +41,20 @@ func Cleanup(tb testing.TB, ctr *Container) {
 	})
 }
 
-// Prune removes containers created by this library that are selected by
-// the active backend's list filter. Apple selects managed containers in
-// the stopped state. The current Docker filter selects managed containers
-// in the exited state only; dead-state selection is tracked by issue #113.
-// On Apple, the current list-to-delete path does not re-inspect each
-// candidate under the per-name lock, so a same-name replacement can race
-// the delete; #98 tracks that cleanup gap. CONTAINERGO_KEEP does not
-// suppress this operation. It returns the backend list identifiers it
-// removed; Docker currently returns container names.
+// StrictCleanup registers container removal like Cleanup, but reports a
+// removal failure as a test failure instead of logging it. A container that
+// outlives its test is a leak, and a green run would otherwise hide it.
+func StrictCleanup(tb testing.TB, ctr *Container) {
+	tb.Helper()
+	tb.Cleanup(func() {
+		if err := TerminateContainer(ctr); err != nil {
+			tb.Errorf("container-go: cleanup %s left the container behind: %v", ctr.ID(), err)
+		}
+	})
+}
+
+// Prune removes stopped containers created by this library, from any
+// session. It returns the IDs it removed.
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
@@ -61,10 +68,7 @@ func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) 
 }
 
 // pruneListed lists containers with listArgs, parses IDs, and force-deletes
-// each one. On the current Apple path, the list result is used for the
-// subsequent name delete without a fresh inspect/name-lock critical
-// section; #98 tracks that race. errKind prefixes per-ID delete failures
-// ("prune", …).
+// each one. errKind prefixes per-ID delete failures ("prune", …).
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()

@@ -43,6 +43,7 @@ and the root `CLIError`, `ErrContainerNotFound`, and
 `v0.2.0`. The core `Run`, options, lifecycle, endpoints, `Exec`, `Logs`,
 `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and
 original wait strategies were present in `v0.2.0`.
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.23+
 
 ## Purpose
 
@@ -94,7 +95,14 @@ not an exhaustive compatibility claim for every 1.2.x or 1.3.x release.
 - `--label` exists, but filtering by label means filtering the JSON
   output client-side. Label keys are restricted to lowercase
   Docker/OCI-style keys.
-- `container cp` only works on running containers.
+- `container cp` only works on running containers. Its copy-out operation
+  has no type-preserving/no-follow mode: observed versions can dereference
+  or consume symlinks, FIFOs, and device nodes before the host can inspect
+  the result. `CopyFileFromContainer` therefore fails closed on Apple
+  Container with `ErrCopyFileFromContainerUnsupported`; Docker requires
+  client and server versions >=29.7.0 for the type-preserving extractor,
+  then retains the host-side Lstat/open checks where the host supports the
+  required flags, and otherwise fails closed.
 - `--rm` removal leaves anonymous volumes behind.
 - Error classification depends on CLI stderr substrings owned by
   `engine_apple.go` (name conflict, image/container missing). Those
@@ -255,6 +263,10 @@ described below are not.
 - `WithNetwork(name string)`: attach to an existing named network.
 - `WithPlatform(p string)`: select an image platform such as
   `linux/amd64` (including Rosetta use on Apple Container).
+  and working directory
+- `WithNetwork(name string)`: target network; when omitted, Docker keeps
+  its daemon-selected default (`bridge` on Linux, `nat` on native Windows)
+- `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
 Options outside the backend-neutral CLI surface are intentionally
 omitted. There is no public logger-injection option. For log consumers,
@@ -334,6 +346,21 @@ propagate. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are nil-safe
 helpers preserving the testcontainers-go idiom of registering cleanup
 before checking `Run`'s error.
 
+`CopyFileFromContainer` is a Docker-only copy-out operation that requires
+safe host file-open semantics. The method verifies the materialized result
+is a regular file, but does not claim that every Docker host can represent
+every container file type. Apple Container's CLI cannot preserve or reject
+all source file types before the host opens the result, so the method
+returns `ErrCopyFileFromContainerUnsupported` without invoking `container
+cp`. Docker copy-out requires both the client and server to be at least
+29.7.0; the method verifies those versions before creating its private
+temporary directory or invoking `docker cp`, and fails closed with the same
+error if verification fails. Hosts without no-follow/nonblocking file-open
+support fail closed with the same error. On Windows, Go 1.23 through 1.25 do
+not propagate the required Windows file flags through `os.OpenFile`, so
+Docker copy-out requires Go 1.26 or newer. `CopyToContainer` remains
+available on both backends.
+
 ## Connection endpoints
 
 testcontainers' Docker implementation publishes container ports to
@@ -377,6 +404,54 @@ therefore be stale. This is a snapshot behavior, not an immutability
 guarantee; #85 tracks refreshing dynamic endpoint data. For Docker with
 multiple networks and no top-level address, current network selection is
 unspecified rather than a deterministic first-network contract.
+Docker's `host` and `none` network modes cannot create
+library-managed port bindings.
+Externally isolated networks (`Internal: true` or an isolated bridge
+gateway mode) are rejected for the same endpoint contract.
+For an explicitly selected non-default network, `Run` inspects it before
+any image or container command and returns `*ConfigError` when either
+`WithExposedPorts` or `WithPublishedPort` is combined with an incompatible
+network. `host` and `none` publish combinations are rejected before
+startup.
+
+Host mode without port declarations remains available.
+`Host` returns the client-facing daemon host, while `MappedPort` and
+`Endpoint` refuse to infer a service port from the host namespace.
+None mode has no reachable host, so `Host` returns an error matching
+`ErrNoReachableHost`. Endpoint resolution verifies both the requested and
+actual network mode and the inspected binding instead of trusting the
+publish string; mismatches match `ErrNetworkMismatch`.
+
+When `WithNetwork` is omitted, Docker receives no synthesized
+`--network bridge` flag. The daemon chooses its platform default
+(`bridge` on Linux, `nat` on native Windows). Inspect's special
+`HostConfig.NetworkMode == "default"` is matched against the concrete
+names in `NetworkSettings.Networks`, so a pre-existing default container
+can be reused without treating omission as a wildcard for `host`, `none`,
+or arbitrary named networks. The daemon server OS is also queried for the
+authoritative platform default; a user-defined `bridge` on Windows or
+`nat` on Linux is rejected, and an unavailable identity fails closed with
+`ErrNetworkMismatch`.
+
+Docker handles retain the immutable ID printed by `docker run --detach`.
+Inspect for Host, Endpoint, lifecycle operations, and reuse targets that
+ID and validates the returned identity. Network, IP, and port-binding
+fields are dynamic and are refreshed for every operation; only immutable
+identity (UID, image, and labels) is cached.
+
+IP addresses are canonicalized with `netip`, so expanded IPv6 loopback
+and `::` compare correctly with Docker inspect output.
+An unspecified IPv6 bind resolves to `::1`, preserving its address
+family.
+On a remote daemon, an inspected loopback binding returns
+`ErrEndpointUnreachable`; rewriting it to the remote host would not
+reach the daemon's loopback listener.
+
+`MappedPort` and `Endpoint` error with `ErrPortNotExposed` for ports
+not declared via `WithExposedPorts` or `WithPublishedPort`, and for
+declared ports without a usable host binding.
+The declarations also feed wait strategies (the default port of
+ForListeningPort, for example).
 
 ## Wait strategies
 
@@ -406,6 +481,26 @@ provides:
   types expose `WithStartupTimeout` to bound the whole composition;
   they do not expose `WithPollInterval`. The `v0.2.0` functions return
   an interface without a composite timeout setter.
+- `wait.ForLog(s string)`: wait until a substring (or regexp via
+  `AsRegexp`) appears in `container logs --follow` output;
+  `WithOccurrence(n)` for repeat counts
+- `wait.ForListeningPort(port string)`: wait until a TCP connection to
+  the container endpoint succeeds. The specification may be `PORT` or
+  `PORT/tcp`; UDP and malformed specifications return a typed
+  `*wait.ConfigError` before any target probe. The error matches
+  `wait.ErrInvalidConfiguration`.
+- `wait.ForHTTP(path string)`: wait until an HTTP request via
+  `net/http` matches the status predicate (2xx by default,
+  `WithStatusCodeMatcher` to change). `WithPort` / `WithMethod` select
+  the target; `WithHeaders` / `WithBasicAuth` / `WithTLS` /
+  `WithTLSConfig` / `WithHTTPClient` cover auth, TLS, and custom
+  transports without breaking the default plain-HTTP probe.
+- `wait.ForExec(cmd []string)`: wait until `container exec` exits with
+  an accepted code (0 by default)
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
+  composition. Each child keeps its own `WithStartupTimeout`; the whole
+  composition can also be bounded with `WithStartupTimeout` (or
+  `context.WithTimeout` from the caller).
 
 The primitive strategies default to a 60-second startup timeout.
 `ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms;
@@ -568,6 +663,21 @@ ignored when attaching to an existing shared container (#94). Other
 creation-only differences such as `env`, `cmd`, and `mounts` attach
 silently to the existing container by design; callers needing isolation
 should use distinct names or reset state via `Exec`.
+(shared across processes).
+The compatibility check compares the image reference, declared and
+published ports, and the Docker network identity.
+An omitted Docker `WithNetwork` means the daemon-selected default. Docker's
+special `default` inspect mode is resolved against the actual network names
+(`bridge` on Linux, `nat` on native Windows), rather than being assumed to
+be `bridge`; omission is not a wildcard for `host`, `none`, or a named
+network.
+Reuse re-inspects by immutable Docker UID before compatibility checks and
+again before returning the handle.
+A loopback binding inspected on a remote daemon fails with
+`ErrEndpointUnreachable`.
+`env`, `cmd`, and `mounts` differences attach silently to the existing
+container by design; callers needing isolation should use distinct
+names or reset state via `Exec`.
 
 Each creation by this checkout normally carries a `creationLabel`
 (16-hex). The current reuse path is narrower than that label suggests:
@@ -631,6 +741,11 @@ not apply that backend-specific preflight check (#112). After issue #73,
 the reaper will separately accept a full lowercase 64-hex Docker ID.
 Reaper registration failures are ignored. The two layers together leave
 no command injection through registered IDs.
+expansions), and the library validates each target before writing it to
+the pipe. Apple Container names must match
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs must be lowercase
+64-character hexadecimal strings matching `^[0-9a-f]{64}$`. The two
+layers together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -641,6 +756,13 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 **Reaper staging**. The current reaper writes the full `inspect` output
 to an un-namespaced `mktemp` file before removing it. A killed reaper can
 leave environment data on disk; see the #111 mitigation above.
+**Validate inputs**. Container names (name rule above), label keys
+(the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
+environment keys (no `=`, no NUL), and copy paths (absolute POSIX
+paths with `/` separators, no backslashes, valid UTF-8) are all
+validated before reaching the CLI. The CLI validates
+too, but validating first gives clearer errors and independence from
+future CLI changes.
 
 **Validate inputs**. The shared `WithName` guard and name-addressed
 reaper check use the rule above; label keys (the CLI's Docker/OCI form),
@@ -674,6 +796,12 @@ container IP and host-side bindings, even though those values are dynamic;
 `State` and some lifecycle operations re-inspect. This is a stale-data
 limitation, not an immutability guarantee; #85 tracks refreshing dynamic
 endpoint data.
+**Minimize subprocess count**. Create+start is one
+`container run --detach` call. The immutable UID, image, and label identity
+is cached after validation, while endpoint, Host, lifecycle, and reuse
+operations refresh dynamic network, IP, state, and port-binding data from
+inspect. This avoids stale endpoint data without treating published ports
+as immutable.
 
 **Wait via connections where possible**. `ForListeningPort` and
 `ForHTTP` use the resolved endpoint directly. `ForExec` and state
@@ -755,6 +883,26 @@ these follow-up issues are applied.
   into text (#104).
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
+- `ErrSystemNotRunning`: after a CLI failure, a follow-up
+  `container system status` probe failed too; the message tells the
+  user to run `container system start`
+- `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrPortNotExposed`: querying a port not declared via
+  `WithExposedPorts`
+- `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
+  file
+- `ErrCopyFileFromContainerUnsupported`: the selected backend or host
+  cannot perform a type-safe copy-out (Apple Container, Docker client or
+  server below 29.7.0, hosts without the required open flags, or Windows
+  Go 1.23 through 1.25)
+- `ErrInvalidConfig` / `*ConfigError`: a backend-incompatible option
+  combination rejected before creation
+- `ErrPortNotExposed`: a port was not declared or has no usable host
+  binding
+- `ErrEndpointUnreachable`: an inspected binding, notably remote-daemon
+  loopback, cannot be reached by the client
+- `*CLIError`: any other CLI failure; carries the subcommand, exit
+  code, and stderr (capped at 64KiB)
 
 When a non-reuse `Run` fails after a successful backend `run`, the
 post-create rollback error is returned. If rollback deletion fails, its
@@ -839,6 +987,19 @@ benchmark module (the nested `bench/` module requires Go 1.25+).
 the hosted Linux runners do not provide the Apple Container service or
 the required host environment. `CONTAINERGO_BACKEND=apple` or
 `CONTAINERGO_BACKEND=docker` can select one backend locally.
+**Integration tests**: split off behind the `integration` build tag
+and run against real backends. Apple tests require macOS 26 with Apple
+Container up; Docker tests require a running Docker daemon. The Apple
+watchdog test is Darwin-only, and Windows runtime integration is not run
+by the repository's Linux-only CI jobs. They check backend availability
+first and skip when the daemon or service is down. They cover startup,
+connection, exec, copy, normal cleanup, and the Darwin watchdog. Windows
+copy-out must be verified manually with Go 1.26+ and Docker client/server
+29.7.0+.
+
+**CI**: unit, race, vet, lint, and Docker integration jobs run on Ubuntu;
+Apple integration remains local because its service and host requirements
+are not available in those runners. No Windows runtime job is configured.
 
 ## Backends (v0.2 and current development)
 
@@ -887,9 +1048,35 @@ binding observed on that detected remote daemon still resolves to the
 remote host. An explicit `WithPublishedPort` loopback bind on that
 detected remote daemon is rejected by `Run`: Docker would listen on the
 remote machine's loopback, which no client-side rewrite can reach.
+stopping / unknown), labels, immutable identity, image, container IP,
+Docker network mode, and host-side port bindings (container port →
+host address and port).
+
+**Endpoint differences**: Docker Desktop (macOS / Windows) does not
+route to container IPs from the host, so the Docker backend defaults
+to the published-port model testcontainers uses.
+Ports declared via `WithExposedPorts` are automatically published to
+random ports: locally `-p 127.0.0.1::<port>`, on a remote daemon
+`-p 0.0.0.0::<port>` so the client can reach it. Remote means any
+`DOCKER_HOST` that does not name this machine — `tcp://host`,
+`ssh://user@host`, or a scheme-less `host:port` / hostname
+— while `unix://`, `npipe://`, loopback addresses, and an
+empty value stay local. Docker CLI client protocols are `unix`,
+`tcp`, `npipe`, and `ssh`; other schemes are not usable
+`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1` (or the remote
+hostname) and `MappedPort` the assigned host port.
+Unspecified binds resolve through loopback while preserving IPv4/IPv6
+family; explicit IPv6 addresses are canonicalized through `netip`.
+For `ssh://` that hostname must be directly dialable; the CLI's SSH
+session carries only the Docker API, so an alias behind a ProxyJump or
+bastion needs a manual `ssh -L` forward.
+An explicit or reused loopback binding on a remote daemon is rejected:
+it listens on the remote machine's loopback, which no client-side
+rewrite can reach.
 Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected. The daemon assigns ports atomically at start,
-so the free-port race avoided on Apple Container does not reappear.
+daemon is not detected.
+The daemon assigns ports atomically at start, so the free-port race
+avoided on Apple Container does not reappear.
 The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
@@ -915,6 +1102,10 @@ Docker).
   named-volume, or tmpfs mounts, but their lifecycle belongs to the
   caller. Current bind-source validation is Unix-style; Windows and
   remote Docker bind-source semantics are pending #76.
+- Dockerfile builds via `container build` / `docker build`
+- Network creation and management (`WithNetwork` can attach an existing
+  Docker network)
+- Volume creation and management
 - High-level packages equivalent to testcontainers modules (postgres
   and the like; revisit once the core is stable).
 - A direct Docker Engine API client. The CLI wrapper is the current

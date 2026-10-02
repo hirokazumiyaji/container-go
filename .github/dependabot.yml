@@ -4,3 +4,22 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # Actions are pinned to a commit SHA, so a PR here is the only way the
+    # pins get bumped. Group them so one review updates all of them.
+    groups:
+      github-actions:
+        patterns: ["*"]
+
+  # The root module and bench are separate modules, so each needs its own
+  # entry; without them a vulnerable dependency in either is never raised.
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+
+  - package-ecosystem: "gomod"
+    directory: "/bench"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

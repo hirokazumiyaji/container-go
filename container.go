@@ -30,6 +30,43 @@ const (
 	runTimeout = 10 * time.Minute
 )
 
+// contextLock is a zero-value mutex whose acquisition can be canceled.
+// It protects identity publication and serializes backend inspects without
+// allowing a canceled caller to wait indefinitely for a long inspect.
+type contextLock struct {
+	once sync.Once
+	gate chan struct{}
+}
+
+func (l *contextLock) channel() chan struct{} {
+	l.once.Do(func() {
+		l.gate = make(chan struct{}, 1)
+		l.gate <- struct{}{}
+	})
+	return l.gate
+}
+
+func (l *contextLock) Lock(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	gate := l.channel()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-gate:
+		if err := ctx.Err(); err != nil {
+			gate <- struct{}{}
+			return err
+		}
+		return nil
+	}
+}
+
+func (l *contextLock) Unlock() {
+	l.channel() <- struct{}{}
+}
+
 // reuseAttachTimeout bounds waiting for another process's create to
 // reach a usable state during WithReuse get-or-create. It applies to
 // attach polling only; a leader's own image pull and create carry an
@@ -83,29 +120,68 @@ type Container struct {
 	eng       engine
 	exposed   []portSpec
 	published []publishSpec
+	// network is the explicitly requested backend network. An empty
+	// value means the backend's daemon-selected default.
+	network         string
+	networkExplicit bool
+	// defaultNetwork is Docker's authoritative daemon default identity
+	// (bridge on Linux, nat on Windows), learned lazily for implicit
+	// compatibility checks.
+	defaultNetwork string
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
 	// process exit. Explicit Terminate still removes them.
 	reused bool
 	// creation is the unique generation ID stored in creationLabel.
-	// A non-empty generation is checked by Terminate before a
-	// generation-guarded name delete; empty legacy handles still take
-	// the name path. See Terminate and issues #83/#84 for the limits.
+	// Terminate and the reaper verify it before deleting so a stale
+	// handle does not remove a same-name replacement made by this
+	// library; see Terminate for the limits of the name-based path.
 	creation string
 	// uid is the backend's immutable container ID when it has one
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
-	uid string
+	//
+	// It is promoted from the first inspect, so it is written long after the
+	// handle is published. Guarded by uidMu rather than mu, because readers
+	// on the Terminate path must not hold the inspect lock.
+	uid   string
+	uidMu sync.RWMutex
 
-	mu   sync.Mutex
-	info *engineInfo // cached first inspect; currently also retains dynamic IP and bindings
+	mu        sync.Mutex
+	info      *engineInfo // immutable identity snapshot; dynamic data is never cached
+	inspectMu contextLock // serializes inspect target selection and UID publication
+	// nameInspect is limited to short-lived name lookups used by reuse
+	// discovery and failed-create cleanup. It never publishes an inspected
+	// Docker UID to a caller-visible handle.
+	nameInspect bool
+}
+
+// immutableID returns the backend's immutable container ID, or "" when the
+// backend has none. The ID is only ever promoted from empty to a real value,
+// so a caller that observes "" may re-read after a failed operation.
+func (c *Container) immutableID() string {
+	c.uidMu.RLock()
+	defer c.uidMu.RUnlock()
+	return c.uid
+}
+
+// setImmutableID records the backend's immutable container ID. It never
+// downgrades an existing value, so a concurrent promotion cannot clear it.
+func (c *Container) setImmutableID(uid string) {
+	if uid == "" {
+		return
+	}
+	c.uidMu.Lock()
+	if c.uid == "" {
+		c.uid = uid
+	}
+	c.uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, a non-reuse Run
-// attempts to remove the container before returning. A WithReuse wait
-// failure leaves the shared container in place; see WithReuse for the
-// shared-handle lifecycle.
+// returns a handle to it. On failure after creation, the container is
+// removed before returning. WithReuse switches to get-or-create; see
+// WithReuse for the shared-handle lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	cfg := newConfig()
 	for _, opt := range opts {
@@ -130,7 +206,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 		cfg.eng = eng
 	}
 	applyEngineBinary(cfg)
-	if err := cfg.eng.checkConfig(cfg); err != nil {
+	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
 	if cfg.reuse {
@@ -162,31 +238,42 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	stdout, _, err := cfg.runner.Run(runCtx, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		cleanupFailedCreate(ctx, cfg, err, classified)
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
+			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
 		return nil, classified
 	}
 
+	uid := cfg.eng.parseRunID(stdout)
+	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
+		identityErr := identityError("Docker run returned no valid immutable container ID")
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
+			return nil, withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, identityErr
+	}
+
 	c := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		creation:        cfg.creation,
+		uid:             uid,
 	}
 	// The reaper only backs real CLI containers; with an injected
-	// test runner there is nothing external to clean up. An immutable
-	// ID can be used as a deletion target, but this checkout still
-	// rejects full Docker IDs during reaper registration; #73 is required
-	// before the reaper can register them.
+	// test runner there is nothing external to clean up. With an
+	// immutable ID the reaper deletes by it and needs no generation.
 	if er, ok := cfg.runner.(cli.ExternalRunner); ok && er.External() && !keepContainers() {
 		bin := er.ExternalBinary()
 		if bin == "" {
 			bin = cfg.eng.binary()
 		}
-		if c.uid != "" {
-			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), c.uid, "")
+		if uid := c.immutableID(); uid != "" {
+			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), uid, "")
 		} else {
 			registerWithGlobalReaper(bin, cfg.eng.reaperSubcommand(), cfg.name, cfg.creation)
 		}
@@ -211,58 +298,85 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	return c, nil
 }
 
-// rollback removes a container Run created but cannot return. A failed
-// removal is not hidden: the caller must know when the container was
-// left behind. Without an immutable ID, a valid generation is checked
-// before name deletion; an empty generation currently takes the legacy
-// name path, so the generation guarantee is not universal.
+// rollback removes a container Run created but cannot return. A failed removal
+// is not hidden: without an immutable ID, Terminate refuses to delete when it
+// cannot verify the generation, and the caller must know the container was left
+// behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
 	if err := c.Terminate(context.WithoutCancel(ctx)); err != nil {
-		return fmt.Errorf("%w (container %s left behind: %v)", cause, c.id, err)
+		// %v would flatten the cleanup failure into text, leaving only the
+		// original recoverable through errors.Is. Join it instead.
+		return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
 	}
 	return cause
 }
 
-// cleanupFailedCreate best-effort considers the container this Run left
-// behind after a failed create. It skips name conflicts and only considers
-// a container carrying this process's managed+session labels. If the
-// creation label is present it must also match; an absent label is
-// currently accepted in this best-effort path, not treated as proof that
-// the handle owns the live name. Issue #83 tracks closing that fail-open
-// case.
-func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) {
+// cleanupFailedCreate removes only a container whose exact failed-create
+// generation and ownership labels have been freshly verified. A Docker
+// inspect by name is used only to discover a candidate; deletion always
+// targets its validated immutable UID. A missing generation, session, or
+// reuse marker is a refusal, never permission to fall back to the name.
+//
+// Name conflicts and ownership mismatches are successes (nothing of ours to
+// remove). Every other failure is returned so callers can wrap it in a
+// CleanupError and tell a leftover container apart from a silent attempt.
+func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified error) error {
 	if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) {
-		return
+		return nil
+	}
+	if !validCreationID(cfg.creation) {
+		return identityError("failed create has no valid creation generation")
 	}
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer cancel()
-	unlock, err := lockName(cleanupCtx, cfg.name)
-	if err != nil {
-		return
+	if !requiresImmutableID(cfg.eng) {
+		unlock, err := lockName(cleanupCtx, cfg.name)
+		if err != nil {
+			return fmt.Errorf("cleanup %s: lock name: %w", cfg.name, err)
+		}
+		defer unlock()
 	}
-	defer unlock()
 	info, err := namedContainer(cfg, cfg.name).inspectFresh(cleanupCtx)
+	if isNotFound(err) {
+		return nil
+	}
 	if err != nil {
-		return
+		// A container that cannot be inspected may still be running, so this
+		// is reported rather than treated as "nothing to clean up".
+		return fmt.Errorf("inspect before cleanup: %w", err)
 	}
-	if info.labels[managedLabel] != "true" {
-		return
+	if info == nil || info.labels[managedLabel] != "true" {
+		return nil
 	}
-	if sess, ok := info.labels[sessionLabel]; !ok || sess != sessionID() {
-		return
+	if info.labels[sessionLabel] != sessionID() {
+		return nil
 	}
-	if cfg.creation != "" {
-		if actual, ok := info.labels[creationLabel]; ok && actual != cfg.creation {
-			return
+	if !validCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != cfg.creation {
+		return nil
+	}
+	if cfg.reuse {
+		if info.labels[reuseLabel] != "true" || info.state == StateRunning {
+			return nil
 		}
 	}
-	target := cfg.name
-	if info.uid != "" {
-		target = info.uid
+	if !requiresImmutableID(cfg.eng) && info.uid != "" {
+		return identityError("name-addressed cleanup inspect returned an immutable ID")
+	}
+	target, err := verifiedDeleteTarget(cfg.eng, info, cfg.name)
+	if err != nil {
+		return err
 	}
 	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
 	defer delCancel()
-	_, _, _ = cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...)
+	if _, _, err := cfg.runner.Run(delCtx, cfg.eng.deleteArgs(target)...); err != nil {
+		// The container passed the ownership checks, so it exists and is
+		// ours. A failure here means it is still running.
+		if isNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("delete %s: %w", target, err)
+	}
+	return nil
 }
 
 // writeEnvFile stores env vars in a 0600 file under a private temporary
@@ -284,9 +398,8 @@ func writeEnvFile(env map[string]string) (path, dir string, err error) {
 	return path, dir, nil
 }
 
-// ID returns the handle's logical container ID, which is the configured
-// name. Docker also retains an immutable backend ID internally, but that
-// backend identity is not exposed through this method.
+// ID returns the logical container name. Docker handles also retain the
+// immutable backend ID used for internal operations.
 func (c *Container) ID() string { return c.id }
 
 func (c *Container) classify(ctx context.Context, err error) error {
@@ -295,7 +408,7 @@ func (c *Container) classify(ctx context.Context, err error) error {
 
 // State returns the current lifecycle state.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -303,58 +416,71 @@ func (c *Container) State(ctx context.Context) (State, error) {
 }
 
 // Stop stops the container. A nil timeout uses the CLI's default grace
-// period before the process is killed. For a non-nil timeout, the
-// current backends convert the value to whole seconds by truncating
-// fractional values; negative and extreme durations are not rejected,
-// and the library adds the duration to its query budget without
-// saturation. No library-side maximum is enforced; see #89.
+// period before the process is killed. A non-nil timeout must be non-negative
+// and its rounded-up seconds must fit the backend's supported range. The
+// backend-specific limit is checked before invoking its CLI. Because both
+// backends accept whole seconds, positive sub-second timeouts are rounded up;
+// zero requests immediate termination.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
-	_, _, err := c.runner.Run(stopCtx, c.eng.stopArgs(c.id, timeout)...)
+	target, err := c.verifiedOperationTarget(stopCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.stopArgs(target, timeout)
+	if err != nil {
+		return fmt.Errorf("stop %s: %w", c.id, err)
+	}
+	_, _, err = c.runner.Run(stopCtx, args...)
 	return c.classify(ctx, err)
 }
 
-// Terminate force-removes the container. A backend-reported not-found
-// failure is treated as success, but malformed or mismatched inspect data
-// is not normalized as not-found. A handle with an immutable ID deletes by
-// it; when that ID came from a matching inspect, a same-name replacement
-// does not share the target. For a name-addressed
-// handle with a non-empty creation generation, Terminate requires a
-// matching fresh inspect and holds the per-name lock across inspect and
-// delete. A handle with an empty generation currently takes the legacy
-// name-delete path, so it does not provide that replacement check; issues
-// #83 and #84 track the reuse and generation gaps. An external
-// `container delete` plus re-create inside the lock window is not
-// detectable by name.
+// Terminate force-removes the container. A Docker handle must carry a
+// validated immutable UID; a name-only handle is never an acceptable
+// fallback. Apple Container has no immutable UID, so its name path is
+// allowed only with a valid generation and a fresh locked inspect.
 func (c *Container) Terminate(ctx context.Context) error {
-	if c.uid != "" {
-		return c.delete(ctx, c.uid)
+	if requiresImmutableID(c.eng) {
+		target, err := c.verifiedOperationTarget(ctx)
+		if err != nil {
+			return fmt.Errorf("terminate %s: %w", c.id, err)
+		}
+		return c.delete(ctx, target)
 	}
-	if c.creation == "" {
+	if c.eng.name() == "apple" {
+		uid, creation, err := c.identitySnapshot(ctx)
+		if err != nil {
+			return err
+		}
+		if uid != "" {
+			return identityError("Apple inspect unexpectedly returned a container ID")
+		}
+		if !validCreationID(creation) {
+			return identityError("Apple handle has no valid creation generation")
+		}
+		unlock, err := lockName(ctx, c.id)
+		if err != nil {
+			return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		}
+		defer unlock()
+		info, err := c.inspectFresh(ctx)
+		if isNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
+		}
+		if err := sameContainerIdentity(c.eng, &engineInfo{labels: map[string]string{creationLabel: creation}}, info); err != nil {
+			return err
+		}
 		return c.delete(ctx, c.id)
 	}
-	unlock, err := lockName(ctx, c.id)
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
-		return fmt.Errorf("terminate %s: lock name: %w", c.id, err)
+		return err
 	}
-	defer unlock()
-	info, err := c.inspectFresh(ctx)
-	if isNotFound(err) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
-	}
-	// An absent generation cannot prove ownership of this handle, so
-	// it counts as a replacement too.
-	if info.labels[creationLabel] != c.creation {
-		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
-	}
-	if info.uid != "" {
-		return c.delete(ctx, info.uid)
-	}
-	return c.delete(ctx, c.id)
+	return c.delete(ctx, target)
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
@@ -367,16 +493,11 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	return c.classify(ctx, err)
 }
 
-// ContainerIP returns the address reported for the container. Apple
-// inspect data uses the first attached network. For Docker, selection
-// among multiple networks is unspecified when no top-level address is
-// present. With the Docker backend on Docker Desktop this address is
-// usually not reachable from the host; prefer Endpoint. On this checkout
-// the first successful endpoint inspect is cached, so a later network
-// change can leave this value stale; issue #85 tracks refreshing dynamic
-// endpoint data.
+// ContainerIP returns the container's address on its first attached
+// network. With the Docker backend on Docker Desktop this address is
+// usually not reachable from the host; prefer Endpoint.
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
-	info, err := c.cachedInfo(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -390,35 +511,64 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 // published ports use different host IPs, prefer Endpoint for the
 // specific port — Host returns only the first published binding's
 // address (or the container IP / default host when nothing is published).
-// Endpoint-related values may come from the first cached inspect on this
-// checkout and can be stale; issue #85 tracks refreshing dynamic data.
+// Docker host networking returns the daemon host but does not infer a
+// listening port; Docker none networking has no reachable host.
 func (c *Container) Host(ctx context.Context) (string, error) {
-	if len(c.published) > 0 {
-		addr := c.published[0].connectAddr()
-		if !c.eng.directIP() {
-			addr = dockerConnectHost(addr, c.eng)
-		}
-		return addr, nil
+	// Inspect before returning any address, including an explicitly
+	// published direct-IP endpoint. A requested publish string is not
+	// proof that the handle still names the same live container.
+	info, err := c.inspectDynamic(ctx)
+	if err != nil {
+		return "", err
 	}
 	if c.eng.directIP() {
-		return c.ContainerIP(ctx)
+		if len(c.published) > 0 {
+			return c.published[0].connectAddr(), nil
+		}
+		if info.ip == "" {
+			return "", fmt.Errorf("container %s has no reported IP address", c.id)
+		}
+		return info.ip, nil
+	}
+	if err := c.attachDefaultNetwork(ctx, info); err != nil {
+		return "", err
+	}
+	if err := c.validateNetworkInfo(info); err != nil {
+		return "", err
+	}
+	switch info.networkMode {
+	case dockerNetworkNone:
+		return "", fmt.Errorf("%w: container %s uses Docker network mode %q", ErrNoReachableHost, c.id, info.networkMode)
+	case dockerNetworkHost:
+		if len(c.published) > 0 {
+			return "", dockerNetworkEndpointError(info.networkMode)
+		}
+		return c.eng.defaultHost(), nil
+	}
+	if len(c.published) > 0 {
+		p := c.published[0]
+		b, ok := matchingPublishedBinding(info.bound, p)
+		if !ok {
+			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
+		}
+		host, err := dockerBindingConnectHost(b, c.eng)
+		if err != nil {
+			return "", err
+		}
+		return host, nil
 	}
 	return c.eng.defaultHost(), nil
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
-// to the port clients should dial. On this checkout a daemon-assigned
-// binding may come from the first cached inspect and can be stale; issue
-// #85 tracks refreshing dynamic endpoint data.
+// to the port clients should dial.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
 	_, p, err := c.resolve(ctx, port)
 	return p, err
 }
 
-// Endpoint returns "host:port" for a declared container port. On this
-// checkout the first successful endpoint inspect is cached, so an IP or
-// daemon-assigned host port can be stale after a network or binding change;
-// issue #85 tracks refreshing dynamic endpoint data.
+// Endpoint returns "host:port" for a port declared via WithExposedPorts
+// or WithPublishedPort. It does not infer a host-network service port.
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 	host, p, err := c.resolve(ctx, port)
 	if err != nil {
@@ -433,68 +583,382 @@ func (c *Container) resolve(ctx context.Context, port string) (string, int, erro
 	if err != nil {
 		return "", 0, err
 	}
-	for _, p := range c.published {
+	var published *publishSpec
+	for i := range c.published {
+		p := &c.published[i]
 		if p.containerPort == spec.port && p.proto == spec.proto {
-			addr := p.connectAddr()
-			if !c.eng.directIP() {
-				addr = dockerConnectHost(addr, c.eng)
-			}
-			return addr, p.hostPort, nil
+			published = p
+			break
 		}
 	}
-	if !slices.Contains(c.exposed, spec) {
+	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
-	if c.eng.directIP() {
-		ip, err := c.ContainerIP(ctx)
-		if err != nil {
-			return "", 0, err
-		}
-		return ip, spec.port, nil
-	}
-	// Published-port mode: the backend assigned a host port at start.
-	info, err := c.cachedInfo(ctx)
+	// Always perform one fresh identity-checked inspect before returning
+	// an endpoint. This is especially important for direct-IP backends:
+	// a published address is otherwise just a stale option value and can
+	// be returned for a replacement container without any backend read.
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", 0, err
 	}
-	for _, b := range info.bound {
-		if b.containerPort == spec.port && b.proto == spec.proto {
-			return dockerConnectHost(b.hostAddr, c.eng), b.hostPort, nil
+	if c.eng.directIP() {
+		if published != nil {
+			return published.connectAddr(), published.hostPort, nil
 		}
+		if info.ip == "" {
+			return "", 0, fmt.Errorf("container %s has no reported IP address", c.id)
+		}
+		return info.ip, spec.port, nil
 	}
-	return "", 0, fmt.Errorf("%w: %s has no host binding", ErrPortNotExposed, spec)
+	// Published-port mode: the backend assigned a host port at start.
+	// Docker may discard -p in host mode, so the request is never used
+	// as proof that a binding exists; inspect must confirm it.
+	if err := c.attachDefaultNetwork(ctx, info); err != nil {
+		return "", 0, err
+	}
+	if err := c.validateNetworkInfo(info); err != nil {
+		return "", 0, err
+	}
+	if err := dockerNetworkEndpointError(info.networkMode); err != nil {
+		return "", 0, err
+	}
+	if published != nil {
+		b, ok := matchingPublishedBinding(info.bound, *published)
+		if !ok {
+			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
+		}
+		host, err := dockerBindingConnectHost(b, c.eng)
+		if err != nil {
+			return "", 0, err
+		}
+		return host, b.hostPort, nil
+	}
+	if b, ok := matchingExposedBinding(info.bound, spec); ok {
+		host, err := dockerBindingConnectHost(b, c.eng)
+		if err != nil {
+			return "", 0, err
+		}
+		return host, b.hostPort, nil
+	}
+	return "", 0, fmt.Errorf("%w: %s has no host binding in Docker network mode %q", ErrPortNotExposed, spec, info.networkMode)
 }
 
-// cachedInfo returns the first successful inspect result. The current
-// implementation stores the whole record, including dynamic IP and port
-// bindings, so endpoint-related callers can observe stale data after a
-// lifecycle or network change. Issue #85 tracks separating immutable
-// identity from dynamic endpoint data and refreshing the latter.
+// validateNetworkInfo prevents a requested network mode from being
+// mistaken for the mode the daemon actually used. Apple Container does
+// not report networkMode, so this check is intentionally Docker-specific.
+func (c *Container) validateNetworkInfo(info *engineInfo) error {
+	if c.eng.name() != "docker" {
+		return nil
+	}
+	requested := c.network
+	if !c.networkExplicit {
+		requested = ""
+	}
+	return dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork)
+}
+
+// cachedInfo returns the immutable identity snapshot. Dynamic fields are
+// intentionally not cached; endpoint and lifecycle callers use
+// inspectDynamic instead.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
+	if c.nameInspect {
+		return c.inspectFresh(ctx)
+	}
 	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil {
-		return c.info, nil
+	cached := c.info
+	c.mu.Unlock()
+	if cached != nil {
+		return cached, nil
 	}
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
 	}
-	c.info = info
-	if c.uid == "" {
-		c.uid = info.uid
+	if err := c.rememberIdentity(ctx, info); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	cached = c.info
+	c.mu.Unlock()
+	return cached, nil
+}
+
+// inspectDynamic reads lifecycle, network, and port data on every call.
+// These values can change after a container has been inspected.
+func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
+	info, err := c.inspectFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.applyCachedDefaultNetwork(ctx, info); err != nil {
+		return nil, err
+	}
+	if c.nameInspect {
+		return info, nil
+	}
+	if err := c.rememberIdentity(ctx, info); err != nil {
+		return nil, err
 	}
 	return info, nil
 }
 
+func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) error {
+	identity := immutableInfo(info)
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return err
+	}
+	defer c.inspectMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.info != nil && !sameImmutableInfo(c.info, identity) {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.uid != "" && c.uid != identity.uid {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.uid == "" && c.info != nil && c.info.uid != "" && c.info.uid != identity.uid {
+		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+	}
+	if c.creation != "" {
+		actual := identity.labels[creationLabel]
+		if actual != "" && actual != c.creation {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+		// Once a name-only handle has observed its generation, losing
+		// the label is also evidence of a replacement.
+		if actual == "" && c.uid == "" && c.info != nil && c.info.labels[creationLabel] != "" {
+			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
+		}
+	}
+	if c.info == nil {
+		c.info = identity
+	} else {
+		c.info = mergeImmutableInfo(c.info, identity)
+	}
+	return nil
+}
+
+func immutableInfo(info *engineInfo) *engineInfo {
+	if info == nil {
+		return nil
+	}
+	labels := make(map[string]string, len(info.labels))
+	for key, value := range info.labels {
+		labels[key] = value
+	}
+	return &engineInfo{uid: info.uid, image: info.image, labels: labels}
+}
+
+func sameImmutableInfo(a, b *engineInfo) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	if a.uid != "" && b.uid != "" && a.uid != b.uid {
+		return false
+	}
+	if a.image != "" && b.image != "" && a.image != b.image {
+		return false
+	}
+	for key, value := range a.labels {
+		if other, ok := b.labels[key]; ok && other != value {
+			return false
+		}
+	}
+	return true
+}
+
+func mergeImmutableInfo(old, current *engineInfo) *engineInfo {
+	merged := immutableInfo(old)
+	if merged.uid == "" {
+		merged.uid = current.uid
+	}
+	if merged.image == "" {
+		merged.image = current.image
+	}
+	for key, value := range current.labels {
+		if _, ok := merged.labels[key]; !ok {
+			merged.labels[key] = value
+		}
+	}
+	return merged
+}
+
+// inspectTargetLocked returns the strongest target currently bound to
+// the handle. The caller must hold inspectMu. A temporary name lookup is
+// the only path allowed to use a logical name for Docker.
+func (c *Container) inspectTargetLocked() string {
+	if c.uid != "" {
+		return c.uid
+	}
+	return c.id
+}
+
+// identitySnapshot reads the handle's backend identity and creation
+// generation while holding the same lock that protects their publication.
+func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string, err error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", "", err
+	}
+	defer c.inspectMu.Unlock()
+	return c.uid, c.creation, nil
+}
+
+// verifiedOperationTarget is the safe target for lifecycle, copy, exec,
+// and log operations. In particular, a Docker handle with an empty or
+// malformed UID fails before a CLI call instead of falling back to its
+// name. Apple handles likewise require a valid generation before using a
+// name-addressed operation. Lock acquisition is context-aware so a copy
+// cannot wait behind another call's inspect or default-network lookup after
+// its caller has been canceled.
+func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
+	}
+	defer c.inspectMu.Unlock()
+	uid := c.uid
+	creation := c.creation
+	if requiresImmutableID(c.eng) {
+		if !validImmutableID(c.eng, uid) {
+			return "", identityError("Docker operation has no valid immutable container ID")
+		}
+		return uid, nil
+	}
+	if c.eng.name() == "apple" {
+		if uid != "" {
+			return "", identityError("Apple handle unexpectedly carries a container ID")
+		}
+		if !validCreationID(creation) {
+			return "", identityError("Apple operation has no valid creation generation")
+		}
+	}
+	if c.id == "" {
+		return "", identityError("container has no logical name")
+	}
+	return c.inspectTargetLocked(), nil
+}
+
+func configNeedsDefaultNetwork(cfg *config) bool {
+	return cfg != nil && cfg.eng != nil && cfg.eng.name() == "docker" &&
+		(!cfg.networkExplicit || cfg.network == dockerNetworkDefault)
+}
+
+func (c *Container) needsDefaultNetwork() bool {
+	return c.eng.name() == "docker" &&
+		(!c.networkExplicit || c.network == dockerNetworkDefault)
+}
+
+func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
+	if !c.needsDefaultNetwork() {
+		return "", nil
+	}
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return "", err
+	}
+	defer c.inspectMu.Unlock()
+	if c.defaultNetwork != "" {
+		return c.defaultNetwork, nil
+	}
+	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
+	if err != nil {
+		return "", err
+	}
+	c.defaultNetwork = name
+	return name, nil
+}
+
+func (c *Container) attachDefaultNetwork(ctx context.Context, info *engineInfo) error {
+	if !c.needsDefaultNetwork() {
+		return nil
+	}
+	name, err := c.ensureDefaultNetwork(ctx)
+	if err != nil {
+		return err
+	}
+	info.defaultNetwork = name
+	return nil
+}
+
+// attachDefaultNetworkForConfig deliberately does not consult a shared
+// reuse handle's cache. Each concurrent caller must resolve daemon
+// metadata with its own request and runner; otherwise the first caller's
+// network selection can decide a later caller's compatibility.
+func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engineInfo) error {
+	if !configNeedsDefaultNetwork(cfg) {
+		return nil
+	}
+	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng)
+	if err != nil {
+		return err
+	}
+	info.defaultNetwork = name
+	return nil
+}
+
+func (c *Container) applyCachedDefaultNetwork(ctx context.Context, info *engineInfo) error {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return err
+	}
+	defer c.inspectMu.Unlock()
+	if c.defaultNetwork != "" {
+		info.defaultNetwork = c.defaultNetwork
+	}
+	return nil
+}
+
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
+	if err := c.inspectMu.Lock(ctx); err != nil {
+		return nil, err
+	}
+	defer c.inspectMu.Unlock()
+	return c.inspectFreshLocked(ctx)
+}
+
+func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error) {
+	uid := c.uid
+	if requiresImmutableID(c.eng) {
+		if uid != "" && !validImmutableID(c.eng, uid) {
+			return nil, identityError("Docker handle has an invalid immutable container ID")
+		}
+		if uid == "" && !c.nameInspect {
+			return nil, identityError("refusing Docker name inspect without a verified immutable ID")
+		}
+	}
+	if !c.nameInspect && c.eng.name() == "apple" && !validCreationID(c.creation) {
+		return nil, identityError("Apple handle has no valid creation generation")
+	}
+
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.inspectTargetLocked()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
-	return c.eng.parseInspect(stdout, c.id)
+	info, err := c.eng.parseInspect(stdout, target)
+	if err != nil {
+		return nil, err
+	}
+	if requiresImmutableID(c.eng) {
+		if !validImmutableID(c.eng, info.uid) {
+			return nil, identityError("Docker inspect returned no valid immutable container ID")
+		}
+		if uid != "" && uid != info.uid {
+			return nil, identityError("Docker inspect returned a different immutable container ID")
+		}
+	}
+	if !c.nameInspect && c.eng.name() == "apple" {
+		if info.uid != "" {
+			return nil, identityError("Apple inspect unexpectedly returned a container ID")
+		}
+		if !validCreationID(c.creation) || !validCreationID(info.labels[creationLabel]) || info.labels[creationLabel] != c.creation {
+			return nil, identityError("Apple inspect returned a different creation generation")
+		}
+	}
+	// A name-addressed discovery deliberately returns the inspected UID to
+	// its caller as data only. It is never published into c.uid here; the
+	// caller must first validate managed/reuse/session ownership.
+	return info, nil
 }
 
 func withDefaultTimeout(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {

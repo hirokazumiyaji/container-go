@@ -18,7 +18,8 @@ type File struct {
 }
 
 // WithFiles copies files into the container after it starts. Copy
-// failures fail Run and roll the container back.
+// failures fail Run and roll the container back. On a WithReuse attach,
+// the current checkout ignores this option (#94).
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		for _, f := range files {

@@ -16,7 +16,8 @@ behavior. Integration tests use the `integration` build tag and skip cleanly
 when the relevant CLI or daemon is unavailable. They pull images from the AWS
 public ECR Docker Hub mirror (`public.ecr.aws/docker/library/...`) to avoid
 anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
-and singleflight cases (`make bench-integration` covers those). Set
+and singleflight cases (`make bench-integration` covers those; the
+nested benchmark module requires Go 1.25+). Set
 `CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
 The root test binary records that value in `TestMain` and then unsets it,
 so the other backend's suites skip correctly; guards read it through

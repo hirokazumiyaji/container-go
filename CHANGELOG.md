@@ -1,91 +1,38 @@
-# Changelog
+- Make `CopyFileFromContainer` fail closed on Apple Container, whose CLI
+  has no type-preserving/no-follow copy-out mode, and on Windows Go
+  1.23 through 1.25, whose `os.OpenFile` silently ignores the required
+  Windows file flags. On supported hosts, Docker retains the host-side
+  regular-file and no-follow checks; unsupported host open APIs also
+  fail closed.
+- Reject backslashes in container paths so Windows Docker path
+  normalization cannot reinterpret a literal path component.
+- Require Docker client and server 29.7.0 or newer for safe
+  `CopyFileFromContainer`; older or unverifiable versions fail closed before
+  temporary-directory creation or `docker cp`.
 
-All notable changes to this project will be documented in this file.
+### Cross-issue prerequisites
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-
-## [Unreleased]
-
-### Added
-
-- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
-  versions; centralize stderr matchers on each engine with source comments;
-  add live CLI compatibility integration tests; add Apple inspect fixture
-  for 1.3.0.
-- `StrictCleanup`, which reports a container-teardown failure as a test
-  failure instead of logging it. `Cleanup` still logs, so an unrelated
-  backend problem does not turn an unrelated test red.
-- `internal/integrationtest`, the shared backend preflight for the tagged
-  suites: a required CI run fails when the backend is unavailable or when
-  `CONTAINERGO_BACKEND` names the other backend, a `CONTAINERGO_BACKEND`
-  typo always fails, and a cross-process helper enforces its deadline while
-  blocked and returns the child's partial output on timeout.
-- `internal/releasecheck`, the release invariants as a test: the README
-  install lines, the `SECURITY.md` support matrix, and the newest dated
-  `CHANGELOG` release must name the same version.
-- A `release-check` workflow and a `make release-check` target that run the
-  full gate — build, vet, test, `go mod verify`, a `go mod tidy` check, and
-  the separate `bench` module. `make release-check` and the pull-request
-  run are the pre-tag gate. The tag-push run is a post-push safety net: the
-  tag already exists, and a failing run means a maintainer must delete it
-  and retag.
-
-### Fixed
-
-- Cleanup failures are no longer discarded. A failed-create, reuse
-  inspect/copy rollback, or public `Cleanup` that could not remove the
-  container now joins the cleanup failure onto the operation error, so
-  `errors.Is` still matches the operation error and `errors.As` reaches the
-  new exported `CleanupError` to learn that a container was left behind. An
-  already-absent container and a name conflict remain idempotent successes,
-  and a successful inspect that lists no container is treated as proof of
-  absence rather than reported as a leak (#86).
-- The Docker integration CI job can no longer report success with zero tests
-  run: a missing backend, a misconfigured backend, or a `-run` pattern that
-  selects nothing all fail the job (#106).
-
-### Changed
-
-- Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
-  call `allLabels()` once.
-- Merge `flightGroup` / `reuseFlightGroup` into one generic `flightGroup[T]`
-  in `flight.go`.
-- Deduplicate reuse/cleanup helpers (`inspectNamed`/`deleteNamed`, prune
-  loops, Docker line splitting), hoist `memoryRE`, and document `Host` vs
-  `Endpoint` when publish host-IPs differ.
-- Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
-  binary name in `CLIError` and neutralize `internal/cli` package docs.
-- Remove anonymous Docker volumes from every managed deletion path while
-  preserving named volumes.
-- `Prune` and `PruneReuseGroup` now return immutable Docker container IDs
-  rather than names or abbreviated IDs.
-
-## [0.2.0] - 2026-09-02
-
-First tagged release. Covers the Apple Container backend (v0.1 development)
-plus the v0.2 backend and lifecycle work.
-
-### Added
-
-- Apple Container backend: `Run`, functional options, lifecycle (`Stop`,
-  `Terminate`), connection endpoints (`Host`, `MappedPort`, `Endpoint`),
-  `Exec`, `Logs`, `FollowLogs`, and file copy.
-- `wait` package: log, port, HTTP, exec, and composite strategies with
-  fail-fast on container exit and rollback with log tail on failure.
-- Cleanup: `Cleanup` / `TerminateContainer`, session labels, `Prune`, and a
-  watchdog reaper for orphaned containers (not available on Windows).
-- Docker backend via CLI wrapper with OS-default selection on Linux and
-  Windows; `CONTAINERGO_BACKEND` overrides on any OS.
-- Automatic loopback port publishing on Docker for declared exposed ports.
-- Image pull aggregation across concurrent `Run` calls; `Pull`, `PullAlways`,
-  `PullNever`, and `PullMissing` policies.
-- `WithReuse` get-or-create for named containers shared across tests and
-  processes, with `WithReuseGroup` and `PruneReuseGroup`.
-- Deferred first `inspect` until `Endpoint` or `State` is needed.
-- CI: `workflow_dispatch`, `go test -race`, and Docker integration tests on
-  `ubuntu-latest`.
-
-### Changed
-
-- English is the primary documentation language (`README.md`, `docs/design.md`).
+- The current base's reaper registration still accepts only Apple-style
+  names. Docker's full immutable ID cannot be registered until issue #73
+  is stacked. The current README and design document call out this
+  prerequisite; the normal Docker handle/rollback path is separate.
+- Apple `LogsWithOptions` needs issue #82 before `Tail` and `Since` can be
+  documented as backend-specific capabilities.
+- Dynamic endpoint cache refresh is tracked by issue #85; the current
+  first-inspect cache can expose stale IP or binding data.
+- Reuse ownership and final generation verification are tracked by issues
+  #83 and #84; #94 tracks ignored WithFiles/PullAlways side effects on
+  reuse attach; #98 tracks the Apple Prune list-to-delete race and
+  missing fresh revalidation. This base still has missing-generation,
+  post-wait, and prune fail-open paths.
+- Docker deletion uses an immutable ID on this base, but other operations
+  still address the logical name; #74 tracks the stale-handle fix.
+- Docker `Prune` does not select dead containers until issue #113.
+- Windows and remote bind-source handling is qualified by issue #76;
+  `ForListeningPort`/`ForExposedPort` remain TCP-only until #77.
+- `Stop` timeout validation/rounding is pending #89; wait error-chain
+  normalization is pending #92; public option validation gaps are tracked
+  by #102; reaper staging exposure and mitigation are tracked by #111.
+- Successful missing inspect classification is pending #103; liveness
+  error-chain flattening is tracked by #104; Apple PullNever capability
+  handling is pending #112.

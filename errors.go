@@ -3,6 +3,7 @@ package container
 import (
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -17,9 +18,55 @@ type CLIError = cli.CLIError
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrInvalidConfig reports an option combination that the selected
+// backend cannot honor. Run returns it as a *ConfigError.
+var ErrInvalidConfig = errors.New("invalid container configuration")
+
+// ConfigError describes an invalid option combination before container
+// creation. Callers can use errors.As to inspect the backend, network,
+// and option involved.
+type ConfigError struct {
+	Backend string
+	Network string
+	Option  string
+	Detail  string
+}
+
+func (e *ConfigError) Error() string {
+	scope := "container"
+	if e.Backend != "" {
+		scope = e.Backend
+	}
+	message := ErrInvalidConfig.Error() + ": " + scope + " configuration"
+	if e.Network != "" {
+		message += fmt.Sprintf(" for network %q", e.Network)
+	}
+	if e.Option != "" {
+		message += " (" + e.Option + ")"
+	}
+	if e.Detail != "" {
+		message += ": " + e.Detail
+	}
+	return message
+}
+
+func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
+
 // ErrPortNotExposed reports a port that was not declared via
-// WithExposedPorts.
-var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
+// WithExposedPorts or WithPublishedPort, or that has no usable host
+// binding in the backend's actual network mode.
+var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
+
+// ErrEndpointUnreachable reports an inspected host binding that cannot
+// be reached by this client, such as loopback on a remote Docker daemon.
+var ErrEndpointUnreachable = errors.New("container endpoint is unreachable")
+
+// ErrNetworkMismatch reports that the network reported by inspect does
+// not match the network requested for the handle.
+var ErrNetworkMismatch = errors.New("container network mode does not match the requested network")
+
+// ErrNoReachableHost reports a backend network that has no host endpoint.
+var ErrNoReachableHost = errors.New("container has no reachable host")
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
@@ -31,9 +78,28 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // errors.Is instead of matching CLI stderr text.
 var ErrContainerNotFound = errors.New("container not found")
 
-// ErrGenerationReplaced reports that Terminate refused to delete because
-// the live container's creation label no longer matches this handle.
+// ErrGenerationReplaced reports that a handle's immutable identity or
+// generation no longer matches the live container. Destructive and endpoint
+// operations refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+
+// ErrCopyFileNotRegular reports that a file copied out of a container
+// was not a regular file. Callers should not consume paths that resolve
+// to directories, links, or other special files.
+var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
+
+// ErrCopyFileFromContainerUnsupported reports that the selected backend
+// or host cannot safely perform a file copy-out. This includes Docker
+// client/server versions below the supported copy-out minimum. The method
+// fails before invoking `cp` when the backend, host, or version cannot
+// preserve and validate file types.
+var ErrCopyFileFromContainerUnsupported = errors.New("CopyFileFromContainer is not safely supported by this backend or host")
+
+// ErrUnsupportedCapability reports a configuration that the selected
+// backend cannot support safely, such as a bind mount whose source the
+// remote daemon would resolve on its own host. Every rejection of that class
+// wraps this sentinel, so callers detect it uniformly with errors.Is.
+var ErrUnsupportedCapability = errors.New("unsupported capability")
 
 // cliCommandParts returns the backend command and its arguments from a
 // CLI error. Backend matchers use this to avoid treating an unrelated
@@ -93,6 +159,12 @@ func cliCommandTarget(command string, args []string) string {
 			}
 			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
 				i++
+			}
+		}
+	case "cp":
+		for _, arg := range args {
+			if before, _, ok := strings.Cut(arg, ":"); ok && before != "" && !strings.Contains(before, string(os.PathSeparator)) {
+				return strings.Trim(strings.TrimSpace(before), `"'`)
 			}
 		}
 	case "inspect", "exec", "logs":

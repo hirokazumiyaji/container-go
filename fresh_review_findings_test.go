@@ -47,6 +47,14 @@ type freshDockerPortRunner struct {
 }
 
 func (r *freshDockerPortRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "version" {
+		for _, arg := range args {
+			if strings.Contains(arg, "Server.Os") {
+				return []byte("linux"), nil, nil
+			}
+		}
+		return []byte("29.7.0"), nil, nil
+	}
 	if args[0] != "inspect" {
 		return nil, nil, nil
 	}
@@ -56,19 +64,20 @@ func (r *freshDockerPortRunner) Run(_ context.Context, args ...string) ([]byte, 
 	r.mu.Unlock()
 	id := strings.Repeat("b", 64)
 	if n == 1 {
-		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"Config":{"Labels":{}},"NetworkSettings":{"Ports":{}}}]`, id)), nil, nil
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"HostConfig":{"NetworkMode":"bridge"},"Config":{"Labels":{}},"NetworkSettings":{"Networks":{"bridge":{}},"Ports":{}}}]`, id)), nil, nil
 	}
-	return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"Config":{"Labels":{}},"NetworkSettings":{"Ports":{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}}}]`, id)), nil, nil
+	return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"HostConfig":{"NetworkMode":"bridge"},"Config":{"Labels":{}},"NetworkSettings":{"Networks":{"bridge":{}},"Ports":{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}}}]`, id)), nil, nil
 }
 
 func TestFreshReviewRefreshesIncompletePublishedPortMetadata(t *testing.T) {
 	runner := &freshDockerPortRunner{}
 	ctr := &Container{
-		id:      strings.Repeat("b", 64),
-		uid:     strings.Repeat("b", 64),
-		runner:  runner,
-		eng:     dockerEngine{},
-		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+		id:             strings.Repeat("b", 64),
+		uid:            strings.Repeat("b", 64),
+		runner:         runner,
+		eng:            dockerEngine{},
+		exposed:        []portSpec{{port: 6379, proto: "tcp"}},
+		defaultNetwork: "bridge",
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379"); err == nil {
 		t.Fatal("first incomplete published-port inspect unexpectedly succeeded")

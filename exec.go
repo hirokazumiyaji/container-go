@@ -70,11 +70,6 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
-	target, err := c.checkedOperationTarget()
-	if err != nil {
-		return 0, nil, err
-	}
-
 	var envFile string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFile(cfg.env)
@@ -85,26 +80,30 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, nil
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		return 0, nil, wrapNotFound(c.classify(ctx, err))
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
-	if !isNotFoundFor(c.eng, err) && !maybeInfraExecErr(err) {
+	if !isNotFound(err) && !maybeInfraExecErr(err) {
 		return cliErr.ExitCode, output, nil
 	}
 	if c.execContainerRunning(ctx) {
 		return cliErr.ExitCode, output, nil
 	}
-	return 0, nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	return 0, nil, wrapNotFound(c.classify(ctx, err))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
@@ -139,17 +138,7 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	target, err := c.checkedOperationTarget()
-	if err != nil {
-		return false
-	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, target)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return false
 	}

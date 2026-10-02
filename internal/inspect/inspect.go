@@ -53,8 +53,9 @@ func Decode(data []byte) ([]Container, error) {
 	return containers, nil
 }
 
-// IPv4 returns the container's address on its first attached network,
-// without the CIDR suffix.
+// IPv4 returns the address from the first network in this Apple inspect
+// model, without the CIDR suffix. Docker's multi-network selection is
+// handled separately and is unspecified when no top-level address exists.
 func (c Container) IPv4() (string, error) {
 	if len(c.Status.Networks) == 0 {
 		return "", fmt.Errorf("container %s has no attached networks", c.ID)

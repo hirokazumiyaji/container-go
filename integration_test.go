@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,8 +12,10 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -66,7 +69,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 		t.Errorf("redis-cli ping: code=%d out=%q", code, data)
 	}
 
-	// Copy a file in and read it back.
+	// Copy a file in; Apple Container copy-out is intentionally fail-closed.
 	src := filepath.Join(t.TempDir(), "hello.txt")
 	if err := os.WriteFile(src, []byte("hello from host"), 0o600); err != nil {
 		t.Fatal(err)
@@ -74,14 +77,8 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if err := ctr.CopyToContainer(ctx, src, "/tmp/hello.txt"); err != nil {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
-	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
-	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello from host" {
-		t.Errorf("round-tripped content = %q", round)
+	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt"); !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("CopyFileFromContainer error = %v, want ErrCopyFileFromContainerUnsupported", err)
 	}
 
 	// Logs snapshot.
@@ -102,6 +99,16 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
 	}
+}
+
+func TestIntegrationStopTimeoutRoundsUp(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)
+}
+
+func TestIntegrationStopTimeoutZeroIsImmediate(t *testing.T) {
+	requireSystem(t)
+	runStopTimingIntegration(t, "apple-zero", 0, 0, appleStopImmediateMaxElapsed)
 }
 
 func TestIntegrationPublishedPort(t *testing.T) {
@@ -162,6 +169,91 @@ func TestIntegrationParallelStarts(t *testing.T) {
 			t.Errorf("container %d: %v", i, err)
 		}
 	}
+}
+
+// TestIntegrationReaperSurvivesSIGKILL re-runs this test binary as a
+// child that starts a container and blocks. The parent SIGKILLs the
+// child (no defers, no signal handlers run) and then watches the
+// watchdog reaper remove the container.
+func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple watchdog integration requires Darwin")
+	}
+	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
+		ctx := context.Background()
+		ctr, err := container.Run(ctx, integrationAlpine,
+			container.WithName(os.Getenv("CONTAINERGO_REAPER_NAME")),
+			container.WithCmd("sleep", "120"))
+		if err != nil {
+			fmt.Println("CHILD-ERROR:", err)
+			os.Exit(1)
+		}
+		fmt.Println("READY:", ctr.ID())
+		select {} // block until SIGKILLed
+	}
+
+	requireSystem(t)
+	name := fmt.Sprintf("containergo-reapertest-%d", os.Getpid())
+
+	cmd := exec.Command(os.Args[0], "-test.run", "TestIntegrationReaperSurvivesSIGKILL")
+	cmd.Env = append(os.Environ(),
+		"CONTAINERGO_REAPER_CHILD=1",
+		"CONTAINERGO_REAPER_NAME="+name)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = exec.Command("container", "delete", "--force", name).Run()
+	}()
+
+	// Wait for the child to report the running container.
+	ready := make(chan string, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		var acc string
+		for {
+			n, err := stdout.Read(buf)
+			acc += string(buf[:n])
+			if strings.Contains(acc, "READY:") {
+				ready <- acc
+				return
+			}
+			if err != nil {
+				ready <- acc
+				return
+			}
+		}
+	}()
+	select {
+	case out := <-ready:
+		if !strings.Contains(out, "READY:") {
+			t.Fatalf("child failed before starting container: %q", out)
+		}
+	case <-time.After(5 * time.Minute):
+		_ = cmd.Process.Kill()
+		t.Fatal("child never became ready")
+	}
+
+	// SIGKILL: no Go cleanup runs in the child; only the reaper can
+	// remove the container.
+	if err := cmd.Process.Signal(syscall.SIGKILL); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := exec.Command("container", "ls", "--all", "--quiet").Output()
+		if err == nil && !strings.Contains(string(out), name) {
+			return // reaper removed it
+		}
+		time.Sleep(time.Second)
+	}
+	t.Fatalf("container %s still present 60s after SIGKILL; reaper did not fire", name)
 }
 
 // TestIntegrationLazyInspectStateAndWaitRollback covers #20: Run without

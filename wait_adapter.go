@@ -10,8 +10,9 @@ import (
 )
 
 // WithWaitStrategy blocks Run until the strategy reports the container
-// ready. On failure the container is removed and the error carries a
-// tail of its logs.
+// ready. On failure, a non-reuse Run attempts to remove the container
+// and, when available, attaches a bounded tail of its logs; a reuse wait
+// leaves the shared container in place.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
 		c.waitStrategy = s
@@ -61,10 +62,14 @@ const logTailLimit = 1024 * 1024
 // so neither the CLI output nor the Go buffer grows with total log
 // size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	target, err := c.checkedOperationTarget()
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return ""
 	}
+	return c.logTailTarget(ctx, target)
+}
+
+func (c *Container) logTailTarget(ctx context.Context, target string) string {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)

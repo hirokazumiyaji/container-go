@@ -19,7 +19,7 @@ func (r *freshDockerIdentityRunner) Run(_ context.Context, args ...string) ([]by
 	r.mu.Lock()
 	r.inspects++
 	r.mu.Unlock()
-	return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"Config":{"Labels":{}},"NetworkSettings":{}}]`, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")), nil, nil
+	return []byte(fmt.Sprintf(`[{"Id":%q,"Name":%q,"State":{"Status":"running"},"Config":{"Labels":{}},"NetworkSettings":{}}]`, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/logical-name")), nil, nil
 }
 
 func TestFreshReviewNameLookupDoesNotPublishDockerUID(t *testing.T) {
@@ -31,10 +31,7 @@ func TestFreshReviewNameLookupDoesNotPublishDockerUID(t *testing.T) {
 	if got := ctr.immutableID(); got != "" {
 		t.Fatalf("name lookup published UID %q", got)
 	}
-	if got := ctr.operationTarget(); got != "logical-name" {
-		t.Fatalf("name lookup operation target = %q", got)
-	}
-	if _, err := ctr.verifiedOperationTarget(); err == nil {
+	if _, err := ctr.verifiedOperationTarget(context.Background()); err == nil {
 		t.Fatal("name lookup became an operational Docker target")
 	}
 }

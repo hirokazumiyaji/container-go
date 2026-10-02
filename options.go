@@ -63,9 +63,6 @@ func (c *config) allLabels() map[string]string {
 	if c.creation != "" {
 		labels[creationLabel] = c.creation
 	}
-	if c.creation != "" {
-		labels[creationLabel] = c.creation
-	}
 	if c.reuse {
 		labels[reuseLabel] = "true"
 	}

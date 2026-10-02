@@ -454,9 +454,12 @@ cancellation the child is SIGKILLed and reaped; no zombies, no hangs.
 
 Errors are discriminable with `errors.Is`/`errors.As`.
 
-- `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
+- `ErrSystemNotRunning`: after a CLI failure, a follow-up liveness
+  probe against the selected backend failed too, so the backend's
+  service is not answering. Both backends return this one value (the
+  Apple Container system service, or the Docker daemon), so it does not
+  identify which; the underlying CLI error is retained. The message
+  carries the backend's own hint, e.g. `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrInvalidConfig` / `*ConfigError`: a backend-incompatible option
   combination rejected before creation

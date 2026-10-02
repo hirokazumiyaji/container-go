@@ -105,6 +105,19 @@ func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
 }
 
+// Apple Container's public cp command has no mode that preserves source
+// types or prevents it from dereferencing special files, so fail closed.
+func (appleEngine) checkCopyFileFromContainer() error {
+	return fmt.Errorf(
+		"%w: Apple Container cp has no type-preserving/no-follow copy-out mode",
+		ErrCopyFileFromContainerUnsupported,
+	)
+}
+
+func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner) error {
+	return appleEngine{}.checkCopyFileFromContainer()
+}
+
 func (appleEngine) reaperSubcommand() string { return "delete" }
 
 func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {

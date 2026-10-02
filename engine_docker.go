@@ -28,7 +28,8 @@ type dockerEngine struct{}
 // ones; the daemon's duration conversion is also safe at this limit.
 const maxDockerStopSeconds int64 = math.MaxInt32
 
-// Verified against Docker Engine / CLI 29.x (local: 29.7.2).
+// Verified against Docker Engine / CLI 29.x (local: 29.7.2); copy-out
+// requires client/server 29.7.0 or newer.
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Observed wording:
 //   - name conflict: "Conflict. The container name \"/x\" is already in use by container …"
@@ -43,6 +44,10 @@ const (
 	dockerStderrNotFound     = "not found"
 	dockerStderrNoSuchObj    = "no such object"
 	dockerStderrNoSuchCtr    = "no such container"
+
+	// Docker 29.7.0 is the first client/server combination accepted for
+	// this copy-out contract. Older cp extractors fail closed.
+	dockerCopyOutMinimumVersion = "29.7.0"
 
 	dockerNetworkHost    = "host"
 	dockerNetworkNone    = "none"
@@ -705,6 +710,123 @@ func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
 
 func (dockerEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
+}
+
+func (dockerEngine) checkCopyFileFromContainer() error { return nil }
+
+type dockerVersionOutput struct {
+	Client struct {
+		Version string `json:"Version"`
+	} `json:"Client"`
+	Server struct {
+		Version string `json:"Version"`
+	} `json:"Server"`
+}
+
+type dockerVersion struct {
+	major int
+	minor int
+	patch int
+}
+
+func (v dockerVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+}
+
+func (v dockerVersion) less(other dockerVersion) bool {
+	if v.major != other.major {
+		return v.major < other.major
+	}
+	if v.minor != other.minor {
+		return v.minor < other.minor
+	}
+	return v.patch < other.patch
+}
+
+var dockerVersionRE = regexp.MustCompile(`^(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)$`)
+
+// parseDockerVersion accepts only the plain stable x.y.z form emitted by
+// supported Docker releases. Suffixes describe development or distribution
+// builds whose copy-out behavior has not been verified, so they fail closed.
+func parseDockerVersion(raw string) (dockerVersion, error) {
+	if !dockerVersionRE.MatchString(raw) {
+		return dockerVersion{}, fmt.Errorf("version %q is not a stable major.minor.patch release", raw)
+	}
+
+	parts := strings.Split(raw, ".")
+	version := dockerVersion{}
+	values := []*int{&version.major, &version.minor, &version.patch}
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil {
+			return dockerVersion{}, fmt.Errorf("version %q: %w", raw, err)
+		}
+		*values[i] = n
+	}
+	return version, nil
+}
+
+func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
+	var output dockerVersionOutput
+	if err := json.Unmarshal(data, &output); err != nil {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("decode Docker version output: %w", err)
+	}
+	clientRaw := output.Client.Version
+	serverRaw := output.Server.Version
+	if clientRaw == "" {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("docker client version is empty")
+	}
+	if serverRaw == "" {
+		return dockerVersion{}, dockerVersion{}, fmt.Errorf("docker server version is empty")
+	}
+	client, err := parseDockerVersion(clientRaw)
+	if err != nil {
+		return dockerVersion{}, dockerVersion{}, err
+	}
+	server, err := parseDockerVersion(serverRaw)
+	if err != nil {
+		return dockerVersion{}, dockerVersion{}, err
+	}
+	return client, server, nil
+}
+
+// checkCopyFileFromContainerVersion verifies both ends of the Docker
+// client/daemon connection before any private destination is created.
+func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner) error {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
+	if err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if qCtx.Err() != nil {
+			return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
+		}
+		return fmt.Errorf("%w: cannot verify Docker client/server version: %w", ErrCopyFileFromContainerUnsupported, err)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if qCtx.Err() != nil {
+		return fmt.Errorf("%w: Docker version query timed out: %w", ErrCopyFileFromContainerUnsupported, qCtx.Err())
+	}
+
+	client, server, err := parseDockerVersionPair(stdout)
+	if err != nil {
+		return fmt.Errorf("%w: invalid Docker client/server version: %v", ErrCopyFileFromContainerUnsupported, err)
+	}
+	minimum := dockerVersion{major: 29, minor: 7, patch: 0}
+	if client.less(minimum) || server.less(minimum) {
+		return fmt.Errorf(
+			"%w: Docker client/server must both be >=%s (got %s/%s)",
+			ErrCopyFileFromContainerUnsupported,
+			dockerCopyOutMinimumVersion,
+			client,
+			server,
+		)
+	}
+	return nil
 }
 
 func (dockerEngine) reaperSubcommand() string { return "rm" }

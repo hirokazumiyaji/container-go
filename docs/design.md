@@ -3,7 +3,7 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS), Go 1.23+
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.23+
 
 ## Purpose
 
@@ -50,7 +50,14 @@ The design decisions below rest on these properties of Apple Container
 - `--label` exists, but filtering by label means filtering the JSON
   output client-side. Label keys are restricted to lowercase
   Docker/OCI-style keys.
-- `container cp` only works on running containers.
+- `container cp` only works on running containers. Its copy-out operation
+  has no type-preserving/no-follow mode: observed versions can dereference
+  or consume symlinks, FIFOs, and device nodes before the host can inspect
+  the result. `CopyFileFromContainer` therefore fails closed on Apple
+  Container with `ErrCopyFileFromContainerUnsupported`; Docker requires
+  client and server versions >=29.7.0 for the type-preserving extractor,
+  then retains the host-side Lstat/open checks where the host supports the
+  required flags, and otherwise fails closed.
 - `--rm` removal leaves anonymous volumes behind.
 - Error classification depends on CLI stderr substrings owned by
   `engine_apple.go` (name conflict, image/container missing). Those
@@ -190,6 +197,21 @@ name recycled by another process (see Reuse below).
 (deleting an already-absent container succeeds). `Cleanup(t, ctr)` and
 `TerminateContainer(ctr)` are nil-safe helpers preserving the
 testcontainers-go idiom of deferring cleanup before the error check.
+
+`CopyFileFromContainer` is a Docker-only copy-out operation that requires
+safe host file-open semantics. The method verifies the materialized result
+is a regular file, but does not claim that every Docker host can represent
+every container file type. Apple Container's CLI cannot preserve or reject
+all source file types before the host opens the result, so the method
+returns `ErrCopyFileFromContainerUnsupported` without invoking `container
+cp`. Docker copy-out requires both the client and server to be at least
+29.7.0; the method verifies those versions before creating its private
+temporary directory or invoking `docker cp`, and fails closed with the same
+error if verification fails. Hosts without no-follow/nonblocking file-open
+support fail closed with the same error. On Windows, Go 1.23 through 1.25 do
+not propagate the required Windows file flags through `os.OpenFile`, so
+Docker copy-out requires Go 1.26 or newer. `CopyToContainer` remains
+available on both backends.
 
 ## Connection endpoints
 
@@ -411,8 +433,9 @@ writes them to a file under `os.MkdirTemp` with mode 0600, passes
 
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
-environment keys (no `=`, no NUL), and copy paths (absolute, valid
-UTF-8) are all validated before reaching the CLI. The CLI validates
+environment keys (no `=`, no NUL), and copy paths (absolute POSIX
+paths with `/` separators, no backslashes, valid UTF-8) are all
+validated before reaching the CLI. The CLI validates
 too, but validating first gives clearer errors and independence from
 future CLI changes.
 
@@ -458,6 +481,14 @@ Errors are discriminable with `errors.Is`/`errors.As`.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrPortNotExposed`: querying a port not declared via
+  `WithExposedPorts`
+- `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
+  file
+- `ErrCopyFileFromContainerUnsupported`: the selected backend or host
+  cannot perform a type-safe copy-out (Apple Container, Docker client or
+  server below 29.7.0, hosts without the required open flags, or Windows
+  Go 1.23 through 1.25)
 - `ErrInvalidConfig` / `*ConfigError`: a backend-incompatible option
   combination rejected before creation
 - `ErrPortNotExposed`: a port was not declared or has no usable host
@@ -507,15 +538,18 @@ strategy logic without real hardware. Dependencies that production
 code assumes non-nil get real fakes in tests, never nil.
 
 **Integration tests**: split off behind the `integration` build tag
-and run only on real hardware (macOS 26 with Apple Container up). They
-cover startup, connection, exec, copy, cleanup, and the watchdog
-(SIGKILL a child process, watch the reaper act). They check
-`container system status` first and skip when the service is down.
+and run against real backends. Apple tests require macOS 26 with Apple
+Container up; Docker tests require a running Docker daemon. The Apple
+watchdog test is Darwin-only, and Windows runtime integration is not run
+by the repository's Linux-only CI jobs. They check backend availability
+first and skip when the daemon or service is down. They cover startup,
+connection, exec, copy, normal cleanup, and the Darwin watchdog. Windows
+copy-out must be verified manually with Go 1.26+ and Docker client/server
+29.7.0+.
 
-**CI**: unit tests and `go vet` run in GitHub Actions per push (no
-Apple Container needed). GitHub-hosted runners are unlikely to run the
-integration tests (macOS version and nested-virtualization limits), so
-those stay local as `make integration`.
+**CI**: unit, race, vet, lint, and Docker integration jobs run on Ubuntu;
+Apple integration remains local because its service and host requirements
+are not available in those runners. No Windows runtime job is configured.
 
 ## Backends (v0.2)
 

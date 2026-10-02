@@ -81,6 +81,18 @@ var ErrContainerNotFound = errors.New("container not found")
 // operations refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrCopyFileNotRegular reports that a file copied out of a container
+// was not a regular file. Callers should not consume paths that resolve
+// to directories, links, or other special files.
+var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
+
+// ErrCopyFileFromContainerUnsupported reports that the selected backend
+// or host cannot safely perform a file copy-out. This includes Docker
+// client/server versions below the supported copy-out minimum. The method
+// fails before invoking `cp` when the backend, host, or version cannot
+// preserve and validate file types.
+var ErrCopyFileFromContainerUnsupported = errors.New("CopyFileFromContainer is not safely supported by this backend or host")
+
 // ErrUnsupportedCapability reports a configuration that the selected
 // backend cannot support safely, such as a bind mount whose source the
 // remote daemon would resolve on its own host. Every rejection of that class

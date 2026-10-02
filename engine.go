@@ -66,6 +66,12 @@ type engine interface {
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
+	// checkCopyFileFromContainer rejects backends whose copy-out cannot
+	// preserve file types and reject links/special files before host open.
+	checkCopyFileFromContainer() error
+	// checkCopyFileFromContainerVersion verifies backend-specific
+	// minimum versions before a copy-out creates a private temp directory.
+	checkCopyFileFromContainerVersion(context.Context, cli.Runner) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	// logsFollowArgs builds the streaming follow argv.
 	logsFollowArgs(id string) []string

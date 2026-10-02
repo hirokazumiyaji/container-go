@@ -30,8 +30,8 @@ func TestRedis(t *testing.T) {
 | OS | Default backend | Requirement |
 |---|---|---|
 | macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) 1.2.x with `container system start` done |
-| Linux | Docker | docker CLI + running daemon |
-| Windows | Docker | docker CLI + running daemon (no watchdog reaper; see below) |
+| Linux | Docker | docker CLI + running daemon; copy-out requires client/server 29.7.0+ |
+| Windows | Docker | docker CLI + running daemon; copy-out requires client/server 29.7.0+ (no watchdog reaper; see below) |
 
 Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
 Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
@@ -48,7 +48,7 @@ matches against):
 | Backend | Verified versions |
 |---|---|
 | Apple Container | 1.2.x–1.3.x |
-| Docker Engine / CLI | 29.x |
+| Docker Engine / CLI | 29.x; secure copy-out requires client/server 29.7.0+ |
 
 Newer CLI releases may change error text or JSON fields; see the stderr
 matchers at the top of `engine_apple.go` / `engine_docker.go` and the
@@ -73,6 +73,30 @@ as backends and probing needs change; prefer the built-in strategies when
 possible.
 
 See [CHANGELOG.md](CHANGELOG.md) for release notes.
+
+## Copy-out backend capability
+
+`CopyFileFromContainer` is supported only by the Docker backend when the
+host provides safe file-open semantics. This library verifies that the
+materialized result is a regular file and does not claim that every Docker
+host can represent every container file type. Apple Container's
+`container cp` has no type-preserving/no-follow copy-out mode; it can
+dereference or consume links and special files before host-side validation.
+On Apple Container, `CopyFileFromContainer` therefore returns
+`ErrCopyFileFromContainerUnsupported` without invoking the CLI. Hosts
+without no-follow and nonblocking file-open support fail closed with the
+same error. On Windows, this includes Go 1.23 through 1.25, whose
+`os.OpenFile` does not propagate the required Windows file flags; use Go
+1.26 or newer for Docker copy-out there. Use
+`CONTAINERGO_BACKEND=docker` on macOS when a safe copy-out is required.
+Container paths passed to the copy APIs are absolute POSIX paths using `/`;
+backslashes are rejected. Docker copy-out requires both the Docker client
+and server to be version 29.7.0 or newer. The method verifies both versions
+before creating its private temporary directory or invoking `docker cp`, and
+returns `ErrCopyFileFromContainerUnsupported` if the minimum cannot be
+verified. CI unit and Docker integration jobs run on Linux only; Windows
+runtime coverage is manual and requires Go 1.26+ with Docker client/server
+29.7.0+.
 
 ## Connection endpoints
 

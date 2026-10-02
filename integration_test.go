@@ -4,6 +4,7 @@ package container_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -67,7 +69,7 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 		t.Errorf("redis-cli ping: code=%d out=%q", code, data)
 	}
 
-	// Copy a file in and read it back.
+	// Copy a file in; Apple Container copy-out is intentionally fail-closed.
 	src := filepath.Join(t.TempDir(), "hello.txt")
 	if err := os.WriteFile(src, []byte("hello from host"), 0o600); err != nil {
 		t.Fatal(err)
@@ -75,14 +77,8 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	if err := ctr.CopyToContainer(ctx, src, "/tmp/hello.txt"); err != nil {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
-	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
-	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello from host" {
-		t.Errorf("round-tripped content = %q", round)
+	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt"); !errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("CopyFileFromContainer error = %v, want ErrCopyFileFromContainerUnsupported", err)
 	}
 
 	// Logs snapshot.
@@ -180,6 +176,9 @@ func TestIntegrationParallelStarts(t *testing.T) {
 // child (no defers, no signal handlers run) and then watches the
 // watchdog reaper remove the container.
 func TestIntegrationReaperSurvivesSIGKILL(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple watchdog integration requires Darwin")
+	}
 	if os.Getenv("CONTAINERGO_REAPER_CHILD") == "1" {
 		ctx := context.Background()
 		ctr, err := container.Run(ctx, integrationAlpine,

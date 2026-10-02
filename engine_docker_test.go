@@ -183,6 +183,39 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 }
 
+func TestParseDockerVersionPair(t *testing.T) {
+	client, server, err := parseDockerVersionPair([]byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.2"}}`))
+	if err != nil {
+		t.Fatalf("parseDockerVersionPair: %v", err)
+	}
+	if client != (dockerVersion{major: 29, minor: 7, patch: 0}) {
+		t.Errorf("client version = %s", client)
+	}
+	if server != (dockerVersion{major: 29, minor: 7, patch: 2}) {
+		t.Errorf("server version = %s", server)
+	}
+	for _, raw := range []string{
+		`{"Client":{"Version":"29.7"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.07.0"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"v29.7.0"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":" 29.7.0 "},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"-29.7.0"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-rc.1"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-dev"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-10-gdeadbee"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-0.1"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0-ce"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0+garbage"},"Server":{"Version":"29.7.0"}}`,
+		`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.2+desktop"}}`,
+		`{"Client":{"Version":"29.7.0"},"Server":{"Version":"not-a-version"}}`,
+	} {
+		if _, _, err := parseDockerVersionPair([]byte(raw)); err == nil {
+			t.Errorf("parseDockerVersionPair(%s) = nil error", raw)
+		}
+	}
+}
+
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {
@@ -217,6 +250,11 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 	d.calls = append(d.calls, args)
 	switch args[0] {
 	case "version":
+		for _, a := range args {
+			if strings.Contains(a, "json .") {
+				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`), nil, nil
+			}
+		}
 		if d.serverOS != "" {
 			return []byte(d.serverOS), nil, nil
 		}

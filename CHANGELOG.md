@@ -9,13 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x;
+  copy-out requires 29.7.0+) CLI versions; centralize stderr matchers on
+  each engine with source comments; add live CLI compatibility integration
+  tests; add Apple inspect fixture for 1.3.0.
 - Add `ConfigError` / `ErrInvalidConfig` for backend-incompatible options,
   `ErrEndpointUnreachable` for unusable inspected bindings, and
   `ErrNetworkMismatch` / `ErrNoReachableHost` for runtime network failures.
-- Document verified Apple Container (1.2.x–1.3.x) and Docker (29.x) CLI
-  versions; centralize stderr matchers on each engine with source comments;
-  add live CLI compatibility integration tests; add Apple inspect fixture
-  for 1.3.0.
 - `StrictCleanup`, which reports a container-teardown failure as a test
   failure instead of logging it. `Cleanup` still logs, so an unrelated
   backend problem does not turn an unrelated test red.
@@ -70,6 +70,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `Endpoint` when publish host-IPs differ.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
+- Make `CopyFileFromContainer` fail closed on Apple Container, whose CLI
+  has no type-preserving/no-follow copy-out mode, and on Windows Go
+  1.23 through 1.25, whose `os.OpenFile` silently ignores the required
+  Windows file flags. On supported hosts, Docker retains the host-side
+  regular-file and no-follow checks; unsupported host open APIs also
+  fail closed.
+- Reject backslashes in container paths so Windows Docker path
+  normalization cannot reinterpret a literal path component.
+- Require Docker client and server 29.7.0 or newer for safe
+  `CopyFileFromContainer`; older or unverifiable versions fail closed before
+  temporary-directory creation or `docker cp`.
 
 ## [0.2.0] - 2026-09-02
 

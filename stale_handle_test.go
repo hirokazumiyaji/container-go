@@ -26,6 +26,11 @@ type staleHandleRunner struct {
 func (r *staleHandleRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls = append(r.calls, args)
 	if args[0] == "version" {
+		for _, a := range args {
+			if strings.Contains(a, "json .") {
+				return []byte(`{"Client":{"Version":"29.7.0"},"Server":{"Version":"29.7.0"}}`), nil, nil
+			}
+		}
 		return []byte("29.8.0"), nil, nil
 	}
 	if hasImmutableTarget(args, staleHandleUID) {

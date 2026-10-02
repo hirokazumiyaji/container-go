@@ -34,3 +34,8 @@ Never let a worktree branch inherit an upstream it did not create. `git worktree
 ## Security and Configuration
 
 Never commit credentials or environment files. Configure backend selection with `CONTAINERGO_BACKEND` and use the backend CLI’s own authentication and host settings. Keep integration-only configuration local to the developer environment.
+
+## Cursor Cloud specific instructions
+
+- `mise install` reads `mise.toml` (Go 1.27 and golangci-lint 2.13.0). Non-interactive login shells do not source `~/.bashrc`, so the environment links `go` and `golangci-lint` onto `/usr/local/bin`.
+- Docker Engine 29.7.2 is the CLI this repository checks. systemd is not running in the VM, so the environment `start` script launches `containerd` and `dockerd` (fuse-overlayfs). Wait until `docker info` succeeds before `make integration` or `make integration-docker`. Apple Container is not available here; use the Docker backend.

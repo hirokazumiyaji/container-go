@@ -2,6 +2,8 @@ package container
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -13,13 +15,25 @@ type engineInfo struct {
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
-	// (Apple Container), where a delete cannot be bound to a generation.
+	// (Apple Container), where operations remain name-based.
 	uid string
 	// image is the image reference the container was created from.
 	image string
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
+	// networkMode is the backend's reported network mode. Docker uses
+	// this to distinguish a real host binding from a request that the
+	// daemon discarded (for example, -p with host networking).
+	networkMode string
+	// networkNames contains the actual attached network names reported by
+	// Docker. It resolves the API's special "default" mode to the daemon's
+	// concrete default network (bridge on Linux, nat on Windows).
+	networkNames []string
+	// defaultNetwork is the authoritative Docker daemon default identity
+	// (bridge on Linux, nat on Windows). It is daemon metadata rather than
+	// container identity, so it is not cached with the immutable fields.
+	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort
@@ -41,14 +55,14 @@ type engine interface {
 	probe() cli.Probe
 	// checkConfig rejects option combinations this backend cannot
 	// honor before anything is created.
-	checkConfig(cfg *config) error
+	checkConfig(ctx context.Context, cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).
 	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
-	stopArgs(id string, timeout *time.Duration) []string
+	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
@@ -59,7 +73,11 @@ type engine interface {
 	// minimum versions before a copy-out creates a private temp directory.
 	checkCopyFileFromContainerVersion(context.Context, cli.Runner) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
-	logsArgs(id string, follow bool) []string
+	// logsFollowArgs builds the streaming follow argv.
+	logsFollowArgs(id string) []string
+	// logsArgsWithOptions builds snapshot args and rejects options the
+	// backend cannot honor.
+	logsArgsWithOptions(id string, opts LogsOptions) ([]string, error)
 	// logsTailArgs fetches a bounded tail for diagnostics without
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
@@ -98,4 +116,34 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+}
+
+func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {
+	args := []string{"stop"}
+	if timeout != nil {
+		seconds, err := stopTimeoutSeconds(*timeout, maxSeconds)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--time", strconv.FormatInt(seconds, 10))
+	}
+	return append(args, id), nil
+}
+
+// stopTimeoutSeconds rounds up so the backend never grants less grace than
+// the caller requested, then checks the rounded value against the backend's
+// seconds limit. The result is int64 so the validation does not depend on the
+// host architecture's native int width.
+func stopTimeoutSeconds(timeout time.Duration, maxSeconds int64) (int64, error) {
+	if timeout < 0 {
+		return 0, fmt.Errorf("stop timeout must be non-negative: %s", timeout)
+	}
+	seconds := int64(timeout / time.Second)
+	if timeout%time.Second != 0 {
+		seconds++
+	}
+	if seconds > maxSeconds {
+		return 0, fmt.Errorf("stop timeout %s exceeds backend limit of %d seconds", timeout, maxSeconds)
+	}
+	return seconds, nil
 }

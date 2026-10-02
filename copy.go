@@ -46,7 +46,11 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(c.id, abs, containerPath)...)
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
 	return c.classify(ctx, err)
 }
 
@@ -77,6 +81,13 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err := checkCopyFileOpenCapability(); err != nil {
 		return nil, err
 	}
+
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return nil, err
+	}
 	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner); err != nil {
 		return nil, err
 	}
@@ -97,10 +108,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(c.id, containerPath, dst)...); err != nil {
+	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
 		return nil, c.classify(ctx, err)
 	}
 	if err := qCtx.Err(); err != nil {

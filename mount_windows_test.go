@@ -23,7 +23,7 @@ func TestWindowsBindMountUsesHostPathAndPOSIXTarget(t *testing.T) {
 
 	t.Setenv("DOCKER_HOST", "")
 	cfg := dockerTestConfig(t, WithMounts(mount))
-	if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+	if err := (dockerEngine{}).checkConfig(context.Background(), cfg); err != nil {
 		t.Fatalf("local Windows bind mount: %v", err)
 	}
 	args := (dockerEngine{}).runArgs(cfg, "redis:7-alpine", "")

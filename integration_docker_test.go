@@ -416,11 +416,12 @@ func TestIntegrationDockerPruneKeepsCreatedAndRunning(t *testing.T) {
 		}
 	})
 	const managedLabel = "com.github.hirokazumiyaji.container-go=true"
+	const creationLabel = "com.github.hirokazumiyaji.container-go.creation=0123456789abcdef"
 
-	runDockerCommand(t, "create", "--label", managedLabel, "--name", createdName, integrationAlpine)
-	runDockerCommand(t, "create", "--label", managedLabel, "--name", exitedName, integrationAlpine, "true")
+	runDockerCommand(t, "create", "--label", managedLabel, "--label", creationLabel, "--name", createdName, integrationAlpine)
+	runDockerCommand(t, "create", "--label", managedLabel, "--label", creationLabel, "--name", exitedName, integrationAlpine, "true")
 	runDockerCommand(t, "start", exitedName)
-	runDockerCommand(t, "run", "--detach", "--label", managedLabel, "--name", runningName,
+	runDockerCommand(t, "run", "--detach", "--label", managedLabel, "--label", creationLabel, "--name", runningName,
 		integrationAlpine, "sh", "-c", "while :; do sleep 3600; done")
 	waitDockerContainerState(t, createdName, "created")
 	waitDockerContainerState(t, exitedName, "exited")
@@ -837,9 +838,11 @@ func TestIntegrationDockerStaleHandlePreservesReplacement(t *testing.T) {
 	defer func() {
 		_ = newCtr.Terminate(context.Background())
 	}()
-	// Stale handle must refuse; replacement must survive.
-	if err := oldCtr.Terminate(ctx); err == nil {
-		t.Fatal("want error when stale handle deletes replacement")
+	// Docker's stale handle retains the old immutable ID. A second
+	// termination is therefore an idempotent no-op, while the
+	// same-name replacement must survive.
+	if err := oldCtr.Terminate(ctx); err != nil {
+		t.Fatalf("stale Docker Terminate = %v, want idempotent success", err)
 	}
 	if out, inspectErr := exec.Command("docker", "inspect", name).CombinedOutput(); inspectErr != nil {
 		t.Fatalf("replacement missing after stale Terminate: %s / %v", out, inspectErr)

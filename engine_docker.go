@@ -922,16 +922,17 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 	return len(images) > 0
 }
 
+// listReuseGroupArgs requests full container IDs: group prune verifies and
+// deletes by immutable ID, so names or truncated IDs would be skipped.
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerPruneIDs(data)
 }
 
 // nameConflict matches Docker's duplicate container name error.

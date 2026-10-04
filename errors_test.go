@@ -274,6 +274,17 @@ func TestDockerPreciseDeleteNotFoundIsContainerMissing(t *testing.T) {
 	}
 }
 
+func TestDockerCopyToContainerNotFoundSkipsWindowsDrive(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "docker",
+		Args:   []string{"cp", `C:\tmp\file`, dockerFixtureID + ":/tmp/file"},
+		Stderr: "Error response from daemon: No such container: " + dockerFixtureID,
+	}
+	if !isNotFoundFor(dockerEngine{}, err) {
+		t.Fatal("cp from a Windows drive path did not resolve the container target")
+	}
+}
+
 func TestLogsWrapsErrContainerNotFound(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

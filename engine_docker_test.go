@@ -219,6 +219,17 @@ func TestParseDockerVersionPair(t *testing.T) {
 	}
 }
 
+func TestDockerReuseGroupListsFullIDs(t *testing.T) {
+	e := dockerEngine{}
+	got := e.listReuseGroupArgs("group")
+	if !slices.Contains(got, "--no-trunc") || !slices.Contains(got, "{{.ID}}") || slices.Contains(got, "--quiet") {
+		t.Errorf("listReuseGroupArgs = %v, want non-truncated {{.ID}} output", got)
+	}
+	if _, err := e.parseReuseGroupIDs([]byte("group-member\n"), "group"); err == nil {
+		t.Error("parseReuseGroupIDs accepted a container name")
+	}
+}
+
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {

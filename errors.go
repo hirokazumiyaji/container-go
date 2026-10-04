@@ -163,7 +163,7 @@ func cliCommandTarget(command string, args []string) string {
 		}
 	case "cp":
 		for _, arg := range args {
-			if before, _, ok := strings.Cut(arg, ":"); ok && before != "" && !strings.Contains(before, string(os.PathSeparator)) {
+			if before, _, ok := strings.Cut(arg, ":"); ok && before != "" && !strings.Contains(before, string(os.PathSeparator)) && !isWindowsDriveLetter(before) {
 				return strings.Trim(strings.TrimSpace(before), `"'`)
 			}
 		}
@@ -191,6 +191,12 @@ func cliCommandTarget(command string, args []string) string {
 		}
 	}
 	return ""
+}
+
+// isWindowsDriveLetter reports whether s is the drive of a Windows host path
+// such as C:\tmp. Container names and IDs are never a single letter.
+func isWindowsDriveLetter(s string) bool {
+	return len(s) == 1 && ('a' <= s[0] && s[0] <= 'z' || 'A' <= s[0] && s[0] <= 'Z')
 }
 
 func cliOptionTakesValue(option string) bool {

@@ -67,6 +67,7 @@ func (r *staleHandleRunner) Run(_ context.Context, args ...string) ([]byte, []by
 
 func notFoundError(args []string) error {
 	return &cli.CLIError{
+		Binary:   "docker",
 		Args:     args,
 		ExitCode: 1,
 		Stderr:   "Error response from daemon: No such container: " + staleHandleUID,

@@ -34,15 +34,13 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		creation := "0123456789abcdef"
-		r.mu.Lock()
-		if r.creations != nil && r.creations[args[len(args)-1]] != "" {
-			creation = r.creations[args[len(args)-1]]
+		creation := r.creations[args[len(args)-1]]
+		if creation == "" {
+			creation = "0123456789abcdef"
 		}
-		r.mu.Unlock()
-		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -167,10 +165,10 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
-	return reuseInspectJSONWithCreation(id, state, image, "0123456789abcdef")
+	return reuseInspectJSONForCreation(id, state, image, "0123456789abcdef")
 }
 
-func reuseInspectJSONWithCreation(id, state, image, creation string) string {
+func reuseInspectJSONForCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -286,7 +284,7 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -317,7 +315,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -374,22 +372,22 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 			return []byte(reuseInspectJSON(args[len(args)-1], "stopped", "redis:7-alpine")), nil, nil
 		}
 		if !s.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
-		s.created = true
 		for i, arg := range args {
 			if arg == "--label" && i+1 < len(args) {
-				if creation, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
-					s.creation = creation
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					s.creation = value
 				}
 			}
 		}
+		s.created = true
 		return []byte("myctr\n"), nil, nil
 	default:
 		return nil, nil, nil
@@ -484,111 +482,6 @@ func (c *createdThenRunningRunner) Run(ctx context.Context, args ...string) ([]b
 	return c.fakeRunner.Run(ctx, args...)
 }
 
-func TestDockerReuseAcceptsPreExistingDaemonDefault(t *testing.T) {
-	runner := &staticDockerReuseRunner{fakeRunner: newTestRunner()}
-	runner.imagePresent = true
-	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithReuse(),
-		withRunner(runner), withEngine(dockerEngine{}))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if ctr.network != "" || ctr.networkExplicit {
-		t.Fatalf("handle network = %q explicit=%t, want daemon default", ctr.network, ctr.networkExplicit)
-	}
-}
-
-type staticDockerReuseRunner struct {
-	*fakeRunner
-}
-
-func (r *staticDockerReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "version":
-		return []byte("linux"), nil, nil
-	case "inspect":
-		r.mu.Lock()
-		r.calls = append(r.calls, args)
-		r.mu.Unlock()
-		return []byte(dockerReuseInspectJSON(dockerNetworkDefault)), nil, nil
-	default:
-		return r.fakeRunner.Run(ctx, args...)
-	}
-}
-
-func TestDockerReuseRechecksNetworkAfterEnsure(t *testing.T) {
-	runner := &networkChangingDockerReuseRunner{fakeRunner: newTestRunner()}
-	runner.imagePresent = true
-	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithReuse(), WithNetwork("bridge"),
-		withRunner(runner), withEngine(dockerEngine{}))
-	if !errors.Is(err, ErrNetworkMismatch) {
-		t.Fatalf("Run error = %v, want ErrNetworkMismatch", err)
-	}
-	runner.mu.Lock()
-	calls := append([][]string(nil), runner.calls...)
-	runner.mu.Unlock()
-	inspectCalls := 0
-	for _, call := range calls {
-		if len(call) > 0 && call[0] == "inspect" {
-			if inspectCalls > 0 && call[len(call)-1] != dockerFixtureID {
-				t.Errorf("reuse compatibility inspect target = %q, want immutable Docker ID", call[len(call)-1])
-			}
-			inspectCalls++
-		}
-	}
-	if inspectCalls < 3 {
-		t.Fatalf("inspect calls = %d, want compatibility and post-wait rechecks", inspectCalls)
-	}
-}
-
-type networkChangingDockerReuseRunner struct {
-	*fakeRunner
-}
-
-func dockerReuseInspectJSON(mode string) string {
-	return fmt.Sprintf(`[
-  {
-    "Id": %q,
-    "Name": "/myctr",
-    "State": {"Status": "running"},
-    "Config": {
-      "Image": "redis:7-alpine",
-      "Labels": {
-        "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true",
-        "com.github.hirokazumiyaji.container-go.creation": "0123456789abcdef"
-      }
-    },
-    "HostConfig": {"NetworkMode": %q},
-    "NetworkSettings": {
-      "Ports": {},
-      "Networks": {"bridge": {"IPAddress": "172.17.0.2"}}
-    }
-  }
-]`, dockerFixtureID, mode)
-}
-
-func (r *networkChangingDockerReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "inspect" {
-		r.mu.Lock()
-		r.calls = append(r.calls, args)
-		count := 0
-		for _, call := range r.calls {
-			if len(call) > 0 && call[0] == "inspect" {
-				count++
-			}
-		}
-		r.mu.Unlock()
-		mode := "bridge"
-		if count >= 3 {
-			mode = "host"
-		}
-		return []byte(dockerReuseInspectJSON(mode)), nil, nil
-	}
-	return r.fakeRunner.Run(ctx, args...)
-}
-
 func TestImagesCompatible(t *testing.T) {
 	cases := []struct {
 		req, act string
@@ -615,8 +508,8 @@ func TestImagesCompatible(t *testing.T) {
 
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}

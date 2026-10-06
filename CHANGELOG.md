@@ -68,6 +68,8 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Fixed
 
+- Remove anonymous Docker volumes from every managed deletion path while
+  preserving named volumes (#81).
 - Cleanup failures are no longer discarded. A failed-create, reuse
   inspect/copy rollback, or public `Cleanup` that could not remove the
   container now joins the cleanup failure onto the operation error, so

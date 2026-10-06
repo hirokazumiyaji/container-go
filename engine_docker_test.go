@@ -165,11 +165,14 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	if got, err := e.stopArgs("myctr", &d); err != nil || !slices.Equal(got, []string{"stop", "--time", "10", "myctr"}) {
 		t.Errorf("stopArgs = %v, %v", got, err)
 	}
-	if got := e.deleteArgs("myctr"); !slices.Equal(got, []string{"rm", "--force", "myctr"}) {
+	if got := e.deleteArgs("myctr"); !slices.Equal(got, []string{"rm", "--force", "--volumes", "myctr"}) {
 		t.Errorf("deleteArgs = %v", got)
 	}
 	if e.reaperSubcommand() != "rm" {
 		t.Errorf("reaperSubcommand = %q", e.reaperSubcommand())
+	}
+	if got := e.reaperDeleteFlags(); !slices.Equal(got, []string{"--volumes"}) {
+		t.Errorf("reaperDeleteFlags = %v", got)
 	}
 	if got := e.logsFollowArgs("myctr"); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
 		t.Errorf("logsFollowArgs = %v", got)
@@ -216,17 +219,33 @@ func TestParseDockerVersionPair(t *testing.T) {
 	}
 }
 
+func TestDockerReuseGroupListsFullIDs(t *testing.T) {
+	e := dockerEngine{}
+	got := e.listReuseGroupArgs("group")
+	if !slices.Contains(got, "--no-trunc") || !slices.Contains(got, "{{.ID}}") || slices.Contains(got, "--quiet") {
+		t.Errorf("listReuseGroupArgs = %v, want non-truncated {{.ID}} output", got)
+	}
+	if _, err := e.parseReuseGroupIDs([]byte("group-member\n"), "group"); err == nil {
+		t.Error("parseReuseGroupIDs accepted a container name")
+	}
+}
+
 func TestDockerParseStoppedManaged(t *testing.T) {
 	e := dockerEngine{}
 	if got := e.listArgs(); !slices.Contains(got, "--filter") {
 		t.Errorf("listArgs = %v, want daemon-side filters", got)
 	}
-	ids, err := e.parseStoppedManaged([]byte("one\ntwo\n\n"))
+	one := strings.Repeat("1", 64)
+	two := strings.Repeat("2", 64)
+	ids, err := e.parseStoppedManaged([]byte(one + "\n" + two + "\n\n"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(ids, []string{"one", "two"}) {
+	if !slices.Equal(ids, []string{one, two}) {
 		t.Errorf("ids = %v", ids)
+	}
+	if _, err := e.parseStoppedManaged([]byte("short\n")); err == nil {
+		t.Fatal("parseStoppedManaged accepted a short ID")
 	}
 }
 
@@ -449,9 +468,10 @@ func TestDockerEndpointAfterTerminationDoesNotUseCache(t *testing.T) {
 		t.Fatalf("Terminate: %v", err)
 	}
 	d.inspectError = &cli.CLIError{
+		Binary:   "docker",
 		Args:     []string{"inspect", dockerFixtureID},
 		ExitCode: 1,
-		Stderr:   "No such container: " + dockerFixtureID,
+		Stderr:   "Error response from daemon: No such container: " + dockerFixtureID,
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("Endpoint after Terminate = %v, want ErrContainerNotFound", err)

@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -111,8 +112,8 @@ func TestRunRollbackDeletesByImmutableIDWhenInspectFails(t *testing.T) {
 		t.Fatalf("err = %v, want wait failure with successful rollback", err)
 	}
 	// docker run printed the container ID; rollback needs no inspect.
-	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
-		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	if rm := d.callWith("rm"); !slices.Equal(rm, []string{"rm", "--force", "--volumes", dockerFixtureID}) {
+		t.Errorf("rm = %v, want volume cleanup by %s", rm, dockerFixtureID)
 	}
 }
 

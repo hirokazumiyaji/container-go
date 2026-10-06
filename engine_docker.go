@@ -37,6 +37,7 @@ const maxDockerStopSeconds int64 = math.MaxInt32
 //   - container missing: "error: no such object: …" (also historically
 //     "No such container" / "not found")
 const (
+	dockerDeleteVolumesFlag  = "--volumes"
 	dockerStderrConflict     = "conflict"
 	dockerStderrAlreadyInUse = "already in use"
 	dockerStderrName         = "name"
@@ -701,7 +702,7 @@ func (dockerEngine) stopArgs(id string, timeout *time.Duration) ([]string, error
 }
 
 func (dockerEngine) deleteArgs(id string) []string {
-	return []string{"rm", "--force", id}
+	return []string{"rm", "--force", dockerDeleteVolumesFlag, id}
 }
 
 func (dockerEngine) copyToArgs(id, hostPath, containerPath string) []string {
@@ -831,6 +832,8 @@ func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runne
 
 func (dockerEngine) reaperSubcommand() string { return "rm" }
 
+func (dockerEngine) reaperDeleteFlags() []string { return []string{dockerDeleteVolumesFlag} }
+
 func (dockerEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}
 	if envFile != "" {
@@ -871,15 +874,25 @@ func (dockerEngine) logsTailArgs(id string) []string {
 // status filters directly.
 func (dockerEngine) listArgs() []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + managedLabel + "=true",
 		"--filter", "status=exited",
-		"--format", "{{.Names}}",
+		"--filter", "status=dead",
 	}
 }
 
 func (dockerEngine) parseStoppedManaged(data []byte) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerPruneIDs(data)
+}
+
+func parseDockerPruneIDs(data []byte) ([]string, error) {
+	ids := splitNonEmptyLines(data)
+	for _, id := range ids {
+		if !dockerIDRE.MatchString(id) {
+			return nil, fmt.Errorf("docker ps returned invalid container ID %q", id)
+		}
+	}
+	return ids, nil
 }
 
 func (dockerEngine) imageInspectArgs(image, platform string) []string {
@@ -909,16 +922,17 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 	return len(images) > 0
 }
 
+// listReuseGroupArgs requests full container IDs: group prune verifies and
+// deletes by immutable ID, so names or truncated IDs would be skipped.
 func (dockerEngine) listReuseGroupArgs(group string) []string {
 	return []string{
-		"ps", "--all", "--quiet",
+		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",
 		"--filter", "label=" + reuseGroupLabel + "=" + group,
-		"--format", "{{.Names}}",
 	}
 }
 
 func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) {
-	return splitNonEmptyLines(data), nil
+	return parseDockerPruneIDs(data)
 }
 
 // nameConflict matches Docker's duplicate container name error.
@@ -933,13 +947,46 @@ func (dockerEngine) nameConflict(err error) bool {
 
 // containerMissing matches a CLI failure for an absent container.
 func (dockerEngine) containerMissing(err error) bool {
-	s, ok := dockerCLIStderr(err)
+	if !cliErrorBelongsTo(err, "docker") {
+		return false
+	}
+	command, args, ok := cliCommandParts(err)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, dockerStderrNotFound) ||
-		strings.Contains(s, dockerStderrNoSuchObj) ||
-		strings.Contains(s, dockerStderrNoSuchCtr)
+	target := cliCommandTarget(command, args)
+	if target == "" {
+		return false
+	}
+	switch command {
+	case "inspect":
+		return hasCLIErrorLine(err, func(line string) bool {
+			if rest, ok := strings.CutPrefix(line, dockerStderrNoSuchObj+":"); ok && cliTargetListMatches(rest, target) {
+				return true
+			}
+			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
+			return ok && cliTargetListMatches(rest, target)
+		})
+	case "rm", "delete", "stop", "exec", "logs", "cp":
+		if hasCLIErrorLine(err, func(line string) bool {
+			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
+			return ok && cliTargetListMatches(rest, target)
+		}) {
+			return true
+		}
+		// Older Docker clients used a target-qualified generic phrase for
+		// rm. Keep that narrow fallback; it is not used for exec/logs,
+		// whose stderr may be application output.
+		if command == "rm" || command == "delete" {
+			return hasCLIErrorLine(err, func(line string) bool {
+				rest, ok := strings.CutPrefix(line, dockerStderrNotFound+":")
+				return ok && cliTargetListMatches(strings.TrimSpace(rest), target)
+			})
+		}
+		return false
+	default:
+		return false
+	}
 }
 
 func dockerCLIStderr(err error) (string, bool) {

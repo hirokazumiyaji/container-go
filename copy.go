@@ -52,7 +52,7 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 		return err
 	}
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
-	return c.classify(ctx, err)
+	return wrapNotFoundFor(c.eng, c.classify(ctx, err))
 }
 
 // CopyFileFromContainer copies one regular file out of the running
@@ -110,7 +110,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
-		return nil, c.classify(ctx, err)
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	if err := qCtx.Err(); err != nil {
 		return nil, err

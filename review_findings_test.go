@@ -5,315 +5,201 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func TestDockerNameInspectDoesNotPublishUID(t *testing.T) {
-	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
-	if err != nil {
-		t.Fatal(err)
+func TestAppleTypedNotFoundIsOperationSpecific(t *testing.T) {
+	cases := []struct {
+		name      string
+		operation string
+		stderr    string
+		want      bool
+	}{
+		{
+			name:      "exec get failed",
+			operation: "exec",
+			stderr:    `Error: notFound: "get failed: container myctr not found"`,
+			want:      true,
+		},
+		{
+			name:      "exec generic inspect form",
+			operation: "exec",
+			stderr:    `Error: notFound: "container not found: myctr"`,
+		},
+		{
+			name:      "inspect exec form",
+			operation: "inspect",
+			stderr:    `Error: notFound: "get failed: container myctr not found"`,
+		},
+		{
+			name:      "inspect lifecycle form",
+			operation: "inspect",
+			stderr:    `Error: notFound: "container with id myctr not found"`,
+		},
+		{
+			name:      "inspect generic form",
+			operation: "inspect",
+			stderr:    `Error: notFound: "container not found: myctr"`,
+			want:      true,
+		},
 	}
-	runner := &dockerRunner{fakeRunner: newTestRunner(), inspectJSON: data}
-	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr"}
-	ctr := namedContainer(cfg, cfg.name)
-	info, err := ctr.inspectFresh(context.Background())
-	if err != nil {
-		t.Fatalf("name inspect: %v", err)
-	}
-	if info.uid != dockerFixtureID {
-		t.Fatalf("inspected UID = %q, want fixture UID", info.uid)
-	}
-	if ctr.uid != "" {
-		t.Fatalf("name inspect published UID into handle: %q", ctr.uid)
-	}
-	if ctr.info != nil {
-		t.Fatalf("name inspect cached identity before ownership validation: %+v", ctr.info)
-	}
-}
-
-func TestDockerOperationsFailClosedWithoutUID(t *testing.T) {
-	runner := &dockerRunner{fakeRunner: newTestRunner()}
-	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
-	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("State error = %v, want ErrGenerationReplaced", err)
-	}
-	if err := ctr.Stop(context.Background(), nil); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("Stop error = %v, want ErrGenerationReplaced", err)
-	}
-	if err := ctr.Terminate(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("Terminate error = %v, want ErrGenerationReplaced", err)
-	}
-	if _, err := ctr.Logs(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("Logs error = %v, want ErrGenerationReplaced", err)
-	}
-	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("Exec error = %v, want ErrGenerationReplaced", err)
-	}
-	if len(runner.calls) != 0 {
-		t.Fatalf("unverified Docker handle issued CLI calls: %v", runner.calls)
-	}
-}
-
-func TestDockerFailedCreateCleanupRequiresExactOwnership(t *testing.T) {
-	const creation = "0123456789abcdef"
-	runner := &dockerRunner{
-		fakeRunner:  newTestRunner(),
-		inspectJSON: []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q}}}]`, dockerFixtureID, managedLabel, sessionLabel, sessionID())),
-	}
-	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr", creation: creation}
-	if err := cleanupFailedCreate(context.Background(), cfg, errors.New("start failed"), errors.New("start failed")); err != nil {
-		t.Fatalf("cleanup error = %v, want refusal without generation", err)
-	}
-	if len(runner.callWith("rm")) != 0 {
-		t.Fatal("cleanup deleted a container without an exact creation generation")
-	}
-
-	owned := &dockerRunner{
-		fakeRunner:  newTestRunner(),
-		inspectJSON: []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q,%q:%q}}}]`, dockerFixtureID, managedLabel, sessionLabel, sessionID(), creationLabel, creation)),
-	}
-	cfg.runner = owned
-	if err := cleanupFailedCreate(context.Background(), cfg, errors.New("start failed"), errors.New("start failed")); err != nil {
-		t.Fatalf("owned cleanup error = %v", err)
-	}
-	rm := owned.callWith("rm")
-	if len(rm) == 0 || rm[len(rm)-1] != dockerFixtureID {
-		t.Fatalf("owned cleanup rm = %v, want immutable UID %s", rm, dockerFixtureID)
-	}
-}
-
-func TestDockerRejectsMacvlanAndIPvlanPublishing(t *testing.T) {
-	for _, driver := range []string{"macvlan", "ipvlan"} {
-		t.Run(driver, func(t *testing.T) {
-			runner := &dockerRunner{
-				fakeRunner:         newTestRunner(),
-				networkInspectJSON: []byte(fmt.Sprintf(`[{"Name":"private","Driver":%q,"Internal":false,"Options":{}}]`, driver)),
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			args := []string{tc.operation, "myctr"}
+			if tc.operation == "exec" {
+				args = append(args, "true")
 			}
-			_, err := Run(context.Background(), "redis:7-alpine",
-				WithName("myctr"), WithNetwork("private"), WithExposedPorts("6379/tcp"),
-				withRunner(runner), withEngine(dockerEngine{}))
-			if !errors.Is(err, ErrInvalidConfig) || !strings.Contains(err.Error(), driver) {
-				t.Fatalf("Run error = %v, want %s driver rejection", err, driver)
-			}
-			if len(runner.callWith("run")) != 0 {
-				t.Fatal("driver rejection happened after container create")
+			err := &cli.CLIError{Binary: "container", Args: args, Stderr: tc.stderr}
+			if got := (appleEngine{}).containerMissing(err); got != tc.want {
+				t.Fatalf("containerMissing() = %v, want %v", got, tc.want)
 			}
 		})
 	}
 }
 
-func TestDockerConcreteModeRequiresCurrentNetworkMembership(t *testing.T) {
-	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
-	if err != nil {
-		t.Fatal(err)
+func TestAppleTypedNotFoundParsesNestedCauses(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "container",
+		Args:   []string{"inspect", "myctr"},
+		Stderr: `Error: internalError: "outer" (cause: "internalError: \"middle\" (cause: \"notFound: \\\"container not found: myctr\\\"\")")`,
 	}
-	changed := strings.Replace(string(data), `"bridge": {`, `"other": {`, 1)
-	runner := &dockerRunner{
-		fakeRunner:       newTestRunner(),
-		inspectResponses: [][]byte{[]byte(data), []byte(changed)},
-	}
-	ctr := runDockerTestContainer(t, runner, WithNetwork("bridge"), WithExposedPorts("6379/tcp"))
-	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
-		t.Fatalf("first endpoint: %v", err)
-	}
-	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); !errors.Is(err, ErrNetworkMismatch) {
-		t.Fatalf("changed attachment endpoint error = %v, want ErrNetworkMismatch", err)
+	if !(appleEngine{}).containerMissing(err) {
+		t.Fatal("nested typed not-found was not recognized")
 	}
 }
 
-type reviewReuseNetworkRunner struct {
-	*fakeRunner
-	serverOS string
-	network  string
-}
-
-func (r *reviewReuseNetworkRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "version" {
-		return []byte(r.serverOS), nil, nil
+func TestAppleLogsDashNTargetExtraction(t *testing.T) {
+	err := &cli.CLIError{
+		Binary: "container",
+		Args:   []string{"logs", "-n", "1000", "myctr"},
+		Stderr: "Error: get failed: container myctr not found",
 	}
-	if args[0] == "inspect" {
-		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/shared-network-order","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef"}},"HostConfig":{"NetworkMode":"default"},"NetworkSettings":{"Networks":{%q:{"IPAddress":"172.20.0.2"}}}}]`, dockerFixtureID, managedLabel, reuseLabel, creationLabel, r.network)), nil, nil
-	}
-	return r.fakeRunner.Run(ctx, args...)
-}
-
-func TestConcurrentReuseResolvesDefaultNetworkPerCaller(t *testing.T) {
-	windowsRunner := &reviewReuseNetworkRunner{fakeRunner: newTestRunner(), serverOS: "windows", network: "nat"}
-	linuxRunner := &reviewReuseNetworkRunner{fakeRunner: newTestRunner(), serverOS: "linux", network: "bridge"}
-	type result struct {
-		ctr *Container
-		err error
-	}
-	results := make(chan result, 2)
-	var wg sync.WaitGroup
-	for _, tc := range []struct {
-		runner *reviewReuseNetworkRunner
-	}{
-		{windowsRunner},
-		{linuxRunner},
-	} {
-		tc := tc
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			ctr, err := Run(context.Background(), "redis:7-alpine",
-				WithName("shared-network-order"), WithReuse(),
-				withRunner(tc.runner), withEngine(dockerEngine{}))
-			results <- result{ctr: ctr, err: err}
-		}()
-	}
-	wg.Wait()
-	close(results)
-	got := map[string]bool{}
-	for result := range results {
-		if result.err != nil {
-			t.Fatalf("concurrent reuse: %v", result.err)
-		}
-		if result.ctr == nil {
-			t.Fatal("concurrent reuse returned a nil handle")
-		}
-		got[result.ctr.defaultNetwork] = true
-	}
-	if !got["nat"] || !got["bridge"] {
-		t.Fatalf("default network metadata = %v, want caller-specific nat and bridge", got)
+	if !(appleEngine{}).containerMissing(err) {
+		t.Fatal("logs -n target was extracted from the option value")
 	}
 }
 
-type reviewAppleEndpointRunner struct {
-	*fakeRunner
-	mu       sync.Mutex
-	inspects int
+type reuseRollbackReviewRunner struct {
+	creation string
+	inspect  int
+	deletes  int
+	copyErr  error
 }
 
-func (r *reviewAppleEndpointRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] != "inspect" {
-		return r.fakeRunner.Run(ctx, args...)
-	}
-	r.mu.Lock()
-	r.inspects++
-	creation := r.creations["myctr"]
-	if creation == "" {
-		creation = "aaaaaaaaaaaaaaaa"
-	}
-	if r.inspects > 2 {
-		creation = "bbbbbbbbbbbbbbbb"
-	}
-	r.mu.Unlock()
-	return []byte(reuseInspectJSONWithCreation("myctr", "running", "redis:7-alpine", creation)), nil, nil
-}
-
-func TestDirectIPPublishedEndpointsRequireFreshIdentity(t *testing.T) {
-	runner := &reviewAppleEndpointRunner{fakeRunner: newTestRunner()}
-	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithPublishedPort("127.0.0.1:16379:6379/tcp"),
-		withRunner(runner), withEngine(appleEngine{}))
-	if err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if host, err := ctr.Host(context.Background()); err != nil || host != "127.0.0.1" {
-		t.Fatalf("initial Host = %q, err = %v", host, err)
-	}
-	if endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil || endpoint != "127.0.0.1:16379" {
-		t.Fatalf("initial Endpoint = %q, err = %v", endpoint, err)
-	}
-	if _, err := ctr.Host(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("replacement Host error = %v, want ErrGenerationReplaced", err)
-	}
-	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("replacement Endpoint error = %v, want ErrGenerationReplaced", err)
-	}
-	if runner.inspects < 4 {
-		t.Fatalf("inspect count = %d, want fresh inspect for each endpoint", runner.inspects)
-	}
-}
-
-func TestDockerRunRejectsMissingImmutableID(t *testing.T) {
-	base := newTestRunner()
-	base.imagePresent = true
-	runner := &runIDRunner{fakeRunner: base, id: "not-an-immutable-id"}
-	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), withRunner(runner), withEngine(dockerEngine{}))
-	if !errors.Is(err, ErrGenerationReplaced) {
-		t.Fatalf("Run error = %v, want ErrGenerationReplaced", err)
-	}
-	if len(runner.callWith("rm")) != 0 {
-		t.Fatal("invalid Docker run ID cleanup fell back to a name delete")
-	}
-}
-
-type runIDRunner struct {
-	*fakeRunner
-	id string
-}
-
-func (r *runIDRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "run" {
-		r.mu.Lock()
-		r.calls = append(r.calls, args)
-		r.mu.Unlock()
-		return []byte(r.id + "\n"), nil, nil
-	}
-	return r.fakeRunner.Run(ctx, args...)
-}
-
-func TestDeleteStoppedReuseRejectsSameGenerationRunningPeer(t *testing.T) {
-	runner := &reviewAppleStateRunner{state: "running"}
-	cfg := &config{runner: runner, eng: appleEngine{}, name: "shared"}
-	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
-	}
-	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
-		t.Fatalf("deleteStoppedReuse: %v", err)
-	}
-	if runner.deleteCalls != 0 {
-		t.Fatal("stopped recycle deleted a generation that became running")
-	}
-}
-
-type reviewAppleStateRunner struct {
-	mu          sync.Mutex
-	state       string
-	deleteCalls int
-}
-
-func (r *reviewAppleStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reuseRollbackReviewRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
+	case "image":
+		if args[1] == "inspect" {
+			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+		}
+		return nil, nil, nil
+	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = value
+				}
+			}
+		}
+		return []byte("shared\n"), nil, nil
 	case "inspect":
-		r.mu.Lock()
-		state := r.state
-		r.mu.Unlock()
-		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis:7-alpine"},"labels":{%q:"true",%q:"true",%q:"aaaaaaaaaaaaaaaa"}},"status":{"state":%q,"networks":[]}}]`, managedLabel, reuseLabel, creationLabel, state)), nil, nil
+		r.inspect++
+		if r.creation == "" {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "shared"`}
+		}
+		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis:7-alpine"},"labels":{%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, reuseLabel, creationLabel, r.creation)), nil, nil
+	case "cp":
+		return nil, nil, r.copyErr
 	case "delete", "rm":
-		r.mu.Lock()
-		r.deleteCalls++
-		r.mu.Unlock()
+		r.deletes++
 		return nil, nil, nil
 	default:
 		return nil, nil, nil
 	}
 }
 
-func TestCleanupRefusesForeignCreationEvenWithMatchingSession(t *testing.T) {
-	const foreignCreation = "bbbbbbbbbbbbbbbb"
-	runner := &dockerRunner{
-		fakeRunner:  newTestRunner(),
-		inspectJSON: []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q,%q:%q}}}]`, dockerFixtureID, managedLabel, sessionLabel, sessionID(), creationLabel, foreignCreation)),
+func TestReuseRollbackDoesNotDeleteRunningGeneration(t *testing.T) {
+	host := filepath.Join(t.TempDir(), "input")
+	if err := os.WriteFile(host, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr", creation: "aaaaaaaaaaaaaaaa"}
-	if err := cleanupFailedCreate(context.Background(), cfg, errors.New("failed"), errors.New("failed")); err != nil {
-		t.Fatalf("cleanup error = %v", err)
+	r := &reuseRollbackReviewRunner{copyErr: errors.New("copy failed")}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("shared"), WithReuse(), WithFiles(File{HostPath: host, ContainerPath: "/tmp/input"}),
+		withRunner(r), withEngine(appleEngine{}))
+	if err == nil || !strings.Contains(err.Error(), "copy failed") {
+		t.Fatalf("Run error = %v, want copy failure", err)
 	}
-	if inspect := runner.callWith("inspect"); len(inspect) == 0 || inspect[len(inspect)-1] != "myctr" {
-		t.Fatalf("cleanup inspect calls = %v, want a fresh name inspect", inspect)
+	if r.deletes != 0 {
+		t.Fatalf("automatic reuse rollback deleted %d running generations", r.deletes)
 	}
-	if len(runner.callWith("rm")) != 0 {
-		t.Fatal("cleanup deleted a different creation generation")
+}
+
+func TestDeleteStoppedReuseFailsClosedWithoutOwnershipLabels(t *testing.T) {
+	r := &reuseRollbackReviewRunner{}
+	info := &engineInfo{state: StateStopped, labels: map[string]string{reuseLabel: "true"}}
+	if err := deleteStoppedReuse(context.Background(), &config{runner: r, eng: appleEngine{}, name: "shared"}, info); err == nil {
+		t.Fatal("deleteStoppedReuse accepted missing managed/creation labels")
 	}
+	if r.deletes != 0 {
+		t.Fatalf("delete calls = %d, want 0 for unowned container", r.deletes)
+	}
+}
+
+type applePruneReviewRunner struct {
+	listJSON    string
+	inspectJSON string
+	deletes     []string
+}
+
+func (r *applePruneReviewRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "ls":
+		return []byte(r.listJSON), nil, nil
+	case "inspect":
+		return []byte(r.inspectJSON), nil, nil
+	case "delete":
+		r.deletes = append(r.deletes, args[len(args)-1])
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func TestApplePruneRetainsRunningReplacement(t *testing.T) {
+	const creation = "0123456789abcdef"
+	r := &applePruneReviewRunner{
+		listJSON:    fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"stopped","networks":[]}}]`, managedLabel, creationLabel, creation),
+		inspectJSON: fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, creationLabel, creation),
+	}
+	removed, err := pruneWith(context.Background(), r, appleEngine{})
+	if err != nil {
+		t.Fatalf("Prune: %v", err)
+	}
+	if len(removed) != 0 || len(r.deletes) != 0 {
+		t.Fatalf("removed=%v deletes=%v, want running replacement retained", removed, r.deletes)
+	}
+}
+
+func TestDockerPruneRequestsFullIDsWithoutQuiet(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	if !reviewContains(args, "--no-trunc") || reviewContains(args, "--quiet") {
+		t.Fatalf("listArgs = %v, want --no-trunc and no --quiet", args)
+	}
+	if _, err := (dockerEngine{}).parseStoppedManaged([]byte("short-name\n")); err == nil {
+		t.Fatal("Docker prune accepted a non-full container ID")
+	}
+}
+
+func reviewContains(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
 }

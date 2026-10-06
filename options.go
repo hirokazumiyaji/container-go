@@ -386,7 +386,8 @@ type MountType int
 const (
 	// MountBind mounts a host directory (virtiofs).
 	MountBind MountType = iota
-	// MountVolume mounts a named volume.
+	// MountVolume mounts a named volume. Docker managed cleanup preserves
+	// named volumes, including volumes backed by a custom driver.
 	MountVolume
 	// MountTmpfs mounts an in-memory filesystem.
 	MountTmpfs
@@ -414,7 +415,7 @@ func (m Mount) validate() error {
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volume lifecycle is backend-specific", m.Target)
 		}
 	case MountTmpfs:
 		if m.Source != "" {

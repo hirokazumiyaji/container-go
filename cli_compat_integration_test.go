@@ -234,7 +234,7 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _, _ = r.Run(context.Background(), "rm", "--force", name)
+		_, _, _ = r.Run(context.Background(), "rm", "--force", "--volumes", name)
 	})
 
 	_, _, conflictErr := r.Run(ctx, "run", "-d", "--name", name, integrationRedis)

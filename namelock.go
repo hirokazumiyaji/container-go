@@ -32,16 +32,23 @@ func nameLockPath(name string) (string, error) {
 	return filepath.Join(dir, hex.EncodeToString(digest[:])+".lock"), nil
 }
 
-// nameLockDir returns a private directory below the user's cache
-// directory. It deliberately does not use os.TempDir: separate processes
-// commonly have different TMPDIR values but must still coordinate on the
-// same host/user lock.
+// nameLockDir returns a private directory scoped to the current user. It
+// deliberately does not use os.TempDir: separate processes commonly have
+// different TMPDIR values but must still coordinate on the same host/user
+// lock. Using /tmp directly ensures processes with different TMPDIR settings
+// share the same lock namespace.
 func nameLockDir() (string, error) {
-	cacheDir, err := os.UserCacheDir()
-	if err != nil {
-		return "", fmt.Errorf("find user cache directory: %w", err)
+	if override := os.Getenv("CONTAINERGO_LOCK_DIR"); override != "" {
+		if err := ensurePrivateDir(override); err != nil {
+			return "", err
+		}
+		return override, nil
 	}
-	appDir := filepath.Join(cacheDir, "container-go")
+	base := "/tmp"
+	if target, err := filepath.EvalSymlinks(base); err == nil {
+		base = target
+	}
+	appDir := filepath.Join(base, fmt.Sprintf("container-go-%d", os.Geteuid()))
 	lockDir := filepath.Join(appDir, "locks")
 	for _, dir := range []string{appDir, lockDir} {
 		if err := ensurePrivateDir(dir); err != nil {

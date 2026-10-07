@@ -221,3 +221,29 @@ func TestLogsDefaultsToUnbounded(t *testing.T) {
 		t.Errorf("default Logs must not bound: %v", joined)
 	}
 }
+
+func TestLogsWithOptionsHoldsLockUntilClose(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	rc, err := ctr.Logs(context.Background())
+	if err != nil {
+		t.Fatalf("Logs: %v", err)
+	}
+	tryCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	unlock, err := lockName(tryCtx, ctr.id)
+	if err == nil {
+		unlock()
+		t.Fatal("expected lockName to block or fail while Logs stream is open")
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	openCtx, openCancel := context.WithTimeout(context.Background(), time.Second)
+	defer openCancel()
+	unlock, err = lockName(openCtx, ctr.id)
+	if err != nil {
+		t.Fatalf("lockName after Close: %v", err)
+	}
+	unlock()
+}

@@ -44,7 +44,6 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	args := c.eng.logsArgs(target, false)
@@ -54,11 +53,13 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
 	if err != nil {
+		unlock()
 		return nil, wrapNotFound(c.classify(ctx, err))
 	}
 	// docker logs splits the container's streams across the CLI's
 	// stdout and stderr; a snapshot carries both.
-	return io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))), nil
+	reader := io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)))
+	return newLockedReadCloser(ctx, reader, unlock), nil
 }
 
 // FollowLogs streams the container's log output until Close is called

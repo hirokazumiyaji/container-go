@@ -20,11 +20,15 @@ func keepContainers() bool {
 // TerminateContainer removes the container. It is nil-safe so it can be
 // deferred before the error check on Run. Shared WithReuse handles are
 // left alone; call ctr.Terminate explicitly to remove a reused container.
+// The complete operation, including the Apple name-lock wait, is bounded
+// by terminateTimeout so a stuck peer cannot stall test cleanup forever.
 func TerminateContainer(ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	return ctr.Terminate(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+	defer cancel()
+	return ctr.Terminate(ctx)
 }
 
 type cleanupTB interface {

@@ -30,6 +30,13 @@ const (
 	runTimeout = 10 * time.Minute
 )
 
+var (
+	// terminateTimeout bounds the complete generation-checked termination,
+	// including waiting for another process' name lock. It is a var so tests
+	// can exercise the bounded cleanup contract without a long wait.
+	terminateTimeout = queryTimeout
+)
+
 // contextLock is a zero-value mutex whose acquisition can be canceled.
 // It protects identity publication and serializes backend inspects without
 // allowing a canceled caller to wait indefinitely for a long inspect.

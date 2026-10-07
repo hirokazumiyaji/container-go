@@ -18,8 +18,7 @@ import (
 // run, then serves a reused-container inspect payload.
 type reuseCreateRunner struct {
 	*fakeRunner
-	created    atomic.Bool
-	reuseGroup string
+	created atomic.Bool
 }
 
 func newReuseCreateRunner() *reuseCreateRunner {
@@ -33,16 +32,15 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		created := r.created.Load()
-		group := r.reuseGroup
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		creation := r.creations[args[len(args)-1]]
 		if creation == "" {
 			creation = "0123456789abcdef"
 		}
-		return []byte(reuseInspectJSONWithCreationAndGroup(args[len(args)-1], "running", "redis:7-alpine", creation, group)), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -67,7 +65,6 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 
 func TestReuseAddsLabels(t *testing.T) {
 	f := newReuseCreateRunner()
-	f.reuseGroup = "integration"
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithReuseGroup("integration"),
 		withRunner(f), withEngine(appleEngine{}))
@@ -168,19 +165,10 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
-	return reuseInspectJSONWithCreation(id, state, image, "0123456789abcdef")
+	return reuseInspectJSONForCreation(id, state, image, "0123456789abcdef")
 }
 
-func reuseInspectJSONWithCreation(id, state, image, creation string) string {
-	return reuseInspectJSONWithCreationAndGroup(id, state, image, creation, "")
-}
-
-func reuseInspectJSONWithCreationAndGroup(id, state, image, creation, group string) string {
-	groupLabel := ""
-	if group != "" {
-		groupLabel = fmt.Sprintf(`,
-        %q: %q`, reuseGroupLabel, group)
-	}
+func reuseInspectJSONForCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -191,7 +179,7 @@ func reuseInspectJSONWithCreationAndGroup(id, state, image, creation, group stri
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
         "com.github.hirokazumiyaji.container-go.reuse": "true",
-        "com.github.hirokazumiyaji.container-go.creation": %q%s
+        "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
     "status": {
@@ -199,7 +187,7 @@ func reuseInspectJSONWithCreationAndGroup(id, state, image, creation, group stri
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, creation, groupLabel, state)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {
@@ -296,7 +284,7 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -327,7 +315,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -335,7 +323,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 		n.createAttempts++
 		n.seenNotFound.Store(true)
 		return nil, nil, &cli.CLIError{
-			Binary: "container", Args: args, ExitCode: 1,
+			Args: args, ExitCode: 1,
 			Stderr: "Error: container with ID myctr not found\n",
 		}
 	}
@@ -384,19 +372,14 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 			return []byte(reuseInspectJSON(args[len(args)-1], "stopped", "redis:7-alpine")), nil, nil
 		}
 		if !s.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		creation := s.creation
-		if creation == "" {
-			creation = "0123456789abcdef"
-		}
-		return []byte(reuseInspectJSONWithCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
-		s.created = true
 		for i, arg := range args {
 			if arg == "--label" && i+1 < len(args) {
 				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
@@ -404,6 +387,7 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 				}
 			}
 		}
+		s.created = true
 		return []byte("myctr\n"), nil, nil
 	default:
 		return nil, nil, nil
@@ -529,8 +513,6 @@ func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}
-	f.inspectJSON = strings.Replace(reuseInspectJSONWithCreation("g1", "running", "redis:7-alpine", "0123456789abcdef"),
-		`"`+reuseLabel+`": "true",`, `"`+reuseLabel+`": "true", "`+reuseGroupLabel+`": "integration",`, 1)
 	removed, err := pruneReuseGroupWith(context.Background(), f, appleEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("PruneReuseGroup: %v", err)

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -15,53 +14,6 @@ import (
 // share a name into one ensure operation. Each caller still applies its
 // own compatibility check and wait strategy afterward.
 var reuseFlights flightGroup[*Container]
-
-func waitReusePoll(ctx context.Context) error {
-	timer := time.NewTimer(reusePollInterval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
-}
-
-func waitReuseReady(ctx context.Context, cfg *config, ctr *Container) (*engineInfo, error) {
-	readyCtx, cancel := withMaxTimeout(ctx, reuseAttachTimeout)
-	defer cancel()
-	for {
-		info, err := ctr.inspectFresh(readyCtx)
-		if err != nil {
-			return nil, err
-		}
-		if info.state == StateRunning && reuseEndpointMetadataReady(info, cfg) {
-			return info, nil
-		}
-		if err := waitReusePoll(readyCtx); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for running ports: %w", cfg.name, err)
-			}
-			return nil, err
-		}
-	}
-}
-
-func validateReuseBaseIdentity(eng engine, base *Container, name string) error {
-	if base == nil {
-		return fmt.Errorf("reuse %s: missing base handle", name)
-	}
-	if !requiresImmutableID(eng) {
-		return nil
-	}
-	if !validImmutableID(eng, base.uid) {
-		return fmt.Errorf("reuse %s: refusing unverified Docker handle without an immutable ID", name)
-	}
-	if !validCreationID(base.creation) {
-		return fmt.Errorf("reuse %s: refusing unverified Docker handle without a valid creation generation", name)
-	}
-	return nil
-}
 
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	key := cfg.eng.name() + "\x00" + cfg.name
@@ -76,115 +28,61 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		return nil, err
 	}
 
-	// Docker operations must begin with an already-bound identity from
-	// the create path. A name-addressed inspect is allowed to inform
-	// compatibility checks, but it cannot supply either the UID or the
-	// generation for a handle returned to callers.
-	if err := validateReuseBaseIdentity(cfg.eng, base, cfg.name); err != nil {
+	// The ensure result may have been inspected before a peer changed
+	// network or port state. Once Docker has supplied an immutable ID,
+	// every compatibility inspect must target that ID rather than the
+	// reusable name.
+	info, err := inspectReuseBase(ctx, base, cfg)
+	if err != nil {
 		return nil, err
 	}
-	creation := base.creation
-	if creation == "" && !requiresImmutableID(cfg.eng) && base.info != nil {
-		creation = base.info.labels[creationLabel]
-	}
-	ctr := &Container{
-		id:        base.id,
-		runner:    base.runner,
-		eng:       base.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		info:      base.info,
-		creation:  creation,
-		uid:       base.uid,
-	}
-	info := base.info
-	if info == nil {
-		info, err = ctr.inspectFresh(ctx)
-		if err != nil {
-			return nil, err
-		}
-	}
-	// The ensure path already waited for running state. Only perform an
-	// additional poll when the list-time snapshot does not yet contain all
-	// requested endpoint metadata; this preserves the baseline inspect
-	// contract for ordinary ready containers while closing post-start
-	// address/binding races.
-	if !reuseEndpointMetadataReady(info, cfg) {
-		info, err = waitReuseReady(ctx, cfg, ctr)
-		if err != nil {
-			return nil, err
-		}
+	if err := attachDefaultNetworkForConfig(ctx, cfg, info); err != nil {
+		return nil, err
 	}
 	if err := checkReuseCompat(info, image, cfg); err != nil {
 		return nil, err
 	}
-	ctr.mu.Lock()
-	ctr.info = info
-	ctr.mu.Unlock()
-	ctr.inspectMu.Lock()
-	ctr.creation = info.labels[creationLabel]
-	// Do not bind info.uid from a name-addressed inspect here. A base
-	// handle with no verified UID (for example, after malformed run
-	// output) must not acquire a replacement UID merely because this
-	// inspect passed compatibility checks. A UID already verified by the
-	// ensure path remains on ctr.uid; otherwise keep the handle unbound
-	// and fail closed for backend operations.
-	ctr.inspectMu.Unlock()
+
+	ctr := &Container{
+		id:              base.id,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		defaultNetwork:  info.defaultNetwork,
+		reused:          true,
+		info:            immutableInfo(info),
+		creation:        info.labels[creationLabel],
+		uid:             info.uid,
+	}
 	if err := reuseWait(ctx, cfg, ctr); err != nil {
 		return nil, err
 	}
-	// Readiness can outlive the generation inspected by the ensure path.
-	// Re-inspect immediately before returning and refuse to hand out a
-	// handle for a different, unowned, or no-longer-running object. Apple
-	// keeps the stable name lock across this final inspect so the reaper
-	// cannot delete and recreate the name between verification and
-	// publication of the handle.
-	finalTimeout := reuseFinalVerifyTimeout
-	if reuseAttachTimeout > 0 && reuseAttachTimeout < finalTimeout {
-		finalTimeout = reuseAttachTimeout
-	}
-	finalCtx, finalCancel := withMaxTimeout(ctx, finalTimeout)
-	defer finalCancel()
-	unlock, err := lockReuseFinal(finalCtx, cfg)
+
+	// A readiness wait can outlive the generation returned by the
+	// ensure. Re-inspect by the immutable ID and repeat compatibility checks
+	// before exposing the handle.
+	fresh, err := ctr.inspectDynamic(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
-	}
-	defer unlock()
-	var fresh *engineInfo
-	for {
-		fresh, err = ctr.inspectFreshLocked(finalCtx)
-		if err != nil {
-			// inspectFreshLocked preserves the replacement and backend
-			// not-found causes for a reused handle.
-			return nil, fmt.Errorf("reuse %s: verify before return: %w", cfg.name, err)
+		if isNotFound(err) {
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 		}
-		if err := sameContainerIdentity(cfg.eng, info, fresh); err != nil {
-			return nil, fmt.Errorf("reuse %s: %w", cfg.name, err)
-		}
-		if reuseEndpointMetadataReady(fresh, cfg) || fresh.state != StateRunning {
-			break
-		}
-		// The final inspect can race the backend's network publication just
-		// like the pre-readiness inspect. Keep the name lock while retrying
-		// so an incomplete IP/binding snapshot is never published as the
-		// handle's cached baseline.
-		if err := checkReuseOwned(fresh, image, cfg); err != nil {
-			return nil, err
-		}
-		if err := waitReusePoll(finalCtx); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for final endpoint metadata: %w", cfg.name, err)
-			}
-			return nil, err
-		}
-	}
-	if err := verifyReuseResult(info, fresh, image, cfg); err != nil {
 		return nil, err
 	}
-	ctr.mu.Lock()
-	ctr.info = fresh
-	ctr.mu.Unlock()
+	if fresh.state != StateRunning {
+		return nil, fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
+	}
+	if !sameEnginePlatform(info, fresh) {
+		return nil, fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, info.platform, fresh.platform)
+	}
+	if err := checkReuseOwned(fresh, image, cfg); err != nil {
+		return nil, err
+	}
+	if err := checkReuseCompat(fresh, image, cfg); err != nil {
+		return nil, err
+	}
 	return ctr, nil
 }
 
@@ -193,20 +91,29 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 // reuseRun so every concurrent caller applies its own configuration.
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	recreated := false
+	var lastInspectErr error
 
 	for {
 		if err := ctx.Err(); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return nil, fmt.Errorf("reuse %s: timed out waiting for a usable container", cfg.name)
-			}
-			return nil, err
+			return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 		}
 
 		info, err := inspectNamed(ctx, cfg, cfg.name)
 		if err != nil {
-			if !isNotFound(err) {
-				return nil, err
+			if !isNotFoundFor(cfg.eng, err) {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+				}
+				if !transientReuseInspectError(err) {
+					return nil, err
+				}
+				lastInspectErr = err
+				if err := waitForReusePoll(ctx); err != nil {
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
+				}
+				continue
 			}
+			lastInspectErr = nil
 			// Creation carries its own runTimeout budget detached from
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
@@ -219,18 +126,22 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(createErr) || createRaceMissing(createErr) {
-				if err := waitReusePoll(ctx); err != nil {
-					return nil, err
+				if err := waitForReusePoll(ctx); err != nil {
+					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
 				continue
 			}
 			return nil, createErr
 		}
+		lastInspectErr = nil
 
+		if err := checkReuseOwned(info, image, cfg); err != nil {
+			return nil, err
+		}
 		switch info.state {
 		case StateCreated, StateStopping, StateUnknown:
-			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
+			if err := waitForReusePoll(ctx); err != nil {
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
 		case StateStopped:
@@ -242,29 +153,28 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := checkReuseOwned(info, image, cfg); err != nil {
 				return nil, err
 			}
-			if err := deleteStoppedReuseWithImage(ctx, cfg, info, image); err != nil {
+			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
 				return nil, err
 			}
 			recreated = true
 			continue
 		case StateRunning:
-			if err := checkReuseOwned(info, image, cfg); err != nil {
-				return nil, err
-			}
 			return &Container{
-				id:        cfg.name,
-				runner:    cfg.runner,
-				eng:       cfg.eng,
-				exposed:   cfg.exposed,
-				published: cfg.published,
-				reused:    true,
-				info:      info,
-				creation:  info.labels[creationLabel],
-				uid:       info.uid,
+				id:              cfg.name,
+				runner:          cfg.runner,
+				eng:             cfg.eng,
+				exposed:         cfg.exposed,
+				published:       cfg.published,
+				network:         cfg.network,
+				networkExplicit: cfg.networkExplicit,
+				reused:          true,
+				info:            immutableInfo(info),
+				creation:        info.labels[creationLabel],
+				uid:             info.uid,
 			}, nil
 		default:
-			if err := waitReusePoll(ctx); err != nil {
-				return nil, err
+			if err := waitForReusePoll(ctx); err != nil {
+				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 		}
 	}
@@ -291,9 +201,14 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
-	stdout, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
+	preRegisterRunWithGlobalReaper(cfg)
+	protectReuseReaper(cfg)
+	stdout, _, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
 	if err != nil {
 		if !attempted {
+			if target, ok := runReaperTarget(cfg); ok {
+				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+			}
 			return nil, err
 		}
 		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
@@ -309,232 +224,214 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		return nil, classified
 	}
 
-	ctr := &Container{
-		id:        cfg.name,
-		runner:    cfg.runner,
-		eng:       cfg.eng,
-		exposed:   cfg.exposed,
-		published: cfg.published,
-		reused:    true,
-		creation:  cfg.creation,
-		uid:       cfg.eng.parseRunID(stdout),
+	uid := cfg.eng.parseRunID(stdout)
+	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
+		identityErr := identityError("Docker run returned no valid immutable container ID")
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
+			return nil, withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		}
+		return nil, identityErr
 	}
-	if err := reusePostCreateWithImage(ctx, cfg, ctr, image); err != nil {
-		// The successful run has already published this generation by
-		// name. A peer may have attached to it, so a failed local inspect,
-		// identity check, or copy is not proof that this caller owns the
-		// only reference. Leave the shared generation in place for the
-		// next reuse attempt.
-		return nil, err
+	ctr := &Container{
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		reused:          true,
+		creation:        cfg.creation,
+		uid:             uid,
+	}
+	if target, ok := runReaperTarget(cfg); ok {
+		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
+			protectReuseReaper(cfg)
+			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
+			if cleanupErr != nil {
+				return nil, withCleanupError(err, &CleanupError{Container: cfg.name, Err: cleanupErr})
+			}
+			return nil, err
+		}
+		_ = markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+		unregisterReuseFromGlobalReaper(cfg)
+	}
+	if _, err := ctr.cachedInfo(ctx); err != nil {
+		return nil, ctr.rollback(ctx, err)
+	}
+	for _, f := range cfg.files {
+		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+			return nil, ctr.rollback(ctx, err)
+		}
 	}
 	return ctr, nil
 }
 
-// reusePostCreate verifies and initializes a newly-created reuse
-// generation. A successful `run` can return before Apple reaches running
-// state or publishes all requested endpoint metadata, so wait for both
-// before establishing the baseline used by the caller's compatibility
-// check.
-//
-//nolint:unused // retained for package callers using the original post-create helper
-func reusePostCreate(ctx context.Context, cfg *config, ctr *Container) error {
-	return reusePostCreateWithImage(ctx, cfg, ctr, "")
+// deleteStoppedReuse removes a stopped reuse container only after a
+// fresh ownership/state check. Docker binds the delete to the original
+// immutable UID; Apple holds the cooperating-process name lock across
+// the fresh inspect and delete. A same-generation running replacement is
+// therefore never deleted.
+func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
+	deleted, err := deleteStoppedReuseResult(ctx, cfg, info)
+	if err != nil {
+		return err
+	}
+	if !deleted {
+		return nil
+	}
+	return nil
 }
 
-func reusePostCreateWithImage(ctx context.Context, cfg *config, ctr *Container, image string) error {
-	postCtx, cancel := withMaxTimeout(ctx, reuseAttachTimeout)
+func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo) (bool, error) {
+	if info == nil {
+		return false, fmt.Errorf("reuse %s: missing inspected container", cfg.name)
+	}
+	labels := info.labels
+	dockerLegacy := cfg.eng.name() == "docker" && labels[managedLabel] == "" && labels[reuseLabel] == ""
+	if labels[reuseLabel] != "true" && !dockerLegacy {
+		return false, nil
+	}
+	if labels[reuseLabel] == "true" && labels[managedLabel] != "true" {
+		return false, fmt.Errorf("reuse %s: managed ownership label is missing", cfg.name)
+	}
+	creation := labels[creationLabel]
+	if !validCreationID(creation) {
+		return false, fmt.Errorf("reuse %s: creation ownership label is missing or invalid", cfg.name)
+	}
+	if info.state != StateStopped {
+		return false, nil
+	}
+	if cfg.eng.name() == "docker" && !validImmutableID(cfg.eng, info.uid) {
+		return false, fmt.Errorf("reuse %s: stopped container has no verified immutable ID", cfg.name)
+	}
+
+	target := cfg.name
+	guardCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-
-	var ready *engineInfo
-	for {
-		info, err := ctr.inspectFresh(postCtx)
+	unlock := func() {}
+	if !requiresImmutableID(cfg.eng) {
+		var err error
+		unlock, err = lockName(guardCtx, cfg.name)
 		if err != nil {
-			return err
-		}
-		if err := verifyReusePostCreateInfo(cfg, ctr, info); err != nil {
-			return err
-		}
-		if image != "" && cfg.reuse {
-			if err := checkReuseOwned(info, image, cfg); err != nil {
-				return err
-			}
-		}
-		if info.state == StateRunning && reuseEndpointMetadataReady(info, cfg) {
-			ready = info
-			break
-		}
-		if err := waitReusePoll(postCtx); err != nil {
-			if errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("reuse %s: timed out waiting for post-create readiness: %w", cfg.name, err)
-			}
-			return err
+			return false, fmt.Errorf("reuse %s: lock name: %w", cfg.name, err)
 		}
 	}
+	defer unlock()
 
-	// Recheck under the Apple name lock and keep it through all file copies.
-	// The baseline and the copy therefore cannot target different
-	// generations. Docker is already bound to its immutable UID.
-	target := ready.uid
-	if cfg.eng.name() == "apple" {
-		unlock, err := lockNameShared(postCtx, cfg.name)
-		if err != nil {
-			return fmt.Errorf("reuse %s: lock post-create generation: %w", cfg.name, err)
-		}
-		defer unlock()
-		fresh, err := ctr.inspectFreshLocked(postCtx)
-		if err != nil {
-			return err
-		}
-		if err := verifyReusePostCreateInfo(cfg, ctr, fresh); err != nil {
-			return err
-		}
-		if image != "" && cfg.reuse {
-			if err := checkReuseOwned(fresh, image, cfg); err != nil {
-				return err
-			}
-		}
-		if fresh.state != StateRunning || !reuseEndpointMetadataReady(fresh, cfg) {
-			return fmt.Errorf("reuse %s: post-create generation changed before initialization", cfg.name)
-		}
-		if err := sameContainerIdentity(cfg.eng, ready, fresh); err != nil {
-			return fmt.Errorf("reuse %s: %w", cfg.name, err)
-		}
-		ready = fresh
-		target = cfg.name
-		for _, f := range cfg.files {
-			if err := ctr.copyToContainerTarget(postCtx, target, f.HostPath, f.ContainerPath); err != nil {
-				// The shared generation remains available to peers; a
-				// caller-specific copy failure must not delete it.
-				return err
-			}
-		}
-	} else {
-		if !validImmutableID(cfg.eng, target) || target != ctr.uid {
-			return fmt.Errorf("reuse %s: %w: post-create Docker ID changed", cfg.name, ErrGenerationReplaced)
-		}
-		for _, f := range cfg.files {
-			if err := ctr.copyToContainerTarget(postCtx, target, f.HostPath, f.ContainerPath); err != nil {
-				return err
-			}
-		}
+	freshContainer := namedContainer(cfg, cfg.name)
+	fresh, err := freshContainer.inspectFreshLocked(guardCtx)
+	if isNotFoundFor(cfg.eng, err) {
+		unregisterContainerReaper(cfg, cfg.name, creation, target)
+		return false, nil
 	}
-
-	ctr.mu.Lock()
-	ctr.info = ready
-	ctr.mu.Unlock()
-	return nil
+	if err != nil {
+		protectReuseReaper(cfg)
+		return false, fmt.Errorf("reuse %s: verify stopped generation: %w", cfg.name, err)
+	}
+	if !sameStoppedReuseGeneration(info, fresh) {
+		unregisterContainerReaper(cfg, cfg.name, creation, info.uid)
+		return false, nil
+	}
+	if fresh.state != StateStopped {
+		protectReuseReaper(cfg)
+		return false, nil
+	}
+	if cfg.eng.name() == "docker" {
+		if !validImmutableID(cfg.eng, fresh.uid) || fresh.uid != info.uid {
+			unregisterContainerReaper(cfg, cfg.name, creation, info.uid)
+			return false, nil
+		}
+		target = info.uid
+	} else if fresh.uid != "" {
+		unregisterContainerReaper(cfg, cfg.name, creation, "")
+		return false, fmt.Errorf("reuse %s: Apple inspect returned an unexpected immutable ID", cfg.name)
+	}
+	_, _, err = cfg.runner.Run(guardCtx, cfg.eng.deleteArgs(target)...)
+	if err != nil && !isNotFoundFor(cfg.eng, err) {
+		return false, fmt.Errorf("reuse %s: delete stopped generation: %w", cfg.name, err)
+	}
+	unregisterContainerReaper(cfg, cfg.name, creation, target)
+	return true, nil
 }
 
-func verifyReusePostCreateInfo(cfg *config, ctr *Container, info *engineInfo) error {
-	if info == nil || info.labels[managedLabel] != "true" ||
-		(cfg.reuse && info.labels[reuseLabel] != "true") ||
-		!validCreationID(cfg.creation) || info.labels[creationLabel] != cfg.creation {
-		return fmt.Errorf("reuse %s: %w: post-create generation could not be verified", cfg.name, ErrGenerationReplaced)
+func sameStoppedReuseGeneration(before, after *engineInfo) bool {
+	if before == nil || after == nil {
+		return false
 	}
-	if err := verifyExactReuseGroup(info, cfg); err != nil {
-		return fmt.Errorf("reuse %s: %w: %v", cfg.name, ErrGenerationReplaced, err)
+	if before.labels[managedLabel] != after.labels[managedLabel] ||
+		before.labels[reuseLabel] != after.labels[reuseLabel] ||
+		before.labels[reuseGroupLabel] != after.labels[reuseGroupLabel] ||
+		before.labels[sessionLabel] != after.labels[sessionLabel] ||
+		before.labels[creationLabel] != after.labels[creationLabel] {
+		return false
 	}
-	if requiresImmutableID(cfg.eng) && (!validImmutableID(cfg.eng, info.uid) || info.uid != ctr.uid) {
-		return fmt.Errorf("reuse %s: %w: post-create Docker ID changed", cfg.name, ErrGenerationReplaced)
-	}
-	return nil
+	return after.state == StateStopped
 }
 
-// reuseEndpointMetadataReady reports whether the inspect contains all
-// endpoint data this request can actually use. Apple resolves an exposed
-// port through the container IP, so an attach that is running but has not
-// reported an address yet is not a usable reuse baseline.
-func reuseEndpointMetadataReady(info *engineInfo, cfg *config) bool {
+func rollbackReuse(ctx context.Context, ctr *Container, cfg *config) (bool, error) {
+	if ctr == nil {
+		return false, errors.New("reuse: missing container for rollback")
+	}
+	info := ctr.infoSnapshot()
 	if info == nil {
-		return false
+		protectReuseReaper(cfg)
+		return false, fmt.Errorf("reuse %s: missing inspected generation for rollback", cfg.name)
 	}
-	if cfg.eng.directIP() && reuseNeedsDirectIP(cfg) && info.ip == "" {
-		return false
+	if info.state != StateStopped {
+		protectReuseReaper(cfg)
+		return false, fmt.Errorf("reuse %s: %s generation may be shared; refusing automatic deletion", cfg.name, info.state)
 	}
-	return endpointMetadataReady(info, cfg.eng, cfg.exposed, cfg.published)
+	deleted, err := deleteStoppedReuseResult(ctx, cfg, info)
+	if err != nil {
+		protectReuseReaper(cfg)
+		return false, err
+	}
+	if !deleted {
+		protectReuseReaper(cfg)
+		return false, fmt.Errorf("reuse %s: stopped generation changed; refusing automatic deletion", cfg.name)
+	}
+	return true, nil
 }
 
-func endpointMetadataReady(info *engineInfo, eng engine, exposed []portSpec, published []publishSpec) bool {
-	if info == nil {
+func transientReuseInspectError(err error) bool {
+	if err == nil || errors.Is(err, ErrSystemNotRunning) ||
+		errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	if !eng.directIP() {
-		for _, spec := range exposed {
-			if !hasBoundPort(info.bound, spec.port, spec.proto) {
-				return false
-			}
-		}
-	}
-	for _, p := range published {
-		if !hasPublishedBinding(info.bound, p) {
-			return false
-		}
-	}
-	return true
-}
 
-// reuseNeedsDirectIP reports whether at least one exposed port will be
-// resolved through a direct-IP endpoint. An explicitly published port is
-// usable through its host binding even when the backend has not assigned an
-// IP yet.
-func reuseNeedsDirectIP(cfg *config) bool {
-	for _, spec := range cfg.exposed {
-		published := false
-		for _, p := range cfg.published {
-			if p.containerPort == spec.port && p.proto == spec.proto {
-				published = true
-				break
-			}
-		}
-		if !published {
+	message := err.Error()
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		message = cliErr.Stderr
+	}
+	message = strings.ToLower(message)
+	for _, marker := range []string{
+		"temporary", "temporarily", "try again", "timeout", "timed out",
+		"temporarily unavailable", "unavailable", "connection", "transport",
+		"xpc", "busy", "not ready", "try later", "eof", "reset by peer",
+	} {
+		if strings.Contains(message, marker) {
 			return true
 		}
 	}
 	return false
 }
 
-// reusePortsReady is retained for package callers that used the original
-// helper name; it now includes direct-IP address readiness.
-//
-//nolint:unused // retained for package callers using the original helper
-func reusePortsReady(info *engineInfo, cfg *config) bool {
-	return reuseEndpointMetadataReady(info, cfg)
-}
-
-// deleteStoppedReuse removes a stopped reuse container only after
-// verifying the managed, reuse, and creation labels on the inspected
-// container. The image-aware production path additionally verifies the
-// requested image. A fresh inspect must still be StateStopped; Docker
-// binds that inspect and deletion to the original immutable UID, while a
-// same-generation running replacement is therefore never deleted.
-func deleteStoppedReuse(ctx context.Context, cfg *config, info *engineInfo) error {
-	return deleteStoppedReuseWithImage(ctx, cfg, info, "")
-}
-
-func deleteStoppedReuseWithImage(ctx context.Context, cfg *config, info *engineInfo, image string) error {
-	if err := checkReuseLabels(info, cfg); err != nil {
-		return err
-	}
-	ctr := namedContainer(cfg, cfg.name)
-	ctr.creation = info.labels[creationLabel]
-	if requiresImmutableID(cfg.eng) {
-		if !validImmutableID(cfg.eng, info.uid) {
-			return fmt.Errorf("reuse %s: stopped generation has no valid immutable ID", cfg.name)
-		}
-		ctr.uid = info.uid
-	}
-	if image != "" {
-		if err := checkReuseOwned(info, image, cfg); err != nil {
-			return err
-		}
-	}
-	_, err := ctr.terminateByNameWithImage(ctx, info, true, image)
-	if errors.Is(err, ErrGenerationReplaced) {
-		// A different generation means the name was recreated. Let the
-		// ensure loop inspect and attach to that fresh generation.
+func reuseInspectWaitError(name string, waitErr, lastInspectErr error) error {
+	if waitErr == nil {
 		return nil
 	}
-	return err
+	if lastInspectErr == nil {
+		if errors.Is(waitErr, context.DeadlineExceeded) {
+			return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, waitErr)
+		}
+		return waitErr
+	}
+	if errors.Is(waitErr, context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container (last inspect error: %w): %w", name, lastInspectErr, waitErr)
+	}
+	return fmt.Errorf("reuse %s: %w (last inspect error: %w)", name, waitErr, lastInspectErr)
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
@@ -551,171 +448,148 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 	return nil
 }
 
-// verifyReuseResult applies the final ownership and identity checks after
-// readiness. The initial inspect is part of the comparison: a fresh
-// inspect alone cannot tell whether a backend returned a different object
-// with compatible labels.
-func verifyReuseResult(before, fresh *engineInfo, image string, cfg *config) error {
-	// Recheck the live ownership/configuration first so an unowned or
-	// incompatible replacement gets the same fail-closed treatment as the
-	// initial attach check.
-	if err := checkReuseCompat(fresh, image, cfg); err != nil {
-		return err
-	}
-	if err := sameContainerIdentity(cfg.eng, before, fresh); err != nil {
-		return fmt.Errorf("reuse %s: %w", cfg.name, err)
-	}
-	if before.state != StateRunning || fresh.state != StateRunning {
-		return fmt.Errorf("reuse %s: state changed from %s to %s before return", cfg.name, before.state, fresh.state)
-	}
-	if fresh.image != before.image {
-		return fmt.Errorf("reuse %s: image changed from %q to %q before return", cfg.name, before.image, fresh.image)
-	}
-	if !sameEnginePlatform(before, fresh) {
-		return fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, before.platform, fresh.platform)
-	}
-	if !sameReusePorts(before.bound, fresh.bound) {
-		return fmt.Errorf("reuse %s: published ports changed before return", cfg.name)
-	}
-	return nil
-}
-
-func sameReusePorts(before, fresh []boundPort) bool {
-	if len(before) != len(fresh) {
-		return false
-	}
-	counts := make(map[boundPort]int, len(before))
-	for _, port := range before {
-		counts[port]++
-	}
-	for _, port := range fresh {
-		if counts[port] == 0 {
-			return false
-		}
-		counts[port]--
-	}
-	return true
-}
-
-func lockReuseFinal(ctx context.Context, cfg *config) (func(), error) {
-	if cfg.eng.name() != "apple" {
-		return func() {}, nil
-	}
-	return lockName(ctx, cfg.name)
-}
-
 func inspectNamed(ctx context.Context, cfg *config, id string) (*engineInfo, error) {
 	return namedContainer(cfg, id).inspectFresh(ctx)
 }
 
+func inspectReuseBase(ctx context.Context, base *Container, cfg *config) (*engineInfo, error) {
+	ctr := namedContainer(cfg, cfg.name)
+	if base != nil {
+		uid, _, err := base.identitySnapshot(ctx)
+		if err != nil {
+			return nil, err
+		}
+		if uid != "" {
+			ctr.uid = uid
+		}
+	}
+	return ctr.inspectFresh(ctx)
+}
+
 func namedContainer(cfg *config, id string) *Container {
 	return &Container{
-		id:          id,
-		runner:      cfg.runner,
-		eng:         cfg.eng,
-		exposed:     cfg.exposed,
-		published:   cfg.published,
-		nameInspect: true,
+		id:              id,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		nameInspect:     true,
 	}
 }
 
-// createRaceMissing reports only Apple's anchored run/name race: the
-// command was `run`, the backend executable was `container`, and the
-// exact --name value appears in a line-anchored "container with id ...
-// not found" diagnostic. Generic "container not found" text is not
-// evidence of this race.
+// createRaceMissing reports a create/run failure that means the named
+// container vanished mid-start (Apple concurrent-create race), not a
+// generic "… not found" such as a missing entrypoint binary.
 func createRaceMissing(err error) bool {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) || len(cliErr.Args) == 0 || cliErr.Args[0] != "run" {
+	command, args, ok := cliCommandParts(err)
+	if !ok || command != "run" || !cliErrorBelongsTo(err, "container") {
 		return false
 	}
-	if strings.TrimSpace(cliErr.Binary) == "" || !cliBinaryMatches(cliErr.Binary, "container") {
+	target := cliCommandTarget(command, args)
+	if target == "" {
 		return false
 	}
-	name := ""
-	for i, arg := range cliErr.Args {
-		if arg == "--name" {
-			if i+1 >= len(cliErr.Args) {
-				return false
-			}
-			name = cliErr.Args[i+1]
-			break
-		}
-		if value, ok := strings.CutPrefix(arg, "--name="); ok {
-			name = value
-			break
-		}
-	}
-	if name == "" {
-		return false
-	}
-	for _, line := range strings.Split(strings.ToLower(cliErr.Stderr), "\n") {
-		id, ok := appleRunMissingID(line)
-		if ok && strings.EqualFold(id, name) {
+	return hasCLIErrorLine(err, func(line string) bool {
+		if appleTypedContainerIDNotFoundLine(line, target) || appleIDMissingLine(line, target) {
 			return true
 		}
-	}
-	return false
-}
-
-func appleRunMissingID(line string) (string, bool) {
-	line = strings.TrimSpace(line)
-	for {
-		changed := false
-		for _, prefix := range []string{"error: ", "failed to bootstrap container: "} {
-			if strings.HasPrefix(line, prefix) {
-				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
-				changed = true
-				break
+		for _, wrapper := range []string{
+			"failed to bootstrap container:",
+			"failed to run container:",
+		} {
+			rest, found := strings.CutPrefix(line, wrapper)
+			if found {
+				rest = strings.TrimSpace(rest)
+				if appleIDMissingLine(rest, target) || appleTypedContainerIDNotFoundLine(rest, target) {
+					return true
+				}
 			}
 		}
-		if !changed {
-			break
-		}
-	}
-	const prefix = "container with id "
-	if !strings.HasPrefix(line, prefix) {
-		return "", false
-	}
-	rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
-	if strings.HasPrefix(rest, "\"") {
-		end := strings.IndexByte(rest[1:], '"')
-		if end < 0 {
-			return "", false
-		}
-		id := rest[1 : end+1]
-		if strings.TrimSpace(rest[end+2:]) != "not found" || id == "" {
-			return "", false
-		}
-		return id, true
-	}
-	const suffix = " not found"
-	if !strings.HasSuffix(rest, suffix) {
-		return "", false
-	}
-	id := strings.TrimSpace(strings.TrimSuffix(rest, suffix))
-	if id == "" || strings.ContainsAny(id, " \t\r\n") {
-		return "", false
-	}
-	return id, true
+		return false
+	})
 }
 
-// checkReuseOwned reports whether an existing container may be adopted
-// or deleted for this reuse request. All three labels are required: a
-// reuse marker alone can be present on a foreign container, and a
-// generation is what makes a later name-based delete safe.
-func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+// checkReuseIdentity verifies the ownership facts required before a
+// reuse attach or destructive recycle. A reuse marker alone is not proof:
+// the managed marker, a valid generation, and (for Docker) a full UID are
+// all required.
+func checkReuseIdentity(info *engineInfo, cfg *config) error {
 	if info == nil {
 		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
 	}
-	if err := checkReuseLabels(info, cfg); err != nil {
-		return err
+	if info.labels[managedLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
 	}
-	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, info.uid) {
-		return fmt.Errorf("reuse %s: existing container has no valid immutable ID", cfg.name)
+	if info.labels[reuseLabel] != "true" {
+		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+	}
+	if !validCreationID(info.labels[creationLabel]) {
+		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
+	}
+	if requiresImmutableID(cfg.eng) {
+		if !validImmutableID(cfg.eng, info.uid) {
+			return identityError(fmt.Sprintf("reuse %s: existing container has no valid immutable ID", cfg.name))
+		}
+	} else if info.uid != "" {
+		return identityError(fmt.Sprintf("reuse %s: name-addressed container unexpectedly has an immutable ID", cfg.name))
+	}
+	return nil
+}
+
+// checkReuseOwned reports whether an existing container may be adopted
+// or recycled for this reuse request.
+func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+	if err := checkReuseIdentity(info, cfg); err != nil {
+		return err
 	}
 	if !imagesCompatible(image, info.image) {
 		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	}
+	return nil
+}
+
+func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
+	if err := checkReuseOwned(info, image, cfg); err != nil {
+		return err
+	}
+	if cfg.eng.name() == "docker" {
+		requested := cfg.network
+		if !cfg.networkExplicit {
+			requested = ""
+		}
+		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
+			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
+		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
+			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
+				return fmt.Errorf("reuse %s: %w", cfg.name, err)
+			}
+		}
+	}
+	// Auto-published exposed ports only appear as host bindings on
+	// published-port backends. Explicit WithPublishedPort always needs
+	// validation, including on direct-IP engines.
+	if !cfg.eng.directIP() {
+		for _, spec := range cfg.exposed {
+			b, ok := matchingExposedBinding(info.bound, spec)
+			if !ok {
+				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
+			}
+			if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+				return fmt.Errorf("reuse %s: exposed port %s: %w", cfg.name, spec, err)
+			}
+		}
+	}
+	for _, p := range cfg.published {
+		b, ok := matchingPublishedBinding(info.bound, p)
+		if !ok {
+			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
+		}
+		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
+			return fmt.Errorf("reuse %s: published port %s: %w", cfg.name, p.raw, err)
+		}
 	}
 	if cfg.platform != "" {
 		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
@@ -728,60 +602,33 @@ func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
 	return nil
 }
 
-func checkReuseLabels(info *engineInfo, cfg *config) error {
-	if info == nil {
-		return fmt.Errorf("reuse %s: inspect returned no container identity", cfg.name)
+func checkReuseBindingReachable(eng engine, b boundPort) error {
+	if eng.name() != "docker" {
+		return nil
 	}
-	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
-	}
-	if info.labels[managedLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
-	}
-	if !creationRE.MatchString(info.labels[creationLabel]) {
-		return fmt.Errorf("reuse %s: existing container has no valid creation generation: %w", cfg.name, ErrGenerationReplaced)
-	}
-	if err := verifyExactReuseGroup(info, cfg); err != nil {
-		return fmt.Errorf("reuse %s: %w", cfg.name, err)
-	}
-	return nil
+	_, err := dockerBindingConnectHost(b, eng)
+	return err
 }
 
-func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
-	if err := checkReuseOwned(info, image, cfg); err != nil {
-		return err
-	}
-	if !reuseEndpointMetadataReady(info, cfg) {
-		return fmt.Errorf("reuse %s: endpoint metadata is incomplete", cfg.name)
-	}
-	// Auto-published exposed ports only appear as host bindings on
-	// published-port backends. Explicit WithPublishedPort always needs
-	// validation, including on direct-IP engines.
-	if !cfg.eng.directIP() {
-		for _, spec := range cfg.exposed {
-			if !hasBoundPort(info.bound, spec.port, spec.proto) {
-				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
-			}
-		}
-	}
-	for _, p := range cfg.published {
-		if !hasPublishedBinding(info.bound, p) {
-			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
-		}
-	}
-	return nil
-}
-
-func hasBoundPort(bound []boundPort, port int, proto string) bool {
+func matchingExposedBinding(bound []boundPort, spec portSpec) (boundPort, bool) {
+	var loopback boundPort
+	foundLoopback := false
 	for _, b := range bound {
-		if b.containerPort == port && b.proto == proto && b.hostPort > 0 {
-			return true
+		if b.containerPort != spec.port || b.proto != spec.proto || b.hostPort <= 0 {
+			continue
 		}
+		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+			loopback, foundLoopback = b, true
+			continue
+		}
+		return b, true
 	}
-	return false
+	return loopback, foundLoopback
 }
 
-func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
+func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool) {
+	var loopback boundPort
+	foundLoopback := false
 	for _, b := range bound {
 		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
 			continue
@@ -789,12 +636,16 @@ func hasPublishedBinding(bound []boundPort, p publishSpec) bool {
 		if p.hostPort != 0 && b.hostPort != p.hostPort {
 			continue
 		}
-		if p.hostAddr != "" && b.hostAddr != "" && b.hostAddr != p.hostAddr {
+		if p.hostAddr != "" && canonicalIP(b.hostAddr) != p.hostAddr {
 			continue
 		}
-		return true
+		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+			loopback, foundLoopback = b, true
+			continue
+		}
+		return b, true
 	}
-	return false
+	return loopback, foundLoopback
 }
 
 // imagesCompatible reports whether a requested image reference matches

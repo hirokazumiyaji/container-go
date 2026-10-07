@@ -257,7 +257,7 @@ func (r *reuseOwnershipRunner) Run(ctx context.Context, args ...string) ([]byte,
 			return []byte(inspectJSONWithStateAndLabels(args[len(args)-1], string(state), "redis:7-alpine", r.labels)), nil, nil
 		}
 		if deleted {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf("container not found: %s", args[len(args)-1])}
 		}
 		state := r.state
 		return []byte(inspectJSONWithStateAndLabels(args[len(args)-1], string(state), "redis:7-alpine", r.labels)), nil, nil
@@ -300,7 +300,7 @@ func TestReuseDeleteNotFoundRemainsIdempotent(t *testing.T) {
 		reuseLabel:    "true",
 		creationLabel: "0123456789abcdef",
 	}
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "shared"`}
+	r := &inspectErrorRunner{stderr: "container not found: shared"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, &engineInfo{state: StateStopped, labels: labels}); err != nil {
 		t.Fatalf("deleteStoppedReuse: %v", err)
@@ -311,7 +311,7 @@ func TestReuseDeleteNotFoundRemainsIdempotent(t *testing.T) {
 }
 
 func TestCleanupFailedCreateNotFoundRemainsIdempotent(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: "container not found: myctr"}
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	cfg := &config{
 		runner:   r,

@@ -92,8 +92,8 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint metadata is dynamic, so each resolution performs a fresh
-	// identity-checked inspect.
+	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
+	// intentionally not cached.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
@@ -127,20 +127,16 @@ func TestRunForLogSkipsInitialInspect(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + generation-verifying inspect + logs stream.
-	if got := r.count(); got != 4 {
-		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
+	// image inspect + run + logs stream; no container inspect.
+	if got := r.count(); got != 3 {
+		t.Fatalf("after ForLog Run: calls = %d, want 3", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	inspectCalls := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			inspectCalls++
+			t.Fatalf("unexpected container inspect during ForLog Run: %v", r.args)
 		}
-	}
-	if inspectCalls != 1 {
-		t.Fatalf("inspect calls = %d, want one generation check: %v", inspectCalls, r.args)
 	}
 }
 

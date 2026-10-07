@@ -35,7 +35,9 @@ type Target interface {
 	ExecCommand(ctx context.Context, cmd []string) (int, error)
 }
 
-// Strategy waits until a started container is ready for use.
+// Strategy waits until a started container is ready for use. The
+// built-in strategies do not yet preserve context errors uniformly in
+// every timeout/cancellation path; see issue #92.
 type Strategy interface {
 	WaitUntilReady(ctx context.Context, target Target) error
 }

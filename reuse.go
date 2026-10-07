@@ -74,6 +74,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if fresh.state != StateRunning {
 		return nil, fmt.Errorf("reuse %s: state changed to %s before return", cfg.name, fresh.state)
 	}
+	if !sameEnginePlatform(info, fresh) {
+		return nil, fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, info.platform, fresh.platform)
+	}
 	if err := checkReuseOwned(fresh, image, cfg); err != nil {
 		return nil, err
 	}
@@ -586,6 +589,14 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 		}
 		if err := checkReuseBindingReachable(cfg.eng, b); err != nil {
 			return fmt.Errorf("reuse %s: published port %s: %w", cfg.name, p.raw, err)
+		}
+	}
+	if cfg.platform != "" {
+		if info.platform == "" || platformSelectorUnverifiable(cfg.platform, info.platform) {
+			return fmt.Errorf("reuse %s: platform %q could not be verified", cfg.name, cfg.platform)
+		}
+		if !enginePlatformCompatible(cfg.eng, cfg.platform, info) {
+			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
 		}
 	}
 	return nil

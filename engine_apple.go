@@ -72,6 +72,17 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			labels: c.Configuration.Labels,
 			image:  c.Configuration.Image.Reference,
 		}
+		platform := c.Configuration.Platform
+		platformMeta := platformMetadataFromParts(
+			platform.OS,
+			platform.Architecture,
+			platform.Variant,
+			platform.OSPresent || platform.OS != "",
+			platform.ArchPresent || platform.Architecture != "",
+			platform.VariantPresent || platform.Variant != "",
+		)
+		info.platform = platformMeta.normalized()
+		info.platformMeta = platformMeta
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
 		}
@@ -244,6 +255,10 @@ func splitPlatform(p string) (os, arch, variant string) {
 		variant = parts[2]
 	}
 	return os, arch, variant
+}
+
+func (appleEngine) platformCompatible(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
 }
 
 func (appleEngine) listReuseGroupArgs(string) []string {

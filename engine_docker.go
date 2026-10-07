@@ -573,9 +573,10 @@ func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect",
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
-	ID    string `json:"Id"`
-	Name  string `json:"Name"`
-	State struct {
+	ID       string `json:"Id"`
+	Name     string `json:"Name"`
+	Platform string `json:"Platform"`
+	State    struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	HostConfig struct {
@@ -633,6 +634,8 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		labels:       c.Config.Labels,
 		uid:          c.ID,
 		image:        c.Config.Image,
+		platform:     c.Platform,
+		platformMeta: platformMetadataFromString(c.Platform),
 		ip:           c.NetworkSettings.IPAddress,
 		networkMode:  c.HostConfig.NetworkMode,
 		networkNames: networkNames,
@@ -920,6 +923,10 @@ func (dockerEngine) parseImageExists(data []byte, _ string) bool {
 		return false
 	}
 	return len(images) > 0
+}
+
+func (dockerEngine) platformCompatible(selector, actual string) bool {
+	return dockerPlatformMatches(selector, actual)
 }
 
 // listReuseGroupArgs requests full container IDs: group prune verifies and

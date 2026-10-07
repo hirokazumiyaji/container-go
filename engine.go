@@ -20,6 +20,11 @@ type engineInfo struct {
 	uid string
 	// image is the image reference the container was created from.
 	image string
+	// platform is the platform reported by inspect, normalized when
+	// possible. platformMeta retains whether each component was actually
+	// reported so an incomplete value cannot silently become a wildcard.
+	platform     string
+	platformMeta platformMetadata
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
@@ -124,6 +129,9 @@ type engine interface {
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+	// platformCompatible compares a requested platform selector with the
+	// platform this backend reports from container inspect.
+	platformCompatible(selector, actual string) bool
 }
 
 func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {

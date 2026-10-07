@@ -85,7 +85,7 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			execErr:    &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 		},
 	}
 	ctr := runTestContainer(t, f)
@@ -97,15 +97,11 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 
 type execMissingRunner struct {
 	*execRunner
-	inspectCount int
 }
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		m.inspectCount++
-		if m.inspectCount > 1 {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
-		}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
 	}
 	return m.execRunner.Run(ctx, args...)
 }
@@ -126,7 +122,7 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 }
 
-func TestExecSuccessAddsOnlyIdentityCheck(t *testing.T) {
+func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)
 	ctr := runTestContainer(t, r)
@@ -134,8 +130,8 @@ func TestExecSuccessAddsOnlyIdentityCheck(t *testing.T) {
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); err != nil {
 		t.Fatalf("Exec: %v", err)
 	}
-	if got := r.count() - before; got != 2 {
-		t.Fatalf("exec success calls = %d, want generation verify plus exec", got)
+	if got := r.count() - before; got != 1 {
+		t.Fatalf("exec success calls = %d, want 1", got)
 	}
 }
 

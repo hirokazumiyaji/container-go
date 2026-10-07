@@ -2,10 +2,10 @@ package container
 
 import (
 	"context"
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -24,8 +24,18 @@ func TestMain(m *testing.M) {
 	// explicit selection, and a typo must be reported rather than silently
 	// ignored. REQUIRE_BACKEND is left alone, because it is CI's signal that
 	// a missing backend must fail rather than skip.
+	//
+	// Everything that decides which backend to run must read the recorded
+	// value (integrationtest.SelectedBackend), not the environment: the
+	// unset below runs before any test, so an os.Getenv in a skip guard
+	// would always see "" and never skip. That is what made
+	// `make integration CONTAINERGO_BACKEND=docker` run the Apple
+	// scenarios too. The unit tests that depend on the library's own
+	// detection pin the engine explicitly instead of relying on the
+	// environment being absent.
 	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv("CONTAINERGO_KEEP")
 	os.Exit(m.Run())
 }
 
@@ -41,8 +51,6 @@ type fakeRunner struct {
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
 	creations    map[string]string // container name -> creation generation from run args
-	uidCreations map[string]string // Docker UID -> creation generation
-	lastCreation string
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -78,7 +86,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
-			return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reference":"redis:7-alpine","RepoDigests":["docker.io/library/redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"],"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","platform":{"os":"linux","architecture":"amd64","variant":""}}]}]`), nil, nil
+			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
@@ -97,12 +105,10 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	switch args[0] {
 	case "run":
-		name, creation := "", ""
 		for i, a := range args {
 			if a == "--label" && i+1 < len(args) {
 				if v, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
-					creation = v
-					name = ""
+					name := ""
 					for j, b := range args {
 						if b == "--name" && j+1 < len(args) {
 							name = args[j+1]
@@ -113,20 +119,11 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 							f.creations = map[string]string{}
 						}
 						f.creations[name] = v
-						f.lastCreation = v
 					}
 				}
 			}
 		}
-		// Docker's detached run output is a full immutable ID. Derive a
-		// stable per-generation value in this fake so concurrent tests do
-		// not share one name-addressed inspect snapshot.
-		uid := fmt.Sprintf("%x", sha256.Sum256([]byte(name+":"+creation)))
-		if f.uidCreations == nil {
-			f.uidCreations = map[string]string{}
-		}
-		f.uidCreations[uid] = creation
-		return []byte(uid + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
@@ -134,37 +131,14 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			// creation generation captured at run time so
 			// generation-verified deletes succeed.
 			name := args[len(args)-1]
-			if validDockerUID(name) {
-				creation := f.uidCreations[name]
-				if creation == "" {
-					creation = f.creations[name]
-				}
-				if creation == "" {
-					creation = f.lastCreation
-				}
-				json = fmt.Sprintf(`[
-  {
-    "Id": %q,
-    "Created": "2026-08-19T01:23:45.678901234Z",
-    "Image": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-    "State": {"Status": "running"},
-    "Config": {
-      "Image": "docker.io/library/redis:7-alpine@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-      "Labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.creation": %q}
-    },
-    "NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
-  }
-]`, name, sessionID(), creation)
-			} else {
-				json = fmt.Sprintf(`[
+			json = fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},
-      "platform": {"os": "linux", "architecture": "amd64"},
+      "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.reuse": "true", "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
     },
     "status": {
       "state": "running",
@@ -172,7 +146,6 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
     }
   }
 ]`, name, name, sessionID(), f.creations[name])
-			}
 		}
 		return []byte(json), nil, nil
 	default:
@@ -216,7 +189,7 @@ func TestRunInvokesRunDetachedWithImage(t *testing.T) {
 	if !slices.Contains(runCall, "--detach") {
 		t.Errorf("run call missing --detach: %v", runCall)
 	}
-	if !strings.HasPrefix(runCall[len(runCall)-1], "redis:7-alpine") {
+	if runCall[len(runCall)-1] != "redis:7-alpine" {
 		t.Errorf("image not last arg: %v", runCall)
 	}
 	if ctr.ID() != "myctr" {
@@ -229,13 +202,7 @@ func TestRunAppendsCmdAfterImage(t *testing.T) {
 	runTestContainer(t, f, WithCmd("redis-server", "--appendonly", "yes"))
 
 	runCall := f.callWith("run")
-	i := -1
-	for index, value := range runCall {
-		if strings.HasPrefix(value, "redis:7-alpine") {
-			i = index
-			break
-		}
-	}
+	i := slices.Index(runCall, "redis:7-alpine")
 	if i < 0 || !slices.Equal(runCall[i+1:], []string{"redis-server", "--appendonly", "yes"}) {
 		t.Errorf("cmd not after image: %v", runCall)
 	}
@@ -362,16 +329,19 @@ func TestRunPassesResourceAndProcessFlags(t *testing.T) {
 
 func TestRunPassesMounts(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "host", "data")
 	runTestContainer(t, f,
 		WithMounts(
-			Mount{Type: MountBind, Source: "/host/data", Target: "/data", ReadOnly: true},
+			Mount{Type: MountBind, Source: source, Target: "/data", ReadOnly: true},
 			Mount{Type: MountTmpfs, Target: "/scratch"},
 		))
 
-	joined := strings.Join(f.callWith("run"), " ")
-	if !strings.Contains(joined, "--mount type=bind,source=/host/data,target=/data,readonly") {
-		t.Errorf("bind mount missing: %s", joined)
+	runCall := f.callWith("run")
+	wantBind := "type=bind,source=" + source + ",target=/data,readonly"
+	if !slices.Contains(runCall, wantBind) {
+		t.Errorf("bind mount argv missing %q: %v", wantBind, runCall)
 	}
+	joined := strings.Join(runCall, " ")
 	if !strings.Contains(joined, "--mount type=tmpfs,target=/scratch") {
 		t.Errorf("tmpfs mount missing: %s", joined)
 	}
@@ -379,23 +349,46 @@ func TestRunPassesMounts(t *testing.T) {
 
 func TestRunRejectsMountWithComma(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "a,b")
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
-		WithMounts(Mount{Type: MountBind, Source: "/a,b", Target: "/data"}), withRunner(f))
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
 	if err == nil {
 		t.Fatal("want error for comma in mount source")
 	}
 }
 
-func TestRunVerifiesPostCreateIdentity(t *testing.T) {
+func TestRunRejectsRelativeBindMountSource(t *testing.T) {
+	f := newTestRunner()
+	source := filepath.Join("relative", "data")
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
+	if err == nil {
+		t.Fatal("want error for relative bind mount source")
+	}
+	if !strings.Contains(err.Error(), "absolute host path") {
+		t.Errorf("error = %q, want absolute host path error", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("run must not be issued: %v", f.callWith("run"))
+	}
+}
+
+func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
-	if ctr != nil || err == nil {
-		t.Fatalf("Run = (%v, %v), want post-create identity failure", ctr, err)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
 	}
-	if f.callWith("run") == nil {
-		t.Fatal("run was not attempted")
+	if f.callWith("inspect") != nil {
+		t.Errorf("inspect issued during Run: %v", f.calls)
+	}
+	if f.callWith("delete") != nil {
+		t.Errorf("unexpected delete during Run: %v", f.calls)
+	}
+	if _, err := ctr.State(context.Background()); err == nil {
+		t.Fatal("want error when first inspect fails after Run")
 	}
 }
 
@@ -433,7 +426,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

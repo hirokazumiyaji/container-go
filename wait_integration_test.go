@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -67,22 +68,6 @@ func TestRunWaitFailureRollsBackAndAttachesLogs(t *testing.T) {
 
 // endpointInspectStrategy forces the wait path through Endpoint so a
 // deferred first inspect failure still rolls the container back.
-type inspectFailAfterRunner struct {
-	*fakeRunner
-	inspectCount int
-	failAfter    int
-}
-
-func (r *inspectFailAfterRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "inspect" {
-		r.inspectCount++
-		if r.inspectCount > r.failAfter {
-			return nil, nil, errors.New("injected inspect failure")
-		}
-	}
-	return r.fakeRunner.Run(ctx, args...)
-}
-
 type endpointInspectStrategy struct{}
 
 func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.Target) error {
@@ -91,7 +76,8 @@ func (endpointInspectStrategy) WaitUntilReady(ctx context.Context, target wait.T
 }
 
 func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
-	f := &inspectFailAfterRunner{fakeRunner: newTestRunner(), failAfter: 1}
+	f := newTestRunner()
+	f.failPrefix = "inspect"
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
 		WithExposedPorts("6379/tcp"),
@@ -103,9 +89,10 @@ func TestRunRollsBackWhenWaitEndpointInspectFails(t *testing.T) {
 	if !strings.Contains(err.Error(), "failed to become ready") {
 		t.Errorf("error = %v, want wait-path failure after deferred inspect", err)
 	}
-	// Apple has no immutable ID, so rollback fails closed when the
-	// generation cannot be verified: no name-based delete, and the
-	// leaked container is reported instead of hidden.
+	// This non-reuse Apple handle has a creation generation but no
+	// immutable ID, so rollback refuses the name delete when inspection
+	// cannot verify the generation. The leaked container is reported
+	// instead of hidden; this is not a general reuse guarantee.
 	if del := f.callWith("delete"); del != nil {
 		t.Errorf("rollback deleted without a verified generation: %v", del)
 	}
@@ -125,8 +112,8 @@ func TestRunRollbackDeletesByImmutableIDWhenInspectFails(t *testing.T) {
 		t.Fatalf("err = %v, want wait failure with successful rollback", err)
 	}
 	// docker run printed the container ID; rollback needs no inspect.
-	if rm := d.callWith("rm"); rm == nil || rm[len(rm)-1] != dockerFixtureID {
-		t.Errorf("rm = %v, want delete by %s", rm, dockerFixtureID)
+	if rm := d.callWith("rm"); !slices.Equal(rm, []string{"rm", "--force", "--volumes", dockerFixtureID}) {
+		t.Errorf("rm = %v, want volume cleanup by %s", rm, dockerFixtureID)
 	}
 }
 

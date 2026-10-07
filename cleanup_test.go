@@ -6,6 +6,13 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
+)
+
+const (
+	cleanupDockerIDOne = "1111111111111111111111111111111111111111111111111111111111111111"
+	cleanupDockerIDTwo = "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
 func TestTerminateContainerIsNilSafe(t *testing.T) {
@@ -67,7 +74,11 @@ type lsRunner struct {
 }
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "ls" || args[0] == "inspect" {
+	if args[0] == "ls" {
+		l.calls = append(l.calls, args)
+		return []byte(l.lsJSON), nil, nil
+	}
+	if args[0] == "inspect" && l.lsJSON != "" {
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
@@ -75,8 +86,8 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 }
 
 const pruneLsJSON = `[
-  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}},
-  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true"}},"status":{"state":"running","networks":[]}},
+  {"id":"managed-stopped","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"stopped","networks":[]}},
+  {"id":"managed-running","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}},
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
@@ -106,97 +117,183 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	}
 }
 
-func TestDockerPruneIDListRevalidatesOwnershipAndGroup(t *testing.T) {
-	uid := strings.Repeat("a", 64)
-	candidates, err := (dockerEngine{}).parseReuseGroupIDs([]byte(uid+"\n"), "group-a")
-	if err != nil {
-		t.Fatal(err)
+type dockerListRunner struct {
+	*fakeRunner
+	output    string
+	deleteErr error
+}
+
+func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ps" {
+		d.calls = append(d.calls, args)
+		return []byte(d.output), nil, nil
 	}
-	if len(candidates) != 1 || candidates[0].reuseGroup != "group-a" {
-		t.Fatalf("candidates = %+v", candidates)
+	if args[0] == "inspect" {
+		d.calls = append(d.calls, args)
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:"integration"}},"NetworkSettings":{}}]`, id, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
 	}
-	fresh := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:    "true",
-			reuseLabel:      "true",
-			reuseGroupLabel: "group-a",
-			creationLabel:   "0123456789abcdef",
+	if args[0] == "rm" && d.deleteErr != nil {
+		d.calls = append(d.calls, args)
+		return nil, nil, d.deleteErr
+	}
+	return d.fakeRunner.Run(ctx, args...)
+}
+
+func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *dockerListRunner) ([]string, error)
+	}{
+		{
+			name: "prune",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneWith(ctx, r, dockerEngine{})
+			},
 		},
-		uid: uid,
-	}
-	if !pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
-		t.Fatal("matching Docker ID candidate was rejected")
-	}
-	fresh.state = StateRunning
-	if !pruneCandidateStillCurrent(candidates[0], fresh, "group-a") {
-		t.Fatal("running Docker reuse-group candidate was rejected")
-	}
-	if pruneCandidateStillCurrent(candidates[0], fresh, "") {
-		t.Fatal("running Docker candidate was accepted by ordinary Prune")
+		{
+			name: "reuse group",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneReuseGroupWith(ctx, r, dockerEngine{}, "integration")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &dockerListRunner{fakeRunner: newTestRunner(), output: cleanupDockerIDOne + "\n" + cleanupDockerIDTwo + "\n"}
+			removed, err := tc.run(context.Background(), r)
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+			if !slices.Equal(removed, []string{cleanupDockerIDOne, cleanupDockerIDTwo}) {
+				t.Fatalf("removed = %v", removed)
+			}
+
+			var deletes [][]string
+			for _, call := range r.calls {
+				if call[0] == "rm" {
+					deletes = append(deletes, call)
+				}
+			}
+			if len(deletes) != 2 {
+				t.Fatalf("rm calls = %v, want 2", deletes)
+			}
+			for _, call := range deletes {
+				want := []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				if !slices.Equal(call, want) {
+					t.Errorf("rm call = %v, want %v", call, want)
+				}
+			}
+		})
 	}
 }
 
-func TestApplePruneRequiresListTimeGeneration(t *testing.T) {
-	r := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
-	removed, err := pruneNamedCandidate(context.Background(), r, appleEngine{}, pruneCandidate{id: "managed-stopped", state: StateStopped, managed: true}, "prune", "")
-	if err != nil {
-		t.Fatal(err)
+func TestDockerPruneReportsVolumeDeleteFailure(t *testing.T) {
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     cleanupDockerIDOne + "\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", cleanupDockerIDOne},
+			Stderr: "error removing volume: volume driver plugin not found",
+		},
 	}
-	if removed || len(r.calls) != 0 {
-		t.Fatalf("removed=%v calls=%v; missing list generation must fail before inspect/delete", removed, r.calls)
-	}
-}
-
-func TestAppleReuseGroupRequiresListTimeGeneration(t *testing.T) {
-	r := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
-	removed, err := pruneListed(context.Background(), r, appleEngine{}, []string{"list"}, func([]byte) ([]pruneCandidate, error) {
-		return []pruneCandidate{{id: "managed-stopped", state: StateStopped, managed: true, reuseGroup: "ci"}}, nil
-	}, "prune reuse group ci", "ci")
-	if err != nil {
-		t.Fatal(err)
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err == nil {
+		t.Fatal("prune succeeded, want volume deletion failure")
 	}
 	if len(removed) != 0 {
-		t.Fatalf("removed = %v, want none without list-time generation", removed)
+		t.Fatalf("removed = %v, want no falsely successful deletions", removed)
 	}
-	for _, call := range r.calls {
-		if len(call) > 0 && (call[0] == "inspect" || call[0] == "delete") {
-			t.Fatalf("missing list generation reached name operation: %v", call)
+	if !strings.Contains(err.Error(), "prune "+cleanupDockerIDOne) {
+		t.Fatalf("error = %v, want prune target context", err)
+	}
+}
+
+func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
+	id := cleanupDockerIDOne
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     id + "\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", id},
+			Stderr: "Error response from daemon: No such container: " + id,
+		},
+	}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if !slices.Equal(removed, []string{id}) {
+		t.Fatalf("removed = %v, want [%s]", removed, id)
+	}
+}
+
+func TestDockerPruneSelectsExitedAndDeadOnly(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	for _, want := range []string{"status=exited", "status=dead"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
+	for _, unwanted := range []string{"status=created", "status=running"} {
+		if slices.Contains(args, unwanted) {
+			t.Errorf("listArgs = %v, unexpectedly includes %q", args, unwanted)
 		}
 	}
 }
 
-type dockerRunningGroupRunner struct {
-	uid     string
-	deleted []string
+type cleanupTBRecorder struct {
+	testing.TB
+	callbacks []func()
+	logs      []string
+	errors    []string
+	helpers   int
 }
 
-func (r *dockerRunningGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "ps":
-		return []byte(r.uid + "\n"), nil, nil
-	case "inspect":
-		return []byte(fmt.Sprintf(`[{"Id":%q,"Created":"2026-08-19T01:23:45.678901234Z","Name":"/group-member","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:%q,%q:%q}}}]`, r.uid, managedLabel, reuseLabel, creationLabel, "0123456789abcdef", reuseGroupLabel, "ci")), nil, nil
-	case "rm":
-		r.deleted = append(r.deleted, args[len(args)-1])
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
+func (r *cleanupTBRecorder) Helper() { r.helpers++ }
+
+func (r *cleanupTBRecorder) Cleanup(fn func()) {
+	r.callbacks = append(r.callbacks, fn)
+}
+
+func (r *cleanupTBRecorder) Logf(format string, args ...any) {
+	r.logs = append(r.logs, fmt.Sprintf(format, args...))
+}
+
+func (r *cleanupTBRecorder) Errorf(format string, args ...any) {
+	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
+func TestCleanupFunctionsMarkThemselvesAsHelpers(t *testing.T) {
+	tb := &cleanupTBRecorder{}
+	Cleanup(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("Cleanup helper calls = %d, want exported and registration helpers", tb.helpers)
+	}
+
+	tb = &cleanupTBRecorder{}
+	StrictCleanup(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("StrictCleanup helper calls = %d, want exported and registration helpers", tb.helpers)
 	}
 }
 
-func TestDockerPruneReuseGroupRemovesRunningMember(t *testing.T) {
-	uid := strings.Repeat("d", 64)
-	r := &dockerRunningGroupRunner{uid: uid}
-	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "ci")
-	if err != nil {
-		t.Fatalf("PruneReuseGroup: %v", err)
+func TestStrictCleanupReportsCleanupFailure(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.failPrefix = "delete"
+	tb := &cleanupTBRecorder{}
+	registerCleanup(tb, ctr, true)
+	if len(tb.callbacks) != 1 {
+		t.Fatalf("callbacks = %d, want 1", len(tb.callbacks))
 	}
-	if !slices.Equal(removed, []string{uid}) {
-		t.Fatalf("removed = %v, want [%s]", removed, uid)
+	tb.callbacks[0]()
+	if len(tb.errors) != 1 {
+		t.Fatalf("errors = %v, want cleanup failure", tb.errors)
 	}
-	if !slices.Equal(r.deleted, []string{uid}) {
-		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
+	if len(tb.logs) != 0 {
+		t.Fatalf("logs = %v, strict cleanup should report through Errorf", tb.logs)
 	}
 }
 

@@ -5,30 +5,17 @@ import (
 	"context"
 	"errors"
 	"io"
-	"strconv"
-	"sync"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // LogsOptions bounds a Logs snapshot. Tail keeps the last N lines
-// (0 means all); Since drops entries older than the timestamp. Both
-// map to the backend CLI's --tail/--since flags.
+// (0 means all); Since drops entries older than the timestamp. Each
+// backend maps the options to its supported CLI arguments.
 type LogsOptions struct {
 	Tail  int
 	Since time.Time
-}
-
-func (o LogsOptions) args() []string {
-	var args []string
-	if o.Tail > 0 {
-		args = append(args, "--tail", strconv.Itoa(o.Tail))
-	}
-	if !o.Since.IsZero() {
-		args = append(args, "--since", o.Since.Format(time.RFC3339))
-	}
-	return args
 }
 
 // Logs returns a snapshot of the container's log output so far.
@@ -38,19 +25,18 @@ func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 
 // LogsWithOptions returns a bounded snapshot of the container's log
 // output. Long-lived reuse containers can grow unbounded logs, so
-// prefer Tail for diagnostics.
+// prefer Tail for diagnostics. It returns ErrUnsupportedCapability
+// without invoking the backend when the backend cannot honor opts.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
-	target, unlock, err := c.verifiedOperationTarget(ctx)
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return nil, err
 	}
-	defer unlock()
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	args := c.eng.logsArgs(target, false)
-	if extra := opts.args(); len(extra) > 0 {
-		// Insert --tail/--since before the container ID (last arg).
-		args = append(args[:len(args)-1], append(extra, args[len(args)-1])...)
+	args, err := c.eng.logsArgsWithOptions(target, opts)
+	if err != nil {
+		return nil, err
 	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
 	if err != nil {
@@ -61,73 +47,17 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	return io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))), nil
 }
 
-// lockedLogStream keeps an Apple name lock for the entire lifetime of a
-// followed log stream. Releasing it when FollowLogs returns would let a
-// replacement acquire the name while the stream is still addressing it.
-type lockedLogStream struct {
-	io.ReadCloser
-	unlock    func()
-	done      chan struct{}
-	once      sync.Once
-	closeOnce sync.Once
-	closeErr  error
-}
-
-func (s *lockedLogStream) release() {
-	s.once.Do(func() {
-		close(s.done)
-		s.unlock()
-	})
-}
-
-func (s *lockedLogStream) Read(p []byte) (int, error) {
-	n, err := s.ReadCloser.Read(p)
-	if err != nil {
-		s.release()
-	}
-	return n, err
-}
-
-func (s *lockedLogStream) closeUnderlying() error {
-	s.closeOnce.Do(func() { s.closeErr = s.ReadCloser.Close() })
-	return s.closeErr
-}
-
-func (s *lockedLogStream) Close() error {
-	err := s.closeUnderlying()
-	s.release()
-	return err
-}
-
 // FollowLogs streams the container's log output until Close is called
 // or the context is cancelled. Close terminates the underlying CLI
 // process.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return nil, err
+	}
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
 		return nil, errors.New("logs: runner does not support streaming")
 	}
-	target, unlock, err := c.verifiedOperationTarget(ctx)
-	if err != nil {
-		return nil, err
-	}
-	stream, err := s.Stream(ctx, c.eng.logsArgs(target, true)...)
-	if err != nil {
-		unlock()
-		return nil, err
-	}
-	if stream == nil {
-		unlock()
-		return nil, errors.New("logs: streaming runner returned a nil stream")
-	}
-	locked := &lockedLogStream{ReadCloser: stream, unlock: unlock, done: make(chan struct{})}
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = locked.closeUnderlying()
-			locked.release()
-		case <-locked.done:
-		}
-	}()
-	return locked, nil
+	return s.Stream(ctx, c.eng.logsFollowArgs(target)...)
 }

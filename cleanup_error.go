@@ -37,12 +37,3 @@ func withCleanupError(cause, cleanupErr error) error {
 	}
 	return errors.Join(cause, cleanupErr)
 }
-
-// leftoverContainer wraps a cleanup failure as a *CleanupError naming the
-// container that could not be removed.
-func leftoverContainer(name string, cleanupErr error) error {
-	if cleanupErr == nil {
-		return nil
-	}
-	return &CleanupError{Container: name, Err: cleanupErr}
-}

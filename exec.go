@@ -80,11 +80,10 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	target, unlock, err := c.verifiedOperationTarget(ctx)
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer unlock()
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
@@ -139,9 +138,7 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	// Exec keeps the verified Apple name lock while it probes the
-	// ambiguous command result, so use the lock-held inspector here.
-	info, err := c.inspectFreshLocked(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return false
 	}

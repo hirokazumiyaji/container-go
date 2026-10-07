@@ -246,10 +246,13 @@ func WithExposedPorts(ports ...string) Option {
 }
 
 // WithPublishedPort publishes a container port on the host
+// WithPublishedPort publishes a container port on the host
 // ("[host-ip:]host-port:container-port[/proto]"). On Apple Container,
 // endpoints resolve to the container's own IP when this is omitted; on
 // Docker, WithExposedPorts auto-publishes instead. Docker rejects both
 // publish forms on host, none, internal, and isolated networks.
+// Publishing a port does not reorder WithExposedPorts declarations used by
+// implicit wait probes.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)

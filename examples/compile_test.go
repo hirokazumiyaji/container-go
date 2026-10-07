@@ -177,7 +177,34 @@ func normalizedTextSource(source string) []byte {
 }
 
 func documentationModule(root string) string {
-	return fmt.Sprintf("module documentation-example\n\ngo 1.23.0\n\nrequire github.com/hirokazumiyaji/container-go v0.0.0\n\nreplace github.com/hirokazumiyaji/container-go => %s\n", strconv.Quote(filepath.ToSlash(root)))
+	extraRequires := ""
+	if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
+		lines := strings.Split(string(data), "\n")
+		var requires []string
+		inRequire := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "require (") {
+				inRequire = true
+				continue
+			}
+			if inRequire {
+				if trimmed == ")" {
+					inRequire = false
+				} else if trimmed != "" {
+					requires = append(requires, "\t"+trimmed)
+				}
+				continue
+			}
+			if strings.HasPrefix(trimmed, "require ") && !strings.Contains(trimmed, "github.com/hirokazumiyaji/container-go") {
+				requires = append(requires, "\t"+strings.TrimPrefix(trimmed, "require "))
+			}
+		}
+		if len(requires) > 0 {
+			extraRequires = "\n" + strings.Join(requires, "\n")
+		}
+	}
+	return fmt.Sprintf("module documentation-example\n\ngo 1.23.0\n\nrequire (\n\tgithub.com/hirokazumiyaji/container-go v0.0.0%s\n)\n\nreplace github.com/hirokazumiyaji/container-go => %s\n", extraRequires, strconv.Quote(filepath.ToSlash(root)))
 }
 
 func compileDocumentationBlocks(t *testing.T, root string, blocks []documentationBlock) {
@@ -186,6 +213,11 @@ func compileDocumentationBlocks(t *testing.T, root string, blocks []documentatio
 	module := documentationModule(root)
 	if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte(module), 0o600); err != nil {
 		t.Fatalf("write temporary go.mod: %v", err)
+	}
+	if sum, err := os.ReadFile(filepath.Join(root, "go.sum")); err == nil {
+		if err := os.WriteFile(filepath.Join(dir, "go.sum"), sum, 0o600); err != nil {
+			t.Fatalf("write temporary go.sum: %v", err)
+		}
 	}
 
 	compiled := 0

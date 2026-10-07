@@ -14,19 +14,20 @@ import (
 // endpoint succeeds.
 type HostPortStrategy struct {
 	options
-	port         string
-	explicitPort bool
+	port    string
+	portSet bool
 }
 
 // ForListeningPort waits for the given declared port ("6379/tcp" or
 // "6379") to accept TCP connections. UDP and malformed port specifications
 // return a ConfigError before probing the container.
 func ForListeningPort(port string) *HostPortStrategy {
-	return &HostPortStrategy{port: port, explicitPort: true}
+	return &HostPortStrategy{port: port, portSet: true}
 }
 
-// ForExposedPort waits on the first port declared via
-// WithExposedPorts.
+// ForExposedPort waits on the first TCP port declared via
+// WithExposedPorts, falling back to the first published TCP port when
+// the container has no exposed TCP port.
 func ForExposedPort() *HostPortStrategy {
 	return &HostPortStrategy{}
 }
@@ -41,11 +42,19 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 	return s
 }
 
+func (s *HostPortStrategy) validate() error {
+	if err := s.options.validate(); err != nil {
+		return err
+	}
+	if s.portSet {
+		return validateTCPPortSpec("ForListeningPort", s.port)
+	}
+	return nil
+}
+
 func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
-	if s.explicitPort {
-		if err := validateTCPPortSpec("ForListeningPort", s.port); err != nil {
-			return err
-		}
+	if err := s.validate(); err != nil {
+		return err
 	}
 	return poll(ctx, s.options, target, fmt.Sprintf("wait for listening port %q", s.port), func(ctx context.Context) error {
 		endpoint, err := target.Endpoint(ctx, s.port)

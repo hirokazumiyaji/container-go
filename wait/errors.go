@@ -10,6 +10,16 @@ import (
 // *ConfigError, so a caller can detect the whole class with one errors.Is.
 var ErrInvalidConfiguration = errors.New("invalid wait strategy configuration")
 
+// ErrPortNotExposed identifies a wait target that does not declare the
+// requested port. The container package aliases this value for callers
+// that use container.ErrPortNotExposed.
+var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
+
+// ErrContainerNotFound identifies a wait target whose container no
+// longer exists. The container package aliases this value for callers
+// that use container.ErrContainerNotFound.
+var ErrContainerNotFound = errors.New("container not found")
+
 // ConfigError reports invalid static configuration passed to a wait strategy.
 // It can be inspected with errors.As and classified with errors.Is using
 // ErrInvalidConfiguration.

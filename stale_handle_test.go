@@ -165,16 +165,22 @@ func TestDockerFollowLogsUsesImmutableIDForTerminalError(t *testing.T) {
 		t.Fatalf("FollowLogs start: %v", err)
 	}
 	defer stream.Close()
-	data, readErr := io.ReadAll(stream)
-	if readErr != nil {
-		t.Fatalf("FollowLogs terminal read error = %v, want asynchronous EOF", readErr)
+	_, readErr := io.ReadAll(stream)
+	if !errors.Is(readErr, ErrContainerNotFound) {
+		t.Fatalf("FollowLogs terminal read error = %v, want ErrContainerNotFound", readErr)
 	}
-	got := string(data)
-	if !strings.Contains(got, "No such container: logs --follow "+staleHandleUID) {
-		t.Errorf("terminal stream = %q, want immutable-ID command", got)
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("FollowLogs terminal read error = %v, want *CLIError", readErr)
 	}
-	if strings.Contains(got, "replacement") {
-		t.Errorf("terminal stream = %q, must not target the logical name", got)
+	if !strings.Contains(cliErr.Stderr, "No such container: "+staleHandleUID) {
+		t.Errorf("terminal stream = %q, want immutable-ID command", cliErr.Stderr)
+	}
+	if !slices.Equal(cliErr.Args, []string{"logs", "--follow", staleHandleUID}) {
+		t.Errorf("terminal args = %v, want logs --follow %s", cliErr.Args, staleHandleUID)
+	}
+	if strings.Contains(cliErr.Stderr, "replacement") {
+		t.Errorf("terminal stream = %q, must not target the logical name", cliErr.Stderr)
 	}
 	if err := stream.Close(); err != nil {
 		t.Fatalf("FollowLogs close: %v", err)
@@ -184,7 +190,14 @@ func TestDockerFollowLogsUsesImmutableIDForTerminalError(t *testing.T) {
 func writeStaleFollowLogsStub(t *testing.T) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "docker")
-	script := "#!/bin/sh\nprintf 'Error response from daemon: No such container: %s\\n' \"$*\" >&2\nexit 1\n"
+	script := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '29.7\n'
+  exit 0
+fi
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
+exit 1
+`
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}

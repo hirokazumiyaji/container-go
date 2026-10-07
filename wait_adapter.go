@@ -3,8 +3,8 @@ package container
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
+	"strconv"
 
 	"github.com/hirokazumiyaji/container-go/wait"
 )
@@ -15,6 +15,9 @@ import (
 // leaves the shared container in place.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
+		if err := wait.Validate(s); err != nil {
+			return err
+		}
 		c.waitStrategy = s
 		return nil
 	}
@@ -27,10 +30,28 @@ type waitTarget struct {
 
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
-		if len(t.c.exposed) == 0 {
-			return "", fmt.Errorf("no ports declared via WithExposedPorts")
+		// Port probes are TCP-only. A UDP declaration must not silently
+		// become the target of an implicit ForExposedPort/ForHTTP probe.
+		// Exposed declarations retain their order even when another port
+		// has an explicit host binding; published-only containers fall back
+		// to their first TCP binding.
+		for _, exposed := range t.c.exposed {
+			if exposed.proto == "tcp" {
+				port = exposed.String()
+				break
+			}
 		}
-		port = t.c.exposed[0].String()
+		if port == "" {
+			for _, published := range t.c.published {
+				if published.proto == "tcp" {
+					port = strconv.Itoa(published.containerPort) + "/" + published.proto
+					break
+				}
+			}
+		}
+		if port == "" {
+			return "", ErrPortNotExposed
+		}
 	}
 	return t.c.Endpoint(ctx, port)
 }

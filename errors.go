@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
@@ -17,6 +18,10 @@ type CLIError = cli.CLIError
 // ErrSystemNotRunning reports that the Apple Container system service is
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
+
+// ErrInvalidConfiguration reports a wait strategy that cannot run with
+// the options supplied to Run.
+var ErrInvalidConfiguration = wait.ErrInvalidConfiguration
 
 // ErrInvalidConfig reports an option combination that the selected
 // backend cannot honor. Run returns it as a *ConfigError.
@@ -55,7 +60,7 @@ func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts or WithPublishedPort, or that has no usable host
 // binding in the backend's actual network mode.
-var ErrPortNotExposed = errors.New("port is not declared or has no usable host binding")
+var ErrPortNotExposed = wait.ErrPortNotExposed
 
 // ErrEndpointUnreachable reports an inspected host binding that cannot
 // be reached by this client, such as loopback on a remote Docker daemon.
@@ -74,9 +79,10 @@ var ErrNoReachableHost = errors.New("container has no reachable host")
 var ErrImageNotFound = errors.New("image not found in local store")
 
 // ErrContainerNotFound reports that the container does not exist.
-// Inspect, State, Exec, and Logs wrap it with %w so callers can use
-// errors.Is instead of matching CLI stderr text.
-var ErrContainerNotFound = errors.New("container not found")
+// Inspect, State, Exec, Logs, and FollowLogs wrap it with %w so callers can use
+// errors.Is instead of matching CLI stderr text. For FollowLogs,
+// a failure after the stream has started is reported by Read.
+var ErrContainerNotFound = wait.ErrContainerNotFound
 
 // ErrGenerationReplaced reports that a handle's immutable identity or
 // generation no longer matches the live container. Destructive and endpoint
@@ -225,12 +231,12 @@ func cliErrorLines(err error) ([]string, bool) {
 }
 
 func normalizeCLIErrorLine(line string) string {
-	line = strings.ToLower(strings.TrimSpace(line))
+	line = strings.ToLower(strings.Trim(line, "\x00 \t\r\n"))
 	for {
 		changed := false
 		for _, prefix := range []string{"docker: ", "container: ", "error response from daemon: ", "error: "} {
 			if strings.HasPrefix(line, prefix) {
-				line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+				line = strings.Trim(strings.TrimPrefix(line, prefix), "\x00 \t\r\n")
 				changed = true
 				break
 			}

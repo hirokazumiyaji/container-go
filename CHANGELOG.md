@@ -84,6 +84,16 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- Validate wait strategies and declared ports before image pulls, classify
+  terminal log-stream errors, retry transient state probes, preserve exposed-port
+  declaration order, and bound replay de-duplication state.
+- Clarify streaming log behavior: startup failures are returned by
+  `FollowLogs`, terminal CLI failures are delivered by `Read`, and
+  process-group descendants are only best-effort terminated (the direct
+  CLI child is the process this package reaps).
+- Serialize stream endpoint ownership and stop process-tree signaling
+  after the direct child is reaped, so delayed cancellation cannot target a
+  reused PID or process-group ID.
 - Reject Docker host, none, internal, and isolated networks before
   published endpoint creation; leave omitted `WithNetwork` to the
   daemon default and resolve Docker's `default` mode from actual

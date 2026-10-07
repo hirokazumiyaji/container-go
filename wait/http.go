@@ -18,7 +18,7 @@ type HTTPStrategy struct {
 	options
 	path          string
 	port          string
-	explicitPort  bool
+	portSet       bool
 	method        string
 	statusMatcher func(int) bool
 	headers       map[string]string
@@ -30,16 +30,18 @@ type HTTPStrategy struct {
 	httpClient    *http.Client
 }
 
-// ForHTTP waits for a plain-HTTP endpoint at path (on the first
-// declared port unless WithPort is used) to return 2xx.
+// ForHTTP waits for a plain-HTTP endpoint at path (on the first declared
+// TCP port unless WithPort is used) to return 2xx.
 func ForHTTP(path string) *HTTPStrategy {
 	return &HTTPStrategy{path: path, method: http.MethodGet}
 }
 
-// WithPort probes a specific declared port instead of the first one.
+// WithPort probes a specific declared port instead of the first one. An
+// empty value is invalid; omit WithPort to select the first declared TCP
+// port.
 func (s *HTTPStrategy) WithPort(port string) *HTTPStrategy {
 	s.port = port
-	s.explicitPort = true
+	s.portSet = true
 	return s
 }
 
@@ -110,7 +112,51 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 	return s
 }
 
+func (s *HTTPStrategy) validate() error {
+	if err := s.options.validate(); err != nil {
+		return err
+	}
+	if s.portSet {
+		if err := validateTCPPortSpec("ForHTTP", s.port); err != nil {
+			return err
+		}
+	}
+	if s.method == "" {
+		return invalidConfigf("HTTP method must not be empty")
+	}
+	if s.path != "" &&
+		!strings.HasPrefix(s.path, "/") &&
+		!strings.HasPrefix(s.path, "@") &&
+		!strings.HasPrefix(s.path, "http://") &&
+		!strings.HasPrefix(s.path, "https://") &&
+		!strings.ContainsAny(s.path, "?#") {
+		return invalidConfigf("invalid HTTP path %q: path must start with /", s.path)
+	}
+	for i := 0; i < len(s.path); i++ {
+		if s.path[i] <= ' ' || s.path[i] == 0x7f {
+			return invalidConfigf("invalid HTTP path %q: path contains a control or space", s.path)
+		}
+	}
+	probeURL, err := buildHTTPProbeURL("http", "wait.invalid:80", s.path)
+	if err != nil {
+		return invalidConfigf("invalid HTTP path %q: %v", s.path, err)
+	}
+	if _, err := http.NewRequestWithContext(context.Background(), s.method, probeURL, nil); err != nil {
+		return invalidConfigf("invalid HTTP method or path: %v", err)
+	}
+	for key, value := range s.headers {
+		if err := validateHTTPHeader(key, value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+
 	matcher := s.statusMatcher
 	if matcher == nil {
 		matcher = func(status int) bool { return status >= 200 && status < 300 }
@@ -119,14 +165,6 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 	if client == nil {
 		client = newDefaultHTTPClient(s.tlsConfig)
 		defer client.CloseIdleConnections()
-	}
-	// A malformed or udp port specification is static configuration, so it
-	// must fail immediately rather than being retried until the startup
-	// timeout. It carries the same sentinel as the other config errors.
-	if s.explicitPort {
-		if err := validateTCPPortSpec("ForHTTP", s.port); err != nil {
-			return err
-		}
 	}
 	scheme := "http"
 	if s.useTLS {
@@ -140,11 +178,11 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 		}
 		probeURL, err := buildHTTPProbeURL(scheme, endpoint, s.path)
 		if err != nil {
-			return err
+			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
 		}
 		req, err := http.NewRequestWithContext(ctx, s.method, probeURL, nil)
 		if err != nil {
-			return err
+			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
 		}
 		for k, v := range s.headers {
 			req.Header.Set(k, v)
@@ -165,6 +203,9 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 }
 
 func buildHTTPProbeURL(scheme, endpoint, callerPath string) (string, error) {
+	if _, err := url.Parse(scheme + "://" + endpoint + "/"); err != nil {
+		return "", err
+	}
 	pathRef, err := url.Parse(callerPath)
 	if err == nil && pathRef.Scheme == "" && pathRef.Opaque == "" && pathRef.Host == "" && pathRef.User == nil && !strings.HasPrefix(callerPath, "//") {
 		return (&url.URL{

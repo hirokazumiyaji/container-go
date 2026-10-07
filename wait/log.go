@@ -10,7 +10,9 @@ import (
 )
 
 // LogStrategy waits until a pattern appears in the container's log
-// stream. Patterns are matched per line.
+// stream. Patterns are matched per line. If the stream ends first,
+// readiness is not implied: the strategy probes whether the container is
+// stopped and otherwise reports the stream ending before the pattern.
 type LogStrategy struct {
 	options
 	pattern     string
@@ -54,7 +56,12 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if s.isRegexp {
 		re, err := regexp.Compile(s.pattern)
 		if err != nil {
-			return fmt.Errorf("wait for log: %w", err)
+			return &ConfigError{
+				Strategy: "ForLog",
+				Field:    "pattern",
+				Value:    s.pattern,
+				Reason:   err.Error(),
+			}
 		}
 		match = func(line string) int { return len(re.FindAllString(line, -1)) }
 	} else {

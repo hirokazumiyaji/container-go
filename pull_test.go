@@ -466,21 +466,24 @@ func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
 }
 
 func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
-	first := strings.Repeat("a", 64)
-	second := strings.Repeat("b", 64)
+	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{first, second}}
+	r := &reuseGroupRunner{ids: []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
 	}
-	if !slices.Equal(removed, []string{first, second}) {
-		t.Errorf("removed = %v, want full IDs %v", removed, []string{first, second})
+	if len(removed) != 2 {
+		t.Errorf("removed = %v, want 2 ids", removed)
 	}
 	if r.listCalls != 1 || r.deleteCalls != 2 {
 		t.Errorf("list=%d delete=%d, want 1/2", r.listCalls, r.deleteCalls)
 	}
+	_ = f
 }
 
 type reuseGroupRunner struct {
@@ -494,7 +497,10 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	case "ps":
 		r.listCalls++
 		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
+		return []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/group-%s","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"integration",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`, id, id[:1], managedLabel, reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

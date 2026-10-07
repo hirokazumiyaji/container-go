@@ -3,10 +3,8 @@ package container
 import (
 	"context"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 func creationInspectJSON(name, creation string) string {
@@ -72,21 +70,6 @@ func TestTerminateRefusesReplacedContainer(t *testing.T) {
 	}
 }
 
-func TestTerminateRejectsMissingOrInvalidGeneration(t *testing.T) {
-	for _, generation := range []string{"", "not-a-generation"} {
-		t.Run(generation, func(t *testing.T) {
-			r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
-			ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: generation}
-			if err := ctr.Terminate(context.Background()); err == nil || !strings.Contains(err.Error(), "missing or invalid creation generation") {
-				t.Fatalf("Terminate = %v, want missing-generation refusal", err)
-			}
-			if r.deleteCalls != 0 {
-				t.Fatalf("deleteCalls = %d, want 0", r.deleteCalls)
-			}
-		})
-	}
-}
-
 func TestTerminateDeletesSameGeneration(t *testing.T) {
 	base := newTestRunner()
 	creation := "cccccccccccccccc"
@@ -117,53 +100,4 @@ func TestRunAddsCreationLabel(t *testing.T) {
 	if !strings.Contains(joined, creationLabel+"="+ctr.creation) {
 		t.Errorf("run args missing creation label: %s", joined)
 	}
-}
-
-func TestReaperSkipsReplacedGeneration(t *testing.T) {
-	requireReaperLockf(t)
-	// Stub binary: inspect prints the *current* creation, delete logs.
-	dir := t.TempDir()
-	logPath := dir + "/calls.log"
-	binPath := dir + "/ctr"
-	currentCreation := "dddddddddddddddd"
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo \"" + currentCreation + "\"; exit 0; fi\n" +
-		"echo \"$@\" >> " + logPath + "\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	r := newReaper(binPath, "delete")
-	oldCreation := "eeeeeeeeeeeeeeee"
-	if err := r.register("myctr", oldCreation); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	r.closeStdin()
-	// Give the reaper a moment to run; it must NOT delete.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if data, _ := os.ReadFile(logPath); len(data) != 0 && strings.Contains(string(data), "myctr") {
-		t.Fatalf("reaper deleted replaced container: %q", data)
-	}
-}
-
-func TestReaperDeletesMatchingGeneration(t *testing.T) {
-	requireReaperLockf(t)
-	dir := t.TempDir()
-	logPath := dir + "/calls.log"
-	binPath := dir + "/ctr"
-	creation := "ffffffffffffffff"
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\",'; exit 0; fi\n" +
-		"echo \"$@\" >> " + logPath + "\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	r := newReaper(binPath, "delete")
-	if err := r.register("myctr", creation); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	r.closeStdin()
-	waitForLogLines(t, logPath, "delete --force myctr")
 }

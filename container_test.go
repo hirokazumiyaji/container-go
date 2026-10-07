@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -23,50 +24,19 @@ func TestMain(m *testing.M) {
 	// explicit selection, and a typo must be reported rather than silently
 	// ignored. REQUIRE_BACKEND is left alone, because it is CI's signal that
 	// a missing backend must fail rather than skip.
+	//
+	// Everything that decides which backend to run must read the recorded
+	// value (integrationtest.SelectedBackend), not the environment: the
+	// unset below runs before any test, so an os.Getenv in a skip guard
+	// would always see "" and never skip. That is what made
+	// `make integration CONTAINERGO_BACKEND=docker` run the Apple
+	// scenarios too. The unit tests that depend on the library's own
+	// detection pin the engine explicitly instead of relying on the
+	// environment being absent.
 	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
-
-	// Keep all lock-related state inside one disposable directory. A
-	// subprocess test sets CONTAINERGO_LOCK_INHERIT=1 so it reuses this
-	// namespace instead of creating a second one in its own TestMain.
-	root := ""
-	if os.Getenv("CONTAINERGO_LOCK_INHERIT") == "1" {
-		nameLockStateRootOverride = os.Getenv("CONTAINERGO_LOCK_STATE_ROOT")
-	} else {
-		var err error
-		root, err = os.MkdirTemp("", "containergo-lock-test-")
-		if err != nil {
-			panic(err)
-		}
-		dirs := map[string]string{
-			"TMPDIR":                      root + string(os.PathSeparator) + "tmp",
-			"TMP":                         root + string(os.PathSeparator) + "tmp",
-			"TEMP":                        root + string(os.PathSeparator) + "tmp",
-			"XDG_CACHE_HOME":              root + string(os.PathSeparator) + "cache",
-			"HOME":                        root + string(os.PathSeparator) + "home",
-			"LocalAppData":                root + string(os.PathSeparator) + "cache",
-			"XDG_STATE_HOME":              root + string(os.PathSeparator) + "ignored-state",
-			"CONTAINERGO_LOCK_STATE_ROOT": root + string(os.PathSeparator) + "state",
-		}
-		for _, dir := range dirs {
-			if err := os.MkdirAll(dir, 0o700); err != nil {
-				_ = os.RemoveAll(root)
-				panic(err)
-			}
-		}
-		for key, dir := range dirs {
-			if err := os.Setenv(key, dir); err != nil {
-				_ = os.RemoveAll(root)
-				panic(err)
-			}
-		}
-		nameLockStateRootOverride = dirs["CONTAINERGO_LOCK_STATE_ROOT"]
-	}
-	code := m.Run()
-	if root != "" {
-		_ = os.RemoveAll(root)
-	}
-	os.Exit(code)
+	os.Unsetenv("CONTAINERGO_KEEP")
+	os.Exit(m.Run())
 }
 
 // fakeRunner records CLI calls and replays canned results.
@@ -153,7 +123,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
@@ -359,16 +329,19 @@ func TestRunPassesResourceAndProcessFlags(t *testing.T) {
 
 func TestRunPassesMounts(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "host", "data")
 	runTestContainer(t, f,
 		WithMounts(
-			Mount{Type: MountBind, Source: "/host/data", Target: "/data", ReadOnly: true},
+			Mount{Type: MountBind, Source: source, Target: "/data", ReadOnly: true},
 			Mount{Type: MountTmpfs, Target: "/scratch"},
 		))
 
-	joined := strings.Join(f.callWith("run"), " ")
-	if !strings.Contains(joined, "--mount type=bind,source=/host/data,target=/data,readonly") {
-		t.Errorf("bind mount missing: %s", joined)
+	runCall := f.callWith("run")
+	wantBind := "type=bind,source=" + source + ",target=/data,readonly"
+	if !slices.Contains(runCall, wantBind) {
+		t.Errorf("bind mount argv missing %q: %v", wantBind, runCall)
 	}
+	joined := strings.Join(runCall, " ")
 	if !strings.Contains(joined, "--mount type=tmpfs,target=/scratch") {
 		t.Errorf("tmpfs mount missing: %s", joined)
 	}
@@ -376,10 +349,27 @@ func TestRunPassesMounts(t *testing.T) {
 
 func TestRunRejectsMountWithComma(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "a,b")
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
-		WithMounts(Mount{Type: MountBind, Source: "/a,b", Target: "/data"}), withRunner(f))
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
 	if err == nil {
 		t.Fatal("want error for comma in mount source")
+	}
+}
+
+func TestRunRejectsRelativeBindMountSource(t *testing.T) {
+	f := newTestRunner()
+	source := filepath.Join("relative", "data")
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
+	if err == nil {
+		t.Fatal("want error for relative bind mount source")
+	}
+	if !strings.Contains(err.Error(), "absolute host path") {
+		t.Errorf("error = %q, want absolute host path error", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("run must not be issued: %v", f.callWith("run"))
 	}
 }
 
@@ -436,7 +426,7 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

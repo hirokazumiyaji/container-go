@@ -16,6 +16,8 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
+const testDockerUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 // streamRunner adds a canned Stream implementation to fakeRunner.
 type streamRunner struct {
 	*fakeRunner
@@ -154,7 +156,7 @@ func TestFollowLogsRequiresStreamingRunner(t *testing.T) {
 func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
 	terminal := &cli.CLIError{
 		Binary:   "docker",
-		Args:     []string{"logs", "--follow", "myctr"},
+		Args:     []string{"logs", "--follow", testDockerUID},
 		ExitCode: 17,
 		Stderr:   "logs stream failed",
 	}
@@ -162,7 +164,7 @@ func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
 		fakeRunner: newTestRunner(),
 		stream:     &stagedTerminalReader{terminalErr: terminal},
 	}
-	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", uid: testDockerUID, runner: runner, eng: dockerEngine{}}
 
 	err := wait.ForLog("ready").
 		WithStartupTimeout(time.Second).
@@ -180,15 +182,15 @@ func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
 func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testing.T) {
 	terminal := &cli.CLIError{
 		Binary:   "docker",
-		Args:     []string{"logs", "--follow", "myctr"},
+		Args:     []string{"logs", "--follow", testDockerUID},
 		ExitCode: 1,
-		Stderr:   "Error response from daemon: No such container: myctr",
+		Stderr:   "Error response from daemon: No such container: " + testDockerUID,
 	}
 	runner := &singleStreamRunner{
 		fakeRunner: &fakeRunner{systemUp: false},
 		stream:     newTerminalStatusReader(terminal),
 	}
-	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", uid: testDockerUID, runner: runner, eng: dockerEngine{}}
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {
 		t.Fatalf("FollowLogs: %v", err)
@@ -212,33 +214,55 @@ func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testin
 	}
 }
 
-func TestLogsWithOptionsPassesTailAndSince(t *testing.T) {
-	f := newTestRunner()
-	ctr := runTestContainer(t, f)
-	f.calls = nil
-
+func TestLogsWithOptionsBackendMatrix(t *testing.T) {
 	since := time.Date(2026, 9, 11, 0, 0, 0, 0, time.UTC)
-	rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{Tail: 50, Since: since})
-	if err != nil {
-		t.Fatalf("LogsWithOptions: %v", err)
+	sinceArg := since.Format(time.RFC3339)
+	const testDockerUID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	const testCreation = "bbbbbbbbbbbbbbbb"
+	tests := []struct {
+		name            string
+		eng             engine
+		opts            LogsOptions
+		wantArgs        []string
+		wantUnsupported bool
+	}{
+		{name: "apple tail only", eng: appleEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "-n", "50", "myctr"}},
+		{name: "apple since only", eng: appleEngine{}, opts: LogsOptions{Since: since}, wantUnsupported: true},
+		{name: "apple tail and since", eng: appleEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantUnsupported: true},
+		{name: "apple neither", eng: appleEngine{}, wantArgs: []string{"logs", "myctr"}},
+		{name: "docker tail only", eng: dockerEngine{}, opts: LogsOptions{Tail: 50}, wantArgs: []string{"logs", "--tail", "50", testDockerUID}},
+		{name: "docker since only", eng: dockerEngine{}, opts: LogsOptions{Since: since}, wantArgs: []string{"logs", "--since", sinceArg, testDockerUID}},
+		{name: "docker tail and since", eng: dockerEngine{}, opts: LogsOptions{Tail: 50, Since: since}, wantArgs: []string{"logs", "--tail", "50", "--since", sinceArg, testDockerUID}},
+		{name: "docker neither", eng: dockerEngine{}, wantArgs: []string{"logs", testDockerUID}},
 	}
-	_ = rc.Close()
 
-	call := f.callWith("logs")
-	if call == nil {
-		t.Fatal("no logs call recorded")
-	}
-	joined := strings.Join(call, " ")
-	if !strings.Contains(joined, "--tail 50") {
-		t.Errorf("missing --tail 50: %v", call)
-	}
-	if !strings.Contains(joined, "--since") {
-		t.Errorf("missing --since: %v", call)
-	}
-	tailIdx := strings.Index(joined, "--tail")
-	idIdx := strings.LastIndex(joined, "myctr")
-	if tailIdx < 0 || idIdx < 0 || tailIdx > idIdx {
-		t.Errorf("flags must precede container id: %v", call)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := &Container{id: "myctr", creation: testCreation, runner: f, eng: tc.eng}
+			if _, ok := tc.eng.(dockerEngine); ok {
+				ctr.setImmutableID(testDockerUID)
+			}
+
+			rc, err := ctr.LogsWithOptions(context.Background(), tc.opts)
+			if tc.wantUnsupported {
+				if !errors.Is(err, ErrUnsupportedCapability) {
+					t.Fatalf("LogsWithOptions error = %v, want ErrUnsupportedCapability", err)
+				}
+				if call := f.callWith("logs"); call != nil {
+					t.Errorf("unsupported options must not invoke the CLI: %v", call)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("LogsWithOptions: %v", err)
+			}
+			_ = rc.Close()
+
+			if call := f.callWith("logs"); !slices.Equal(call, tc.wantArgs) {
+				t.Errorf("logs args = %v, want %v", call, tc.wantArgs)
+			}
+		})
 	}
 }
 
@@ -259,7 +283,7 @@ func TestLogsDefaultsToUnbounded(t *testing.T) {
 
 func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
 	r := &cli.ExecRunner{Binary: writeFollowLogsStub(t)}
-	ctr := &Container{id: "myctr", runner: r, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", uid: testDockerUID, runner: r, eng: dockerEngine{}}
 
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {
@@ -278,7 +302,7 @@ func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
 	if cliErr.ExitCode != 1 {
 		t.Errorf("ExitCode = %d, want 1", cliErr.ExitCode)
 	}
-	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+	if !strings.Contains(cliErr.Stderr, "No such container: "+testDockerUID) {
 		t.Errorf("Stderr = %q, want not-found diagnostic", cliErr.Stderr)
 	}
 }
@@ -295,7 +319,7 @@ if [ "$1" = "version" ]; then
   exit 0
 fi
 head -c 70000 /dev/zero >&2
-printf 'Error response from daemon: No such container: myctr\n' >&2
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
 exit 1
 `
 	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {

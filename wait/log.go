@@ -26,7 +26,9 @@ const (
 var errLogLineTooLong = errors.New("log line exceeds 1 MiB")
 
 // LogStrategy waits until a pattern appears in the container's log
-// stream. Patterns are matched per line.
+// stream. Patterns are matched per line. If the stream ends first,
+// readiness is not implied: the strategy probes whether the container is
+// stopped and otherwise reports the stream ending before the pattern.
 type LogStrategy struct {
 	options
 	pattern     string
@@ -77,7 +79,12 @@ func (s *LogStrategy) validate() error {
 	}
 	if s.isRegexp {
 		if _, err := regexp.Compile(s.pattern); err != nil {
-			return invalidConfigf("invalid log pattern %q: %v", s.pattern, err)
+			return &ConfigError{
+				Strategy: "ForLog",
+				Field:    "pattern",
+				Value:    s.pattern,
+				Reason:   err.Error(),
+			}
 		}
 	}
 	return nil
@@ -529,7 +536,12 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	if s.isRegexp {
 		re, err := regexp.Compile(s.pattern)
 		if err != nil {
-			return invalidConfigf("invalid log pattern %q: %v", s.pattern, err)
+			return &ConfigError{
+				Strategy: "ForLog",
+				Field:    "pattern",
+				Value:    s.pattern,
+				Reason:   err.Error(),
+			}
 		}
 		match = func(line string) int { return len(re.FindAllString(line, -1)) }
 	} else {

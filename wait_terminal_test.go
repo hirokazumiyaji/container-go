@@ -33,6 +33,7 @@ exit 17
 
 	ctr := &Container{
 		id:     "myctr",
+		uid:    testDockerUID,
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
 	}
@@ -67,7 +68,7 @@ if [ "$1" = "version" ]; then
 fi
 printf 'ready\n'
 head -c 70000 /dev/zero >&2
-printf 'Error response from daemon: No such container: myctr\n' >&2
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
 exit 1
 `
 	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
@@ -76,6 +77,7 @@ exit 1
 
 	ctr := &Container{
 		id:     "myctr",
+		uid:    testDockerUID,
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
 	}
@@ -90,7 +92,7 @@ exit 1
 	if !errors.As(err, &cliErr) {
 		t.Fatalf("error = %v, want *cli.CLIError", err)
 	}
-	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+	if !strings.Contains(cliErr.Stderr, "No such container: "+testDockerUID) {
 		t.Fatalf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
 	}
 	if !errors.Is(err, ErrContainerNotFound) {
@@ -108,11 +110,11 @@ fi
 printf 'ready\n'
 i=0
 while [ "$i" -lt 4000 ]; do
-  printf 'noise-%04d\\n' "$i" >&2
+  printf 'noise-%04d\n' "$i" >&2
   i=$((i+1))
 done
 sleep 0.05
-printf 'Error response from daemon: No such container: myctr\\n' >&2
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
 exit 1
 `
 	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
@@ -121,6 +123,7 @@ exit 1
 
 	ctr := &Container{
 		id:     "myctr",
+		uid:    testDockerUID,
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
 	}
@@ -138,7 +141,7 @@ exit 1
 	if !errors.As(err, &cliErr) {
 		t.Fatalf("error = %v, want *cli.CLIError", err)
 	}
-	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+	if !strings.Contains(cliErr.Stderr, "No such container: "+testDockerUID) {
 		t.Fatalf("Stderr = %q, want final not-found marker", cliErr.Stderr)
 	}
 }
@@ -150,7 +153,7 @@ if [ "$1" = "version" ]; then
   printf '29.7\n'
   exit 0
 fi
-printf 'Error response from daemon: No such container: myctr\n' >&2
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
 exit 1
 `
 	if err := os.WriteFile(script, []byte(contents), 0o755); err != nil {
@@ -158,6 +161,7 @@ exit 1
 	}
 	ctr := &Container{
 		id:     "myctr",
+		uid:    testDockerUID,
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
 	}
@@ -174,7 +178,7 @@ exit 1
 	if !errors.As(readErr, &cliErr) {
 		t.Fatalf("read error = %v, want *CLIError", readErr)
 	}
-	if !strings.Contains(cliErr.Stderr, "No such container: myctr") {
+	if !strings.Contains(cliErr.Stderr, "No such container: "+testDockerUID) {
 		t.Fatalf("Stderr = %q, want not-found diagnostic", cliErr.Stderr)
 	}
 }

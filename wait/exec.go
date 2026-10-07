@@ -49,10 +49,18 @@ func (s *ExecStrategy) validate() error {
 		return err
 	}
 	if len(s.cmd) == 0 {
-		return invalidConfigf("wait for exec: command must not be empty")
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "command",
+			Reason:   "command must not be empty",
+		}
 	}
 	if s.cmd[0] == "" {
-		return invalidConfigf("wait for exec: executable must not be empty")
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "executable",
+			Reason:   "executable must not be empty",
+		}
 	}
 	return nil
 }

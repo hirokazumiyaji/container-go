@@ -35,7 +35,7 @@ func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
 }
 
 func (p *processIdentity) usable() error {
-	if p == nil || p.closed.Load() || p.pidfd <= 0 {
+	if p == nil || p.closed.Load() || p.pidfd < 0 {
 		return os.ErrProcessDone
 	}
 	return nil
@@ -127,7 +127,7 @@ func (p *processIdentity) groupID() (int, bool) {
 func (p *processIdentity) close() {
 	p.closeOne.Do(func() {
 		p.closed.Store(true)
-		if p.pidfd > 0 {
+		if p.pidfd >= 0 {
 			_ = unix.Close(p.pidfd)
 		}
 	})

@@ -44,19 +44,6 @@ func validatePortSpec(port string, allowEmpty bool) error {
 	return nil
 }
 
-func validateTCPPortSpec(port string, allowEmpty bool) error {
-	if err := validatePortSpec(port, allowEmpty); err != nil {
-		return err
-	}
-	if port == "" {
-		return nil
-	}
-	_, proto, hasProto := strings.Cut(port, "/")
-	if hasProto && proto != "tcp" {
-		return invalidConfigf("invalid port %q: wait probes require tcp", port)
-	}
-	return nil
-}
 
 func isPermanentCheckError(err error) bool {
 	if err == nil {

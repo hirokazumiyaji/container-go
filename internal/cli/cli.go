@@ -17,8 +17,11 @@ import (
 // maxStderr bounds the stderr captured into a CLIError.
 const maxStderr = 64 * 1024
 
-// ErrSystemNotRunning reports that the container backend (Apple
-// Container system service or Docker daemon) is not running.
+// ErrSystemNotRunning reports that a backend CLI command returned a
+// non-zero exit status and its follow-up liveness probe also failed.
+// Missing or unlaunchable CLI binaries remain launch errors and are not
+// classified as this value. When classification wraps this sentinel, the
+// current implementation flattens the original CLI error into text (#104).
 var ErrSystemNotRunning = errors.New("container backend is not running")
 
 // Probe is the backend-specific liveness check Classify runs after a

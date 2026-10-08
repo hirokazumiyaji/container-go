@@ -49,6 +49,7 @@ func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	}
 	ctr := &Container{
 		id:     "myctr",
+		uid:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		runner: &cli.ExecRunner{Binary: backend},
 		eng:    dockerEngine{},
 	}

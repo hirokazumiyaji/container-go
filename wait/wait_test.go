@@ -17,14 +17,16 @@ import (
 
 // fakeTarget implements Target for tests.
 type fakeTarget struct {
-	endpoint   string
-	state      atomic.Value
-	stateErr   error
-	stateCalls atomic.Int32
-	logs       io.ReadCloser
-	execCode   int
-	execErr    error
-	execCalls  atomic.Int32
+	endpoint      string
+	endpointCalls atomic.Int32
+	state         atomic.Value
+	stateErr      error
+	stateCalls    atomic.Int32
+	runningCalls  atomic.Int32
+	logs          io.ReadCloser
+	execCode      int
+	execErr       error
+	execCalls     atomic.Int32
 }
 
 func newFakeTarget() *fakeTarget {
@@ -34,6 +36,7 @@ func newFakeTarget() *fakeTarget {
 }
 
 func (f *fakeTarget) Endpoint(_ context.Context, port string) (string, error) {
+	f.endpointCalls.Add(1)
 	if f.endpoint == "" {
 		return "", errors.New("no endpoint configured")
 	}
@@ -80,12 +83,84 @@ func TestForListeningPortSucceedsWhenPortOpen(t *testing.T) {
 	}
 	defer ln.Close()
 
+	for _, spec := range []string{"6379", "6379/tcp"} {
+		t.Run(spec, func(t *testing.T) {
+			target := newFakeTarget()
+			target.endpoint = ln.Addr().String()
+
+			s := ForListeningPort(spec).WithStartupTimeout(3 * time.Second)
+			if err := s.WaitUntilReady(context.Background(), target); err != nil {
+				t.Fatalf("WaitUntilReady: %v", err)
+			}
+		})
+	}
+}
+
+func TestForExposedPortSucceedsWhenPortOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
 	target := newFakeTarget()
 	target.endpoint = ln.Addr().String()
 
-	s := ForListeningPort("6379/tcp").WithStartupTimeout(3 * time.Second)
+	s := ForExposedPort().WithStartupTimeout(3 * time.Second)
 	if err := s.WaitUntilReady(context.Background(), target); err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)
+	}
+}
+
+func TestForListeningPortRejectsInvalidConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		port string
+		want string
+	}{
+		{name: "UDP", port: "5353/udp", want: "only TCP is supported"},
+		{name: "empty", port: "", want: "port must be 1-65535"},
+		{name: "non-numeric", port: "not-a-port", want: "port must be 1-65535"},
+		{name: "out of range", port: "65536/tcp", want: "port must be 1-65535"},
+		{name: "unknown protocol", port: "6379/sctp", want: "protocol must be tcp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := newFakeTarget()
+			err := ForListeningPort(tt.port).
+				WithStartupTimeout(100*time.Millisecond).
+				WithPollInterval(10*time.Millisecond).
+				WaitUntilReady(context.Background(), target)
+			if err == nil {
+				t.Fatal("want configuration error")
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("error = %T %q, want *ConfigError", err, err)
+			}
+			if !errors.Is(err, ErrInvalidConfiguration) {
+				t.Errorf("error = %v, want ErrInvalidConfiguration", err)
+			}
+			if configErr.Strategy != "ForListeningPort" ||
+				configErr.Field != "port specification" ||
+				configErr.Value != tt.port ||
+				configErr.Reason != tt.want {
+				t.Errorf("ConfigError = %+v", configErr)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want %q", err, tt.want)
+			}
+			if strings.Contains(err.Error(), "timed out") {
+				t.Errorf("error = %q, want fail-fast configuration error", err)
+			}
+			if got := target.endpointCalls.Load(); got != 0 {
+				t.Errorf("Endpoint calls = %d, want 0", got)
+			}
+			if got := target.runningCalls.Load(); got != 0 {
+				t.Errorf("Running calls = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -106,6 +181,9 @@ func TestForListeningPortTimesOut(t *testing.T) {
 	err = s.WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -530,6 +608,36 @@ func (s *slowStateTarget) State(ctx context.Context) (State, error) {
 	}
 }
 
+// slowRunningTarget blocks in Running until ctx ends or block elapses.
+type slowRunningTarget struct {
+	*fakeTarget
+	block time.Duration
+}
+
+func (s *slowRunningTarget) Running(ctx context.Context) (bool, error) {
+	s.runningCalls.Add(1)
+	timer := time.NewTimer(s.block)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false, ctx.Err()
+	case <-timer.C:
+		state, err := s.fakeTarget.State(ctx)
+		return state == StateRunning, err
+	}
+}
+
+func (s *slowRunningTarget) State(ctx context.Context) (State, error) {
+	running, err := s.Running(ctx)
+	if err != nil {
+		return StateUnknown, err
+	}
+	if running {
+		return StateRunning, nil
+	}
+	return StateStopped, nil
+}
+
 func TestForAllRunsStrategiesInOrder(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -623,14 +731,27 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 }
 
 func TestForExecRejectsEmptyCommand(t *testing.T) {
-	target := newFakeTarget()
-	s := ForExec(nil).WithStartupTimeout(60 * time.Second)
-	start := time.Now()
-	err := s.WaitUntilReady(context.Background(), target)
-	if err == nil {
-		t.Fatal("want error for empty command")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("took %v, want immediate error", elapsed)
+	for _, tc := range []struct {
+		name string
+		cmd  []string
+	}{
+		{name: "empty command", cmd: nil},
+		{name: "empty executable", cmd: []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := newFakeTarget()
+			s := ForExec(tc.cmd).WithStartupTimeout(60 * time.Second)
+			start := time.Now()
+			err := s.WaitUntilReady(context.Background(), target)
+			if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Errorf("took %v, want immediate error", elapsed)
+			}
+			if got := target.execCalls.Load(); got != 0 {
+				t.Fatalf("exec calls = %d, want 0", got)
+			}
+		})
 	}
 }

@@ -8,29 +8,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 const (
-	defaultStartupTimeout = 60 * time.Second
-	defaultPollInterval   = 100 * time.Millisecond
-	// stateCheckInterval bounds lifecycle probes during an ongoing
-	// readiness poll. Stream failures are reclassified immediately.
-	stateCheckInterval = time.Second
-	// finalLifecycleProbeTimeout matches the backend query budget. It is
-	// clamped by the strategy's remaining context rather than replacing it.
+	defaultStartupTimeout      = 60 * time.Second
+	defaultPollInterval        = 100 * time.Millisecond
+	stateCheckInterval         = time.Second
+	lifecycleProbeTimeout      = 5 * time.Second
 	finalLifecycleProbeTimeout = 30 * time.Second
 )
 
-// ErrTargetNotFound can wrap a Target method error when the target no
-// longer exists. Readiness polling treats it as permanent and returns
-// immediately instead of retrying until its deadline.
-var ErrTargetNotFound = errors.New("wait target not found")
+// Target is the container surface strategies probe. *container.Container
+// is adapted to it by container.Run.
+type Target interface {
+	// Endpoint resolves a declared container port ("6379/tcp") to a
+	// dialable "host:port". An empty port asks the built-in adapter for
+	// its first exposed TCP declaration, falling back to a published TCP
+	// declaration.
+	Endpoint(ctx context.Context, port string) (string, error)
+	// Running reports whether the container is still running.
+	Running(ctx context.Context) (bool, error)
+	// FollowLogs streams log output; Close releases the stream. A
+	// terminal CLI failure is returned by Read after the stream starts.
+	FollowLogs(ctx context.Context) (io.ReadCloser, error)
+	// ExecCommand runs a command in the container and returns its
+	// exit code.
+	ExecCommand(ctx context.Context, cmd []string) (int, error)
+}
 
-// State is a container lifecycle state reported by a StateTarget.
+// State is a container lifecycle state reported by Target.
 type State string
 
 const (
@@ -43,43 +52,17 @@ const (
 	StatePaused     State = "paused"
 )
 
-// Target is the container surface strategies probe. Running remains on
-// the interface for compatibility with existing custom strategies.
-// Targets that can distinguish startup transitions should also implement
-// StateTarget; built-in strategies use State when available and fall back
-// to Running otherwise. *container.Container is adapted by container.Run.
-type Target interface {
-	// Endpoint resolves a declared container port ("6379/tcp") to a
-	// dialable "host:port". An empty port means the first declared
-	// port.
-	Endpoint(ctx context.Context, port string) (string, error)
-	// Running reports whether the container is running. A false result
-	// is terminal for a startup wait. Transient lifecycle states need the
-	// richer StateTarget interface.
-	Running(ctx context.Context) (bool, error)
-	// FollowLogs streams log output; Close releases the stream. ForLog
-	// requires each connection to begin with all currently retained log
-	// history and treats that history as append-only during one wait.
-	// Empty or partial reconnects are allowed and do not advance ForLog's
-	// replay cursor.
-	FollowLogs(ctx context.Context) (io.ReadCloser, error)
-	// ExecCommand runs a command in the container and returns its
-	// exit code.
-	ExecCommand(ctx context.Context, cmd []string) (int, error)
-}
-
-// StateTarget is the optional richer lifecycle surface used by built-in
-// readiness strategies. State should return StateUnknown with an error when
-// inspection fails. Permanent target disappearance should wrap
-// ErrTargetNotFound; all other state errors are retried until the wait ends.
+// StateTarget is an optional extension to Target for targets that can
+// distinguish transitional states (Created, Restarting, Unknown) from
+// terminal ones (Stopped, Stopping, Paused). Built-in strategies use it
+// when available and fall back to Running.
 type StateTarget interface {
-	Target
 	State(ctx context.Context) (State, error)
 }
 
-// Strategy waits until a started container is ready for use. Composite
-// strategies may run a strategy in a goroutine, so implementations should
-// return when ctx is done.
+// Strategy waits until a started container is ready for use.
+// Implementations must return when ctx is done so composite strategies can
+// collect their final causes without extending the caller's budget.
 type Strategy interface {
 	WaitUntilReady(ctx context.Context, target Target) error
 }
@@ -100,8 +83,8 @@ func (o options) effective() (timeout, interval time.Duration) {
 	return timeout, interval
 }
 
-// waitError keeps the context cause as the conventional Unwrap result while
-// exposing transient check/state causes through errors.Is and errors.As.
+// waitError keeps a conventional single context cause for errors.Unwrap
+// while exposing additional transient causes through errors.Is/As.
 type waitError struct {
 	message string
 	primary error
@@ -141,160 +124,32 @@ func newWaitError(message string, causes ...error) error {
 	return &waitError{message: message, primary: primary, causes: filtered}
 }
 
+func waitContextError(what string, contextErr, lastErr error) error {
+	message := fmt.Sprintf("%s: %s", what, contextErr)
+	if lastErr != nil {
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
+	}
+	return newWaitError(message, contextErr, lastErr)
+}
+
 func waitTimeoutError(what string, timeout time.Duration, lastErr error) error {
 	message := fmt.Sprintf("%s: timed out after %v", what, timeout)
 	if lastErr != nil {
-		message += diagnosticSuffix(lastErr, nil)
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
 	}
 	return newWaitError(message, context.DeadlineExceeded, lastErr)
 }
 
-func joinNonNil(errs ...error) error {
-	filtered := make([]error, 0, len(errs))
-	for _, err := range errs {
-		if err != nil {
-			filtered = append(filtered, err)
-		}
+func waitStoppedStateError(what string, state State, lastErr error) error {
+	message := fmt.Sprintf("%s: container %s while waiting", what, state)
+	if lastErr != nil {
+		message += fmt.Sprintf(" (last error: %v)", lastErr)
 	}
-	switch len(filtered) {
-	case 0:
-		return nil
-	case 1:
-		return filtered[0]
-	default:
-		return errors.Join(filtered...)
-	}
+	return newWaitError(message, lastErr)
 }
 
-// poll runs check until it succeeds, the container enters a state from
-// which startup cannot proceed, or the timeout elapses. Every strategy gets
-// the same lifecycle policy: inspect once up front, then at a bounded cadence;
-// retain transient check and state errors for final diagnostics.
-func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error) error {
-	timeout, interval := o.effective()
-	callerCtx := ctx
-	startupDeadline := time.Now().Add(timeout)
-	waitCtx, cancel := context.WithDeadline(ctx, startupDeadline)
-	defer cancel()
-
-	var lastCheckErr, lastStateErr error
-	if err := callerCtx.Err(); err != nil {
-		return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-	}
-	state, err := targetState(waitCtx, target)
-	if waitErr := waitCtx.Err(); waitErr != nil {
-		return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-	}
-	if err != nil {
-		if permanentProbeError(err) {
-			return fmt.Errorf("%s: %w", what, err)
-		}
-		lastStateErr = err
-	} else if terminalWaitState(state) {
-		if callerErr := callerCtx.Err(); callerErr != nil {
-			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-		}
-		return stateFailure(what, state, lastCheckErr, lastStateErr)
-	}
-	lastStateCheck := time.Now()
-
-	for {
-		if err := waitCtx.Err(); err != nil {
-			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-		}
-
-		err := check(waitCtx)
-		if err == nil {
-			if waitErr := waitCtx.Err(); waitErr != nil {
-				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-			}
-			finalErr := finalLifecycleCheck(waitCtx, target, what)
-			if waitErr := waitCtx.Err(); waitErr != nil {
-				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, finalErr)
-			}
-			if finalErr != nil {
-				return finalErr
-			}
-			return nil
-		}
-		// Keep the check cause even when the context ends while the check
-		// is returning; it is useful diagnostic context for the terminal
-		// cancellation/deadline error.
-		lastCheckErr = err
-		if waitErr := waitCtx.Err(); waitErr != nil {
-			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-		}
-		if permanentProbeError(err) {
-			return fmt.Errorf("%s: %w", what, err)
-		}
-
-		if waitCtx.Err() == nil && time.Since(lastStateCheck) >= stateCheckInterval {
-			lastStateCheck = time.Now()
-			state, stateErr := targetState(waitCtx, target)
-			if waitErr := waitCtx.Err(); waitErr != nil {
-				return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-			}
-			if stateErr != nil {
-				if permanentProbeError(stateErr) {
-					return fmt.Errorf("%s: %w", what, stateErr)
-				}
-				lastStateErr = stateErr
-			} else if terminalWaitState(state) {
-				if callerErr := callerCtx.Err(); callerErr != nil {
-					return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-				}
-				return stateFailure(what, state, lastCheckErr, lastStateErr)
-			}
-		}
-
-		timer := time.NewTimer(interval)
-		select {
-		case <-waitCtx.Done():
-			if !timer.Stop() {
-				select {
-				case <-timer.C:
-				default:
-				}
-			}
-			// The strategy deadline is authoritative. Do not detach from
-			// it or start a fresh timeout budget for post-deadline state.
-			return pollTerminationError(callerCtx, waitCtx, startupDeadline, what, timeout, lastCheckErr, lastStateErr)
-		case <-timer.C:
-		}
-	}
-}
-
-// pollTerminationError classifies the context that ended a leaf poll. The
-// caller is checked first, and the startup deadline is only reported as the
-// strategy timeout when the caller did not win the race.
-func pollTerminationError(callerCtx, waitCtx context.Context, startupDeadline time.Time, what string, timeout time.Duration, checkErr, stateErr error) error {
-	if err := callerCtx.Err(); err != nil {
-		message := fmt.Sprintf("%s: %s", what, err)
-		return newWaitError(message+diagnosticSuffix(checkErr, stateErr), err, checkErr, stateErr)
-	}
-	if err := waitCtx.Err(); err != nil {
-		if errors.Is(err, context.DeadlineExceeded) && callerDeadlineWins(callerCtx, startupDeadline) {
-			message := fmt.Sprintf("%s: caller deadline exceeded", what)
-			return newWaitError(message+diagnosticSuffix(checkErr, stateErr), context.DeadlineExceeded, checkErr, stateErr)
-		}
-		if errors.Is(err, context.DeadlineExceeded) {
-			return waitTimeoutError(what, timeout, joinNonNil(checkErr, stateErr))
-		}
-		message := fmt.Sprintf("%s: %s", what, err)
-		return newWaitError(message+diagnosticSuffix(checkErr, stateErr), err, checkErr, stateErr)
-	}
-	return waitTimeoutError(what, timeout, joinNonNil(checkErr, stateErr))
-}
-
-// callerDeadlineWins reports whether the caller's configured deadline is at
-// or before this strategy's own deadline. Checking the timestamp as well as
-// Err closes the small race where a custom context has not published Err yet.
-func callerDeadlineWins(callerCtx context.Context, startupDeadline time.Time) bool {
-	if callerCtx.Err() != nil {
-		return true
-	}
-	deadline, ok := callerCtx.Deadline()
-	return ok && !deadline.After(startupDeadline)
+func stateFailure(what string, state State, checkErr, stateErr error) error {
+	return waitStoppedStateError(what, state, joinNonNil(checkErr, stateErr))
 }
 
 // targetState uses the richer optional interface when available. Running is a
@@ -303,7 +158,10 @@ func targetState(ctx context.Context, target Target) (State, error) {
 	if stateTarget, ok := target.(StateTarget); ok {
 		state, err := stateTarget.State(ctx)
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			return StateUnknown, ctxErr
+			if permanentProbeError(err) || isPermanentCheckError(err) {
+				return StateUnknown, ctxErr
+			}
+			return StateUnknown, joinNonNil(err, ctxErr)
 		}
 		if err != nil {
 			return StateUnknown, err
@@ -312,7 +170,10 @@ func targetState(ctx context.Context, target Target) (State, error) {
 	}
 	running, err := target.Running(ctx)
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		return StateUnknown, ctxErr
+		if permanentProbeError(err) || isPermanentCheckError(err) {
+			return StateUnknown, ctxErr
+		}
+		return StateUnknown, joinNonNil(err, ctxErr)
 	}
 	if err != nil {
 		return StateUnknown, err
@@ -340,30 +201,244 @@ func terminalWaitState(state State) bool {
 	return state == StateStopping || state == StateStopped || state == StatePaused
 }
 
-func stateFailure(what string, state State, checkErr, stateErr error) error {
-	message := fmt.Sprintf("%s: container %s while waiting", what, state)
-	return newWaitError(message+diagnosticSuffix(checkErr, stateErr), checkErr, stateErr)
+func waitContextTerminationError(callerCtx, waitCtx context.Context, what string, timeout time.Duration, lastErr error) error {
+	if err := callerCtx.Err(); err != nil {
+		return waitContextError(what, err, lastErr)
+	}
+	if err := waitCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return waitTimeoutError(what, timeout, lastErr)
+		}
+		return waitContextError(what, err, lastErr)
+	}
+	return nil
 }
 
-func diagnosticSuffix(checkErr, stateErr error) string {
-	var causes []string
-	if checkErr != nil {
-		causes = append(causes, fmt.Sprintf("last check error: %v", checkErr))
+func finalLifecycleError(
+	callerCtx, waitCtx context.Context,
+	target Target,
+	what string,
+	timeout, interval time.Duration,
+	lastErr error,
+) error {
+	// A successful endpoint/exec/log check can race a short-lived daemon
+	// hiccup. The lifecycle check is still a fail-fast guard for a stopped
+	// container, but transient probe failures get another attempt while the
+	// original wait budget remains. Retries reuse the strategy's poll
+	// interval so a transient daemon failure cannot turn into a faster
+	// probe loop than the check it follows, and only the latest probe cause
+	// is retained so retries cannot grow an error tree.
+	var lastProbeErr error
+	for {
+		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
+		if err := probeCtx.Err(); err != nil {
+			probeCancel()
+			return waitContextTerminationError(
+				callerCtx,
+				waitCtx,
+				what,
+				timeout,
+				joinNonNil(lastErr, lastProbeErr, err),
+			)
+		}
+		state, probeErr := targetState(probeCtx, target)
+		probeCtxErr := probeCtx.Err()
+		probeCancel()
+		if probeCtxErr != nil {
+			probeErr = joinNonNil(probeErr, probeCtxErr)
+		}
+		if terminalErr := waitContextTerminationError(
+			callerCtx,
+			waitCtx,
+			what,
+			timeout,
+			joinNonNil(lastErr, lastProbeErr, probeErr),
+		); terminalErr != nil {
+			return terminalErr
+		}
+		if probeErr != nil {
+			lastProbeErr = probeErr
+			if isPermanentCheckError(probeErr) {
+				return wrapWaitCause(what, permanentCause(probeErr), joinNonNil(lastErr, lastProbeErr))
+			}
+			if err := waitForReconnect(waitCtx, interval); err != nil {
+				return waitContextTerminationError(
+					callerCtx,
+					waitCtx,
+					what,
+					timeout,
+					joinNonNil(lastErr, lastProbeErr),
+				)
+			}
+			continue
+		}
+		if terminalWaitState(state) {
+			return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+		}
+		if state != StateRunning {
+			return fmt.Errorf("%s: final lifecycle state %s; want running", what, state)
+		}
+		return nil
 	}
-	if stateErr != nil {
-		causes = append(causes, fmt.Sprintf("last state error: %v", stateErr))
-	}
-	if len(causes) == 0 {
-		return ""
-	}
-	return " (" + strings.Join(causes, "; ") + ")"
 }
 
-// permanentProbeError identifies failures that cannot recover by retrying the
-// same target operation. Backend adapters should wrap disappearance in
-// ErrTargetNotFound. Deterministic executable-start failures are permanent;
-// ordinary CLI/inspect failures remain retryable unless the operation-specific
-// strategy says otherwise.
+func joinNonNil(errs ...error) error {
+	filtered := make([]error, 0, len(errs))
+	for _, err := range errs {
+		if err != nil {
+			filtered = append(filtered, err)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return filtered[0]
+	}
+	return errors.Join(filtered...)
+}
+
+func wrapWaitCause(what string, cause error, previous ...error) error {
+	if cause == nil {
+		return nil
+	}
+	causes := make([]error, 0, len(previous)+1)
+	causes = append(causes, cause)
+	causes = append(causes, previous...)
+	return newWaitError(fmt.Sprintf("%s: %v", what, cause), causes...)
+}
+
+// poll runs check until it succeeds, the container enters a state from
+// which startup cannot proceed, or the timeout elapses. Every strategy gets
+// the same lifecycle policy: inspect once up front, then at a bounded cadence;
+// retain transient check and state errors for final diagnostics.
+func poll(ctx context.Context, o options, target Target, what string, check func(context.Context) error) error {
+	if err := o.validate(); err != nil {
+		return err
+	}
+	timeout, interval := o.effective()
+	callerCtx := ctx
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	var lastErr, lastProbeErr error
+	var lastStateCheck time.Time
+	terminationErr := func() error {
+		return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
+	}
+
+	if err := terminationErr(); err != nil {
+		return err
+	}
+
+	state, err := targetState(waitCtx, target)
+	if terminalErr := terminationErr(); terminalErr != nil {
+		return terminalErr
+	}
+	if err != nil {
+		if permanentProbeError(err) || isPermanentCheckError(err) {
+			return wrapWaitCause(what, permanentCause(err), lastProbeErr)
+		}
+		lastProbeErr = err
+	} else if terminalWaitState(state) {
+		return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+	}
+	lastStateCheck = time.Now()
+
+	for {
+		if err := terminationErr(); err != nil {
+			return err
+		}
+
+		if err := check(waitCtx); err != nil {
+			// Keep the latest check cause even when it races with the
+			// context becoming done; the terminal classification must not
+			// erase a typed backend error.
+			lastErr = err
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
+			if isPermanentCheckError(err) {
+				return wrapWaitCause(what, permanentCause(err), joinNonNil(lastErr, lastProbeErr))
+			}
+		} else {
+			if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			}
+			causes := joinNonNil(lastErr, lastProbeErr)
+			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, causes); err != nil {
+				return err
+			}
+			return terminationErr()
+		}
+
+		if err := terminationErr(); err != nil {
+			return err
+		}
+		if time.Since(lastStateCheck) >= stateCheckInterval && waitCtx.Err() == nil {
+			lastStateCheck = time.Now()
+			state, err := targetState(waitCtx, target)
+			if err != nil {
+				if terminalErr := terminationErr(); terminalErr != nil {
+					lastProbeErr = err
+					return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
+				}
+				if isPermanentCheckError(err) || permanentProbeError(err) {
+					return wrapWaitCause(what, permanentCause(err), joinNonNil(lastErr, lastProbeErr))
+				}
+				lastProbeErr = err
+			} else if terminalErr := terminationErr(); terminalErr != nil {
+				return terminalErr
+			} else if terminalWaitState(state) {
+				return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+			}
+		}
+
+		timer := time.NewTimer(interval)
+		select {
+		case <-waitCtx.Done():
+			timer.Stop()
+			// No post-deadline probe is started. The caller and startup
+			// deadlines are the hard budget for every target call.
+			return terminationErrOrTimeout(terminationErr(), what, timeout, joinNonNil(lastErr, lastProbeErr))
+		case <-timer.C:
+		}
+	}
+}
+
+func terminationErrOrTimeout(err error, what string, timeout time.Duration, lastErr error) error {
+	if err != nil {
+		return err
+	}
+	return waitTimeoutError(what, timeout, lastErr)
+}
+
+func permanentCause(err error) error {
+	var fatal fatalCheckError
+	if errors.As(err, &fatal) && fatal.err != nil {
+		return fatal.err
+	}
+	var fatalPointer *fatalCheckError
+	if errors.As(err, &fatalPointer) && fatalPointer != nil && fatalPointer.err != nil {
+		return fatalPointer.err
+	}
+	return err
+}
+
+// fatalCheckError wraps a check error that must end the poll
+// immediately instead of being retried: the check cannot succeed as
+// configured (for example, a CLI launch failure, unknown container, or
+// invalid request), so retrying cannot help.
+type fatalCheckError struct{ err error }
+
+func (e fatalCheckError) Error() string {
+	if e.err == nil {
+		return "permanent wait error"
+	}
+	return e.err.Error()
+}
+func (e fatalCheckError) Unwrap() error { return e.err }
+
 func permanentProbeError(err error) bool {
 	if err == nil {
 		return false

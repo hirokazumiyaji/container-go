@@ -39,7 +39,6 @@ func TestReview91ForLogRejectsStopDuringMatch(t *testing.T) {
 		state State
 		err   error
 	}{
-		{state: StateRunning},
 		{state: StateStopped},
 	}
 	target.logStreams = []io.ReadCloser{

@@ -24,6 +24,8 @@ type review91InspectStep struct {
 	err  error
 }
 
+const review91DockerUID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
 func (r *review91ReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		r.mu.Lock()
@@ -38,7 +40,7 @@ func (r *review91ReuseRunner) Run(ctx context.Context, args ...string) ([]byte, 
 		return []byte(step.data), nil, step.err
 	}
 	if args[0] == "run" {
-		return []byte("myctr\n"), nil, nil
+		return []byte(review91DockerUID + "\n"), nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
@@ -50,7 +52,7 @@ func (r *review91ReuseRunner) inspectCount() int {
 }
 
 func review91DockerInspect(bound bool) string {
-	return review91DockerInspectIdentity(bound, "myctr", "aaaaaaaaaaaaaaaa")
+	return review91DockerInspectIdentity(bound, review91DockerUID, "aaaaaaaaaaaaaaaa")
 }
 
 func review91DockerInspectIdentity(bound bool, uid, creation string) string {
@@ -62,12 +64,15 @@ func review91DockerInspectIdentity(bound bool, uid, creation string) string {
 	if creation != "" {
 		creationLabel = fmt.Sprintf(`,"com.github.hirokazumiyaji.container-go.creation":%q`, creation)
 	}
+	sessionLabelJSON := fmt.Sprintf(`,"com.github.hirokazumiyaji.container-go.session":%q`, sessionID())
 	return fmt.Sprintf(`[{
 		"Id":%q,
-		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true"%s}},
+		"Name":"/myctr",
+		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true"%s%s}},
 		"State":{"Status":"running"},
-		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s}
-	}]`, uid, creationLabel, ports)
+		"HostConfig":{"NetworkMode":"bridge"},
+		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s,"Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}
+	}]`, uid, sessionLabelJSON, creationLabel, ports)
 }
 
 func TestReview91WithReuseRetriesTransientInspect(t *testing.T) {
@@ -147,13 +152,13 @@ func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) (
 		r.mu.Lock()
 		defer r.mu.Unlock()
 		if !r.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: `Error: No such container: myctr`}
 		}
 		r.inspects++
 		if r.inspects == 1 {
 			return nil, nil, errors.New("temporary post-create inspect failure")
 		}
-		return []byte(review91DockerInspectIdentity(true, "myctr", r.creation)), nil, nil
+		return []byte(review91DockerInspectIdentity(true, review91DockerUID, r.creation)), nil, nil
 	case "run":
 		r.created = true
 		for i, arg := range args {
@@ -163,7 +168,7 @@ func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) (
 				}
 			}
 		}
-		return []byte("myctr\n"), nil, nil
+		return []byte(review91DockerUID + "\n"), nil, nil
 	default:
 		return r.fakeRunner.Run(ctx, args...)
 	}

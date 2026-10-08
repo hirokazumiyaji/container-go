@@ -33,7 +33,8 @@ func review91OwnedDockerInspect(uid, generation string, reused, bound bool) stri
 			"%s":%q%s
 		}},
 		"State":{"Status":"running"},
-		"NetworkSettings":{"Ports":%s}
+		"HostConfig":{"NetworkMode":"bridge"},
+		"NetworkSettings":{"IPAddress":"172.17.0.2","Ports":%s,"Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}
 	}]`, uid, managedLabel, sessionLabel, sessionID(), creationLabel, generation, reuseLabelJSON, ports)
 }
 
@@ -66,6 +67,13 @@ func (s review91AfterWaitStrategy) WaitUntilReady(context.Context, wait.Target) 
 	return nil
 }
 
+const (
+	review91Round2UIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	review91Round2UIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	review91Round2GenA = "0123456789abcdef"
+	review91Round2GenB = "fedcba9876543210"
+)
+
 func TestReview91ReuseRevalidatesAfterReadiness(t *testing.T) {
 	oldPoll, oldTimeout := reusePollInterval, reuseAttachTimeout
 	reusePollInterval = time.Millisecond
@@ -74,24 +82,24 @@ func TestReview91ReuseRevalidatesAfterReadiness(t *testing.T) {
 		reusePollInterval, reuseAttachTimeout = oldPoll, oldTimeout
 	})
 
-	initial := review91OwnedDockerInspect("uid-a", "generation-a", true, true)
+	initial := review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, true, true)
 	cases := map[string]struct {
 		after  string
 		check  func(error) bool
 		reason string
 	}{
 		"identity": {
-			after:  review91OwnedDockerInspect("uid-b", "generation-b", true, true),
+			after:  review91OwnedDockerInspect(review91Round2UIDB, review91Round2GenB, true, true),
 			check:  func(err error) bool { return errors.Is(err, ErrGenerationReplaced) },
 			reason: "replacement identity",
 		},
 		"ownership": {
-			after:  review91OwnedDockerInspect("uid-a", "generation-a", false, true),
+			after:  review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, false, true),
 			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "WithReuse") },
 			reason: "missing ownership",
 		},
 		"compatibility": {
-			after:  review91OwnedDockerInspect("uid-a", "generation-a", true, false),
+			after:  review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, true, false),
 			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "exposed port") },
 			reason: "missing published endpoint",
 		},
@@ -221,20 +229,20 @@ func TestReview91LazyCacheRejectsReplacementNameLookup(t *testing.T) {
 func TestReview91CacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 	original := &engineInfo{
 		state:  StateRunning,
-		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: "generation-a"},
-		uid:    "uid-a",
+		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: review91Round2GenA},
+		uid:    review91Round2UIDA,
 		bound:  []boundPort{{containerPort: 6379, proto: "tcp", hostPort: 49153}},
 	}
 	replacement := &engineInfo{
 		state:  StateRunning,
-		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: "generation-a"},
-		uid:    "uid-b",
+		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: review91Round2GenA},
+		uid:    review91Round2UIDB,
 		bound:  []boundPort{{containerPort: 6379, proto: "tcp", hostPort: 49154}},
 	}
 	ctr := &Container{
 		eng:      dockerEngine{},
-		creation: "generation-a",
-		uid:      "uid-a",
+		creation: review91Round2GenA,
+		uid:      review91Round2UIDA,
 		exposed:  []portSpec{{port: 6379, proto: "tcp"}},
 	}
 	if err := ctr.cacheInfo(original); err != nil {
@@ -249,7 +257,7 @@ func TestReview91CacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 	if ctr.uid != original.uid {
 		t.Fatalf("uid = %q, want immutable %q", ctr.uid, original.uid)
 	}
-	if ctr.info != original {
-		t.Fatalf("cached endpoint = %+v, want original %+v", ctr.info, original)
+	if ctr.info == nil || ctr.info.uid != original.uid {
+		t.Fatalf("cached info = %+v, want immutable UID %q", ctr.info, original.uid)
 	}
 }

@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -173,7 +174,7 @@ func TestReviewAutoPublishBindsLoopbackLocally(t *testing.T) {
 // because Docker would listen on the remote machine's loopback.
 func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
-	err := (dockerEngine{}).checkConfig(&config{
+	err := (dockerEngine{}).checkConfig(context.Background(), &config{
 		published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
 	})
 	if err == nil {
@@ -184,7 +185,7 @@ func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	}
 
 	// A non-loopback bind is fine on the same remote daemon.
-	if err := (dockerEngine{}).checkConfig(&config{
+	if err := (dockerEngine{}).checkConfig(context.Background(), &config{
 		published: []publishSpec{{hostAddr: "0.0.0.0", raw: "0.0.0.0:18080:80"}},
 	}); err != nil {
 		t.Errorf("a 0.0.0.0 publish on a remote daemon was rejected: %v", err)
@@ -196,7 +197,7 @@ func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 func TestReviewLoopbackPublishStillAllowedLocally(t *testing.T) {
 	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"} {
 		t.Setenv("DOCKER_HOST", host)
-		if err := (dockerEngine{}).checkConfig(&config{
+		if err := (dockerEngine{}).checkConfig(context.Background(), &config{
 			published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
 		}); err != nil {
 			t.Errorf("DOCKER_HOST=%q: local loopback publish rejected: %v", host, err)

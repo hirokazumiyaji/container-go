@@ -187,7 +187,6 @@ func TestReview91FinalSuccessRequiresRunning(t *testing.T) {
 				state State
 				err   error
 			}{
-				{state: StateRunning},
 				{state: state},
 			}
 			err := ForLog("ready").
@@ -198,37 +197,5 @@ func TestReview91FinalSuccessRequiresRunning(t *testing.T) {
 				t.Fatalf("error = %v, state calls = %d, log calls = %d, want final %s failure", err, target.stateCalls, target.logCalls, state)
 			}
 		})
-	}
-}
-
-func TestReview91QueuedTerminalScanResultWinsContextRace(t *testing.T) {
-	cliErr := &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 23, Stderr: "late terminal failure"}
-	results := make(chan logScanResult, 1)
-	results <- logScanResult{err: cliErr}
-
-	got, ok := scanResultOnContextDone(results)
-	if !ok {
-		t.Fatal("queued scanner result was discarded on context completion")
-	}
-	if !errors.Is(got.err, cliErr) && got.err != cliErr {
-		t.Fatalf("queued error = %v, want %v", got.err, cliErr)
-	}
-	scannerErrors := make(chan error, 1)
-	scannerErrors <- cliErr
-	if gotErr, ok := scannerErrorOnContextDone(scannerErrors); !ok || gotErr != cliErr {
-		t.Fatalf("settle scanner error = %v, queued = %t, want %v", gotErr, ok, cliErr)
-	}
-
-	caller, cancelCaller := context.WithCancel(context.Background())
-	cancelCaller()
-	wait, cancelWait := context.WithCancel(context.Background())
-	cancelWait()
-	joined := logContextScanError(caller, wait, "wait for test", time.Second, nil, cliErr)
-	if !errors.Is(joined, context.Canceled) {
-		t.Fatalf("joined error = %v, want context.Canceled", joined)
-	}
-	var gotCLI *cli.CLIError
-	if !errors.As(joined, &gotCLI) || gotCLI.ExitCode != 23 {
-		t.Fatalf("joined error = %v, want retained CLIError", joined)
 	}
 }

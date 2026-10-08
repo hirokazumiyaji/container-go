@@ -18,6 +18,13 @@ type review91IdentitySwitchRunner struct {
 	releaseBase chan struct{}
 }
 
+const (
+	review91UIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	review91UIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	review91GenA = "0123456789abcdef"
+	review91GenB = "fedcba9876543210"
+)
+
 func (r *review91IdentitySwitchRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] != "inspect" {
 		return r.fakeRunner.Run(ctx, args...)
@@ -31,13 +38,13 @@ func (r *review91IdentitySwitchRunner) Run(ctx context.Context, args ...string) 
 	switch inspect {
 	case 1:
 		close(r.first)
-		created := strings.Replace(review91ReuseInspectJSON("uid-a", "generation-a", false), `"Status":"running"`, `"Status":"created"`, 1)
+		created := strings.Replace(review91ReuseInspectJSON(review91UIDA, review91GenA, false), `"Status":"running"`, `"Status":"created"`, 1)
 		return []byte(created), nil, nil
 	case 2:
 		<-r.releaseBase
-		return []byte(review91ReuseInspectJSON("uid-a", "generation-a", false)), nil, nil
+		return []byte(review91ReuseInspectJSON(review91UIDA, review91GenA, false)), nil, nil
 	default:
-		return []byte(review91ReuseInspectJSON("uid-b", "generation-b", true)), nil, nil
+		return []byte(review91ReuseInspectJSON(review91UIDB, review91GenB, true)), nil, nil
 	}
 }
 
@@ -130,19 +137,19 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 		creation string
 		uid      string
 	}{
-		"generation": {creation: "generation-b", uid: "uid-a"},
-		"uid":        {creation: "generation-a", uid: "uid-b"},
+		"generation": {creation: review91GenB, uid: review91UIDA},
+		"uid":        {creation: review91GenA, uid: review91UIDB},
 	}
 	for name, replacement := range cases {
 		t.Run(name, func(t *testing.T) {
 			initial := &engineInfo{
 				state:  StateCreated,
-				labels: map[string]string{creationLabel: "generation-a"},
-				uid:    "uid-a",
+				labels: map[string]string{creationLabel: review91GenA},
+				uid:    review91UIDA,
 			}
 			base := &Container{
-				creation: "generation-a",
-				uid:      "uid-a",
+				creation: review91GenA,
+				uid:      review91UIDA,
 				info:     initial,
 			}
 			cfg := &config{
@@ -165,16 +172,17 @@ type review91CreatedRunner struct{}
 
 func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return []byte(`[{
-			"Id":"uid-a",
+		return []byte(fmt.Sprintf(`[{
+			"Id":%q,
+			"Name":"/shared",
 			"Config":{"Image":"redis:7-alpine","Labels":{
 				"com.github.hirokazumiyaji.container-go":"true",
 				"com.github.hirokazumiyaji.container-go.reuse":"true",
-				"com.github.hirokazumiyaji.container-go.creation":"generation-a"
+				"com.github.hirokazumiyaji.container-go.creation":%q
 			}},
 			"State":{"Status":"created"},
 			"NetworkSettings":{}
-		}]`), nil, nil
+		}]`, review91UIDA, review91GenA)), nil, nil
 	}
 	return nil, nil, nil
 }
@@ -218,11 +226,11 @@ func (r *review91RefreshTimeoutRunner) Run(ctx context.Context, args ...string) 
 	switch inspect {
 	case 1:
 		close(r.first)
-		created := strings.Replace(review91ReuseInspectJSON("uid-a", "generation-a", false), `"Status":"running"`, `"Status":"created"`, 1)
+		created := strings.Replace(review91ReuseInspectJSON(review91UIDA, review91GenA, false), `"Status":"running"`, `"Status":"created"`, 1)
 		return []byte(created), nil, nil
 	case 2:
 		<-r.releaseBase
-		return []byte(review91ReuseInspectJSON("uid-a", "generation-a", false)), nil, nil
+		return []byte(review91ReuseInspectJSON(review91UIDA, review91GenA, false)), nil, nil
 	default:
 		return nil, nil, errors.New("temporary refreshed inspect failure")
 	}
@@ -293,7 +301,7 @@ func (r *review91LazyUIDRunner) Run(_ context.Context, args ...string) ([]byte, 
 		// Keep inspect in flight while concurrent Terminate calls read the
 		// lazy immutable-ID field.
 		time.Sleep(r.inspectDelay)
-		return []byte(review91OwnedDockerInspect("immutable-uid", "generation-a", false, false)), nil, nil
+		return []byte(review91OwnedDockerInspect(review91UIDA, review91GenA, false, false)), nil, nil
 	case "rm":
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])
@@ -308,9 +316,10 @@ func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
 	runner := &review91LazyUIDRunner{inspectDelay: 50 * time.Millisecond}
 	ctr := &Container{
 		id:       "shared",
+		uid:      review91UIDA,
 		runner:   runner,
 		eng:      dockerEngine{},
-		creation: "generation-a",
+		creation: review91GenA,
 	}
 
 	start := make(chan struct{})
@@ -346,7 +355,7 @@ func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
 		t.Fatalf("delete calls = %d, want %d", len(deleted), terminators)
 	}
 	for _, target := range deleted {
-		if target != "immutable-uid" {
+		if target != review91UIDA {
 			t.Fatalf("deleted target = %q, want immutable UID", target)
 		}
 	}

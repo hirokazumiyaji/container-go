@@ -62,6 +62,8 @@ func (r *inspectSequenceRunner) Run(_ context.Context, args ...string) ([]byte, 
 		}
 		step := r.steps[len(r.steps)-1]
 		return []byte(r.withAppleOwnership(step.data)), nil, step.err
+	case "version":
+		return []byte("linux"), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -70,7 +72,7 @@ func (r *inspectSequenceRunner) Run(_ context.Context, args ...string) ([]byte, 
 func (r *inspectSequenceRunner) withAppleOwnership(data string) string {
 	generation := r.generation
 	if generation == "" {
-		generation = "generation-a"
+		generation = "0123456789abcdef"
 	}
 	oldLabel := `"` + managedLabel + `": "true"`
 	newLabels := fmt.Sprintf(`%q: "true", %q: %q, %q: %q`, managedLabel, sessionLabel, sessionID(), creationLabel, generation)
@@ -97,7 +99,7 @@ func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
 	created := appleInspectWithNetwork("myctr", "created", "")
 	running := appleInspectWithNetwork("myctr", "running", "192.168.64.3/24")
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "generation-a", exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef", exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no IP yet")
@@ -115,8 +117,8 @@ func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
 	runner.mu.Lock()
 	inspects := runner.inspects
 	runner.mu.Unlock()
-	if inspects != 2 {
-		t.Fatalf("inspect calls = %d, want incomplete then complete then cached", inspects)
+	if inspects != 3 {
+		t.Fatalf("inspect calls = %d, want incomplete then complete then refreshed", inspects)
 	}
 }
 
@@ -129,15 +131,17 @@ func dockerInspectWithBinding(id, state, address string, hostPort int) string {
 		"Id": %q,
 		"Config": {"Image": "redis:7-alpine", "Labels": {}},
 		"State": {"Status": %q},
-		"NetworkSettings": {"IPAddress": %q, "Ports": %s}
-	}]`, id, state, address, ports)
+		"HostConfig": {"NetworkMode": "bridge"},
+		"NetworkSettings": {"IPAddress": %q, "Ports": %s, "Networks": {"bridge": {"IPAddress": %q}}}
+	}]`, id, state, address, ports, address)
 }
 
 func TestEndpointRefreshesIncompleteDockerBinding(t *testing.T) {
-	created := dockerInspectWithBinding("myctr", "created", "", 0)
-	running := dockerInspectWithBinding("myctr", "running", "172.17.0.2", 49153)
+	validUID := strings.Repeat("a", 64)
+	created := dockerInspectWithBinding(validUID, "created", "", 0)
+	running := dockerInspectWithBinding(validUID, "running", "172.17.0.2", 49153)
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", uid: "myctr", runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", uid: validUID, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no host binding yet")
@@ -196,7 +200,7 @@ func TestContainerStateCanonicalizesUnknownAppleState(t *testing.T) {
 	runner := newInspectSequenceRunner([]inspectStep{{
 		data: appleInspectWithNetwork("myctr", "future-state", "192.168.64.3/24"),
 	}})
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "generation-a"}
+	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef"}
 
 	state, err := ctr.State(context.Background())
 	if err != nil {
@@ -213,21 +217,19 @@ type dockerStateRunner struct {
 }
 
 func (r *dockerStateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "image" {
-		return r.fakeRunner.Run(ctx, args...)
+	if args[0] == "inspect" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return []byte(fmt.Sprintf(`[{
+			"Id": %q,
+			"Name": "/myctr",
+			"Config": {"Image": "redis:7-alpine", "Labels": {%q:"true",%q:"true",%q:"aaaaaaaaaaaaaaaa"}},
+			"State": {"Status": %q},
+			"NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
+		}]`, strings.Repeat("a", 64), managedLabel, reuseLabel, creationLabel, r.status)), nil, nil
 	}
-	if args[0] != "inspect" {
-		return nil, nil, nil
-	}
-	r.mu.Lock()
-	r.calls = append(r.calls, args)
-	r.mu.Unlock()
-	return []byte(fmt.Sprintf(`[{
-		"Id": "myctr",
-		"Config": {"Image": "redis:7-alpine", "Labels": {%q:"true",%q:"true",%q:"aaaaaaaaaaaaaaaa"}},
-		"State": {"Status": %q},
-		"NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}
-	}]`, managedLabel, reuseLabel, creationLabel, r.status)), nil, nil
+	return r.fakeRunner.Run(ctx, args...)
 }
 
 func TestReuseFailsFastForPausedAndStoppingContainers(t *testing.T) {

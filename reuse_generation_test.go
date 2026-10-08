@@ -84,8 +84,13 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
-		state:  StateStopped,
-		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+		uid: strings.Repeat("0f", 32),
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
@@ -100,7 +105,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 }
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: `Error: container not found: "myctr"`}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)

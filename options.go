@@ -3,11 +3,13 @@ package container
 import (
 	"fmt"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/portspec"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -15,28 +17,29 @@ import (
 type Option func(*config) error
 
 type config struct {
-	runner       cli.Runner
-	eng          engine
-	name         string
-	env          map[string]string
-	cmd          []string
-	entrypoint   string
-	exposed      []portSpec
-	published    []publishSpec
-	labels       map[string]string
-	mounts       []Mount
-	files        []File
-	waitStrategy wait.Strategy
-	cpus         int
-	memory       string
-	user         string
-	workdir      string
-	network      string
-	platform     string
-	pullPolicy   PullPolicy
-	reuse        bool
-	reuseGroup   string
-	creation     string
+	runner          cli.Runner
+	eng             engine
+	name            string
+	env             map[string]string
+	cmd             []string
+	entrypoint      string
+	exposed         []portSpec
+	published       []publishSpec
+	labels          map[string]string
+	mounts          []Mount
+	files           []File
+	waitStrategy    wait.Strategy
+	cpus            int
+	memory          string
+	user            string
+	workdir         string
+	network         string
+	networkExplicit bool
+	platform        string
+	pullPolicy      PullPolicy
+	reuse           bool
+	reuseGroup      string
+	creation        string
 }
 
 func newConfig() *config {
@@ -106,7 +109,7 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	if c.workdir != "" {
 		args = append(args, "--workdir", c.workdir)
 	}
-	if c.network != "" {
+	if c.networkExplicit && c.network != "" {
 		args = append(args, "--network", c.network)
 	}
 	if c.platform != "" {
@@ -226,7 +229,9 @@ func WithEntrypoint(entrypoint string) Option {
 }
 
 // WithExposedPorts declares the container ports ("6379/tcp" or "6379")
-// that MappedPort and Endpoint may resolve.
+// that MappedPort and Endpoint may resolve. Docker auto-publishes these
+// ports; host, none, internal, and isolated networks reject that
+// combination before container creation.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
 		for _, p := range ports {
@@ -241,8 +246,13 @@ func WithExposedPorts(ports ...string) Option {
 }
 
 // WithPublishedPort publishes a container port on the host
-// ("[host-ip:]host-port:container-port[/proto]"). Without it, endpoints
-// resolve to the container's own IP, which needs no host port at all.
+// WithPublishedPort publishes a container port on the host
+// ("[host-ip:]host-port:container-port[/proto]"). On Apple Container,
+// endpoints resolve to the container's own IP when this is omitted; on
+// Docker, WithExposedPorts auto-publishes instead. Docker rejects both
+// publish forms on host, none, internal, and isolated networks.
+// Publishing a port does not reorder WithExposedPorts declarations used by
+// implicit wait probes.
 func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)
@@ -341,14 +351,19 @@ func WithWorkingDir(dir string) Option {
 	}
 }
 
-// WithNetwork attaches the container to a named network instead of
-// "default".
+// WithNetwork selects a network. Omitting it leaves Docker's
+// daemon-selected default unchanged (bridge on Linux and nat on native
+// Windows). Docker's "host" and "none" modes and externally isolated
+// networks cannot be combined with WithExposedPorts or WithPublishedPort;
+// the Docker backend rejects those combinations before creating the
+// container.
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
 			return fmt.Errorf("invalid network name %q", name)
 		}
 		c.network = name
+		c.networkExplicit = true
 		return nil
 	}
 }
@@ -374,7 +389,8 @@ type MountType int
 const (
 	// MountBind mounts a host directory (virtiofs).
 	MountBind MountType = iota
-	// MountVolume mounts a named volume.
+	// MountVolume mounts a named volume. Docker managed cleanup preserves
+	// named volumes, including volumes backed by a custom driver.
 	MountVolume
 	// MountTmpfs mounts an in-memory filesystem.
 	MountTmpfs
@@ -383,8 +399,8 @@ const (
 // Mount describes one filesystem mount.
 type Mount struct {
 	Type     MountType
-	Source   string // host path (bind) or volume name (volume); empty for tmpfs
-	Target   string // absolute path inside the container
+	Source   string // host path in host OS syntax (bind) or volume name (volume); empty for tmpfs
+	Target   string // absolute POSIX path inside the container
 	ReadOnly bool
 }
 
@@ -397,12 +413,12 @@ func (m Mount) validate() error {
 	}
 	switch m.Type {
 	case MountBind:
-		if !strings.HasPrefix(m.Source, "/") {
+		if !filepath.IsAbs(m.Source) {
 			return fmt.Errorf("bind mount source %q must be an absolute host path", m.Source)
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volumes are not cleaned up by --rm", m.Target)
+			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volume lifecycle is backend-specific", m.Target)
 		}
 	case MountTmpfs:
 		if m.Source != "" {
@@ -437,18 +453,11 @@ type portSpec struct {
 func (p portSpec) String() string { return strconv.Itoa(p.port) + "/" + p.proto }
 
 func parsePortSpec(s string) (portSpec, error) {
-	portPart, proto, ok := strings.Cut(s, "/")
-	if !ok {
-		proto = "tcp"
+	spec, err := portspec.Parse(s)
+	if err != nil {
+		return portSpec{}, err
 	}
-	if proto != "tcp" && proto != "udp" {
-		return portSpec{}, fmt.Errorf("invalid port %q: protocol must be tcp or udp", s)
-	}
-	n, err := strconv.Atoi(portPart)
-	if err != nil || n < 1 || n > 65535 {
-		return portSpec{}, fmt.Errorf("invalid port %q: port must be 1-65535", s)
-	}
-	return portSpec{port: n, proto: proto}, nil
+	return portSpec{port: spec.Port, proto: spec.Protocol}, nil
 }
 
 type publishSpec struct {
@@ -483,9 +492,11 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		rest = parts[1] + ":" + parts[2]
 	}
 	if spec.hostAddr != "" {
-		if _, err := netip.ParseAddr(spec.hostAddr); err != nil {
+		addr, err := netip.ParseAddr(spec.hostAddr)
+		if err != nil {
 			return publishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
 		}
+		spec.hostAddr = addr.Unmap().String()
 	}
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")
@@ -511,10 +522,40 @@ func parsePortNumber(s string) (int, error) {
 }
 
 // connectAddr is the address clients should dial for a published port.
-// An unspecified bind address is reachable via loopback.
+// Preserve the address family when turning an unspecified bind into a
+// loopback destination.
 func (p publishSpec) connectAddr() string {
-	if p.hostAddr == "" || p.hostAddr == "0.0.0.0" || p.hostAddr == "::" {
+	if p.hostAddr == "" {
 		return "127.0.0.1"
 	}
-	return p.hostAddr
+	if ipIsUnspecified(p.hostAddr) {
+		if ipIs4(p.hostAddr) {
+			return "127.0.0.1"
+		}
+		return "::1"
+	}
+	return canonicalIP(p.hostAddr)
+}
+
+func canonicalIP(addr string) string {
+	ip, err := netip.ParseAddr(addr)
+	if err != nil {
+		return addr
+	}
+	return ip.Unmap().String()
+}
+
+func ipIs4(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().Is4()
+}
+
+func ipIsLoopback(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().IsLoopback()
+}
+
+func ipIsUnspecified(addr string) bool {
+	ip, err := netip.ParseAddr(addr)
+	return err == nil && ip.Unmap().IsUnspecified()
 }

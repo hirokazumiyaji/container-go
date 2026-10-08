@@ -5,8 +5,14 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
+)
+
+const (
+	cleanupDockerIDOne = "1111111111111111111111111111111111111111111111111111111111111111"
+	cleanupDockerIDTwo = "2222222222222222222222222222222222222222222222222222222222222222"
 )
 
 func TestTerminateContainerIsNilSafe(t *testing.T) {
@@ -64,8 +70,7 @@ func TestCleanupIsNilSafe(t *testing.T) {
 // lsRunner serves a canned `ls` listing and records deletes.
 type lsRunner struct {
 	*fakeRunner
-	lsJSON      string
-	inspectJSON func(string) []byte
+	lsJSON string
 }
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -73,8 +78,9 @@ func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		l.calls = append(l.calls, args)
 		return []byte(l.lsJSON), nil, nil
 	}
-	if args[0] == "inspect" && l.inspectJSON != nil {
-		return l.inspectJSON(args[len(args)-1]), nil, nil
+	if args[0] == "inspect" && l.lsJSON != "" {
+		l.calls = append(l.calls, args)
+		return []byte(l.lsJSON), nil, nil
 	}
 	return l.fakeRunner.Run(ctx, args...)
 }
@@ -85,18 +91,8 @@ const pruneLsJSON = `[
   {"id":"unmanaged-stopped","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 
-func stoppedPruneInspect(id string) []byte {
-	return []byte(strings.Replace(
-		reuseInspectJSONWithCreation(id, "running", "redis:7-alpine", "0123456789abcdef"),
-		`"state": "running"`, `"state": "stopped"`, 1))
-}
-
 func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
-	f := &lsRunner{
-		fakeRunner:  newTestRunner(),
-		lsJSON:      pruneLsJSON,
-		inspectJSON: stoppedPruneInspect,
-	}
+	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: pruneLsJSON}
 
 	removed, err := pruneWith(context.Background(), f, appleEngine{})
 	if err != nil {
@@ -121,48 +117,183 @@ func TestPruneRemovesOnlyManagedStoppedContainers(t *testing.T) {
 	}
 }
 
-type pruneRaceRunner struct {
-	mu           sync.Mutex
-	id           string
-	inspectCalls int
-	deleted      []string
+type dockerListRunner struct {
+	*fakeRunner
+	output    string
+	deleteErr error
 }
 
-func (r *pruneRaceRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "ls":
-		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa"}},"status":{"state":"stopped","networks":[]}}]`, r.id)), nil, nil
-	case "inspect":
-		r.mu.Lock()
-		r.inspectCalls++
-		n := r.inspectCalls
-		r.mu.Unlock()
-		_ = n
-		return []byte(strings.Replace(reuseInspectJSONWithCreation(r.id, "running", "redis:7-alpine", "bbbbbbbbbbbbbbbb"), `"state": "running"`, `"state": "stopped"`, 1)), nil, nil
-	case "delete":
-		r.mu.Lock()
-		r.deleted = append(r.deleted, args[len(args)-1])
-		r.mu.Unlock()
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
+func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ps" {
+		d.calls = append(d.calls, args)
+		return []byte(d.output), nil, nil
+	}
+	if args[0] == "inspect" {
+		d.calls = append(d.calls, args)
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:"integration"}},"NetworkSettings":{}}]`, id, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
+	}
+	if args[0] == "rm" && d.deleteErr != nil {
+		d.calls = append(d.calls, args)
+		return nil, nil, d.deleteErr
+	}
+	return d.fakeRunner.Run(ctx, args...)
+}
+
+func TestDockerPruneAndReuseGroupUseVolumeCleanup(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, *dockerListRunner) ([]string, error)
+	}{
+		{
+			name: "prune",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneWith(ctx, r, dockerEngine{})
+			},
+		},
+		{
+			name: "reuse group",
+			run: func(ctx context.Context, r *dockerListRunner) ([]string, error) {
+				return pruneReuseGroupWith(ctx, r, dockerEngine{}, "integration")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &dockerListRunner{fakeRunner: newTestRunner(), output: cleanupDockerIDOne + "\n" + cleanupDockerIDTwo + "\n"}
+			removed, err := tc.run(context.Background(), r)
+			if err != nil {
+				t.Fatalf("prune: %v", err)
+			}
+			if !slices.Equal(removed, []string{cleanupDockerIDOne, cleanupDockerIDTwo}) {
+				t.Fatalf("removed = %v", removed)
+			}
+
+			var deletes [][]string
+			for _, call := range r.calls {
+				if call[0] == "rm" {
+					deletes = append(deletes, call)
+				}
+			}
+			if len(deletes) != 2 {
+				t.Fatalf("rm calls = %v, want 2", deletes)
+			}
+			for _, call := range deletes {
+				want := []string{"rm", "--force", "--volumes", call[len(call)-1]}
+				if !slices.Equal(call, want) {
+					t.Errorf("rm call = %v, want %v", call, want)
+				}
+			}
+		})
 	}
 }
 
-func TestPruneRevalidatesAppleCandidateUnderStableLock(t *testing.T) {
-	r := &pruneRaceRunner{id: "prune-race-" + newContainerName()}
-	removed, err := pruneWith(context.Background(), r, appleEngine{})
-	if err != nil {
-		t.Fatalf("pruneWith: %v", err)
+func TestDockerPruneReportsVolumeDeleteFailure(t *testing.T) {
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     cleanupDockerIDOne + "\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", cleanupDockerIDOne},
+			Stderr: "error removing volume: volume driver plugin not found",
+		},
+	}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err == nil {
+		t.Fatal("prune succeeded, want volume deletion failure")
 	}
 	if len(removed) != 0 {
-		t.Fatalf("removed = %v, want stale candidate skipped", removed)
+		t.Fatalf("removed = %v, want no falsely successful deletions", removed)
 	}
-	r.mu.Lock()
-	deleted := append([]string(nil), r.deleted...)
-	r.mu.Unlock()
-	if len(deleted) != 0 {
-		t.Fatalf("deleted = %v, want no delete after generation replacement", deleted)
+	if !strings.Contains(err.Error(), "prune "+cleanupDockerIDOne) {
+		t.Fatalf("error = %v, want prune target context", err)
+	}
+}
+
+func TestDockerPruneAcceptsPreciseContainerNotFound(t *testing.T) {
+	id := cleanupDockerIDOne
+	r := &dockerListRunner{
+		fakeRunner: newTestRunner(),
+		output:     id + "\n",
+		deleteErr: &cli.CLIError{
+			Binary: "docker",
+			Args:   []string{"rm", "--force", "--volumes", id},
+			Stderr: "Error response from daemon: No such container: " + id,
+		},
+	}
+	removed, err := pruneWith(context.Background(), r, dockerEngine{})
+	if err != nil {
+		t.Fatalf("prune: %v", err)
+	}
+	if !slices.Equal(removed, []string{id}) {
+		t.Fatalf("removed = %v, want [%s]", removed, id)
+	}
+}
+
+func TestDockerPruneSelectsExitedAndDeadOnly(t *testing.T) {
+	args := (dockerEngine{}).listArgs()
+	for _, want := range []string{"status=exited", "status=dead"} {
+		if !slices.Contains(args, want) {
+			t.Errorf("listArgs = %v, missing %q", args, want)
+		}
+	}
+	for _, unwanted := range []string{"status=created", "status=running"} {
+		if slices.Contains(args, unwanted) {
+			t.Errorf("listArgs = %v, unexpectedly includes %q", args, unwanted)
+		}
+	}
+}
+
+type cleanupTBRecorder struct {
+	testing.TB
+	callbacks []func()
+	logs      []string
+	errors    []string
+	helpers   int
+}
+
+func (r *cleanupTBRecorder) Helper() { r.helpers++ }
+
+func (r *cleanupTBRecorder) Cleanup(fn func()) {
+	r.callbacks = append(r.callbacks, fn)
+}
+
+func (r *cleanupTBRecorder) Logf(format string, args ...any) {
+	r.logs = append(r.logs, fmt.Sprintf(format, args...))
+}
+
+func (r *cleanupTBRecorder) Errorf(format string, args ...any) {
+	r.errors = append(r.errors, fmt.Sprintf(format, args...))
+}
+
+func TestCleanupFunctionsMarkThemselvesAsHelpers(t *testing.T) {
+	tb := &cleanupTBRecorder{}
+	Cleanup(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("Cleanup helper calls = %d, want exported and registration helpers", tb.helpers)
+	}
+
+	tb = &cleanupTBRecorder{}
+	StrictCleanup(tb, nil)
+	if tb.helpers < 2 {
+		t.Fatalf("StrictCleanup helper calls = %d, want exported and registration helpers", tb.helpers)
+	}
+}
+
+func TestStrictCleanupReportsCleanupFailure(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.failPrefix = "delete"
+	tb := &cleanupTBRecorder{}
+	registerCleanup(tb, ctr, true)
+	if len(tb.callbacks) != 1 {
+		t.Fatalf("callbacks = %d, want 1", len(tb.callbacks))
+	}
+	tb.callbacks[0]()
+	if len(tb.errors) != 1 {
+		t.Fatalf("errors = %v, want cleanup failure", tb.errors)
+	}
+	if len(tb.logs) != 0 {
+		t.Fatalf("logs = %v, strict cleanup should report through Errorf", tb.logs)
 	}
 }
 

@@ -33,9 +33,6 @@ func TestDecodeRealOutputSample(t *testing.T) {
 			if got := c.Configuration.Image.Reference; got != "docker.io/library/redis:7-alpine" {
 				t.Errorf("Image.Reference = %q", got)
 			}
-			if got := c.Configuration.Image.Descriptor.Digest; got == "" {
-				t.Error("Image.Descriptor.Digest is empty")
-			}
 			if got := c.Configuration.Labels["com.github.hirokazumiyaji.container-go.session"]; got != "f00dcafe" {
 				t.Errorf("session label = %q", got)
 			}

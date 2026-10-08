@@ -245,58 +245,6 @@ func TestReuseConcurrentLeaderAndWaiterApplyOwnFiles(t *testing.T) {
 	}
 }
 
-type reuseLeaderCopyFailureRunner struct {
-	*blockingReuseRunner
-	leaderSource string
-}
-
-func (r *reuseLeaderCopyFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if len(args) >= 2 && args[0] == "cp" && args[1] == r.leaderSource {
-		r.mu.Lock()
-		r.calls = append(r.calls, args)
-		r.mu.Unlock()
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "leader copy failed"}
-	}
-	return r.blockingReuseRunner.Run(ctx, args...)
-}
-
-func TestReuseLeaderFileFailureDoesNotPoisonWaiter(t *testing.T) {
-	base := newBlockingReuseRunner()
-	dir := t.TempDir()
-	leaderFile := filepath.Join(dir, "leader.txt")
-	if err := os.WriteFile(leaderFile, []byte("leader"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f := &reuseLeaderCopyFailureRunner{blockingReuseRunner: base, leaderSource: leaderFile}
-
-	joined := waitForReuseFlightJoin(t)
-	leaderErr := make(chan error, 1)
-	go func() {
-		_, err := Run(context.Background(), "redis:7-alpine",
-			WithName("shared-copy-failure"), WithReuse(), WithFiles(File{HostPath: leaderFile, ContainerPath: "/leader.txt"}),
-			withRunner(f), withEngine(appleEngine{}))
-		leaderErr <- err
-	}()
-	<-base.runStarted
-
-	waiterErr := make(chan error, 1)
-	go func() {
-		_, err := Run(context.Background(), "redis:7-alpine",
-			WithName("shared-copy-failure"), WithReuse(),
-			withRunner(f), withEngine(appleEngine{}))
-		waiterErr <- err
-	}()
-	<-joined
-	close(base.releaseRun)
-
-	if err := <-leaderErr; err == nil || !strings.Contains(err.Error(), "leader copy failed") {
-		t.Fatalf("leader error = %v, want its own copy failure", err)
-	}
-	if err := <-waiterErr; err != nil {
-		t.Fatalf("waiter error = %v, want success after leader file failure", err)
-	}
-}
-
 func TestReuseConcurrentPullAlwaysWaiterPullsBeforeAttach(t *testing.T) {
 	f := newBlockingReuseRunner()
 	joined := waitForReuseFlightJoin(t)

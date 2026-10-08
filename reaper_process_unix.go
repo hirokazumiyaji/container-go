@@ -3,21 +3,17 @@
 package container
 
 import (
-	"errors"
 	"os/exec"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 )
 
-// The reaper runs detached in its own process group. A signal aimed at
-// this process's group (a terminal hangup, a group-wide kill) then does
-// not remove the watchdog before it observes the pipe EOF that tells it
-// to clean up, and the shell's timeout helpers and backend children stay
-// inside one group that can be terminated as a unit.
-func prepareReaperCommand(cmd *exec.Cmd) {
-	if cmd == nil {
-		return
-	}
+// configureReaperProcess gives each reaper shell its own process group.
+// Backend commands and the timeout helper can then be terminated as a
+// unit when the child is stopped or replaced.
+func configureReaperProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
@@ -25,73 +21,59 @@ func reaperProcessGroupID(cmd *exec.Cmd) int {
 	if cmd == nil || cmd.Process == nil {
 		return 0
 	}
-	for attempt := 0; attempt < 5; attempt++ {
-		pgid, err := syscall.Getpgid(cmd.Process.Pid)
-		if err == nil {
-			if pgid != cmd.Process.Pid {
-				// Never retain a numeric group ID that was not observed as
-				// this child's private group.
-				return 0
-			}
-			return pgid
-		}
-		if errors.Is(err, syscall.ESRCH) {
-			return 0
-		}
-		// Start can return while the child is still completing exec. Retry
-		// briefly so a transient observation does not discard the group.
-		time.Sleep(time.Millisecond)
+	pgid, err := syscall.Getpgid(cmd.Process.Pid)
+	if err != nil || pgid != cmd.Process.Pid {
+		return 0
 	}
-	return 0
+	return pgid
 }
 
+// killReaperProcess terminates the shell's group and any job-control
+// descendants that were placed in separate groups. The shell is waited
+// by the caller; the short poll also gives descendants time to disappear
+// before a replacement process is started.
 func killReaperProcess(cmd *exec.Cmd, pgid int) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	if pgid <= 0 {
-		// A process can be observed between fork and exec. Recheck the
-		// group identity at signal time rather than either dropping the
-		// descendants or signalling an unverified numeric ID.
-		if current, err := syscall.Getpgid(cmd.Process.Pid); err == nil && current == cmd.Process.Pid {
-			pgid = current
-		}
-	}
+	pid := cmd.Process.Pid
+	pids := descendantPIDs(pid)
 	if pgid > 0 {
-		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil || errors.Is(err, syscall.ESRCH) {
-			return
-		}
-		// Fall through to the direct handle.
+		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
-	_ = cmd.Process.Kill()
-}
-
-// finishReaperProcess waits for the detached group to disappear so a
-// replacement child never races a lingering descendant for the pipe or a
-// name barrier.
-func finishReaperProcess(pgid int) {
-	if pgid <= 0 {
-		return
+	for i := len(pids) - 1; i >= 0; i-- {
+		_ = syscall.Kill(pids[i], syscall.SIGKILL)
 	}
-	deadline := time.Now().Add(2 * time.Second)
+	_ = syscall.Kill(pid, syscall.SIGKILL)
+	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {
-		if errors.Is(syscall.Kill(-pgid, syscall.Signal(0)), syscall.ESRCH) {
+		alive := false
+		for _, descendant := range pids {
+			if syscall.Kill(descendant, 0) == nil {
+				alive = true
+				break
+			}
+		}
+		if !alive {
 			return
 		}
-		time.Sleep(10 * time.Millisecond)
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 
-// terminateReaperProcess stops a replaced child and its descendants. A
-// child that already exited is not signalled again, because its
-// process-group ID may already belong to an unrelated process; the group
-// is only waited out, since the timeout helpers can still hold the pipe.
-func terminateReaperProcess(cmd *exec.Cmd, pgid int, exited bool) {
-	if cmd == nil {
-		return
+func descendantPIDs(parent int) []int {
+	out, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
+	if err != nil {
+		return nil
 	}
-	if !exited {
-		killReaperProcess(cmd, pgid)
+	var pids []int
+	for _, line := range strings.Fields(string(out)) {
+		pid, err := strconv.Atoi(line)
+		if err != nil || pid <= 0 {
+			continue
+		}
+		pids = append(pids, pid)
+		pids = append(pids, descendantPIDs(pid)...)
 	}
-	finishReaperProcess(pgid)
+	return pids
 }

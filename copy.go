@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"unicode/utf8"
@@ -19,9 +20,8 @@ type File struct {
 // WithFiles copies files into the container after it starts. Copy
 // failures fail Run; an ordinary newly created container is rolled
 // back. WithReuse applies the copy to every caller, including callers
-// that attach to an existing shared container. A reuse copy failure
-// returns an error without deleting the shared generation, because a
-// peer may already be using it.
+// that attach to an existing shared container; an attach copy failure
+// returns an error without deleting that shared container.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		for _, f := range files {
@@ -37,12 +37,6 @@ func WithFiles(files ...File) Option {
 // CopyToContainer copies a host file or directory into the running
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
-	return c.withCurrentTarget(ctx, func(target string) error {
-		return c.copyToContainerTarget(ctx, target, hostPath, containerPath)
-	})
-}
-
-func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
 		return err
 	}
@@ -55,50 +49,118 @@ func (c *Container) copyToContainerTarget(ctx context.Context, target, hostPath,
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return err
+	}
 	_, _, err = c.runner.Run(qCtx, c.eng.copyToArgs(target, abs, containerPath)...)
-	return wrapNotFound(c.classify(ctx, err))
+	return wrapNotFoundFor(c.eng, c.classify(ctx, err))
 }
 
-// CopyFileFromContainer copies one file out of the running container
-// and returns its content. Close releases the temporary copy.
+// CopyFileFromContainer copies one regular file out of the running
+// container and returns its content. It is supported by the Docker
+// backend when the host can open copied files without following links or
+// blocking on special files. Docker copy-out also requires client and
+// server versions >=29.7.0. Apple Container, unsupported hosts, unsupported
+// Docker versions, and Windows Go 1.23 through 1.25 return
+// ErrCopyFileFromContainerUnsupported before invoking the backend's
+// copy-out command. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, err
 	}
-	if filepath.Clean(containerPath) == "/" || strings.HasSuffix(containerPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", containerPath)
+	requestedPath := containerPath
+	containerPath = path.Clean(containerPath)
+	base := path.Base(containerPath)
+	if base == "/" || base == "." || strings.HasSuffix(requestedPath, "/") {
+		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", requestedPath)
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := c.eng.checkCopyFileFromContainer(); err != nil {
+		return nil, err
+	}
+	if err := checkCopyFileOpenCapability(); err != nil {
+		return nil, err
+	}
+
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return nil, err
+	}
+	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner); err != nil {
+		return nil, err
+	}
+
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
 		return nil, err
 	}
-	dst := filepath.Join(dir, filepath.Base(containerPath))
-	var result io.ReadCloser
-	err = c.withCurrentTarget(ctx, func(target string) error {
-		qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-		defer cancel()
-		if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
-			return wrapNotFound(c.classify(ctx, err))
+	keepDir := false
+	defer func() {
+		if !keepDir {
+			_ = os.RemoveAll(dir)
 		}
-		info, err := os.Stat(dst)
-		if err != nil {
-			return err
-		}
-		if info.IsDir() {
-			return fmt.Errorf("copy file from container %q: target is a directory", containerPath)
-		}
-		f, err := os.Open(dst)
-		if err != nil {
-			return err
-		}
-		result = &tempFileReader{File: f, dir: dir}
-		return nil
-	})
-	if err != nil {
-		_ = os.RemoveAll(dir)
+	}()
+	// The destination name is fixed so container path components can
+	// never escape the private directory or become a host path.
+	dst := filepath.Join(dir, "payload")
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	return result, nil
+	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	}
+	if err := qCtx.Err(); err != nil {
+		return nil, err
+	}
+
+	info, err := os.Lstat(dst)
+	if err != nil {
+		return nil, err
+	}
+	if !info.Mode().IsRegular() {
+		return nil, copyFileNotRegularError(requestedPath, info.Mode())
+	}
+	if err := qCtx.Err(); err != nil {
+		return nil, err
+	}
+
+	f, err := openCopyFile(dst)
+	if err != nil {
+		// A no-follow open can fail after the path changes to a link
+		// or special file. Prefer the same typed error in that case.
+		if changed, statErr := os.Lstat(dst); statErr == nil && !changed.Mode().IsRegular() {
+			return nil, copyFileNotRegularError(requestedPath, changed.Mode())
+		}
+		return nil, err
+	}
+	openedInfo, statErr := f.Stat()
+	if statErr != nil {
+		_ = f.Close()
+		return nil, statErr
+	}
+	if !openedInfo.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, copyFileNotRegularError(requestedPath, openedInfo.Mode())
+	}
+	if err := qCtx.Err(); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+
+	keepDir = true
+	return &tempFileReader{File: f, dir: dir}, nil
+}
+
+func copyFileNotRegularError(containerPath string, mode os.FileMode) error {
+	if mode.IsDir() {
+		return fmt.Errorf("copy file from container %q: target is a directory: %w", containerPath, ErrCopyFileNotRegular)
+	}
+	return fmt.Errorf("copy file from container %q: target is not a regular file (mode %s): %w", containerPath, mode.Type(), ErrCopyFileNotRegular)
 }
 
 type tempFileReader struct {
@@ -113,10 +175,14 @@ func (r *tempFileReader) Close() error {
 }
 
 // validateContainerPath enforces the invariants the copy protocol
-// relies on: absolute, valid UTF-8, and free of NUL bytes.
+// relies on: absolute POSIX paths with '/' separators, valid UTF-8,
+// and no NUL or backslash characters.
 func validateContainerPath(p string) error {
-	if !strings.HasPrefix(p, "/") {
+	if !path.IsAbs(p) {
 		return fmt.Errorf("container path %q must be absolute", p)
+	}
+	if strings.ContainsRune(p, '\\') {
+		return fmt.Errorf("container path %q must use '/' as the path separator", p)
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
 		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)

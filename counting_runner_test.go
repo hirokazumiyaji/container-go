@@ -92,9 +92,8 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint triggers an identity-checked inspect. Apple handles must
-	// recheck their name generation on later reads; Docker's UID cache is
-	// still reused.
+	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
+	// intentionally not cached.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
@@ -102,7 +101,7 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 		t.Fatalf("Endpoint again: %v", err)
 	}
 	if got := r.count(); got != 4 {
-		t.Fatalf("after revalidated Endpoint: calls = %d, want 4", got)
+		t.Fatalf("after refreshed Endpoint: calls = %d, want 4", got)
 	}
 
 	// The wrapper forwards results unchanged.
@@ -111,9 +110,9 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	}
 }
 
-// TestRunForLogVerifiesGenerationBeforeStream pins that FollowLogs
-// performs the required Apple generation check before opening its stream.
-func TestRunForLogVerifiesGenerationBeforeStream(t *testing.T) {
+// TestRunForLogDefersInspectUntilFinalLifecycleCheck pins that a successful
+// ForLog wait does not pay for an eager post-start inspect.
+func TestRunForLogDefersInspectUntilFinalLifecycleCheck(t *testing.T) {
 	inner := &streamRunner{
 		fakeRunner: newTestRunner(),
 		streamData: "Ready to accept connections\n",
@@ -128,20 +127,20 @@ func TestRunForLogVerifiesGenerationBeforeStream(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + generation-verified inspect + logs stream.
+	// image inspect + run + logs stream + final lifecycle inspect.
 	if got := r.count(); got != 4 {
 		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	inspects := 0
+	inspectCalls := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			inspects++
+			inspectCalls++
 		}
 	}
-	if inspects != 1 {
-		t.Fatalf("container inspects during ForLog Run = %d, want 1: %v", inspects, r.args)
+	if inspectCalls != 1 {
+		t.Fatalf("container inspect calls = %d, want one final lifecycle check: %v", inspectCalls, r.args)
 	}
 }
 

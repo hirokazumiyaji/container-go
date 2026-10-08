@@ -80,40 +80,30 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		envFile = path
 	}
 
-	var stdout, stderr []byte
-	var output io.Reader
-	var exitCode int
-	var opErr error
-	err := c.withHandleTarget(ctx, func(target string) error {
-		var runErr error
-		stdout, stderr, runErr = c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
-		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
-		if runErr == nil {
-			return nil
-		}
-		if !cli.IsCommandExit(runErr) {
-			opErr = wrapNotFound(c.classify(ctx, runErr))
-			return opErr
-		}
-		var cliErr *cli.CLIError
-		errors.As(runErr, &cliErr)
-		exitCode = cliErr.ExitCode
-		// App stderr alone must not decide infrastructure state. Only
-		// ambiguous failures pay for a verification inspect; clear app
-		// results return immediately with no extra CLI call.
-		if !isNotFound(runErr) && !maybeInfraExecErr(runErr) {
-			return nil
-		}
-		if c.execContainerRunning(ctx, target) {
-			return nil
-		}
-		opErr = wrapNotFound(c.classify(ctx, runErr))
-		return opErr
-	})
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
-	return exitCode, output, opErr
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	if err == nil {
+		return 0, output, nil
+	}
+	if !cli.IsCommandExit(err) {
+		return 0, nil, wrapNotFound(c.classify(ctx, err))
+	}
+	var cliErr *cli.CLIError
+	errors.As(err, &cliErr)
+	// App stderr alone must not decide infrastructure state. Only
+	// ambiguous failures pay for a verification inspect; clear app
+	// results return immediately with no extra CLI call.
+	if !isNotFound(err) && !maybeInfraExecErr(err) {
+		return cliErr.ExitCode, output, nil
+	}
+	if c.execContainerRunning(ctx) {
+		return cliErr.ExitCode, output, nil
+	}
+	return 0, nil, wrapNotFound(c.classify(ctx, err))
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
@@ -147,19 +137,9 @@ func execCLIStderr(err error) (string, bool) {
 // execContainerRunning verifies via inspect that the container is still
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context, targets ...string) bool {
-	target := c.operationTarget()
-	if len(targets) > 0 {
-		target = targets[0]
-	}
-	if usesImmutableIDs(c.eng) && !dockerIDRE.MatchString(target) {
-		return false
-	}
-	info, err := c.inspectTargetFreshRetry(ctx, target)
+func (c *Container) execContainerRunning(ctx context.Context) bool {
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
-		return false
-	}
-	if c.identityMatches(info) != nil {
 		return false
 	}
 	return info.state == StateRunning

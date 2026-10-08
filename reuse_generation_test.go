@@ -28,7 +28,7 @@ type generationRunner struct {
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":
@@ -52,12 +52,8 @@ func TestTerminateAllowsMatchingGeneration(t *testing.T) {
 func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	cfg := &config{runner: &generationRunner{creation: "bbbbbbbbbbbbbbbb"}, eng: appleEngine{}, name: "shared"}
 	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
 	// Fresh inspect reports a different generation in running state, so
 	// there is nothing stopped to delete.
@@ -71,50 +67,10 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	}
 }
 
-type runningPeerRunner struct {
-	deleteCalls int
-}
-
-func (r *runningPeerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "inspect":
-		return reviewAppleInspect("shared", "running", "redis:7-alpine", "0123456789abcdef", "linux/amd64"), nil, nil
-	case "delete", "rm":
-		r.deleteCalls++
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
-	}
-}
-
-func TestDeleteStoppedReuseDoesNotDeleteGenerationThatBecameRunning(t *testing.T) {
-	const generation = "0123456789abcdef"
-	runner := &runningPeerRunner{}
-	cfg := &config{runner: runner, eng: appleEngine{}, name: "shared"}
-	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: generation,
-		},
-	}
-	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
-		t.Fatalf("deleteStoppedReuse: %v", err)
-	}
-	if runner.deleteCalls != 0 {
-		t.Fatal("running generation was deleted after a peer could adopt it")
-	}
-}
-
 func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
 	r := &generationStateRunner{creation: "", state: "stopped"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
@@ -129,12 +85,12 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	info := &engineInfo{
 		state: StateStopped,
-		uid:   strings.Repeat("0f", 32),
 		labels: map[string]string{
 			managedLabel:  "true",
 			reuseLabel:    "true",
 			creationLabel: "aaaaaaaaaaaaaaaa",
 		},
+		uid: strings.Repeat("0f", 32),
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
@@ -149,7 +105,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 }
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: `Error: container not found: "myctr"`}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)
@@ -223,10 +179,11 @@ type generationStateRunner struct {
 func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		labels := ""
+		labels := `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true"`
 		if g.creation != "" {
-			labels = `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}`
+			labels += `,"` + creationLabel + `":"` + g.creation + `"`
 		}
+		labels += `}`
 		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil

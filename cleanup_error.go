@@ -37,13 +37,3 @@ func withCleanupError(cause, cleanupErr error) error {
 	}
 	return errors.Join(cause, cleanupErr)
 }
-
-// leftBehind wraps a cleanup failure as a *CleanupError naming the container
-// left behind. A nil cleanup error stays nil so callers can pass it straight
-// to withCleanupError.
-func leftBehind(name string, cleanupErr error) error {
-	if cleanupErr == nil {
-		return nil
-	}
-	return &CleanupError{Container: name, Err: cleanupErr}
-}

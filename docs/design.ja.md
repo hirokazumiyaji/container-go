@@ -15,8 +15,7 @@ English (primary): [design.md](design.md)
 動的な endpoint の更新は #85、reuse の ownership と最終 generation
 確認は #83 と #84、stale Docker operation の target 修正は #74、
 Docker inspect target validation は #103、Docker の dead-state prune は
-#113 に依存します。Apple `Prune` の
-list-to-delete cleanup validation は #98、
+#113 に依存します。
 missing inspect の分類は #103、error chain の保持は #104、Apple PullNever の
 capability handling は #112 に依存します。Windows / remote の bind source は
 #76、TCP 専用 readiness の validation は #77、Stop timeout の validation は
@@ -427,7 +426,7 @@ no-leak 保証ではない。
 - `com.github.hirokazumiyaji.container-go.session`：プロセスごとのランダム ID
 - 作成世代ラベルと、Reuse 時の再利用グループラベル
 
-Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。現在の Docker filter は exited 状態だけを選ぶため、dead 状態のコンテナは #113 を適用するまで残る。running と created 状態は選ばない。Apple の現在の `Prune` と `PruneReuseGroup` は、list した candidate を per-name lock の中で fresh inspect せず name を delete するため、list と delete の間に replacement が入り込む。#98 は fresh identity/label/state の再確認と lock cleanup を担当する。
+Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。現在の Docker filter は exited 状態だけを選ぶため、dead 状態のコンテナは #113 を適用するまで残る。running と created 状態は選ばない。Apple では、各 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、session、管理対象ラベル、および停止状態が再確認される。
 
 `CONTAINERGO_KEEP=1` を設定すると、自動 cleanup helper の `Cleanup` と
 `TerminateContainer`、およびリーパー登録を省略する。明示的な
@@ -459,9 +458,8 @@ generation 確認を追加する。`CONTAINERGO_KEEP=1` はこの reuse rule を
 有効な non-empty generation を持つ Apple の handle では、delete 前に
 fresh inspect を行い、inspect と delete を一時ディレクトリ内の名前単位
 `flock`（`containergo-<name>.lock`）で直列化する。同じ host で本ライブラリの
-generation-checked `Terminate` と failed-create cleanup は保護される。
-現在の Apple `Prune`/`PruneReuseGroup` list-to-delete path は candidate を
-再 inspect せず lock を保持しないため、#98 がこの race を扱う。外部 reaper も
+generation-checked `Terminate` と failed-create cleanup、および Apple の
+`Prune` と `PruneReuseGroup` は名前単位 `flock` で保護される。外部 reaper は
 現在のチェックアウトではこの lock を取らない。これは別の cleanup limitation
 である。外部ツールによる同じ窓の delete / recreate も保証外である。Docker の
 handle は `docker run` が出力した完全な不変 `Id` を保持するならその ID で
@@ -662,7 +660,7 @@ Apple バックエンドの直接 IP の既定は変えない。
 
 現在の API が暗黙に意味を与えない事项を、ここに明記する。
 
-- **Apple の名前ベース削除**：non-empty で一致する作成世代チェックと per-name `flock` は、同じ host で本ライブラリの generation-checked `Terminate` / failed-create cleanup を保護する。現在の `Prune` / `PruneReuseGroup` list-to-delete path は candidate を再 inspect せず lock も保持せず、外部 reaper もこの lock を取らない。現在の base は空 generation の name delete も許し、同じ窓で外部の CLI が delete して再作成した場合には区別できない。#83、#84、#98 が ownership、最終確認、prune list-to-delete の gap を扱い、外部競合を閉じるには backend の不変 ID または原子的な条件付き削除が必要である。
+- **Apple の名前ベース削除**：non-empty で一致する作成世代チェックと per-name `flock` は、同じ host で本ライブラリの generation-checked `Terminate` / failed-create cleanup、および `Prune` / `PruneReuseGroup` を保護する。外部 reaper はこの lock を取らず、同じ窓で外部の CLI が delete して再作成した場合には区別できない。#83 と #84 が ownership と最終確認の gap を扱い、外部競合を閉じるには backend の不変 ID または原子的な条件付き削除が必要である。
 - **remote Docker の検出**：endpoint 選択に使うのは `DOCKER_HOST=tcp://...` だけである。remote Docker context は検出しない。
 - **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`env`、`cmd`、`mounts` の差は意図的に attach する。今後の release で設定を比較すべきかは未解決の製品上の決定であり、分離が必要なら別の名前を使う。
 - **logger injection**：公開 logger hook は存在しない。追加するには新しい API と、公開できるコマンドデータの範囲を決める決定が必要である。

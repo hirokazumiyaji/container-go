@@ -20,11 +20,9 @@ backend-specific behavior. Apple log options depend on #82, dynamic
 endpoint refreshes depend on #85, reuse ownership and final generation
 verification depend on #83 and #84, stale Docker operation targeting
 depends on #74, and Docker inspect target validation depends on #103.
-Docker dead-state pruning depends on #113. Apple
-`Prune` list-to-delete cleanup validation depends on #98;
-missing-inspect classification depends on #103;
-error-chain preservation depends on #104; and Apple PullNever capability
-handling depends on #112. Windows and remote bind-source handling depend
+Docker dead-state pruning depends on #113; missing-inspect
+classification depends on #103; error-chain preservation depends on
+#104; and Apple PullNever capability handling depends on #112. Windows and remote bind-source handling depend
 on #76, TCP-only readiness validation on #77, Stop timeout validation on
 #89, wait error-chain normalization on #92, public option validation on
 #102, and reaper staging cleanup on #111. The current sections describe
@@ -628,11 +626,10 @@ The Apple CLI has no label filter, so orphan sweeps filter
 containers selected by the active backend's managed filter. Apple selects
 the stopped state. The current Docker filter selects the exited state
 only, so Docker dead-state containers remain until #113 is applied;
-running and created containers are not selected. On Apple, the current
-`Prune` and `PruneReuseGroup` list-to-delete path does not re-inspect a
-candidate under the per-name lock before deleting its name; a replacement
-can therefore occur between list and delete. #98 tracks the fresh
-identity/label/state revalidation and lock cleanup.
+running and created containers are not selected. On Apple, each
+candidate is re-inspected and re-verified (generation, session,
+managed/reuse/group labels, stopped state) under the stable per-name lock
+before deletion.
 
 Setting `CONTAINERGO_KEEP=1` skips the automatic `Cleanup` and
 `TerminateContainer` helpers and reaper registration. It does not suppress
@@ -701,11 +698,10 @@ For a handle with a valid non-empty generation, the Apple path checks a
 fresh inspect and runs inspect plus delete under a per-name `flock` in the
 temp directory (`containergo-<name>.lock`). That protects the ordinary
 generation-checked `Terminate` and failed-create cleanup paths from
-cooperating library processes on the same host. It does not cover the
-current Apple `Prune`/`PruneReuseGroup` list-to-delete path, which does
-not re-inspect a candidate or hold the lock across deletion; #98 tracks
-that race. The external reaper also does not take this lock on the
-current checkout, which is a separate cleanup limitation. An external
+cooperating library processes on the same host. That same per-name lock
+covers Apple `Prune` and `PruneReuseGroup` candidate deletion. The external
+reaper does not take this lock on the current checkout, which is a separate
+cleanup limitation. An external
 `container delete` plus re-create in the same window also remains outside
 the guarantee. A Docker handle that retains the immutable `Id` printed by
 `docker run` deletes by that ID, so a same-name replacement does not share
@@ -1139,14 +1135,12 @@ These are deliberately recorded rather than implied by the current API:
 
 - **Apple name-based deletion**: a non-empty, matching creation-generation
   check and per-name `flock` protect the generation-checked
-  `Terminate`/failed-create paths on one host. The current
-  `Prune`/`PruneReuseGroup` list-to-delete path does not re-inspect a
-  candidate or hold that lock, the external reaper does not take it, and
-  the current base still permits empty-generation name deletes. It also
-  cannot distinguish an external CLI delete/recreate in the same window.
-  Issues #83, #84, and #98 track the ownership, final-verification, and
-  prune list-to-delete gaps; closing the race requires an immutable
-  identity or an atomic conditional delete from the backend.
+  `Terminate`/failed-create paths, as well as `Prune` and `PruneReuseGroup`,
+  on one host. The external reaper does not take that lock, and the current
+  base cannot distinguish an external CLI delete/recreate in the same window.
+  Issues #83 and #84 track the ownership and final-verification gaps;
+  closing the external race requires an immutable identity or an atomic
+  conditional delete from the backend.
 - **Remote Docker detection**: only `DOCKER_HOST=tcp://...` is used
   for endpoint selection. A remote Docker context is not detected.
 - **Reuse compatibility**: image is checked on both backends. Docker

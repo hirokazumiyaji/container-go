@@ -244,9 +244,6 @@ func pruneCandidateStillCurrent(candidate pruneCandidate, fresh *engineInfo, reu
 	// a replacement that reuses the name/generation but changes the object
 	// selected by the list query.
 	for _, key := range []string{managedLabel, reuseLabel, reuseGroupLabel, sessionLabel} {
-		if key == sessionLabel && candidate.labels[key] == "" {
-			continue
-		}
 		if candidate.labels[key] != fresh.labels[key] {
 			return false
 		}

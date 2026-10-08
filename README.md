@@ -51,9 +51,6 @@ backend-specific behavior. In particular:
   operation-target fix and #103 tracks Docker inspect target validation.
 - Docker `Prune` currently selects exited containers, not containers in the
   dead state; #113 tracks dead-state coverage.
-- Apple `Prune` and `PruneReuseGroup` currently use a list-to-delete path
-  without fresh candidate revalidation or the per-name lock; #98 tracks
-  that Apple cleanup race.
 - Windows Docker bind sources and remote Docker bind-source semantics are
   not supported by the current validation path; #76 tracks host-path and
   remote-mount handling.
@@ -696,9 +693,9 @@ selected by the active backend's filter. Apple selects managed containers
 in the stopped state. Docker currently selects managed containers in the
 exited state only, so a Docker container in the dead state is not removed
 until #113 is applied. The filter does not select running or created
-containers. On Apple, the current `Prune` and `PruneReuseGroup` list-to-delete
-path does not re-inspect each candidate under the per-name lock before
-deleting its name; a replacement can race that delete (#98).
+containers. On Apple, each candidate is re-inspected and re-verified
+(generation, session, managed label, and stopped state) under the stable
+per-name lock before deletion.
 
 ## Reuse (shared containers across tests/processes)
 
@@ -789,14 +786,15 @@ Contract:
   matching reuse container can still be deleted and recreated, and
   `PruneReuseGroup` can still remove the group.
 - The per-name `flock` protects the generation-checked ordinary
-  `Terminate`/failed-create cleanup paths. It does not cover the current
-  Apple `Prune`/`PruneReuseGroup` list-to-delete path, which lacks fresh
-  candidate revalidation (#98), or the external reaper's separate
-  inspect/delete window. Treat those paths as uncoordinated.
+  `Terminate`/failed-create cleanup paths, as well as Apple `Prune` and
+  `PruneReuseGroup`. It does not cover the external reaper's separate
+  inspect/delete window. Treat external uncoordinated CLI operations as
+  uncoordinated.
 - `container.PruneReuseGroup(ctx, "integration")` force-removes every
   container tagged with that group (CI teardown). The group is a label,
-  not part of the reuse key. On Apple, the current list-to-delete path has
-  the same missing fresh revalidation/name-lock boundary as `Prune` (#98).
+  not part of the reuse key. On Apple Container, it applies the same fresh
+  candidate inspection (generation, session, managed/reuse/group labels,
+  running/stopped state) under the per-name lock before deletion.
   Ordinary `Prune` uses the backend filter described above; on the current
   Docker backend that means exited containers, not dead ones.
 

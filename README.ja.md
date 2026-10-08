@@ -51,9 +51,6 @@ Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
   target の修正を担当し、#103 が Docker inspect target validation を担当します。
 - Docker の `Prune` は現在 exited コンテナだけを選び、dead 状態は
   選びません。dead 状態の対応は #113 が担当します。
-- Apple の `Prune` と `PruneReuseGroup` は現在、fresh candidate validation や
-  per-name lock なしの list-to-delete path を使う。#98 が Apple cleanup race を
-  担当する。
 - Windows Docker の bind source と remote Docker の bind source semantics は
   現在の validation path では扱えていません。#76 が host path と remote mount を
   担当します。
@@ -678,10 +675,9 @@ best-effort cleanup は抑制しません。`Prune` と `PruneReuseGroup` は
 作成したコンテナを削除します。Apple は managed コンテナのうち stopped
 状態を選びます。Docker は現在 managed コンテナのうち exited 状態だけ
 を選ぶため、dead 状態のコンテナは #113 を適用するまで削除されません。
-この filter は running または created 状態を選びません。Apple では現在の
-`Prune` と `PruneReuseGroup` の list-to-delete path が、per-name lock の中で
-candidate を fresh inspect せず name を delete するため、replacement が
-競合する可能性があります（#98）。
+この filter は running または created 状態を選びません。Apple では、各
+candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、
+session、管理対象ラベル、および停止状態が再確認されます。
 
 ## Reuse（テスト / process 間でのコンテナ共有）
 
@@ -753,16 +749,15 @@ func TestReuse(t *testing.T) {
   stopped reuse container は削除・再作成され、`PruneReuseGroup` はその
   group を削除できる。
 - 名前単位の `flock` は generation-checked な通常の `Terminate` /
-  failed-create cleanup 経路を保護する。現在の Apple `Prune` /
-  `PruneReuseGroup` list-to-delete path は fresh candidate validation がなく、
-  外部 reaper の inspect / delete window にもこの lock は使われないため、
-  これらの経路は協調していないものとして扱う（prune は #98）。
+  failed-create cleanup 経路、および Apple の `Prune` と `PruneReuseGroup`
+  を保護する。外部 reaper の inspect / delete window にはこの lock は使われない
+  ため、外部ツールによる協調していない CLI 操作は非協調として扱う。
 - `container.PruneReuseGroup(ctx, "integration")` はその group の
   コンテナを強制削除する（CI teardown）。group は再利用 key ではなく
-  label である。Apple では現在の list-to-delete path が `Prune` と同じ
-  fresh revalidation / per-name lock の欠落を持つ（#98）。通常の `Prune` は
-  上記の backend filter を使い、現在の Docker backend では exited コンテナ
-  だけが対象で、dead は対象外である。
+  label である。Apple Container では、削除前に名前単位 lock の下で fresh
+  candidate 検査（世代、session、managed/reuse/group ラベル、running/stopped
+  状態）を適用する。通常の `Prune` は上記の backend filter を使い、現在の
+  Docker backend では exited コンテナだけが対象で、dead は対象外である。
 - `WithName` 必須。待機戦略は attach 時も必ず再実行する。
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない

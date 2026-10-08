@@ -70,6 +70,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return 0, nil, err
+	}
+
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
 		path, dir, err := writeEnvFileContext(ctx, cfg.env)
@@ -94,7 +99,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}()
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
@@ -155,13 +160,7 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return false
 	}

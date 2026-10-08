@@ -5,6 +5,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1353,7 +1354,7 @@ func (r *issue97ConflictCleanupRunner) Run(ctx context.Context, args ...string) 
 			r.attachInspect.Add(1)
 			return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 		}
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 	}
 	if args[0] == "run" {
 		for i, arg := range args {

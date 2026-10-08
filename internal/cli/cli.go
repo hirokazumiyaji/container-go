@@ -7,17 +7,26 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 )
 
 // maxStderr bounds the stderr captured into a CLIError.
 const maxStderr = 64 * 1024
 
-// ErrSystemNotRunning reports that the container backend (Apple
-// Container system service or Docker daemon) is not running.
+// ErrSystemNotRunning reports that a backend CLI command returned a
+// non-zero exit status and its follow-up liveness probe also failed.
+// Missing or unlaunchable CLI binaries remain launch errors and are not
+// classified as this value. When classification wraps this sentinel, the
+// current implementation flattens the original CLI error into text (#104).
 var ErrSystemNotRunning = errors.New("container backend is not running")
+
+// ErrStreamSetup identifies a deterministic log-stream setup failure.
+// Retrying the same runner and backend path cannot recover from it.
+var ErrStreamSetup = errors.New("log stream setup failed")
 
 // Probe is the backend-specific liveness check Classify runs after a
 // failure: a cheap CLI invocation plus the hint to show the user when
@@ -94,6 +103,31 @@ func (r *ExecRunner) binary() string {
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	configureProcessTree(cmd)
+	startDone := make(chan struct{})
+	var treeMu sync.Mutex
+	var tree processTree
+	var cancelCalled bool
+	var cancelResult terminationResult
+	cmd.Cancel = func() error {
+		<-startDone
+		treeMu.Lock()
+		defer treeMu.Unlock()
+		cancelCalled = true
+		if tree == nil {
+			cancelResult = terminationResult{err: os.ErrProcessDone}
+			return cancelResult.err
+		}
+		cancelResult = tree.terminate(cmd)
+		if !cancelResult.active && cancelResult.err != nil {
+			// os/exec treats a non-nil Cancel error as an injected
+			// cancellation failure. The retained result still carries the
+			// ownership/barrier cause for classification, but returning
+			// ErrProcessDone keeps a settled child result authoritative.
+			return os.ErrProcessDone
+		}
+		return cancelResult.err
+	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -101,12 +135,35 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	err := cmd.Run()
+	if err := cmd.Start(); err != nil {
+		close(startDone)
+		return stdout.Bytes(), stderr.Bytes(), err
+	}
+	ownedTree, treeErr := newProcessTree(cmd)
+	if treeErr != nil {
+		ownedTree = directProcessTree{}
+	}
+	treeMu.Lock()
+	tree = ownedTree
+	treeMu.Unlock()
+	close(startDone)
+
+	err := cmd.Wait()
+	treeMu.Lock()
+	if tree != nil {
+		tree.close()
+	}
+	called := cancelCalled
+	result := cancelResult
+	treeMu.Unlock()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
 	if err != nil {
-		if ctx.Err() != nil {
+		// A cancellation callback is not proof that the child was
+		// signaled. Preserve a settled process/CLI error unless the
+		// termination result contains positive delivery evidence.
+		if ctx.Err() != nil && called && result.active {
 			return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 		}
 		var exitErr *exec.ExitError
@@ -120,15 +177,52 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 		}
 		return stdout.Bytes(), stderr.Bytes(), err
 	}
+	if ctx.Err() != nil && called && result.active {
+		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+	}
 	return stdout.Bytes(), stderr.Bytes(), nil
 }
 
-// truncateStderr bounds the diagnostic copy kept in CLIError.
+// truncateStderr returns at most maxStderr bytes from the end of the
+// diagnostic. Keeping the tail, rather than the first bytes, preserves
+// the final daemon error after a large amount of preceding output.
 func truncateStderr(s string) string {
-	if len(s) > maxStderr {
-		return s[:maxStderr]
+	return tailString(s)
+}
+
+func tailString(s string) string {
+	if len(s) <= maxStderr {
+		return s
 	}
-	return s
+	return string([]byte(s[len(s)-maxStderr:]))
+}
+
+// tailBuffer is a bounded rolling diagnostic buffer. It always reports
+// complete writes, even when older bytes are discarded.
+type tailBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
+
+func (b *tailBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(p) >= maxStderr {
+		b.data = append(b.data[:0], p[len(p)-maxStderr:]...)
+		return len(p), nil
+	}
+	if overflow := len(b.data) + len(p) - maxStderr; overflow > 0 {
+		copy(b.data, b.data[overflow:])
+		b.data = b.data[:len(b.data)-overflow]
+	}
+	b.data = append(b.data, p...)
+	return len(p), nil
+}
+
+func (b *tailBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(append([]byte(nil), b.data...))
 }
 
 // IsCommandExit reports whether err is a CLIError from a child process
@@ -145,8 +239,7 @@ func IsCommandExit(err error) bool {
 const probeTimeout = 5 * time.Second
 
 // Classify augments a failed CLI call: if the backend does not answer
-// the probe, the failure is reported as ErrSystemNotRunning instead of
-// the original error.
+// the probe, ErrSystemNotRunning is joined with the original failure.
 func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 	if err == nil {
 		return nil
@@ -166,7 +259,8 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		if ctx.Err() != nil {
 			return err
 		}
-		return fmt.Errorf("%w: %s (underlying error: %v)", ErrSystemNotRunning, probe.Hint, err)
+		classification := fmt.Errorf("%w: %s", ErrSystemNotRunning, probe.Hint)
+		return errors.Join(classification, err)
 	}
 	return err
 }

@@ -17,11 +17,13 @@ var reuseFlights flightGroup[*Container]
 
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	// PullAlways is a per-caller side effect, even when the container is
-	// already running. Do it before joining the shared ensure flight so
-	// concurrent callers aggregate the pull instead of silently inheriting
-	// the leader's result.
+	// already running. Do it directly before joining the shared ensure
+	// flight so every caller performs its own fetch instead of being
+	// absorbed by an in-flight image pull.
 	if cfg.pullPolicy == PullAlways {
-		if err := cfg.ensureImage(ctx, image); err != nil {
+		pullCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+		defer cancel()
+		if err := pullImage(pullCtx, cfg.runner, cfg.eng, image, cfg.platform); err != nil {
 			return nil, err
 		}
 		cfg.imagePrepared = true

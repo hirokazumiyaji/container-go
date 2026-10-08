@@ -303,3 +303,59 @@ func TestReuseCreatePullAlwaysDoesNotPullTwice(t *testing.T) {
 		t.Fatalf("pulls = %d, want one fetch for the creating caller", f.pullCalls)
 	}
 }
+
+type concurrentPullRunner struct {
+	*attachRunner
+	pullStarted chan struct{}
+	releasePull chan struct{}
+	startOnce   sync.Once
+}
+
+func (r *concurrentPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "pull" || (args[0] == "image" && len(args) > 1 && args[1] == "pull") {
+		r.startOnce.Do(func() {
+			close(r.pullStarted)
+			<-r.releasePull
+		})
+	}
+	return r.attachRunner.Run(ctx, args...)
+}
+
+func TestReuseConcurrentPullAlwaysBothPull(t *testing.T) {
+	base := &attachRunner{fakeRunner: newTestRunner(), state: "running"}
+	base.imagePresent = true
+	r := &concurrentPullRunner{
+		attachRunner: base,
+		pullStarted:  make(chan struct{}),
+		releasePull:  make(chan struct{}),
+	}
+
+	err1 := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"), WithReuse(), WithPullPolicy(PullAlways),
+			withRunner(r), withEngine(appleEngine{}))
+		err1 <- err
+	}()
+	<-r.pullStarted
+
+	err2 := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"), WithReuse(), WithPullPolicy(PullAlways),
+			withRunner(r), withEngine(appleEngine{}))
+		err2 <- err
+	}()
+
+	close(r.releasePull)
+	if err := <-err1; err != nil {
+		t.Fatalf("first caller: %v", err)
+	}
+	if err := <-err2; err != nil {
+		t.Fatalf("second caller: %v", err)
+	}
+	if r.pullCalls != 2 {
+		t.Fatalf("pullCalls = %d, want each PullAlways caller to perform its own pull", r.pullCalls)
+	}
+}
+

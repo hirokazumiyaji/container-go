@@ -56,31 +56,68 @@ func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		return err
 	}
 
+	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for all")
+	if err != nil {
+		return err
+	}
+
 	for i, strategy := range s.strategies {
 		if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("before strategy %d", i)); err != nil {
 			return err
 		}
-		err := strategy.WaitUntilReady(waitCtx, target)
-		if err != nil {
-			term := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i))
-			if term == nil && s.startupTimeout > 0 && !time.Now().Before(startupDeadline) && !callerOwnsDeadline(callerDeadline, callerHasDeadline, startupDeadline) && errors.Is(err, context.DeadlineExceeded) && callerCtx.Err() == nil {
-				// A child can observe the derived deadline just before the
-				// parent context records Err. Treat that boundary as the
-				// composite's startup timeout rather than leaking a generic
-				// child deadline.
-				term = newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in strategy %d", s.startupTimeout, i), context.DeadlineExceeded)
+
+		result := make(chan error, 1)
+		go func(strategy Strategy) {
+			result <- strategy.WaitUntilReady(waitCtx, target)
+		}(strategy)
+
+		select {
+		case lifecycleErrValue := <-lifecycleErr:
+			return lifecycleErrValue
+		case err := <-result:
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				return lifecycleErrValue
+			default:
 			}
-			if term != nil {
-				primary := term
-				if cause := errors.Unwrap(term); cause != nil {
-					primary = cause
+			if err != nil {
+				term := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i))
+				if term == nil && s.startupTimeout > 0 && !time.Now().Before(startupDeadline) && !callerOwnsDeadline(callerDeadline, callerHasDeadline, startupDeadline) && errors.Is(err, context.DeadlineExceeded) && callerCtx.Err() == nil {
+					// A child can observe the derived deadline just before the
+					// parent context records Err. Treat that boundary as the
+					// composite's startup timeout rather than leaking a generic
+					// child deadline.
+					term = newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in strategy %d", s.startupTimeout, i), context.DeadlineExceeded)
 				}
-				return newWaitError(fmt.Sprintf("wait for all: %v (strategy %d: %v)", term, i, err), primary, term, err)
+				if term != nil {
+					primary := term
+					if cause := errors.Unwrap(term); cause != nil {
+						primary = cause
+					}
+					return newWaitError(fmt.Sprintf("wait for all: %v (strategy %d: %v)", term, i, err), primary, term, err)
+				}
+				return err
 			}
-			return err
-		}
-		if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d", i)); err != nil {
-			return err
+			if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d", i)); err != nil {
+				return err
+			}
+			if finalErr := finalLifecycleCheck(waitCtx, target, "wait for all"); finalErr != nil {
+				if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d final check", i)); err != nil {
+					return errors.Join(err, finalErr)
+				}
+				return finalErr
+			}
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				return lifecycleErrValue
+			default:
+			}
+		case <-waitCtx.Done():
+			term := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i))
+			if term == nil {
+				term = context.Canceled
+			}
+			return drainCompositeResult(result, term)
 		}
 	}
 	return nil
@@ -98,7 +135,7 @@ func allContextError(callerCtx, waitCtx context.Context, startupTimeout time.Dur
 			return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed %s", phase), context.DeadlineExceeded)
 		}
 		if startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-			return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed %s", startupTimeout, phase), context.DeadlineExceeded)
+			return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in %s", startupTimeout, phase), context.DeadlineExceeded)
 		}
 		return newWaitError(fmt.Sprintf("wait for all: context ended %s", phase), err)
 	}
@@ -159,6 +196,11 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	}
 	callerDeadline, callerHasDeadline := callerCtx.Deadline()
 
+	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for any")
+	if err != nil {
+		return err
+	}
+
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
 		go func(strategy Strategy) {
@@ -170,10 +212,16 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 	remaining := len(s.strategies)
 	for remaining > 0 {
 		select {
+		case lifecycleErrValue := <-lifecycleErr:
+			cancel()
+			return lifecycleErrValue
 		case err := <-results:
 			remaining--
-			if err != nil {
-				errs = append(errs, err)
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				cancel()
+				return lifecycleErrValue
+			default:
 			}
 			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
 				cancel()
@@ -181,8 +229,22 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 				return errors.Join(append([]error{terminal}, append(errs, childErrs...)...)...)
 			}
 			if err == nil {
+				if finalErr := finalLifecycleCheck(waitCtx, target, "wait for any"); finalErr != nil {
+					cancel()
+					if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
+						return errors.Join(terminal, finalErr)
+					}
+					return finalErr
+				}
+				select {
+				case lifecycleErrValue := <-lifecycleErr:
+					cancel()
+					return lifecycleErrValue
+				default:
+				}
 				return nil
 			}
+			errs = append(errs, err)
 		case <-waitCtx.Done():
 			terminalErr := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline)
 			if terminalErr == nil {
@@ -195,6 +257,100 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func finalLifecycleCheck(ctx context.Context, target Target, what string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, finalLifecycleProbeTimeout)
+	defer cancel()
+	if err := probeCtx.Err(); err != nil {
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+	}
+	state, err := targetState(probeCtx, target)
+	probeErr := probeCtx.Err()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, ctxErr), ctxErr, err)
+	}
+	if probeErr != nil {
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, probeErr), probeErr, err)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+	}
+	if terminalWaitState(state) {
+		return stateFailure(what, state, nil, nil)
+	}
+	if state != StateRunning {
+		return fmt.Errorf("%s: final lifecycle state %s; want running", what, state)
+	}
+	return nil
+}
+
+func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	lifecycleErr := make(chan error, 1)
+	go func() {
+		var lastStateErr error
+		check := func() bool {
+			probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+			state, err := targetState(probeCtx, target)
+			probeErr := probeCtx.Err()
+			cancel()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false
+			}
+			if probeErr != nil {
+				if err != nil {
+					lastStateErr = err
+				}
+				return true
+			}
+			if err != nil {
+				if permanentProbeError(err) {
+					lifecycleErr <- fmt.Errorf("%s: %w", what, err)
+					return false
+				}
+				lastStateErr = err
+				return true
+			}
+			if terminalWaitState(state) {
+				lifecycleErr <- stateFailure(what, state, nil, lastStateErr)
+				return false
+			}
+			return true
+		}
+		if !check() {
+			return
+		}
+		ticker := time.NewTicker(stateCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !check() {
+					return
+				}
+			}
+		}
+	}()
+	return lifecycleErr, nil
+}
+
+func drainCompositeResult(result <-chan error, contextErr error) error {
+	timer := time.NewTimer(compositeDrainTimeout)
+	defer timer.Stop()
+	select {
+	case childErr := <-result:
+		return errors.Join(contextErr, childErr)
+	case <-timer.C:
+		return contextErr
+	}
 }
 
 func drainCompositeResults(results <-chan error, count int) []error {

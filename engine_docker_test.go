@@ -148,9 +148,10 @@ func TestDockerStateMapping(t *testing.T) {
 		"exited":     StateStopped,
 		"dead":       StateStopped,
 		"created":    StateCreated,
-		"restarting": StateStopping,
+		"restarting": StateRestarting,
 		"removing":   StateStopping,
-		"paused":     StateUnknown,
+		"paused":     StatePaused,
+		"unexpected": StateUnknown,
 	}
 	for docker, want := range cases {
 		if got := dockerState(docker); got != want {

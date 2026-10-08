@@ -391,20 +391,27 @@ func ReleasedWaitStrategies() {
 }
 ```
 
-The primitive strategies have a 60-second default startup timeout.
-`ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms by
-default; `ForExec` polls every 250ms by default. `ForLog` reads a
-continuous `FollowLogs` stream rather than polling, so its
-`WithPollInterval` setter has no effect. `ForAll` and `ForAny` in
-`v0.2.0` do not expose a composite timeout setter. Connection and HTTP
-strategies probe the stopped state at most once per second. `ForExec` does
-not fail fast while polling; it checks the container state when its wait
-deadline expires. `ForLog` returns success only after the required
-pattern count is reached. If its log stream ends first, it performs a
-bounded (up to five seconds) `Running` probe: a confirmed stopped
-container produces the stopped-before-pattern error; otherwise it reports
-that the log stream ended before the pattern appeared, including any
-reader error. EOF alone is not proof that the container stopped.
+Every leaf strategy accepts `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms, except `ForExec`, which defaults to
+250ms). For `ForLog`, the poll interval is the delay before reopening a
+stream that ends before the pattern is found. `ForAll` and `ForAny` have
+no composition-wide timeout by default; a positive `WithStartupTimeout`
+bounds the whole composition, while zero or a negative value leaves it
+unbounded and lets each child strategy's timeout apply.
+
+Waiting fails fast when the container is stopping, stopped, or paused.
+Created, restarting, unknown, and transient inspect states retry under the
+timeout; transient log stream open/EOF failures are reopened, while a
+terminal log-stream error is returned. A successful marker is accepted only
+after a bounded final lifecycle observation reports `Running`; `ForLog` is for
+long-lived services, not one-shot job completion. `ForLog` counts occurrences
+across reconnects after de-duplicating the replayed log prefix. A failed wait rolls
+the container back with a tail of its logs attached to the error.
+
+For custom strategies, `wait.Target` retains its original `Running` method.
+Implement the optional `wait.StateTarget` interface when the target can
+distinguish transient startup states; built-in strategies use it automatically
+and fall back to `Running` for compatibility.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
 UDP may be declared for endpoint configuration, but the current

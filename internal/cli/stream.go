@@ -84,6 +84,9 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		_ = pr.Close()
 		_ = pw.Close()
 		stream.closeSourceFiles()
+		if PermanentStartError(err) {
+			return nil, fmt.Errorf("%s %s: %w: %w", bin, strings.Join(args, " "), ErrStreamSetup, err)
+		}
 		return nil, fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), err)
 	}
 

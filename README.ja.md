@@ -394,20 +394,19 @@ func ReleasedWaitStrategies() {
     _ = wait.ForAny(wait.ForExposedPort())
 }
 ```
+すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を受け付けます。
+`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間です。
+`ForAll` と `ForAny` は既定では合成全体のタイムアウトを持ちません。正の `WithStartupTimeout` を指定すると合成全体を制限し、0 または負の値では制限せず各子の戦略のタイムアウトを適用します。
 
-基本 strategy の起動タイムアウトは既定 60 秒です。
-`ForListeningPort`、`ForExposedPort`、`ForHTTP` は既定 100 ミリ秒、
-`ForExec` は既定 250 ミリ秒で poll します。`ForLog` は
-`FollowLogs` のストリームを継続して読むため、`WithPollInterval` の
-セッターは動作を変更しません。`v0.2.0` の `ForAll` と `ForAny` には
-合成全体に設定する timeout setter がありません。接続・HTTP strategy は
-最大 1 秒間隔で停止状態を調べます。`ForExec` は poll 中には fail-fast
-しません。wait の期限到来時にコンテナ状態を調べます。`ForLog` は必要な
-pattern の出現回数に達した場合だけ成功を返します。先にログ stream が終了
-した場合は最大 5 秒の `Running` probe を行います。probe が停止を確認した
-場合は「pattern 前に停止」の error を返し、それ以外は pattern 前に stream
-が終了した error を返します（reader error があれば併記します）。EOF だけ
-ではコンテナが停止したことの証明にはなりません。
+コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
+created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
+成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理されます。`ForLog` はワンショットジョブではなく、長時間稼働するサービス向けです。
+`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計します。
+待機に失敗した場合はロールバック削除し、エラーにログ末尾を添付します。
+
+カスタム戦略向けの `wait.Target` は従来の `Running` メソッドを維持します。
+起動中の一時状態を区別できるターゲットでは、任意の `wait.StateTarget` インターフェースも実装してください。
+組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
 
 `ForListeningPort` と `ForExposedPort` は TCP 専用の readiness probe です。
 UDP は endpoint 設定には宣言できますが、現在の実装は probe 前に `/udp` を
@@ -549,6 +548,16 @@ parser は valid だが mismatched な Docker object を no-match として拒�
 ない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure
 はそのまま返る。
 
+`ForListeningPort` とポート宣言では、対応プロトコルが異なります。
+
+| API | TCP | UDP |
+|---|---|---|
+| `WithExposedPorts` / `WithPublishedPort` | 対応 | 対応 |
+| `wait.ForListeningPort` | `6379` または `6379/tcp` | 接続を試みる前に `*wait.ConfigError` |
+
+`ForListeningPort` は、不正なポート指定にも `*wait.ConfigError` を返します。
+エラーメッセージを比較せず分類する場合は、`errors.Is(err, wait.ErrInvalidConfiguration)` を使えます。
+
 ## イメージの pull
 
 コンテナを新規作成する必要がある場合、`Run` は起動前に明示的な pull policy
@@ -606,16 +615,6 @@ func PullPolicy(ctx context.Context, t testing.TB) {
 例は `Run` の error を確認する前に cleanup を登録する。現在のチェックアウトでは
 `PullNever` の `ErrImageNotFound` は backend 固有であり、Apple では best-effort
 である。Apple の no-fetch 保証ではない（#112）。
-
-`ForListeningPort` とポート宣言では、対応プロトコルが異なります。
-
-| API | TCP | UDP |
-|---|---|---|
-| `WithExposedPorts` / `WithPublishedPort` | 対応 | 対応 |
-| `wait.ForListeningPort` | `6379` または `6379/tcp` | 接続を試みる前に `*wait.ConfigError` |
-
-`ForListeningPort` は、不正なポート指定にも `*wait.ConfigError` を返します。
-エラーメッセージを比較せず分類する場合は、`errors.Is(err, wait.ErrInvalidConfiguration)` を使えます。
 
 ## クリーンアップの契約
 

@@ -498,23 +498,23 @@ provides:
 - `wait.ForExec(cmd []string)`: wait until `container exec` exits with
   an accepted code (0 by default)
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`:
-  composition. Each child keeps its own `WithStartupTimeout`; the whole
-  composition can also be bounded with `WithStartupTimeout` (or
-  `context.WithTimeout` from the caller).
+  composition. Each child keeps its own `WithStartupTimeout`; a positive
+  composition `WithStartupTimeout` bounds the whole sequence/concurrent
+  wait. With no positive composition timeout, zero or a negative value
+  leaves the composition unbounded and the child timeouts apply.
 
-The primitive strategies default to a 60-second startup timeout.
-`ForListeningPort`, `ForExposedPort`, and `ForHTTP` poll every 100ms;
-`ForExec` polls every 250ms. The current `ForLog` type also exposes
-`WithPollInterval`, but it has no effect because it consumes a stream.
-Connection and HTTP strategies check the stopped state at most once per
-second. `ForExec` does not fail fast while polling; it checks the
-container state when its wait deadline expires. `ForLog` returns success
-only after the required pattern count is reached. If its log stream ends
-first, it performs a bounded (up to five seconds) `Running` probe: a
-confirmed stopped container produces the stopped-before-pattern error;
-otherwise it reports that the log stream ended before the pattern
-appeared, including any reader error. EOF alone is not proof that the
-container stopped. A failed
+Every leaf strategy carries `WithStartupTimeout` (zero means 60s) and
+`WithPollInterval` (zero means 100ms, except `ForExec`, which defaults to
+250ms). For `ForLog`, the poll interval is the delay before reopening a
+stream that ends before the pattern is found. A stopping, stopped, or
+paused container fails the wait without burning the remaining timeout.
+Created, restarting, unknown, and transient inspect states remain
+retryable; transient log-stream open and EOF failures reopen the stream,
+while a terminal log-stream error is returned. A marker match is accepted
+only after a bounded final lifecycle observation reports `Running`; `ForLog`
+therefore targets long-lived services rather than one-shot job completion.
+`ForLog` counts occurrences across reconnects after de-duplicating the
+replayed log prefix. A failed
 non-reuse `Run` wait rolls the container back and, when the bounded log
 fetch succeeds, attaches a log tail capped at 1MiB to the error; a reuse
 wait leaves the shared container in place.
@@ -543,8 +543,12 @@ type Strategy interface {
 `FollowLogs`, and `ExecCommand`. `*container.Container` is adapted to
 it. `Target` does not expose `ContainerIP`; connection strategies use the
 resolved endpoint, which is the right abstraction for both direct-IP
-Apple Container and published-port Docker. The dependency points from
-`container` to `wait`, never back, avoiding an import cycle.
+Apple Container and published-port Docker. `Target` keeps its original `Running`
+method for custom-strategy compatibility. Targets that distinguish startup
+transitions also implement the optional `StateTarget` interface; built-in
+strategies prefer `State` and fall back to `Running`. `container.Run` adapts
+`*container.Container` to both surfaces. The dependency points from `container`
+to `wait`, never back, avoiding an import cycle.
 
 ## Cleanup
 
@@ -800,14 +804,16 @@ endpoint data.
 `container run --detach` call. The immutable UID, image, and label identity
 is cached after validation, while endpoint, Host, lifecycle, and reuse
 operations refresh dynamic network, IP, state, and port-binding data from
-inspect. This avoids stale endpoint data without treating published ports
-as immutable.
+inspect. Incomplete Created data is refreshed instead of cached, and the
+lifecycle state is re-queried. This avoids stale endpoint data without treating
+published ports as immutable.
 
 **Wait via connections where possible**. `ForListeningPort` and
 `ForHTTP` use the resolved endpoint directly. `ForExec` and state
 queries invoke the backend CLI; `ForLog` uses the streaming logs API.
 The default polling intervals are 100ms for connection probes and
-250ms for exec probes.
+250ms for exec probes. Ongoing lifecycle queries are limited to once per
+second, while a log-stream failure is classified immediately.
 
 **Never serialize parallel startups**. The library holds no global
 lock for container creation (reaper ID registration takes a mutex for
@@ -1022,8 +1028,8 @@ resolution stay the docker CLI's job.
 **Internal structure**: a backend is an internal interface owning only
 argv assembly and inspect normalization. Process execution (the
 runner), wait strategies, cleanup, and validation are shared. The
-normalized record holds state (mapped onto running / stopped /
-stopping / created / unknown), labels, image reference, a backend ID
+normalized record holds lifecycle state (created, running, restarting,
+stopping, stopped, paused, or unknown), labels, image reference, a backend ID
 when available, container IP, and host-side port bindings (container port
 → host address and port). The backend ID is the stable identity; IP
 addresses and bindings are dynamic, even though the current endpoint cache

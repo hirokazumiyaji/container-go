@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sync"
 	"time"
@@ -64,7 +65,7 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	}
 	s, ok := c.runner.(cli.Streamer)
 	if !ok {
-		return nil, errors.New("logs: runner does not support streaming")
+		return nil, fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup)
 	}
 	stream, err := s.Stream(ctx, c.eng.logsFollowArgs(target)...)
 	if err != nil {
@@ -106,6 +107,13 @@ func (s *classifyingStream) Read(p []byte) (int, error) {
 		return n, s.classifyTerminal(err)
 	}
 	return n, wrapNotFound(s.container.classify(s.ctx, err))
+}
+
+func (s *classifyingStream) TerminalError() error {
+	if status, ok := s.ReadCloser.(interface{ TerminalError() error }); ok {
+		return s.classifyTerminal(status.TerminalError())
+	}
+	return s.terminalErr
 }
 
 func (s *classifyingStream) classifyTerminal(err error) error {

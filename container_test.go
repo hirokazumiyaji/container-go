@@ -74,6 +74,9 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {
+			if len(args) > 2 && args[1] == "--format" && args[2] == "{{.Server.Os}}" {
+				return []byte("linux\n"), nil, nil
+			}
 			return []byte("ok"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
@@ -138,7 +141,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "id": %q,
       "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
     },
     "status": {
       "state": "running",

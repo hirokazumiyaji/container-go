@@ -20,7 +20,7 @@ const (
 	// consumed pending output. maxLogSettleWindow bounds a continuously
 	// active live --follow stream so readiness cannot wait forever.
 	terminalSettleWindow = 100 * time.Millisecond
-	maxLogSettleWindow   = time.Second
+	maxLogSettleWindow   = 250 * time.Millisecond
 )
 
 var errLogLineTooLong = errors.New("log line exceeds 1 MiB")
@@ -95,6 +95,7 @@ type logScanResult struct {
 	committed   bool
 	err         error
 	terminalErr error
+	state       State
 	count       int
 	lines       [][sha256.Size]byte
 	lineStart   int
@@ -138,6 +139,10 @@ func appendReplayLine(lines [][sha256.Size]byte, start *int, line [sha256.Size]b
 // of occurrences is found. Only a clean EOF commits replay, count, and
 // partial state; a non-EOF transport error rolls the scan back.
 func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
+	return scanLogStreamTarget(ctx, nil, stream, match, occurrences, replay)
+}
+
+func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
 	results := make(chan logScanResult, 1)
 	go func() {
 		reader := bufio.NewReader(stream)
@@ -177,7 +182,8 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 					replaying = false
 					lineCount = observedLines
 				}
-				if !replaying {
+				canCount := !replaying && (replay.count == 0 || observedLines >= replay.previousLines)
+				if canCount {
 					logical, reconcileErr := reconcileLogLine(partial, line)
 					if reconcileErr != nil {
 						results <- result(false, false, reconcileErr, nil)
@@ -204,11 +210,12 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 					return
 				}
 				if errors.Is(err, io.EOF) {
+					committed := observedLines >= replay.previousLines
 					if count >= occurrences {
 						terminalErr := settleLogMatch(ctx, stream, reader)
-						results <- result(true, true, nil, terminalErr)
+						results <- result(true, committed, nil, terminalErr)
 					} else {
-						results <- result(false, true, nil, nil)
+						results <- result(false, committed, nil, nil)
 					}
 					return
 				}
@@ -223,7 +230,7 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 		}
 	}()
 
-	if result, ok := receiveLogScanResult(results, ctx.Done()); ok {
+	if result, ok := receiveLogScanResult(ctx, target, results, ctx.Done()); ok {
 		return result
 	}
 	terminalErr := settledTerminalError(stream)
@@ -253,7 +260,7 @@ func settledTerminalError(stream io.ReadCloser) error {
 	}
 }
 
-func receiveLogScanResult(results <-chan logScanResult, done <-chan struct{}) (logScanResult, bool) {
+func receiveLogScanResult(ctx context.Context, target Target, results <-chan logScanResult, done <-chan struct{}) (logScanResult, bool) {
 	// Prefer a result queued before the context became ready. This keeps
 	// a terminal CLI error visible when EOF and a deadline race.
 	select {
@@ -261,17 +268,34 @@ func receiveLogScanResult(results <-chan logScanResult, done <-chan struct{}) (l
 		return result, true
 	default:
 	}
-	select {
-	case result := <-results:
-		return result, true
-	case <-done:
+
+	var tickerChan <-chan time.Time
+	if target != nil {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		tickerChan = ticker.C
+	}
+
+	for {
 		select {
 		case result := <-results:
 			return result, true
-		default:
+		case <-tickerChan:
+			probeCtx, probeCancel := context.WithTimeout(ctx, lifecycleProbeTimeout)
+			state, err := targetState(probeCtx, target)
+			probeCancel()
+			if ctx.Err() == nil && err == nil && terminalWaitState(state) {
+				return logScanResult{state: state}, true
+			}
+		case <-done:
+			select {
+			case result := <-results:
+				return result, true
+			default:
+			}
+			return logScanResult{}, false
 		}
 	}
-	return logScanResult{}, false
 }
 
 // readLogLine returns bufio.ScanLines-compatible text: a line terminator is
@@ -574,47 +598,53 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(err, nil)); terminalErr != nil {
 				return terminalErr
 			}
-			return wrapWaitCause(what, err, lastProbeErr)
-		}
-
-		result := scanLogStream(waitCtx, stream, match, s.occurrences, replay)
-		terminalStreamErr := result.terminalErr
-		resultErr := record(terminalStreamErr, nil)
-		if result.found {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
+			if isPermanentCheckError(err) || isTerminalStreamError(err) {
+				return wrapWaitCause(what, err, lastProbeErr)
+			}
+		} else {
+			result := scanLogStreamTarget(waitCtx, target, stream, match, s.occurrences, replay)
+			if terminalWaitState(result.state) {
 				_ = stream.Close()
-				return terminalErr
+				return waitStoppedStateError(what, result.state, retained())
 			}
-		}
-		_ = stream.Close()
-		if result.found {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
-				return terminalErr
+			terminalStreamErr := result.terminalErr
+			resultErr := record(terminalStreamErr, nil)
+			if result.found {
+				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
+					_ = stream.Close()
+					return terminalErr
+				}
 			}
-			if terminalStreamErr != nil {
-				return wrapWaitCause(what, terminalStreamErr, lastProbeErr)
+			_ = stream.Close()
+			if result.found {
+				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
+					return terminalErr
+				}
+				if terminalStreamErr != nil {
+					return wrapWaitCause(what, terminalStreamErr, lastProbeErr)
+				}
+				if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, resultErr); err != nil {
+					return err
+				}
+				return nil
 			}
-			if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, resultErr); err != nil {
-				return err
-			}
-			return nil
-		}
 
-		if result.committed {
-			replay = logReplay{
-				previous:      result.lines,
-				previousStart: result.lineStart,
-				previousLines: result.lineCount,
-				count:         result.count,
-				partial:       result.partial,
+			if result.committed {
+				replay = logReplay{
+					previous:      result.lines,
+					previousStart: result.lineStart,
+					previousLines: result.lineCount,
+					count:         result.count,
+					partial:       result.partial,
+				}
 			}
-		}
-		if result.err != nil {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(result.err, nil)); terminalErr != nil {
-				return terminalErr
-			}
-			if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
-				return wrapWaitCause(what, result.err, lastProbeErr)
+			if result.err != nil {
+				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(result.err, nil)); terminalErr != nil {
+					return terminalErr
+				}
+				if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
+					return wrapWaitCause(what, result.err, lastProbeErr)
+				}
 			}
 		}
 		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, retained()); terminalErr != nil {
@@ -629,25 +659,25 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			probeCancel()
 			return waitContextError(what, err, retained())
 		}
-		running, runningErr := target.Running(probeCtx)
+		state, probeErr := targetState(probeCtx, target)
 		probeCtxErr := probeCtx.Err()
 		probeCancel()
 		if probeCtxErr != nil {
-			runningErr = joinNonNil(runningErr, probeCtxErr)
+			probeErr = joinNonNil(probeErr, probeCtxErr)
 		}
-		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(nil, runningErr)); terminalErr != nil {
+		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(nil, probeErr)); terminalErr != nil {
 			return terminalErr
 		}
-		if runningErr != nil {
+		if probeErr != nil {
 			// A CLIError here came from the independent state probe, not
 			// from the log stream. Only typed permanent state errors stop
 			// the wait; transient daemon/inspect failures remain causes and
 			// are retried with the next log connection.
-			if isPermanentCheckError(runningErr) {
-				return wrapWaitCause(what, runningErr, retained())
+			if isPermanentCheckError(probeErr) {
+				return wrapWaitCause(what, probeErr, retained())
 			}
-		} else if !running {
-			return waitStoppedError(what, retained())
+		} else if terminalWaitState(state) {
+			return waitStoppedStateError(what, state, retained())
 		}
 
 		if err := waitForReconnect(waitCtx, interval); err != nil {

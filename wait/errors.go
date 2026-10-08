@@ -3,6 +3,8 @@ package wait
 import (
 	"errors"
 	"fmt"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // ErrInvalidConfiguration classifies invalid static configuration passed
@@ -19,6 +21,14 @@ var ErrPortNotExposed = errors.New("port is not declared or has no usable host b
 // longer exists. The container package aliases this value for callers
 // that use container.ErrContainerNotFound.
 var ErrContainerNotFound = errors.New("container not found")
+
+// ErrTargetNotFound can wrap a Target method error when the target no
+// longer exists.
+var ErrTargetNotFound = errors.New("wait target not found")
+
+// ErrLogStreamSetup identifies deterministic log-stream setup failures
+// that readiness strategies must not retry.
+var ErrLogStreamSetup = cli.ErrStreamSetup
 
 // ConfigError reports invalid static configuration passed to a wait strategy.
 // It can be inspected with errors.As and classified with errors.Is using

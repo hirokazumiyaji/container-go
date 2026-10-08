@@ -270,7 +270,6 @@ func TestPollRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return nil },
-		true,
 	)
 	if err == nil || !strings.Contains(err.Error(), "stopped") {
 		t.Fatalf("error = %v, want final stopped lifecycle error", err)
@@ -303,7 +302,6 @@ func TestFinalLifecycleProbeHonorsWaitBudget(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return nil },
-		true,
 	)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want bounded final probe deadline", err)

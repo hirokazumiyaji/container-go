@@ -13,7 +13,7 @@ import (
 type recordingStrategy struct {
 	called   bool
 	endpoint string
-	running  bool
+	state    wait.State
 	err      error
 }
 
@@ -22,8 +22,10 @@ func (s *recordingStrategy) WaitUntilReady(ctx context.Context, target wait.Targ
 	if ep, err := target.Endpoint(ctx, "6379/tcp"); err == nil {
 		s.endpoint = ep
 	}
-	if r, err := target.Running(ctx); err == nil {
-		s.running = r
+	if stateTarget, ok := target.(wait.StateTarget); ok {
+		if state, err := stateTarget.State(ctx); err == nil {
+			s.state = state
+		}
 	}
 	return s.err
 }
@@ -40,8 +42,8 @@ func TestRunInvokesWaitStrategyWithAdaptedTarget(t *testing.T) {
 	if s.endpoint != "192.168.64.3:6379" {
 		t.Errorf("target endpoint = %q", s.endpoint)
 	}
-	if !s.running {
-		t.Error("target reports not running")
+	if s.state != wait.StateRunning {
+		t.Errorf("target state = %q, want %q", s.state, wait.StateRunning)
 	}
 }
 

@@ -343,12 +343,9 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
   このエラーは `wait.ErrInvalidConfiguration` と一致する。
 - `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
-- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。`WithStartupTimeout` で合成全体のタイムアウトも設定可能
+- `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。各子は自身の `WithStartupTimeout` を持ち、正の合成 `WithStartupTimeout` で合成全体を制限できる。合成のタイムアウトを正の値にしなければ、0 または負の値では合成を無制限にし、各子のタイムアウトを適用する。
 
-基本 strategy の起動タイムアウトは既定 60 秒である。
-`ForListeningPort`、`ForExposedPort`、`ForHTTP` は既定 100 ミリ秒で poll し、`ForExec` は既定 250 ミリ秒で poll する。
-現在の `ForLog` 型にも `WithPollInterval` があるが、stream を読むため効果がない。
-接続・HTTP strategy は最大 1 秒間隔で停止状態を調べる。`ForExec` は poll 中に fail-fast せず、wait の期限到来時にコンテナ状態を調べる。`ForLog` は必要な pattern の出現回数に達した場合だけ成功を返す。先に log stream が終了した場合は最大 5 秒の `Running` probe を行い、停止を確認できた場合だけ「pattern 前に停止」の error を返す。それ以外は stream が先に終了したことを報告し、reader error があれば併記する。EOF だけでは停止の証明にならない。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
+すべての葉戦略は `WithStartupTimeout`（0 は 60 秒）と `WithPollInterval`（0 は 100 ミリ秒、`ForExec` は 250 ミリ秒）を持つ。`ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間である。コンテナが stopping、stopped、paused の状態のいずれかになると、残りのタイムアウトを待たずに失敗する。created、restarting、unknown と一時的な inspect エラーは再試行し、一時的なログストリームの open と EOF は再-open する。終了コードを伴うログストリームエラーは返却する。成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理される。`ForLog` はワンショットジョブではなく長時間稼働するサービス向けである。`ForLog` は、再-open 時に再生されるログの共通部分を除外してから出現回数を累計する。再利用でない `Run` の待機が失敗した場合はコンテナをロールバックし、上限付き log の取得が成功した場合だけ 1MiB 上限の末尾をエラーに付ける。再利用の待機失敗では共有コンテナを残す。
 
 `ForListeningPort` と `ForExposedPort` は TCP 専用 probe です。UDP は endpoint 設定に
 宣言できますが、現在の実装は probe 前に `/udp` を reject せず TCP dial に渡します。
@@ -369,7 +366,7 @@ type Strategy interface {
 }
 ```
 
-`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`container.Run` が `*container.Container` を適合させる。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避けられる。
+`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。`container.Run` が `*container.Container` を両方のインターフェースへ適合させる。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
 
 ## クリーンアップ
 
@@ -511,9 +508,9 @@ CLI 側にも検証はあるが、ライブラリ側で先に落とすことで�
 
 ## パフォーマンス設計
 
-**子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。最初の inspect 結果を endpoint 関連経路が再利用する。ただし現在のキャッシュにはコンテナ IP と host 側 binding も含まれ、これらは動的な値である。`State` と一部の lifecycle 操作は再 inspect する。これは stale data の制限であり、immutable な保証ではない。動的 endpoint データの更新は #85 が担当する。
+**子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。起動後の inspect では接続に必要な情報がそろった結果を endpoint 関連経路が再利用する。created 状態で IP や公開ポートが未確定ならキャッシュせず、次の inspect で再取得する。状態 (`status.state`) は毎回取得する。ただし現在のキャッシュにはコンテナ IP と host 側 binding も含まれ、これらは動的な値である。`State` と一部の lifecycle 操作は再 inspect する。これは stale data の制限であり、immutable な保証ではない。動的 endpoint データの更新は #85 が担当する。
 
-**接続で確認できる待機は接続で行う**。`ForListeningPort` と `ForHTTP` は解決したエンドポイントへ直接接続する。`ForExec` と状態照会はバックエンド CLI を呼び出し、`ForLog` はログストリーム API を使う。接続 probe の既定間隔は 100ms、exec probe は 250ms である。
+**接続で確認できる待機は接続で行う**。`ForListeningPort` と `ForHTTP` は解決したエンドポイントへ直接接続する。`ForExec` と状態照会はバックエンド CLI を呼び出し、`ForLog` はログストリーム API を使う。接続 probe の既定間隔は 100ms、exec probe は 250ms である。通常のライフサイクル照会を最大 1 秒間隔に制限し、ログストリームの失敗時は直ちに状態を分類する。
 
 **並列起動を妨げない**。コンテナ作成にグローバルロックを置かない（reaper の ID 登録だけ 1 行の書き込みにミューテックスを使う）。Apple Container は既定でホストポートを消費せず、Docker はデーモンが公開ポートを原子的に割り当てる。
 
@@ -607,13 +604,9 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 
 **方式**：Docker も `os/exec` の CLI ラッパーにする。container-rs は Docker Engine API を直接呼ぶが、本ライブラリは直接 API を使わない。直接 API クライアントは tar の生成、ログストリームの逆多重化、レジストリ認証、Windows の名前付きパイプを自前実装することになるため、CLI ラッパーを使う方が既存の runner 層（argv 実行、timeout、streaming）を共有できる。`DOCKER_HOST`、Docker context、認証の解決は docker CLI に委ねる。ただし、このライブラリが remote endpoint として検出するのは `DOCKER_HOST` だけで、Docker context の remote daemon は検出しない。
 
-**内部構造**：バックエンドは argv 組み立てと inspect 正規化だけを持つ内部 interface にする。プロセス実行（runner）、待機戦略、cleanup、検証は両バックエンドで共有する。正規化した記録には state（running / stopped / stopping / created / unknown へ写像）、label、image 参照、利用できる場合の backend ID、コンテナ IP、host 側 port binding（コンテナポートから host アドレスとポートへ）を持つ。backend ID が stable identity で、IP と binding は動的である。現在の endpoint cache は後者を保持する。
+**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。正規化した情報には、ライフサイクル状態(created、running、restarting、stopping、stopped、paused、unknown)、ラベル、image 参照、利用できる場合の backend ID、コンテナ IP、Docker network mode、公開ポートの束縛（コンテナポート → ホストアドレスとポート）を含める。backend ID が stable identity で、IP と binding は動的である。現在の endpoint cache は後者を保持する。
 
 **Image 処理**：両バックエンドとも、明示的な image inspect と pull コマンドで pull policy を実装する。Docker の run argv は `--pull=never` を追加し、Apple Container も同じ明示的な policy 経路を使う。並行 pull は同一プロセス内で、backend、image、platform、操作が同じ場合だけ集約する。
-**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。
-プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。
-正規化した情報には、状態(running / stopped / stopping / unknown への写像)、ラベル、immutable identity、image、コンテナ IP、Docker network mode、公開ポートの束縛(コンテナポート → ホストアドレスとポート)を含める。
-状態、IP、network、port binding は dynamic data として inspect のたびに更新し、cache には immutable identity のみを保持する。
 
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。

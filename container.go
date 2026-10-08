@@ -114,11 +114,13 @@ func newCreationID() string {
 type State string
 
 const (
-	StateRunning  State = "running"
-	StateStopped  State = "stopped"
-	StateStopping State = "stopping"
-	StateCreated  State = "created"
-	StateUnknown  State = "unknown"
+	StateRunning    State = "running"
+	StateStopped    State = "stopped"
+	StateStopping   State = "stopping"
+	StateCreated    State = "created"
+	StateRestarting State = "restarting"
+	StatePaused     State = "paused"
+	StateUnknown    State = "unknown"
 )
 
 // Container is a handle to a container created by Run.
@@ -493,7 +495,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if err == nil {
 			break
 		}
-		if !isNotFoundFor(cfg.eng, err) {
+		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 		if err := waitForReusePoll(verifyCtx); err != nil {
@@ -937,6 +939,9 @@ func (c *Container) validateNetworkInfo(info *engineInfo) error {
 // intentionally not cached; endpoint and lifecycle callers use
 // inspectDynamic instead.
 func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if c.nameInspect {
 		return c.inspectFresh(ctx)
 	}
@@ -1012,6 +1017,10 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 		c.info = mergeImmutableInfo(c.info, identity)
 	}
 	return nil
+}
+
+func (c *Container) cacheInfo(info *engineInfo) error {
+	return c.rememberIdentity(context.Background(), info)
 }
 
 func immutableInfo(info *engineInfo) *engineInfo {

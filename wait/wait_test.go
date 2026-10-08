@@ -19,7 +19,9 @@ import (
 type fakeTarget struct {
 	endpoint      string
 	endpointCalls atomic.Int32
-	running       atomic.Bool
+	state         atomic.Value
+	stateErr      error
+	stateCalls    atomic.Int32
 	runningCalls  atomic.Int32
 	logs          io.ReadCloser
 	execCode      int
@@ -29,7 +31,7 @@ type fakeTarget struct {
 
 func newFakeTarget() *fakeTarget {
 	t := &fakeTarget{logs: io.NopCloser(strings.NewReader(""))}
-	t.running.Store(true)
+	t.state.Store(StateRunning)
 	return t
 }
 
@@ -41,9 +43,30 @@ func (f *fakeTarget) Endpoint(_ context.Context, port string) (string, error) {
 	return f.endpoint, nil
 }
 
-func (f *fakeTarget) Running(_ context.Context) (bool, error) {
-	f.runningCalls.Add(1)
-	return f.running.Load(), nil
+func (f *fakeTarget) Running(context.Context) (bool, error) {
+	state, err := f.State(context.Background())
+	return state == StateRunning, err
+}
+
+func (f *fakeTarget) State(_ context.Context) (State, error) {
+	f.stateCalls.Add(1)
+	return f.state.Load().(State), f.stateErr
+}
+
+type firstStateTarget struct {
+	*fakeTarget
+	first    State
+	firstErr error
+}
+
+func (t *firstStateTarget) State(_ context.Context) (State, error) {
+	t.stateCalls.Add(1)
+	if t.stateCalls.Load() == 1 {
+		t.state.Store(t.first)
+		return t.first, t.firstErr
+	}
+	t.state.Store(StateRunning)
+	return StateRunning, nil
 }
 
 func (f *fakeTarget) FollowLogs(_ context.Context) (io.ReadCloser, error) { return f.logs, nil }
@@ -167,7 +190,7 @@ func TestForListeningPortTimesOut(t *testing.T) {
 func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // nothing listens
-	target.running.Store(false)
+	target.state.Store(StateStopped)
 
 	s := ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second)
 	start := time.Now()
@@ -180,6 +203,121 @@ func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "stopped") {
 		t.Errorf("error = %v, want mention of stopped container", err)
+	}
+}
+
+func TestForListeningPortFailsFastWhenContainerPaused(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1" // nothing listens
+	target.state.Store(StatePaused)
+
+	s := ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second)
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error when container is paused")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %v; want fail-fast, not full timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "paused") {
+		t.Errorf("error = %v, want mention of paused container", err)
+	}
+}
+
+func TestPollRetriesCreatedUntilRunning(t *testing.T) {
+	target := &firstStateTarget{fakeTarget: newFakeTarget(), first: StateCreated}
+	checks := 0
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error {
+			checks++
+			if target.state.Load() != StateRunning {
+				return errors.New("not ready")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if target.stateCalls.Load() < 2 {
+		t.Fatalf("State calls = %d, want Created -> Running transition", target.stateCalls.Load())
+	}
+}
+
+func TestPollRetriesRestartingUntilRunning(t *testing.T) {
+	target := &firstStateTarget{fakeTarget: newFakeTarget(), first: StateRestarting}
+	checks := 0
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error {
+			checks++
+			if target.state.Load() != StateRunning {
+				return errors.New("not ready")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if checks < 2 {
+		t.Fatalf("checks = %d, want retry after Restarting", checks)
+	}
+}
+
+func TestPollRetriesUnknownAndTransientInspectErrorUntilTimeout(t *testing.T) {
+	cases := map[string]error{
+		"unknown state": nil,
+		"inspect error": errors.New("temporary inspect failure"),
+	}
+	for name, stateErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			target := newFakeTarget()
+			target.state.Store(StateUnknown)
+			target.stateErr = stateErr
+			checks := 0
+			err := poll(
+				context.Background(),
+				options{startupTimeout: 100 * time.Millisecond, pollInterval: 20 * time.Millisecond},
+				target,
+				"wait for test",
+				func(context.Context) error {
+					checks++
+					return errors.New("not ready")
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("poll error = %v, want timeout", err)
+			}
+			if checks < 3 {
+				t.Errorf("checks = %d, want retries until timeout", checks)
+			}
+		})
+	}
+}
+
+func TestTerminalWaitStatePolicy(t *testing.T) {
+	cases := map[State]bool{
+		StateCreated:    false,
+		StateRunning:    false,
+		StateStopping:   true,
+		StateRestarting: false,
+		StateUnknown:    false,
+		StateStopped:    true,
+		StatePaused:     true,
+	}
+	for state, want := range cases {
+		if got := terminalWaitState(state); got != want {
+			t.Errorf("terminalWaitState(%q) = %t, want %t", state, got, want)
+		}
 	}
 }
 
@@ -303,7 +441,7 @@ func TestForExecTimesOutOnPersistentFailure(t *testing.T) {
 	}
 }
 
-func TestForListeningPortProbesRunningDuringPoll(t *testing.T) {
+func TestForListeningPortProbesStateDuringPoll(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -320,24 +458,24 @@ func TestForListeningPortProbesRunningDuringPoll(t *testing.T) {
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
-	// stateCheckInterval is 1s; a 2.5s poll should probe Running a few times.
-	if n := target.runningCalls.Load(); n < 2 || n > 5 {
-		t.Errorf("Running calls = %d, want 2..5 during connection poll", n)
+	// stateCheckInterval is 1s; a 2.5s poll should probe state a few times.
+	if n := target.stateCalls.Load(); n < 2 || n > 5 {
+		t.Errorf("State calls = %d, want 2..5 during connection poll", n)
 	}
 }
 
-func TestForExecSkipsRunningDuringPoll(t *testing.T) {
+func TestForExecProbesStateDuringPoll(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
 
 	// Default ForExec interval is 250ms; a 3s timeout should exec a
-	// modest number of times and only inspect Running once at the end.
+	// modest number of times and inspect state at the bounded cadence.
 	s := ForExec([]string{"pg_isready"}).WithStartupTimeout(3 * time.Second)
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
-	if n := target.runningCalls.Load(); n != 1 {
-		t.Errorf("Running calls = %d, want 1 (final classification only)", n)
+	if n := target.stateCalls.Load(); n < 3 || n > 5 {
+		t.Errorf("State calls = %d, want periodic checks plus final classification", n)
 	}
 	// 3s / 250ms ≈ 12 intervals plus the initial check → ~13; allow slack.
 	if n := target.execCalls.Load(); n < 10 || n > 16 {
@@ -363,8 +501,8 @@ func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	if target.execCalls.Load() != 1 {
 		t.Errorf("exec calls = %d, want 1 (no retry)", target.execCalls.Load())
 	}
-	if target.runningCalls.Load() != 0 {
-		t.Errorf("Running calls = %d, want 0 on fatal check error", target.runningCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want 1 initial lifecycle check", target.stateCalls.Load())
 	}
 	if !strings.Contains(err.Error(), "executable file not found") {
 		t.Errorf("error = %v, want launch failure", err)
@@ -393,7 +531,7 @@ func TestForExecRetriesTransientErrors(t *testing.T) {
 func TestForExecReportsStoppedAtTimeout(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
-	target.running.Store(false)
+	target.state.Store(StateStopped)
 
 	s := ForExec([]string{"pg_isready"}).
 		WithStartupTimeout(200 * time.Millisecond).
@@ -407,7 +545,7 @@ func TestForExecReportsStoppedAtTimeout(t *testing.T) {
 	}
 }
 
-func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
+func TestForExecFinalStateProbeRespectsCallerCancel(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
 
@@ -427,17 +565,17 @@ func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want context.Canceled", err)
 	}
-	if target.runningCalls.Load() != 0 {
-		t.Errorf("Running calls = %d, want 0 when caller cancels", target.runningCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want only the initial lifecycle check", target.stateCalls.Load())
 	}
 }
 
-func TestForExecFinalRunningProbeIsBounded(t *testing.T) {
+func TestForExecStateProbeHonorsDeadline(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
-	// Running ignores progress until its context ends; without a bound
-	// on the diagnostic probe this would hang for queryTimeout.
-	slow := &slowRunningTarget{fakeTarget: target, block: 30 * time.Second}
+	// State ignores progress until its context ends; a probe must not
+	// outlive the strategy deadline or create a fresh timeout budget.
+	slow := &slowStateTarget{fakeTarget: target, block: 30 * time.Second}
 
 	s := ForExec([]string{"pg_isready"}).
 		WithStartupTimeout(150 * time.Millisecond).
@@ -448,7 +586,25 @@ func TestForExecFinalRunningProbeIsBounded(t *testing.T) {
 		t.Fatal("want error")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("took %v; want bounded final Running probe", elapsed)
+		t.Errorf("took %v; want State probe bounded by strategy deadline", elapsed)
+	}
+}
+
+// slowStateTarget blocks in State until ctx ends or block elapses.
+type slowStateTarget struct {
+	*fakeTarget
+	block time.Duration
+}
+
+func (s *slowStateTarget) State(ctx context.Context) (State, error) {
+	s.stateCalls.Add(1)
+	timer := time.NewTimer(s.block)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return StateUnknown, ctx.Err()
+	case <-timer.C:
+		return s.state.Load().(State), nil
 	}
 }
 
@@ -466,8 +622,20 @@ func (s *slowRunningTarget) Running(ctx context.Context) (bool, error) {
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case <-timer.C:
-		return s.running.Load(), nil
+		state, err := s.fakeTarget.State(ctx)
+		return state == StateRunning, err
 	}
+}
+
+func (s *slowRunningTarget) State(ctx context.Context) (State, error) {
+	running, err := s.Running(ctx)
+	if err != nil {
+		return StateUnknown, err
+	}
+	if running {
+		return StateRunning, nil
+	}
+	return StateStopped, nil
 }
 
 func TestForAllRunsStrategiesInOrder(t *testing.T) {

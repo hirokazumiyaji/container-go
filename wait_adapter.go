@@ -3,6 +3,8 @@ package container
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"io"
 	"strconv"
 
@@ -27,6 +29,11 @@ func WithWaitStrategy(s wait.Strategy) Option {
 type waitTarget struct {
 	c *Container
 }
+
+var (
+	_ wait.Target      = waitTarget{}
+	_ wait.StateTarget = waitTarget{}
+)
 
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
@@ -53,24 +60,56 @@ func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 			return "", ErrPortNotExposed
 		}
 	}
-	return t.c.Endpoint(ctx, port)
+	endpoint, err := t.c.Endpoint(ctx, port)
+	return endpoint, waitTargetError(err)
 }
 
 func (t waitTarget) Running(ctx context.Context) (bool, error) {
+	state, err := t.State(ctx)
+	return state == wait.StateRunning, err
+}
+
+func (t waitTarget) State(ctx context.Context) (wait.State, error) {
+	if t.c == nil || t.c.eng == nil {
+		return wait.StateRunning, nil
+	}
 	state, err := t.c.State(ctx)
 	if err != nil {
-		return false, err
+		return wait.StateUnknown, waitTargetError(err)
 	}
-	return state == StateRunning, nil
+	switch state {
+	case StateRunning:
+		return wait.StateRunning, nil
+	case StateStopped:
+		return wait.StateStopped, nil
+	case StateStopping:
+		return wait.StateStopping, nil
+	case StateCreated:
+		return wait.StateCreated, nil
+	case StateRestarting:
+		return wait.StateRestarting, nil
+	case StatePaused:
+		return wait.StatePaused, nil
+	default:
+		return wait.StateUnknown, nil
+	}
 }
 
 func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
-	return t.c.FollowLogs(ctx)
+	stream, err := t.c.FollowLogs(ctx)
+	return stream, waitTargetError(err)
 }
 
 func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) {
 	code, _, err := t.c.Exec(ctx, cmd)
-	return code, err
+	return code, waitTargetError(err)
+}
+
+func waitTargetError(err error) error {
+	if err == nil || !isNotFound(err) || errors.Is(err, wait.ErrTargetNotFound) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", wait.ErrTargetNotFound, err)
 }
 
 // logTailLimit bounds the diagnostic log tail attached to wait

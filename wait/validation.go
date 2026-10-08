@@ -44,7 +44,6 @@ func validatePortSpec(port string, allowEmpty bool) error {
 	return nil
 }
 
-
 func isPermanentCheckError(err error) bool {
 	if err == nil {
 		return false
@@ -59,8 +58,13 @@ func isPermanentCheckError(err error) bool {
 	}
 	if errors.Is(err, ErrPortNotExposed) ||
 		errors.Is(err, ErrContainerNotFound) ||
+		errors.Is(err, ErrTargetNotFound) ||
+		errors.Is(err, ErrLogStreamSetup) ||
 		errors.Is(err, ErrInvalidConfiguration) ||
 		errors.Is(err, errLogLineTooLong) {
+		return true
+	}
+	if cli.PermanentStartError(err) {
 		return true
 	}
 	var launchErr *exec.Error

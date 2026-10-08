@@ -32,8 +32,13 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// network or port state. Once Docker has supplied an immutable ID,
 	// every compatibility inspect must target that ID rather than the
 	// reusable name.
-	info, err := inspectReuseBase(ctx, base, cfg)
+	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer infoCancel()
+	info, err := reuseInfoForCaller(infoCtx, cfg, base)
 	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && ctx.Err() == nil {
+			return nil, fmt.Errorf("reuse %s: timed out waiting for complete inspect: %w", cfg.name, err)
+		}
 		return nil, err
 	}
 	if err := attachDefaultNetworkForConfig(ctx, cfg, info); err != nil {
@@ -139,11 +144,15 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			return nil, err
 		}
 		switch info.state {
-		case StateCreated, StateStopping, StateUnknown:
+		case StateCreated, StateRestarting, StateUnknown:
 			if err := waitForReusePoll(ctx); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
+		case StateStopping:
+			return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
+		case StatePaused:
+			return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
 		case StateStopped:
 			if recreated {
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
@@ -256,8 +265,19 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, er
 		_ = markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation)
 		unregisterReuseFromGlobalReaper(cfg)
 	}
-	if _, err := ctr.cachedInfo(ctx); err != nil {
-		return nil, ctr.rollback(ctx, err)
+	inspectCtx, inspectCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	defer inspectCancel()
+	for {
+		_, err := ctr.cachedInfo(inspectCtx)
+		if err == nil {
+			break
+		}
+		if !transientReuseInspectError(err) {
+			return nil, ctr.rollback(ctx, err)
+		}
+		if err := waitForReusePoll(inspectCtx); err != nil {
+			return nil, ctr.rollback(ctx, err)
+		}
 	}
 	for _, f := range cfg.files {
 		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
@@ -435,6 +455,9 @@ func reuseInspectWaitError(name string, waitErr, lastInspectErr error) error {
 }
 
 func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if cfg.waitStrategy == nil {
 		return nil
 	}
@@ -444,6 +467,9 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 			return fmt.Errorf("reuse %s failed to become ready: %w\ncontainer logs:\n%s", ctr.id, err, tail)
 		}
 		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -749,4 +775,92 @@ func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group st
 	return pruneListedWithGroup(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)
 	}, "prune reuse group "+group, group)
+}
+
+func reuseContextError(ctx context.Context, name string) error {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return fmt.Errorf("reuse %s: timed out waiting for a usable container: %w", name, context.DeadlineExceeded)
+	}
+	return ctx.Err()
+}
+
+func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		info, err := inspectReuseBase(ctx, base, cfg)
+		if err == nil {
+			if base != nil {
+				base.mu.Lock()
+				creation := base.creation
+				uid := base.uid
+				base.mu.Unlock()
+				if creation != "" && info.labels[creationLabel] != creation {
+					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+				}
+				if uid != "" && info.uid != "" && info.uid != uid {
+					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+				}
+			}
+			if reuseInfoReady(cfg, info) {
+				return info, nil
+			}
+			switch info.state {
+			case StateStopping:
+				return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
+			case StatePaused:
+				return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
+			case StateStopped:
+				return nil, fmt.Errorf("reuse %s: container stopped before becoming ready", cfg.name)
+			}
+		} else {
+			if isNotFound(err) {
+				return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
+			}
+			if !transientReuseInspectError(err) {
+				return nil, err
+			}
+		}
+		if err := waitForReusePoll(ctx); err != nil {
+			return nil, err
+		}
+	}
+}
+
+func reuseInfoReady(cfg *config, info *engineInfo) bool {
+	return info != nil && info.state == StateRunning && reuseInfoComplete(cfg, info)
+}
+
+func reuseInfoComplete(cfg *config, info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	if len(cfg.exposed) == 0 && len(cfg.published) == 0 {
+		return true
+	}
+	if cfg.eng.directIP() {
+		return info.ip != ""
+	}
+	for _, spec := range cfg.exposed {
+		bound := false
+		for _, b := range info.bound {
+			if b.containerPort == spec.port && b.proto == spec.proto && b.hostPort > 0 {
+				bound = true
+				break
+			}
+		}
+		if !bound {
+			return false
+		}
+	}
+	for _, p := range cfg.published {
+		if _, ok := matchingPublishedBinding(info.bound, p); !ok {
+			return false
+		}
+	}
+	return true
 }

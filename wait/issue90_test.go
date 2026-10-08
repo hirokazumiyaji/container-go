@@ -292,7 +292,6 @@ func TestTimeoutRetainsLastErrorChain(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return cause },
-		false,
 	)
 	if !errors.Is(err, cause) {
 		t.Fatalf("error = %v, want last error in chain", err)

@@ -19,6 +19,10 @@ type CLIError = cli.CLIError
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrLogStreamSetup reports that a log stream cannot be started with the
+// configured runner or backend executable and will not be retried.
+var ErrLogStreamSetup = wait.ErrLogStreamSetup
+
 // ErrInvalidConfiguration reports a wait strategy that cannot run with
 // the options supplied to Run.
 var ErrInvalidConfiguration = wait.ErrInvalidConfiguration

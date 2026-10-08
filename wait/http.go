@@ -199,7 +199,7 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("status %d not accepted", resp.StatusCode)
 		}
 		return nil
-	}, true)
+	})
 }
 
 func buildHTTPProbeURL(scheme, endpoint, callerPath string) (string, error) {

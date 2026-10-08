@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -623,4 +624,26 @@ func assertStreamDirectChildReaped(t *testing.T, pid int) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("process %d was not reaped", pid)
+}
+
+func TestStreamClassifiesNonExecutableAbsolutePath(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows does not enforce Unix executable permission bits")
+	}
+	backend := filepath.Join(t.TempDir(), "backend")
+	if err := os.WriteFile(backend, []byte("not executable"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	stream, err := (&ExecRunner{Binary: backend}).Stream(context.Background(), "logs", "--follow", "x")
+	if err == nil {
+		_ = stream.Close()
+		t.Fatal("Stream unexpectedly started a non-executable backend")
+	}
+	if !errors.Is(err, ErrStreamSetup) {
+		t.Fatalf("error = %v, want ErrStreamSetup", err)
+	}
+	if !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("error = %v, want underlying permission cause", err)
+	}
 }

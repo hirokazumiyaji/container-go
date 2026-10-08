@@ -64,7 +64,6 @@ func TestFinalLifecycleProbeRetriesTransientError(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return nil },
-		false,
 	)
 	if err != nil {
 		t.Fatalf("poll returned %v, want success after transient final probe", err)
@@ -82,7 +81,6 @@ func TestFinalLifecycleProbePreservesPermanentCause(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return nil },
-		false,
 	)
 	if !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("poll error = %v, want permanent lifecycle cause", err)
@@ -114,7 +112,6 @@ func TestFinalLifecycleProbeRetainsTransientCauseAtDeadline(t *testing.T) {
 		target,
 		"wait for test",
 		func(context.Context) error { return nil },
-		false,
 	)
 	if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, transient) {
 		t.Fatalf("error = %v, want deadline and latest lifecycle cause", err)

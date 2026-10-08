@@ -18,9 +18,7 @@ import (
 // run, then serves a reused-container inspect payload.
 type reuseCreateRunner struct {
 	*fakeRunner
-	created    atomic.Bool
-	creation   string
-	reuseGroup string
+	created atomic.Bool
 }
 
 func newReuseCreateRunner() *reuseCreateRunner {
@@ -34,27 +32,20 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		created := r.created.Load()
-		creation := r.creation
-		group := r.reuseGroup
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSONWithGroup(args[len(args)-1], "running", "redis:7-alpine", creation, group)), nil, nil
+		name := args[len(args)-1]
+		r.mu.Lock()
+		creation := r.creations[name]
+		r.mu.Unlock()
+		if creation == "" {
+			creation = "0123456789abcdef"
+		}
+		return []byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
-		for _, arg := range args {
-			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
-				r.mu.Lock()
-				r.creation = creation
-				r.mu.Unlock()
-			}
-			if group, ok := strings.CutPrefix(arg, reuseGroupLabel+"="); ok {
-				r.mu.Lock()
-				r.reuseGroup = group
-				r.mu.Unlock()
-			}
-		}
 		r.created.Store(true)
 	}
 	return r.fakeRunner.Run(ctx, args...)
@@ -72,6 +63,25 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 		WithName("myctr"), WithReuseGroup("integration"), withRunner(newTestRunner()))
 	if err == nil || !strings.Contains(err.Error(), "WithReuseGroup requires WithReuse") {
 		t.Fatalf("error = %v, want WithReuseGroup requires WithReuse", err)
+	}
+}
+
+func TestReuseDoesNotDetachCanceledPreflight(t *testing.T) {
+	f := newReuseCreateRunner()
+	cfg := newConfig()
+	cfg.name = "canceled-reuse"
+	cfg.reuse = true
+	cfg.eng = appleEngine{}
+	cfg.runner = f
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ctr, err := reuseRun(ctx, "redis:7-alpine", cfg)
+	if ctr != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reuseRun = (%v, %v), want canceled before flight", ctr, err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("canceled reuse started backend work: %v", f.calls)
 	}
 }
 
@@ -176,11 +186,11 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 	}
 }
 
-func reuseInspectJSON(id, state, image string, generations ...string) string {
-	creation := "aaaaaaaaaaaaaaaa"
-	if len(generations) > 0 {
-		creation = generations[0]
-	}
+func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONForCreation(id, state, image, "0123456789abcdef")
+}
+
+func reuseInspectJSONForCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -190,7 +200,6 @@ func reuseInspectJSON(id, state, image string, generations ...string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q,
         "com.github.hirokazumiyaji.container-go.reuse": "true",
         "com.github.hirokazumiyaji.container-go.creation": %q
       }
@@ -200,16 +209,7 @@ func reuseInspectJSON(id, state, image string, generations ...string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, sessionID(), creation, state)
-}
-
-func reuseInspectJSONWithGroup(id, state, image, creation, group string) string {
-	data := reuseInspectJSON(id, state, image, creation)
-	if group == "" {
-		return data
-	}
-	marker := `"com.github.hirokazumiyaji.container-go.creation": "` + creation + `"`
-	return strings.Replace(data, marker, marker+`, "com.github.hirokazumiyaji.container-go.reuse-group": "`+group+`"`, 1)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {
@@ -306,7 +306,7 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -337,7 +337,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -394,17 +394,19 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 			return []byte(reuseInspectJSON(args[len(args)-1], "stopped", "redis:7-alpine")), nil, nil
 		}
 		if !s.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
-		for _, arg := range args {
-			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
-				s.creation = creation
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					s.creation = value
+				}
 			}
 		}
 		s.created = true
@@ -528,8 +530,8 @@ func TestImagesCompatible(t *testing.T) {
 
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.session":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"aaaaaaaaaaaaaaaa","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.session":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"bbbbbbbbbbbbbbbb","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}

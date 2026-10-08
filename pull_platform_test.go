@@ -70,14 +70,13 @@ func TestPullNeverWithPlatformReportsMissing(t *testing.T) {
 func TestPlatformEmptyPreservesCallCounts(t *testing.T) {
 	f := newTestRunner()
 	f.imagePresent = true
-	f.immutableInspect = true
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	_ = ctr
-	// image inspect + run + identity inspect, no platform flags.
+	// image inspect + run, no platform flags.
 	for _, c := range f.calls {
 		for _, a := range c {
 			if a == "--platform" {
@@ -94,6 +93,12 @@ func TestAppleParseImageExistsPlatform(t *testing.T) {
 	}
 	if (appleEngine{}).parseImageExists(data, "linux/amd64") {
 		t.Error("want mismatch for linux/amd64")
+	}
+	if !(appleEngine{}).parseImageExists(data, "linux") {
+		t.Error("an OS-only selector must accept any Linux architecture")
+	}
+	if (appleEngine{}).parseImageExists(data, "darwin") {
+		t.Error("want mismatch for a different OS")
 	}
 	if !(appleEngine{}).parseImageExists(data, "") {
 		t.Error("empty platform must mean present")

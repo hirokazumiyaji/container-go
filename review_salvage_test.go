@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
@@ -173,7 +174,7 @@ func TestReviewAutoPublishBindsLoopbackLocally(t *testing.T) {
 // because Docker would listen on the remote machine's loopback.
 func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
-	err := (dockerEngine{}).checkConfig(&config{
+	err := (dockerEngine{}).checkConfig(context.Background(), &config{
 		published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
 	})
 	if err == nil {
@@ -184,7 +185,7 @@ func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	}
 
 	// A non-loopback bind is fine on the same remote daemon.
-	if err := (dockerEngine{}).checkConfig(&config{
+	if err := (dockerEngine{}).checkConfig(context.Background(), &config{
 		published: []publishSpec{{hostAddr: "0.0.0.0", raw: "0.0.0.0:18080:80"}},
 	}); err != nil {
 		t.Errorf("a 0.0.0.0 publish on a remote daemon was rejected: %v", err)
@@ -196,7 +197,7 @@ func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 func TestReviewLoopbackPublishStillAllowedLocally(t *testing.T) {
 	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"} {
 		t.Setenv("DOCKER_HOST", host)
-		if err := (dockerEngine{}).checkConfig(&config{
+		if err := (dockerEngine{}).checkConfig(context.Background(), &config{
 			published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
 		}); err != nil {
 			t.Errorf("DOCKER_HOST=%q: local loopback publish rejected: %v", host, err)
@@ -204,53 +205,43 @@ func TestReviewLoopbackPublishStillAllowedLocally(t *testing.T) {
 	}
 }
 
-// uid is bound from inspect under inspectMu long after the handle is
-// published. Readers on the Terminate path and writers in inspectFresh share
-// that lock so a published handle cannot race on the bound ID.
+// uid is promoted from the first inspect, long after the handle is published.
+// Terminate read it without synchronization while cachedInfo wrote it, which is
+// a data race on a published handle.
 func TestReviewImmutableIDAccessIsSynchronized(t *testing.T) {
 	first := strings.Repeat("a", 64)
 	second := strings.Repeat("b", 64)
 
-	ctr := &Container{eng: dockerEngine{}}
-	bindOnce := func(uid string) {
-		ctr.inspectMu.Lock()
-		defer ctr.inspectMu.Unlock()
-		if ctr.uidBound {
-			return
-		}
-		ctr.uid = uid
-		ctr.uidBound = true
+	ctr := &Container{}
+	if got := ctr.immutableID(); got != "" {
+		t.Fatalf("immutableID() = %q before any promotion", got)
 	}
-	readBound := func() (string, bool) {
-		ctr.inspectMu.Lock()
-		defer ctr.inspectMu.Unlock()
-		return ctr.uid, ctr.uidBound
-	}
+	ctr.setImmutableID(first)
 
-	if uid, bound := readBound(); bound || uid != "" {
-		t.Fatalf("uid=%q bound=%v before any promotion", uid, bound)
-	}
-	bindOnce(first)
-
+	// Concurrent readers and writers must not race, and the value must stay
+	// the first one promoted.
 	var wg sync.WaitGroup
 	for range 8 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range 100 {
-				uid, bound := readBound()
-				if !bound || uid != first {
-					t.Errorf("uid=%q bound=%v mid-race, want first=%q", uid, bound, first)
+				if got := ctr.immutableID(); got != first {
+					t.Errorf("immutableID() = %q mid-race, want %q", got, first)
 					return
 				}
-				bindOnce(second)
+				ctr.setImmutableID(second)
 			}
 		}()
 	}
 	wg.Wait()
 
-	uid, bound := readBound()
-	if !bound || uid != first {
-		t.Errorf("uid=%q bound=%v, want the first promoted value %q", uid, bound, first)
+	if got := ctr.immutableID(); got != first {
+		t.Errorf("immutableID() = %q, want the first promoted value %q", got, first)
+	}
+	// An empty write must not clear it.
+	ctr.setImmutableID("")
+	if got := ctr.immutableID(); got != first {
+		t.Errorf("immutableID() = %q after an empty write, want it preserved", got)
 	}
 }

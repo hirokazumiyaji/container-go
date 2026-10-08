@@ -124,32 +124,22 @@ func TestApplePruneParsersCaptureIdentityMetadata(t *testing.T) {
 	const creation = "aaaaaaaaaaaaaaaa"
 	fixture := pruneFixture("shared", creation, string(StateStopped), "integration", true)
 	data := mustPruneJSON([]pruneFixtureContainer{fixture})
-	eng := appleEngine{}
 
-	for _, tc := range []struct {
-		name  string
-		parse func([]byte) ([]pruneCandidate, error)
-	}{
-		{name: "stopped managed", parse: eng.parseStoppedManaged},
-		{name: "reuse group", parse: func(data []byte) ([]pruneCandidate, error) {
-			return eng.parseReuseGroupIDs(data, "integration")
-		}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			candidates, err := tc.parse(data)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if len(candidates) != 1 {
-				t.Fatalf("candidates = %+v, want one", candidates)
-			}
-			candidate := candidates[0]
-			if candidate.id != "shared" || candidate.creation != creation ||
-				candidate.session != pruneFixtureSession || candidate.state != StateStopped ||
-				!candidate.managed || !candidate.reuse || candidate.reuseGroup != "integration" {
-				t.Fatalf("candidate = %+v, want complete Apple identity metadata", candidate)
-			}
-		})
+	candidates, err := applePruneCandidates(data)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(candidates) != 1 {
+		t.Fatalf("candidates = %+v, want one", candidates)
+	}
+	candidate, ok := candidates["shared"]
+	if !ok {
+		t.Fatalf("candidate for shared not found: %+v", candidates)
+	}
+	if candidate.id != "shared" || candidate.creation != creation ||
+		candidate.labels[sessionLabel] != pruneFixtureSession || candidate.state != StateStopped ||
+		!candidate.managed || !candidate.reuse || candidate.reuseGroup != "integration" {
+		t.Fatalf("candidate = %+v, want complete Apple identity metadata", candidate)
 	}
 }
 
@@ -191,9 +181,10 @@ func TestPruneAppleFailsClosedOnUnverifiedCandidate(t *testing.T) {
 	}
 
 	cases := []struct {
-		name   string
-		listed pruneFixtureContainer
-		fresh  pruneFixtureContainer
+		name        string
+		listed      pruneFixtureContainer
+		fresh       pruneFixtureContainer
+		wantInspect bool
 	}{
 		{
 			name:   "list generation missing",
@@ -206,49 +197,58 @@ func TestPruneAppleFailsClosedOnUnverifiedCandidate(t *testing.T) {
 			fresh:  matching(),
 		},
 		{
-			name:   "fresh generation missing",
-			listed: matching(),
-			fresh:  withLabel(matching(), creationLabel, ""),
+			name:        "fresh generation missing",
+			listed:      matching(),
+			fresh:       withLabel(matching(), creationLabel, ""),
+			wantInspect: true,
 		},
 		{
-			name:   "generation mismatch",
-			listed: matching(),
-			fresh:  withLabel(matching(), creationLabel, "bbbbbbbbbbbbbbbb"),
+			name:        "generation mismatch",
+			listed:      matching(),
+			fresh:       withLabel(matching(), creationLabel, "bbbbbbbbbbbbbbbb"),
+			wantInspect: true,
 		},
 		{
-			name:   "list session missing",
-			listed: withLabel(matching(), sessionLabel, ""),
-			fresh:  matching(),
+			name:        "list session missing",
+			listed:      withLabel(matching(), sessionLabel, ""),
+			fresh:       matching(),
+			wantInspect: true,
 		},
 		{
-			name:   "fresh session missing",
-			listed: matching(),
-			fresh:  withLabel(matching(), sessionLabel, ""),
+			name:        "fresh session missing",
+			listed:      matching(),
+			fresh:       withLabel(matching(), sessionLabel, ""),
+			wantInspect: true,
 		},
 		{
-			name:   "session mismatch",
-			listed: matching(),
-			fresh:  withLabel(matching(), sessionLabel, "bbbbbbbbbbbbbbbb"),
+			name:        "session mismatch",
+			listed:      matching(),
+			fresh:       withLabel(matching(), sessionLabel, "bbbbbbbbbbbbbbbb"),
+			wantInspect: true,
 		},
 		{
-			name:   "state changed",
-			listed: matching(),
-			fresh:  running,
+			name:        "state changed",
+			listed:      matching(),
+			fresh:       running,
+			wantInspect: true,
 		},
 		{
-			name:   "reuse marker changed",
-			listed: withLabel(matching(), reuseLabel, "true"),
-			fresh:  withLabel(matching(), reuseLabel, ""),
+			name:        "reuse marker changed",
+			listed:      withLabel(matching(), reuseLabel, "true"),
+			fresh:       withLabel(matching(), reuseLabel, ""),
+			wantInspect: true,
 		},
 		{
-			name:   "group changed",
-			listed: withLabel(withLabel(matching(), reuseGroupLabel, "old"), reuseLabel, "true"),
-			fresh:  withLabel(withLabel(matching(), reuseGroupLabel, "new"), reuseLabel, "true"),
+			name:        "group changed",
+			listed:      withLabel(withLabel(matching(), reuseGroupLabel, "old"), reuseLabel, "true"),
+			fresh:       withLabel(withLabel(matching(), reuseGroupLabel, "new"), reuseLabel, "true"),
+			wantInspect: true,
 		},
 		{
-			name:   "managed marker changed",
-			listed: matching(),
-			fresh:  withLabel(matching(), managedLabel, ""),
+			name:        "managed marker changed",
+			listed:      matching(),
+			fresh:       withLabel(matching(), managedLabel, ""),
+			wantInspect: true,
 		},
 	}
 
@@ -265,8 +265,12 @@ func TestPruneAppleFailsClosedOnUnverifiedCandidate(t *testing.T) {
 			if len(removed) != 0 || len(r.deleted) != 0 {
 				t.Fatalf("removed = %v, deleted = %v; want fail-closed skip", removed, r.deleted)
 			}
-			if r.callCount("inspect") != 1 {
-				t.Fatalf("inspect calls = %d, want one fresh inspect", r.callCount("inspect"))
+			wantInspect := 0
+			if tc.wantInspect {
+				wantInspect = 1
+			}
+			if r.callCount("inspect") != wantInspect {
+				t.Fatalf("inspect calls = %d, want %d", r.callCount("inspect"), wantInspect)
 			}
 		})
 	}
@@ -493,7 +497,7 @@ func TestPruneAppleHoldsNameLockThroughInspectAndDelete(t *testing.T) {
 	createDone := make(chan error, 1)
 	go func() {
 		cfg := &config{name: name, runner: runner, eng: appleEngine{}}
-		_, attempted, err := runCreateLocked(context.Background(), cfg, "run")
+		_, _, attempted, err := runCreateLocked(context.Background(), cfg, "run")
 		if err == nil && !attempted {
 			err = errors.New("create was not attempted")
 		}

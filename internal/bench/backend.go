@@ -2,9 +2,10 @@ package bench
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
 // Backend wraps the engine-specific operations the scenarios need
@@ -89,15 +90,32 @@ func AppleBackend() Backend {
 // missing, or when CONTAINERGO_BACKEND selects a different backend.
 func (b Backend) Available(tb testing.TB) {
 	tb.Helper()
-	if want := os.Getenv("CONTAINERGO_BACKEND"); want != "" && want != b.Name {
-		tb.Skipf("CONTAINERGO_BACKEND=%s; skipping %s", want, b.Name)
+	if reason := b.SkipReason(); reason != "" {
+		tb.Skip(reason)
+	}
+}
+
+// SkipReason reports why this backend cannot be exercised in the current
+// run, or "" when it can.
+//
+// The selection is read through integrationtest.SelectedBackend, not
+// os.Getenv. The root test binary's TestMain unsets the variable before
+// running any test, so reading the environment here would always see ""
+// and this guard could never skip anything - which is what made
+// `make integration CONTAINERGO_BACKEND=docker` still run the Apple
+// scenarios. The bench module has no TestMain, so SelectedBackend has to
+// fall back to the environment for it to keep working there.
+func (b Backend) SkipReason() string {
+	if want := integrationtest.SelectedBackend(); want != "" && want != b.Name {
+		return fmt.Sprintf("CONTAINERGO_BACKEND=%s; skipping %s", want, b.Name)
 	}
 	if _, err := exec.LookPath(b.Bin); err != nil {
-		tb.Skipf("%s CLI not installed", b.Name)
+		return fmt.Sprintf("%s CLI not installed", b.Name)
 	}
 	if err := b.Probe(); err != nil {
-		tb.Skipf("%s backend service not running: %v", b.Name, err)
+		return fmt.Sprintf("%s backend service not running: %v", b.Name, err)
 	}
+	return ""
 }
 
 // EnsureImage guarantees the image is present before a timed

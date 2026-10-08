@@ -55,7 +55,7 @@ func TestDockerFailedCreateCleanupDoesNotSkipMalformedMatchingInspect(t *testing
 	if errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("cleanup error = %v, want protocol failure rather than not-found", err)
 	}
-	if !strings.Contains(err.Error(), "cleanup myctr: inspect") {
+	if !strings.Contains(err.Error(), "cleanup container myctr: inspect") {
 		t.Fatalf("cleanup error = %v, want inspect failure", err)
 	}
 	if len(r.deletes) != 0 {

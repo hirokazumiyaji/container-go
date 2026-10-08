@@ -1,9 +1,11 @@
 package container
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -15,6 +17,10 @@ import (
 // appleEngine drives Apple Container's `container` CLI.
 type appleEngine struct{}
 
+// Apple Container parses stop --time as a signed 32-bit integer, even when
+// the library itself runs on a 64-bit host.
+const maxAppleStopSeconds int64 = math.MaxInt32
+
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
 // Stderr substrings below are matched case-insensitively on CLIError.Stderr.
 // Sources (apple/container):
@@ -23,20 +29,18 @@ type appleEngine struct{}
 //   - image missing / container missing: ContainerizationError(.notFound)
 //     surfaces as "image not found: …" / "container not found: …"
 const (
-	appleStderrAlready   = "already"
-	appleStderrExist     = "exist"
-	appleStderrInUse     = "in use"
-	appleStderrTaken     = "taken"
-	appleStderrNotFound  = "not found"
-	appleStderrNoSuchObj = "no such object"    // defensive; not observed on 1.3.0
-	appleStderrNoSuchCtr = "no such container" // defensive; not observed on 1.3.0
+	appleStderrAlready  = "already"
+	appleStderrExist    = "exist"
+	appleStderrInUse    = "in use"
+	appleStderrTaken    = "taken"
+	appleStderrNotFound = "not found"
 )
 
 func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
-func (appleEngine) checkConfig(*config) error { return nil }
+func (appleEngine) checkConfig(context.Context, *config) error { return nil }
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
@@ -51,9 +55,6 @@ func (appleEngine) runArgs(cfg *config, image, envFile string) []string {
 
 func (appleEngine) parseRunID([]byte) string { return "" }
 
-func (appleEngine) immutableID() bool          { return false }
-func (appleEngine) nameAddressedDeletes() bool { return true }
-
 func (appleEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
 
 func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
@@ -66,10 +67,22 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			continue
 		}
 		info := &engineInfo{
-			state:  State(c.Status.State),
+			state:  appleState(c.Status.State),
+			name:   c.ID,
 			labels: c.Configuration.Labels,
 			image:  c.Configuration.Image.Reference,
 		}
+		platform := c.Configuration.Platform
+		platformMeta := platformMetadataFromParts(
+			platform.OS,
+			platform.Architecture,
+			platform.Variant,
+			platform.OSPresent || platform.OS != "",
+			platform.ArchPresent || platform.Architecture != "",
+			platform.VariantPresent || platform.Variant != "",
+		)
+		info.platform = platformMeta.normalized()
+		info.platformMeta = platformMeta
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
 		}
@@ -77,7 +90,7 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
 				proto:         p.Proto,
-				hostAddr:      p.HostAddress,
+				hostAddr:      canonicalIP(p.HostAddress),
 				hostPort:      p.HostPort,
 			})
 		}
@@ -86,12 +99,23 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 	return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, id)
 }
 
-func (appleEngine) stopArgs(id string, timeout *time.Duration) []string {
-	args := []string{"stop"}
-	if timeout != nil {
-		args = append(args, "--time", strconv.Itoa(int(timeout.Seconds())))
+func appleState(state string) State {
+	switch state {
+	case string(StateRunning):
+		return StateRunning
+	case string(StateStopped):
+		return StateStopped
+	case string(StateStopping):
+		return StateStopping
+	case string(StateCreated):
+		return StateCreated
+	default:
+		return StateUnknown
 	}
-	return append(args, id)
+}
+
+func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {
+	return stopArgsFor(id, timeout, maxAppleStopSeconds)
 }
 
 func (appleEngine) deleteArgs(id string) []string {
@@ -106,7 +130,22 @@ func (appleEngine) copyFromArgs(id, containerPath, hostPath string) []string {
 	return []string{"cp", id + ":" + containerPath, hostPath}
 }
 
+// Apple Container's public cp command has no mode that preserves source
+// types or prevents it from dereferencing special files, so fail closed.
+func (appleEngine) checkCopyFileFromContainer() error {
+	return fmt.Errorf(
+		"%w: Apple Container cp has no type-preserving/no-follow copy-out mode",
+		ErrCopyFileFromContainerUnsupported,
+	)
+}
+
+func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner) error {
+	return appleEngine{}.checkCopyFileFromContainer()
+}
+
 func (appleEngine) reaperSubcommand() string { return "delete" }
+
+func (appleEngine) reaperDeleteFlags() []string { return nil }
 
 func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string {
 	args := []string{"exec"}
@@ -123,11 +162,19 @@ func (appleEngine) execArgs(id string, cfg *execConfig, envFile string, cmd []st
 	return append(args, cmd...)
 }
 
-func (appleEngine) logsArgs(id string, follow bool) []string {
-	if follow {
-		return []string{"logs", "--follow", id}
+func (appleEngine) logsFollowArgs(id string) []string {
+	return []string{"logs", "--follow", id}
+}
+
+func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
+	if !opts.Since.IsZero() {
+		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)
 	}
-	return []string{"logs", id}
+	args := []string{"logs"}
+	if opts.Tail > 0 {
+		args = append(args, "-n", strconv.Itoa(opts.Tail))
+	}
+	return append(args, id), nil
 }
 
 func (appleEngine) logsTailArgs(id string) []string {
@@ -139,31 +186,19 @@ func (appleEngine) listArgs() []string {
 }
 
 // parseStoppedManaged filters client-side: the Apple CLI exposes no
-// label or status filter. It retains the complete list-time ownership
-// metadata so a later name-based delete can be checked against a fresh
-// inspect without trusting stale name-only output.
-func (appleEngine) parseStoppedManaged(data []byte) ([]pruneCandidate, error) {
+// label or status filter.
+func (appleEngine) parseStoppedManaged(data []byte) ([]string, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var candidates []pruneCandidate
+	var ids []string
 	for _, c := range containers {
-		labels := c.Configuration.Labels
-		if labels[managedLabel] != "true" || c.Status.State != string(StateStopped) {
-			continue
+		if c.Configuration.Labels[managedLabel] == "true" && c.Status.State == string(StateStopped) {
+			ids = append(ids, c.ID)
 		}
-		candidates = append(candidates, pruneCandidate{
-			id:         c.ID,
-			creation:   labels[creationLabel],
-			session:    labels[sessionLabel],
-			state:      State(c.Status.State),
-			managed:    true,
-			reuse:      labels[reuseLabel] == "true",
-			reuseGroup: labels[reuseGroupLabel],
-		})
 	}
-	return candidates, nil
+	return ids, nil
 }
 
 func (appleEngine) imageInspectArgs(image, _ string) []string {
@@ -237,32 +272,26 @@ func splitPlatform(p string) (os, arch, variant string) {
 	return os, arch, variant
 }
 
+func (appleEngine) platformCompatible(selector, actual string) bool {
+	return platformSelectorMatches(selector, actual)
+}
+
 func (appleEngine) listReuseGroupArgs(string) []string {
 	return []string{"ls", "--all", "--format", "json"}
 }
 
-func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]pruneCandidate, error) {
+func (appleEngine) parseReuseGroupIDs(data []byte, group string) ([]string, error) {
 	containers, err := inspect.Decode(data)
 	if err != nil {
 		return nil, err
 	}
-	var candidates []pruneCandidate
+	var ids []string
 	for _, c := range containers {
-		labels := c.Configuration.Labels
-		if labels[reuseGroupLabel] != group {
-			continue
+		if c.Configuration.Labels[reuseGroupLabel] == group {
+			ids = append(ids, c.ID)
 		}
-		candidates = append(candidates, pruneCandidate{
-			id:         c.ID,
-			creation:   labels[creationLabel],
-			session:    labels[sessionLabel],
-			state:      State(c.Status.State),
-			managed:    labels[managedLabel] == "true",
-			reuse:      labels[reuseLabel] == "true",
-			reuseGroup: labels[reuseGroupLabel],
-		})
 	}
-	return candidates, nil
+	return ids, nil
 }
 
 // nameConflict matches Apple Container's duplicate-name wording.
@@ -277,15 +306,258 @@ func (appleEngine) nameConflict(err error) bool {
 			strings.Contains(s, appleStderrTaken))
 }
 
-// containerMissing matches a CLI failure for an absent container.
+// containerMissing matches the command-specific Apple Container forms
+// for an absent container. The command, binary, and exact target are
+// required so application output containing "not found" is not treated
+// as a backend result.
 func (appleEngine) containerMissing(err error) bool {
-	s, ok := appleCLIStderr(err)
+	if !cliErrorBelongsTo(err, "container") {
+		return false
+	}
+	command, args, ok := cliCommandParts(err)
 	if !ok {
 		return false
 	}
-	return strings.Contains(s, appleStderrNotFound) ||
-		strings.Contains(s, appleStderrNoSuchObj) ||
-		strings.Contains(s, appleStderrNoSuchCtr)
+	target := cliCommandTarget(command, args)
+	if target == "" {
+		return false
+	}
+	switch command {
+	case "inspect", "exec", "stop", "delete", "rm", "logs":
+		return hasCLIErrorLine(err, func(line string) bool {
+			return appleContainerMissingLine(line, target, command)
+		})
+	default:
+		return false
+	}
+}
+
+func appleContainerMissingLine(line, target, command string) bool {
+	if appleTypedNotFoundLine(line, target, command) {
+		return true
+	}
+	switch command {
+	case "inspect":
+		rest, ok := strings.CutPrefix(line, "container not found:")
+		return ok && cliTargetListMatches(rest, target)
+	case "exec":
+		return appleExecMissingLine(line, target)
+	case "stop":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
+		return appleStateMissingLine(line, target, "failed to stop container:")
+	case "delete", "rm":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
+		return appleStateMissingLine(line, target, "failed to delete container:")
+	case "logs":
+		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
+			return true
+		}
+		return appleLogsMissingLine(line, target) || appleExecMissingLine(line, target)
+	default:
+		return false
+	}
+}
+
+// appleTypedNotFoundLine handles the structured ContainerizationError
+// spelling emitted by Apple Container 1.3.0. The CLI prints descriptions
+// such as notFound: "container not found: id" and can wrap that value in
+// internalError: "..." (cause: "...") layers. Only these typed forms
+// are accepted; an arbitrary application line containing "not found" is
+// deliberately not a backend absence result.
+func appleTypedNotFoundLine(line, target, command string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleContainerNotFoundMessage(message, target, command)
+}
+
+func appleTypedContainerIDNotFoundLine(line, target string) bool {
+	message, ok := appleTypedNotFoundMessage(line)
+	return ok && appleIDMessageMatches(message, target)
+}
+
+// appleTypedNotFoundMessage unwraps only the typed wrapper grammar. The
+// cause value is treated as a quoted string at each level, then escapes are
+// decoded before the next wrapper is examined. This handles both escaped
+// forms emitted by the CLI and the older unescaped nested spelling without
+// searching arbitrary stderr for the words "not found".
+func appleTypedNotFoundMessage(line string) (string, bool) {
+	current := strings.ToLower(strings.TrimSpace(line))
+	if strings.HasPrefix(current, "error:") {
+		current = strings.TrimSpace(strings.TrimPrefix(current, "error:"))
+	}
+	for range 16 {
+		current = strings.TrimSpace(current)
+		current = strings.TrimSpace(strings.Trim(current, "()"))
+		switch {
+		case strings.HasPrefix(current, "notfound:"):
+			message := decodeAppleQuotedValue(strings.TrimSpace(strings.TrimPrefix(current, "notfound:")))
+			return message, message != ""
+		case strings.HasPrefix(current, "internalerror:"), strings.HasPrefix(current, "cause:"):
+			index := strings.Index(current, "cause:")
+			if index < 0 {
+				return "", false
+			}
+			current = decodeAppleQuotedValue(strings.TrimSpace(current[index+len("cause:"):]))
+			if current == "" {
+				return "", false
+			}
+		default:
+			return "", false
+		}
+	}
+	return "", false
+}
+
+// decodeAppleQuotedValue removes one outer quoted value and decodes the
+// escaping used when Swift's diagnostic description is rendered. The
+// fallback is intentionally permissive for the CLI's older unescaped nested
+// form, but it still requires the value to be bounded by a quote.
+func decodeAppleQuotedValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 && (value[0] == '"' || value[0] == '\'') {
+		quote := value[0]
+		value = value[1:]
+		if value[len(value)-1] == quote {
+			value = value[:len(value)-1]
+		}
+	}
+	var b strings.Builder
+	b.Grow(len(value))
+	escaped := false
+	for _, r := range value {
+		if !escaped {
+			if r == '\\' {
+				escaped = true
+				continue
+			}
+			b.WriteRune(r)
+			continue
+		}
+		switch r {
+		case 'n':
+			b.WriteByte('\n')
+		case 'r':
+			b.WriteByte('\r')
+		case 't':
+			b.WriteByte('\t')
+		case '"', '\\':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('\\')
+			b.WriteRune(r)
+		}
+		escaped = false
+	}
+	if escaped {
+		b.WriteByte('\\')
+	}
+	return strings.TrimSpace(b.String())
+}
+
+func appleContainerNotFoundMessage(message, target, command string) bool {
+	message = strings.TrimSpace(strings.Trim(message, `"'`))
+	generic, hasGeneric := strings.CutPrefix(message, "container not found:")
+	switch command {
+	case "inspect":
+		// Inspect emits the generic list/inspect spelling. A lifecycle
+		// ID error or an exec-specific get failure is not an inspect
+		// absence result.
+		return hasGeneric && cliTargetListMatches(generic, target)
+	case "exec":
+		// Exec reports its failure after the get operation. Do not
+		// classify an application/container-not-found line as a backend
+		// result merely because it contains the target.
+		return appleExecMissingLine(message, target)
+	case "stop", "delete", "rm":
+		if hasGeneric && cliTargetListMatches(generic, target) {
+			return true
+		}
+		return appleIDMessageMatches(message, target)
+	case "logs":
+		if hasGeneric && cliTargetListMatches(generic, target) {
+			return true
+		}
+		return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
+	default:
+		return false
+	}
+}
+
+func appleIDMessageMatches(message, target string) bool {
+	return appleIDMissingLine(strings.TrimSpace(strings.Trim(message, `"'`)), target)
+}
+
+func appleExecMissingLine(line, target string) bool {
+	rest, ok := strings.CutPrefix(line, "get failed:")
+	if !ok {
+		return false
+	}
+	rest = strings.TrimSpace(rest)
+	rest, ok = strings.CutPrefix(rest, "container ")
+	if !ok || !strings.HasSuffix(rest, " not found") {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, " not found")), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+		(target == "" || strings.EqualFold(id, target))
+}
+
+func appleIDMissingLine(line, target string) bool {
+	rest, ok := strings.CutPrefix(line, "container with id ")
+	if !ok || !strings.HasSuffix(rest, " not found") {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, " not found")), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+		(target == "" || strings.EqualFold(id, target))
+}
+
+func appleStateMissingLine(line, target, wrapper string) bool {
+	current := line
+	for range 3 {
+		if appleIDMissingLine(current, target) {
+			return true
+		}
+		rest, ok := strings.CutPrefix(current, wrapper)
+		if !ok {
+			return false
+		}
+		current = strings.TrimSpace(rest)
+	}
+	return false
+}
+
+func appleLogsMissingLine(line, target string) bool {
+	const prefix = "failed to get logs for container "
+	rest, ok := strings.CutPrefix(line, prefix)
+	if !ok {
+		return appleIDMissingLine(line, target)
+	}
+	rest = strings.TrimSpace(rest)
+	separator := strings.Index(rest, ":")
+	if separator < 0 {
+		return false
+	}
+	logID := strings.TrimSpace(rest[:separator])
+	if logID == "" || (target != "" && !strings.EqualFold(logID, target)) {
+		return false
+	}
+	nested := strings.TrimSpace(rest[separator+1:])
+	const openPrefix = "failed to open container logs: "
+	for range 3 {
+		if appleIDMissingLine(nested, target) || appleExecMissingLine(nested, target) {
+			return true
+		}
+		openRest, ok := strings.CutPrefix(nested, openPrefix)
+		if !ok {
+			return false
+		}
+		nested = strings.TrimSpace(openRest)
+	}
+	return false
 }
 
 func appleCLIStderr(err error) (string, bool) {

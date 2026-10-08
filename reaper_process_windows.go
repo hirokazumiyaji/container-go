@@ -4,11 +4,12 @@ package container
 
 import "os/exec"
 
-func prepareReaperCommand(*exec.Cmd) {}
+func configureReaperProcess(*exec.Cmd) {}
 
-func killReaperProcess(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
+func reaperProcessGroupID(*exec.Cmd) int { return 0 }
+
+func killReaperProcess(cmd *exec.Cmd, _ int) {
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
 	}
-	return cmd.Process.Kill()
 }

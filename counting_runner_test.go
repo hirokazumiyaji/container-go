@@ -92,15 +92,16 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint triggers the deferred inspect once; later reads reuse it.
+	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
+	// intentionally not cached.
 	if got := r.count(); got != 3 {
 		t.Fatalf("after Endpoint: calls = %d, want 3", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 3 {
-		t.Fatalf("after cached Endpoint: calls = %d, want 3", got)
+	if got := r.count(); got != 4 {
+		t.Fatalf("after refreshed Endpoint: calls = %d, want 4", got)
 	}
 
 	// The wrapper forwards results unchanged.
@@ -109,10 +110,9 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 	}
 }
 
-// TestRunForLogPerformsFinalPublicationCheck verifies that a successful
-// ForLog wait still performs the fresh identity check required before a
-// handle is published.
-func TestRunForLogPerformsFinalPublicationCheck(t *testing.T) {
+// TestRunForLogDefersInspectUntilFinalLifecycleCheck pins that a successful
+// ForLog wait does not pay for an eager post-start inspect.
+func TestRunForLogDefersInspectUntilFinalLifecycleCheck(t *testing.T) {
 	inner := &streamRunner{
 		fakeRunner: newTestRunner(),
 		streamData: "Ready to accept connections\n",
@@ -127,20 +127,20 @@ func TestRunForLogPerformsFinalPublicationCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + logs stream + final identity inspect.
+	// image inspect + run + logs stream + final lifecycle inspect.
 	if got := r.count(); got != 4 {
 		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	inspects := 0
+	inspectCalls := 0
 	for _, args := range r.args {
 		if len(args) > 0 && args[0] == "inspect" {
-			inspects++
+			inspectCalls++
 		}
 	}
-	if inspects != 1 {
-		t.Fatalf("container inspects = %d, want one final identity check: %v", inspects, r.args)
+	if inspectCalls != 1 {
+		t.Fatalf("container inspect calls = %d, want one final lifecycle check: %v", inspectCalls, r.args)
 	}
 }
 

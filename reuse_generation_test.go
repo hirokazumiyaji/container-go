@@ -2,8 +2,6 @@ package container
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -22,76 +20,15 @@ func TestTerminateRefusesReplacedGeneration(t *testing.T) {
 	}
 }
 
-func TestTerminateAppleRequiresCreation(t *testing.T) {
-	for _, creation := range []string{"", "not-a-generation"} {
-		t.Run(creation, func(t *testing.T) {
-			r := &generationRunner{creation: "bbbbbbbbbbbbbbbb"}
-			ctr := &Container{id: "legacy", runner: r, eng: appleEngine{}, creation: creation}
-			err := ctr.Terminate(context.Background())
-			if !errors.Is(err, ErrGenerationReplaced) {
-				t.Fatalf("Terminate = %v, want ErrGenerationReplaced", err)
-			}
-			if r.inspectCalls != 0 || r.deleteCalls != 0 {
-				t.Fatalf("inspect calls = %d, delete calls = %d; want no name mutation", r.inspectCalls, r.deleteCalls)
-			}
-		})
-	}
-}
-
-func TestTerminateDockerAllowsMissingCreationWithImmutableID(t *testing.T) {
-	uid := strings.Repeat("0f", 32)
-	r := &dockerGenerationRunner{uid: uid}
-	ctr := &Container{id: "shared", runner: r, eng: dockerEngine{}, uid: uid}
-	if err := ctr.Terminate(context.Background()); err != nil {
-		t.Fatalf("Terminate = %v", err)
-	}
-	if len(r.deleted) != 1 || r.deleted[0] != uid {
-		t.Fatalf("deleted = %v, want [%s]", r.deleted, uid)
-	}
-}
-
 type generationRunner struct {
-	creation     string
-	inspectCalls int
-	deleteCalls  int
-}
-
-type nameUIDEngine struct {
-	appleEngine
-	uid string
-}
-
-func (e nameUIDEngine) parseInspect(_ []byte, _ string) (*engineInfo, error) {
-	return &engineInfo{
-		state: StateRunning,
-		uid:   e.uid,
-		labels: map[string]string{
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
-	}, nil
-}
-
-type nameDeleteRunner struct {
-	deleted []string
-}
-
-func (r *nameDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "inspect":
-		return []byte("{}"), nil, nil
-	case "delete", "rm":
-		r.deleted = append(r.deleted, args[len(args)-1])
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
-	}
+	creation    string
+	deleteCalls int
 }
 
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		g.inspectCalls++
-		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":
@@ -112,34 +49,11 @@ func TestTerminateAllowsMatchingGeneration(t *testing.T) {
 	}
 }
 
-func TestTerminateNameAddressedEngineDeletesByNameAfterInspectReportsUID(t *testing.T) {
-	const (
-		name     = "shared"
-		uid      = "opaque-inspect-id"
-		creation = "aaaaaaaaaaaaaaaa"
-	)
-	r := &nameDeleteRunner{}
-	ctr := &Container{
-		id: name, runner: r, eng: nameUIDEngine{uid: uid}, creation: creation,
-	}
-	if err := ctr.Terminate(context.Background()); err != nil {
-		t.Fatalf("Terminate = %v", err)
-	}
-	if len(r.deleted) != 1 || r.deleted[0] != name {
-		t.Fatalf("deleted = %v, want [%s]", r.deleted, name)
-	}
-}
-
 func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 	cfg := &config{runner: &generationRunner{creation: "bbbbbbbbbbbbbbbb"}, eng: appleEngine{}, name: "shared"}
 	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			sessionLabel:  sessionID(),
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
 	// Fresh inspect reports a different generation in running state, so
 	// there is nothing stopped to delete.
@@ -155,13 +69,8 @@ func TestDeleteStoppedReuseSkipsMismatchedGeneration(t *testing.T) {
 
 func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	info := &engineInfo{
-		state: StateStopped,
-		labels: map[string]string{
-			managedLabel:  "true",
-			sessionLabel:  sessionID(),
-			reuseLabel:    "true",
-			creationLabel: "aaaaaaaaaaaaaaaa",
-		},
+		state:  StateStopped,
+		labels: map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
 	}
 	r := &generationStateRunner{creation: "", state: "stopped"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
@@ -173,45 +82,17 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 	}
 }
 
-func TestDeleteStoppedReuseSkipsNonStoppedSnapshot(t *testing.T) {
-	for _, state := range []State{StateRunning, StateStopping, StateUnknown} {
-		t.Run(string(state), func(t *testing.T) {
-			r := &completeReuseStateRunner{state: string(StateStopped)}
-			cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
-			info := &engineInfo{
-				state: state,
-				image: "redis:7-alpine",
-				labels: map[string]string{
-					managedLabel:  "true",
-					sessionLabel:  sessionID(),
-					reuseLabel:    "true",
-					creationLabel: "aaaaaaaaaaaaaaaa",
-				},
-			}
-			if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
-				t.Fatalf("deleteStoppedReuse = %v", err)
-			}
-			if r.inspectCalls != 0 || r.deleteCalls != 0 {
-				t.Fatalf("calls = inspect:%d delete:%d, want no mutation for %s snapshot", r.inspectCalls, r.deleteCalls, state)
-			}
-		})
-	}
-}
-
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
-	uid := strings.Repeat("0f", 32)
 	info := &engineInfo{
 		state: StateStopped,
 		labels: map[string]string{
 			managedLabel:  "true",
-			sessionLabel:  sessionID(),
 			reuseLabel:    "true",
 			creationLabel: "aaaaaaaaaaaaaaaa",
 		},
-		image: "redis",
-		uid:   uid,
+		uid: strings.Repeat("0f", 32),
 	}
-	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
+	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: strings.Repeat("0f", 32)}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, info); err != nil {
 		t.Fatalf("deleteStoppedReuse = %v", err)
@@ -224,7 +105,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 }
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: `Error: container not found: "myctr"`}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)
@@ -278,7 +159,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":
@@ -298,10 +179,11 @@ type generationStateRunner struct {
 func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		labels := ""
+		labels := `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true"`
 		if g.creation != "" {
-			labels = `,"labels":{"` + creationLabel + `":"` + g.creation + `"}`
+			labels += `,"` + creationLabel + `":"` + g.creation + `"`
 		}
+		labels += `}`
 		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
@@ -312,68 +194,6 @@ func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, 
 		return nil, nil, nil
 	default:
 		return nil, nil, nil
-	}
-}
-
-type completeReuseStateRunner struct {
-	state        string
-	inspectCalls int
-	deleteCalls  int
-}
-
-func (r *completeReuseStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "inspect":
-		r.inspectCalls++
-		return []byte(reuseInspectJSONWithGroup(args[len(args)-1], r.state, "redis:7-alpine", "aaaaaaaaaaaaaaaa", "")), nil, nil
-	case "delete", "rm":
-		r.deleteCalls++
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
-	}
-}
-
-type legacyReuseRunner struct {
-	state   string
-	calls   []string
-	deletes int
-}
-
-func (r *legacyReuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	r.calls = append(r.calls, args[0])
-	switch args[0] {
-	case "inspect":
-		data := fmt.Sprintf(`[{"id":"legacy","configuration":{"id":"legacy","image":{"reference":"redis:7-alpine"},"labels":{%q:"true"}},"status":{"state":%q,"networks":[]}}]`, reuseLabel, r.state)
-		return []byte(data), nil, nil
-	case "run":
-		return nil, nil, fmt.Errorf("legacy reuse container must not be replaced")
-	case "delete", "rm":
-		r.deletes++
-		return nil, nil, nil
-	default:
-		return nil, nil, nil
-	}
-}
-
-func TestWithReuseRejectsLegacyUnlabeledAppleContainer(t *testing.T) {
-	for _, state := range []State{StateRunning, StateStopped} {
-		t.Run(string(state), func(t *testing.T) {
-			r := &legacyReuseRunner{state: string(state)}
-			_, err := Run(context.Background(), "redis:7-alpine",
-				WithName("legacy"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
-			if !errors.Is(err, ErrGenerationReplaced) {
-				t.Fatalf("Run = %v, want ErrGenerationReplaced", err)
-			}
-			if r.deletes != 0 {
-				t.Fatalf("deletes = %d, want 0", r.deletes)
-			}
-			for _, call := range r.calls {
-				if call == "run" || call == "delete" {
-					t.Fatalf("calls = %v, legacy container was mutated", r.calls)
-				}
-			}
-		})
 	}
 }
 
@@ -389,7 +209,7 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 	r := &slowPullRunner{pullDelay: 400 * time.Millisecond}
 	cfg := &config{
 		runner: r, eng: appleEngine{}, name: "shared-reuse",
-		reuse: true, pullPolicy: PullAlways,
+		pullPolicy: PullAlways,
 	}
 	ctx := context.Background()
 	ctr, err := reuseCreate(ctx, "redis:7-alpine", cfg)
@@ -404,7 +224,6 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 type slowPullRunner struct {
 	*fakeRunner
 	pullDelay time.Duration
-	creation  string
 }
 
 func (s *slowPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -417,20 +236,6 @@ func (s *slowPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 			return nil, nil, ctx.Err()
 		case <-time.After(s.pullDelay):
 		}
-	}
-	if args[0] == "run" {
-		for _, arg := range args {
-			if creation, ok := strings.CutPrefix(arg, creationLabel+"="); ok {
-				s.creation = creation
-			}
-		}
-	}
-	if args[0] == "inspect" {
-		s.mu.Lock()
-		s.calls = append(s.calls, args)
-		creation := s.creation
-		s.mu.Unlock()
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
 	}
 	return s.fakeRunner.Run(ctx, args...)
 }

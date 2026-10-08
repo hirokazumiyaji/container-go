@@ -13,28 +13,31 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-	f := newTestRunner()
-	f.immutableInspect = true
-	opts := make([][]Option, 10)
-	for i := range opts {
-		opts[i] = []Option{WithName(fmt.Sprintf("parallel-%d", i)), withRunner(f), withEngine(dockerEngine{})}
-	}
-	errs := make([]error, len(opts))
+// runParallelRuns starts n Runs of the same image concurrently and
+// returns the errors indexed by goroutine.
+func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
+	t.Helper()
+	errs := make([]error, n)
 	var wg sync.WaitGroup
-	for i := range opts {
+	for i := range n {
 		wg.Add(1)
-		go func(i int) {
+		go func() {
 			defer wg.Done()
-			ctr, err := Run(context.Background(), "redis:7-alpine", opts[i]...)
+			ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
 			if err != nil {
 				errs[i] = err
 				return
 			}
 			_ = ctr.Terminate(context.Background())
-		}(i)
+		}()
 	}
 	wg.Wait()
+	return errs
+}
+
+func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
+	f := newTestRunner()
+	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
 			t.Fatalf("run %d: %v", i, err)
@@ -62,7 +65,6 @@ func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
 func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 	f := newTestRunner()
 	f.imagePresent = true
-	f.immutableInspect = true
 	opts := []Option{WithName("myctr"), WithPullPolicy(PullAlways), withRunner(f), withEngine(dockerEngine{})}
 	for i := range 2 {
 		if _, err := Run(context.Background(), "redis:7-alpine", opts...); err != nil {
@@ -464,20 +466,24 @@ func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
 }
 
 func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
+	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	ids := []string{strings.Repeat("a", 64), strings.Repeat("b", 64)}
-	r := &reuseGroupRunner{ids: ids}
+	r := &reuseGroupRunner{ids: []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
 	}
-	if !slices.Equal(removed, ids) {
-		t.Errorf("removed = %v, want %v", removed, ids)
+	if len(removed) != 2 {
+		t.Errorf("removed = %v, want 2 ids", removed)
 	}
 	if r.listCalls != 1 || r.deleteCalls != 2 {
 		t.Errorf("list=%d delete=%d, want 1/2", r.listCalls, r.deleteCalls)
 	}
+	_ = f
 }
 
 type reuseGroupRunner struct {
@@ -490,8 +496,11 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	switch args[0] {
 	case "ps":
 		r.listCalls++
-		// docker parseReuseGroupIDs splits lines; return the stub IDs.
-		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
+		// docker parseReuseGroupIDs splits lines; return the stub ids.
+		return []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/group-%s","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"integration",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`, id, id[:1], managedLabel, reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

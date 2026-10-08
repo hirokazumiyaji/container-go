@@ -1,32 +1,43 @@
-//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris
+//go:build !darwin && !dragonfly && !freebsd && !linux && !netbsd && !openbsd && !solaris && !illumos && !windows
 
 package cli
 
 import (
-	"context"
+	"os"
 	"os/exec"
 )
 
-// Windows and other non-Unix targets do not get the POSIX parent-death
-// supervisor. The reaper is already disabled there, and the normal direct
-// command/cancellation path remains unchanged.
-func commandWithParentDeath(ctx context.Context, binary string, args []string) (*exec.Cmd, func(), error) {
-	return exec.CommandContext(ctx, binary, args...), func() {}, nil
+// These platforms have no portable process-group implementation in this
+// package. Cancellation still terminates and reaps the direct CLI child;
+// detached descendants cannot be guaranteed.
+func configureProcessTree(*exec.Cmd) {}
+
+type otherProcessTree struct{}
+
+func newProcessTree(*exec.Cmd) (processTree, error) {
+	return otherProcessTree{}, nil
 }
 
-func configureProcessGroup(*exec.Cmd) {}
-
-type directPlatformProcessTree struct{}
-
-func newProcessTree(*exec.Cmd) (processTree, error) { return directPlatformProcessTree{}, nil }
-func (directPlatformProcessTree) terminate(cmd *exec.Cmd) error {
-	return killProcessGroup(cmd)
+func (otherProcessTree) terminate(cmd *exec.Cmd) terminationResult {
+	return terminateDirectProcessResult(cmd)
 }
-func (directPlatformProcessTree) close() {}
 
-func killProcessGroup(cmd *exec.Cmd) error {
+func (otherProcessTree) close() {}
+
+func terminateDirectProcessResult(cmd *exec.Cmd) terminationResult {
 	if cmd == nil || cmd.Process == nil {
-		return nil
+		return terminationResult{err: os.ErrProcessDone}
 	}
-	return cmd.Process.Kill()
+	if err := cmd.Process.Kill(); err != nil {
+		return terminationResult{err: err}
+	}
+	return terminationResult{active: true}
+}
+
+func terminateProcessTreeResult(cmd *exec.Cmd) terminationResult {
+	return terminateDirectProcessResult(cmd)
+}
+
+func terminateProcessTree(cmd *exec.Cmd) error {
+	return terminateProcessTreeResult(cmd).err
 }

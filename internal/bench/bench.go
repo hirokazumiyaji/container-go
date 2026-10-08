@@ -35,7 +35,9 @@ type Result struct {
 	// DurationNS is the wall-clock time of the iteration.
 	DurationNS int64 `json:"duration_ns"`
 	// Subprocesses is the number of CLI child processes spawned, or
-	// zero when the scenario does not count subprocesses.
+	// zero when the scenario does not count subprocesses. A recorded
+	// zero is therefore ambiguous on its own, and Table renders it as
+	// "n/a" so an unmeasured column cannot be read as a measurement.
 	Subprocesses int64 `json:"subprocesses"`
 }
 
@@ -87,7 +89,8 @@ type Summary struct {
 	Max        time.Duration
 
 	// MedianSubprocesses is the median spawn count across iterations;
-	// zero when the scenario does not count subprocesses.
+	// zero when the scenario does not count subprocesses. Table renders
+	// that zero as "n/a" rather than as a number.
 	MedianSubprocesses int64
 }
 
@@ -145,19 +148,47 @@ func median(values []int64) int64 {
 	return sorted[len(sorted)/2]
 }
 
-// Table renders summaries as a fixed-width human-readable table.
+// unmeasuredSubprocesses is the SPAWN cell for a scenario that does not
+// count subprocesses. Result.Subprocesses documents zero as "not
+// counted", so printing the number made an unmeasured column
+// indistinguishable from a measured zero - and a reader comparing spawn
+// counts across libraries would be comparing a measurement against an
+// absence of one.
+const unmeasuredSubprocesses = "n/a"
+
+// Table renders summaries as a human-readable table whose column widths
+// follow the data. The image column in particular is sized to the longest
+// reference in the table: the current references are 44-character ECR
+// mirror paths, which overflowed a fixed 18-character field and shifted
+// every later column on every row.
 func Table(summaries []Summary) string {
-	const pattern = "%-8s %-18s %-18s %-16s %4s %10s %10s %10s %8s\n"
+	backendW, libraryW, imageW, scenarioW := len("BACKEND"), len("LIBRARY"), len("IMAGE"), len("SCENARIO")
+	for _, s := range summaries {
+		backendW = max(backendW, len(s.Backend))
+		libraryW = max(libraryW, len(s.Library))
+		imageW = max(imageW, len(s.Image))
+		scenarioW = max(scenarioW, len(s.Scenario))
+	}
+	// The header is wider than the data for SPAWN, so size that column
+	// from the header too.
+	spawnW := max(len("SPAWN"), len(unmeasuredSubprocesses))
+
+	pattern := fmt.Sprintf("%%-%ds %%-%ds %%-%ds %%-%ds %%4s %%10s %%10s %%10s %%-%ds\n",
+		backendW, libraryW, imageW, scenarioW, spawnW)
 	var b strings.Builder
 	fmt.Fprintf(&b, pattern, "BACKEND", "LIBRARY", "IMAGE", "SCENARIO", "N", "MEDIAN", "MIN", "MAX", "SPAWN")
 	for _, s := range summaries {
+		spawn := fmt.Sprint(s.MedianSubprocesses)
+		if s.MedianSubprocesses == 0 {
+			spawn = unmeasuredSubprocesses
+		}
 		fmt.Fprintf(&b, pattern,
 			s.Backend, s.Library, s.Image, s.Scenario,
 			fmt.Sprint(s.Iterations),
 			s.Median.Round(time.Millisecond),
 			s.Min.Round(time.Millisecond),
 			s.Max.Round(time.Millisecond),
-			fmt.Sprint(s.MedianSubprocesses),
+			spawn,
 		)
 	}
 	return b.String()

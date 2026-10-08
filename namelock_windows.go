@@ -8,4 +8,6 @@ func lockName(context.Context, string) (func(), error) {
 	return func() {}, nil
 }
 
-func ensureReaperNameLock(string) error { return nil }
+func reaperNameLockPath(string) (string, error) {
+	return "", nil
+}

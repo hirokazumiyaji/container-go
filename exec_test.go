@@ -136,6 +136,7 @@ func TestExecSuccessAddsNoProbe(t *testing.T) {
 }
 
 func TestExecPassesOptionsAndEnvFile(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := &execRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 

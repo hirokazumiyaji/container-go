@@ -29,6 +29,8 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   and a Docker 29.x-shaped inspect fixture with a local 29.7.2 run; centralize
   stderr matchers on each engine with source comments; add live CLI
   compatibility integration tests; add an Apple inspect fixture for 1.3.0.
+- Add `ErrEnvFileUnsupported` for Windows operations that would need a
+  per-user secret env file.
 
 ### Changed
 
@@ -90,6 +92,18 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- Reject invalid UTF-8 and Unicode control/line-separator characters in env
+  values, and invalid Unicode whitespace/control characters in keys. This is
+  an intentional compatibility tightening; printable Unicode, spaces, and
+  `=` remain valid values.
+- Store Unix env files under a marked, current-user-owned cache root instead
+  of `TMPDIR`; make stale cleanup marker/mode/owner/child aware, protect
+  live calls with locks, and return plus retry cleanup failures.
+- Canonicalize Unix cache paths once, repair only provable staging/root-marker
+  crash states, use transactional tombstones for partial removal, and retain
+  cleanup ownership across late close/release errors. A successful reuse
+  create now returns its handle with a joined cleanup error instead of
+  orphaning the container.
 - Validate wait strategies and declared ports before image pulls, classify
   terminal log-stream errors, retry transient state probes, preserve exposed-port
   declaration order, and bound replay de-duplication state.

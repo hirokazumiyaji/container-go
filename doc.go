@@ -7,6 +7,8 @@
 // system start`), and Docker on Linux, Windows, and macOS (`docker`,
 // selected with CONTAINERGO_BACKEND=docker). Current Windows and remote
 // Docker bind-source limitations are documented in README.md and are
-// tracked by issue #76. See README.md for backend selection and endpoint
-// differences.
+// tracked by issue #76. On Windows, operations that need an environment
+// file fail with ErrEnvFileUnsupported because the library does not treat
+// chmod bits as a per-user ACL. See README.md for backend selection,
+// environment validation, and endpoint differences.
 package container

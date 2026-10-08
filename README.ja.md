@@ -626,7 +626,9 @@ func PullPolicy(ctx context.Context, t testing.TB) {
 2. **作成後の rollback**: 再利用でない `Run` が file copy または readiness
    待ちの途中で失敗すると、`Run` は `Terminate` を呼びます。削除にも失敗
    した場合は、元の失敗とコンテナが残ったことを示すメッセージを返り値に
-   含めます。
+   含めます。作成後の env-file cleanup が失敗した場合は、利用可能な
+   ハンドルと結合済みエラーを返します。呼び出し側はそのハンドルを確認
+   または明示的に `Terminate` してください。
 3. **create 失敗**: backend の `run` 自体が失敗した場合、best-effort の
    `cleanupFailedCreate` は、この process の managed / session label を
    持つコンテナだけを inspect します。creation label がある場合はこの
@@ -787,8 +789,27 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
   shell script（reaper）は固定文字列で、検証済みの container name と、
   #73 適用後の Docker ID だけを stdin data として受け取ります。
-- 環境変数は mode 0600 の一時 env file 経由で渡すため、秘密が process
-  一覧（`ps`）に現れません。
+- Unix では環境変数を、正規化済みの `os.UserCacheDir()` 配下の、所有者と
+  モードを検証した 0700 ディレクトリ内の 0600 ファイル経由で渡します。
+  既存の symlink 祖先は一度だけ解決し、`..` と書き込み可能な信頼できない
+  祖先は拒否します。`TMPDIR` は使用しません。
+  24 時間経過した staging ディレクトリだけを age で回収し、marker 作成後、
+  lock 作成前に終了した状態や tombstone 化した部分削除は自動修復します。
+  初期化済みディレクトリは age ではなく書き込み側 lock で生存を判断します。
+  marker が不正な場合、置き換えられた場合、許可されない子がある場合は
+  fail closed します。利用者が内容を確認して手動で削除してください。
+  cleanup 失敗は API から返し、関数から返る前に deferred retry します。
+- Windows の Go `chmod` はユーザー単位の秘密性を保証しません。
+  空でない環境変数指定を含む `Run`/`Exec` は `ErrEnvFileUnsupported` で
+  fail closed します。
+  それ以外の Windows 機能は利用できます。
+- 環境変数キーは、空でない有効な UTF-8 であり、`=`、Unicode 空白、制御
+  文字、先頭の `#`、先頭 BOM を含むできません。
+  値は有効な UTF-8 であり、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029
+  を含むできません。
+  制御文字でない Unicode、空白、`=` は値として許容します。
+  制御文字(タブを含む)や不正な UTF-8 を拒否する方針は、backend が受け付ける
+  値でも env ファイルには書かないという意図的な互換性変更です。
 - レジストリ認証情報は本 library では扱いません。Apple Container では
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。
@@ -829,6 +850,10 @@ integration tag のないドキュメント test は、この README の英語�
 コメント除去後に比較します。Go block は引用符付きローカル `replace` を持つ
 一時 module 内でコンパイルします。tag付き `examples/` の example が実
 backend を動かします。
+
+リポジトリ CI の unit/race job は Ubuntu で実行します。
+Windows 固有の環境変数のテストは開発時にコンパイル確認しますが、
+この変更では Windows 実行時 CI のカバレッジを主張しません。
 
 Design document: [docs/design.md](docs/design.md)（日本語版:
 [docs/design.ja.md](docs/design.ja.md)）。設計ドキュメントの「実装フェーズ」は

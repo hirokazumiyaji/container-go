@@ -635,7 +635,10 @@ different error visibility.
 2. **Post-create rollback**: if a non-reuse `Run` fails while copying files
    or waiting for readiness, `Run` calls `Terminate`. If that deletion
    fails, the returned error includes the original failure and a message
-   saying that the container was left behind.
+   saying that the container was left behind. If a post-create
+   environment-file cleanup still fails, `Run` returns the usable handle
+   together with the joined error; the caller must inspect or explicitly
+   terminate that handle.
 3. **Failed create**: if the backend `run` command itself fails, the
    best-effort `cleanupFailedCreate` path only inspects and deletes a
    container carrying this process's managed/session labels. When the
@@ -806,8 +809,28 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Every CLI call is an argv vector; no shell is involved. The one shell
   script (the reaper) is a fixed string that receives validated container
   names or, after #73, Docker IDs only as stdin data.
-- Environment variables are passed via a temporary `0600` env file, so
-  secrets never appear in the process table (`ps`).
+- On Unix, environment variables are passed through a `0600` file in a
+  validated, current-user-owned `0700` directory under the canonical
+  `os.UserCacheDir()` path. The library resolves existing symlinked ancestors
+  once, rejects `..` and untrusted writable ancestors, and never uses
+  `TMPDIR`. The root marker is created with an exclusive, locked hand-off;
+  a partially written marker is repaired only while the private root is empty.
+- Stale cleanup removes only exact, owned library children. A staging
+  directory is eligible after `24h`; marker-before-lock and tombstoned
+  partial-removal states are self-healing. An initialized directory is never
+  aged out: its unlocked writer lock is the liveness proof. If an entry is
+  unmarked, replaced, or contains an unexpected child, cleanup fails closed
+  and leaves it for manual inspection and removal. Cleanup failures are
+  returned and retried before `Run`, reuse creation, or `Exec` returns.
+- Windows cannot provide the claimed per-user secrecy with Go `chmod`, so
+  `Run`/`Exec` fail with `ErrEnvFileUnsupported` when a non-empty environment
+  map requires an env file. Other Windows operations remain supported.
+- Env keys must be valid, non-empty UTF-8 without `=`, Unicode whitespace or
+  controls, a leading `#`, or a leading BOM. Values must be valid UTF-8
+  without Unicode controls, NUL, CR/LF, U+2028, or U+2029. Other non-control
+  Unicode, spaces, and `=` remain valid values. Rejecting controls (including
+  tab) and invalid UTF-8 is an intentional compatibility change: a backend may
+  accept a value that the library refuses to put in a line-delimited env file.
 - Registry credentials are never handled by this library; use
   `container registry login` for Apple Container or `docker login` for
   Docker. The backend CLI owns the resulting credentials and registry
@@ -849,6 +872,10 @@ all fenced code blocks from both language versions of this README and the
 design document, compares paired blocks after removing comments, and
 compiles the Go blocks in a temporary module with a quoted local
 `replace`. The tagged examples under `examples/` exercise a real backend.
+
+The repository CI runs unit and race jobs on Ubuntu. Windows-specific
+environment-file tests are compile-checked during development; this change
+does not claim Windows runtime CI coverage.
 
 Design document: [docs/design.md](docs/design.md) (日本語版:
 [docs/design.ja.md](docs/design.ja.md)). The implementation phases in that

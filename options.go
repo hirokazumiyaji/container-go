@@ -201,17 +201,23 @@ func WithName(name string) Option {
 	}
 }
 
-// WithEnv adds environment variables. They are passed to the CLI via a
-// temporary env file so values never appear in the process table.
+// WithEnv adds environment variables. On Unix they are passed to the CLI via
+// a per-user 0600 env file so values never appear in the process table. On
+// Windows, Run returns ErrEnvFileUnsupported when this map is non-empty
+// because chmod does not provide per-user file secrecy there.
+//
+// Keys must be non-empty valid UTF-8 without '=', Unicode whitespace or
+// control characters, a leading '#', or a leading byte-order mark. Values must
+// be valid UTF-8 without Unicode control characters, NUL, CR/LF, U+2028, or
+// U+2029. Spaces, '=', and other non-control Unicode are valid in values.
+// This common policy is intentionally stricter than values some backends may
+// accept.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
+		if err := validateEnvMap(env); err != nil {
+			return err
+		}
 		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") {
-				return fmt.Errorf("invalid environment variable name %q", k)
-			}
-			if strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("environment variable %s: value must not contain newlines", k)
-			}
 			c.env[k] = v
 		}
 		return nil

@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"slices"
 	"sort"
 	"strconv"
@@ -196,9 +194,12 @@ func (c *Container) setImmutableID(uid string) {
 
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
-// removed before returning. WithReuse switches to get-or-create; see
-// WithReuse for the shared-handle lifecycle.
-func Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
+// normally removed before returning. If a post-create environment-file
+// cleanup cannot be completed, Run returns the usable handle together
+// with the joined error so the container is not orphaned. WithReuse
+// switches to get-or-create; see WithReuse for the shared-handle
+// lifecycle.
+func Run(ctx context.Context, image string, opts ...Option) (result *Container, retErr error) {
 	cfg := newConfig()
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
@@ -234,59 +235,111 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
+	// Establish the run budget before env-file security preflight. The
+	// preflight takes the root advisory lock and may otherwise outlive a
+	// canceled caller while another process is holding that lock.
+	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	defer cancel()
+
+	// Reject Windows before an image pull or any env-file storage setup.
+	// chmod's 0600/0700 bits do not provide per-user secrecy there.
+	if len(cfg.env) > 0 {
+		if err := ensureEnvFileSecurity(); err != nil {
+			return nil, err
+		}
+		// Validate the private root and reclaim provably stale directories
+		// before spending time on an image pull or backend create. The
+		// security cleanup has its own finite budget in addition to the
+		// caller's run deadline.
+		cleanupCtx, cleanupCancel := context.WithTimeout(runCtx, envFileSecurityTimeout)
+		err := cleanupStaleEnvFilesContext(cleanupCtx)
+		cleanupCancel()
+		if err != nil {
+			// A trusted directory whose cleanup is still pending must not
+			// turn a shared reuse attach into a failed flight. Other
+			// security-scan failures remain fail-closed.
+			if !cfg.reuse || !isRetryablePendingEnvCleanupError(err) {
+				return nil, err
+			}
+		}
+	}
 	if cfg.reuse {
-		return reuseRun(ctx, image, cfg)
+		if err := runCtx.Err(); err != nil {
+			return nil, err
+		}
+		return reuseRun(runCtx, image, cfg)
 	}
 	if cfg.name == "" {
 		cfg.name = newContainerName()
 	}
 	cfg.creation = newCreationID()
 
-	var envFile string
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return nil, err
-		}
-		defer os.RemoveAll(dir)
-		envFile = path
-	}
-
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
-	defer cancel()
 	// The pull policy brings the image into the local store before the
 	// run command; both share the aggregated flight so concurrent Runs
 	// of the same image pull once.
 	if err := cfg.ensureImage(runCtx, image); err != nil {
 		return nil, err
 	}
+	// Do not put secrets on disk while an image pull may be waiting for
+	// minutes. The backend reads this file only while handling run. If the
+	// first removal fails, envDir remains set so the deferred path retries
+	// before returning; the first error is still preserved below.
+	var envFile, envDir string
+	if len(cfg.env) > 0 {
+		path, dir, err := writeEnvFileContext(runCtx, cfg.env)
+		if err != nil {
+			if dir != "" {
+				// A late root-lock error can return a published directory
+				// together with the write error. Keep ownership until a
+				// bounded retry has also failed.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+			}
+			return nil, err
+		}
+		envFile, envDir = path, dir
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
+	}
+
 	// Register the exact logical name and generation before the backend
 	// create starts. If the process is killed while `run` is in flight,
 	// the reaper can wait for the pending generation instead of missing
 	// the container entirely.
 	preRegisterRunWithGlobalReaper(cfg)
-	stdout, _, attempted, err := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
-	if err != nil {
+	stdout, _, attempted, runErr := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
+	envCleanupErr := cleanupEnvFileAfterUseContext(runCtx, envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+	if runErr != nil {
 		if !attempted {
 			if target, ok := runReaperTarget(cfg); ok {
 				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
 			}
-			return nil, err
+			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
-		if cleanupErr := cleanupFailedCreate(ctx, cfg, err, classified); cleanupErr != nil {
-			return nil, withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr})
+		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
+		if cleanupErr := cleanupFailedCreate(ctx, cfg, runErr, classified); cleanupErr != nil {
+			return nil, joinEnvFileCleanupError(withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
-		return nil, classified
+		return nil, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
 	uid := cfg.eng.parseRunID(stdout)
 	if requiresImmutableID(cfg.eng) && !validImmutableID(cfg.eng, uid) {
 		identityErr := identityError("Docker run returned no valid immutable container ID")
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, identityErr, identityErr); cleanupErr != nil {
-			return nil, withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr})
+			return nil, joinEnvFileCleanupError(withCleanupError(identityErr, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
-		return nil, identityErr
+		return nil, joinEnvFileCleanupError(identityErr, envCleanupErr)
 	}
 
 	c := &Container{
@@ -313,9 +366,9 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			// outcome.
 			cleanupErr := cleanupFailedCreate(ctx, cfg, err, err)
 			if cleanupErr != nil {
-				return nil, withCleanupError(err, &CleanupError{Container: cfg.name, Err: cleanupErr})
+				return nil, joinEnvFileCleanupError(withCleanupError(err, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 			}
-			return nil, err
+			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
 		// completePending updates the in-memory state before any pipe
 		// write. Never register a second active record as a fallback:
@@ -326,10 +379,16 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, uid, "")
 		}
 	}
+	// Do not perform file copies or readiness polling while the env file
+	// still exists. The handle is usable, and the deferred retry retains
+	// ownership for a later safe cleanup attempt.
+	if envCleanupErr != nil {
+		return c, envCleanupErr
+	}
 
 	for _, f := range cfg.files {
 		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
-			return nil, c.rollback(ctx, err)
+			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
 	}
 	if cfg.waitStrategy != nil {
@@ -340,10 +399,10 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error) 
 			if tail != "" {
 				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
 			}
-			return nil, c.rollback(ctx, err)
+			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
 	}
-	return c, nil
+	return c, envCleanupErr
 }
 
 func runWaitPorts(cfg *config) []string {
@@ -653,25 +712,6 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	}
 	unregisterContainerReaper(cfg, cfg.name, cfg.creation, target)
 	return nil
-}
-
-// writeEnvFile stores env vars in a 0600 file under a private temporary
-// directory, keeping values out of the process table.
-func writeEnvFile(env map[string]string) (path, dir string, err error) {
-	dir, err = os.MkdirTemp("", "containergo-env-")
-	if err != nil {
-		return "", "", err
-	}
-	var b []byte
-	for _, k := range sortedKeys(env) {
-		b = append(b, k+"="+env[k]+"\n"...)
-	}
-	path = filepath.Join(dir, "env")
-	if err := os.WriteFile(path, b, 0o600); err != nil {
-		_ = os.RemoveAll(dir)
-		return "", "", err
-	}
-	return path, dir, nil
 }
 
 // ID returns the logical container name. Docker handles also retain the

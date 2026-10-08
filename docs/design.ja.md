@@ -493,12 +493,20 @@ attach polling だけを制限する。
 ライブラリは、パイプへ書く前の ID を検証し、Apple Container の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または Docker の完全な小文字 64 桁の 16 進数 ID `^[0-9a-f]{64}$` だけを受け入れる。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
-**環境変数を argv に載せない**。`--env key=value` を使うと、値がプロセス一覧（`ps`）から見える。データベースパスワードなど秘密情報を環境変数で渡す用途による情報漏洩を避けるため、ライブラリは `os.MkdirTemp` の mode 0600 ファイルへ環境変数を書き、`--env-file` で渡して起動後に削除する。
+**環境変数を argv に載せない**。
+`--env key=value` を使うと、値がプロセス一覧(`ps`)から他ユーザーにも見える。
+データベースのパスワードなど秘密情報を渡せるよう、Unix では正規化済みの `os.UserCacheDir()` 配下に、所有者が現在のユーザーでモードが 0700 のディレクトリを作り、0600 の env ファイルを書く。
+既存の symlink 祖先は一度だけ解決し、`..` と書き込み可能な信頼できない祖先は拒否する。
+`TMPDIR` は信頼境界に置かない。
+24 時間経過した staging ディレクトリだけを age で回収し、marker 作成後に lock を作る途中で終了した状態や tombstone 化した部分削除は自動修復する。
+初期化済みディレクトリは age ではなく backend 呼び出し中ずっと保持する書き込み側ロックで生存を判断する。
+不正な marker、置き換えられたディレクトリ、許可されない子がある場合は fail closed とし、利用者が内容を確認して手動で削除する。
+cleanup 失敗は返し、deferred retry する。
+Windows の Go `chmod` は同等の秘密性を保証しないため、env ファイルが要る操作は backend を呼ぶ前に `ErrEnvFileUnsupported` で失敗する。
 
 **Reaper staging**。現在の reaper は full `inspect` output を namespace のない `mktemp` file へ書き込んでから削除する。kill された場合、環境 data を含む file が残るため、#111 の mitigation を参照する。
 **入力を検証する**。
-コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、環境変数キーは `=` と NUL を含まないこと、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。
-CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
+コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。環境変数キーは空でない有効な UTF-8 で、`=`、Unicode 空白、制御文字、先頭 `#`、先頭 BOM を含まない。値は有効な UTF-8 で、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029 を含まない。制御文字でない Unicode、空白、`=` は値として許可する。制御文字(タブを含む)や不正な UTF-8 を、バックエンドが受け付ける場合でも行区切り env ファイルへ書かないという意図的な互換性変更である。CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
 
 **入力を検証する**。共有 `WithName` guard と name-addressed reaper check は前述の規則を使い、ラベルキー（CLI と同じ Docker/OCI 形式）、ポート（数値範囲と `tcp`/`udp`）、環境変数キー（`=` と NUL を含まない）、コンテナ内コピー先パス（絶対パス、有効な UTF-8、NUL なし）も CLI へ渡す前に検証する。この library-side guard は backend の完全な name validation を意味しない。Apple のより厳密な minimum は現在の checkout では強制されない（#112）。ホスト側コピー元パスは絶対パスへ解決する。CLI にも検証はあるが、先にライブラリで落とすことでエラーメッセージを明確にし、将来の CLI の変化に依存しない。public option の validation は部分的で、negative `LogsOptions.Tail`、zero memory、unknown mount type、reuse-group grammar は backend work 前に一様に reject されない（#102）。
 
@@ -531,11 +539,11 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
 - `ErrContainerNotFound`：inspect などの not found
-- `ErrPortNotExposed`：`WithExposedPorts` 未宣言のポート照会
+- `ErrPortNotExposed`：未宣言、または利用可能な host binding がない port
+- `ErrEnvFileUnsupported`：空でない環境変数指定には安全な env ファイルが必要だが、現在のプラットフォームではユーザー単位の秘密性を確保できない
 - `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない
 - `ErrCopyFileFromContainerUnsupported`：選択した backend または host が型安全な copy-out を実装していない(Apple Container、Docker client/server が 29.7.0 未満、必要な open flag がない host、または Windows Go 1.23 から 1.25)
 - `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
-- `ErrPortNotExposed`：未宣言、または利用可能な host binding がない port
 - `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
 

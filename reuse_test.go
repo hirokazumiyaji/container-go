@@ -36,11 +36,14 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		if !created {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		creation := r.creations[args[len(args)-1]]
+		name := args[len(args)-1]
+		r.mu.Lock()
+		creation := r.creations[name]
+		r.mu.Unlock()
 		if creation == "" {
 			creation = "0123456789abcdef"
 		}
-		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", creation)), nil, nil
+		return []byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -60,6 +63,25 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 		WithName("myctr"), WithReuseGroup("integration"), withRunner(newTestRunner()))
 	if err == nil || !strings.Contains(err.Error(), "WithReuseGroup requires WithReuse") {
 		t.Fatalf("error = %v, want WithReuseGroup requires WithReuse", err)
+	}
+}
+
+func TestReuseDoesNotDetachCanceledPreflight(t *testing.T) {
+	f := newReuseCreateRunner()
+	cfg := newConfig()
+	cfg.name = "canceled-reuse"
+	cfg.reuse = true
+	cfg.eng = appleEngine{}
+	cfg.runner = f
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ctr, err := reuseRun(ctx, "redis:7-alpine", cfg)
+	if ctr != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reuseRun = (%v, %v), want canceled before flight", ctr, err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("canceled reuse started backend work: %v", f.calls)
 	}
 }
 

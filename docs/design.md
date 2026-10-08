@@ -753,20 +753,35 @@ layers together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
-channel for secrets (database passwords and the like), the library
-writes them to a file under `os.MkdirTemp` with mode 0600, passes
-`--env-file`, and deletes the file after startup.
+channel for secrets, Unix writes them to a 0600 file in a 0700,
+current-user-owned directory under the canonical `os.UserCacheDir()` path
+and passes `--env-file`. Existing symlinked ancestors are resolved once;
+`..`, symlinked storage roots, and writable untrusted ancestors are
+rejected, and `TMPDIR` is not trusted. A version marker, owner/mode
+checks, an expected-child allowlist, and a writer lock held for the
+whole backend call bound crash cleanup. A staging directory becomes
+eligible for cleanup after 24 hours. Marker-before-lock and tombstoned
+partial-removal states are self-healing, while an unmarked, replaced, or
+unexpected entry fails closed and requires manual inspection. Cleanup
+errors are returned and retried. Windows has no equivalent secrecy
+guarantee through Go `chmod`, so operations requiring an env file return
+`ErrEnvFileUnsupported` before invoking the backend.
 
 **Reaper staging**. The current reaper writes the full `inspect` output
 to an un-namespaced `mktemp` file before removing it. A killed reaper can
 leave environment data on disk; see the #111 mitigation above.
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
-environment keys (no `=`, no NUL), and copy paths (absolute POSIX
-paths with `/` separators, no backslashes, valid UTF-8) are all
-validated before reaching the CLI. The CLI validates
-too, but validating first gives clearer errors and independence from
-future CLI changes.
+and copy paths (absolute POSIX paths with `/` separators, no backslashes,
+valid UTF-8) are validated before reaching the CLI. Env keys are valid
+non-empty UTF-8 without `=`, Unicode whitespace/controls, a leading `#`, or
+a leading BOM. Env values are valid UTF-8 without Unicode controls, NUL,
+CR/LF, U+2028, or U+2029; other non-control Unicode, spaces, and `=` remain
+valid. Rejecting controls (including tab) and invalid UTF-8 is intentional
+even if a particular backend accepts such a value, because the library will
+not place it in a line-delimited env file. The CLI validates too, but
+first-party validation gives clearer errors and independence from future CLI
+changes.
 
 **Validate inputs**. The shared `WithName` guard and name-addressed
 reaper check use the rule above; label keys (the CLI's Docker/OCI form),
@@ -893,8 +908,10 @@ these follow-up issues are applied.
   `container system status` probe failed too; the message tells the
   user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
-- `ErrPortNotExposed`: querying a port not declared via
-  `WithExposedPorts`
+- `ErrPortNotExposed`: a port was not declared or has no usable host
+  binding
+- `ErrEnvFileUnsupported`: a non-empty environment map needs a secure env
+  file, but the current platform cannot provide per-user secrecy
 - `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
   file
 - `ErrCopyFileFromContainerUnsupported`: the selected backend or host
@@ -903,8 +920,6 @@ these follow-up issues are applied.
   Go 1.23 through 1.25)
 - `ErrInvalidConfig` / `*ConfigError`: a backend-incompatible option
   combination rejected before creation
-- `ErrPortNotExposed`: a port was not declared or has no usable host
-  binding
 - `ErrEndpointUnreachable`: an inspected binding, notably remote-daemon
   loopback, cannot be reached by the client
 - `*CLIError`: any other CLI failure; carries the subcommand, exit

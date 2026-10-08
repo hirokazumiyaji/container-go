@@ -268,6 +268,7 @@ func TestRunRejectsInvalidLabelKey(t *testing.T) {
 }
 
 func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"PASSWORD": "s3cret"}))
 
@@ -284,6 +285,7 @@ func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
 }
 
 func TestRunRemovesEnvFileAfterStart(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"A": "1"}))
 

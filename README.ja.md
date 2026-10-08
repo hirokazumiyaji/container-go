@@ -54,8 +54,6 @@ Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
 - Apple の `Prune` と `PruneReuseGroup` は現在、fresh candidate validation や
   per-name lock なしの list-to-delete path を使う。#98 が Apple cleanup race を
   担当する。
-- 現在の `WithReuse` attach caller は `WithFiles` と `PullAlways` を無視する。
-  #94 がこれらの creation-only side effect を担当する。
 - Windows Docker の bind source と remote Docker の bind source semantics は
   現在の validation path では扱えていません。#76 が host path と remote mount を
   担当します。
@@ -565,8 +563,8 @@ parser は valid だが mismatched な Docker object を no-match として拒�
 
 - `PullMissing`（既定値）はローカルストアを検査し、イメージがないときだけ
   明示的に pull します。
-- `PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求します。
-  現在の `WithReuse` attach ではこの side effect を実行しません（#94）。
+- `PullAlways` は Run の実行ごとに明示的な pull を要求します。
+  `WithReuse` の attach 前にも共有コンテナを返す前に実行されます。
 - `PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck
   を行い、image がない場合は `ErrImageNotFound` を返します。Docker は
   `--pull=never` も渡すため strict な no-fetch 経路がありますが、Apple Container
@@ -733,8 +731,9 @@ func TestReuse(t *testing.T) {
   それを比較できない。Apple では新しい handle ごとに自分の exposed-port
   宣言を共有コンテナ IP へ適用するので、宣言を分離したい場合は名前を変える。
 - `env` / `cmd` / `mounts` の差は既存へ黙って attach する。重要な設定は
-  別の名前を使う。現在のチェックアウトでは `WithFiles` と `PullAlways` は
-  reuse creation path だけで適用され、attach caller では無視される（#94）。
+  別の名前を使う。`WithFiles` は attach caller を含むすべての reuse caller
+  でコピーされます。attach 時のコピー失敗は共有コンテナを削除せずにエラーを
+  返します。`PullAlways` は attach 前にも各 caller で実行されます。
 - このチェックアウトが作成するコンテナは通常 generation label を持ちます。
   ただし、既存の reuse コンテナでは現在の check が managed label と
   creation label のすべてを要求せず、`WithReuse` marker と互換 image

@@ -32,6 +32,12 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- Apply `WithFiles` and `WithPullPolicy(PullAlways)` for every
+  `WithReuse` caller, including attach callers (#94). Pull failures and
+  post-pull image mismatches are returned without replacing a running
+  shared container; creation-only options remain intentionally ignored
+  on attach.
+
 - Synchronize the English and Japanese README/design documents with the
   current pull policies, `Logs`/`FollowLogs` split, operation-specific
   timeouts, reaper limits, backend selection, and CI matrix. Separate the

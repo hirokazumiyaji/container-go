@@ -21,8 +21,8 @@ endpoint refreshes depend on #85, reuse ownership and final generation
 verification depend on #83 and #84, stale Docker operation targeting
 depends on #74, and Docker inspect target validation depends on #103.
 Docker dead-state pruning depends on #113. Apple
-`Prune` list-to-delete cleanup validation depends on #98; WithReuse attach
-side effects depend on #94; missing-inspect classification depends on #103;
+`Prune` list-to-delete cleanup validation depends on #98;
+missing-inspect classification depends on #103;
 error-chain preservation depends on #104; and Apple PullNever capability
 handling depends on #112. Windows and remote bind-source handling depend
 on #76, TCP-only readiness validation on #77, Stop timeout validation on
@@ -236,21 +236,20 @@ described below are not.
   Current bind-source validation is Unix-style; Windows host paths and
   remote Docker bind-source semantics are pending #76.
 - `WithFiles(files ...File)`: files copied into the running container
-  after start; a copy failure rolls back `Run`. On a current `WithReuse`
-  attach, this option is ignored (#94).
+  after start; a copy failure rolls back `Run`. On `WithReuse`, files
+  are copied for every caller, including attach callers; an attach copy
+  failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
   Apple normally uses the container's direct IP, while Docker
   auto-publishes ports declared with `WithExposedPorts` to
   daemon-assigned host ports. Use an explicit binding when a caller
   needs a specific host port.
 - `WithPullPolicy(policy PullPolicy)`: choose `PullMissing` (default),
-  `PullAlways`, or `PullNever`. On the current checkout, a `WithReuse`
-  attach ignores `PullAlways`; only the reuse creation path applies it
-  (#94).
-- `WithReuse()`: make a named `Run` a get-or-create operation. On the
-  current checkout, attach callers do not apply `WithFiles` or
-  `PullAlways`; those side effects are limited to the creation path
-  (#94).
+  `PullAlways`, or `PullNever`. `PullAlways` fetches before attach on
+  `WithReuse` as well as on create.
+- `WithReuse()`: make a named `Run` a get-or-create operation. Attach
+  callers apply `WithFiles` and `PullAlways`. Other creation-only
+  options are ignored on attach.
 - `WithReuseGroup(group string)`: label a reused container for
   `PruneReuseGroup`; it requires `WithReuse` and is not part of the
   reuse key. `PruneReuseGroup` currently uses a weaker validation
@@ -661,12 +660,13 @@ bindings. Apple checks explicit published bindings, but the library's
 Apple inspect model does not retain `WithExposedPorts` declarations, so
 those declarations cannot be compared. Each Apple caller uses its own
 exposed-port declaration against the shared container IP; use distinct
-names when those declarations must be isolated. On the current checkout,
-`WithFiles` and `PullAlways` are applied by the reuse creation path but
-ignored when attaching to an existing shared container (#94). Other
-creation-only differences such as `env`, `cmd`, and `mounts` attach
-silently to the existing container by design; callers needing isolation
-should use distinct names or reset state via `Exec`.
+names when those declarations must be isolated. `WithFiles` is
+copied for every caller, and `PullAlways` fetches the image before
+attach; a failed attach copy returns an error without deleting the
+shared container. Other creation-only differences such as `env`, `cmd`,
+and `mounts` attach silently to the existing container by design;
+callers needing isolation should use distinct names or reset state via
+`Exec`.
 (shared across processes).
 The compatibility check compares the image reference, declared and
 published ports, and the Docker network identity.

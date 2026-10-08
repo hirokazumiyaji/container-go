@@ -54,8 +54,6 @@ backend-specific behavior. In particular:
 - Apple `Prune` and `PruneReuseGroup` currently use a list-to-delete path
   without fresh candidate revalidation or the per-name lock; #98 tracks
   that Apple cleanup race.
-- `WithReuse` attach callers currently ignore `WithFiles` and `PullAlways`;
-  #94 tracks those creation-only side effects.
 - Windows Docker bind sources and remote Docker bind-source semantics are
   not supported by the current validation path; #76 tracks host-path and
   remote-mount handling.
@@ -574,9 +572,8 @@ before starting it:
 
 - `PullMissing` (the default) inspects the local image store and runs an
   explicit pull only when the image is absent.
-- `PullAlways` requests an explicit pull for every new-container
-  attempt. On a `WithReuse` attach, the current checkout does not run
-  this side effect (#94).
+- `PullAlways` requests an explicit pull for every Run attempt,
+  including a `WithReuse` attach before the shared container is returned.
 - `PullNever` is backend-specific: the current checkout performs a
   best-effort precheck and returns `ErrImageNotFound` when it finds no
   image. Docker also passes `--pull=never` and therefore has the strict
@@ -752,9 +749,10 @@ Contract:
   container IP, so use distinct names when those declarations must be
   isolated.
 - `env` / `cmd` / `mounts` differences attach silently by design; use
-  distinct names when they matter. On the current checkout, `WithFiles`
-  and `PullAlways` are applied only by the reuse creation path and are
-  ignored by an attach caller (#94).
+  distinct names when they matter. `WithFiles` is copied for every reuse
+  caller, including attach callers; a failed attach copy returns an error
+  without deleting the shared container. `PullAlways` fetches the image for
+  every caller before attach.
 - Containers created by this checkout normally carry a generation label.
   For an existing reuse container, the current checks require the
   `WithReuse` marker and a compatible image, but do not require the

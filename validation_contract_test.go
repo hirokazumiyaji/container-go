@@ -137,7 +137,7 @@ func TestDockerVolumeGrammarIsCompleteAndBackendNeutral(t *testing.T) {
 	for _, name := range valid {
 		t.Run("valid/"+name, func(t *testing.T) {
 			cfg := &config{mounts: []Mount{{Type: MountVolume, Source: name, Target: "/data"}}}
-			if err := (dockerEngine{}).checkConfig(cfg); err != nil {
+			if err := (dockerEngine{}).checkConfig(context.Background(), cfg); err != nil {
 				t.Fatalf("Docker rejected valid volume name %q: %v", name, err)
 			}
 		})
@@ -147,7 +147,7 @@ func TestDockerVolumeGrammarIsCompleteAndBackendNeutral(t *testing.T) {
 	for _, name := range invalid {
 		t.Run("invalid/"+name, func(t *testing.T) {
 			cfg := &config{mounts: []Mount{{Type: MountVolume, Source: name, Target: "/data"}}}
-			if err := (dockerEngine{}).checkConfig(cfg); !errors.Is(err, ErrInvalidOption) {
+			if err := (dockerEngine{}).checkConfig(context.Background(), cfg); !errors.Is(err, ErrInvalidOption) {
 				t.Fatalf("Docker accepted invalid volume name %q: %v", name, err)
 			}
 		})
@@ -158,7 +158,7 @@ func TestDockerVolumeGrammarIsCompleteAndBackendNeutral(t *testing.T) {
 	if err := (WithMounts(Mount{Type: MountVolume, Source: appleName, Target: "/data"}))(appleCfg); err != nil {
 		t.Fatalf("shared mount validation rejected Apple volume name %q: %v", appleName, err)
 	}
-	if err := (appleEngine{}).checkConfig(appleCfg); err != nil {
+	if err := (appleEngine{}).checkConfig(context.Background(), appleCfg); err != nil {
 		t.Fatalf("Apple rejected one-character volume name: %v", err)
 	}
 }

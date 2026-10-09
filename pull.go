@@ -7,7 +7,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// PullPolicy decides when Run fetches the image.
+// PullPolicy decides when Run fetches the image. PullNever is a
+// backend-specific best-effort precheck on this checkout: Docker passes
+// --pull=never, while Apple Container has no equivalent run-time switch
+// and may resolve the image during its own run path. #112 tracks strict
+// Apple capability handling.
 type PullPolicy int
 
 const (
@@ -15,10 +19,13 @@ const (
 	// backend's local store. This is the default and mirrors the
 	// implicit pull Run always did before.
 	PullMissing PullPolicy = iota
-	// PullAlways fetches the image on every Run.
+	// PullAlways fetches the image on every Run, including a
+	// WithReuse attach before the shared container is returned.
 	PullAlways
-	// PullNever never fetches; Run fails before starting when the
-	// image is absent.
+	// PullNever performs the current backend precheck and returns
+	// ErrImageNotFound when the image is absent. Docker also passes
+	// --pull=never, but Apple Container has no equivalent flag; its
+	// best-effort precheck is not a no-fetch guarantee (#112).
 	PullNever
 )
 
@@ -30,7 +37,8 @@ const (
 )
 
 // WithPullPolicy sets when Run fetches the image. The default is
-// PullMissing.
+// PullMissing. PullAlways is honored for every WithReuse caller,
+// including attach callers.
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {

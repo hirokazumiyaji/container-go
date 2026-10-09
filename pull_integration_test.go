@@ -38,6 +38,9 @@ func isPullCall(args []string) bool {
 // parallel Runs of it: every Run must succeed and the fetch must happen
 // exactly once across all runners.
 func TestIntegrationPullSingleflight(t *testing.T) {
+	// This benchmark owns teardown; do not inherit diagnostic retention
+	// from the caller's environment.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	const n = 10
 	for _, b := range []bench.Backend{bench.DockerBackend(), bench.AppleBackend()} {
 		t.Run(b.Name, func(t *testing.T) {
@@ -53,6 +56,7 @@ func TestIntegrationPullSingleflight(t *testing.T) {
 
 			runners := make([]*countingRunner, n)
 			errs := make([]error, n)
+			containers := make([]*Container, n)
 			var wg sync.WaitGroup
 			for i := range n {
 				runners[i] = newCountingRunner(&cli.ExecRunner{Binary: b.Bin})
@@ -61,14 +65,21 @@ func TestIntegrationPullSingleflight(t *testing.T) {
 					defer wg.Done()
 					ctr, err := Run(context.Background(), image,
 						withRunner(runners[i]), withEngine(eng))
+					containers[i] = ctr
 					if err != nil {
 						errs[i] = err
-						return
 					}
-					_ = ctr.Terminate(context.Background())
 				}()
 			}
 			wg.Wait()
+			for i, ctr := range containers {
+				if ctr == nil {
+					continue
+				}
+				if err := ctr.Terminate(context.Background()); err != nil {
+					t.Logf("terminate run %d: %v", i, err)
+				}
+			}
 
 			pulls := 0
 			for _, r := range runners {
@@ -91,9 +102,16 @@ func TestIntegrationPullSingleflight(t *testing.T) {
 			r := newCountingRunner(&cli.ExecRunner{Binary: b.Bin})
 			ctr, err := Run(context.Background(), image, withRunner(r), withEngine(eng))
 			if err != nil {
+				if ctr != nil {
+					if termErr := ctr.Terminate(context.Background()); termErr != nil {
+						t.Logf("terminate warm run: %v", termErr)
+					}
+				}
 				t.Fatalf("warm run: %v", err)
 			}
-			_ = ctr.Terminate(context.Background())
+			if termErr := ctr.Terminate(context.Background()); termErr != nil {
+				t.Logf("terminate warm run: %v", termErr)
+			}
 			if slices.ContainsFunc(r.recordedArgs(), isPullCall) {
 				t.Error("warm run pulled again")
 			}

@@ -123,8 +123,12 @@ func TestCopyToContainerFilesystemErrorIsNotValidationError(t *testing.T) {
 }
 
 func TestCopyFileFromContainerFilesystemErrorIsNotValidationError(t *testing.T) {
-	f := newTestRunner()
-	ctr := runTestContainer(t, f)
+	skipIfCopyFileOpenUnsupported(t)
+	f := &cpRunner{
+		fakeRunner:  newTestRunner(),
+		materialize: func(string) error { return nil },
+	}
+	ctr := runCopyDockerTestContainer(t, f)
 	f.calls = nil
 
 	_, err := ctr.CopyFileFromContainer(context.Background(), "/missing")

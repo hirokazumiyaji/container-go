@@ -7,6 +7,10 @@ import (
 	"time"
 )
 
+// compositeDrainTimeout bounds collection of child results after a
+// composite context ends; non-cooperative children cannot hold the caller.
+const compositeDrainTimeout = 100 * time.Millisecond
+
 // AllStrategy waits for every strategy, in order.
 type AllStrategy struct {
 	strategies     []Strategy
@@ -20,33 +24,126 @@ func ForAll(strategies ...Strategy) *AllStrategy {
 
 // WithStartupTimeout bounds the total time spent waiting across all
 // strategies in the sequence. A non-positive d leaves the sequence
-// unbounded, relying on each strategy's own startup timeout.
+// unbounded, relying on each strategy's own startup timeout. Negative
+// values retain the original composite-wait compatibility meaning.
 func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 	s.startupTimeout = d
 	return s
 }
 
+func (s *AllStrategy) validate() error {
+	// Negative composite timeouts historically meant unbounded. Keep
+	// that compatibility while still validating every child.
+	return validateStrategies(s.strategies)
+}
+
 func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+
+	callerCtx := ctx
+	waitCtx := ctx
+	var cancel context.CancelFunc
+	var startupDeadline time.Time
 	if s.startupTimeout > 0 {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, s.startupTimeout)
+		startupDeadline = time.Now().Add(s.startupTimeout)
+		waitCtx, cancel = context.WithDeadline(ctx, startupDeadline)
 		defer cancel()
 	}
+	callerDeadline, callerHasDeadline := callerCtx.Deadline()
+	if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, "before waiting"); err != nil {
+		return err
+	}
+
+	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for all")
+	if err != nil {
+		return err
+	}
+
 	for i, strategy := range s.strategies {
-		if err := ctx.Err(); err != nil {
-			if s.startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed before strategy %d ran: %w", s.startupTimeout, i, err)
-			}
+		if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("before strategy %d", i)); err != nil {
 			return err
 		}
-		if err := strategy.WaitUntilReady(ctx, target); err != nil {
-			if s.startupTimeout > 0 && errors.Is(ctx.Err(), context.DeadlineExceeded) {
-				return fmt.Errorf("wait for all: startup timeout %v elapsed in strategy %d: %w", s.startupTimeout, i, err)
+
+		result := make(chan error, 1)
+		go func(strategy Strategy) {
+			result <- strategy.WaitUntilReady(waitCtx, target)
+		}(strategy)
+
+		select {
+		case lifecycleErrValue := <-lifecycleErr:
+			return lifecycleErrValue
+		case err := <-result:
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				return lifecycleErrValue
+			default:
 			}
-			return err
+			if err != nil {
+				term := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i))
+				if term == nil && s.startupTimeout > 0 && !time.Now().Before(startupDeadline) && !callerOwnsDeadline(callerDeadline, callerHasDeadline, startupDeadline) && errors.Is(err, context.DeadlineExceeded) && callerCtx.Err() == nil {
+					// A child can observe the derived deadline just before the
+					// parent context records Err. Treat that boundary as the
+					// composite's startup timeout rather than leaking a generic
+					// child deadline.
+					term = newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in strategy %d", s.startupTimeout, i), context.DeadlineExceeded)
+				}
+				if term != nil {
+					primary := term
+					if cause := errors.Unwrap(term); cause != nil {
+						primary = cause
+					}
+					return newWaitError(fmt.Sprintf("wait for all: %v (strategy %d: %v)", term, i, err), primary, term, err)
+				}
+				return err
+			}
+			if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d", i)); err != nil {
+				return err
+			}
+			if finalErr := finalLifecycleCheck(waitCtx, target, "wait for all"); finalErr != nil {
+				if err := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("after strategy %d final check", i)); err != nil {
+					return errors.Join(err, finalErr)
+				}
+				return finalErr
+			}
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				return lifecycleErrValue
+			default:
+			}
+		case <-waitCtx.Done():
+			term := allContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline, fmt.Sprintf("in strategy %d", i))
+			if term == nil {
+				term = context.Canceled
+			}
+			return drainCompositeResult(result, term)
 		}
 	}
 	return nil
+}
+
+func allContextError(callerCtx, waitCtx context.Context, startupTimeout time.Duration, startupDeadline, callerDeadline time.Time, callerHasDeadline bool, phase string) error {
+	if err := callerCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed %s", phase), err)
+		}
+		return newWaitError(fmt.Sprintf("wait for all: caller context ended %s", phase), err)
+	}
+	if err := waitCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && callerOwnsDeadline(callerDeadline, callerHasDeadline, startupDeadline) {
+			return newWaitError(fmt.Sprintf("wait for all: caller deadline elapsed %s", phase), context.DeadlineExceeded)
+		}
+		if startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
+			return newWaitError(fmt.Sprintf("wait for all: startup timeout %v elapsed in %s", startupTimeout, phase), context.DeadlineExceeded)
+		}
+		return newWaitError(fmt.Sprintf("wait for all: context ended %s", phase), err)
+	}
+	return nil
+}
+
+func callerOwnsDeadline(callerDeadline time.Time, callerHasDeadline bool, startupDeadline time.Time) bool {
+	return callerHasDeadline && !callerDeadline.After(startupDeadline)
 }
 
 // AnyStrategy waits until one of the strategies succeeds.
@@ -62,40 +159,235 @@ func ForAny(strategies ...Strategy) *AnyStrategy {
 
 // WithStartupTimeout bounds the total time spent waiting for any
 // strategy to succeed. A non-positive d leaves the wait unbounded,
-// relying on each strategy's own startup timeout.
+// relying on each strategy's own startup timeout. Negative values
+// retain the original composite-wait compatibility meaning.
 func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	s.startupTimeout = d
 	return s
 }
 
+func (s *AnyStrategy) validate() error {
+	// Negative composite timeouts historically meant unbounded. Keep
+	// that compatibility while still validating every child.
+	return validateStrategies(s.strategies)
+}
+
 func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
+	}
+	callerCtx := ctx
+	if err := callerCtx.Err(); err != nil {
+		return newWaitError("wait for any: caller context ended before waiting", err)
+	}
 	if len(s.strategies) == 0 {
 		return nil
 	}
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
 
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	waitCtx := runCtx
+	var startupDeadline time.Time
 	if s.startupTimeout > 0 {
+		startupDeadline = time.Now().Add(s.startupTimeout)
 		var timeoutCancel context.CancelFunc
-		ctx, timeoutCancel = context.WithTimeout(ctx, s.startupTimeout)
+		waitCtx, timeoutCancel = context.WithDeadline(runCtx, startupDeadline)
 		defer timeoutCancel()
+	}
+	callerDeadline, callerHasDeadline := callerCtx.Deadline()
+
+	lifecycleErr, err := startLifecycleMonitor(waitCtx, target, "wait for any")
+	if err != nil {
+		return err
 	}
 
 	results := make(chan error, len(s.strategies))
 	for _, strategy := range s.strategies {
-		go func() { results <- strategy.WaitUntilReady(ctx, target) }()
+		go func(strategy Strategy) {
+			results <- strategy.WaitUntilReady(waitCtx, target)
+		}(strategy)
 	}
+
 	var errs []error
-	for range s.strategies {
+	remaining := len(s.strategies)
+	for remaining > 0 {
 		select {
+		case lifecycleErrValue := <-lifecycleErr:
+			cancel()
+			return lifecycleErrValue
 		case err := <-results:
+			remaining--
+			select {
+			case lifecycleErrValue := <-lifecycleErr:
+				cancel()
+				return lifecycleErrValue
+			default:
+			}
+			if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
+				cancel()
+				childErrs := drainCompositeResults(results, remaining)
+				return errors.Join(append([]error{terminal}, append(errs, childErrs...)...)...)
+			}
 			if err == nil {
+				if finalErr := finalLifecycleCheck(waitCtx, target, "wait for any"); finalErr != nil {
+					cancel()
+					if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
+						return errors.Join(terminal, finalErr)
+					}
+					return finalErr
+				}
+				select {
+				case lifecycleErrValue := <-lifecycleErr:
+					cancel()
+					return lifecycleErrValue
+				default:
+				}
 				return nil
 			}
 			errs = append(errs, err)
-		case <-ctx.Done():
-			return errors.Join(append(errs, ctx.Err())...)
+		case <-waitCtx.Done():
+			terminalErr := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline)
+			if terminalErr == nil {
+				// A custom Context may close Done without exposing Err.
+				terminalErr = context.Canceled
+			}
+			cancel()
+			childErrs := drainCompositeResults(results, remaining)
+			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func finalLifecycleCheck(ctx context.Context, target Target, what string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, finalLifecycleProbeTimeout)
+	defer cancel()
+	if err := probeCtx.Err(); err != nil {
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+	}
+	state, err := targetState(probeCtx, target)
+	probeErr := probeCtx.Err()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, ctxErr), ctxErr, err)
+	}
+	if probeErr != nil {
+		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, probeErr), probeErr, err)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+	}
+	if terminalWaitState(state) {
+		return stateFailure(what, state, nil, nil)
+	}
+	if state != StateRunning {
+		return fmt.Errorf("%s: final lifecycle state %s; want running", what, state)
+	}
+	return nil
+}
+
+func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-chan error, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("%s: %w", what, err)
+	}
+	lifecycleErr := make(chan error, 1)
+	go func() {
+		var lastStateErr error
+		check := func() bool {
+			probeCtx, cancel := context.WithTimeout(ctx, stateCheckInterval)
+			state, err := targetState(probeCtx, target)
+			probeErr := probeCtx.Err()
+			cancel()
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false
+			}
+			if probeErr != nil {
+				if err != nil {
+					lastStateErr = err
+				}
+				return true
+			}
+			if err != nil {
+				if permanentProbeError(err) {
+					lifecycleErr <- fmt.Errorf("%s: %w", what, err)
+					return false
+				}
+				lastStateErr = err
+				return true
+			}
+			if terminalWaitState(state) {
+				lifecycleErr <- stateFailure(what, state, nil, lastStateErr)
+				return false
+			}
+			return true
+		}
+		if !check() {
+			return
+		}
+		ticker := time.NewTicker(stateCheckInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if !check() {
+					return
+				}
+			}
+		}
+	}()
+	return lifecycleErr, nil
+}
+
+func drainCompositeResult(result <-chan error, contextErr error) error {
+	timer := time.NewTimer(compositeDrainTimeout)
+	defer timer.Stop()
+	select {
+	case childErr := <-result:
+		return errors.Join(contextErr, childErr)
+	case <-timer.C:
+		return contextErr
+	}
+}
+
+func drainCompositeResults(results <-chan error, count int) []error {
+	if count <= 0 {
+		return nil
+	}
+	childErrs := make([]error, 0, count)
+	timer := time.NewTimer(compositeDrainTimeout)
+	defer timer.Stop()
+	for received := 0; received < count; received++ {
+		select {
+		case err := <-results:
+			if err != nil {
+				childErrs = append(childErrs, err)
+			}
+		case <-timer.C:
+			return childErrs
+		}
+	}
+	return childErrs
+}
+
+func anyContextError(callerCtx, waitCtx context.Context, startupTimeout time.Duration, startupDeadline, callerDeadline time.Time, callerHasDeadline bool) error {
+	if err := callerCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return newWaitError("wait for any: caller deadline elapsed", err)
+		}
+		return newWaitError("wait for any: caller context ended", err)
+	}
+	if err := waitCtx.Err(); err != nil {
+		if errors.Is(err, context.DeadlineExceeded) && callerOwnsDeadline(callerDeadline, callerHasDeadline, startupDeadline) {
+			return newWaitError("wait for any: caller deadline elapsed", context.DeadlineExceeded)
+		}
+		if startupTimeout > 0 && errors.Is(err, context.DeadlineExceeded) {
+			return newWaitError(fmt.Sprintf("wait for any: startup timeout %v elapsed", startupTimeout), context.DeadlineExceeded)
+		}
+		return newWaitError("wait for any: context ended", err)
+	}
+	return nil
 }

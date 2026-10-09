@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -20,11 +19,13 @@ type execConfig struct {
 	workdir string
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. It uses the same key and value validation as WithEnv.
+// Exec returns ErrEnvFileUnsupported on Windows.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
-		for k, v := range env {
+		for _, k := range sortedKeys(env) {
+			v := env[k]
 			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
 				return err
 			}
@@ -58,7 +59,7 @@ func WithExecWorkDir(dir string) ExecOption {
 
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error.
-func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
 	for i, opt := range opts {
 		if opt == nil {
 			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
@@ -74,23 +75,49 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
-	var envFile string
-	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
-		if err != nil {
-			return 0, nil, err
-		}
-		defer os.RemoveAll(dir)
-		envFile = path
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return 0, nil, err
 	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	var envFile, envDir string
+	if len(cfg.env) > 0 {
+		path, dir, err := writeEnvFileContext(ctx, cfg.env)
+		if err != nil {
+			if dir != "" {
+				// Preserve ownership when a late root-lock error is
+				// returned with a published env directory.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+			}
+			return 0, nil, err
+		}
+		envFile, envDir = path, dir
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
+	}
+
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	// The CLI has finished reading the env file. Remove it before any
+	// result classification or caller-visible output processing. Retain
+	// envDir for a deferred retry if removal fails, and preserve the error.
+	envCleanupErr := cleanupEnvFileAfterUseContext(ctx, envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
-		return 0, output, nil
+		return 0, output, envCleanupErr
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -98,12 +125,12 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
 	if c.execContainerRunning(ctx) {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
@@ -138,13 +165,7 @@ func execCLIStderr(err error) (string, bool) {
 // running. App-level failures keep their exit code; missing, stopped,
 // or unreachable containers report an error.
 func (c *Container) execContainerRunning(ctx context.Context) bool {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
-	if err != nil {
-		return false
-	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return false
 	}

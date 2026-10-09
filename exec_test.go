@@ -86,7 +86,7 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			execErr:    &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 		},
 	}
 	ctr := runTestContainer(t, f)
@@ -102,7 +102,7 @@ type execMissingRunner struct {
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
 	}
 	return m.execRunner.Run(ctx, args...)
 }
@@ -133,7 +133,7 @@ func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
 			name: "target missing",
 			inspectErr: &cli.CLIError{
 				Args:   []string{"inspect", "myctr"},
-				Stderr: `not found: "myctr"`,
+				Stderr: `Error: container not found: "myctr"`,
 			},
 			wantNotFound: true,
 		},
@@ -219,6 +219,7 @@ func TestExecSuccessAddsNoProbe(t *testing.T) {
 }
 
 func TestExecPassesOptionsAndEnvFile(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := &execRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 

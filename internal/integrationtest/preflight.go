@@ -31,8 +31,29 @@ var selected string
 // started with. Call it before unsetting the variable.
 func SetSelectedBackend(value string) { selected = value }
 
-// SelectedBackend returns the recorded process-level selection.
-func SelectedBackend() string { return selected }
+// SetSelectedBackendForTest overrides the recorded selection and returns a
+// function restoring the previous one. It exists so a test can exercise
+// the selection guards without going through a child process; production
+// callers use SetSelectedBackend from TestMain.
+func SetSelectedBackendForTest(value string) func() {
+	previous := selected
+	selected = value
+	return func() { selected = previous }
+}
+
+// SelectedBackend returns the recorded process-level selection, or the
+// environment variable when nothing was recorded.
+//
+// The fallback is for test binaries that have no TestMain calling
+// SetSelectedBackend - the bench module, for one. A binary that does
+// unset the variable records the value first, so the recorded value wins
+// there and the unset variable cannot blank the selection.
+func SelectedBackend() string {
+	if selected != "" {
+		return selected
+	}
+	return os.Getenv("CONTAINERGO_BACKEND")
+}
 
 // Preflight resolves one backend for an integration suite.
 //
@@ -67,6 +88,21 @@ const (
 	// Fail means the run must not report success.
 	Fail
 )
+
+// String names the verdict, so callers and tests can report it without
+// re-deriving the mapping.
+func (v Verdict) String() string {
+	switch v {
+	case Proceed:
+		return "proceed"
+	case Skip:
+		return "skip"
+	case Fail:
+		return "fail"
+	default:
+		return fmt.Sprintf("verdict(%d)", int(v))
+	}
+}
 
 // Decide reports whether a suite should proceed, skip, or fail.
 //

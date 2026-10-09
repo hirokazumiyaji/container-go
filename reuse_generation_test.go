@@ -36,15 +36,6 @@ func TestTerminateRejectsMissingOrInvalidGeneration(t *testing.T) {
 	}
 }
 
-func TestErrGenerationReplacedDescribesOriginalContainer(t *testing.T) {
-	got := ErrGenerationReplaced.Error()
-	if !strings.Contains(got, "original verified container") {
-		t.Fatalf("ErrGenerationReplaced = %q, want original-container wording", got)
-	}
-	if strings.Contains(strings.ToLower(got), "delete") {
-		t.Fatalf("ErrGenerationReplaced = %q, want operation-level wording", got)
-	}
-}
 
 type generationRunner struct {
 	creation    string
@@ -54,7 +45,7 @@ type generationRunner struct {
 func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		return []byte(`[{"id":"myctr","configuration":{"id":"myctr","image":{"reference":"redis"},"labels":{"` + managedLabel + `":"true","` + sessionLabel + `":"` + sessionID() + `","` + creationLabel + `":"` + g.creation + `"}},"status":{"state":"running","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil
 	case "version":
@@ -111,10 +102,13 @@ func TestDeleteStoppedReuseSkipsUnlabeledReplacement(t *testing.T) {
 func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 	uid := strings.Repeat("0f", 32)
 	info := &engineInfo{
-		state:       StateStopped,
-		uid:         uid,
-		uidVerified: true,
-		labels:      map[string]string{creationLabel: "aaaaaaaaaaaaaaaa"},
+		state: StateStopped,
+		labels: map[string]string{
+			managedLabel:  "true",
+			reuseLabel:    "true",
+			creationLabel: "aaaaaaaaaaaaaaaa",
+		},
+		uid: uid,
 	}
 	r := &dockerGenerationRunner{creation: "aaaaaaaaaaaaaaaa", uid: uid}
 	cfg := &config{runner: r, eng: dockerEngine{}, name: "shared"}
@@ -129,7 +123,7 @@ func TestDeleteStoppedReuseDeletesByImmutableID(t *testing.T) {
 }
 
 func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: `Error: container not found: "myctr"`}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for a missing container", err)
@@ -143,8 +137,8 @@ func TestTerminateFailsClosedWhenInspectFails(t *testing.T) {
 	r := &inspectErrorRunner{stderr: "daemon unavailable"}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	err := ctr.Terminate(context.Background())
-	if !errors.Is(err, ErrGenerationReplaced) || !strings.Contains(err.Error(), "verify generation") {
-		t.Fatalf("Terminate = %v, want ErrGenerationReplaced and verify-generation failure", err)
+	if err == nil || !strings.Contains(err.Error(), "verify generation") {
+		t.Fatalf("Terminate = %v, want verify-generation failure", err)
 	}
 	// Without a verified generation a name-based delete could hit a
 	// same-name replacement, so none may be issued.
@@ -164,9 +158,6 @@ func TestTerminateFailsClosedOnSchemaInvalidInspect(t *testing.T) {
 			err := ctr.Terminate(context.Background())
 			if err == nil {
 				t.Fatal("Terminate = nil, want failure on unreadable inspect output")
-			}
-			if !errors.Is(err, ErrGenerationReplaced) {
-				t.Errorf("Terminate = %v, want ErrGenerationReplaced", err)
 			}
 			if errors.Is(err, ErrContainerNotFound) {
 				t.Errorf("Terminate = %v, want a schema error, not ErrContainerNotFound", err)
@@ -229,7 +220,7 @@ type dockerGenerationRunner struct {
 func (g *dockerGenerationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
+		return []byte(`[{"Id":"` + g.uid + `","Name":"/shared","State":{"Status":"exited"},"Config":{"Image":"redis","Labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true","` + creationLabel + `":"` + g.creation + `"}},"NetworkSettings":{}}]`), nil, nil
 	case "info":
 		return []byte("ok"), nil, nil
 	case "rm":
@@ -249,10 +240,11 @@ type generationStateRunner struct {
 func (g *generationStateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
-		labels := ""
+		labels := `,"labels":{"` + managedLabel + `":"true","` + reuseLabel + `":"true"`
 		if g.creation != "" {
-			labels = `,"labels":{"` + creationLabel + `":"` + g.creation + `"}`
+			labels += `,"` + creationLabel + `":"` + g.creation + `"`
 		}
+		labels += `}`
 		return []byte(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis"}` + labels + `},"status":{"state":"` + g.state + `","networks":[]}}]`), nil, nil
 	case "system":
 		return []byte("running"), nil, nil

@@ -24,6 +24,15 @@ type flight[T any] struct {
 }
 
 func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error)) (T, error) {
+	value, _, err := g.doWithLeader(ctx, key, fn)
+	return value, err
+}
+
+// doWithLeader is the role-aware form used when a successful shared result
+// can carry a warning. The bool is true only for the caller that created the
+// in-flight entry; all callers that joined it receive false. The result and
+// error are still shared exactly as in do.
+func (g *flightGroup[T]) doWithLeader(ctx context.Context, key string, fn func() (T, error)) (T, bool, error) {
 	g.mu.Lock()
 	if g.inflight == nil {
 		g.inflight = map[string]*flight[T]{}
@@ -34,7 +43,8 @@ func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error
 		if onJoin != nil {
 			onJoin(key)
 		}
-		return g.wait(ctx, f)
+		value, err := g.wait(ctx, f)
+		return value, false, err
 	}
 	f := &flight[T]{done: make(chan struct{})}
 	g.inflight[key] = f
@@ -53,7 +63,8 @@ func (g *flightGroup[T]) do(ctx context.Context, key string, fn func() (T, error
 		f.val, f.err = fn()
 	}()
 
-	return g.wait(ctx, f)
+	value, err := g.wait(ctx, f)
+	return value, true, err
 }
 
 func (g *flightGroup[T]) wait(ctx context.Context, f *flight[T]) (T, error) {

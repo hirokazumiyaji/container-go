@@ -4,9 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
-	"os"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -21,13 +19,15 @@ type execConfig struct {
 	workdir string
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. It uses the same key and value validation as WithEnv.
+// Exec returns ErrEnvFileUnsupported on Windows.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
-		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("invalid exec environment variable %q", k)
+		for _, k := range sortedKeys(env) {
+			v := env[k]
+			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
+				return err
 			}
 			c.env[k] = v
 		}
@@ -39,7 +39,7 @@ func WithExecEnv(env map[string]string) ExecOption {
 func WithExecUser(u string) ExecOption {
 	return func(c *execConfig) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid exec user %q", u)
+			return validationErrorf("WithExecUser", u, "invalid exec user %q", u)
 		}
 		c.user = u
 		return nil
@@ -50,7 +50,7 @@ func WithExecUser(u string) ExecOption {
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("exec working directory %q must be an absolute path", dir)
+			return validationErrorf("WithExecWorkDir", dir, "exec working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
 		return nil
@@ -59,9 +59,14 @@ func WithExecWorkDir(dir string) ExecOption {
 
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error.
-func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
+	for i, opt := range opts {
+		if opt == nil {
+			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
+		}
+	}
 	if len(cmd) == 0 {
-		return 0, nil, errors.New("exec: command must not be empty")
+		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")
 	}
 	cfg := &execConfig{env: map[string]string{}}
 	for _, opt := range opts {
@@ -69,28 +74,50 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 			return 0, nil, err
 		}
 	}
+
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return 0, nil, err
 	}
 
-	var envFile string
+	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
+		path, dir, err := writeEnvFileContext(ctx, cfg.env)
 		if err != nil {
+			if dir != "" {
+				// Preserve ownership when a late root-lock error is
+				// returned with a published env directory.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+			}
 			return 0, nil, err
 		}
-		defer os.RemoveAll(dir)
-		envFile = path
+		envFile, envDir = path, dir
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
 	}
 
 	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	// The CLI has finished reading the env file. Remove it before any
+	// result classification or caller-visible output processing. Retain
+	// envDir for a deferred retry if removal fails, and preserve the error.
+	envCleanupErr := cleanupEnvFileAfterUseContext(ctx, envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
-		return 0, output, nil
+		return 0, output, envCleanupErr
 	}
 	if !cli.IsCommandExit(err) {
-		return 0, nil, wrapNotFound(c.classify(ctx, err))
+		return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 	}
 	var cliErr *cli.CLIError
 	errors.As(err, &cliErr)
@@ -98,16 +125,16 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
 	state, inspectErr := c.verifyExecContainer(ctx)
 	if inspectErr != nil {
-		return 0, nil, errors.Join(err, inspectErr)
+		return 0, nil, joinEnvFileCleanupError(errors.Join(err, inspectErr), envCleanupErr)
 	}
 	if state == StateRunning {
-		return cliErr.ExitCode, output, nil
+		return cliErr.ExitCode, output, envCleanupErr
 	}
-	return 0, nil, wrapNotFound(c.classify(ctx, err))
+	return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
 }
 
 // maybeInfraExecErr reports whether an exec CLIError could be about the
@@ -142,7 +169,7 @@ func execCLIStderr(err error) (string, bool) {
 // precise inspect error for callers that need to distinguish a missing
 // container from malformed or otherwise unusable output.
 func (c *Container) verifyExecContainer(ctx context.Context) (State, error) {
-	info, err := c.inspectFresh(ctx)
+	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}

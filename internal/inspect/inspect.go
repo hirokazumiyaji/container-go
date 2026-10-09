@@ -4,6 +4,7 @@
 package inspect
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/netip"
 
@@ -20,11 +21,41 @@ type Container struct {
 type Configuration struct {
 	Image          Image             `json:"image"`
 	Labels         map[string]string `json:"labels"`
+	Platform       Platform          `json:"platform"`
 	PublishedPorts []PublishedPort   `json:"publishedPorts"`
 }
 
 type Image struct {
 	Reference string `json:"reference"`
+}
+
+type Platform struct {
+	OS           string `json:"os"`
+	Architecture string `json:"architecture"`
+	Variant      string `json:"variant"`
+
+	// Presence bits distinguish an omitted field from an explicitly empty
+	// field. The latter is still incomplete metadata, not a wildcard.
+	OSPresent      bool `json:"-"`
+	ArchPresent    bool `json:"-"`
+	VariantPresent bool `json:"-"`
+}
+
+func (p *Platform) UnmarshalJSON(data []byte) error {
+	type plain Platform
+	var decoded plain
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	*p = Platform(decoded)
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	_, p.OSPresent = fields["os"]
+	_, p.ArchPresent = fields["architecture"]
+	_, p.VariantPresent = fields["variant"]
+	return nil
 }
 
 type PublishedPort struct {
@@ -64,8 +95,9 @@ func Decode(data []byte) ([]Container, error) {
 	return containers, nil
 }
 
-// IPv4 returns the container's address on its first attached network,
-// without the CIDR suffix.
+// IPv4 returns the address from the first network in this Apple inspect
+// model, without the CIDR suffix. Docker's multi-network selection is
+// handled separately and is unspecified when no top-level address exists.
 func (c Container) IPv4() (string, error) {
 	if len(c.Status.Networks) == 0 {
 		return "", fmt.Errorf("container %s has no attached networks", c.ID)

@@ -3,8 +3,11 @@ package container
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
@@ -16,31 +19,401 @@ type CLIError = cli.CLIError
 // not running. Start it with `container system start`.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrLogStreamSetup reports that a log stream cannot be started with the
+// configured runner or backend executable and will not be retried.
+var ErrLogStreamSetup = wait.ErrLogStreamSetup
+
+// ErrInvalidConfiguration reports a wait strategy that cannot run with
+// the options supplied to Run.
+var ErrInvalidConfiguration = wait.ErrInvalidConfiguration
+
+// ErrInvalidConfig reports an option combination that the selected
+// backend cannot honor. Run returns it as a *ConfigError.
+var ErrInvalidConfig = errors.New("invalid container configuration")
+
+// ConfigError describes an invalid option combination before container
+// creation. Callers can use errors.As to inspect the backend, network,
+// and option involved.
+type ConfigError struct {
+	Backend string
+	Network string
+	Option  string
+	Detail  string
+}
+
+func (e *ConfigError) Error() string {
+	scope := "container"
+	if e.Backend != "" {
+		scope = e.Backend
+	}
+	message := ErrInvalidConfig.Error() + ": " + scope + " configuration"
+	if e.Network != "" {
+		message += fmt.Sprintf(" for network %q", e.Network)
+	}
+	if e.Option != "" {
+		message += " (" + e.Option + ")"
+	}
+	if e.Detail != "" {
+		message += ": " + e.Detail
+	}
+	return message
+}
+
+func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
+
 // ErrPortNotExposed reports a port that was not declared via
-// WithExposedPorts.
-var ErrPortNotExposed = errors.New("port not declared via WithExposedPorts")
+// WithExposedPorts or WithPublishedPort, or that has no usable host
+// binding in the backend's actual network mode.
+var ErrPortNotExposed = wait.ErrPortNotExposed
+
+// ErrEndpointUnreachable reports an inspected host binding that cannot
+// be reached by this client, such as loopback on a remote Docker daemon.
+var ErrEndpointUnreachable = errors.New("container endpoint is unreachable")
+
+// ErrNetworkMismatch reports that the network reported by inspect does
+// not match the network requested for the handle.
+var ErrNetworkMismatch = errors.New("container network mode does not match the requested network")
+
+// ErrNoReachableHost reports a backend network that has no host endpoint.
+var ErrNoReachableHost = errors.New("container has no reachable host")
+
+// ErrInvalidOption identifies an invalid public option, operation argument,
+// or option value. Callers can use errors.Is without matching the
+// human-readable message, or use errors.As with *ValidationError for field
+// metadata.
+var ErrInvalidOption = errors.New("invalid option")
+
+// ValidationError describes a public input rejected before a backend
+// operation starts.
+//
+// Option names the public option or operation. Field names the exact input
+// field, such as "key", "value", "hostPath", or "containerPath". Value is
+// the rejected value when it is safe to expose; values that may contain
+// credentials or other sensitive material are represented by nil. Message is
+// retained for source compatibility, but Err is the source of truth for the
+// rendered message and the error chain.
+type ValidationError struct {
+	Option  string
+	Field   string
+	Value   any
+	Message string
+	Err     error
+}
+
+func (e *ValidationError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	// Derive the message from Err so callers cannot make Message and Err
+	// disagree by mutating the exported compatibility field.
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	if e.Message != "" {
+		return e.Message
+	}
+	return ErrInvalidOption.Error()
+}
+
+// Unwrap preserves an underlying parse or validation error when one is
+// available. Is classifies every ValidationError as ErrInvalidOption.
+func (e *ValidationError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+func (e *ValidationError) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	if target == ErrInvalidOption {
+		return true
+	}
+	return e.Err != nil && errors.Is(e.Err, target)
+}
+
+func newValidationError(option string, value any, err error) error {
+	return newValidationErrorWithField(option, option, value, err)
+}
+
+func newValidationErrorWithField(option, field string, value any, err error) error {
+	if err == nil {
+		err = ErrInvalidOption
+	}
+	var existing *ValidationError
+	if errors.As(err, &existing) {
+		return err
+	}
+	return &ValidationError{
+		Option:  option,
+		Field:   field,
+		Value:   value,
+		Message: err.Error(),
+		Err:     err,
+	}
+}
+
+func validationErrorf(option string, value any, format string, args ...any) error {
+	return newValidationError(option, value, fmt.Errorf(format, args...))
+}
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
+// ErrEnvFileUnsupported reports that the current platform cannot provide
+// the per-user private temporary storage required for environment files.
+// On Windows, Run and Exec return this error when a non-empty WithEnv or
+// WithExecEnv option would require such a file.
+var ErrEnvFileUnsupported = errors.New("secure environment files are not supported on this platform")
+
 // ErrContainerNotFound reports that the container does not exist.
-// Inspect, State, Exec, and Logs wrap it with %w so callers can use
-// errors.Is instead of matching CLI stderr text.
-var ErrContainerNotFound = errors.New("container not found")
+// Inspect, State, Exec, Logs, and FollowLogs wrap it with %w so callers can use
+// errors.Is instead of matching CLI stderr text. For FollowLogs,
+// a failure after the stream has started is reported by Read.
+var ErrContainerNotFound = wait.ErrContainerNotFound
 
-// ErrGenerationReplaced reports that an operation could not prove it was
-// acting on the original verified container and therefore failed closed.
-var ErrGenerationReplaced = errors.New("operation requires the original verified container")
+// ErrGenerationReplaced reports that a handle's immutable identity or
+// generation no longer matches the live container. Destructive and endpoint
+// operations refuse to act on the replacement.
+var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
-// isNotFound reports whether a CLI failure means the container does not
-// exist. Matching substrings live on each engine (see engine_*.go).
-func isNotFound(err error) bool {
+// ErrCopyFileNotRegular reports that a file copied out of a container
+// was not a regular file. Callers should not consume paths that resolve
+// to directories, links, or other special files.
+var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
+
+// ErrCopyFileFromContainerUnsupported reports that the selected backend
+// or host cannot safely perform a file copy-out. This includes Docker
+// client/server versions below the supported copy-out minimum. The method
+// fails before invoking `cp` when the backend, host, or version cannot
+// preserve and validate file types.
+var ErrCopyFileFromContainerUnsupported = errors.New("CopyFileFromContainer is not safely supported by this backend or host")
+
+// ErrUnsupportedCapability reports a configuration that the selected
+// backend cannot support safely, such as a bind mount whose source the
+// remote daemon would resolve on its own host. Every rejection of that class
+// wraps this sentinel, so callers detect it uniformly with errors.Is.
+var ErrUnsupportedCapability = errors.New("unsupported capability")
+
+// cliCommandParts returns the backend command and its arguments from a
+// CLI error. Backend matchers use this to avoid treating an unrelated
+// "not found" (for example, a missing volume plugin) as a missing
+// container.
+func cliCommandParts(err error) (command string, args []string, ok bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || len(cliErr.Args) == 0 {
+		return "", nil, false
+	}
+	return strings.ToLower(cliErr.Args[0]), cliErr.Args[1:], true
+}
+
+func cliBinaryMatches(got, want string) bool {
+	got = strings.TrimSpace(strings.ToLower(got))
+	if got == "" {
+		return want == "container"
+	}
+	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
+		got = got[i+1:]
+	}
+	return got == strings.ToLower(want)
+}
+
+func cliErrorBelongsTo(err error, backend string) bool {
+	var cliErr *cli.CLIError
+	return errors.As(err, &cliErr) && cliBinaryMatches(cliErr.Binary, backend)
+}
+
+func cliCommandTarget(command string, args []string) string {
+	switch command {
+	case "run":
+		for i, arg := range args {
+			if arg == "--name" && i+1 < len(args) {
+				return strings.Trim(strings.TrimSpace(args[i+1]), `"'`)
+			}
+			if strings.HasPrefix(arg, "--name=") {
+				return strings.Trim(strings.TrimSpace(strings.TrimPrefix(arg, "--name=")), `"'`)
+			}
+		}
+	case "rm", "delete":
+		for i := len(args) - 1; i >= 0; i-- {
+			if strings.HasPrefix(args[i], "-") {
+				continue
+			}
+			return strings.Trim(strings.TrimSpace(args[i]), `"'`)
+		}
+	case "stop":
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			if !strings.HasPrefix(arg, "-") {
+				return strings.Trim(strings.TrimSpace(arg), `"'`)
+			}
+			option := arg
+			if equal := strings.IndexByte(option, '='); equal >= 0 {
+				option = option[:equal]
+			}
+			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
+				i++
+			}
+		}
+	case "cp":
+		for _, arg := range args {
+			if before, _, ok := strings.Cut(arg, ":"); ok && before != "" && !strings.Contains(before, string(os.PathSeparator)) && !isWindowsDriveLetter(before) {
+				return strings.Trim(strings.TrimSpace(before), `"'`)
+			}
+		}
+	case "inspect", "exec", "logs":
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			if !strings.HasPrefix(arg, "-") {
+				return strings.Trim(strings.TrimSpace(arg), `"'`)
+			}
+
+			// Options that take a separate value must consume that value
+			// before the target scan. In particular, Apple logs uses
+			// `-n 1000 <id>`; returning "1000" would make a target-qualified
+			// not-found error look like a backend/container identity error.
+			option := arg
+			if equal := strings.IndexByte(option, '='); equal >= 0 {
+				option = option[:equal]
+			}
+			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
+				if i+1 >= len(args) {
+					return ""
+				}
+				i++
+			}
+		}
+	}
+	return ""
+}
+
+// isWindowsDriveLetter reports whether s is the drive of a Windows host path
+// such as C:\tmp. Container names and IDs are never a single letter.
+func isWindowsDriveLetter(s string) bool {
+	return len(s) == 1 && ('a' <= s[0] && s[0] <= 'z' || 'A' <= s[0] && s[0] <= 'Z')
+}
+
+func cliOptionTakesValue(option string) bool {
+	switch option {
+	case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--until",
+		"--platform", "--format", "--size", "--type", "--filter", "-n":
+		return true
+	default:
+		return false
+	}
+}
+
+func cliErrorLines(err error) ([]string, bool) {
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return nil, false
+	}
+	var lines []string
+	for _, line := range strings.Split(cliErr.Stderr, "\n") {
+		line = normalizeCLIErrorLine(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines, true
+}
+
+func normalizeCLIErrorLine(line string) string {
+	line = strings.ToLower(strings.Trim(line, "\x00 \t\r\n"))
+	for {
+		changed := false
+		for _, prefix := range []string{"docker: ", "container: ", "error response from daemon: ", "error: "} {
+			if strings.HasPrefix(line, prefix) {
+				line = strings.Trim(strings.TrimPrefix(line, prefix), "\x00 \t\r\n")
+				changed = true
+				break
+			}
+		}
+		if !changed {
+			return line
+		}
+	}
+}
+
+func hasCLIErrorLine(err error, match func(string) bool) bool {
+	lines, ok := cliErrorLines(err)
+	if !ok {
+		return false
+	}
+	for _, line := range lines {
+		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func cliTargetListMatches(rest, want string) bool {
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return false
+	}
+	found := false
+	for _, part := range strings.Split(rest, ",") {
+		part = strings.Trim(strings.TrimSpace(part), `"'`)
+		if part == "" || strings.ContainsAny(part, " \t\r\n") {
+			return false
+		}
+		if want == "" || strings.EqualFold(part, strings.Trim(want, `"'`)) {
+			found = true
+		}
+	}
+	return found
+}
+
+// isNotFoundFor applies the selected backend's operation-aware matcher.
+func isNotFoundFor(eng engine, err error) bool {
+	if err == nil {
+		return false
+	}
 	if errors.Is(err, ErrContainerNotFound) {
 		return true
 	}
-	return appleEngine{}.containerMissing(err) || dockerEngine{}.containerMissing(err)
+	if eng == nil {
+		return isNotFound(err)
+	}
+	return eng.containerMissing(err)
+}
+
+// isNotFound is retained for callers that do not have an engine context.
+// It still selects a backend from the CLI error and uses the same
+// operation-aware matcher.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		return true
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) {
+		return false
+	}
+	if cliBinaryMatches(cliErr.Binary, "docker") {
+		return (dockerEngine{}).containerMissing(err)
+	}
+	return (appleEngine{}).containerMissing(err)
+}
+
+// wrapNotFoundFor converts a classified CLI not-found failure into
+// ErrContainerNotFound for the selected backend.
+func wrapNotFoundFor(eng engine, err error) error {
+	if eng == nil {
+		return wrapNotFound(err)
+	}
+	if err == nil || !isNotFoundFor(eng, err) || errors.Is(err, ErrContainerNotFound) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
 }
 
 // wrapNotFound converts a classified CLI not-found failure into

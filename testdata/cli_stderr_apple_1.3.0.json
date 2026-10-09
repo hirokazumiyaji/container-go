@@ -1,0 +1,79 @@
+[
+  {
+    "name": "typed_inspect_not_found",
+    "operation": "inspect",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"container not found: myctr\"",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_inspect_internal_cause",
+    "operation": "inspect",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to list containers\" (cause: \"notFound: \\\"container not found: myctr\\\"\")",
+    "containerMissing": true
+  },
+  {
+    "name": "direct_exec_get_failed",
+    "operation": "exec",
+    "target": "myctr",
+    "stderr": "Error: get failed: container myctr not found",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_inspect_internal_cause_unescaped",
+    "operation": "inspect",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to list containers\" (cause: \"notFound: \"container not found: myctr\"\")",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_exec_get_failed",
+    "operation": "exec",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"get failed: container myctr not found\"",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_exec_internal_cause",
+    "operation": "exec",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to get container\" (cause: \"notFound: \\\"get failed: container myctr not found\\\"\")",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_delete_internal_cause",
+    "operation": "delete",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to delete container\" (cause: \"notFound: \\\"container not found: myctr\\\"\")",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_logs_internal_cause",
+    "operation": "logs",
+    "target": "myctr",
+    "stderr": "Error: internalError: \"failed to get logs for container myctr\" (cause: \"notFound: \\\"container not found: myctr\\\"\")",
+    "containerMissing": true
+  },
+  {
+    "name": "typed_exec_error_on_inspect",
+    "operation": "inspect",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"get failed: container myctr not found\"",
+    "containerMissing": false
+  },
+  {
+    "name": "application_typed_not_found",
+    "operation": "exec",
+    "target": "myctr",
+    "stderr": "Error: application: notFound: \"container not found: myctr\"",
+    "containerMissing": false
+  },
+  {
+    "name": "typed_wrong_target",
+    "operation": "inspect",
+    "target": "myctr",
+    "stderr": "Error: notFound: \"container not found: other\"",
+    "containerMissing": false
+  }
+]

@@ -62,6 +62,77 @@ func TestDockerRunArgsSkipAutoPublishForExplicitlyPublished(t *testing.T) {
 	}
 }
 
+func TestDockerRemoteLoopbackPublishReturnsValidationError(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://remote.example:2375")
+	cfg := dockerTestConfig(t, WithPublishedPort("127.0.0.1:18080:80"))
+
+	check := func(err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("remote loopback publish was accepted")
+		}
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("error = %T %v, want *ValidationError", err, err)
+		}
+		if !errors.Is(err, ErrInvalidOption) {
+			t.Fatalf("error = %v, want ErrInvalidOption", err)
+		}
+		if validationErr.Option != "WithPublishedPort" {
+			t.Errorf("validation option = %q, want WithPublishedPort", validationErr.Option)
+		}
+	}
+
+	check((dockerEngine{}).checkConfig(context.Background(), cfg))
+
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithPublishedPort("127.0.0.1:18080:80"),
+		withRunner(f), withEngine(dockerEngine{}))
+	check(err)
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called before remote-publish validation: %v", f.calls)
+	}
+}
+
+func TestDockerRejectsOneCharacterVolumeNameBeforeBackend(t *testing.T) {
+	mount := Mount{Type: MountVolume, Source: "x", Target: "/data"}
+	cfg := dockerTestConfig(t, WithMounts(mount))
+
+	check := func(err error) {
+		t.Helper()
+		if err == nil {
+			t.Fatal("one-character Docker volume name was accepted")
+		}
+		var validationErr *ValidationError
+		if !errors.As(err, &validationErr) {
+			t.Fatalf("error = %T %v, want *ValidationError", err, err)
+		}
+		if !errors.Is(err, ErrInvalidOption) {
+			t.Fatalf("error = %v, want ErrInvalidOption", err)
+		}
+		if validationErr.Option != "WithMounts" || validationErr.Field != "mount" {
+			t.Errorf("validation option/field = %q/%q, want WithMounts/mount", validationErr.Option, validationErr.Field)
+		}
+	}
+
+	check((dockerEngine{}).checkConfig(context.Background(), cfg))
+
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithMounts(mount), withRunner(f), withEngine(dockerEngine{}))
+	check(err)
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called before Docker volume validation: %v", f.calls)
+	}
+
+	// The common grammar remains permissive enough for Apple Container,
+	// which accepts one-character volume names.
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
+		t.Fatalf("Apple backend rejected one-character volume name: %v", err)
+	}
+}
+
 func TestDockerRunArgsCarryCommonFlags(t *testing.T) {
 	cfg := dockerTestConfig(t,
 		WithCPUs(2), WithMemory("512M"), WithUser("nobody"),

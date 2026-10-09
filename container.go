@@ -201,8 +201,17 @@ func (c *Container) setImmutableID(uid string) {
 // switches to get-or-create; see WithReuse for the shared-handle
 // lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (result *Container, retErr error) {
+	// Validate the public image before applying options. Option functions
+	// are user-provided code and may have side effects or return errors;
+	// an invalid image must have a deterministic, side-effect-free result.
+	if err := validateImageReference(image); err != nil {
+		return nil, err
+	}
 	cfg := newConfig()
-	for _, opt := range opts {
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, validationErrorf("Run", i, "option %d is nil", i)
+		}
 		if err := opt(cfg); err != nil {
 			return nil, err
 		}
@@ -216,14 +225,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			return nil, err
 		}
 	}
-	if !imageRE.MatchString(image) {
-		return nil, fmt.Errorf("invalid image reference %q", image)
-	}
-	if cfg.reuse && cfg.name == "" {
-		return nil, fmt.Errorf("WithReuse requires WithName")
-	}
-	if cfg.reuseGroup != "" && !cfg.reuse {
-		return nil, fmt.Errorf("WithReuseGroup requires WithReuse")
+	if err := cfg.validate(); err != nil {
+		return nil, err
 	}
 	if cfg.eng == nil {
 		eng, err := detectEngine()
@@ -739,6 +742,10 @@ func (c *Container) State(ctx context.Context) (State, error) {
 // backends accept whole seconds, positive sub-second timeouts are rounded up;
 // zero requests immediate termination.
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Stop", "timeout", *timeout,
+			fmt.Errorf("stop timeout must be >= 0, got %s", *timeout))
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
@@ -888,14 +895,14 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
 // to the port clients should dial.
 func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
-	_, p, err := c.resolve(ctx, port)
+	_, p, err := c.resolve(ctx, port, "MappedPort")
 	return p, err
 }
 
 // Endpoint returns "host:port" for a port declared via WithExposedPorts
 // or WithPublishedPort. It does not infer a host-network service port.
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
-	host, p, err := c.resolve(ctx, port)
+	host, p, err := c.resolve(ctx, port, "Endpoint")
 	if err != nil {
 		return "", err
 	}
@@ -903,10 +910,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 }
 
 // resolve maps a container port to the (host, port) pair to dial.
-func (c *Container) resolve(ctx context.Context, port string) (string, int, error) {
+func (c *Container) resolve(ctx context.Context, port, operation string) (string, int, error) {
 	spec, err := parsePortSpec(port)
 	if err != nil {
-		return "", 0, err
+		return "", 0, newValidationErrorWithField(operation, "port", port, err)
 	}
 	var published *publishSpec
 	for i := range c.published {

@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"strings"
 
@@ -25,10 +24,11 @@ type execConfig struct {
 // Exec returns ErrEnvFileUnsupported on Windows.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
-		if key, _, err := firstInvalidEnv(env); err != nil {
-			return fmt.Errorf("invalid exec environment variable %q: %w", key, err)
-		}
-		for k, v := range env {
+		for _, k := range sortedKeys(env) {
+			v := env[k]
+			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
+				return err
+			}
 			c.env[k] = v
 		}
 		return nil
@@ -39,7 +39,7 @@ func WithExecEnv(env map[string]string) ExecOption {
 func WithExecUser(u string) ExecOption {
 	return func(c *execConfig) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid exec user %q", u)
+			return validationErrorf("WithExecUser", u, "invalid exec user %q", u)
 		}
 		c.user = u
 		return nil
@@ -50,7 +50,7 @@ func WithExecUser(u string) ExecOption {
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("exec working directory %q must be an absolute path", dir)
+			return validationErrorf("WithExecWorkDir", dir, "exec working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
 		return nil
@@ -60,8 +60,13 @@ func WithExecWorkDir(dir string) ExecOption {
 // Exec runs a command in the container and returns its exit code and
 // combined output. A non-zero exit code is a result, not an error.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
+	for i, opt := range opts {
+		if opt == nil {
+			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
+		}
+	}
 	if len(cmd) == 0 {
-		return 0, nil, errors.New("exec: command must not be empty")
+		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")
 	}
 	cfg := &execConfig{env: map[string]string{}}
 	for _, opt := range opts {

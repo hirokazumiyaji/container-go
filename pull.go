@@ -42,7 +42,7 @@ const (
 func WithPullPolicy(policy PullPolicy) Option {
 	return func(c *config) error {
 		if policy < PullMissing || policy > PullNever {
-			return fmt.Errorf("invalid pull policy %d", policy)
+			return validationErrorf("WithPullPolicy", policy, "invalid pull policy %d", policy)
 		}
 		c.pullPolicy = policy
 		return nil
@@ -54,8 +54,8 @@ func WithPullPolicy(policy PullPolicy) Option {
 // caller whose context is cancelled stops waiting without affecting
 // the others.
 func Pull(ctx context.Context, image string) error {
-	if !imageRE.MatchString(image) {
-		return fmt.Errorf("invalid image reference %q", image)
+	if err := validateImageReference(image); err != nil {
+		return err
 	}
 	eng, err := detectEngine()
 	if err != nil {

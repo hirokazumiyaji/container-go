@@ -86,12 +86,34 @@ func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine) (s
 	}
 }
 
-// checkConfig rejects publish options that Docker cannot honor before
-// any image or container command is issued. Named networks are
-// inspected because Docker's externally isolated networks cannot provide
-// the host endpoints promised by WithExposedPorts or
-// WithPublishedPort.
+// dockerVolumeNameRE is Docker's complete local-volume name grammar:
+// an alphanumeric first character followed by at least one name character.
+var dockerVolumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
+
+// checkConfig rejects options Docker cannot honor before any image or
+// container command is issued, including volume names and publish
+// options that cannot be honored on the selected network.
 func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
+	// Docker's local volume driver adds a minimum length to the shared name
+	// grammar. Apple Container accepts names (for example, one-character
+	// names) that Docker rejects, so this check stays backend-specific.
+	for _, m := range cfg.mounts {
+		if m.Type != MountVolume {
+			continue
+		}
+		if len(m.Source) > maxVolumeNameBytes {
+			return mountValidationErrorf(m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
+		}
+		if m.Source == "" {
+			return mountValidationErrorf(m, "volume name must not be empty")
+		}
+		if len(m.Source) == 1 {
+			return mountValidationErrorf(m, "volume name %q is too short, names should be at least two alphanumeric characters", m.Source)
+		}
+		if !dockerVolumeNameRE.MatchString(m.Source) {
+			return mountValidationErrorf(m, "invalid volume name %q", m.Source)
+		}
+	}
 	network := cfg.network
 	if !cfg.networkExplicit {
 		network = ""
@@ -126,7 +148,7 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 					Option:  "WithPublishedPort",
 					Detail:  fmt.Sprintf("published port %q binds loopback on a remote DOCKER_HOST and would be unreachable", p.raw),
 				}
-				return errors.Join(err, ErrEndpointUnreachable)
+				return newValidationError("WithPublishedPort", p.raw, errors.Join(err, ErrEndpointUnreachable))
 			}
 		}
 	}

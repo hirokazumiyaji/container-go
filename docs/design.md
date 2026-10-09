@@ -270,6 +270,28 @@ omitted. There is no public logger-injection option. For log consumers,
 `FollowLogs` returns a stream and `Logs`/`LogsWithOptions` return
 snapshots.
 
+### Public input validation
+
+Public calls reject invalid inputs before starting a backend operation. An
+input that is known to be invalid returns an error matching
+`ErrInvalidOption`; callers that need details can declare a
+`*container.ValidationError` and pass its address to `errors.As`.
+`ValidationError.Option` identifies the public option or operation, and
+`Field` identifies the exact
+field such as `key`, `value`, `hostPath`, or `containerPath`. `Value` is
+populated only for values that are safe to expose. Environment and label
+values are never copied into the typed error or rendered diagnostic when
+they are rejected.
+
+`ValidationError.Err` is the source of truth for the rendered message and
+unwrap chain. The exported `Message` field remains for source compatibility
+but does not override `Err`. `Run` validates its image before invoking any
+`Option`; `WithFiles` resolves and stats each host path before image or
+container work; Docker applies its complete local-volume-name grammar in
+`checkConfig` while Apple keeps its backend-specific name rules. Copy paths
+are interpreted as POSIX paths with the `path` package, and a negative
+`Container.Stop` timeout is rejected before the CLI is called.
+
 ### The Container handle
 
 The following signature inventory includes current-development methods. It is

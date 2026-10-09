@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/portspec"
@@ -15,6 +16,15 @@ import (
 
 // Option configures Run.
 type Option func(*config) error
+
+const (
+	// maxMemoryBytes is a portable, backend-neutral ceiling. Individual
+	// backends may enforce a smaller capability limit in checkConfig.
+	maxMemoryBytes     uint64 = 1 << 50 // 1 PiB
+	maxVolumeNameBytes        = 255
+	maxMountPathBytes         = 4096
+	maxReuseGroupBytes        = 128
+)
 
 type config struct {
 	runner          cli.Runner
@@ -56,6 +66,21 @@ func newConfig() *config {
 		env:    map[string]string{},
 		labels: map[string]string{},
 	}
+}
+
+// validate checks invariants that depend on more than one option. Scalar
+// option values are validated when their option is applied; keeping those
+// checks there gives callers an error from the option itself. This second
+// pass is intentionally limited to cross-option relationships and is called
+// by Run after every option has been applied.
+func (c *config) validate() error {
+	if c.reuse && c.name == "" {
+		return validationErrorf("WithReuse", nil, "WithReuse requires WithName")
+	}
+	if c.reuseGroup != "" && !c.reuse {
+		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
+	}
+	return nil
 }
 
 // allLabels merges the session labels the library always applies with
@@ -103,7 +128,9 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 		args = append(args, "--publish", raw)
 	}
 	for _, m := range c.mounts {
-		args = append(args, "--mount", m.arg())
+		if arg := m.arg(); arg != "" {
+			args = append(args, "--mount", arg)
+		}
 	}
 	if c.cpus > 0 {
 		args = append(args, "--cpus", strconv.Itoa(c.cpus))
@@ -151,11 +178,8 @@ func WithReuse() Option {
 // shared container. Requires WithReuse.
 func WithReuseGroup(group string) Option {
 	return func(c *config) error {
-		if group == "" {
-			return fmt.Errorf("reuse group must not be empty")
-		}
-		if len(group) > 128 || !labelKeyRE.MatchString(group) {
-			return fmt.Errorf("invalid reuse group %q", group)
+		if err := validateReuseGroup(group); err != nil {
+			return err
 		}
 		c.reuseGroup = group
 		return nil
@@ -170,10 +194,31 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 // extended with slash-separated OCI segments.
 var labelKeyRE = regexp.MustCompile(`^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:[./][a-z0-9](?:[a-z0-9-]*[a-z0-9])?)*$`)
 
+func validateReuseGroup(group string) error {
+	return validateReuseGroupFor("WithReuseGroup", group)
+}
+
+func validateReuseGroupFor(option, group string) error {
+	if group == "" {
+		return newValidationErrorWithField(option, "group", group, fmt.Errorf("reuse group must not be empty"))
+	}
+	if len(group) > maxReuseGroupBytes || !labelKeyRE.MatchString(group) {
+		return newValidationErrorWithField(option, "group", group, fmt.Errorf("invalid reuse group %q", group))
+	}
+	return nil
+}
+
 // imageRE keeps image references to registry-reference characters and,
 // critically, rejects a leading dash so an image can never be parsed as
 // a CLI flag.
 var imageRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._:/@-]*$`)
+
+func validateImageReference(image string) error {
+	if !imageRE.MatchString(image) {
+		return validationErrorf("image", image, "invalid image reference %q", image)
+	}
+	return nil
+}
 
 func withRunner(r cli.Runner) Option {
 	return func(c *config) error {
@@ -194,7 +239,7 @@ func withEngine(e engine) Option {
 func WithName(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid container name %q: must match %s", name, nameRE)
+			return validationErrorf("WithName", name, "invalid container name %q: must match %s", name, nameRE)
 		}
 		c.name = name
 		return nil
@@ -214,14 +259,29 @@ func WithName(name string) Option {
 // accept.
 func WithEnv(env map[string]string) Option {
 	return func(c *config) error {
-		if err := validateEnvMap(env); err != nil {
-			return err
-		}
-		for k, v := range env {
+		for _, k := range sortedKeys(env) {
+			v := env[k]
+			if err := validateEnvironmentEntry("WithEnv", "environment variable", k, v); err != nil {
+				return err
+			}
 			c.env[k] = v
 		}
 		return nil
 	}
+}
+
+func validateEnvironmentEntry(option, description, key, value string) error {
+	if err := validateEnvKey(key); err != nil {
+		return newValidationErrorWithField(option, "key", key,
+			fmt.Errorf("invalid %s name %q: %w", description, key, err))
+	}
+	if err := validateEnvValue(value); err != nil {
+		// Environment and exec values can contain credentials. Keep both
+		// the value and its error text free of the rejected value.
+		return newValidationErrorWithField(option, "value", nil,
+			fmt.Errorf("%s %q has an invalid value: %w", description, key, err))
+	}
+	return nil
 }
 
 // WithCmd overrides the arguments passed to the image's entrypoint.
@@ -238,7 +298,7 @@ func WithCmd(cmd ...string) Option {
 func WithEntrypoint(entrypoint string) Option {
 	return func(c *config) error {
 		if entrypoint == "" || strings.HasPrefix(entrypoint, "-") || strings.ContainsAny(entrypoint, "\n\x00") {
-			return fmt.Errorf("invalid entrypoint %q", entrypoint)
+			return validationErrorf("WithEntrypoint", entrypoint, "invalid entrypoint %q", entrypoint)
 		}
 		c.entrypoint = entrypoint
 		return nil
@@ -251,13 +311,15 @@ func WithEntrypoint(entrypoint string) Option {
 // combination before container creation.
 func WithExposedPorts(ports ...string) Option {
 	return func(c *config) error {
+		specs := make([]portSpec, 0, len(ports))
 		for _, p := range ports {
 			spec, err := parsePortSpec(p)
 			if err != nil {
-				return err
+				return newValidationError("WithExposedPorts", p, err)
 			}
-			c.exposed = append(c.exposed, spec)
+			specs = append(specs, spec)
 		}
+		c.exposed = append(c.exposed, specs...)
 		return nil
 	}
 }
@@ -274,7 +336,7 @@ func WithPublishedPort(spec string) Option {
 	return func(c *config) error {
 		ps, err := parsePublishSpec(spec)
 		if err != nil {
-			return err
+			return newValidationError("WithPublishedPort", spec, err)
 		}
 		c.published = append(c.published, ps)
 		return nil
@@ -287,17 +349,21 @@ func WithLabels(labels map[string]string) Option {
 	return func(c *config) error {
 		for k, v := range labels {
 			if len(k) > 128 || !labelKeyRE.MatchString(k) {
-				return fmt.Errorf("invalid label key %q", k)
+				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("invalid label key %q", k))
 			}
 			switch k {
 			case managedLabel, sessionLabel, reuseLabel, reuseGroupLabel, creationLabel:
-				return fmt.Errorf("label key %q is reserved", k)
+				return newValidationErrorWithField("WithLabels", "key", k, fmt.Errorf("label key %q is reserved", k))
 			}
+			// Label values may carry secrets. Do not put them in Value or
+			// the rendered diagnostic when the entry is rejected.
 			if len(k)+len(v)+1 > 4096 {
-				return fmt.Errorf("label %s: key=value exceeds 4096 bytes", k)
+				return newValidationErrorWithField("WithLabels", "value", nil,
+					fmt.Errorf("label %q: key=value exceeds 4096 bytes", k))
 			}
 			if strings.ContainsAny(v, "\x00") {
-				return fmt.Errorf("label %s: value must not contain NUL", k)
+				return newValidationErrorWithField("WithLabels", "value", nil,
+					fmt.Errorf("label %q: value must not contain NUL", k))
 			}
 			c.labels[k] = v
 		}
@@ -312,8 +378,8 @@ func WithMounts(mounts ...Mount) Option {
 			if err := m.validate(); err != nil {
 				return err
 			}
-			c.mounts = append(c.mounts, m)
 		}
+		c.mounts = append(c.mounts, mounts...)
 		return nil
 	}
 }
@@ -322,21 +388,57 @@ func WithMounts(mounts ...Mount) Option {
 func WithCPUs(n int) Option {
 	return func(c *config) error {
 		if n < 1 {
-			return fmt.Errorf("cpus must be >= 1, got %d", n)
+			return validationErrorf("WithCPUs", n, "cpus must be >= 1, got %d", n)
 		}
 		c.cpus = n
 		return nil
 	}
 }
 
-// memoryRE accepts sizes like "512M" or "1G".
+// memoryRE accepts sizes like "512M" or "1G". Unit support beyond
+// this syntax is a backend capability and is checked separately.
 var memoryRE = regexp.MustCompile(`^[0-9]+[KMGTP]?$`)
+
+func validateMemorySize(size string) error {
+	if !memoryRE.MatchString(size) {
+		return validationErrorf("WithMemory", size, "invalid memory size %q", size)
+	}
+
+	digits := size
+	unit := uint64(1)
+	if last := size[len(size)-1]; last < '0' || last > '9' {
+		digits = size[:len(size)-1]
+		switch last {
+		case 'K':
+			unit = 1 << 10
+		case 'M':
+			unit = 1 << 20
+		case 'G':
+			unit = 1 << 30
+		case 'T':
+			unit = 1 << 40
+		case 'P':
+			unit = 1 << 50
+		}
+	}
+	value, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		return newValidationError("WithMemory", size, fmt.Errorf("invalid or overflowing memory size %q: %w", size, err))
+	}
+	if value == 0 {
+		return validationErrorf("WithMemory", size, "memory size must be greater than zero: %q", size)
+	}
+	if value > maxMemoryBytes/unit {
+		return validationErrorf("WithMemory", size, "memory size overflows the %d-byte maximum: %q", maxMemoryBytes, size)
+	}
+	return nil
+}
 
 // WithMemory sets the VM memory size, e.g. "512M" or "1G".
 func WithMemory(size string) Option {
 	return func(c *config) error {
-		if !memoryRE.MatchString(size) {
-			return fmt.Errorf("invalid memory size %q", size)
+		if err := validateMemorySize(size); err != nil {
+			return err
 		}
 		c.memory = size
 		return nil
@@ -350,7 +452,7 @@ var userRE = regexp.MustCompile(`^[a-zA-Z0-9._][a-zA-Z0-9._-]*(:[a-zA-Z0-9._-]+)
 func WithUser(u string) Option {
 	return func(c *config) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid user %q", u)
+			return validationErrorf("WithUser", u, "invalid user %q", u)
 		}
 		c.user = u
 		return nil
@@ -361,7 +463,7 @@ func WithUser(u string) Option {
 func WithWorkingDir(dir string) Option {
 	return func(c *config) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("working directory %q must be an absolute path", dir)
+			return validationErrorf("WithWorkingDir", dir, "working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
 		return nil
@@ -377,7 +479,7 @@ func WithWorkingDir(dir string) Option {
 func WithNetwork(name string) Option {
 	return func(c *config) error {
 		if !nameRE.MatchString(name) {
-			return fmt.Errorf("invalid network name %q", name)
+			return validationErrorf("WithNetwork", name, "invalid network name %q", name)
 		}
 		c.network = name
 		c.networkExplicit = true
@@ -393,7 +495,7 @@ var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
 func WithPlatform(p string) Option {
 	return func(c *config) error {
 		if !platformRE.MatchString(p) {
-			return fmt.Errorf("invalid platform %q", p)
+			return validationErrorf("WithPlatform", p, "invalid platform %q", p)
 		}
 		c.platform = p
 		return nil
@@ -402,6 +504,11 @@ func WithPlatform(p string) Option {
 
 // MountType selects how a Mount is backed.
 type MountType int
+
+// volumeNameRE is the name grammar shared by both backends. Docker adds a
+// minimum length requirement in dockerEngine.checkConfig; Apple accepts a
+// single-character name.
+var volumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
 const (
 	// MountBind mounts a host directory (virtiofs).
@@ -421,25 +528,49 @@ type Mount struct {
 	ReadOnly bool
 }
 
+func mountValidationErrorf(m Mount, format string, args ...any) error {
+	return newValidationErrorWithField("WithMounts", "mount", m, fmt.Errorf(format, args...))
+}
+
 func (m Mount) validate() error {
+	if m.Type < MountBind || m.Type > MountTmpfs {
+		return mountValidationErrorf(m, "unknown mount type %d", m.Type)
+	}
+	if len(m.Source) > maxMountPathBytes || len(m.Target) > maxMountPathBytes {
+		return mountValidationErrorf(m, "mount paths exceed the %d-byte maximum", maxMountPathBytes)
+	}
+	if !utf8.ValidString(m.Source) || !utf8.ValidString(m.Target) {
+		return mountValidationErrorf(m, "mount paths must be valid UTF-8")
+	}
 	if strings.ContainsAny(m.Source, ",=\x00") || strings.ContainsAny(m.Target, ",=\x00") {
-		return fmt.Errorf("mount %q -> %q: paths must not contain ',' or '='", m.Source, m.Target)
+		return mountValidationErrorf(m, "mount %q -> %q: paths must not contain ',' or '='", m.Source, m.Target)
+	}
+	if strings.ContainsAny(m.Source, "\r\n") || strings.ContainsAny(m.Target, "\r\n") {
+		return mountValidationErrorf(m, "mount %q -> %q: paths must not contain control characters", m.Source, m.Target)
 	}
 	if !strings.HasPrefix(m.Target, "/") {
-		return fmt.Errorf("mount target %q must be absolute", m.Target)
+		return mountValidationErrorf(m, "mount target %q must be absolute", m.Target)
 	}
 	switch m.Type {
 	case MountBind:
 		if !filepath.IsAbs(m.Source) {
-			return fmt.Errorf("bind mount source %q must be an absolute host path", m.Source)
+			return mountValidationErrorf(m, "bind mount source %q must be an absolute host path", m.Source)
 		}
 	case MountVolume:
 		if m.Source == "" {
-			return fmt.Errorf("volume mount for %q needs a volume name: anonymous volume lifecycle is backend-specific", m.Target)
+			return mountValidationErrorf(m, "volume mount for %q needs a volume name: anonymous volume lifecycle is backend-specific", m.Target)
+		}
+		// Docker's minimum length is checked in checkConfig because Apple
+		// accepts one-character names.
+		if len(m.Source) > maxVolumeNameBytes {
+			return mountValidationErrorf(m, "volume name exceeds the %d-byte maximum: %q", maxVolumeNameBytes, m.Source)
+		}
+		if !volumeNameRE.MatchString(m.Source) {
+			return mountValidationErrorf(m, "invalid volume name %q", m.Source)
 		}
 	case MountTmpfs:
 		if m.Source != "" {
-			return fmt.Errorf("tmpfs mount for %q must not have a source", m.Target)
+			return mountValidationErrorf(m, "tmpfs mount for %q must not have a source", m.Target)
 		}
 	}
 	return nil
@@ -454,6 +585,11 @@ func (m Mount) arg() string {
 		b.WriteString("type=volume,source=" + m.Source)
 	case MountTmpfs:
 		b.WriteString("type=tmpfs")
+	default:
+		// Run validates mounts before argv construction. Keep a direct
+		// call from producing a partial --mount value if that invariant
+		// is ever bypassed by internal code.
+		return ""
 	}
 	b.WriteString(",target=" + m.Target)
 	if m.ReadOnly {

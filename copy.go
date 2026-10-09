@@ -24,21 +24,45 @@ type File struct {
 // returns an error without deleting that shared container.
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
-		for _, f := range files {
+		validated := make([]File, len(files))
+		for i, f := range files {
 			if err := validateContainerPath(f.ContainerPath); err != nil {
-				return err
+				return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, err)
 			}
+			abs, err := validateHostPath(f.HostPath)
+			if err != nil {
+				return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
+			}
+			f.HostPath = abs
+			validated[i] = f
 		}
-		c.files = append(c.files, files...)
+		c.files = append(c.files, validated...)
 		return nil
 	}
+}
+
+// validateHostPath resolves a host path before any backend work and checks
+// that the resulting absolute path can be statted. Resolving here also
+// prevents a later working-directory change from changing the source.
+func validateHostPath(hostPath string) (string, error) {
+	if hostPath == "" {
+		return "", fmt.Errorf("host path must not be empty")
+	}
+	abs, err := filepath.Abs(hostPath)
+	if err != nil {
+		return "", fmt.Errorf("resolve host path %q: %w", hostPath, err)
+	}
+	if _, err := os.Stat(abs); err != nil {
+		return "", fmt.Errorf("host path %q: %w", hostPath, err)
+	}
+	return abs, nil
 }
 
 // CopyToContainer copies a host file or directory into the running
 // container.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return err
+		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, err)
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
@@ -67,13 +91,22 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 // copy-out command. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
 	if err := validateContainerPath(containerPath); err != nil {
-		return nil, err
+		return nil, newValidationErrorWithField("CopyFileFromContainer", "containerPath", containerPath, err)
 	}
+	// Container paths are POSIX paths even when the client runs on Windows.
+	// Normalize with path (not filepath) so equivalent root spellings such as
+	// // and /tmp/.. are classified consistently. Keep the raw trailing slash
+	// check because path.Clean intentionally removes it.
 	requestedPath := containerPath
 	containerPath = path.Clean(containerPath)
 	base := path.Base(containerPath)
-	if base == "/" || base == "." || strings.HasSuffix(requestedPath, "/") {
-		return nil, fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", requestedPath)
+	if containerPath == "/" || base == "/" || base == "." || strings.HasSuffix(requestedPath, "/") {
+		return nil, newValidationErrorWithField(
+			"CopyFileFromContainer",
+			"containerPath",
+			requestedPath,
+			fmt.Errorf("copy file from container %q: cannot copy directory or root as a single file", requestedPath),
+		)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

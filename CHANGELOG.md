@@ -136,6 +136,16 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   Docker auto-publishing and missing host bindings.
 - Route `cp` through engine `copyToArgs`/`copyFromArgs`; include the CLI
   binary name in `CLIError` and neutralize `internal/cli` package docs.
+- Public input validation now consistently returns `ErrInvalidOption` and
+  a typed `*ValidationError`. `Run` validates the image before applying
+  options, `WithFiles` preflights and resolves host paths, Docker validates
+  its complete volume-name grammar, and negative `Stop` timeouts are
+  rejected before a backend call. POSIX container copy paths are normalized
+  independently of the host OS.
+- `ValidationError` uses field-specific metadata and does not retain
+  potentially sensitive environment or label values; its rendered message
+  is derived from `Err`. The redundant `OptionError` and
+  `InvalidOptionError` aliases were removed; use `ValidationError`.
 - Make `CopyFileFromContainer` fail closed on Apple Container, whose CLI
   has no type-preserving/no-follow copy-out mode, and on Windows Go
   1.23 through 1.25, whose `os.OpenFile` silently ignores the required
@@ -169,8 +179,8 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 - Windows and remote bind-source handling is qualified by issue #76;
   `ForListeningPort`/`ForExposedPort` remain TCP-only until #77.
 - `Stop` timeout validation/rounding is pending #89; wait error-chain
-  normalization is pending #92; public option validation gaps are tracked
-  by #102; reaper staging exposure and mitigation are tracked by #111.
+  normalization is pending #92; reaper staging exposure and mitigation are
+  tracked by #111.
 - Successful missing inspect classification is pending #103; liveness
   error-chain flattening is tracked by #104; Apple PullNever capability
   handling is pending #112.

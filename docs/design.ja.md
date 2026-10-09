@@ -479,6 +479,19 @@ daemon 呼び出しが後続を妨げない。リーダーの pull と create �
 `runTimeout` 予算を使い、`reuseAttachTimeout` は別 process のコンテナへの
 attach polling だけを制限する。
 
+pull flight がまとめるのは *並行* 呼び出しだけである。完了するとエントリは
+削除されるため、前の `Run` が終わったあとの `Run` は再び image を inspect
+する。これは安全側の既定であり、2 つの `Run` のあいだにストアから image が
+消えることがある。そのため `Run` は毎回存在確認の daemon round trip を払い、
+ストアが実行中安定している呼び出し側は `WithImagePresenceCache(ttl)` でそれを
+省ける。返された Option がキャッシュを所有するので、呼び出し側はその
+Option を `Run` 間で再利用する必要がある。新しい呼び出しは空のキャッシュを
+作る。キャッシュするのは "present" の答えだけである。不在をキャッシュすると、
+それが引き起こした pull で無効化する必要が出る。キーは backend、image store
+（Docker では client-config env）、image、platform であり、これらのストアは
+独立している。`PullNever` は常に inspect する。契約は image 不在で失敗する
+ことなので、キャッシュされた答えをその確認の代わりにしてはならない。
+
 ## セキュリティ設計
 
 外部プロセスを起動するライブラリとして、次の原則は security boundary を表す。ただし #111 の reaper staging exception があるため、「情報漏洩がない」という end-to-end 保証ではない。

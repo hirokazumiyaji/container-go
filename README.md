@@ -627,9 +627,20 @@ backend's store is known to be stable for the length of the test run,
 each call to `WithImagePresenceCache` owns a distinct cache:
 
 ```go
-presence := container.WithImagePresenceCache(5 * time.Minute)
-container.Run(ctx, "redis:7-alpine", presence)
-container.Run(ctx, "redis:7-alpine", presence) // skips image inspect
+package docexample
+
+import (
+    "context"
+    "time"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func ImagePresenceCache(ctx context.Context) {
+    presence := container.WithImagePresenceCache(5 * time.Minute)
+    _, _ = container.Run(ctx, "redis:7-alpine", presence)
+    _, _ = container.Run(ctx, "redis:7-alpine", presence) // skips image inspect
+}
 ```
 
 It is off by default, and only "present" answers are cached: caching an

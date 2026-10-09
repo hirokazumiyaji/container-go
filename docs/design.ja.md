@@ -428,13 +428,14 @@ no-leak 保証ではない。
 
 Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。現在の Docker filter は exited 状態だけを選ぶため、dead 状態のコンテナは #113 を適用するまで残る。running と created 状態は選ばない。Apple では、各 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、session、管理対象ラベル、および停止状態が再確認される。
 
-`CONTAINERGO_KEEP=1` を設定すると、自動 cleanup helper の `Cleanup` と
-`TerminateContainer`、およびリーパー登録を省略する。明示的な
-`Container.Terminate`、`Run` のロールバック経路、create 失敗後の
-best-effort cleanup は抑制しない。`Prune` と `PruneReuseGroup` は
-引き続きコンテナを削除できる。`WithReuse` の停止済みコンテナ置換も
-変わらないため、条件に一致した stopped reuse container は削除・再作成され
-る。この変数をグローバルな削除ロックとして扱わない。
+`CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグである。`Cleanup` と
+`TerminateContainer` による自動削除、リーパー登録を省略し、作成失敗、
+`WithFiles` コピー失敗、wait strategy 失敗時の自動 rollback を抑制して、
+調査のためにコンテナを残す。明示的な `Container.Terminate` は抑制
+されず、`Prune` や `PruneReuseGroup` は引き続きコンテナを削除できる。
+`WithReuse` の停止済みコンテナ置換も変わらないため、条件に一致した stopped
+reuse container は削除・再作成される。この変数をグローバルな削除ロック
+として扱わない。
 
 匿名ボリュームは `--rm` でも残るので、ライブラリは匿名ボリュームを作らない。ボリュームを使う場合は名前付き，そのライフサイクルは呼び出し元に委ねる。現在の bind source validation は Unix-style で、Windows と remote Docker の bind-source semantics は #76 に残る。
 

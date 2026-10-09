@@ -663,13 +663,14 @@ listing し、affected time window に限定してください。file content �
 該当 run に確実に帰属する file だけを削除し、inspect output に含まれた可能性が
 ある credential を rotate してください（#111）。これは no-leak 保証ではありません。
 
-`CONTAINERGO_KEEP=1` は自動 cleanup helper の `Cleanup` と
-`TerminateContainer`、および reaper 登録を省略します。明示的な
-`Container.Terminate`、作成後の失敗に対する rollback、create 失敗後の
-best-effort cleanup は抑制しません。`Prune` と `PruneReuseGroup` は
-引き続きコンテナを削除できます。`WithReuse` の停止済みコンテナ置換も
-変わらないため、条件に一致した stopped reuse container は削除・再作成され
-ます。この変数をグローバルな削除ロックとして扱わないでください。
+`CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグです。`Cleanup` と
+`TerminateContainer` による自動削除、reaper 登録を省略し、作成失敗、
+`WithFiles` コピー失敗、wait strategy 失敗時の自動 rollback を抑制して、
+調査のためにコンテナを残します。明示的な `Container.Terminate` は抑制
+されず、`Prune` や `PruneReuseGroup` は引き続きコンテナを削除できます。
+`WithReuse` の停止済みコンテナ置換も変わらないため、条件に一致した stopped
+reuse container は削除・再作成されます。この変数をグローバルな削除ロック
+として扱わないでください。
 
 `container.Prune(ctx)` は、現在の backend の filter が選ぶ、本 library が
 作成したコンテナを削除します。Apple は managed コンテナのうち stopped

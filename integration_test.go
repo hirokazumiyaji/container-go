@@ -27,6 +27,9 @@ import (
 // non-apple value, Apple integration tests are skipped.
 func requireSystem(t *testing.T) {
 	t.Helper()
+	// Integration tests own their teardown; never inherit a developer's
+	// diagnostic retention switch.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	integrationtest.Preflight(t, "apple", integrationtest.AppleUnavailable)
 }
 

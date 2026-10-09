@@ -679,14 +679,15 @@ only files positively tied to the affected run, and rotate credentials
 that may have appeared in inspect output (#111). This is not a no-leak
 guarantee.
 
-`CONTAINERGO_KEEP=1` skips the automatic `Cleanup` and
-`TerminateContainer` helpers and reaper registration. It does not suppress
-explicit `Container.Terminate`, post-create rollback, or best-effort
-failed-create cleanup, and `Prune` or `PruneReuseGroup` can still delete
-containers. `WithReuse` also keeps its stopped-container replacement
-behavior, so a matching stopped reuse container can still be deleted and
-recreated. Treat the variable as a debugging aid, not a global deletion
-lock.
+`CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
+automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper
+registration, and suppresses automatic rollback on failed creates, `WithFiles`
+copies, and wait strategy failures, leaving containers in place for
+inspection. It does not suppress explicit `Container.Terminate`, and `Prune`
+or `PruneReuseGroup` can still delete containers. `WithReuse` also keeps its
+stopped-container replacement behavior, so a matching stopped reuse container
+can still be deleted and recreated. Treat the variable as a debugging aid,
+not a global deletion lock.
 
 `container.Prune(ctx)` removes containers this library created that are
 selected by the active backend's filter. Apple selects managed containers

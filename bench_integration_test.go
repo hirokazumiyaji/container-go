@@ -54,6 +54,21 @@ func benchPortOptions(b bench.Backend, eng engine) func(cli.Runner) []Option {
 	}
 }
 
+// terminateBenchContainers removes handles after a benchmark iteration.
+// Explicit Terminate is used even when diagnostic retention is enabled,
+// so a failed Run cannot leave a partial handle behind.
+func terminateBenchContainers(t *testing.T, containers ...*Container) {
+	t.Helper()
+	for _, ctr := range containers {
+		if ctr == nil {
+			continue
+		}
+		if err := ctr.Terminate(context.Background()); err != nil {
+			t.Logf("terminate: %v", err)
+		}
+	}
+}
+
 // benchScenario runs one scenario benchIterations times, recording
 // duration and subprocess count per iteration. prep runs before each
 // timed iteration (image removal for cold, image ensure for warm).
@@ -71,12 +86,11 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 		ctr, err := Run(context.Background(), image, opts(r)...)
 		elapsed := time.Since(start)
 		if err != nil {
+			terminateBenchContainers(t, ctr)
 			t.Fatalf("%s iteration %d: Run: %v", scenario, i, err)
 		}
 		spawns := r.count()
-		if err := ctr.Terminate(context.Background()); err != nil {
-			t.Logf("%s iteration %d: terminate: %v", scenario, i, err)
-		}
+		terminateBenchContainers(t, ctr)
 		doc.Results = append(doc.Results, bench.Result{
 			Backend:      b.Name,
 			Library:      bench.LibraryContainerGo,
@@ -93,6 +107,9 @@ func benchScenario(t *testing.T, doc *bench.Doc, b bench.Backend, image, scenari
 // subprocess counts for both backends. It skips cleanly when a backend
 // is unavailable.
 func TestIntegrationBenchCounting(t *testing.T) {
+	// Benchmarks own teardown; do not inherit a developer's diagnostic
+	// retention setting through the integration process environment.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	for _, b := range []bench.Backend{bench.DockerBackend(), bench.AppleBackend()} {
 		t.Run(b.Name, func(t *testing.T) {
 			b.Available(t)
@@ -155,26 +172,25 @@ func benchParallel(t *testing.T, doc *bench.Doc, b bench.Backend, eng engine, im
 			go func() {
 				defer ready.Done()
 				ctr, err := Run(context.Background(), image, benchPortOptions(b, eng)(r)...)
+				if ctr != nil {
+					mu.Lock()
+					containers = append(containers, ctr)
+					mu.Unlock()
+				}
 				if err != nil {
 					errs[idx] = err
-					return
 				}
-				mu.Lock()
-				containers = append(containers, ctr)
-				mu.Unlock()
 			}()
 		}
 		ready.Wait()
 		elapsed := time.Since(start)
 		spawns := r.count()
+		// Clean up both successful handles and any partial handles
+		// returned with errors before reporting the benchmark failure.
+		terminateBenchContainers(t, containers...)
 		for _, err := range errs {
 			if err != nil {
 				t.Fatalf("parallel iteration %d: %v", i, err)
-			}
-		}
-		for _, ctr := range containers {
-			if err := ctr.Terminate(context.Background()); err != nil {
-				t.Logf("parallel iteration %d: terminate: %v", i, err)
 			}
 		}
 		doc.Results = append(doc.Results, bench.Result{

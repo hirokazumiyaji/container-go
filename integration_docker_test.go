@@ -26,6 +26,9 @@ import (
 // backendPreflight.
 func requireDocker(t *testing.T) {
 	t.Helper()
+	// Integration tests own their teardown; never inherit a developer's
+	// diagnostic retention switch.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
 }
 

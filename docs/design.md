@@ -631,14 +631,15 @@ candidate is re-inspected and re-verified (generation, session,
 managed/reuse/group labels, stopped state) under the stable per-name lock
 before deletion.
 
-Setting `CONTAINERGO_KEEP=1` skips the automatic `Cleanup` and
-`TerminateContainer` helpers and reaper registration. It does not suppress
-explicit `Container.Terminate`, post-create rollback, or best-effort
-failed-create cleanup, and `Prune` or `PruneReuseGroup` can still delete
-containers. `WithReuse` also keeps its stopped-container replacement
-behavior, so a matching stopped reuse container can still be deleted and
-recreated. Treat the variable as a debugging aid, not a global deletion
-lock.
+Setting `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
+automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper
+registration, and suppresses automatic rollback on failed creates, `WithFiles`
+copies, and wait strategy failures, leaving containers in place for
+inspection. It does not suppress explicit `Container.Terminate`, and `Prune`
+or `PruneReuseGroup` can still delete containers. `WithReuse` also keeps its
+stopped-container replacement behavior, so a matching stopped reuse container
+can still be deleted and recreated. Treat the variable as a debugging aid,
+not a global deletion lock.
 
 Anonymous volumes survive `--rm`, so the library never creates one;
 volumes must be named, and their lifecycle belongs to the caller.

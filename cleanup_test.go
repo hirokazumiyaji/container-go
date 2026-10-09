@@ -2,7 +2,10 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -301,5 +304,106 @@ func TestSessionLabelValueIsValid(t *testing.T) {
 	id := sessionID()
 	if len(id) != 16 || strings.ToLower(id) != id {
 		t.Errorf("sessionID = %q, want 16 lowercase hex chars", id)
+	}
+}
+
+func TestRunWaitFailureHonorsKeepEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		keep       string
+		wantDelete bool
+	}{
+		{name: "default rolls back", keep: "", wantDelete: true},
+		{name: "keep skips rollback", keep: "1", wantDelete: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONTAINERGO_KEEP", tc.keep)
+			f := newTestRunner()
+			_, err := Run(context.Background(), "redis:7-alpine",
+				withRunner(f), withEngine(appleEngine{}),
+				WithWaitStrategy(&recordingStrategy{err: errors.New("never ready")}))
+			if err == nil {
+				t.Fatal("Run succeeded; want readiness wait error")
+			}
+			didDelete := f.callWith("delete") != nil
+			if didDelete != tc.wantDelete {
+				t.Fatalf("delete issued = %v, want %v", didDelete, tc.wantDelete)
+			}
+		})
+	}
+}
+
+func TestRunCopyFailureHonorsKeepEnv(t *testing.T) {
+	src := filepath.Join(t.TempDir(), "testfile")
+	if err := os.WriteFile(src, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name       string
+		keep       string
+		wantDelete bool
+	}{
+		{name: "default rolls back", keep: "", wantDelete: true},
+		{name: "keep skips rollback", keep: "1", wantDelete: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONTAINERGO_KEEP", tc.keep)
+			f := newTestRunner()
+			f.failPrefix = "cp"
+			_, err := Run(context.Background(), "redis:7-alpine",
+				withRunner(f), withEngine(appleEngine{}),
+				WithFiles(File{HostPath: src, ContainerPath: "/testfile"}))
+			if err == nil {
+				t.Fatal("Run succeeded; want copy error")
+			}
+			didDelete := f.callWith("delete") != nil
+			if didDelete != tc.wantDelete {
+				t.Fatalf("delete issued = %v, want %v", didDelete, tc.wantDelete)
+			}
+		})
+	}
+}
+
+func TestRunFailedCreateHonorsKeepEnv(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		keep       string
+		wantDelete bool
+	}{
+		{name: "default cleans up", keep: "", wantDelete: true},
+		{name: "keep skips cleanup", keep: "1", wantDelete: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("CONTAINERGO_KEEP", tc.keep)
+			base := newTestRunner()
+			base.imagePresent = true
+			r := &failRunRunner{
+				fakeRunner:  base,
+				runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"},
+				inspectJSON: ownedInspectJSON("myctr"),
+			}
+			_, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+			if err == nil {
+				t.Fatal("Run succeeded; want run error")
+			}
+			didDelete := len(r.deleted) > 0
+			if didDelete != tc.wantDelete {
+				t.Fatalf("delete issued = %v, want %v", didDelete, tc.wantDelete)
+			}
+		})
+	}
+}
+
+func TestExplicitTerminateIgnoresKeepEnv(t *testing.T) {
+	t.Setenv("CONTAINERGO_KEEP", "1")
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.calls = nil
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	if f.callWith("delete") == nil {
+		t.Fatal("explicit Terminate did not issue delete when CONTAINERGO_KEEP=1")
 	}
 }

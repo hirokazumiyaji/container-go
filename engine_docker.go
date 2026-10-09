@@ -64,6 +64,20 @@ func (dockerEngine) directIP() bool { return false }
 
 func (dockerEngine) requiresImmutableID() bool { return true }
 
+// imageStoreID partitions presence-cache entries by the env-visible
+// Docker client settings that change which store or platform variant a
+// Run without WithPlatform would observe: DOCKER_HOST, DOCKER_CONTEXT,
+// DOCKER_CONFIG (context metadata), and DOCKER_DEFAULT_PLATFORM. A
+// context chosen only via `docker context use` with no env remains
+// invisible here, matching the library's existing DOCKER_HOST-only
+// remote detection.
+func (dockerEngine) imageStoreID() string {
+	return normalizeDockerHost(os.Getenv("DOCKER_HOST")) + "\x00" +
+		os.Getenv("DOCKER_CONTEXT") + "\x00" +
+		os.Getenv("DOCKER_CONFIG") + "\x00" +
+		os.Getenv("DOCKER_DEFAULT_PLATFORM")
+}
+
 // dockerDefaultNetwork asks the daemon which platform default it exposes.
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network

@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -45,6 +46,46 @@ func WithPullPolicy(policy PullPolicy) Option {
 			return validationErrorf("WithPullPolicy", policy, "invalid pull policy %d", policy)
 		}
 		c.pullPolicy = policy
+		return nil
+	}
+}
+
+// WithImagePresenceCache reuses the answer to "is this image already in
+// the local store?" for up to ttl, so a second Run of the same image does
+// not spawn an `image inspect` against the daemon.
+//
+// Off by default: Run's default PullMissing policy inspects on every
+// call, and caching that answer means an image removed out of band (by
+// another tool, or by a CI cache prune) would not be re-pulled until the
+// entry expired. Enable it when the daemon's store is known to be stable
+// for the duration of the test run and the round trip is worth avoiding.
+//
+// Only "present" answers are cached. A missing image is pulled, and the
+// successful pull is recorded, so the next Run of the same image skips
+// the inspect too.
+//
+// The cache is owned by the returned Option, not process-global: call
+// WithImagePresenceCache once and reuse that Option across Runs so
+// entries persist. Each Run still builds a fresh config, but applying the
+// same Option attaches the same cache. A fresh call to
+// WithImagePresenceCache creates a distinct empty cache, so callers that
+// do not share Options cannot observe each other's entries. Concurrent
+// Runs of the same image in the same process still collapse onto one
+// flight; this option removes the inspect cost across sequential Runs.
+//
+// A ttl of zero disables the cache, which is the same as not passing
+// this option. A negative ttl is rejected so a typo cannot silently
+// turn the cache off. Run without this option always inspects, so the
+// cache is a cost decision the caller makes explicitly.
+func WithImagePresenceCache(ttl time.Duration) Option {
+	if ttl < 0 {
+		return func(*config) error {
+			return fmt.Errorf("invalid image presence cache ttl %v: must not be negative", ttl)
+		}
+	}
+	cache := newImageCache(ttl)
+	return func(c *config) error {
+		c.imageCache = cache
 		return nil
 	}
 }
@@ -92,6 +133,9 @@ var imageFlights flightGroup[struct{}]
 // pulls, the rest wait.
 func (c *config) ensureImage(ctx context.Context, image string) error {
 	platform := c.platform
+	if c.pullPolicy == PullMissing && c.imageCache.seen(c.eng, image, platform) {
+		return nil
+	}
 	switch c.pullPolicy {
 	case PullNever:
 		exists, err := imageExists(ctx, c.runner, c.eng, image, platform)
@@ -106,21 +150,37 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 		}
 		return nil
 	case PullAlways:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull, platform), func() error {
+		if err := doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
 			return pullImage(execCtx, c.runner, c.eng, image, platform)
-		})
+		}); err != nil {
+			return err
+		}
+		// Record outside the flight so every waiter — each with its own
+		// Option-owned cache — learns the image is present, not only the
+		// leader whose config the callback closed over.
+		c.imageCache.remember(c.eng, image, platform)
+		return nil
 	default:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing, platform), func() error {
+		if err := doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
 			exists, err := imageExists(execCtx, c.runner, c.eng, image, platform)
-			if err != nil || exists {
+			if err != nil {
 				return err
 			}
+			if exists {
+				return nil
+			}
 			return pullImage(execCtx, c.runner, c.eng, image, platform)
-		})
+		}); err != nil {
+			return err
+		}
+		// Same as PullAlways: waiters share the successful flight but not
+		// the leader's cache, so each caller records presence itself.
+		c.imageCache.remember(c.eng, image, platform)
+		return nil
 	}
 }
 

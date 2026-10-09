@@ -611,6 +611,35 @@ func PullPolicy(ctx context.Context, t testing.TB) {
 `PullNever` の `ErrImageNotFound` は backend 固有であり、Apple では best-effort
 である。Apple の no-fetch 保証ではない（#112）。
 
+この存在確認は `Run` ごとの daemon round trip である。テスト実行中に
+backend のストアが安定していると分かっている場合、
+`WithImagePresenceCache` は TTL の間 "present" の答えを再利用し、同じ
+image の後続 `Run` では inspect を省略する。Option は一度作って再利用する —
+`WithImagePresenceCache` を呼ぶたびに別の空キャッシュになる:
+
+```go
+package docexample
+
+import (
+    "context"
+    "time"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func ImagePresenceCache(ctx context.Context) {
+    presence := container.WithImagePresenceCache(5 * time.Minute)
+    _, _ = container.Run(ctx, "redis:7-alpine", presence)
+    _, _ = container.Run(ctx, "redis:7-alpine", presence) // skips image inspect
+}
+```
+
+既定では無効で、キャッシュするのは "present" の答えだけである。不在を
+キャッシュすると、それが引き起こした pull で無効化する必要が出る。帯域外で
+image が消えた場合はエントリ期限まで再 pull されないので、毎回確実に知りたい
+呼び出し側はオフのままにする。`PullNever` は契約上 image 不在で失敗するため、
+キャッシュの有無に関わらず常に inspect する。
+
 ## クリーンアップの契約
 
 通常の終了、作成後の rollback、create 失敗、異常終了では、エラーの見え方が異なります。

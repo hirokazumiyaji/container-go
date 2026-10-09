@@ -744,6 +744,21 @@ rest. The leader's own pull/create uses an independent `runTimeout`
 budget; `reuseAttachTimeout` bounds only attach polling for another
 process's container.
 
+The pull flight collapses *concurrent* callers only: an entry is removed
+when it completes, so a `Run` that happens after the previous one has
+finished inspects the image again. That is the safe default, since an
+image can be removed from the store between two `Run`s. `Run` therefore
+pays one daemon round trip for the existence check every time, which
+`WithImagePresenceCache(ttl)` can remove for callers whose store is
+stable for the length of the run. The returned Option owns the cache, so
+callers must reuse that Option across `Run`s; a fresh call creates an
+empty cache. The cache holds only "present" answers - a cached absence
+would have to be invalidated by the pull it triggered - and is keyed by
+backend, image store (Docker client-config env for Docker), image, and
+platform, since those stores are independent.
+`PullNever` always inspects: its contract is to fail when the image is
+absent, so a cached answer must not stand in for the check.
+
 ## Security design
 
 As a library that spawns subprocesses, these rules describe the intended

@@ -42,6 +42,9 @@ func (appleEngine) directIP() bool { return true }
 
 func (appleEngine) checkConfig(context.Context, *config) error { return nil }
 
+// imageStoreID is empty: Apple Container talks to one local store.
+func (appleEngine) imageStoreID() string { return "" }
+
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
 func (appleEngine) probe() cli.Probe {

@@ -132,6 +132,10 @@ type engine interface {
 	// platformCompatible compares a requested platform selector with the
 	// platform this backend reports from container inspect.
 	platformCompatible(selector, actual string) bool
+	// imageStoreID identifies the backend's image store so a presence
+	// cache entry recorded against one daemon is not reused against
+	// another (for Docker, the effective DOCKER_HOST).
+	imageStoreID() string
 }
 
 func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {

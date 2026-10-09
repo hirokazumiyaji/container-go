@@ -353,6 +353,35 @@ func TestImageCacheIsNotWrittenWhenThePullFails(t *testing.T) {
 	}
 }
 
+// TestImageCacheIsPerDockerHost keeps a presence recorded against one
+// DOCKER_HOST from answering for another: the two daemons are independent
+// stores, and PullMissing would otherwise skip the inspect and fail with
+// --pull=never on the second host.
+func TestImageCacheIsPerDockerHost(t *testing.T) {
+	r := newTestRunner()
+	r.imagePresent = true
+	opt := WithImagePresenceCache(time.Minute)
+	cfg := newConfig()
+	cfg.runner = r
+	cfg.eng = dockerEngine{}
+	if err := opt(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	t.Setenv("DOCKER_HOST", "unix:///var/run/docker.sock")
+	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.5:2375")
+	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countInspects(r.calls, "image"); got != 2 {
+		t.Errorf("ran %d image inspects across DOCKER_HOST values, want 2", got)
+	}
+}
+
 // TestImageCacheIsPerPlatformAndPerBackend keeps entries from being
 // shared where the underlying stores are independent.
 func TestImageCacheIsPerPlatformAndPerBackend(t *testing.T) {

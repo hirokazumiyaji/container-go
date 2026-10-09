@@ -73,8 +73,9 @@ func WithPullPolicy(policy PullPolicy) Option {
 // Runs of the same image in the same process still collapse onto one
 // flight; this option removes the inspect cost across sequential Runs.
 //
-// A ttl of zero or less disables the cache, which is the same as not
-// passing this option. Run without this option always inspects, so the
+// A ttl of zero disables the cache, which is the same as not passing
+// this option. A negative ttl is rejected so a typo cannot silently
+// turn the cache off. Run without this option always inspects, so the
 // cache is a cost decision the caller makes explicitly.
 func WithImagePresenceCache(ttl time.Duration) Option {
 	if ttl < 0 {

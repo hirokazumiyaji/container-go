@@ -64,6 +64,13 @@ func (dockerEngine) directIP() bool { return false }
 
 func (dockerEngine) requiresImmutableID() bool { return true }
 
+// imageStoreID partitions presence-cache entries by the daemon the Docker
+// CLI will talk to. Two DOCKER_HOST values name independent stores, so a
+// "present" answer for one must not skip the inspect against the other.
+func (dockerEngine) imageStoreID() string {
+	return normalizeDockerHost(os.Getenv("DOCKER_HOST"))
+}
+
 // dockerDefaultNetwork asks the daemon which platform default it exposes.
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network

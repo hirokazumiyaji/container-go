@@ -133,8 +133,9 @@ type engine interface {
 	// platform this backend reports from container inspect.
 	platformCompatible(selector, actual string) bool
 	// imageStoreID identifies the backend's image store so a presence
-	// cache entry recorded against one daemon is not reused against
-	// another (for Docker: DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG).
+	// cache entry recorded against one daemon or default platform is not
+	// reused against another (for Docker: DOCKER_HOST, DOCKER_CONTEXT,
+	// DOCKER_CONFIG, DOCKER_DEFAULT_PLATFORM).
 	imageStoreID() string
 }
 

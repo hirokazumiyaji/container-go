@@ -754,8 +754,8 @@ stable for the length of the run. The returned Option owns the cache, so
 callers must reuse that Option across `Run`s; a fresh call creates an
 empty cache. The cache holds only "present" answers - a cached absence
 would have to be invalidated by the pull it triggered - and is keyed by
-backend, image store (`DOCKER_HOST` for Docker), image, and platform,
-since those stores are independent.
+backend, image store (`DOCKER_HOST` / `DOCKER_CONTEXT` for Docker),
+image, and platform, since those stores are independent.
 `PullNever` always inspects: its contract is to fail when the image is
 absent, so a cached answer must not stand in for the check.
 

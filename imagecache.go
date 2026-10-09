@@ -44,9 +44,9 @@ func (c *imageCache) enabled() bool {
 }
 
 // key identifies one cached presence: one backend, one image store
-// (DOCKER_HOST for Docker), one image, one platform variant. Same image
-// on different platforms or daemons is a different entry, because those
-// stores are independent.
+// (DOCKER_HOST / DOCKER_CONTEXT for Docker), one image, one platform
+// variant. Same image on different platforms or daemons is a different
+// entry, because those stores are independent.
 func imageCacheKey(eng engine, image, platform string) string {
 	return eng.name() + "\x00" + eng.imageStoreID() + "\x00" + image + "\x00" + platform
 }

@@ -13,7 +13,7 @@
     {
       "backend": "docker",
       "library": "container-go",
-      "image": "redis:7-alpine",
+      "image": "public.ecr.aws/docker/library/redis:7-alpine",
       "scenario": "run/warm",
       "iteration": 1,
       "duration_ns": 140000000,
@@ -22,11 +22,20 @@
     {
       "backend": "docker",
       "library": "testcontainers-go",
-      "image": "redis:7-alpine",
+      "image": "public.ecr.aws/docker/library/redis:7-alpine",
       "scenario": "tc/single",
       "iteration": 1,
       "duration_ns": 900000000,
       "subprocesses": 0
+    },
+    {
+      "backend": "docker",
+      "library": "container-go",
+      "image": "public.ecr.aws/docker/library/nginx:alpine",
+      "scenario": "run/warm",
+      "iteration": 1,
+      "duration_ns": 210000000,
+      "subprocesses": 3
     }
   ]
 }

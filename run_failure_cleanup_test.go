@@ -115,6 +115,23 @@ func foreignInspectJSON(name string) string {
 ]`, name, name)
 }
 
+func unverifiableOwnedInspectJSON(name string) string {
+	return fmt.Sprintf(`[
+  {
+    "id": %q,
+    "configuration": {
+      "id": %q,
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q
+      }
+    },
+    "status": {"state": "created", "networks": []}
+  }
+]`, name, name, sessionID())
+}
 func ownedDockerInspectJSON(name, id string) string {
 	return fmt.Sprintf(`[
   {
@@ -375,6 +392,24 @@ func TestRunFailurePreservesForeignContainer(t *testing.T) {
 	}
 	if len(r.deleted) != 0 {
 		t.Fatalf("deleted = %v, want no cleanup for foreign container", r.deleted)
+	}
+}
+
+func TestRunFailurePreservesContainerWithMissingGeneration(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "port bind failed"},
+		inspectJSON: unverifiableOwnedInspectJSON("myctr"),
+	}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want error")
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no cleanup without a verified generation", r.deleted)
 	}
 }
 

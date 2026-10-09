@@ -127,7 +127,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if !isNotFound(err) && !maybeInfraExecErr(err) {
 		return cliErr.ExitCode, output, envCleanupErr
 	}
-	if c.execContainerRunning(ctx) {
+	state, inspectErr := c.verifyExecContainer(ctx)
+	if inspectErr != nil {
+		return 0, nil, joinEnvFileCleanupError(errors.Join(err, inspectErr), envCleanupErr)
+	}
+	if state == StateRunning {
 		return cliErr.ExitCode, output, envCleanupErr
 	}
 	return 0, nil, joinEnvFileCleanupError(wrapNotFound(c.classify(ctx, err)), envCleanupErr)
@@ -161,13 +165,13 @@ func execCLIStderr(err error) (string, bool) {
 	return strings.ToLower(cliErr.Stderr), true
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context) bool {
+// verifyExecContainer verifies the current state while preserving the
+// precise inspect error for callers that need to distinguish a missing
+// container from malformed or otherwise unusable output.
+func (c *Container) verifyExecContainer(ctx context.Context) (State, error) {
 	info, err := c.inspectDynamic(ctx)
 	if err != nil {
-		return false
+		return StateUnknown, err
 	}
-	return info.state == StateRunning
+	return info.state, nil
 }

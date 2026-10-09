@@ -215,6 +215,9 @@ func reuseInspectJSONForCreation(id, state, image, creation string) string {
 type attachRunner struct {
 	*fakeRunner
 	state string
+	// inspectJSON overrides the generated payload, so a test can serve
+	// output that is not a readable inspect array.
+	inspectJSON string
 }
 
 func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -222,6 +225,9 @@ func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		a.mu.Lock()
 		a.calls = append(a.calls, args)
 		a.mu.Unlock()
+		if a.inspectJSON != "" {
+			return []byte(a.inspectJSON), nil, nil
+		}
 		return []byte(reuseInspectJSON(args[len(args)-1], a.state, "redis:7-alpine")), nil, nil
 	}
 	if args[0] == "run" {
@@ -247,6 +253,34 @@ func TestReuseAttachesToRunningContainer(t *testing.T) {
 	}
 	if !ctr.reused || ctr.ID() != "myctr" {
 		t.Errorf("ctr = %+v", ctr)
+	}
+}
+
+// Unreadable inspect output does not mean the container is absent. The
+// attach path must surface the decode failure instead of trying to create
+// a same-name container that already exists and retrying until the attach
+// deadline.
+func TestReuseDoesNotCreateWhenInspectOutputIsUnreadable(t *testing.T) {
+	oldAttach, oldPoll := reuseAttachTimeout, reusePollInterval
+	reuseAttachTimeout, reusePollInterval = 200*time.Millisecond, 10*time.Millisecond
+	defer func() { reuseAttachTimeout, reusePollInterval = oldAttach, oldPoll }()
+
+	f := &attachRunner{fakeRunner: newTestRunner(), state: "running", inspectJSON: `[null]`}
+	f.imagePresent = true
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(),
+		withRunner(f), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("Run: want error for unreadable inspect output")
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		t.Errorf("error = %v, want a schema error, not ErrContainerNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "decode container inspect output") {
+		t.Errorf("error = %v, want the decode failure surfaced", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("create run issued after an unreadable inspect: %v", f.callWith("run"))
 	}
 }
 

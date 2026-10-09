@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -104,6 +105,88 @@ func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
 	}
 	return m.execRunner.Run(ctx, args...)
+}
+
+type execInspectFailureRunner struct {
+	*execRunner
+	inspectStdout []byte
+	inspectErr    error
+}
+
+func (r *execInspectFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "inspect" {
+		return r.inspectStdout, nil, r.inspectErr
+	}
+	return r.execRunner.Run(ctx, args...)
+}
+
+func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
+	cases := []struct {
+		name            string
+		inspectStdout   []byte
+		inspectErr      error
+		wantNotFound    bool
+		wantSyntaxError bool
+		wantSchema      string
+	}{
+		{
+			name: "target missing",
+			inspectErr: &cli.CLIError{
+				Args:   []string{"inspect", "myctr"},
+				Stderr: `Error: container not found: "myctr"`,
+			},
+			wantNotFound: true,
+		},
+		{
+			name:            "malformed inspect",
+			inspectStdout:   []byte(`{not json`),
+			wantSyntaxError: true,
+		},
+		{
+			name:          "null inspect",
+			inspectStdout: []byte(`null`),
+			wantSchema:    "expected a JSON array",
+		},
+		{
+			// A null entry is unreadable output, not a missing
+			// container: reporting it as not found would send a running
+			// container's exec failure down the wrong path.
+			name:          "null inspect entry",
+			inspectStdout: []byte(`[null]`),
+			wantSchema:    "got null",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execInspectFailureRunner{
+				execRunner: &execRunner{
+					fakeRunner: newTestRunner(),
+					execErr: &cli.CLIError{
+						Args:     []string{"exec"},
+						ExitCode: 1,
+						Stderr:   "daemon unavailable",
+					},
+				},
+				inspectStdout: tc.inspectStdout,
+				inspectErr:    tc.inspectErr,
+			}
+			ctr := runTestContainer(t, f)
+			_, _, err := ctr.Exec(context.Background(), []string{"true"})
+			if err == nil {
+				t.Fatal("Exec returned nil error for failed inspect verification")
+			}
+			if got := errors.Is(err, ErrContainerNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(ErrContainerNotFound) = %t, want %t: %v", got, tc.wantNotFound, err)
+			}
+			var syntaxErr *json.SyntaxError
+			if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
+				t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
+			}
+			if tc.wantSchema != "" && (!strings.Contains(err.Error(), tc.wantSchema) || errors.Is(err, ErrContainerNotFound)) {
+				t.Errorf("error = %v, want a schema error containing %q and distinct from ErrContainerNotFound", err, tc.wantSchema)
+			}
+		})
+	}
 }
 
 func TestExecAppNotFoundStderrIsResult(t *testing.T) {

@@ -3,10 +3,13 @@ package container
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -185,6 +188,609 @@ func TestDockerParseInspect(t *testing.T) {
 	}
 }
 
+func TestDockerNameInspectDoesNotPublishUnverifiedUID(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &dockerRunner{fakeRunner: newTestRunner(), inspectJSON: data}
+	cfg := &config{runner: runner, eng: dockerEngine{}, name: "myctr"}
+	ctr := namedContainer(cfg, cfg.name)
+
+	info, err := ctr.inspectFresh(context.Background())
+	if err != nil {
+		t.Fatalf("name inspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Fatalf("inspected UID = %q, want fixture UID", info.uid)
+	}
+	if ctr.uid != "" {
+		t.Fatalf("name inspect published unverified UID: %q", ctr.uid)
+	}
+}
+
+func TestDockerInspectArgsRestrictTargetToContainers(t *testing.T) {
+	got := (dockerEngine{}).inspectArgs("myctr")
+	want := []string{"inspect", "--type=container", "myctr"}
+	if !slices.Equal(got, want) {
+		t.Errorf("inspectArgs = %v, want %v", got, want)
+	}
+}
+
+func TestDockerNameInspectRequiresSlashPrefixedName(t *testing.T) {
+	data := []byte(`[{"Id":"` + dockerFixtureID + `","Name":"myctr","State":{"Status":"running"}}]`)
+	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("name without slash was accepted: %v", err)
+	}
+}
+
+func TestDockerParseInspectSkipsNetworkBeforeContainer(t *testing.T) {
+	networkID := strings.Repeat("b", 64)
+	data := []byte(`[{"Id":"` + networkID + `","Name":"/myctr","Driver":"bridge","Scope":"local"},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Errorf("uid = %q, want container %q", info.uid, dockerFixtureID)
+	}
+	if info.state != StateRunning {
+		t.Errorf("state = %q, want %q", info.state, StateRunning)
+	}
+}
+
+func TestParseInspectTargetErrors(t *testing.T) {
+	engines := []struct {
+		name       string
+		eng        engine
+		absentData string
+	}{
+		{name: "apple", eng: appleEngine{}, absentData: `[{"id":"other"}]`},
+		{name: "docker", eng: dockerEngine{}, absentData: `[{"Id":"other"}]`},
+	}
+	cases := []struct {
+		name            string
+		data            string
+		backendData     bool
+		wantNotFound    bool
+		wantSyntaxError bool
+		wantSchema      string
+	}{
+		{name: "empty", data: `[]`, wantNotFound: true},
+		{name: "target absent", backendData: true, wantNotFound: true},
+		{name: "ID missing", data: `[{}]`, wantNotFound: true},
+		{name: "malformed JSON", data: `{not json`, wantSyntaxError: true},
+		{name: "top-level null", data: `null`, wantSchema: "expected a JSON array"},
+		// A null entry decodes to a zero value, so a skipped non-match
+		// would report a missing container for output that never said so.
+		{name: "null entry", data: `[null]`, wantSchema: "got null"},
+		{name: "null entry after another", data: `[{"id":"other"},null]`, wantSchema: "got null"},
+	}
+	for _, backend := range engines {
+		for _, tc := range cases {
+			t.Run(backend.name+"/"+tc.name, func(t *testing.T) {
+				data := tc.data
+				if tc.backendData {
+					data = backend.absentData
+				}
+				_, err := backend.eng.parseInspect([]byte(data), "requested")
+				if err == nil {
+					t.Fatal("parseInspect: want error, got nil")
+				}
+				if got := errors.Is(err, ErrContainerNotFound); got != tc.wantNotFound {
+					t.Errorf("errors.Is(ErrContainerNotFound) = %t, want %t: %v", got, tc.wantNotFound, err)
+				}
+				var syntaxErr *json.SyntaxError
+				if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
+					t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
+				}
+				if tc.wantSchema != "" {
+					if errors.Is(err, ErrContainerNotFound) || !strings.Contains(err.Error(), tc.wantSchema) {
+						t.Errorf("error = %v, want a schema error containing %q and distinct from ErrContainerNotFound", err, tc.wantSchema)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestDockerParseInspectSelectsRequestedID(t *testing.T) {
+	otherID := strings.Repeat("a", 64)
+	cases := []struct {
+		name         string
+		target       string
+		data         string
+		wantUID      string
+		wantNotFound bool
+	}{
+		{
+			name:    "exact ID",
+			target:  dockerFixtureID,
+			data:    `[{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:    "logical name",
+			target:  "myctr",
+			data:    `[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:   "logical name with multiple objects",
+			target: "myctr",
+			data: `[{"Id":"` + otherID + `","Name":"/other","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:   "exact ID wins over matching name",
+			target: dockerFixtureID,
+			data: `[{"Id":"` + otherID + `","Name":"/` + dockerFixtureID + `","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+		{
+			name:         "full ID does not fall back to name",
+			target:       dockerFixtureID,
+			data:         `[{"Id":"` + otherID + `","Name":"/` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantNotFound: true,
+		},
+		{
+			name:   "multiple objects",
+			target: dockerFixtureID,
+			data: `[{"Id":"` + otherID + `","State":{"Status":"exited"}},` +
+				`{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`,
+			wantUID: dockerFixtureID,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := (dockerEngine{}).parseInspect([]byte(tc.data), tc.target)
+			if tc.wantNotFound {
+				if !errors.Is(err, ErrContainerNotFound) {
+					t.Fatalf("error = %v, want ErrContainerNotFound", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseInspect: %v", err)
+			}
+			if info.uid != tc.wantUID {
+				t.Errorf("uid = %q, want %q", info.uid, tc.wantUID)
+			}
+			if info.state != StateRunning {
+				t.Errorf("state = %q, want %q", info.state, StateRunning)
+			}
+		})
+	}
+}
+
+func TestDockerParseInspectNameSkipsMalformedIDAndNonmatchingName(t *testing.T) {
+	data := []byte(`[{"Id":"myctr","Name":"/other","State":{"Status":"exited"}},` +
+		`{"Id":"malicious","Name":"/myctr","State":{"Status":"exited"}},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID {
+		t.Errorf("uid = %q, want %q", info.uid, dockerFixtureID)
+	}
+	if info.state != StateRunning {
+		t.Errorf("state = %q, want %q", info.state, StateRunning)
+	}
+}
+
+// An explicit null in a field the matcher reads is unreadable output, not
+// a missing container. Reporting ErrContainerNotFound would let a delete
+// that verified nothing pass as a removal that happened.
+func TestDockerParseInspectRejectsNullIdentityFields(t *testing.T) {
+	cases := []struct {
+		name   string
+		entry  string
+		target string
+		field  string
+	}{
+		{
+			name:   "Id null on an ID target",
+			entry:  `{"Id":null,"Name":"/myctr","State":{"Status":"running"}}`,
+			target: dockerFixtureID,
+			field:  "Id",
+		},
+		{
+			name:   "Id null on a name target",
+			entry:  `{"Id":null,"Name":"/myctr","State":{"Status":"running"}}`,
+			target: "myctr",
+			field:  "Id",
+		},
+		{
+			name:   "Name null on a name target",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":null,"State":{"Status":"running"}}`,
+			target: "myctr",
+			field:  "Name",
+		},
+		{
+			name:   "State null",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":null}`,
+			target: "myctr",
+			field:  "State",
+		},
+		{
+			name:   "State.Status null",
+			entry:  `{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":null}}`,
+			target: "myctr",
+			field:  "State.Status",
+		},
+		{
+			// A malformed entry is unusable output whatever the target is.
+			name:   "State null for an unrelated target",
+			entry:  `{"Id":"` + strings.Repeat("a", 64) + `","Name":"/other","State":null}`,
+			target: "myctr",
+			field:  "State",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := (dockerEngine{}).parseInspect([]byte("["+tc.entry+"]"), tc.target)
+			if err == nil {
+				t.Fatalf("parseInspect = %+v, want a schema error", info)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Errorf("error = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if want := fmt.Sprintf("field %q", tc.field); !strings.Contains(err.Error(), want) {
+				t.Errorf("error = %v, want it to report %s", err, want)
+			}
+		})
+	}
+}
+
+// A field that is absent is not a schema violation: a network or volume
+// inspect entry carries no container State, and the matcher must keep
+// skipping it in favor of the exact container entry that follows.
+func TestDockerParseInspectSkipsNonContainerObjectsWithoutState(t *testing.T) {
+	networkID := strings.Repeat("b", 64)
+	// The name and ID would match, so only the absent State keeps this
+	// entry from being taken for the requested container.
+	data := []byte(`[{"Id":"` + networkID + `","Name":"/myctr","Driver":"bridge"}]`)
+	if _, err := (dockerEngine{}).parseInspect(data, "myctr"); !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want ErrContainerNotFound for a non-container entry", err)
+	}
+	// A volume-shaped entry alongside the real one still resolves exactly.
+	data = []byte(`[{"Id":"` + networkID + `","Name":"vol","Mountpoint":"/var/lib/volumes/vol"},` +
+		`{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"exited"}}]`)
+	info, err := (dockerEngine{}).parseInspect(data, "myctr")
+	if err != nil {
+		t.Fatalf("parseInspect: %v", err)
+	}
+	if info.uid != dockerFixtureID || info.state != StateStopped {
+		t.Errorf("info = %+v, want the exact container entry", info)
+	}
+}
+
+func TestDockerInspectUsesRunIDAndRejectsMismatch(t *testing.T) {
+	d := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := runDockerTestContainer(t, d)
+	d.inspectJSON = []byte(`[{"Id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Name":"/myctr","State":{"Status":"running"}}]`)
+
+	_, err := ctr.State(context.Background())
+	inspectCall := d.callWith("inspect")
+	if inspectCall == nil {
+		t.Fatal("inspect was not called")
+	}
+	if got := inspectCall[len(inspectCall)-1]; got != dockerFixtureID {
+		t.Errorf("inspect target = %q, want Docker run ID %q", got, dockerFixtureID)
+	}
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
+	}
+}
+
+type blockingDockerInspectRunner struct {
+	*fakeRunner
+	data []byte
+
+	mu            sync.Mutex
+	inspectTarget []string
+	firstStarted  chan struct{}
+	secondStarted chan struct{}
+}
+
+func (r *blockingDockerInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 || args[0] != "inspect" {
+		return r.fakeRunner.Run(ctx, args...)
+	}
+	r.mu.Lock()
+	r.inspectTarget = append(r.inspectTarget, args[len(args)-1])
+	call := len(r.inspectTarget)
+	if call == 1 {
+		close(r.firstStarted)
+	}
+	if call == 2 {
+		close(r.secondStarted)
+	}
+	r.mu.Unlock()
+
+	if call == 1 {
+		select {
+		case <-r.secondStarted:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+	return r.data, nil, nil
+}
+
+func (r *blockingDockerInspectRunner) targets() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.inspectTarget)
+}
+
+func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &blockingDockerInspectRunner{
+		fakeRunner:    newTestRunner(),
+		data:          data,
+		firstStarted:  make(chan struct{}),
+		secondStarted: make(chan struct{}),
+	}
+	ctr := &Container{
+		id:      "myctr",
+		uid:     dockerFixtureID,
+		runner:  runner,
+		eng:     dockerEngine{},
+		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+	}
+
+	start := make(chan struct{})
+	endpointResult := make(chan error, 1)
+	stateResult := make(chan struct {
+		state State
+		err   error
+	}, 1)
+	var ready sync.WaitGroup
+	ready.Add(2)
+	go func() {
+		ready.Done()
+		<-start
+		_, err := ctr.Endpoint(context.Background(), "6379/tcp")
+		endpointResult <- err
+	}()
+	go func() {
+		ready.Done()
+		<-start
+		state, err := ctr.State(context.Background())
+		stateResult <- struct {
+			state State
+			err   error
+		}{state: state, err: err}
+	}()
+	ready.Wait()
+	close(start)
+
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+	if err := <-endpointResult; err != nil {
+		t.Fatalf("Endpoint: %v", err)
+	}
+	result := <-stateResult
+	if result.err != nil {
+		t.Fatalf("State: %v", result.err)
+	}
+	if result.state != StateRunning {
+		t.Fatalf("State = %q, want %q", result.state, StateRunning)
+	}
+	if got := ctr.uid; got != dockerFixtureID {
+		t.Fatalf("uid = %q, want %q", got, dockerFixtureID)
+	}
+	wantTargets := []string{dockerFixtureID, dockerFixtureID}
+	if got := runner.targets(); !slices.Equal(got, wantTargets) {
+		t.Errorf("inspect targets = %v, want %v", got, wantTargets)
+	}
+}
+
+type cancelingDockerInspectRunner struct {
+	*fakeRunner
+	data []byte
+
+	mu           sync.Mutex
+	inspectCalls int
+	firstStarted chan struct{}
+	releaseFirst chan struct{}
+}
+
+func (r *cancelingDockerInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 || args[0] != "inspect" {
+		return r.fakeRunner.Run(ctx, args...)
+	}
+	r.mu.Lock()
+	r.inspectCalls++
+	call := r.inspectCalls
+	r.mu.Unlock()
+	if call == 1 {
+		close(r.firstStarted)
+		select {
+		case <-r.releaseFirst:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return r.data, nil, nil
+}
+
+func (r *cancelingDockerInspectRunner) calls() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.inspectCalls
+}
+
+func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
+	runner := &cancelingDockerInspectRunner{
+		fakeRunner:   newTestRunner(),
+		data:         []byte(`[{"Id":"` + dockerFixtureID + `","Name":"/myctr","State":{"Status":"running"}}]`),
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+
+	release := func() {
+		select {
+		case <-runner.releaseFirst:
+		default:
+			close(runner.releaseFirst)
+		}
+	}
+	defer release()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(ctx)
+		secondDone <- err
+	}()
+
+	select {
+	case err := <-secondDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("second inspect error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-firstDone
+		t.Fatal("canceled second inspect waited behind the first inspect")
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+	if got := runner.calls(); got != 1 {
+		t.Errorf("inspect calls = %d, want 1", got)
+	}
+}
+
+func TestDockerStopUsesBoundUID(t *testing.T) {
+	runner := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	if err := ctr.Stop(context.Background(), nil); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	call := runner.callWith("stop")
+	if len(call) == 0 || call[len(call)-1] != dockerFixtureID {
+		t.Fatalf("stop target = %v, want immutable UID", call)
+	}
+}
+
+func TestDockerTerminateDoesNotWaitBehindInspectLock(t *testing.T) {
+	runner := &cancelingDockerInspectRunner{
+		fakeRunner:   newTestRunner(),
+		data:         []byte(`[{"Id":"` + dockerFixtureID + `","State":{"Status":"running"}}]`),
+		firstStarted: make(chan struct{}),
+		releaseFirst: make(chan struct{}),
+	}
+	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	release := func() {
+		select {
+		case <-runner.releaseFirst:
+		default:
+			close(runner.releaseFirst)
+		}
+	}
+	defer release()
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := ctr.State(context.Background())
+		firstDone <- err
+	}()
+	select {
+	case <-runner.firstStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first inspect did not start")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	terminateDone := make(chan error, 1)
+	go func() { terminateDone <- ctr.Terminate(ctx) }()
+	select {
+	case err := <-terminateDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Terminate error = %v, want context.Canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		release()
+		<-firstDone
+		t.Fatal("canceled Terminate waited behind inspectMu")
+	}
+
+	release()
+	if err := <-firstDone; err != nil {
+		t.Fatalf("first inspect: %v", err)
+	}
+}
+
+func TestDockerOperationFailsClosedWithoutUID(t *testing.T) {
+	runner := &dockerRunner{fakeRunner: newTestRunner()}
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	if err := ctr.Stop(context.Background(), nil); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("Stop error = %v, want ErrGenerationReplaced", err)
+	}
+	if len(runner.calls) != 0 {
+		t.Fatalf("unverified Docker handle issued calls: %v", runner.calls)
+	}
+}
+
+// Unreadable inspect output says nothing about whether the container
+// exists. Reporting ErrContainerNotFound would let callers that read a
+// missing container as a removed one act on a container that is still up.
+func TestDockerInspectSchemaErrorIsNotNotFound(t *testing.T) {
+	for _, data := range []string{`[null]`, `[{"Id":"` + dockerFixtureID + `","State":null}]`} {
+		t.Run(data, func(t *testing.T) {
+			d := &dockerRunner{fakeRunner: newTestRunner()}
+			ctr := runDockerTestContainer(t, d)
+			// runDockerTestContainer installs a well-formed fixture; replace
+			// it with the unreadable output under test.
+			d.inspectJSON = []byte(data)
+
+			state, err := ctr.State(context.Background())
+			if err == nil {
+				t.Fatalf("State = %q, want an error for unreadable output", state)
+			}
+			if errors.Is(err, ErrContainerNotFound) {
+				t.Errorf("State error = %v, want a schema error, not ErrContainerNotFound", err)
+			}
+			if !strings.Contains(err.Error(), "decode docker inspect output") {
+				t.Errorf("State error = %v, want a decode error", err)
+			}
+			// A rejected entry must not publish a UID to the handle; the
+			// handle keeps only the ID docker run itself printed.
+			if ctr.uid != dockerFixtureID {
+				t.Errorf("uid = %q, want the run ID %q", ctr.uid, dockerFixtureID)
+			}
+		})
+	}
+}
+
 func TestDockerParseInspectRejectsWrongTarget(t *testing.T) {
 	_, err := (dockerEngine{}).parseInspect([]byte(`[{"Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","Name":"/myctr"}]`), dockerFixtureID)
 	if !errors.Is(err, ErrContainerNotFound) {
@@ -194,8 +800,8 @@ func TestDockerParseInspectRejectsWrongTarget(t *testing.T) {
 
 func TestDockerParseInspectInfersNetworkMode(t *testing.T) {
 	info, err := (dockerEngine{}).parseInspect([]byte(`[
-  {"Id":"id","State":{"Status":"running"},"NetworkSettings":{"Networks":{"test-net":{"IPAddress":"172.20.0.2"}}}}
-]`), "id")
+  {"Id":"`+dockerFixtureID+`","State":{"Status":"running"},"NetworkSettings":{"Networks":{"test-net":{"IPAddress":"172.20.0.2"}}}}
+]`), dockerFixtureID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -335,6 +941,7 @@ type dockerRunner struct {
 	inspectError       error
 	networkInspectJSON []byte
 	failInspect        bool
+	runID              string
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -359,6 +966,9 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		name := args[len(args)-1]
 		return []byte(`[{"Name":"` + name + `","Driver":"bridge","Internal":false,"Options":{}}]`), nil, nil
 	case "run":
+		if d.runID != "" {
+			return []byte(d.runID + "\n"), nil, nil
+		}
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
@@ -409,6 +1019,36 @@ func TestDockerParseRunID(t *testing.T) {
 		if got := e.parseRunID([]byte(out)); got != "" {
 			t.Errorf("parseRunID(%q) = %q, want empty", out, got)
 		}
+	}
+}
+
+func TestDockerRunRejectsInvalidImmutableID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts []Option
+	}{
+		{name: "create"},
+		{name: "reuse", opts: []Option{WithReuse()}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &dockerRunner{
+				fakeRunner:  newTestRunner(),
+				runID:       "not-an-immutable-id",
+				inspectJSON: []byte(`[]`),
+			}
+			d.imagePresent = true
+			opts := append([]Option{WithName("myctr"), withRunner(d), withEngine(dockerEngine{})}, tc.opts...)
+			ctr, err := Run(context.Background(), "redis:7-alpine", opts...)
+			if ctr != nil {
+				t.Fatalf("Run returned container %+v after invalid ID", ctr)
+			}
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), "no valid immutable") {
+				t.Fatalf("Run error = %v, want invalid immutable ID error", err)
+			}
+			if rm := d.callWith("rm"); rm != nil {
+				t.Fatalf("invalid run output issued an unverified delete: %v", rm)
+			}
+		})
 	}
 }
 

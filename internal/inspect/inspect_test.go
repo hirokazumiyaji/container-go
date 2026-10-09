@@ -2,6 +2,7 @@ package inspect
 
 import (
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -92,5 +93,37 @@ func TestDecodeIgnoresUnknownFields(t *testing.T) {
 func TestDecodeRejectsInvalidJSON(t *testing.T) {
 	if _, err := Decode([]byte(`{not json`)); err == nil {
 		t.Error("Decode invalid input: want error, got nil")
+	}
+}
+
+// A null entry decodes to a zero Container, whose empty ID is skipped as a
+// non-match. That would report a missing container for output that never
+// said whether the target exists.
+func TestDecodeRejectsNullEntries(t *testing.T) {
+	cases := map[string]string{
+		"null entry":            `[null]`,
+		"null entry after one":  `[{"id":"x"},null]`,
+		"null entry before one": `[null,{"id":"x"}]`,
+	}
+	for name, data := range cases {
+		t.Run(name, func(t *testing.T) {
+			_, err := Decode([]byte(data))
+			if err == nil {
+				t.Fatal("Decode null entry: want error, got nil")
+			}
+			if !strings.Contains(err.Error(), "got null") {
+				t.Errorf("Decode = %v, want a schema error naming the null entry", err)
+			}
+		})
+	}
+}
+
+func TestDecodeEmptyArrayIsNotAnError(t *testing.T) {
+	containers, err := Decode([]byte(`[]`))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if len(containers) != 0 {
+		t.Errorf("len = %d, want 0", len(containers))
 	}
 }

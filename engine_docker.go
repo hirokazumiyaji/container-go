@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
 // dockerEngine drives the `docker` CLI. Unlike Apple Container, the
@@ -590,7 +591,12 @@ func (dockerEngine) parseRunID(stdout []byte) string {
 	return id
 }
 
-func (dockerEngine) inspectArgs(id string) []string { return []string{"inspect", id} }
+func (dockerEngine) inspectArgs(id string) []string {
+	// Docker resolves an unqualified target across object types by default.
+	// Restrict the CLI lookup to containers so a network or volume cannot
+	// shadow the requested container name.
+	return []string{"inspect", "--type=container", id}
+}
 
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
@@ -598,7 +604,9 @@ type dockerInspect struct {
 	ID       string `json:"Id"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
-	State    struct {
+	// State is present on container inspect objects, but not on Docker
+	// network or volume inspect objects.
+	State *struct {
 		Status string `json:"Status"`
 	} `json:"State"`
 	HostConfig struct {
@@ -620,27 +628,56 @@ type dockerInspect struct {
 	} `json:"NetworkSettings"`
 }
 
+// dockerInspectFields are the entry fields the matcher below depends on to
+// recognize the requested container and its state. Nullable collections
+// the CLI uses for empty values (Config.Labels, NetworkSettings.Ports,
+// which real output emits as null) are deliberately absent: a null there
+// is an empty value, not unreadable output.
+var dockerInspectFields = []string{"Id", "Name", "State", "State.Status"}
+
+// parseInspect returns the one entry that matches target exactly: the full
+// container ID for an ID target, or the slash-prefixed name for a logical
+// name. Other entries are ignored, and output the parser cannot read is an
+// error rather than a missing container.
 func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
-	var containers []dockerInspect
-	if err := json.Unmarshal(data, &containers); err != nil {
+	// Decode entry by entry so an entry this parser cannot interpret is
+	// reported as a schema failure instead of a zero value. A target-naming
+	// entry that decoded to nothing would be classified ErrContainerNotFound
+	// even though the container exists, which lets a delete that verified
+	// nothing pass as a removal that happened.
+	containers, err := strictjson.Array[dockerInspect](data, dockerInspectFields)
+	if err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
 	match := -1
-	for i, c := range containers {
-		if c.ID != "" && c.ID == target {
-			match = i
-			break
-		}
-	}
-	if match < 0 && !dockerIDRE.MatchString(target) {
+	var malformedID string
+	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
-			if strings.TrimPrefix(c.Name, "/") == target {
+			if c.State != nil && dockerIDRE.MatchString(c.ID) && c.ID == target {
 				match = i
 				break
 			}
 		}
+	} else {
+		for i, c := range containers {
+			if target != "" && c.Name == "/"+target {
+				if c.ID != "" && !dockerIDRE.MatchString(c.ID) {
+					if malformedID == "" {
+						malformedID = c.ID
+					}
+					continue
+				}
+				if c.State != nil && dockerIDRE.MatchString(c.ID) {
+					match = i
+					break
+				}
+			}
+		}
 	}
 	if match < 0 {
+		if malformedID != "" {
+			return nil, fmt.Errorf("decode docker inspect output: container %s has invalid ID %q", target, malformedID)
+		}
 		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
 	}
 	c := containers[match]

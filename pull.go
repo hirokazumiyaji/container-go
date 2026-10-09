@@ -149,20 +149,20 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 		}
 		return nil
 	case PullAlways:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull, platform), func() error {
+		if err := doErr(ctx, &imageFlights, flightKey(c.eng, image, flightPull, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
-			// A successful PullAlways fetch makes the image present, so
-			// drop any entry that disagrees before recording the new one.
-			c.imageCache.forget(c.eng, image, platform)
-			if err := pullImage(execCtx, c.runner, c.eng, image, platform); err != nil {
-				return err
-			}
-			c.imageCache.remember(c.eng, image, platform)
-			return nil
-		})
+			return pullImage(execCtx, c.runner, c.eng, image, platform)
+		}); err != nil {
+			return err
+		}
+		// Record outside the flight so every waiter — each with its own
+		// Option-owned cache — learns the image is present, not only the
+		// leader whose config the callback closed over.
+		c.imageCache.remember(c.eng, image, platform)
+		return nil
 	default:
-		return doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing, platform), func() error {
+		if err := doErr(ctx, &imageFlights, flightKey(c.eng, image, flightMissing, platform), func() error {
 			execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 			defer cancel()
 			exists, err := imageExists(execCtx, c.runner, c.eng, image, platform)
@@ -170,19 +170,16 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 				return err
 			}
 			if exists {
-				// Record the presence so a later Run of the same image
-				// can skip the inspect entirely.
-				c.imageCache.remember(c.eng, image, platform)
 				return nil
 			}
-			if err := pullImage(execCtx, c.runner, c.eng, image, platform); err != nil {
-				return err
-			}
-			// The pull just made the image present; remember that rather
-			// than making the next Run inspect to find out.
-			c.imageCache.remember(c.eng, image, platform)
-			return nil
-		})
+			return pullImage(execCtx, c.runner, c.eng, image, platform)
+		}); err != nil {
+			return err
+		}
+		// Same as PullAlways: waiters share the successful flight but not
+		// the leader's cache, so each caller records presence itself.
+		c.imageCache.remember(c.eng, image, platform)
+		return nil
 	}
 }
 

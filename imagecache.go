@@ -72,15 +72,25 @@ func (c *imageCache) seen(eng engine, image, platform string) bool {
 	return true
 }
 
-// remember records that the image is present.
+// remember records that the image is present. While inserting it also
+// drops any expired entries so a long-lived Option used with changing
+// image references does not retain dead keys forever; seen() already
+// drops an expired key on lookup, but keys that are never queried again
+// would otherwise linger until the Option itself is discarded.
 func (c *imageCache) remember(eng engine, image, platform string) {
 	if !c.enabled() {
 		return
 	}
 	key := imageCacheKey(eng, image, platform)
+	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.entries[key] = c.now().Add(c.ttl)
+	for k, expiry := range c.entries {
+		if !now.Before(expiry) {
+			delete(c.entries, k)
+		}
+	}
+	c.entries[key] = now.Add(c.ttl)
 }
 
 // forget drops any entry for key. Called after a pull, so that a pull of

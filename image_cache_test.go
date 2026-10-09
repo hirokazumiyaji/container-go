@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -167,6 +168,106 @@ func TestImageCacheForgetsExpiredEntries(t *testing.T) {
 	}
 	if got := c.size(); got != 0 {
 		t.Errorf("size = %d after an expired entry was observed, want 0 (it should be dropped)", got)
+	}
+}
+
+// TestImageCacheRememberPurgesExpiredEntries covers keys that expire
+// without ever being looked up again: remember of a different image must
+// still drop them so a long-lived Option does not retain dead entries.
+func TestImageCacheRememberPurgesExpiredEntries(t *testing.T) {
+	c := newImageCache(time.Minute)
+	now := time.Now()
+	c.now = func() time.Time { return now }
+
+	c.remember(dockerEngine{}, "old:1", "")
+	now = now.Add(2 * time.Minute)
+	c.remember(dockerEngine{}, "new:1", "")
+	if got := c.size(); got != 1 {
+		t.Errorf("size = %d after remember purged expired, want 1", got)
+	}
+	if c.seen(dockerEngine{}, "old:1", "") {
+		t.Error("expired entry survived a remember of a different key")
+	}
+	if !c.seen(dockerEngine{}, "new:1", "") {
+		t.Error("fresh entry missing after remember")
+	}
+}
+
+// TestImageCacheWaitersPopulateOwnCaches covers concurrent PullMissing
+// Runs that share a flight but hold distinct Options: only the leader
+// used to record presence, so a later Run reusing a waiter's Option
+// paid another inspect. Every successful waiter must populate its cache.
+func TestImageCacheWaitersPopulateOwnCaches(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+
+	inspectEntered := make(chan struct{})
+	releaseInspect := make(chan struct{})
+	var inspectOnce sync.Once
+	r := &hookRunner{
+		fakeRunner: base,
+		before: func(args []string) {
+			if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
+				inspectOnce.Do(func() { close(inspectEntered) })
+				<-releaseInspect
+			}
+		},
+	}
+
+	optLeader := WithImagePresenceCache(time.Minute)
+	optWaiter := WithImagePresenceCache(time.Minute)
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		cfg := newConfig()
+		cfg.runner = r
+		cfg.eng = dockerEngine{}
+		if err := optLeader(cfg); err != nil {
+			leaderDone <- err
+			return
+		}
+		leaderDone <- cfg.ensureImage(context.Background(), "redis:7-alpine")
+	}()
+	select {
+	case <-inspectEntered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader never entered image inspect")
+	}
+
+	waiterDone := make(chan error, 1)
+	go func() {
+		cfg := newConfig()
+		cfg.runner = r
+		cfg.eng = dockerEngine{}
+		if err := optWaiter(cfg); err != nil {
+			waiterDone <- err
+			return
+		}
+		waiterDone <- cfg.ensureImage(context.Background(), "redis:7-alpine")
+	}()
+	// Give the waiter time to join the in-flight inspect.
+	time.Sleep(50 * time.Millisecond)
+	close(releaseInspect)
+
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+	if err := <-waiterDone; err != nil {
+		t.Fatalf("waiter: %v", err)
+	}
+
+	cfg := newConfig()
+	cfg.runner = r
+	cfg.eng = dockerEngine{}
+	if err := optWaiter(cfg); err != nil {
+		t.Fatal(err)
+	}
+	before := countInspects(base.calls, "image")
+	if err := cfg.ensureImage(context.Background(), "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countInspects(base.calls, "image"); got != before {
+		t.Errorf("waiter Option cache missed: inspects grew from %d to %d", before, got)
 	}
 }
 

@@ -64,21 +64,27 @@ func WithPullPolicy(policy PullPolicy) Option {
 // successful pull is recorded, so the next Run of the same image skips
 // the inspect too.
 //
-// The cache is per-Run, not process-global: it lives on the config, so
-// two Runs do not share it and a caller cannot observe another caller's
-// entries. Runs of the same image in the same process still collapse onto
-// one flight, so this only removes the cost across time rather than
-// within it.
+// The cache is owned by the returned Option, not process-global: call
+// WithImagePresenceCache once and reuse that Option across Runs so
+// entries persist. Each Run still builds a fresh config, but applying the
+// same Option attaches the same cache. A fresh call to
+// WithImagePresenceCache creates a distinct empty cache, so callers that
+// do not share Options cannot observe each other's entries. Concurrent
+// Runs of the same image in the same process still collapse onto one
+// flight; this option removes the inspect cost across sequential Runs.
 //
 // A ttl of zero or less disables the cache, which is the same as not
 // passing this option. Run without this option always inspects, so the
 // cache is a cost decision the caller makes explicitly.
 func WithImagePresenceCache(ttl time.Duration) Option {
-	return func(c *config) error {
-		if ttl < 0 {
+	if ttl < 0 {
+		return func(*config) error {
 			return fmt.Errorf("invalid image presence cache ttl %v: must not be negative", ttl)
 		}
-		c.imageCache = newImageCache(ttl)
+	}
+	cache := newImageCache(ttl)
+	return func(c *config) error {
+		c.imageCache = cache
 		return nil
 	}
 }

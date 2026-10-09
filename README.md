@@ -623,11 +623,13 @@ best-effort on Apple; it is not an unconditional no-fetch guarantee (#112).
 That existence check is a daemon round trip on every `Run`. When the
 backend's store is known to be stable for the length of the test run,
 `WithImagePresenceCache` reuses a "present" answer for a TTL so later
-`Run`s of the same image skip it:
+`Run`s of the same image skip it. Create the option once and reuse it —
+each call to `WithImagePresenceCache` owns a distinct cache:
 
 ```go
-container.Run(ctx, "redis:7-alpine",
-    container.WithImagePresenceCache(5*time.Minute))
+presence := container.WithImagePresenceCache(5 * time.Minute)
+container.Run(ctx, "redis:7-alpine", presence)
+container.Run(ctx, "redis:7-alpine", presence) // skips image inspect
 ```
 
 It is off by default, and only "present" answers are cached: caching an

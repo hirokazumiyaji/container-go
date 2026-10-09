@@ -44,29 +44,71 @@ func TestImageCacheDisabledByDefault(t *testing.T) {
 	}
 }
 
-// TestImageCacheSkipsTheSecondInspect is the point of the option.
+// TestImageCacheSkipsTheSecondInspect is the point of the option:
+// reusing one Option across sequential configs (as Run does) skips the
+// second inspect.
 func TestImageCacheSkipsTheSecondInspect(t *testing.T) {
 	r := newTestRunner()
 	r.imagePresent = true
-	cfg := newConfig()
-	cfg.runner = r
-	cfg.eng = dockerEngine{}
-	if err := WithImagePresenceCache(time.Minute)(cfg); err != nil {
+	opt := WithImagePresenceCache(time.Minute)
+
+	cfg1 := newConfig()
+	cfg1.runner = r
+	cfg1.eng = dockerEngine{}
+	if err := opt(cfg1); err != nil {
 		t.Fatal(err)
 	}
 
 	ctx := context.Background()
-	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+	if err := cfg1.ensureImage(ctx, "redis:7-alpine"); err != nil {
 		t.Fatalf("first ensureImage: %v", err)
 	}
 	if got := countInspects(r.calls, "image"); got != 1 {
 		t.Fatalf("first Run ran %d image inspects, want 1", got)
 	}
-	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+
+	cfg2 := newConfig()
+	cfg2.runner = r
+	cfg2.eng = dockerEngine{}
+	if err := opt(cfg2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg2.ensureImage(ctx, "redis:7-alpine"); err != nil {
 		t.Fatalf("second ensureImage: %v", err)
 	}
 	if got := countInspects(r.calls, "image"); got != 1 {
 		t.Errorf("second Run ran an extra image inspect (total %d, want 1)", got)
+	}
+}
+
+// TestImageCacheIsNotSharedAcrossDistinctOptions keeps a fresh
+// WithImagePresenceCache call from observing another caller's entries.
+func TestImageCacheIsNotSharedAcrossDistinctOptions(t *testing.T) {
+	r := newTestRunner()
+	r.imagePresent = true
+	ctx := context.Background()
+
+	cfg1 := newConfig()
+	cfg1.runner = r
+	cfg1.eng = dockerEngine{}
+	if err := WithImagePresenceCache(time.Minute)(cfg1); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg1.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatalf("first ensureImage: %v", err)
+	}
+
+	cfg2 := newConfig()
+	cfg2.runner = r
+	cfg2.eng = dockerEngine{}
+	if err := WithImagePresenceCache(time.Minute)(cfg2); err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg2.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatalf("second ensureImage: %v", err)
+	}
+	if got := countInspects(r.calls, "image"); got != 2 {
+		t.Errorf("ran %d image inspects across distinct Options, want 2", got)
 	}
 }
 
@@ -215,10 +257,11 @@ func TestImageCacheIsNotWrittenWhenThePullFails(t *testing.T) {
 func TestImageCacheIsPerPlatformAndPerBackend(t *testing.T) {
 	r := newTestRunner()
 	r.imagePresent = true
+	opt := WithImagePresenceCache(time.Minute)
 	cfg := newConfig()
 	cfg.runner = r
 	cfg.eng = dockerEngine{}
-	if err := WithImagePresenceCache(time.Minute)(cfg); err != nil {
+	if err := opt(cfg); err != nil {
 		t.Fatal(err)
 	}
 	ctx := context.Background()
@@ -235,11 +278,12 @@ func TestImageCacheIsPerPlatformAndPerBackend(t *testing.T) {
 	if got := countInspects(r.calls, "image"); got != 2 {
 		t.Errorf("ran %d image inspects for two platforms, want 2", got)
 	}
-	// And the other backend's store is independent too.
+	// And the other backend's store is independent too — same Option, so
+	// the miss comes from the key, not from a fresh empty cache.
 	appleCfg := newConfig()
 	appleCfg.runner = r
 	appleCfg.eng = appleEngine{}
-	if err := WithImagePresenceCache(time.Minute)(appleCfg); err != nil {
+	if err := opt(appleCfg); err != nil {
 		t.Fatal(err)
 	}
 	if err := appleCfg.ensureImage(ctx, "redis:7-alpine"); err != nil {

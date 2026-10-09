@@ -750,12 +750,13 @@ finished inspects the image again. That is the safe default, since an
 image can be removed from the store between two `Run`s. `Run` therefore
 pays one daemon round trip for the existence check every time, which
 `WithImagePresenceCache(ttl)` can remove for callers whose store is
-stable for the length of the run. The cache holds only "present"
-answers - a cached absence would have to be invalidated by the pull it
-triggered - and is keyed by backend, image, and platform, since those
-stores are independent. `PullNever` always inspects: its contract is to
-fail when the image is absent, so a cached answer must not stand in for
-the check.
+stable for the length of the run. The returned Option owns the cache, so
+callers must reuse that Option across `Run`s; a fresh call creates an
+empty cache. The cache holds only "present" answers - a cached absence
+would have to be invalidated by the pull it triggered - and is keyed by
+backend, image, and platform, since those stores are independent.
+`PullNever` always inspects: its contract is to fail when the image is
+absent, so a cached answer must not stand in for the check.
 
 ## Security design
 

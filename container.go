@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"slices"
@@ -782,12 +783,19 @@ func (c *Container) Terminate(ctx context.Context) error {
 		defer unlock()
 		info, err := c.inspectFresh(ctx)
 		if isNotFound(err) {
+			unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, "")
 			return nil
 		}
 		if err != nil {
+			if errors.Is(err, ErrGenerationReplaced) {
+				unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, "")
+			}
 			return fmt.Errorf("terminate %s: verify generation: %w", c.id, err)
 		}
 		if err := sameContainerIdentity(c.eng, &engineInfo{labels: map[string]string{creationLabel: creation}}, info); err != nil {
+			if errors.Is(err, ErrGenerationReplaced) {
+				unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, "")
+			}
 			return err
 		}
 		return c.delete(ctx, c.id)

@@ -3,6 +3,9 @@
 package container
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -450,5 +453,217 @@ func TestReaperSharedEntryIsNotDeletedOnEOF(t *testing.T) {
 	time.Sleep(250 * time.Millisecond)
 	if data, _ := os.ReadFile(logPath); strings.Contains(string(data), "delete --force shared") {
 		t.Fatalf("shared entry was deleted: %q", data)
+	}
+}
+
+func TestReaperUnregisterRemovesCompletedEntryFromEOF(t *testing.T) {
+	requirePOSIXShell(t)
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+
+	if err := r.register("completed", ""); err != nil {
+		t.Fatalf("register completed: %v", err)
+	}
+	if err := r.register("active", ""); err != nil {
+		t.Fatalf("register active: %v", err)
+	}
+	if err := r.unregister("completed", ""); err != nil {
+		t.Fatalf("unregister completed: %v", err)
+	}
+
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force active")
+
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force completed") {
+		t.Fatalf("reaper deleted completed entry: %q", data)
+	}
+}
+
+func TestReaperRespawnReplaysOnlyActiveEntries(t *testing.T) {
+	requirePOSIXShell(t)
+	bin, logPath := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+
+	if err := r.register("completed", ""); err != nil {
+		t.Fatalf("register completed: %v", err)
+	}
+	if err := r.unregister("completed", ""); err != nil {
+		t.Fatalf("unregister completed: %v", err)
+	}
+	if err := r.register("active", ""); err != nil {
+		t.Fatalf("register active: %v", err)
+	}
+
+	r.killForTest()
+	if err := r.register("after-crash", ""); err != nil {
+		t.Fatalf("register after crash: %v", err)
+	}
+	r.closeStdin()
+	waitForLogLines(t, logPath, "delete --force active", "delete --force after-crash")
+
+	data, _ := os.ReadFile(logPath)
+	if strings.Contains(string(data), "delete --force completed") {
+		t.Fatalf("reaper replayed completed entry after crash: %q", data)
+	}
+}
+
+func TestReaperCompletedEntriesAreBounded(t *testing.T) {
+	requirePOSIXShell(t)
+	bin, _ := writeReaperStub(t)
+	r := newReaper(bin, "delete")
+
+	// Anchor keeps child process alive during the batch of 10,000 register/unregister cycles.
+	if err := r.register("anchor", ""); err != nil {
+		t.Fatalf("register anchor: %v", err)
+	}
+
+	const lifecycles = 10_000
+	for i := 0; i < lifecycles; i++ {
+		id := fmt.Sprintf("ctr-%d", i)
+		if err := r.register(id, ""); err != nil {
+			t.Fatalf("register %d: %v", i, err)
+		}
+		if err := r.unregister(id, ""); err != nil {
+			t.Fatalf("unregister %d: %v", i, err)
+		}
+	}
+
+	if err := r.unregister("anchor", ""); err != nil {
+		t.Fatalf("unregister anchor: %v", err)
+	}
+
+	r.mu.Lock()
+	activeCount := len(r.entries)
+	r.mu.Unlock()
+	if activeCount != 0 {
+		t.Fatalf("active entries after %d lifecycles = %d, want 0", lifecycles, activeCount)
+	}
+	if !r.entriesEmpty() {
+		t.Fatal("entriesEmpty() returned false, want true")
+	}
+}
+
+func BenchmarkReaperLifecycle(b *testing.B) {
+	dir := b.TempDir()
+	logPath := filepath.Join(dir, "calls.log")
+	binPath := filepath.Join(dir, "container")
+	script := "#!/bin/sh\necho \"$@\" >> " + logPath + "\n"
+	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
+		b.Fatal(err)
+	}
+	r := newReaper(binPath, "delete")
+	if err := r.register("anchor", ""); err != nil {
+		b.Fatal(err)
+	}
+	defer func() {
+		_ = r.unregister("anchor", "")
+		r.closeStdin()
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		id := fmt.Sprintf("bench-%d", i)
+		if err := r.register(id, ""); err != nil {
+			b.Fatal(err)
+		}
+		if err := r.unregister(id, ""); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+type fakeAppleTerminateRunner struct {
+	bin      string
+	notFound bool
+	replaced bool
+}
+
+func (r *fakeAppleTerminateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) == 0 {
+		return nil, nil, nil
+	}
+	switch args[0] {
+	case "inspect":
+		if r.notFound {
+			return nil, []byte("container not found"), fmt.Errorf("%w: exit status 1", ErrContainerNotFound)
+		}
+		target := "ctr"
+		if len(args) > 1 {
+			target = args[1]
+		}
+		gen := "0123456789abcdef"
+		if r.replaced {
+			gen = "fedcba9876543210"
+		}
+		return []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"id":%q,"image":{"reference":"alpine"},"labels":{%q:"true",%q:%q,%q:%q}},"status":{"state":"running","networks":[]}}]`, target, target, managedLabel, sessionLabel, sessionID(), creationLabel, gen)), nil, nil
+	case "delete":
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func (r *fakeAppleTerminateRunner) External() bool         { return true }
+func (r *fakeAppleTerminateRunner) ExternalBinary() string { return r.bin }
+
+func TestTerminateAppleNotFoundUnregistersReaper(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "container")
+	runner := &fakeAppleTerminateRunner{bin: bin, notFound: true}
+	watchdog := newReaper(bin, "delete")
+	creation := "0123456789abcdef"
+	if err := watchdog.register("apple-not-found", creation); err != nil {
+		t.Fatal(err)
+	}
+	globalReapersMu.Lock()
+	globalReapers[bin] = watchdog
+	globalReapersMu.Unlock()
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, bin)
+		globalReapersMu.Unlock()
+		watchdog.closeStdin()
+	})
+
+	ctr := &Container{id: "apple-not-found", creation: creation, runner: runner, eng: appleEngine{}}
+	if err := ctr.Terminate(context.Background()); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	watchdog.mu.Lock()
+	entries := len(watchdog.entries)
+	watchdog.mu.Unlock()
+	if entries != 0 {
+		t.Fatalf("reaper retained %d records after not found Terminate, want 0", entries)
+	}
+}
+
+func TestTerminateAppleReplacedUnregistersReaper(t *testing.T) {
+	bin := filepath.Join(t.TempDir(), "container")
+	runner := &fakeAppleTerminateRunner{bin: bin, replaced: true}
+	watchdog := newReaper(bin, "delete")
+	creation := "0123456789abcdef"
+	if err := watchdog.register("apple-replaced", creation); err != nil {
+		t.Fatal(err)
+	}
+	globalReapersMu.Lock()
+	globalReapers[bin] = watchdog
+	globalReapersMu.Unlock()
+	t.Cleanup(func() {
+		globalReapersMu.Lock()
+		delete(globalReapers, bin)
+		globalReapersMu.Unlock()
+		watchdog.closeStdin()
+	})
+
+	ctr := &Container{id: "apple-replaced", creation: creation, runner: runner, eng: appleEngine{}}
+	err := ctr.Terminate(context.Background())
+	if !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("Terminate error = %v, want ErrGenerationReplaced", err)
+	}
+	watchdog.mu.Lock()
+	entries := len(watchdog.entries)
+	watchdog.mu.Unlock()
+	if entries != 0 {
+		t.Fatalf("reaper retained %d records after replaced Terminate, want 0", entries)
 	}
 }

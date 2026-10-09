@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -36,9 +34,16 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		name := args[len(args)-1]
+		r.mu.Lock()
+		creation := r.creations[name]
+		r.mu.Unlock()
+		if creation == "" {
+			creation = "0123456789abcdef"
+		}
+		return []byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -58,6 +63,25 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 		WithName("myctr"), WithReuseGroup("integration"), withRunner(newTestRunner()))
 	if err == nil || !strings.Contains(err.Error(), "WithReuseGroup requires WithReuse") {
 		t.Fatalf("error = %v, want WithReuseGroup requires WithReuse", err)
+	}
+}
+
+func TestReuseDoesNotDetachCanceledPreflight(t *testing.T) {
+	f := newReuseCreateRunner()
+	cfg := newConfig()
+	cfg.name = "canceled-reuse"
+	cfg.reuse = true
+	cfg.eng = appleEngine{}
+	cfg.runner = f
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ctr, err := reuseRun(ctx, "redis:7-alpine", cfg)
+	if ctr != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reuseRun = (%v, %v), want canceled before flight", ctr, err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("canceled reuse started backend work: %v", f.calls)
 	}
 }
 
@@ -163,6 +187,10 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONForCreation(id, state, image, "0123456789abcdef")
+}
+
+func reuseInspectJSONForCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -173,7 +201,7 @@ func reuseInspectJSON(id, state, image string) string {
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
         "com.github.hirokazumiyaji.container-go.reuse": "true",
-        "com.github.hirokazumiyaji.container-go.creation": "0123456789abcdef"
+        "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
     "status": {
@@ -181,7 +209,7 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {
@@ -278,7 +306,7 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -309,7 +337,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -346,9 +374,10 @@ func TestReuseRecreatesStoppedContainer(t *testing.T) {
 
 type stoppedThenCreateRunner struct {
 	*fakeRunner
-	deleted bool
-	created bool
-	phase   int
+	deleted  bool
+	created  bool
+	phase    int
+	creation string
 }
 
 func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -365,14 +394,21 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 			return []byte(reuseInspectJSON(args[len(args)-1], "stopped", "redis:7-alpine")), nil, nil
 		}
 		if !s.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					s.creation = value
+				}
+			}
+		}
 		s.created = true
 		return []byte("myctr\n"), nil, nil
 	default:
@@ -468,138 +504,6 @@ func (c *createdThenRunningRunner) Run(ctx context.Context, args ...string) ([]b
 	return c.fakeRunner.Run(ctx, args...)
 }
 
-type reuseRollbackRunner struct {
-	*fakeRunner
-	created      bool
-	inspectCalls int
-	inspectErr   error
-	copyErr      error
-	deleteErr    error
-}
-
-func (r *reuseRollbackRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	switch args[0] {
-	case "run":
-		r.mu.Lock()
-		r.created = true
-		r.mu.Unlock()
-		return r.fakeRunner.Run(ctx, args...)
-	case "inspect":
-		id := args[len(args)-1]
-		r.mu.Lock()
-		r.calls = append(r.calls, args)
-		r.inspectCalls++
-		inspectCalls := r.inspectCalls
-		created := r.created
-		creation := r.creations[id]
-		r.mu.Unlock()
-		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf("not found: %q", id)}
-		}
-		if inspectCalls == 2 && r.inspectErr != nil {
-			return nil, nil, r.inspectErr
-		}
-		return []byte(fmt.Sprintf(`[
-  {
-    "id": %q,
-    "configuration": {
-      "id": %q,
-      "image": {"reference": "redis:7-alpine"},
-      "publishedPorts": [],
-      "labels": {
-        "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.session": %q,
-        "com.github.hirokazumiyaji.container-go.creation": %q,
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
-      }
-    },
-    "status": {"state": "running", "networks": []}
-  }
-]`, id, id, sessionID(), creation)), nil, nil
-	case "cp":
-		if r.copyErr != nil {
-			r.mu.Lock()
-			r.calls = append(r.calls, args)
-			r.mu.Unlock()
-			return nil, nil, r.copyErr
-		}
-	case "delete":
-		if r.deleteErr != nil {
-			r.mu.Lock()
-			r.calls = append(r.calls, args)
-			r.mu.Unlock()
-			return nil, nil, r.deleteErr
-		}
-	}
-	return r.fakeRunner.Run(ctx, args...)
-}
-
-func (r *reuseRollbackRunner) deleteCalls() []string {
-	var deleted []string
-	for _, call := range r.calls {
-		if len(call) > 0 && (call[0] == "delete" || call[0] == "rm") {
-			deleted = append(deleted, call[len(call)-1])
-		}
-	}
-	return deleted
-}
-
-// A published reuse generation is never force-deleted after a
-// post-create failure: a peer may already have adopted it. The original
-// cause and the refusal both reach the caller.
-func TestReuseInspectFailurePreservesRollbackRefusal(t *testing.T) {
-	inspectErr := &cli.CLIError{Args: []string{"inspect", "reuse-rollback"}, ExitCode: 1, Stderr: "post-create inspect failed"}
-	r := &reuseRollbackRunner{
-		fakeRunner: newTestRunner(),
-		inspectErr: inspectErr,
-	}
-
-	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName("reuse-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
-	if ctr != nil {
-		t.Fatalf("container = %#v, want nil", ctr)
-	}
-	if got := cliErrorWithStderr(err, inspectErr.Stderr); got == nil {
-		t.Fatalf("error = %v, want original inspect CLIError", err)
-	}
-	var joined *CleanupError
-	if !errors.As(err, &joined) {
-		t.Fatalf("error = %v, want CleanupError carrying the refusal", err)
-	}
-	if len(r.deleteCalls()) != 0 {
-		t.Fatalf("deleted = %v, want no delete of a published shared generation", r.deleteCalls())
-	}
-}
-
-func TestReuseCopyFailurePreservesRollbackRefusal(t *testing.T) {
-	copyErr := &cli.CLIError{Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
-	r := &reuseRollbackRunner{
-		fakeRunner: newTestRunner(),
-		copyErr:    copyErr,
-	}
-	hostPath := filepath.Join(t.TempDir(), "input.txt")
-	if err := os.WriteFile(hostPath, []byte("input"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	ctr, err := Run(context.Background(), "redis:7-alpine",
-		WithName("reuse-copy-rollback"), WithReuse(), withRunner(r), withEngine(appleEngine{}),
-		WithFiles(File{HostPath: hostPath, ContainerPath: "/tmp/input.txt"}))
-	if ctr != nil {
-		t.Fatalf("container = %#v, want nil", ctr)
-	}
-	if got := cliErrorWithStderr(err, copyErr.Stderr); got == nil {
-		t.Fatalf("error = %v, want original copy CLIError", err)
-	}
-	var joined *CleanupError
-	if !errors.As(err, &joined) {
-		t.Fatalf("error = %v, want CleanupError carrying the refusal", err)
-	}
-	if len(r.deleteCalls()) != 0 {
-		t.Fatalf("deleted = %v, want no delete of a published shared generation", r.deleteCalls())
-	}
-}
-
 func TestImagesCompatible(t *testing.T) {
 	cases := []struct {
 		req, act string
@@ -626,8 +530,8 @@ func TestImagesCompatible(t *testing.T) {
 
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}

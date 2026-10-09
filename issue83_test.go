@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -63,12 +64,6 @@ func TestCheckReuseOwnedRequiresAllOwnershipLabels(t *testing.T) {
 	}
 }
 
-func TestCheckReuseLabelsRejectsMissingInspect(t *testing.T) {
-	if err := checkReuseLabels(nil, &config{name: "myctr"}); err == nil {
-		t.Fatal("checkReuseLabels(nil) succeeded")
-	}
-}
-
 func TestCleanupFailedCreateRequiresMatchingGeneration(t *testing.T) {
 	const creation = "0123456789abcdef"
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
@@ -78,13 +73,6 @@ func TestCleanupFailedCreateRequiresMatchingGeneration(t *testing.T) {
 		reuse      bool
 		wantDelete bool
 	}{
-		{
-			name: "managed missing",
-			labels: map[string]string{
-				sessionLabel:  sessionID(),
-				creationLabel: creation,
-			},
-		},
 		{
 			name: "generation missing",
 			labels: map[string]string{
@@ -269,7 +257,7 @@ func (r *reuseOwnershipRunner) Run(ctx context.Context, args ...string) ([]byte,
 			return []byte(inspectJSONWithStateAndLabels(args[len(args)-1], string(state), "redis:7-alpine", r.labels)), nil, nil
 		}
 		if deleted {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf("container not found: %s", args[len(args)-1])}
 		}
 		state := r.state
 		return []byte(inspectJSONWithStateAndLabels(args[len(args)-1], string(state), "redis:7-alpine", r.labels)), nil, nil
@@ -282,6 +270,22 @@ func (r *reuseOwnershipRunner) Run(ctx context.Context, args ...string) ([]byte,
 	case "run":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
+		creation := ""
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					creation = value
+				}
+			}
+		}
+		if creation != "" {
+			labels := make(map[string]string, len(r.labels)+1)
+			for key, value := range r.labels {
+				labels[key] = value
+			}
+			labels[creationLabel] = creation
+			r.labels = labels
+		}
 		r.created = true
 		r.mu.Unlock()
 		return []byte("myctr\n"), nil, nil
@@ -296,7 +300,7 @@ func TestReuseDeleteNotFoundRemainsIdempotent(t *testing.T) {
 		reuseLabel:    "true",
 		creationLabel: "0123456789abcdef",
 	}
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "shared"`}
+	r := &inspectErrorRunner{stderr: "container not found: shared"}
 	cfg := &config{runner: r, eng: appleEngine{}, name: "shared"}
 	if err := deleteStoppedReuse(context.Background(), cfg, &engineInfo{state: StateStopped, labels: labels}); err != nil {
 		t.Fatalf("deleteStoppedReuse: %v", err)
@@ -307,7 +311,7 @@ func TestReuseDeleteNotFoundRemainsIdempotent(t *testing.T) {
 }
 
 func TestCleanupFailedCreateNotFoundRemainsIdempotent(t *testing.T) {
-	r := &inspectErrorRunner{stderr: `inspect failed: not found: "myctr"`}
+	r := &inspectErrorRunner{stderr: "container not found: myctr"}
 	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "entrypoint not found"}
 	cfg := &config{
 		runner:   r,

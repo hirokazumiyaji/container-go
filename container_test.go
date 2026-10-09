@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -17,13 +18,21 @@ import (
 
 func TestMain(m *testing.M) {
 	// The developer's shell must not redirect fixture-backed tests to
-	// another backend or change their default cleanup policy. Tests
-	// that exercise diagnostic retention opt in with t.Setenv.
+	// another backend; tests opting in use t.Setenv.
 	//
 	// Record the value before clearing it: a preflight still has to honor an
 	// explicit selection, and a typo must be reported rather than silently
 	// ignored. REQUIRE_BACKEND is left alone, because it is CI's signal that
 	// a missing backend must fail rather than skip.
+	//
+	// Everything that decides which backend to run must read the recorded
+	// value (integrationtest.SelectedBackend), not the environment: the
+	// unset below runs before any test, so an os.Getenv in a skip guard
+	// would always see "" and never skip. That is what made
+	// `make integration CONTAINERGO_BACKEND=docker` run the Apple
+	// scenarios too. The unit tests that depend on the library's own
+	// detection pin the engine explicitly instead of relying on the
+	// environment being absent.
 	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
 	os.Unsetenv("CONTAINERGO_KEEP")
@@ -65,6 +74,9 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {
+			if len(args) > 2 && args[1] == "--format" && args[2] == "{{.Server.Os}}" {
+				return []byte("linux\n"), nil, nil
+			}
 			return []byte("ok"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
@@ -114,7 +126,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
@@ -129,7 +141,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "id": %q,
       "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
     },
     "status": {
       "state": "running",
@@ -256,6 +268,7 @@ func TestRunRejectsInvalidLabelKey(t *testing.T) {
 }
 
 func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"PASSWORD": "s3cret"}))
 
@@ -272,6 +285,7 @@ func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
 }
 
 func TestRunRemovesEnvFileAfterStart(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"A": "1"}))
 
@@ -320,16 +334,19 @@ func TestRunPassesResourceAndProcessFlags(t *testing.T) {
 
 func TestRunPassesMounts(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "host", "data")
 	runTestContainer(t, f,
 		WithMounts(
-			Mount{Type: MountBind, Source: "/host/data", Target: "/data", ReadOnly: true},
+			Mount{Type: MountBind, Source: source, Target: "/data", ReadOnly: true},
 			Mount{Type: MountTmpfs, Target: "/scratch"},
 		))
 
-	joined := strings.Join(f.callWith("run"), " ")
-	if !strings.Contains(joined, "--mount type=bind,source=/host/data,target=/data,readonly") {
-		t.Errorf("bind mount missing: %s", joined)
+	runCall := f.callWith("run")
+	wantBind := "type=bind,source=" + source + ",target=/data,readonly"
+	if !slices.Contains(runCall, wantBind) {
+		t.Errorf("bind mount argv missing %q: %v", wantBind, runCall)
 	}
+	joined := strings.Join(runCall, " ")
 	if !strings.Contains(joined, "--mount type=tmpfs,target=/scratch") {
 		t.Errorf("tmpfs mount missing: %s", joined)
 	}
@@ -337,10 +354,27 @@ func TestRunPassesMounts(t *testing.T) {
 
 func TestRunRejectsMountWithComma(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "a,b")
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
-		WithMounts(Mount{Type: MountBind, Source: "/a,b", Target: "/data"}), withRunner(f))
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
 	if err == nil {
 		t.Fatal("want error for comma in mount source")
+	}
+}
+
+func TestRunRejectsRelativeBindMountSource(t *testing.T) {
+	f := newTestRunner()
+	source := filepath.Join("relative", "data")
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
+	if err == nil {
+		t.Fatal("want error for relative bind mount source")
+	}
+	if !strings.Contains(err.Error(), "absolute host path") {
+		t.Errorf("error = %q, want absolute host path error", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("run must not be issued: %v", f.callWith("run"))
 	}
 }
 
@@ -394,11 +428,10 @@ func TestTerminateIsIdempotent(t *testing.T) {
 		t.Fatalf("Terminate: %v", err)
 	}
 
-	// Second terminate: CLI reports not found for the exact delete
-	// target; still success.
+	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `delete failed: not found: "myctr"`}
+	ferr := &cli.CLIError{Args: []string{"delete", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {
@@ -413,13 +446,6 @@ type notFoundRunner struct {
 
 func (n *notFoundRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "delete" {
-		// Report the exact argv the library issued: absence is only
-		// evidence for the target this delete addressed.
-		if cliErr, ok := n.err.(*cli.CLIError); ok {
-			reported := *cliErr
-			reported.Args = args
-			return nil, nil, &reported
-		}
 		return nil, nil, n.err
 	}
 	return n.inner.Run(ctx, args...)

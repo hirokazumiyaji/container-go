@@ -410,6 +410,35 @@ func TestImageCacheIsPerDockerContext(t *testing.T) {
 	}
 }
 
+// TestImageCacheIsPerDockerConfig covers two profiles that share a
+// context name but keep different context definitions under DOCKER_CONFIG.
+func TestImageCacheIsPerDockerConfig(t *testing.T) {
+	r := newTestRunner()
+	r.imagePresent = true
+	opt := WithImagePresenceCache(time.Minute)
+	cfg := newConfig()
+	cfg.runner = r
+	cfg.eng = dockerEngine{}
+	if err := opt(cfg); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "ci")
+	t.Setenv("DOCKER_CONFIG", "/tmp/docker-config-a")
+	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("DOCKER_CONFIG", "/tmp/docker-config-b")
+	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
+		t.Fatal(err)
+	}
+	if got := countInspects(r.calls, "image"); got != 2 {
+		t.Errorf("ran %d image inspects across DOCKER_CONFIG values, want 2", got)
+	}
+}
+
 // TestImageCacheIsPerPlatformAndPerBackend keeps entries from being
 // shared where the underlying stores are independent.
 func TestImageCacheIsPerPlatformAndPerBackend(t *testing.T) {

@@ -65,13 +65,15 @@ func (dockerEngine) directIP() bool { return false }
 func (dockerEngine) requiresImmutableID() bool { return true }
 
 // imageStoreID partitions presence-cache entries by the daemon the Docker
-// CLI will talk to. DOCKER_HOST and DOCKER_CONTEXT each select a store, so
-// a "present" answer recorded under one must not skip the inspect under
-// the other. A context chosen only via `docker context use` (no env) is
-// still invisible here, matching the library's existing DOCKER_HOST-only
-// remote detection.
+// CLI will talk to. The env vars that select that daemon without probing
+// the CLI are DOCKER_HOST, DOCKER_CONTEXT, and DOCKER_CONFIG (the latter
+// holds context metadata). A context chosen only via `docker context use`
+// with no env remains invisible here, matching the library's existing
+// DOCKER_HOST-only remote detection.
 func (dockerEngine) imageStoreID() string {
-	return normalizeDockerHost(os.Getenv("DOCKER_HOST")) + "\x00" + os.Getenv("DOCKER_CONTEXT")
+	return normalizeDockerHost(os.Getenv("DOCKER_HOST")) + "\x00" +
+		os.Getenv("DOCKER_CONTEXT") + "\x00" +
+		os.Getenv("DOCKER_CONFIG")
 }
 
 // dockerDefaultNetwork asks the daemon which platform default it exposes.

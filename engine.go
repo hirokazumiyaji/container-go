@@ -134,7 +134,7 @@ type engine interface {
 	platformCompatible(selector, actual string) bool
 	// imageStoreID identifies the backend's image store so a presence
 	// cache entry recorded against one daemon is not reused against
-	// another (for Docker, DOCKER_HOST and DOCKER_CONTEXT).
+	// another (for Docker: DOCKER_HOST, DOCKER_CONTEXT, DOCKER_CONFIG).
 	imageStoreID() string
 }
 

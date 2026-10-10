@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"syscall"
@@ -73,7 +74,9 @@ func TestStreamClassifiesRelativeMissingStartErrorAsSetup(t *testing.T) {
 	if !errors.Is(err, ErrStreamSetup) {
 		t.Fatalf("error = %v, want ErrStreamSetup", err)
 	}
-	if !errors.Is(err, os.ErrNotExist) {
+	// Unix fork/exec of a relative path surfaces os.ErrNotExist. Windows
+	// LookPath reports the same miss as exec.ErrNotFound.
+	if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, exec.ErrNotFound) {
 		t.Fatalf("error = %v, want not-exist cause", err)
 	}
 }

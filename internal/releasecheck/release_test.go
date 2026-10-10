@@ -48,7 +48,9 @@ func read(t *testing.T, rel string) string {
 	if err != nil {
 		t.Fatalf("%s: %v", rel, err)
 	}
-	return string(data)
+	// Git on Windows may check out CRLF. Normalize so (?m)^/$ anchors and
+	// line splits agree with the LF-shaped markdown committed in the repo.
+	return strings.ReplaceAll(string(data), "\r\n", "\n")
 }
 
 // latestRelease is the highest version with a dated CHANGELOG section. It is

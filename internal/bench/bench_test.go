@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -394,6 +395,9 @@ func TestScenarioPolicyIncludesIdentityAndSessionInitSpecialCase(t *testing.T) {
 
 func fakeGit(t *testing.T, dirty bool) {
 	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake git scripts require a POSIX shell")
+	}
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$1 $2" in

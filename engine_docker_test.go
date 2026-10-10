@@ -1745,7 +1745,10 @@ func dockerNoneNetworkInspect(t *testing.T) []byte {
 	if err != nil {
 		t.Fatal(err)
 	}
-	inspect := strings.Replace(string(data), `"NetworkMode": "bridge"`, `"NetworkMode": "none"`, 1)
+	// Normalize CRLF from Windows checkouts so the multiline fixture
+	// rewrites below match the committed LF-shaped JSON.
+	inspect := strings.ReplaceAll(string(data), "\r\n", "\n")
+	inspect = strings.Replace(inspect, `"NetworkMode": "bridge"`, `"NetworkMode": "none"`, 1)
 	inspect = strings.Replace(inspect, `"IPAddress": "172.17.0.2"`, `"IPAddress": ""`, 1)
 	inspect = strings.Replace(inspect, `"Networks": {
         "bridge": {

@@ -51,8 +51,10 @@ func TestPermanentStartErrorClassifiesWindowsBadExecutable(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("Windows-only executable-format error")
 	}
-	err := &os.PathError{Op: "fork/exec", Path: "backend.exe", Err: syscall.Errno(193)}
-	if !PermanentStartError(err) {
-		t.Fatalf("PermanentStartError(%v) = false, want true", err)
+	for _, errno := range []syscall.Errno{193, 216} {
+		err := &os.PathError{Op: "fork/exec", Path: "backend.exe", Err: errno}
+		if !PermanentStartError(err) {
+			t.Fatalf("PermanentStartError(%v) = false, want true", err)
+		}
 	}
 }

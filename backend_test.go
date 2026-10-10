@@ -42,6 +42,17 @@ func TestDetectEngineForDefaultsByOS(t *testing.T) {
 	}
 }
 
+func TestValidateBackendEnvPreservesValidSelections(t *testing.T) {
+	for _, value := range []string{"", "apple", "docker"} {
+		if err := validateBackendEnv(value); err != nil {
+			t.Errorf("validateBackendEnv(%q): %v", value, err)
+		}
+	}
+	if err := validateBackendEnv("podman"); err == nil {
+		t.Fatal("validateBackendEnv accepted an invalid backend")
+	}
+}
+
 func TestRunSelectsBackendFromEnv(t *testing.T) {
 	t.Setenv("CONTAINERGO_BACKEND", "docker")
 

@@ -277,7 +277,7 @@ func TestImageCacheWaitersPopulateOwnCaches(t *testing.T) {
 // mean a second Run skipped the image that the first Run had just
 // fetched.
 func TestImageCacheDoesNotCacheAbsence(t *testing.T) {
-	r := newTestRunner()
+	r := newDockerTestRunner()
 	// The image is absent: image inspect fails, then the pull succeeds.
 	r.imagePresent = false
 	cfg := newConfig()
@@ -319,7 +319,7 @@ func (r *failingPullRunner) Run(ctx context.Context, args ...string) ([]byte, []
 	// `container images pull`.
 	if (len(args) >= 2 && args[0] == "image" && args[1] == "pull") || args[0] == "pull" {
 		r.calls = append(r.calls, args)
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected pull failure"}
+		return nil, nil, &cli.CLIError{Binary: r.binaryName(), Args: args, ExitCode: 1, Stderr: "injected pull failure"}
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
@@ -327,7 +327,7 @@ func (r *failingPullRunner) Run(ctx context.Context, args ...string) ([]byte, []
 // TestImageCacheIsNotWrittenWhenThePullFails keeps a failed pull from
 // recording a presence that does not exist.
 func TestImageCacheIsNotWrittenWhenThePullFails(t *testing.T) {
-	r := &failingPullRunner{fakeRunner: newTestRunner()}
+	r := &failingPullRunner{fakeRunner: newDockerTestRunner()}
 	r.imagePresent = false
 	cfg := newConfig()
 	cfg.runner = r

@@ -24,7 +24,9 @@ so the other backend's suites skip correctly; guards read it through
 `integrationtest.SelectedBackend` rather than `os.Getenv`, which would
 always see the empty value.
 Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
-pull other Hub images locally.
+pull other Hub images locally. The root module supports Go 1.23+; the nested
+`bench/` benchmark module requires Go 1.25+ and is documented in
+`bench/README.md`.
 
 ## Pull requests
 

@@ -131,6 +131,10 @@ are handled by the docker CLI itself. The library uses only
 `DOCKER_HOST=tcp://...` to select a remote Docker endpoint; a remote
 Docker context is not detected.
 
+Go 1.23+ is required for the root module. The optional nested
+`bench/` benchmark module requires Go 1.25+ because it pins a newer
+testcontainers-go toolchain; see [bench/README.md](bench/README.md).
+
 Verified backend behavior (the CLI stderr wording and inspect JSON shapes
 this library matches against):
 

@@ -44,6 +44,8 @@ integration-docker:
 	rm -f "$$log"; \
 	exit $$status
 
+# This target intentionally includes the pull-heavy singleflight case;
+# keep its root-module command in sync with docs/benchmarks.md.
 bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...

@@ -132,6 +132,11 @@ macOS で Docker（Docker Desktop など）を使う場合は
 ライブラリが remote Docker endpoint の選択に使うのは
 `DOCKER_HOST=tcp://...` だけで、remote Docker context は検出しません。
 
+ルートモジュールには Go 1.23 以上が必要です。オプションの
+ネストした `bench/` ベンチマークモジュールは Go 1.25 以上が必要です
+(testcontainers-go の依存関係の要件)。詳細は
+[bench/README.md](bench/README.md) を参照してください。
+
 現在のチェックアウトで確認した backend の動作（ライブラリが照合する CLI
 stderr 文言と inspect JSON 形状）:
 

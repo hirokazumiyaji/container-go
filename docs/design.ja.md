@@ -389,11 +389,14 @@ type Strategy interface {
 **異常終了**：親 process が終了して reaper pipe が閉じられると、外部
 `/bin/sh` の watchdog が強制削除を試みる。process を終了させる未 recover の
 panic、`SIGKILL`、`os.Exit` では pipe が閉じる。recover した panic では閉じない。
-親が生きている間、reaper は何もしない。reaper は保険であり、トランザクション
-保証ではなく、Windows では利用できない。登録 error と各 entry の delete error
-は `Run` に返らない。spawn failure が retry 上限に達した場合は一度だけ log に
-残り、delete failure は shell が無視する。backend 呼び出しには POSIX の
-`sleep` / `kill` による期限がある。
+reaper は親が生きている間は登録を蓄積し、EOF のあとだけ削除する。reaper は
+保険であり、トランザクション保証ではなく、Windows では利用できない。登録
+error と各 entry の delete error は `Run` に返らない。spawn failure が retry
+上限に達した場合は一度だけ log に残り、delete failure は shell が無視する。
+各 backend 呼び出しには POSIX の `sleep` / `kill` による期限があり、timer
+process も回収する。reap 全体にも overall budget があり、それを超えると新規の
+backend 呼び出しは発行しない。entry は少数ずつ並行処理するため、コストが
+コンテナ数に厳密比例しない。
 各登録エントリの inspect・status marker・filter・delete 全体は 30 秒のタイムアウトで囲む。
 watchdog リーパーは 64 文字の小文字 16 進 Docker ID を不変な ID として受け入れる。
 generation を持つ Docker エントリは名前から inspect を使って ID を取り出すが、削除前に同じ 64 文字の ID が取得できた場合だけ削除する。

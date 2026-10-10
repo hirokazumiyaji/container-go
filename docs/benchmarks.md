@@ -21,10 +21,11 @@ Run→ready measurement infrastructure for the performance issues
   counting scenarios. Each `Run` shape runs against a real backend
   wrapped in a counting runner; every iteration records duration and
   spawn count.
-- `bench/`: separate Go module holding the testcontainers-go
-  comparison. The dependency on testcontainers-go lives only here so
-  the library keeps its zero-dependency constraint. `result.go`
-  re-exports the shared schema; `scenario_test.go` (`integration` tag)
+- `bench/`: separate Go module (requires Go 1.25+) holding the
+  testcontainers-go comparison. The dependency on testcontainers-go
+  lives only here so the library keeps its zero-dependency constraint.
+  `result.go` re-exports the shared schema; `scenario_test.go`
+  (`integration` tag)
   runs the wall-clock scenarios.
 
 ## Scenarios
@@ -280,6 +281,13 @@ were not recorded in this historical run.
 | docker | testcontainers-go | tc/single | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | warm | - | 335ms | 0 |
 | docker | testcontainers-go | tc/multi-5 | 5 | public.ecr.aws/docker/library/redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499 | testcontainers/ryuk@sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | sha256:7c1a8a9a47c780ed0f983770a662f80deb115d95cce3e2daa3d12115b8cd28f0 | warm | - | 1.69s (5 ctrs) | 0 |
 
+The testcontainers-go spawn column was previously printed as `0`, which
+is what the schema records when a scenario does not count subprocesses.
+That made an unmeasured column indistinguishable from a measured zero,
+and the two are not comparable: only the container-go side of the
+spawn counts below was ever measured. The renderer now prints `n/a` for
+an unmeasured count.
+
 Changes observed when the pull singleflight landed (#18), against the
 pre-#18 numbers from PR #23:
 
@@ -289,7 +297,8 @@ pre-#18 numbers from PR #23:
   own registry round-trip.
 - warm shapes pay exactly one extra spawn for the image existence
   check (2 → 3 for plain Run); in exchange concurrent Runs of a
-  missing image pull once instead of racing.
+  missing image pull once instead of racing. Both sides of that
+  comparison are container-go measurements.
 - testcontainers-go's `tc/session-init` depends on whether the pinned
   Ryuk sidecar image is cached: 14.7s on first-ever use, ~0.5s warm.
   New result files encode this distinction in `cache_state` rather than

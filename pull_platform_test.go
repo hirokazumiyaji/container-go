@@ -30,7 +30,7 @@ func TestEnsureImagePassesPlatformToPull(t *testing.T) {
 }
 
 func TestEnsureImagePassesPlatformToInspect(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	cfg := &config{runner: f, eng: dockerEngine{}, pullPolicy: PullNever, platform: "linux/amd64", name: "myctr"}
 	if _, err := imageExists(context.Background(), f, dockerEngine{}, "redis:7-alpine", "linux/amd64"); err != nil {
@@ -51,7 +51,7 @@ func TestEnsureImagePassesPlatformToInspect(t *testing.T) {
 }
 
 func TestPullNeverWithPlatformReportsMissing(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = false
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/amd64"),
@@ -93,6 +93,12 @@ func TestAppleParseImageExistsPlatform(t *testing.T) {
 	}
 	if (appleEngine{}).parseImageExists(data, "linux/amd64") {
 		t.Error("want mismatch for linux/amd64")
+	}
+	if !(appleEngine{}).parseImageExists(data, "linux") {
+		t.Error("an OS-only selector must accept any Linux architecture")
+	}
+	if (appleEngine{}).parseImageExists(data, "darwin") {
+		t.Error("want mismatch for a different OS")
 	}
 	if !(appleEngine{}).parseImageExists(data, "") {
 		t.Error("empty platform must mean present")

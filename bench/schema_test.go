@@ -10,6 +10,58 @@ import (
 	"testing"
 )
 
+// currentImages is the image set the scenarios run against.
+var currentImages = map[string]bool{
+	RedisImage: true,
+	NginxImage: true,
+}
+
+// TestFixtureUsesCurrentImageReferences keeps the fixture honest about
+// the image set, which is what let a column-width regression go unnoticed
+// and what makes the table's output comparable across runs.
+func TestFixtureUsesCurrentImageReferences(t *testing.T) {
+	doc, err := ParseDoc(readFixture(t, "result-doc.json"))
+	if err != nil {
+		t.Fatalf("ParseDoc: %v", err)
+	}
+	for i, r := range doc.Results {
+		if !currentImages[r.Image] {
+			t.Errorf("result[%d] image = %q, which is not one of the scenario images %v",
+				i, r.Image, currentImages)
+		}
+	}
+	// At least one of each scenario image, so the fixture actually
+	// exercises a multi-image table.
+	seen := map[string]bool{}
+	for _, r := range doc.Results {
+		seen[r.Image] = true
+	}
+	if len(seen) < 2 {
+		t.Errorf("fixture covers %d image(s); the scenarios use %d", len(seen), len(currentImages))
+	}
+}
+
+// TestFixtureTableColumnsAlign runs the fixture through the renderer, so
+// the committed data is checked against the column layout rather than
+// only against the JSON schema.
+func TestFixtureTableColumnsAlign(t *testing.T) {
+	doc, err := ParseDoc(readFixture(t, "result-doc.json"))
+	if err != nil {
+		t.Fatalf("ParseDoc: %v", err)
+	}
+	table := Table(Summarize(doc.Results))
+	lines := strings.Split(strings.TrimRight(table, "\n"), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("table has %d lines:\n%s", len(lines), table)
+	}
+	width := len(lines[0])
+	for i, line := range lines {
+		if len(line) != width {
+			t.Errorf("line %d has width %d, header %d:\n%s", i, len(line), width, table)
+		}
+	}
+}
+
 // TestFixtureMatchesSchema validates the committed fixture against the strict
 // result schema without requiring a backend.
 func TestFixtureMatchesSchema(t *testing.T) {

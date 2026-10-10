@@ -31,6 +31,9 @@ func TestMain(m *testing.M) {
 
 func requireSystem(t *testing.T) {
 	t.Helper()
+	// Examples own their teardown; do not inherit a diagnostic KEEP
+	// setting from the developer's shell.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	backend := os.Getenv("CONTAINERGO_BACKEND")
 	if backend == "" {
 		// Match detectEngineFor: darwin → Apple Container, else Docker.
@@ -61,6 +64,9 @@ func requireSystem(t *testing.T) {
 }
 
 func TestExampleRedis(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this example uses WithEnv, which is unsupported on Windows")
+	}
 	requireSystem(t)
 	ctx := context.Background()
 

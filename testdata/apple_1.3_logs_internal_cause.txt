@@ -1,0 +1,1 @@
+Error: internalError: "failed to get logs" (cause: "notFound: \"container not found: myctr\"")

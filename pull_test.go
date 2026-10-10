@@ -36,7 +36,7 @@ func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
 }
 
 func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
@@ -49,7 +49,7 @@ func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
 }
 
 func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, withEngine(dockerEngine{}))
 	_ = ctr
@@ -63,7 +63,7 @@ func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
 }
 
 func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	opts := []Option{WithName("myctr"), WithPullPolicy(PullAlways), withRunner(f), withEngine(dockerEngine{})}
 	for i := range 2 {
@@ -77,7 +77,7 @@ func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 }
 
 func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(f), withEngine(dockerEngine{}))
 	if !errors.Is(err, ErrImageNotFound) {
@@ -92,7 +92,7 @@ func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
 }
 
 func TestRunPullNeverRunsWhenImagePresent(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, WithPullPolicy(PullNever), withEngine(dockerEngine{}))
 	_ = ctr
@@ -140,19 +140,19 @@ func TestDockerRunArgsNeverPullImplicitly(t *testing.T) {
 }
 
 func TestImageMissingClassification(t *testing.T) {
-	imageErr := func(stderr string) error {
-		return &cli.CLIError{Args: []string{"image", "inspect", "x"}, ExitCode: 1, Stderr: stderr}
+	imageErr := func(binary, stderr string) error {
+		return &cli.CLIError{Binary: binary, Args: []string{"image", "inspect", "redis:7-alpine"}, ExitCode: 1, Stderr: stderr}
 	}
-	if !(dockerEngine{}).imageMissing(imageErr("Error response from daemon: No such image: redis:7-alpine")) {
+	if !(dockerEngine{}).imageMissing(imageErr("docker", "Error response from daemon: No such image: redis:7-alpine")) {
 		t.Error("docker: daemon not-found not classified as missing")
 	}
-	if (dockerEngine{}).imageMissing(imageErr("XPC connection error")) {
+	if (dockerEngine{}).imageMissing(imageErr("docker", "XPC connection error")) {
 		t.Error("docker: transport error classified as missing")
 	}
-	if !(appleEngine{}).imageMissing(imageErr("image not found: redis:7-alpine")) {
+	if !(appleEngine{}).imageMissing(imageErr("container", "image not found: redis:7-alpine")) {
 		t.Error("apple: not-found not classified as missing")
 	}
-	if (appleEngine{}).imageMissing(imageErr("XPC connection error")) {
+	if (appleEngine{}).imageMissing(imageErr("container", "XPC connection error")) {
 		t.Error("apple: transport error classified as missing")
 	}
 }
@@ -449,19 +449,20 @@ func TestPullWithSharesFlightAcrossConcurrentCallers(t *testing.T) {
 }
 
 func TestPullWithClassifiesBackendDown(t *testing.T) {
-	f := &fakeRunner{systemUp: false}
+	f := &fakeRunner{systemUp: false, binary: "docker"}
 	if err := pullWith(context.Background(), f, dockerEngine{}, "redis:7-alpine"); !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}
 }
 
-func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
-	f := newTestRunner()
-	if err := Pull(context.Background(), "-bad"); err == nil {
-		t.Fatal("want error for invalid image")
-	}
-	if len(f.calls) != 0 {
-		t.Errorf("CLI was called despite invalid image: %v", f.calls)
+func TestPullRejectsInvalidImageAsValidationErrorBeforeBackend(t *testing.T) {
+	t.Setenv(backendEnv, "not-a-backend")
+	const image = "-bad"
+
+	err := Pull(context.Background(), image)
+	assertImageValidationError(t, err, image)
+	if strings.Contains(err.Error(), backendEnv) {
+		t.Fatalf("error = %v, want validation before backend detection", err)
 	}
 }
 
@@ -469,7 +470,10 @@ func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
 	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	r := &reuseGroupRunner{ids: []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
@@ -494,7 +498,10 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	case "ps":
 		r.listCalls++
 		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte("a\nb\n"), nil, nil
+		return []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/group-%s","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"integration",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`, id, id[:1], managedLabel, reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

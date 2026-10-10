@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
 // Stable keys used in Env.CLIs. Docker client and server versions are
@@ -588,19 +589,36 @@ func imageRepository(image string) string {
 // missing, or when CONTAINERGO_BACKEND selects a different backend.
 func (b Backend) Available(tb testing.TB) {
 	tb.Helper()
-	selected := os.Getenv("CONTAINERGO_BACKEND")
+	selected := integrationtest.SelectedBackend()
 	if err := validateBackendSelection(selected, b.Name); err != nil {
 		tb.Fatal(err)
 	}
-	if selected != "" && selected != b.Name {
-		tb.Skipf("CONTAINERGO_BACKEND=%s; skipping %s", selected, b.Name)
+	if reason := b.SkipReason(); reason != "" {
+		tb.Skip(reason)
+	}
+}
+
+// SkipReason reports why this backend cannot be exercised in the current
+// run, or "" when it can.
+//
+// The selection is read through integrationtest.SelectedBackend, not
+// os.Getenv. The root test binary's TestMain unsets the variable before
+// running any test, so reading the environment here would always see ""
+// and this guard could never skip anything - which is what made
+// `make integration CONTAINERGO_BACKEND=docker` still run the Apple
+// scenarios. The bench module has no TestMain, so SelectedBackend has to
+// fall back to the environment for it to keep working there.
+func (b Backend) SkipReason() string {
+	if want := integrationtest.SelectedBackend(); want != "" && want != b.Name {
+		return fmt.Sprintf("CONTAINERGO_BACKEND=%s; skipping %s", want, b.Name)
 	}
 	if _, err := exec.LookPath(b.Bin); err != nil {
-		tb.Skipf("%s CLI not installed", b.Name)
+		return fmt.Sprintf("%s CLI not installed", b.Name)
 	}
 	if err := b.Probe(); err != nil {
-		tb.Skipf("%s backend service not running: %v", b.Name, err)
+		return fmt.Sprintf("%s backend service not running: %v", b.Name, err)
 	}
+	return ""
 }
 
 func validateBackendSelection(selected, backend string) error {
@@ -659,7 +677,15 @@ func (b Backend) EnsureImageAbsent(tb testing.TB, image string) {
 	if b.RemoveImage == nil {
 		tb.Fatal("image removal operation is unavailable")
 	}
+	for _, tag := range identity.Tags {
+		if tag != "" && !strings.Contains(tag, "<none>") && tag != image {
+			_ = b.RemoveImage(tag)
+		}
+	}
 	removeErr := b.RemoveImage(image)
+	if identity.ContentID != "" {
+		_ = b.RemoveImage(identity.ContentID)
+	}
 	verifyErr := b.verifyImageAbsent(image, identity)
 	if verifyErr != nil {
 		if removeErr != nil {

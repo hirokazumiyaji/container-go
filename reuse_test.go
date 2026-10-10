@@ -34,9 +34,16 @@ func (r *reuseCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		created := r.created.Load()
 		r.mu.Unlock()
 		if !created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		name := args[len(args)-1]
+		r.mu.Lock()
+		creation := r.creations[name]
+		r.mu.Unlock()
+		if creation == "" {
+			creation = "0123456789abcdef"
+		}
+		return []byte(reuseInspectJSONForCreation(name, "running", "redis:7-alpine", creation)), nil, nil
 	}
 	if args[0] == "run" {
 		r.created.Store(true)
@@ -56,6 +63,25 @@ func TestWithReuseGroupRequiresReuse(t *testing.T) {
 		WithName("myctr"), WithReuseGroup("integration"), withRunner(newTestRunner()))
 	if err == nil || !strings.Contains(err.Error(), "WithReuseGroup requires WithReuse") {
 		t.Fatalf("error = %v, want WithReuseGroup requires WithReuse", err)
+	}
+}
+
+func TestReuseDoesNotDetachCanceledPreflight(t *testing.T) {
+	f := newReuseCreateRunner()
+	cfg := newConfig()
+	cfg.name = "canceled-reuse"
+	cfg.reuse = true
+	cfg.eng = appleEngine{}
+	cfg.runner = f
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	ctr, err := reuseRun(ctx, "redis:7-alpine", cfg)
+	if ctr != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("reuseRun = (%v, %v), want canceled before flight", ctr, err)
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("canceled reuse started backend work: %v", f.calls)
 	}
 }
 
@@ -161,6 +187,10 @@ func TestReuseCollapsesConcurrentCreates(t *testing.T) {
 }
 
 func reuseInspectJSON(id, state, image string) string {
+	return reuseInspectJSONForCreation(id, state, image, "0123456789abcdef")
+}
+
+func reuseInspectJSONForCreation(id, state, image, creation string) string {
 	return fmt.Sprintf(`[
   {
     "id": %q,
@@ -170,7 +200,8 @@ func reuseInspectJSON(id, state, image string) string {
       "publishedPorts": [],
       "labels": {
         "com.github.hirokazumiyaji.container-go": "true",
-        "com.github.hirokazumiyaji.container-go.reuse": "true"
+        "com.github.hirokazumiyaji.container-go.reuse": "true",
+        "com.github.hirokazumiyaji.container-go.creation": %q
       }
     },
     "status": {
@@ -178,12 +209,15 @@ func reuseInspectJSON(id, state, image string) string {
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, id, id, image, state)
+]`, id, id, image, creation, state)
 }
 
 type attachRunner struct {
 	*fakeRunner
 	state string
+	// inspectJSON overrides the generated payload, so a test can serve
+	// output that is not a readable inspect array.
+	inspectJSON string
 }
 
 func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -191,6 +225,9 @@ func (a *attachRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		a.mu.Lock()
 		a.calls = append(a.calls, args)
 		a.mu.Unlock()
+		if a.inspectJSON != "" {
+			return []byte(a.inspectJSON), nil, nil
+		}
 		return []byte(reuseInspectJSON(args[len(args)-1], a.state, "redis:7-alpine")), nil, nil
 	}
 	if args[0] == "run" {
@@ -216,6 +253,34 @@ func TestReuseAttachesToRunningContainer(t *testing.T) {
 	}
 	if !ctr.reused || ctr.ID() != "myctr" {
 		t.Errorf("ctr = %+v", ctr)
+	}
+}
+
+// Unreadable inspect output does not mean the container is absent. The
+// attach path must surface the decode failure instead of trying to create
+// a same-name container that already exists and retrying until the attach
+// deadline.
+func TestReuseDoesNotCreateWhenInspectOutputIsUnreadable(t *testing.T) {
+	oldAttach, oldPoll := reuseAttachTimeout, reusePollInterval
+	reuseAttachTimeout, reusePollInterval = 200*time.Millisecond, 10*time.Millisecond
+	defer func() { reuseAttachTimeout, reusePollInterval = oldAttach, oldPoll }()
+
+	f := &attachRunner{fakeRunner: newTestRunner(), state: "running", inspectJSON: `[null]`}
+	f.imagePresent = true
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(),
+		withRunner(f), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("Run: want error for unreadable inspect output")
+	}
+	if errors.Is(err, ErrContainerNotFound) {
+		t.Errorf("error = %v, want a schema error, not ErrContainerNotFound", err)
+	}
+	if !strings.Contains(err.Error(), "decode container inspect output") {
+		t.Errorf("error = %v, want the decode failure surfaced", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("create run issued after an unreadable inspect: %v", f.callWith("run"))
 	}
 }
 
@@ -275,7 +340,7 @@ func (c *conflictThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !c.seenConflict.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -306,7 +371,7 @@ func (n *notFoundThenAttachRunner) Run(ctx context.Context, args ...string) ([]b
 	}
 	if args[0] == "inspect" {
 		if !n.seenNotFound.Load() {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `inspect failed: not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
 		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
 	}
@@ -343,9 +408,10 @@ func TestReuseRecreatesStoppedContainer(t *testing.T) {
 
 type stoppedThenCreateRunner struct {
 	*fakeRunner
-	deleted bool
-	created bool
-	phase   int
+	deleted  bool
+	created  bool
+	phase    int
+	creation string
 }
 
 func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -362,14 +428,21 @@ func (s *stoppedThenCreateRunner) Run(ctx context.Context, args ...string) ([]by
 			return []byte(reuseInspectJSON(args[len(args)-1], "stopped", "redis:7-alpine")), nil, nil
 		}
 		if !s.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: fmt.Sprintf(`Error: container not found: %q`, args[len(args)-1])}
 		}
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", "redis:7-alpine")), nil, nil
+		return []byte(reuseInspectJSONForCreation(args[len(args)-1], "running", "redis:7-alpine", s.creation)), nil, nil
 	case "delete":
 		s.deleted = true
 		s.phase = 1
 		return nil, nil, nil
 	case "run":
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					s.creation = value
+				}
+			}
+		}
 		s.created = true
 		return []byte("myctr\n"), nil, nil
 	default:
@@ -491,8 +564,8 @@ func TestImagesCompatible(t *testing.T) {
 
 func TestPruneReuseGroupRemovesLabeled(t *testing.T) {
 	const lsJSON = `[
-  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
-  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
+  {"id":"g1","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"integration"}},"status":{"state":"running","networks":[]}},
+  {"id":"g2","configuration":{"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef","com.github.hirokazumiyaji.container-go.reuse-group":"other"}},"status":{"state":"running","networks":[]}},
   {"id":"g3","configuration":{"labels":{}},"status":{"state":"stopped","networks":[]}}
 ]`
 	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: lsJSON}

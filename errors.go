@@ -1,6 +1,7 @@
 package container
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -12,11 +13,12 @@ import (
 
 // CLIError is a non-zero exit from the backend CLI. It aliases
 // internal/cli.CLIError so callers can use errors.As without importing
-// an internal package.
+// an internal package. The public four-field layout is retained for
+// compatibility; classification may use additional bounded diagnostics.
 type CLIError = cli.CLIError
 
-// ErrSystemNotRunning reports that the Apple Container system service is
-// not running. Start it with `container system start`.
+// ErrSystemNotRunning reports that the selected container backend is
+// not running. The classified error retains the backend-specific hint.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrLogStreamSetup reports that a log stream cannot be started with the
@@ -199,6 +201,277 @@ var ErrCopyFileFromContainerUnsupported = errors.New("CopyFileFromContainer is n
 // wraps this sentinel, so callers detect it uniformly with errors.Is.
 var ErrUnsupportedCapability = errors.New("unsupported capability")
 
+var errInspectTargetNotFound = errors.New("inspect target not found")
+
+type inspectTargetNotFoundError struct {
+	target string
+	detail string
+}
+
+func (e *inspectTargetNotFoundError) Error() string {
+	if e.detail == "" {
+		return fmt.Sprintf("inspect target %q not found", e.target)
+	}
+	return fmt.Sprintf("inspect target %q not found: %s", e.target, e.detail)
+}
+
+func (e *inspectTargetNotFoundError) Unwrap() error { return errInspectTargetNotFound }
+
+func (e *inspectTargetNotFoundError) Is(target error) bool {
+	return target == errInspectTargetNotFound || target == ErrContainerNotFound
+}
+
+func newInspectTargetNotFound(target, detail string) error {
+	return &inspectTargetNotFoundError{target: target, detail: detail}
+}
+
+func wrapInspectTargetNotFound(err error) error {
+	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+func isBareContainerNotFound(err error) bool {
+	if err == nil || !errors.Is(err, ErrContainerNotFound) {
+		return false
+	}
+	found := false
+	conflict := false
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil || conflict {
+			return
+		}
+		if cur == ErrContainerNotFound || cur == errInspectTargetNotFound {
+			found = true
+			return
+		}
+		if _, ok := cur.(*inspectTargetNotFoundError); ok {
+			found = true
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+			return
+		}
+		conflict = true
+	}
+	walk(err)
+	return found && !conflict
+}
+
+// isNotFound reports whether a CLI failure means the container does not
+// exist. It is retained for callers that do not have an engine context;
+// the concrete backend and command still have to pass their own matcher.
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isBareContainerNotFound(err) {
+		return true
+	}
+	branches := backendCLIErrorBranches(err, "")
+	for _, branch := range branches {
+		eng := engineForCLIError(branch.ctx.err)
+		if eng == nil || !eng.containerMissing(branch.ctx.err) {
+			continue
+		}
+		backendBranches := backendCLIErrorBranches(err, eng.binary())
+		if definitiveBranchVetoes(err, branch, backendBranches) || hasNonCLIAmbiguousObjectText(err) {
+			continue
+		}
+		return true
+	}
+	for _, branch := range branches {
+		if isAmbiguousApplicationError(engineForCLIError(branch.ctx.err), err) {
+			return false
+		}
+	}
+	return false
+}
+
+// isNotFoundFor applies the selected backend's classifier. Keeping this
+// separate from isNotFound prevents a Docker error from being accepted by
+// an Apple operation (and vice versa) when callers do have engine context.
+func isNotFoundFor(eng engine, err error) bool {
+	if err == nil {
+		return false
+	}
+	if eng == nil {
+		return isNotFound(err)
+	}
+	if isBareContainerNotFound(err) {
+		return true
+	}
+	branches := backendCLIErrorBranches(err, eng.binary())
+	for _, branch := range branches {
+		if !eng.containerMissing(branch.ctx.err) {
+			continue
+		}
+		if definitiveBranchVetoes(err, branch, branches) || hasNonCLIAmbiguousObjectText(err) {
+			continue
+		}
+		return true
+	}
+	if isAmbiguousApplicationError(eng, err) {
+		return false
+	}
+	return false
+}
+
+func isNotFoundForOperation(eng engine, err error, operation string, targets ...string) bool {
+	if eng == nil {
+		return isNotFound(err)
+	}
+	selected := matchingCLIErrorBranches(err, eng.binary(), operation, targets...)
+	if operation == "inspect" {
+		found, conflict := inspectAbsenceStatus(eng, err, firstTarget(targets))
+		if conflict {
+			return false
+		}
+		if found && len(selected) == 0 {
+			return true
+		}
+	}
+	if isBareContainerNotFound(err) {
+		return true
+	}
+	if len(selected) == 0 {
+		return false
+	}
+	parts := make([]error, 0, len(selected)+1)
+	for _, branch := range selected {
+		parts = append(parts, branch.cause)
+	}
+	var nonCLI []error
+	collectNonCLIErrorBranches(err, &nonCLI)
+	parts = append(parts, nonCLI...)
+	return isNotFoundFor(eng, errors.Join(parts...))
+}
+
+func firstTarget(targets []string) string {
+	for _, target := range targets {
+		if target != "" {
+			return target
+		}
+	}
+	return ""
+}
+
+func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict bool) {
+	if err == nil {
+		return false, false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			childFound, childConflict := inspectAbsenceStatus(eng, child, target)
+			found = found || childFound
+			conflict = conflict || childConflict
+		}
+		return found, conflict
+	}
+	if detail, ok := err.(*inspectTargetNotFoundError); ok {
+		if target == "" || sameCLITarget(detail.target, target) {
+			return true, false
+		}
+		return false, true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return inspectAbsenceStatus(eng, wrapped.Unwrap(), target)
+	}
+	if err == errInspectTargetNotFound {
+		return target == "", target != ""
+	}
+	if err == ErrContainerNotFound {
+		return false, false
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
+			return false, true
+		}
+		operation := commandOperation(cliErr.Args)
+		if operation != "inspect" || (target != "" && !sameCLITarget(commandTarget(cliErr.Args, operation), target)) {
+			return false, true
+		}
+		if eng.containerMissing(cliErr) {
+			return true, false
+		}
+		return false, true
+	}
+	return false, true
+}
+
+func engineForCLIError(err *cli.CLIError) engine {
+	if err == nil {
+		return nil
+	}
+	if cliBinaryMatches(err.Binary, "docker") {
+		return dockerEngine{}
+	}
+	return appleEngine{}
+}
+
+func definitiveBranchVetoes(err error, candidate cliErrorBranch, branches []cliErrorBranch) bool {
+	if hasNonCLIDefinitiveErrorText(err) {
+		return true
+	}
+	for _, branch := range branches {
+		if !sameCLIErrorContext(branch, candidate) {
+			continue
+		}
+		if cli.IsDefinitiveNonLivenessError(branch.cause) {
+			return true
+		}
+	}
+	return false
+}
+
+func sameCLIErrorContext(a, b cliErrorBranch) bool {
+	if a.ctx.operation != b.ctx.operation {
+		return false
+	}
+	if strings.TrimSpace(a.ctx.target) == "" && strings.TrimSpace(b.ctx.target) == "" {
+		return true
+	}
+	return sameCLITarget(a.ctx.target, b.ctx.target)
+}
+
+func hasNonCLIDefinitiveErrorText(err error) bool {
+	if err == nil {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if hasNonCLIDefinitiveErrorText(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		child := wrapped.Unwrap()
+		if _, joined := child.(interface{ Unwrap() []error }); joined {
+			return hasNonCLIDefinitiveErrorText(child)
+		}
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return false
+	}
+	if cli.IsDefinitiveNonLivenessError(err) {
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return hasNonCLIDefinitiveErrorText(wrapped.Unwrap())
+	}
+	return false
+}
+
 // cliCommandParts returns the backend command and its arguments from a
 // CLI error. Backend matchers use this to avoid treating an unrelated
 // "not found" (for example, a missing volume plugin) as a missing
@@ -209,17 +482,6 @@ func cliCommandParts(err error) (command string, args []string, ok bool) {
 		return "", nil, false
 	}
 	return strings.ToLower(cliErr.Args[0]), cliErr.Args[1:], true
-}
-
-func cliBinaryMatches(got, want string) bool {
-	got = strings.TrimSpace(strings.ToLower(got))
-	if got == "" {
-		return want == "container"
-	}
-	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
-		got = got[i+1:]
-	}
-	return got == strings.ToLower(want)
 }
 
 func cliErrorBelongsTo(err error, backend string) bool {
@@ -314,7 +576,7 @@ func cliErrorLines(err error) ([]string, bool) {
 	}
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {
-		line = normalizeCLIErrorLine(line)
+		line = normalizeDaemonErrorLine(line)
 		if line != "" {
 			lines = append(lines, line)
 		}
@@ -322,7 +584,7 @@ func cliErrorLines(err error) ([]string, bool) {
 	return lines, true
 }
 
-func normalizeCLIErrorLine(line string) string {
+func normalizeDaemonErrorLine(line string) string {
 	line = strings.ToLower(strings.Trim(line, "\x00 \t\r\n"))
 	for {
 		changed := false
@@ -352,75 +614,117 @@ func hasCLIErrorLine(err error, match func(string) bool) bool {
 	return false
 }
 
-func cliTargetListMatches(rest, want string) bool {
-	rest = strings.TrimSpace(rest)
-	if rest == "" {
-		return false
-	}
-	found := false
-	for _, part := range strings.Split(rest, ",") {
-		part = strings.Trim(strings.TrimSpace(part), `"'`)
-		if part == "" || strings.ContainsAny(part, " \t\r\n") {
-			return false
-		}
-		if want == "" || strings.EqualFold(part, strings.Trim(want, `"'`)) {
-			found = true
-		}
-	}
-	return found
+// wrapNotFound converts a classified CLI not-found failure into
+// ErrContainerNotFound so errors.Is works from the root package.
+func wrapNotFound(err error) error {
+	return wrapNotFoundFor(nil, err)
 }
 
-// isNotFoundFor applies the selected backend's operation-aware matcher.
-func isNotFoundFor(eng engine, err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, ErrContainerNotFound) {
-		return true
-	}
-	if eng == nil {
-		return isNotFound(err)
-	}
-	return eng.containerMissing(err)
-}
-
-// isNotFound is retained for callers that do not have an engine context.
-// It still selects a backend from the CLI error and uses the same
-// operation-aware matcher.
-func isNotFound(err error) bool {
-	if err == nil {
-		return false
-	}
-	if errors.Is(err, ErrContainerNotFound) {
-		return true
-	}
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return false
-	}
-	if cliBinaryMatches(cliErr.Binary, "docker") {
-		return (dockerEngine{}).containerMissing(err)
-	}
-	return (appleEngine{}).containerMissing(err)
-}
-
-// wrapNotFoundFor converts a classified CLI not-found failure into
-// ErrContainerNotFound for the selected backend.
+// wrapNotFoundFor applies the selected backend before converting a
+// classified CLI not-found failure into ErrContainerNotFound.
 func wrapNotFoundFor(eng engine, err error) error {
-	if eng == nil {
-		return wrapNotFound(err)
-	}
 	if err == nil || !isNotFoundFor(eng, err) || errors.Is(err, ErrContainerNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
 }
 
-// wrapNotFound converts a classified CLI not-found failure into
-// ErrContainerNotFound so errors.Is works from the root package.
-func wrapNotFound(err error) error {
-	if err == nil || !isNotFound(err) || errors.Is(err, ErrContainerNotFound) {
+func wrapNotFoundForOperation(eng engine, err error, operation string, targets ...string) error {
+	if err == nil || !isNotFoundForOperation(eng, err, operation, targets...) || errors.Is(err, ErrContainerNotFound) {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+// classifyError applies the backend liveness contract, while refusing to
+// probe an ambiguous application message such as a generic "container not
+// found" from a run/exec process. The original CLIError is then returned
+// unchanged even if a runner would report its probe as unavailable.
+func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) error {
+	if err == nil {
+		return nil
+	}
+	if eng == nil {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			return errors.Join(err, ctxErr)
+		}
+		return wrapNotFound(err)
+	}
+	if isAmbiguousApplicationError(eng, err) {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
+			return errors.Join(err, ctxErr)
+		}
+		return err
+	}
+	return cli.Classify(ctx, r, err, eng.probe())
+}
+
+func classifyErrorFor(ctx context.Context, r cli.Runner, err error, eng engine, operation string, targets ...string) error {
+	if err == nil || eng == nil || operation == "" {
+		return classifyError(ctx, r, err, eng)
+	}
+	branch, ok := matchingCLIErrorBranch(err, eng.binary(), operation, targets...)
+	if !ok {
+		return classifyError(ctx, r, err, eng)
+	}
+	allBranches := backendCLIErrorBranches(err, "")
+	selected := branch.cause
+	var nonCLI []error
+	collectNonCLIErrorBranches(err, &nonCLI)
+	parts := make([]error, 0, len(allBranches)+len(nonCLI))
+	parts = append(parts, selected)
+	for _, related := range allBranches {
+		if related.ctx.err == branch.ctx.err || !cliBinaryMatches(related.ctx.err.Binary, eng.binary()) ||
+			!sameCLIErrorContext(related, branch) {
+			continue
+		}
+		if cli.IsDefinitiveNonLivenessError(related.cause) {
+			parts = append(parts, related.cause)
+		}
+	}
+	parts = append(parts, nonCLI...)
+	if len(parts) > 1 {
+		selected = errors.Join(parts...)
+	}
+	if isAmbiguousApplicationError(eng, selected) {
+		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(selected, ctxErr) {
+			selected = errors.Join(selected, ctxErr)
+		}
+		if len(allBranches) == 1 && len(nonCLI) == 0 {
+			return selected
+		}
+		return errors.Join(selected, err)
+	}
+	classified := cli.Classify(ctx, r, selected, eng.probe())
+	if classified == nil {
+		return err
+	}
+	if len(allBranches) == 1 && len(nonCLI) == 0 {
+		return classified
+	}
+	return errors.Join(classified, err)
+}
+
+func collectNonCLIErrorBranches(err error, out *[]error) {
+	if err == nil {
+		return
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			collectNonCLIErrorBranches(child, out)
+		}
+		return
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		child := wrapped.Unwrap()
+		if _, joined := child.(interface{ Unwrap() []error }); joined {
+			collectNonCLIErrorBranches(child, out)
+			return
+		}
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return
+	}
+	*out = append(*out, err)
 }

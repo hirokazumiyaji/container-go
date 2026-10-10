@@ -706,16 +706,20 @@ func namedContainer(cfg *config, id string) *Container {
 // container vanished mid-start (Apple concurrent-create race), not a
 // generic "… not found" such as a missing entrypoint binary.
 func createRaceMissing(err error) bool {
+	return createRaceMissingForTarget(err, "")
+}
+
+func createRaceMissingForTarget(err error, target string) bool {
 	command, args, ok := cliCommandParts(err)
 	if !ok || command != "run" || !cliErrorBelongsTo(err, "container") {
 		return false
 	}
-	target := cliCommandTarget(command, args)
-	if target == "" {
+	cliTarget := cliCommandTarget(command, args)
+	if cliTarget == "" || (target != "" && !strings.EqualFold(cliTarget, target)) {
 		return false
 	}
 	return hasCLIErrorLine(err, func(line string) bool {
-		if appleTypedContainerIDNotFoundLine(line, target) || appleIDMissingLine(line, target) {
+		if appleTypedContainerIDNotFoundLine(line, cliTarget) || appleIDMissingLine(line, cliTarget) {
 			return true
 		}
 		for _, wrapper := range []string{
@@ -725,7 +729,7 @@ func createRaceMissing(err error) bool {
 			rest, found := strings.CutPrefix(line, wrapper)
 			if found {
 				rest = strings.TrimSpace(rest)
-				if appleIDMissingLine(rest, target) || appleTypedContainerIDNotFoundLine(rest, target) {
+				if appleIDMissingLine(rest, cliTarget) || appleTypedContainerIDNotFoundLine(rest, cliTarget) {
 					return true
 				}
 			}

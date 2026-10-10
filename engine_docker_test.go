@@ -839,6 +839,9 @@ func TestDockerStateMapping(t *testing.T) {
 
 func TestDockerLifecycleArgs(t *testing.T) {
 	e := dockerEngine{}
+	if got := e.inspectArgs("myctr"); !slices.Equal(got, []string{"inspect", "--type=container", "myctr"}) {
+		t.Errorf("inspectArgs = %v", got)
+	}
 	d := 10 * time.Second
 	if got, err := e.stopArgs("myctr", &d); err != nil || !slices.Equal(got, []string{"stop", "--time", "10", "myctr"}) {
 		t.Errorf("stopArgs = %v, %v", got, err)
@@ -972,7 +975,7 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 		return []byte(dockerFixtureID + "\n"), nil, nil
 	case "inspect":
 		if d.failInspect {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
+			return nil, nil, &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
 		if d.inspectError != nil {
 			return nil, nil, d.inspectError

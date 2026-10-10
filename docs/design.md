@@ -910,12 +910,11 @@ timeout/cancellation path (#92). Some primitive timeout errors and
 retain a context error. Do not assume one error-chain contract until
 these follow-up issues are applied.
 
-- `ErrSystemNotRunning`: a non-zero CLI exit was followed by a failed
-  backend liveness probe. Apple Container's hint is `container system
-  start`; Docker's hint is to start the Docker daemon. Missing or
-  unlaunchable CLI binaries remain launch errors. The current wrapper
-  keeps the sentinel but flattens the original `*CLIError` into text
-  (#104).
+- `ErrSystemNotRunning`: after a CLI failure, the backend-specific
+  liveness probe reports that the Apple Container service or Docker
+  daemon is unavailable. The original CLI error and probe error stay
+  in the error chain; permission, configuration, and caller
+  cancellation failures are not relabeled.
 - `ErrContainerNotFound`: a classified CLI-reported missing-container
   failure. A successful inspect response with no matching target is not
   guaranteed to produce this sentinel and may return a generic error
@@ -933,14 +932,9 @@ these follow-up issues are applied.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and stderr (the diagnostic stderr copy is
   capped at 64KiB). The root `CLIError` alias is a current-development
-  addition and is not part of `v0.2.0`; a current
-  `ErrSystemNotRunning` classification may flatten this original error
-  into text (#104).
+  addition and is not part of `v0.2.0`.
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
-- `ErrSystemNotRunning`: after a CLI failure, a follow-up
-  `container system status` probe failed too; the message tells the
-  user to run `container system start`
 - `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrPortNotExposed`: a port was not declared or has no usable host
   binding
@@ -957,7 +951,8 @@ these follow-up issues are applied.
 - `ErrEndpointUnreachable`: an inspected binding, notably remote-daemon
   loopback, cannot be reached by the client
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and stderr (capped at 64KiB)
+  code, and bounded stderr diagnostic (capped at 64KiB). Classification
+  also inspects bounded stdout internally for liveness probes.
 
 When a non-reuse `Run` fails after a successful backend `run`, the
 post-create rollback error is returned. If rollback deletion fails, its

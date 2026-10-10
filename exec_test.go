@@ -82,6 +82,124 @@ func TestExecReturnsCommandExitCodeWithoutError(t *testing.T) {
 	}
 }
 
+func TestExecKeepsPositiveWorkloadPermissionTextAsResult(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "workload output\n",
+		execErr: &cli.CLIError{
+			Binary:   "container",
+			Args:     []string{"exec", "myctr", "app"},
+			ExitCode: 23,
+			Stderr:   "permission denied: /var/lib/app/data\n",
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"app"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want ordinary positive workload result", err)
+	}
+	if code != 23 {
+		t.Errorf("exit code = %d, want 23", code)
+	}
+	data, _ := io.ReadAll(out)
+	if got, want := string(data), "workload output\npermission denied: /var/lib/app/data\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+func TestExecReturnsStructuredPermissionAndConfigFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{
+			name: "permission sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 17, Stderr: "permission denied",
+				},
+				os.ErrPermission,
+			),
+			code: 17,
+		},
+		{
+			name: "configuration sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 18, Stderr: "invalid configuration",
+				},
+				os.ErrInvalid,
+			),
+			code: 18,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "diagnostic output\n",
+				execErr:    tc.err,
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"app"})
+			if err == nil {
+				t.Fatal("Exec returned nil for a structured client-side failure")
+			}
+			if code != tc.code {
+				t.Errorf("exit code = %d, want %d", code, tc.code)
+			}
+			if out == nil {
+				t.Fatal("Exec returned nil output for a structured client-side failure")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Errorf("error = %v, want original structured failure", err)
+			}
+		})
+	}
+}
+
+type issue104CanceledExecRunner struct {
+	*execRunner
+}
+
+func (r *issue104CanceledExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		return []byte("partial output"), []byte("process killed"), errors.Join(
+			&cli.CLIError{Args: args, ExitCode: -1, Stderr: "process killed"},
+			context.Canceled,
+		)
+	}
+	return r.execRunner.Run(ctx, args...)
+}
+
+func TestExecReturnsCancellationWhenCLIExitIsSignal(t *testing.T) {
+	f := &issue104CanceledExecRunner{execRunner: &execRunner{fakeRunner: newTestRunner()}}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"sleep"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a canceled CLI process")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != -1 {
+		t.Fatalf("error = %v, want original signal CLIError in the chain", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 for an unobservable signal exit", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a canceled CLI process")
+	}
+}
+
 func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
@@ -202,6 +320,72 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 	if code != 7 {
 		t.Errorf("code = %d, want 7", code)
+	}
+}
+
+func TestExecReturnsStructuredOperationTimeoutAsInfrastructureError(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "partial stdout",
+		execErr: errors.Join(
+			&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command failed"},
+			context.DeadlineExceeded,
+		),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"query"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a structured operation timeout")
+	}
+	if code != 7 {
+		t.Errorf("exit code = %d, want 7", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a structured operation timeout")
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want the original timeout CLIError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if f.callWith("version") != nil || f.callWith("system") != nil {
+		t.Errorf("timeout triggered an infrastructure probe: %v", f.calls)
+	}
+}
+
+func TestExecKeepsTimeoutTextAsApplicationResult(t *testing.T) {
+	cases := []struct {
+		name   string
+		args   []string
+		stderr string
+	}{
+		{name: "application stderr", args: []string{"exec", "myctr", "query"}, stderr: "i/o timeout"},
+		{name: "argv", args: []string{"exec", "myctr", "command timed out"}, stderr: "application failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "application output",
+				execErr: &cli.CLIError{
+					Args:     tc.args,
+					ExitCode: 7,
+					Stderr:   tc.stderr,
+				},
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"query"})
+			if err != nil {
+				t.Fatalf("Exec: %v, want normal non-zero application result", err)
+			}
+			if code != 7 || out == nil {
+				t.Fatalf("code/output = %d/%v, want code 7 and output", code, out)
+			}
+		})
 	}
 }
 

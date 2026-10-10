@@ -540,24 +540,21 @@ Windows の Go `chmod` は同等の秘密性を保証しないため、env フ�
 
 ## エラー処理
 
-root と backend の error は `errors.Is` と `errors.As` で判別できる状態を意図する。ただし現在のチェックアウトには追加の制限がある。`Classify` は元の CLI error を `ErrSystemNotRunning` wrapper の text として format し、unwrap target として保持しない（#104）。target に一致する entry がない successful inspect response は `ErrContainerNotFound` ではなく generic error を返す場合がある（#103）。Docker では empty または malformed な inspect data がこの generic path に入り得ます。現在の parser は返された object が要求した ID や name に一致するかも検証しないため、valid だが mismatched な object は信頼できる no-match signal ではない。built-in wait strategy は timeout / cancellation 経路ごとに context error を一様に保持していない（#92）。primitive timeout や `ForLog` cancellation は string-only になる場合があり、composite strategy は context error を保持する場合がある。これらの follow-up issue を適用するまでは一つの error-chain contract を仮定しない。
+root と backend の error は `errors.Is` と `errors.As` で判別できる状態を意図する。ただし現在のチェックアウトには追加の制限がある。`Classify` は元の CLI エラーと probe エラーを `ErrSystemNotRunning` の error chain に保持する（#104）。target に一致する entry がない successful inspect response は `ErrContainerNotFound` ではなく generic error を返す場合がある（#103）。Docker では empty または malformed な inspect data がこの generic path に入り得ます。現在の parser は返された object が要求した ID や name に一致するかも検証しないため、valid だが mismatched な object は信頼できる no-match signal ではない。built-in wait strategy は timeout / cancellation 経路ごとに context error を一様に保持していない（#92）。primitive timeout や `ForLog` cancellation は string-only になる場合があり、composite strategy は context error を保持する場合がある。これらの follow-up issue を適用するまでは一つの error-chain contract を仮定しない。
 
-- `ErrSystemNotRunning`：CLI が non-zero exit を返した後にバックエンドの liveness probe も失敗した場合。Apple Container のヒントは `container system start`、Docker のヒントは Docker daemon の起動である。missing または unlaunchable な CLI binary は launch error のままである。現在の wrapper は sentinel を保持するが元の `*CLIError` を text に flatten する（#104）。
+- `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：backend が missing container を示す CLI failure を分類した場合。target に一致する entry がない successful inspect response はこの sentinel を保証せず、generic error になる場合がある（#103）。Docker では empty または malformed な inspect data がその generic path に入る。valid だが mismatched な object は現在の parser では no-match として拒否されない。
 - `ErrImageNotFound`：現在の `PullNever` precheck がローカルイメージを見つけなかった場合。Apple では best-effort な backend-specific precheck であり、no-fetch 保証ではない（#112）。
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。現在の reuse 経路には readiness 後の最終 check（#83、#84）がない。
-- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。現在の `ErrSystemNotRunning` 分類は元の error を text に flatten する場合がある（#104）。
+- `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
 - `ErrContainerNotFound` と `ErrGenerationReplaced` も現在の開発版追加である。
-- `ErrSystemNotRunning`：CLI 呼び出しが失敗した際に `container system status` を追加で照会し、サービス未起動と判定できた場合に返す。メッセージに `container system start` の実行を促す文言を含める
-- `ErrContainerNotFound`：inspect などの not found
-- `ErrPortNotExposed`：未宣言、または利用可能な host binding がない port
 - `ErrEnvFileUnsupported`：空でない環境変数指定には安全な env ファイルが必要だが、現在のプラットフォームではユーザー単位の秘密性を確保できない
 - `ErrCopyFileNotRegular`：Docker の copy-out 結果が regular file でない
 - `ErrCopyFileFromContainerUnsupported`：選択した backend または host が型安全な copy-out を実装していない(Apple Container、Docker client/server が 29.7.0 未満、必要な open flag がない host、または Windows Go 1.23 から 1.25)
 - `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
 - `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
-- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr(上限 64KiB)を保持する
+- `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr の診断情報(上限 64KiB)を保持する。liveness probe では stdout の診断情報も内部で確認する
 
 backend の `run` が成功した後に非 reuse `Run` が失敗した場合、作成後の rollback error を返す。rollback 削除にも失敗すると、コンテナが残ったことを message に含める。backend の `run` 自体の失敗は別の best-effort `cleanupFailedCreate` 経路を使い、その cleanup error は元の classified error に連結しない。reaper の登録・削除 error も返さない。Reuse は wait error を返し、共有コンテナは残す。
 

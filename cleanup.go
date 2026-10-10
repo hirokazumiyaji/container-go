@@ -177,8 +177,9 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	}
 	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer dCancel()
-	_, _, err = r.Run(dCtx, eng.deleteArgs(id)...)
-	if err != nil && !isNotFoundFor(eng, err) {
+	deleteArgs := eng.deleteArgs(id)
+	_, _, err = r.Run(dCtx, deleteArgs...)
+	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: fresh.name, creation: candidate.creation}, fresh.name, candidate.creation, id)
@@ -274,8 +275,9 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if !pruneCandidateStillCurrent(candidate, fresh, reuseGroup) || fresh.uid != "" {
 		return false, nil
 	}
-	_, _, err = r.Run(guardCtx, eng.deleteArgs(candidate.id)...)
-	if err != nil && !isNotFoundFor(eng, err) {
+	deleteArgs := eng.deleteArgs(candidate.id)
+	_, _, err = r.Run(guardCtx, deleteArgs...)
+	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), candidate.id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}
 	unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")

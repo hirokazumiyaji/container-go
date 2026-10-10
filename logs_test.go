@@ -187,7 +187,7 @@ func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testin
 		Stderr:   "Error response from daemon: No such container: " + testDockerUID,
 	}
 	runner := &singleStreamRunner{
-		fakeRunner: &fakeRunner{systemUp: false},
+		fakeRunner: &fakeRunner{systemUp: false, binary: "docker"},
 		stream:     newTerminalStatusReader(terminal),
 	}
 	ctr := &Container{id: "myctr", uid: testDockerUID, runner: runner, eng: dockerEngine{}}

@@ -191,10 +191,10 @@ func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform 
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
 	if err != nil {
-		if eng.imageMissing(err) {
+		if eng.imageMissingForTarget(err, image) {
 			return false, nil
 		}
-		return false, cli.Classify(ctx, r, err, eng.probe())
+		return false, classifyErrorFor(ctx, r, err, eng, commandOperation(eng.imageInspectArgs(image, platform)), image)
 	}
 	return eng.parseImageExists(stdout, platform), nil
 }
@@ -202,9 +202,10 @@ func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform 
 // pullImage fetches the image (and requested platform variant, when
 // set) through the backend CLI.
 func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform string) error {
-	_, _, err := r.Run(ctx, eng.pullImageArgs(image, platform)...)
+	args := eng.pullImageArgs(image, platform)
+	_, _, err := r.Run(ctx, args...)
 	if err != nil {
-		return cli.Classify(ctx, r, err, eng.probe())
+		return classifyErrorFor(ctx, r, err, eng, commandOperation(args), image)
 	}
 	return nil
 }

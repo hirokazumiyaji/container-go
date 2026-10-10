@@ -39,10 +39,10 @@ const maxDockerStopSeconds int64 = math.MaxInt32
 //     "No such container" / "not found")
 const (
 	dockerDeleteVolumesFlag  = "--volumes"
-	dockerStderrConflict     = "conflict"
+	dockerStderrConflict     = "conflict. the container name "
 	dockerStderrAlreadyInUse = "already in use"
 	dockerStderrName         = "name"
-	dockerStderrNoSuchImage  = "no such image"
+	dockerStderrNoSuchImage  = "no such image:"
 	dockerStderrNotFound     = "not found"
 	dockerStderrNoSuchObj    = "no such object"
 	dockerStderrNoSuchCtr    = "no such container"
@@ -399,9 +399,82 @@ func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
 	return cli.Probe{
-		Args: []string{"version", "--format", "{{.Server.Version}}"},
-		Hint: "start the Docker daemon",
+		Args:          []string{"version", "--format", "{{.Server.Version}}"},
+		Hint:          "start the Docker daemon",
+		Binary:        "docker",
+		Operation:     "version",
+		IsUnavailable: dockerProbeUnavailable,
 	}
+}
+
+func dockerProbeUnavailable(err error) bool {
+	branches := backendCLIErrorBranches(err, "docker")
+	if len(branches) == 0 {
+		return false
+	}
+	// A reachable daemon can fail the client for TLS, certificate, SSH,
+	// proxy, authentication, or endpoint-configuration reasons. Those
+	// diagnostics veto only the matching version branch.
+	for _, branch := range branches {
+		if branch.ctx.operation != "version" {
+			continue
+		}
+		if cli.IsProbeConfigurationError(branch.cause) {
+			return false
+		}
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "version" {
+			continue
+		}
+		stderr, stdout := branchLines(branch, true)
+		for _, line := range stderr {
+			if dockerProbeLivenessText(line) {
+				return true
+			}
+		}
+		for _, line := range stdout {
+			if dockerProbeLivenessText(line) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func dockerProbeLivenessText(line string) bool {
+	if dockerDesktopStartupFailure(line) {
+		return true
+	}
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"docker daemon is not running",
+		"error during connect",
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"no such host",
+		"host is down",
+		"network is unreachable",
+		"pipe: The system cannot find the file specified",
+		"open //./pipe/docker_engine",
+		"open \\\\.\\pipe\\docker_engine",
+		"failed to connect to socket",
+		"dial unix",
+		"dial tcp",
+	} {
+		if strings.Contains(line, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+var dockerDesktopUnableToStartRE = regexp.MustCompile(`(?i)^(?:error response from daemon:\s*)?docker desktop is unable to start\b`)
+
+func dockerDesktopStartupFailure(line string) bool {
+	return dockerDesktopUnableToStartRE.MatchString(strings.TrimSpace(line))
 }
 
 // defaultHost returns the address the client should dial to reach the
@@ -654,6 +727,9 @@ var dockerInspectFields = []string{"Id", "Name", "State", "State.Status"}
 // name. Other entries are ignored, and output the parser cannot read is an
 // error rather than a missing container.
 func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error) {
+	if strings.TrimSpace(string(data)) == "" {
+		return nil, newInspectTargetNotFound(target, "empty inspect output")
+	}
 	// Decode entry by entry so an entry this parser cannot interpret is
 	// reported as a schema failure instead of a zero value. A target-naming
 	// entry that decoded to nothing would be classified ErrContainerNotFound
@@ -663,11 +739,19 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	if err != nil {
 		return nil, fmt.Errorf("decode docker inspect output: %w", err)
 	}
+	if len(containers) == 0 {
+		return nil, newInspectTargetNotFound(target, "inspect output did not contain the requested target")
+	}
 	match := -1
 	var malformedID string
+	var candidateMissingState bool
 	if dockerIDRE.MatchString(target) {
 		for i, c := range containers {
-			if c.State != nil && dockerIDRE.MatchString(c.ID) && c.ID == target {
+			if dockerIDRE.MatchString(c.ID) && c.ID == target {
+				if c.State == nil || strings.TrimSpace(c.State.Status) == "" {
+					candidateMissingState = true
+					continue
+				}
 				match = i
 				break
 			}
@@ -689,10 +773,13 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		}
 	}
 	if match < 0 {
+		if candidateMissingState {
+			return nil, fmt.Errorf("decode docker inspect output: container State.Status is required")
+		}
 		if malformedID != "" {
 			return nil, fmt.Errorf("decode docker inspect output: container %s has invalid ID %q", target, malformedID)
 		}
-		return nil, fmt.Errorf("%w: container %s not in inspect output", ErrContainerNotFound, target)
+		return nil, newInspectTargetNotFound(target, "inspect output did not contain the requested target")
 	}
 	c := containers[match]
 
@@ -996,9 +1083,26 @@ func (dockerEngine) pullImageArgs(image, platform string) []string {
 	return []string{"pull", image}
 }
 
-// imageMissing matches the daemon's response for an absent image.
+// imageMissing matches only Docker's image-inspect response. Pull errors
+// and arbitrary application output are not local-store absence evidence.
 func (dockerEngine) imageMissing(err error) bool {
-	return dockerStderrContains(err, dockerStderrNoSuchImage)
+	return (dockerEngine{}).imageMissingForTarget(err, "")
+}
+
+func (dockerEngine) imageMissingForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "docker")
+	if target == "" && ambiguousBranchTargets(branches) {
+		return false
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation != "image inspect" || !exactImageTarget(branch, target) {
+			continue
+		}
+		if hasBranchImageLine(branch, dockerStderrNoSuchImage, branch.ctx.target, true) {
+			return true
+		}
+	}
+	return false
 }
 
 func (dockerEngine) parseImageExists(data []byte, _ string) bool {
@@ -1026,14 +1130,60 @@ func (dockerEngine) parseReuseGroupIDs(data []byte, _ string) ([]string, error) 
 	return parseDockerPruneIDs(data)
 }
 
-// nameConflict matches Docker's duplicate container name error.
+// nameConflict matches Docker's duplicate container name error on a
+// create/run command. A delete or application command containing the same
+// words is not evidence that this library lost a name race.
 func (dockerEngine) nameConflict(err error) bool {
-	s, ok := dockerCLIStderr(err)
-	if !ok {
+	return (dockerEngine{}).nameConflictForTarget(err, "")
+}
+
+func (dockerEngine) nameConflictForTarget(err error, target string) bool {
+	branches := backendCLIErrorBranches(err, "docker")
+	if target == "" && ambiguousBranchTargets(branches) {
 		return false
 	}
-	return strings.Contains(s, dockerStderrConflict) ||
-		(strings.Contains(s, dockerStderrAlreadyInUse) && strings.Contains(s, dockerStderrName))
+	for _, branch := range branches {
+		if branch.ctx.operation != "" && branch.ctx.operation != "run" {
+			continue
+		}
+		if !exactBranchTarget(branch, target) {
+			continue
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			return dockerNameConflictLine(line, branch.ctx.target)
+		}) {
+			return true
+		}
+	}
+	return false
+}
+
+func dockerNameConflictLine(line, target string) bool {
+	line = strings.ToLower(line)
+	if !strings.HasPrefix(line, dockerStderrConflict) ||
+		!strings.Contains(line, dockerStderrAlreadyInUse) {
+		return false
+	}
+	if target == "" {
+		return true
+	}
+	rest := strings.TrimSpace(strings.TrimPrefix(line, dockerStderrConflict))
+	if len(rest) >= 2 && rest[0] == '"' {
+		rest = rest[1:]
+		if end := strings.IndexByte(rest, '"'); end >= 0 {
+			rest = rest[:end]
+		}
+		if sameDockerContainerName(rest, target) {
+			return true
+		}
+	}
+	return strings.Contains(line, strings.ToLower(target))
+}
+
+func sameDockerContainerName(got, want string) bool {
+	got = strings.TrimPrefix(strings.Trim(strings.TrimSpace(got), `"'`), "/")
+	want = strings.TrimPrefix(strings.Trim(strings.TrimSpace(want), `"'`), "/")
+	return strings.EqualFold(got, want)
 }
 
 // containerMissing matches a CLI failure for an absent container.
@@ -1078,17 +1228,4 @@ func (dockerEngine) containerMissing(err error) bool {
 	default:
 		return false
 	}
-}
-
-func dockerCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
-}
-
-func dockerStderrContains(err error, substr string) bool {
-	s, ok := dockerCLIStderr(err)
-	return ok && strings.Contains(s, substr)
 }

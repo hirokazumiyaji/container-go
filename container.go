@@ -150,7 +150,7 @@ type Container struct {
 	// (Docker). Deletes target it directly, which makes the generation
 	// check unnecessary: a replacement never shares it.
 	//
-	// It is promoted from the first inspect, so it is written long after the
+	// It is promoted from a verified inspect, so it is written long after the
 	// handle is published. Guarded by uidMu rather than mu, because readers
 	// on the Terminate path must not hold the inspect lock.
 	uid   string
@@ -330,7 +330,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
+		classified := classifyErrorFor(ctx, cfg.runner, runErr, cfg.eng, "run", cfg.name)
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, runErr, classified); cleanupErr != nil {
 			return nil, joinEnvFileCleanupError(withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
@@ -657,7 +657,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	ctr.creation = cfg.creation
 	info, err := ctr.inspectFreshLocked(cleanupCtx)
 	if err != nil {
-		if isNotFoundFor(cfg.eng, err) {
+		if isNotFoundForOperation(cfg.eng, err, "inspect", cfg.name) {
 			unregisterContainerReaper(cfg, cfg.name, cfg.creation, "")
 			return nil
 		}
@@ -722,8 +722,59 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 // immutable backend ID used for internal operations.
 func (c *Container) ID() string { return c.id }
 
+// operationTarget returns the immutable target for backend operations.
+// Docker handles prefer the ID returned by run/inspect; name-based handles
+// (including Apple Container) retain the original name.
+func (c *Container) operationTarget() string {
+	if c.eng != nil && c.eng.name() == "docker" {
+		if uid := c.immutableUID(); uid != "" {
+			return uid
+		}
+	}
+	return c.id
+}
+
+// immutableUID returns the Docker immutable ID, or "" on name-based backends.
+func (c *Container) immutableUID() string {
+	if c.eng == nil || c.eng.name() != "docker" {
+		return ""
+	}
+	return c.immutableID()
+}
+
+// setImmutableUID promotes a Docker immutable ID. Name-based backends ignore it.
+func (c *Container) setImmutableUID(uid string) {
+	if c.eng == nil || c.eng.name() != "docker" {
+		return
+	}
+	c.setImmutableID(uid)
+}
+
+func (c *Container) dockerGenerationMatches(info *engineInfo) bool {
+	return c.eng != nil && c.eng.name() == "docker" && c.creation != "" &&
+		info != nil && info.labels[creationLabel] == c.creation
+}
+
 func (c *Container) classify(ctx context.Context, err error) error {
-	return cli.Classify(ctx, c.runner, err, c.eng.probe())
+	return classifyError(ctx, c.runner, err, c.eng)
+}
+
+func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
+	if c.eng == nil {
+		return c.classify(ctx, err)
+	}
+	target := c.operationTarget()
+	if target == c.id {
+		return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target)
+	}
+	return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target, c.id)
+}
+
+func (c *Container) deleteOperation() string {
+	if c.eng != nil && c.eng.name() == "docker" {
+		return "rm"
+	}
+	return "delete"
 }
 
 // State returns the current lifecycle state.
@@ -757,7 +808,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
 	_, _, err = c.runner.Run(stopCtx, args...)
-	return c.classify(ctx, err)
+	return c.classifyOperation(ctx, err, "stop")
 }
 
 // Terminate force-removes the container. A Docker handle must carry a
@@ -818,11 +869,11 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
-	if err == nil || isNotFoundFor(c.eng, err) {
+	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
 		return nil
 	}
-	return c.classify(ctx, err)
+	return c.classifyOperation(ctx, err, c.deleteOperation())
 }
 
 // ContainerIP returns the container's address on its first attached
@@ -1272,10 +1323,13 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "inspect"), "inspect", target, c.id)
 	}
 	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
+		if errors.Is(err, errInspectTargetNotFound) {
+			return nil, wrapInspectTargetNotFound(err)
+		}
 		return nil, err
 	}
 	if requiresImmutableID(c.eng) {

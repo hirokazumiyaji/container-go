@@ -70,8 +70,20 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 	return c.fakeRunner.Run(ctx, args...)
 }
 
+func (c *cpRunner) setBinary(b string) {
+	if c != nil && c.fakeRunner != nil {
+		c.binary = b
+	}
+}
+
 func runCopyDockerTestContainer(t *testing.T, f cli.Runner, opts ...Option) *Container {
 	t.Helper()
+	if cr, ok := f.(interface{ setBinary(string) }); ok {
+		cr.setBinary("docker")
+	}
+	if fr, ok := f.(*fakeRunner); ok {
+		fr.binary = "docker"
+	}
 	return runTestContainer(t, f, append([]Option{withEngine(dockerEngine{})}, opts...)...)
 }
 

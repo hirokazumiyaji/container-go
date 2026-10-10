@@ -64,7 +64,7 @@ func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
 			}
 		}
 		if cliErr, ok := cur.(*cli.CLIError); ok {
-			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
+			if backend != "" && cliErr.Binary != "" && !cliBinaryMatches(cliErr.Binary, backend) {
 				return
 			}
 			operation := commandOperation(cliErr.Args)

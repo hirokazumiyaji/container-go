@@ -134,6 +134,58 @@ func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 	}
 }
 
+func TestIssue97FlightGroupReportsLeaderAndWaiters(t *testing.T) {
+	var g flightGroup[int]
+	started := make(chan struct{})
+	release := make(chan struct{})
+	joined := make(chan struct{})
+	var joinedOnce sync.Once
+	g.onJoin = func(string) { joinedOnce.Do(func() { close(joined) }) }
+	leaderDone := make(chan struct {
+		value int
+		lead  bool
+		err   error
+	}, 1)
+	go func() {
+		value, lead, err := g.doWithLeader(context.Background(), "roles", func() (int, error) {
+			close(started)
+			<-release
+			return 7, nil
+		})
+		leaderDone <- struct {
+			value int
+			lead  bool
+			err   error
+		}{value, lead, err}
+	}()
+	<-started
+	waiterDone := make(chan struct {
+		value int
+		lead  bool
+		err   error
+	}, 1)
+	go func() {
+		value, lead, err := g.doWithLeader(context.Background(), "roles", func() (int, error) {
+			return 0, errors.New("waiter unexpectedly executed flight")
+		})
+		waiterDone <- struct {
+			value int
+			lead  bool
+			err   error
+		}{value, lead, err}
+	}()
+	<-joined
+	close(release)
+	leader := <-leaderDone
+	waiter := <-waiterDone
+	if leader.err != nil || waiter.err != nil || leader.value != 7 || waiter.value != 7 {
+		t.Fatalf("results = leader(%+v), waiter(%+v)", leader, waiter)
+	}
+	if !leader.lead || waiter.lead {
+		t.Fatalf("leader flags = leader %v, waiter %v", leader.lead, waiter.lead)
+	}
+}
+
 func TestFlightGroupRecoversFromPanic(t *testing.T) {
 	var g flightGroup[int]
 	_, err := g.do(context.Background(), "panic-key", func() (int, error) {

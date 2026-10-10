@@ -87,8 +87,9 @@ func TestExecRunnerPreservesFailureStdout(t *testing.T) {
 }
 
 func TestExecRunnerCapsStderr(t *testing.T) {
-	// Emit ~1MiB of stderr, far beyond the 64KiB cap.
-	r := &ExecRunner{Binary: writeStub(t, `i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; exit 1`)}
+	// Emit ~1MiB of stderr, far beyond the 64KiB cap, then finish with
+	// the diagnostic that classification needs.
+	r := &ExecRunner{Binary: writeStub(t, `printf 'FIRST_BYTES_SENTINEL\n' >&2; i=0; while [ $i -lt 16384 ]; do printf '%064d\n' "$i" >&2; i=$((i+1)); done; printf 'Error response from daemon: No such container: terminal\n' >&2; exit 1`)}
 
 	stdout, stderr, err := r.Run(context.Background(), "run")
 	var cliErr *CLIError
@@ -97,6 +98,12 @@ func TestExecRunnerCapsStderr(t *testing.T) {
 	}
 	if len(cliErr.Stderr) > maxStderr {
 		t.Errorf("len(Stderr) = %d, want <= %d", len(cliErr.Stderr), maxStderr)
+	}
+	if !strings.Contains(cliErr.Stderr, "No such container: terminal") {
+		t.Errorf("Stderr = %q, want terminal not-found diagnostic", cliErr.Stderr)
+	}
+	if strings.Contains(cliErr.Stderr, "FIRST_BYTES_SENTINEL") {
+		t.Errorf("Stderr retained the first bytes instead of the terminal tail")
 	}
 	// The returned output buffers stay whole for exec/log results.
 	if len(stderr) <= maxStderr {
@@ -292,8 +299,19 @@ func TestClassifyReturnsSystemNotRunningWhenStatusProbeFails(t *testing.T) {
 	if !errors.Is(err, ErrSystemNotRunning) {
 		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
 	}
+	if !errors.Is(err, orig) {
+		t.Fatalf("error = %v, want original CLI failure", err)
+	}
+	var got *CLIError
+	if !errors.As(err, &got) || got != orig {
+		t.Fatalf("error = %v, want original CLIError %v", err, orig)
+	}
 	if !strings.Contains(err.Error(), "container system start") {
 		t.Errorf("Error() = %q, want hint to run 'container system start'", err.Error())
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr != orig {
+		t.Fatalf("error = %v, want original CLIError in chain", err)
 	}
 }
 

@@ -152,7 +152,7 @@ func TestTerminateDoesNotTreatPermissionNotFoundAsVerifiedAbsence(t *testing.T) 
 	}
 }
 
-func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
+func TestCreateRaceMissingIsAnchoredAndCommandAwareReview(t *testing.T) {
 	cases := []struct {
 		name string
 		err  *cli.CLIError

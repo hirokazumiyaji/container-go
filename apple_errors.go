@@ -87,44 +87,6 @@ func appleApplicationPrefixed(value string) bool {
 	return strings.HasPrefix(value, "application:") || strings.HasPrefix(value, "application ")
 }
 
-func appleTypedContainerMissingLine(line, target, operation string) bool {
-	switch operation {
-	case "inspect", "exec", "stop", "delete", "rm", "logs":
-	default:
-		return false
-	}
-	root, ok := parseAppleTypedErrorLine(line)
-	if !ok {
-		return false
-	}
-	for node := &root; node != nil; node = node.cause {
-		if node.code != "notfound" && node.code != "internalerror" {
-			continue
-		}
-		if appleTypedNotFoundMessage(node.message, target, operation) {
-			return true
-		}
-	}
-	return false
-}
-
-func appleTypedNotFoundMessage(message, target, operation string) bool {
-	message = strings.ToLower(strings.TrimSpace(message))
-	if appleApplicationPrefixed(message) {
-		return false
-	}
-	if operation == "inspect" {
-		if rest, ok := strings.CutPrefix(message, "container not found:"); ok {
-			return cliTargetListMatches(rest, target)
-		}
-		return false
-	}
-	if rest, ok := strings.CutPrefix(message, "container not found:"); ok {
-		return cliTargetListMatches(rest, target)
-	}
-	return appleContainerMissingLine(message, target) || appleIDMissingLine(message, target)
-}
-
 func appleTypedImageMissingLine(line, target string) bool {
 	root, ok := parseAppleTypedErrorLine(line)
 	if !ok {
@@ -161,26 +123,6 @@ func appleTypedNameConflictLine(line, target string) bool {
 	}
 	for node := &root; node != nil; node = node.cause {
 		if (node.code == "exists" || node.code == "internalerror") && appleNameConflictLine(strings.ToLower(node.message), target) {
-			return true
-		}
-	}
-	return false
-}
-
-func appleTypedCreateRaceMissingLine(line, target string) bool {
-	root, ok := parseAppleTypedErrorLine(line)
-	if !ok {
-		return false
-	}
-	for node := &root; node != nil; node = node.cause {
-		if node.code != "notfound" && node.code != "internalerror" {
-			continue
-		}
-		message := strings.ToLower(strings.TrimSpace(node.message))
-		if appleIDMissingLine(message, target) {
-			return true
-		}
-		if rest, found := strings.CutPrefix(message, "container not found:"); found && cliTargetListMatches(rest, target) {
 			return true
 		}
 	}

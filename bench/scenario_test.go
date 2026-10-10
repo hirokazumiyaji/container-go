@@ -4,6 +4,7 @@ package bench
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -33,8 +34,16 @@ const (
 	nginxImage = "public.ecr.aws/docker/library/nginx:alpine"
 )
 
+func isolateBenchmarkEnv(t *testing.T) {
+	t.Helper()
+	// Benchmarks own teardown; do not inherit a developer's diagnostic
+	// retention setting from the parent integration process.
+	t.Setenv("CONTAINERGO_KEEP", "0")
+}
+
 func requireDocker(t *testing.T) {
 	t.Helper()
+	isolateBenchmarkEnv(t)
 	if _, err := exec.LookPath("docker"); err != nil {
 		t.Skip("docker CLI not installed")
 	}
@@ -143,6 +152,7 @@ func writeDoc(t *testing.T, name string, doc Doc) string {
 // wall-clock for cold, warm, multi, and parallel scenarios on both
 // backends.
 func TestIntegrationBenchContainerGo(t *testing.T) {
+	isolateBenchmarkEnv(t)
 	for _, b := range []ibench.Backend{ibench.DockerBackend(), ibench.AppleBackend()} {
 		t.Run(b.Name, func(t *testing.T) {
 			b.Available(t)
@@ -176,10 +186,12 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 					var containers []*container.Container
 					for range 5 {
 						ctr, err := containerGoStart(t, redisImage, "6379/tcp")
+						if ctr != nil {
+							containers = append(containers, ctr)
+						}
 						if err != nil {
 							return terminateCleanup(t, containers...), err
 						}
-						containers = append(containers, ctr)
 					}
 					return terminateCleanup(t, containers...), nil
 				})
@@ -204,28 +216,27 @@ func TestIntegrationBenchContainerGo(t *testing.T) {
 							container.WithExposedPorts("6379/tcp"),
 							container.WithWaitStrategy(wait.ForListeningPort("6379/tcp")),
 						)
+						if ctr != nil {
+							mu.Lock()
+							containers = append(containers, ctr)
+							mu.Unlock()
+						}
 						if err != nil {
 							errs[idx] = err
-							return
 						}
-						mu.Lock()
-						containers = append(containers, ctr)
-						mu.Unlock()
 					}()
 				}
 				ready.Wait()
 				elapsed := time.Since(start)
+				// Clean up successful and partial handles before reporting
+				// any failed iteration.
+				terminateCleanup(t, containers...)()
 				for _, err := range errs {
 					if err != nil {
 						t.Fatalf("run/parallel-8 iteration %d: %v", i, err)
 					}
 				}
 				record(&doc, b.Name, LibraryContainerGo, redisImage, "run/parallel-8", i, elapsed)
-				for _, ctr := range containers {
-					if err := ctr.Terminate(context.Background()); err != nil {
-						t.Logf("run/parallel-8 iteration %d: terminate: %v", i, err)
-					}
-				}
 			}
 
 			path := writeDoc(t, b.Name, doc)
@@ -262,6 +273,61 @@ func tcTerminateCleanup(t *testing.T, containers ...tc.Container) func() {
 	}
 }
 
+// runTestcontainersMulti keeps cleanup outside the measured region while
+// retaining a partial container returned alongside a failed create/start.
+func runTestcontainersMulti(t *testing.T, create func() (tc.Container, error)) (func(), error) {
+	var containers []tc.Container
+	for range 5 {
+		ctr, err := create()
+		if ctr != nil {
+			containers = append(containers, ctr)
+		}
+		if err != nil {
+			return tcTerminateCleanup(t, containers...), err
+		}
+	}
+	return tcTerminateCleanup(t, containers...), nil
+}
+
+type partialTestcontainersContainer struct {
+	tc.Container
+	terminateCalls int
+}
+
+func (c *partialTestcontainersContainer) Terminate(context.Context, ...tc.TerminateOption) error {
+	c.terminateCalls++
+	return nil
+}
+
+func TestRunTestcontainersMultiCleansPartialHandleOnError(t *testing.T) {
+	previous := &partialTestcontainersContainer{}
+	partial := &partialTestcontainersContainer{}
+	createErr := errors.New("create failed")
+	calls := 0
+
+	cleanup, err := runTestcontainersMulti(t, func() (tc.Container, error) {
+		calls++
+		if calls == 1 {
+			return previous, nil
+		}
+		return partial, createErr
+	})
+	if !errors.Is(err, createErr) {
+		t.Fatalf("error = %v, want %v", err, createErr)
+	}
+	if cleanup == nil {
+		t.Fatal("multi scenario returned nil cleanup")
+	}
+	cleanup()
+
+	if previous.terminateCalls != 1 {
+		t.Fatalf("previous terminate calls = %d, want 1", previous.terminateCalls)
+	}
+	if partial.terminateCalls != 1 {
+		t.Fatalf("partial terminate calls = %d, want 1", partial.terminateCalls)
+	}
+}
+
 // TestIntegrationBenchTestcontainers measures testcontainers-go under
 // the same conditions. The first iteration includes the session
 // initialization (starting and connecting the Ryuk sidecar container),
@@ -276,6 +342,11 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	ctr, err := tc.GenericContainer(context.Background(), tcRequest())
 	elapsed := time.Since(start)
 	if err != nil {
+		if ctr != nil {
+			if termErr := ctr.Terminate(context.Background()); termErr != nil {
+				t.Logf("terminate session-init container: %v", termErr)
+			}
+		}
 		t.Fatalf("session-init container: %v", err)
 	}
 	record(&doc, "docker", LibraryTestcontainersGo, redisImage, "tc/session-init", 1, elapsed)
@@ -293,15 +364,9 @@ func TestIntegrationBenchTestcontainers(t *testing.T) {
 	// initialization was already paid above.
 	runScenario(t, &doc, "docker", LibraryTestcontainersGo, redisImage, "tc/multi-5", nil,
 		func(t *testing.T) (func(), error) {
-			var containers []tc.Container
-			for range 5 {
-				ctr, err := tc.GenericContainer(context.Background(), tcRequest())
-				if err != nil {
-					return tcTerminateCleanup(t, containers...), err
-				}
-				containers = append(containers, ctr)
-			}
-			return tcTerminateCleanup(t, containers...), nil
+			return runTestcontainersMulti(t, func() (tc.Container, error) {
+				return tc.GenericContainer(context.Background(), tcRequest())
+			})
 		})
 
 	path := writeDoc(t, "docker-tc", doc)

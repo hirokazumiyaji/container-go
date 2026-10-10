@@ -103,7 +103,7 @@ func TestExecVerificationPreservesInspectFailures(t *testing.T) {
 				inspectStdout: tc.inspectOut,
 				inspectErr:    tc.inspectErr,
 			}
-			ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}}
+			ctr := &Container{id: "myctr", creation: "0123456789abcdef", runner: r, eng: appleEngine{}}
 			_, _, err := ctr.Exec(context.Background(), []string{"query"})
 			if err == nil {
 				t.Fatal("Exec returned nil error after verification failure")
@@ -377,7 +377,7 @@ func TestInspectTargetValidationWrapsConfirmedAbsence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctr := &Container{id: "myctr", uid: tc.uid, runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng}
+			ctr := &Container{id: "myctr", uid: tc.uid, runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng, nameInspect: true}
 			_, err := ctr.State(context.Background())
 			switch {
 			case tc.wantOK && err != nil:

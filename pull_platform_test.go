@@ -94,6 +94,12 @@ func TestAppleParseImageExistsPlatform(t *testing.T) {
 	if (appleEngine{}).parseImageExists(data, "linux/amd64") {
 		t.Error("want mismatch for linux/amd64")
 	}
+	if !(appleEngine{}).parseImageExists(data, "linux") {
+		t.Error("an OS-only selector must accept any Linux architecture")
+	}
+	if (appleEngine{}).parseImageExists(data, "darwin") {
+		t.Error("want mismatch for a different OS")
+	}
 	if !(appleEngine{}).parseImageExists(data, "") {
 		t.Error("empty platform must mean present")
 	}

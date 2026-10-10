@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -23,8 +24,18 @@ func TestMain(m *testing.M) {
 	// explicit selection, and a typo must be reported rather than silently
 	// ignored. REQUIRE_BACKEND is left alone, because it is CI's signal that
 	// a missing backend must fail rather than skip.
+	//
+	// Everything that decides which backend to run must read the recorded
+	// value (integrationtest.SelectedBackend), not the environment: the
+	// unset below runs before any test, so an os.Getenv in a skip guard
+	// would always see "" and never skip. That is what made
+	// `make integration CONTAINERGO_BACKEND=docker` run the Apple
+	// scenarios too. The unit tests that depend on the library's own
+	// detection pin the engine explicitly instead of relying on the
+	// environment being absent.
 	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv("CONTAINERGO_KEEP")
 	os.Exit(m.Run())
 }
 
@@ -44,10 +55,13 @@ type fakeRunner struct {
 }
 
 func (f *fakeRunner) binaryName() string {
-	if f.binary == "" {
-		return "container"
+	if f.binary != "" {
+		return f.binary
 	}
-	return f.binary
+	if os.Getenv(backendEnv) == "docker" {
+		return "docker"
+	}
+	return "container"
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -71,6 +85,9 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	if args[0] == "version" || args[0] == "info" {
 		if f.systemUp {
+			if len(args) > 2 && args[1] == "--format" && args[2] == "{{.Server.Os}}" {
+				return []byte("linux\n"), nil, nil
+			}
 			return []byte("ok"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
@@ -120,7 +137,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 				}
 			}
 		}
-		return []byte(args[len(args)-1] + "\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
 		json := f.inspectJSON
 		if json == "" {
@@ -135,7 +152,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "id": %q,
       "image": {"reference": "docker.io/library/redis:7-alpine"},
       "publishedPorts": [],
-      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q}
+      "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
     },
     "status": {
       "state": "running",
@@ -160,7 +177,11 @@ func (f *fakeRunner) callWith(subcommand string) []string {
 }
 
 func newTestRunner() *fakeRunner {
-	return &fakeRunner{systemUp: true, binary: "container"}
+	binary := "container"
+	if os.Getenv(backendEnv) == "docker" {
+		binary = "docker"
+	}
+	return &fakeRunner{systemUp: true, binary: binary}
 }
 
 func newDockerTestRunner() *fakeRunner {
@@ -214,14 +235,14 @@ func TestRunAppendsCmdAfterImage(t *testing.T) {
 func TestRunGeneratesNameWhenUnset(t *testing.T) {
 	f := newTestRunner()
 	f.inspectJSON = "" // ignored; we only check the arg
-	ctr, err := Run(context.Background(), "redis:7-alpine", withRunner(f))
+	ctr, err := Run(context.Background(), "redis:7-alpine", withRunner(f), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if !strings.HasPrefix(ctr.ID(), "containergo-") {
 		t.Errorf("generated name = %q, want containergo- prefix", ctr.ID())
 	}
-	ctr2, err := Run(context.Background(), "redis:7-alpine", withRunner(f))
+	ctr2, err := Run(context.Background(), "redis:7-alpine", withRunner(f), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -268,6 +289,7 @@ func TestRunRejectsInvalidLabelKey(t *testing.T) {
 }
 
 func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"PASSWORD": "s3cret"}))
 
@@ -284,6 +306,7 @@ func TestRunPassesEnvViaEnvFileNotArgv(t *testing.T) {
 }
 
 func TestRunRemovesEnvFileAfterStart(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := newTestRunner()
 	runTestContainer(t, f, WithEnv(map[string]string{"A": "1"}))
 
@@ -332,16 +355,19 @@ func TestRunPassesResourceAndProcessFlags(t *testing.T) {
 
 func TestRunPassesMounts(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "host", "data")
 	runTestContainer(t, f,
 		WithMounts(
-			Mount{Type: MountBind, Source: "/host/data", Target: "/data", ReadOnly: true},
+			Mount{Type: MountBind, Source: source, Target: "/data", ReadOnly: true},
 			Mount{Type: MountTmpfs, Target: "/scratch"},
 		))
 
-	joined := strings.Join(f.callWith("run"), " ")
-	if !strings.Contains(joined, "--mount type=bind,source=/host/data,target=/data,readonly") {
-		t.Errorf("bind mount missing: %s", joined)
+	runCall := f.callWith("run")
+	wantBind := "type=bind,source=" + source + ",target=/data,readonly"
+	if !slices.Contains(runCall, wantBind) {
+		t.Errorf("bind mount argv missing %q: %v", wantBind, runCall)
 	}
+	joined := strings.Join(runCall, " ")
 	if !strings.Contains(joined, "--mount type=tmpfs,target=/scratch") {
 		t.Errorf("tmpfs mount missing: %s", joined)
 	}
@@ -349,10 +375,27 @@ func TestRunPassesMounts(t *testing.T) {
 
 func TestRunRejectsMountWithComma(t *testing.T) {
 	f := newTestRunner()
+	source := filepath.Join(t.TempDir(), "a,b")
 	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
-		WithMounts(Mount{Type: MountBind, Source: "/a,b", Target: "/data"}), withRunner(f))
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
 	if err == nil {
 		t.Fatal("want error for comma in mount source")
+	}
+}
+
+func TestRunRejectsRelativeBindMountSource(t *testing.T) {
+	f := newTestRunner()
+	source := filepath.Join("relative", "data")
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("myctr"),
+		WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}), withRunner(f))
+	if err == nil {
+		t.Fatal("want error for relative bind mount source")
+	}
+	if !strings.Contains(err.Error(), "absolute host path") {
+		t.Errorf("error = %q, want absolute host path error", err)
+	}
+	if f.callWith("run") != nil {
+		t.Errorf("run must not be issued: %v", f.callWith("run"))
 	}
 }
 

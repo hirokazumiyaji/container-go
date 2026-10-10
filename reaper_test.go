@@ -213,6 +213,20 @@ func TestReaperScriptHasTimeoutAndAnchoredLabelMatch(t *testing.T) {
 	if strings.Contains(reaperScript, "mktemp") {
 		t.Error("reaper must not stage raw inspect output")
 	}
+	// The reap is bounded overall and concurrent after EOF, not only
+	// per entry: it is last-resort insurance and must finish even when
+	// the backend answers nothing.
+	if !strings.Contains(reaperScript, "remaining") {
+		t.Error("reaper script must bound the total reap time, not only each entry")
+	}
+	if !strings.Contains(reaperScript, `run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &`) {
+		t.Error("reaper script must process independent entries concurrently")
+	}
+	budgetAt := strings.Index(reaperScript, `if [ "$started" -eq 0 ]; then`)
+	reapAt := strings.Index(reaperScript, `run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &`)
+	if budgetAt < 0 || reapAt < 0 || budgetAt >= reapAt {
+		t.Error("reaper script must arm the overall budget before concurrent reap work")
+	}
 }
 
 func TestBreQuoteEscapesLabelKey(t *testing.T) {

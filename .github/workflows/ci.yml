@@ -114,10 +114,12 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: stable
+          # Match the golangci-lint binary's supported export-data format.
+          go-version: '1.27.2'
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
-          version: v2.13.0
+          # v2.13.0 cannot decode Go 1.27 export data (version 5).
+          version: v2.14.0
 
   govulncheck:
     runs-on: ubuntu-latest
@@ -128,17 +130,18 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # Not the root go.mod. This job scans bench/ too, whose go.mod
-          # requires a newer toolchain; a Go older than that aborts the scan
-          # instead of reporting vulnerabilities. The bench toolchain also
-          # satisfies the root module.
-          go-version-file: bench/go.mod
+          # Scan with a patched toolchain, not the go 1.25.0 floor in
+          # bench/go.mod (that release still reports fixed stdlib CVEs).
+          # Pin the patch level: floating `stable` can lag security fixes.
+          go-version: '1.27.2'
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
       # bench/ is a separate module, so the root ./... does not reach it.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.1.4 ./...
+      # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.8.0
+      # is the current scanner that works with this toolchain.
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
         working-directory: bench
 
   # bench/ is a separate module, so no job above reaches it: they all run
@@ -176,7 +179,9 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version-file: go.mod
+          # actionlint@v1.7.12 requires go >= 1.25; the root go.mod floor is
+          # 1.23.0 and GOTOOLCHAIN=local would refuse to download a newer one.
+          go-version-file: bench/go.mod
       # No path argument: actionlint discovers .github/workflows itself, so a
       # workflow added with the .yaml extension is covered too. A shell glob
       # over *.yml would silently skip it.

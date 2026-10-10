@@ -31,6 +31,13 @@ import (
 // while it streams, so raw JSON (which may contain environment secrets)
 // is never staged in a host file. Backend-specific delete flags are
 // retained for the normal cleanup and reaper paths.
+//
+// The event stream is accumulated until stdin EOF before any delete
+// runs, so registration while the parent lives cannot force-delete a
+// live container. After EOF the reap is bounded overall and entries are
+// processed a few at a time: the reaper is insurance and must finish
+// even when the backend answers nothing, rather than paying the
+// container count times the per-entry timeout.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
@@ -44,6 +51,25 @@ case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 [ "$timeout" -gt 0 ] 2>/dev/null || timeout=30
 [ "$pending_attempts" -gt 0 ] 2>/dev/null || pending_attempts=1
 tab=$(printf '\t')
+# Overall reap budget and bounded concurrency. Both apply only after
+# EOF (the awk END below), so a long-lived parent does not spend them.
+budget="${REAPER_BUDGET_SECONDS:-120}"
+parallel="${REAPER_PARALLEL:-4}"
+case "$budget" in ''|*[!0-9]*) budget=120;; esac
+case "$parallel" in ''|*[!0-9]*) parallel=4;; esac
+[ "$budget" -gt 0 ] 2>/dev/null || budget=120
+[ "$parallel" -gt 0 ] 2>/dev/null || parallel=4
+started=0
+remaining() {
+  if [ "$started" -eq 0 ]; then
+    printf '%s' "$budget"
+    return 0
+  fi
+  now=$(date +%s 2>/dev/null || echo 0)
+  left=$((started + budget - now))
+  [ "$left" -gt 0 ] || left=0
+  printf '%s' "$left"
+}
 
 # Keep the backend operation in a separate shell process. The same
 # operation is run either directly for an immutable ID or under flock
@@ -268,9 +294,27 @@ END {
     print line
   }
 }
-' | while IFS="$tab" read -r state entry_id entry_creation entry_lock; do
-  run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@"
-done
+' | {
+  # The consumer starts with the pipeline, but awk's END only prints
+  # after EOF. Arm the budget on the first entry so a long-lived parent
+  # does not spend it before cleanup begins.
+  batch=0
+  while IFS="$tab" read -r state entry_id entry_creation entry_lock; do
+    [ -n "$entry_id" ] || continue
+    if [ "$started" -eq 0 ]; then
+      started=$(( $(date +%s 2>/dev/null || echo 1) ))
+      [ "$started" -gt 0 ] 2>/dev/null || started=1
+    fi
+    [ "$(remaining)" -gt 0 ] || break
+    run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@" &
+    batch=$((batch + 1))
+    if [ "$batch" -ge "$parallel" ]; then
+      wait
+      batch=0
+    fi
+  done
+  wait
+}
 `
 
 const (

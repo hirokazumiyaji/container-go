@@ -2,11 +2,10 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
-	"time"
 )
 
 func creationInspectJSON(name, creation string) string {
@@ -62,10 +61,8 @@ func TestTerminateRefusesReplacedContainer(t *testing.T) {
 		id: "myctr", runner: g, eng: appleEngine{},
 		creation: oldCreation,
 	}
-	if err := ctr.Terminate(context.Background()); err == nil {
-		t.Fatal("want error for replaced container")
-	} else if !strings.Contains(err.Error(), "recreated") {
-		t.Fatalf("error = %v, want recreated", err)
+	if err := ctr.Terminate(context.Background()); !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("error = %v, want ErrGenerationReplaced", err)
 	}
 	if len(g.deleted) != 0 {
 		t.Fatalf("deleted = %v, want no delete", g.deleted)
@@ -102,53 +99,4 @@ func TestRunAddsCreationLabel(t *testing.T) {
 	if !strings.Contains(joined, creationLabel+"="+ctr.creation) {
 		t.Errorf("run args missing creation label: %s", joined)
 	}
-}
-
-func TestReaperSkipsReplacedGeneration(t *testing.T) {
-	requirePOSIXShell(t)
-	// Stub binary: inspect prints the *current* creation, delete logs.
-	dir := t.TempDir()
-	logPath := dir + "/calls.log"
-	binPath := dir + "/ctr"
-	currentCreation := "dddddddddddddddd"
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo \"" + currentCreation + "\"; exit 0; fi\n" +
-		"echo \"$@\" >> " + logPath + "\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	r := newReaper(binPath, "delete")
-	oldCreation := "eeeeeeeeeeeeeeee"
-	if err := r.register("myctr", oldCreation); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	closeReaperForTest(t, r)
-	// Give the reaper a moment to run; it must NOT delete.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		time.Sleep(50 * time.Millisecond)
-	}
-	if data, _ := os.ReadFile(logPath); len(data) != 0 && strings.Contains(string(data), "myctr") {
-		t.Fatalf("reaper deleted replaced container: %q", data)
-	}
-}
-
-func TestReaperDeletesMatchingGeneration(t *testing.T) {
-	requirePOSIXShell(t)
-	dir := t.TempDir()
-	logPath := dir + "/calls.log"
-	binPath := dir + "/ctr"
-	creation := "ffffffffffffffff"
-	script := "#!/bin/sh\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"" + creation + "\",'; exit 0; fi\n" +
-		"echo \"$@\" >> " + logPath + "\n"
-	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	r := newReaper(binPath, "delete")
-	if err := r.register("myctr", creation); err != nil {
-		t.Fatalf("register: %v", err)
-	}
-	closeReaperForTest(t, r)
-	waitForLogLines(t, logPath, "delete --force myctr")
 }

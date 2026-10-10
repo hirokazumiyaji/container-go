@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -20,885 +20,275 @@ import (
 // container. While this process lives, the reaper does nothing;
 // deletion is the job of Terminate/Cleanup, the reaper is insurance.
 //
-// The script is a fixed string; container IDs enter it only as stdin
-// data validated as an Apple Container name or a full Docker ID, and
-// the script itself disables globbing and quotes every expansion the
-// IDs reach.
-// Every backend entry runs behind a bounded timeout. The timeout covers
-// the complete inspect, status-marker, filter, and delete pipeline; it
-// snapshots and validates descendants before signaling them, while helper
-// process groups are isolated and reaped. Inspect output is streamed
-// through a field filter instead of being staged on disk. Failures stay
-// silent (|| true) by design: the reaper is last-resort insurance.
-// When a creation generation is known, the script inspects first and
-// reads the creation label as a structural JSON field: the match is
-// anchored at line start on the quoted key, so label values or other
-// text containing the same characters cannot satisfy it. Inspect output
-// is filtered before command substitution, so only the generation, ID,
-// and status are held in memory; it is never staged in a host file, so
-// a killed reaper cannot leave an environment-bearing inspect dump behind.
-// When inspect also reports an immutable "Id" (Docker), the delete
-// targets that validated ID instead of the name; a Docker entry with a
-// generation but no valid ID is skipped.
-// Apple Container has no such ID; there the delete necessarily goes by
-// name.
+// A create is registered before the backend command starts. The pending
+// record lets the child recheck a name while a create is still settling;
+// the completion record keeps the same generation in the replay set. If
+// the child exits while the parent is alive, a monitor starts a new child
+// and replays every retained record.
+//
+// The script is fixed. IDs enter it only as stdin data validated as an
+// Apple Container name or a full Docker ID. Inspect output is projected
+// while it streams, so raw JSON (which may contain environment secrets)
+// is never staged in a host file. Backend-specific delete flags are
+// retained for the normal cleanup and reaper paths.
 const reaperScript = `set -f
 bin="$1"
 sub="$2"
 key="$3"
-timeout="${4:-30}"
-max_registered_entries=1024
-registered_entries=0
-ids=""
-while IFS= read -r line; do
-  if [ "$registered_entries" -lt "$max_registered_entries" ]; then
-    registered_entries=$((registered_entries + 1))
-    [ "${#line}" -le 256 ] 2>/dev/null || continue
-    ids="$ids
-$line"
-  fi
-done
-# Each helper has a one-second execution budget. The global cleanup budget
-# bounds a timed entry even when every helper is hostile or wedged.
-helper_timeout=1
-max_descendant_pids=256
-max_descendant_depth=32
-max_descendant_lookups=64
-helper_output_blocks=512
-cleanup_helper_budget=8
-cleanup_pgrep_budget=2
-cleanup_enumeration_budget=2
-cleanup_active=0
-cleanup_budget_file=
-cleanup_pgrep_file=
-cleanup_enumeration_file=
-helper_pgrep_active=0
-helper_enumeration_active=0
-consume_cleanup_budget() {
-  [ "$cleanup_active" = 1 ] || return 0
-  if [ "$helper_enumeration_active" = 1 ]; then
-    [ -n "$cleanup_enumeration_file" ] || cleanup_enumeration_file="$work_dir/cleanup.enumeration"
-    selected_budget_file="$cleanup_enumeration_file"
-  elif [ "$helper_pgrep_active" = 1 ]; then
-    [ -n "$cleanup_pgrep_file" ] || cleanup_pgrep_file="$work_dir/cleanup.pgrep"
-    selected_budget_file="$cleanup_pgrep_file"
-  else
-    [ -n "$cleanup_budget_file" ] || cleanup_budget_file="$work_dir/cleanup.budget"
-    selected_budget_file="$cleanup_budget_file"
-  fi
-  cleanup_budget_lock="$selected_budget_file.lock"
-  if ! ( set -C; : >"$cleanup_budget_lock" ) 2>/dev/null; then
-    return 1
-  fi
-  cleanup_budget=
-  if [ -r "$selected_budget_file" ]; then
-    IFS= read -r cleanup_budget <"$selected_budget_file" || cleanup_budget=
-  fi
-  case "$cleanup_budget" in
-    ''|*[!0-9]*) "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :; return 1 ;;
-  esac
-  if [ "$cleanup_budget" -le 0 ] 2>/dev/null; then
-    "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
-    return 1
-  fi
-  printf '%s\n' "$((cleanup_budget - 1))" >"$selected_budget_file" 2>/dev/null || {
-    "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
-    return 1
-  }
-  "$rm_bin" -f "$cleanup_budget_lock" 2>/dev/null || :
-}
-work_dir="$5"
-awk_bin="$6"
-pgrep_bin="$7"
-ps_bin="$8"
-rm_bin="$9"
-sleep_bin="${10:-}"
-ps_start_field="${11:-lstart}"
-case "$ps_start_field" in
-  lstart) ;;
-  *) exit 0 ;;
-esac
-case "$timeout" in
-  ''|*[!0-9]*) timeout=30 ;;
-esac
+shift 3
+timeout="$1"
+pending_attempts="$2"
+shift 2
+case "$timeout" in ''|*[!0-9]*) timeout=30;; esac
+case "$pending_attempts" in ''|*[!0-9]*) pending_attempts=30;; esac
 [ "$timeout" -gt 0 ] 2>/dev/null || timeout=30
-case "$work_dir" in
-  /*) [ -d "$work_dir" ] || exit 0 ;;
-  *) exit 0 ;;
-esac
-for helper_path in "$awk_bin" "$ps_bin" "$rm_bin" "$sleep_bin"; do
-  case "$helper_path" in
-    /*) [ -x "$helper_path" ] || exit 0 ;;
-    *) exit 0 ;;
-  esac
-done
-case "$pgrep_bin" in
-  "") pgrep_disabled=1 ;;
-  /*) [ -x "$pgrep_bin" ] || exit 0 ;;
-  *) exit 0 ;;
-esac
-ulimit -f "$helper_output_blocks" 2>/dev/null || exit 0
-reaper_warn() {
-  printf 'containergo: %s\n' "$*" >&2
-}
-monitor_enabled() {
-  if [ "${CONTAINERGO_REAPER_DISABLE_MONITOR:-}" = 1 ]; then
-    return 1
-  fi
-  monitor_state=$(set -o 2>/dev/null) || monitor_state=
-  case "$monitor_state" in
-    *"monitor on"*) return 0 ;;
-  esac
-  return 1
-}
-helper_tree_pids=
-helper_tree_count=0
-helper_tree_known=
-helper_tree_table_result=0
-build_helper_tree() {
-  helper_tree_root="$1"
-  helper_tree_file="$2"
-  helper_tree_known=" $helper_tree_root"
-  helper_tree_pids=
-  helper_tree_edges=
-  helper_tree_count=1
-  helper_tree_added=1
-  while [ "$helper_tree_added" -eq 1 ]; do
-    helper_tree_added=0
-    while IFS=' ' read -r tree_pid tree_ppid tree_rest; do
-      [ -n "$tree_pid" ] && [ -n "$tree_ppid" ] && [ -n "$tree_rest" ] || { helper_tree_table_result=1; break; }
-      case "$tree_pid" in *[!0-9]*) helper_tree_table_result=1; break ;; esac
-      case "$tree_ppid" in *[!0-9]*) helper_tree_table_result=1; break ;; esac
-      case " $helper_tree_known " in
-        *" $tree_pid "*) continue ;;
-      esac
-      case " $helper_tree_known " in
-        *" $tree_ppid "*)
-          printf '%s\n' "$tree_rest" >"$work_dir/identity.$tree_pid" 2>/dev/null || { helper_tree_table_result=1; break; }
-          helper_tree_known="$helper_tree_known $tree_pid"
-          helper_tree_pids="$helper_tree_pids $tree_pid"
-          helper_tree_edges="$helper_tree_edges $tree_ppid:$tree_pid"
-          helper_tree_count=$((helper_tree_count + 1))
-          if [ "$helper_tree_count" -gt "$max_descendant_pids" ]; then
-            helper_tree_table_result=1
-            break
-          fi
-          helper_tree_added=1
-          ;;
-      esac
-    done <"$helper_tree_file"
-    [ "$helper_tree_table_result" -eq 0 ] || break
-  done
-  helper_tree_pids="${helper_tree_pids# }"
-  return "$helper_tree_table_result"
-}
-kill_helper_descendants() {
-  helper_tree_root="$1"
-  helper_tree_table="$work_dir/helper.table"
-  helper_tree_error="$work_dir/helper.err"
-  helper_tree_attempt=0
-  while [ "$helper_tree_attempt" -lt 2 ]; do
-    saved_helper_pid="$helper_pid"
-    saved_helper_timer="$helper_timer"
-    saved_helper_groups="$helper_process_groups"
-    saved_helper_enumeration="$helper_enumeration"
-    saved_helper_enumeration_active="$helper_enumeration_active"
-    helper_enumeration=1
-    helper_enumeration_active=1
-    run_helper "$helper_tree_table" "$helper_tree_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
-    helper_table_status="$?"
-    helper_enumeration_active="$saved_helper_enumeration_active"
-    helper_pid="$saved_helper_pid"
-    helper_timer="$saved_helper_timer"
-    helper_process_groups="$saved_helper_groups"
-    helper_enumeration="$saved_helper_enumeration"
-    helper_tree_table_result=0
-    if [ "$helper_table_status" -eq 0 ]; then
-      build_helper_tree "$helper_tree_root" "$helper_tree_table" || true
-      for tree_pid in $helper_tree_pids; do
-        kill -0 "$tree_pid" 2>/dev/null || continue
-        kill -KILL "$tree_pid" 2>/dev/null || true
-      done
-    fi
-    helper_tree_attempt=$((helper_tree_attempt + 1))
-  done
-}
-run_helper() {
-  helper_out="$1"
-  helper_err="$2"
-  shift 2
-  if ! consume_cleanup_budget; then
-    return 125
-  fi
-  : >"$helper_out" 2>/dev/null || return 125
-  : >"$helper_err" 2>/dev/null || return 125
-  set -m 2>/dev/null
-  helper_process_groups=0
-  if monitor_enabled; then
-    helper_process_groups=1
-  fi
-  "$@" >"$helper_out" 2>"$helper_err" &
-  helper_pid="$!"
-  (
-    helper_sleeper=
-    cleanup_helper_timer() {
-      if [ -n "$helper_sleeper" ]; then
-        kill -KILL "$helper_sleeper" 2>/dev/null || true
-        wait "$helper_sleeper" 2>/dev/null || true
-      fi
-    }
-    trap 'cleanup_helper_timer; exit 0' HUP INT TERM
-    "$sleep_bin" "$helper_timeout" &
-    helper_sleeper="$!"
-    wait "$helper_sleeper"
-    helper_sleeper=
-    if [ "$helper_process_groups" = 1 ]; then
-      kill -KILL -"$helper_pid" 2>/dev/null || true
-    elif [ "$helper_enumeration" != 1 ]; then
-      kill_helper_descendants "$helper_pid"
-    fi
-    kill -KILL "$helper_pid" 2>/dev/null || true
-    wait "$helper_pid" 2>/dev/null || true
-  ) &
-  helper_timer="$!"
-  wait "$helper_pid"
-  helper_status="$?"
-  kill -TERM "$helper_timer" 2>/dev/null || true
-  wait "$helper_timer" 2>/dev/null || true
-  set +m
-  return "$helper_status"
-}
-remove_files() {
-  # The parent removes the private work directory after Wait. Defer the
-  # pinned rm helper to one bounded batch after all entries are processed.
-  :
-}
-capture_process_table() {
-  process_table="$work_dir/process.table"
-  process_table_error="$work_dir/process-table.err"
-  saved_process_helper_enumeration="$helper_enumeration"
-  helper_enumeration=1
-  run_helper "$process_table" "$process_table_error" "$ps_bin" -e -o pid= -o ppid= -o "$ps_start_field="
-  process_table_status="$?"
-  helper_enumeration="$saved_process_helper_enumeration"
-  if [ "$process_table_status" -ne 0 ]; then
-    reaper_warn "process table lookup failed (status $process_table_status)"
-    return 1
-  fi
-  process_table_ready=1
-  return 0
-}
-list_children_from_table() {
-  table_parent="$1"
-  table_children=
-  table_count=0
-  table_result=0
-  while IFS=' ' read -r table_pid table_ppid table_rest; do
-    [ "$table_ppid" = "$table_parent" ] || continue
-    case "$table_pid" in
-      ""|*[!0-9]*) table_result=1; break ;;
-    esac
-    [ "$table_pid" -gt 0 ] 2>/dev/null || { table_result=1; break; }
-    [ -n "$table_rest" ] || { table_result=1; break; }
-    printf '%s\n' "$table_rest" >"$work_dir/identity.$table_pid" 2>/dev/null || { table_result=1; break; }
-    table_count=$((table_count + 1))
-    if [ "$table_count" -gt "$max_descendant_pids" ]; then
-      table_result=1
-      break
-    fi
-    table_children="$table_children $table_pid"
-  done <"$process_table"
-  if [ "$table_result" -ne 0 ]; then
-    reaper_warn "process table returned invalid descendants for pid $table_parent"
-    return 1
-  fi
-  table_children="${table_children# }"
-  return 0
-}
-capture_identity() {
-  identity_pid="$1"
-  identity_file="$2"
-  identity_raw="$identity_file.raw"
-  identity_error="$identity_file.err"
-  saved_identity_helper_enumeration="$helper_enumeration"
-  helper_enumeration=1
-  run_helper "$identity_raw" "$identity_error" "$ps_bin" -o pid= -o "$ps_start_field=" -p "$identity_pid"
-  identity_status="$?"
-  helper_enumeration="$saved_identity_helper_enumeration"
-  if [ "$identity_status" -eq 1 ] && [ ! -s "$identity_error" ]; then
-    remove_files "$identity_raw" "$identity_error" || true
-    return 1
-  fi
-  if [ "$identity_status" -ne 0 ]; then
-    reaper_warn "process identity lookup failed for pid $identity_pid (status $identity_status)"
-    remove_files "$identity_raw" "$identity_error" || true
-    return 125
-  fi
-  identity_value=
-  identity_lines=0
-  while IFS= read -r identity_line || [ -n "$identity_line" ]; do
-    identity_lines=$((identity_lines + 1))
-    case "$identity_line" in
-      "$identity_pid "*)
-        identity_value=${identity_line#"$identity_pid"}
-        ;;
-      *)
-        reaper_warn "process identity output was malformed for pid $identity_pid"
-        remove_files "$identity_raw" "$identity_error" || true
-        return 125
-        ;;
-    esac
-  done <"$identity_raw"
-  remove_files "$identity_raw" "$identity_error" || true
-  if [ "$identity_lines" -ne 1 ] || [ -z "$identity_value" ] || [ "${#identity_value}" -gt 256 ] 2>/dev/null; then
-    reaper_warn "process identity output was invalid for pid $identity_pid"
-    return 125
-  fi
-  printf '%s\n' "$identity_value" >"$identity_file" 2>/dev/null || return 125
-  return 0
-}
-revalidate_identity() {
-  revalidate_pid="$1"
-  revalidate_stored="$work_dir/identity.$revalidate_pid"
-  revalidate_current="$revalidate_stored.current"
-  capture_identity "$revalidate_pid" "$revalidate_current"
-  revalidate_status="$?"
-  if [ "$revalidate_status" -eq 1 ]; then
-    return 2
-  fi
-  [ "$revalidate_status" -eq 0 ] || return "$revalidate_status"
-  revalidate_old=
-  revalidate_new=
-  while IFS= read -r revalidate_line || [ -n "$revalidate_line" ]; do
-    [ -n "$revalidate_line" ] && revalidate_old=$revalidate_line
-    break
-  done <"$revalidate_stored"
-  while IFS= read -r revalidate_line || [ -n "$revalidate_line" ]; do
-    [ -n "$revalidate_line" ] && revalidate_new=$revalidate_line
-    break
-  done <"$revalidate_current"
-  remove_files "$revalidate_current" || true
-  if [ -z "$revalidate_old" ] || [ -z "$revalidate_new" ]; then
-    return 125
-  fi
-  [ "$revalidate_old" = "$revalidate_new" ] || return 1
-  return 0
-}
-is_tombstoned() {
-  case " $tombstoned_pids " in
-    *" $1 "*) return 0 ;;
-  esac
-  return 1
-}
-mark_tombstoned() {
-  is_tombstoned "$1" || tombstoned_pids="$tombstoned_pids $1"
-}
-is_stopped() {
-  case " $stopped_pids " in
-    *" $1 "*) return 0 ;;
-  esac
-  return 1
-}
-mark_stopped() {
-  is_stopped "$1" || stopped_pids="$stopped_pids $1"
-}
-kill_stopped_processes() {
-  for stopped_pid in $stopped_pids; do
-    # A successful SIGSTOP reserves this PID until it is resumed or exits;
-    # do this even when identity/traversal state was lost after the stop.
-    kill -KILL "$stopped_pid" 2>/dev/null || true
-  done
-}
-list_children() {
-  parent="$1"
-  descendant_lookups=$((descendant_lookups + 1))
-  if [ "$descendant_lookups" -gt "$max_descendant_lookups" ]; then
-    reaper_warn "descendant lookup limit reached"
-    return 1
-  fi
-  pgrep_out="$work_dir/pgrep.out"
-  pgrep_err="$work_dir/pgrep.err"
-  pgrep_children=
-  pgrep_valid=0
-  if [ "$pgrep_disabled" = 1 ]; then
-    pgrep_status=125
-  else
-    saved_pgrep_active="$helper_pgrep_active"
-    helper_pgrep_active=1
-    run_helper "$pgrep_out" "$pgrep_err" "$pgrep_bin" -P "$parent"
-    pgrep_status="$?"
-    helper_pgrep_active="$saved_pgrep_active"
-    if [ "$pgrep_status" -eq 1 ] && [ -s "$pgrep_err" ]; then
-      pgrep_status=125
-    fi
-    case "$pgrep_status" in
-      0|1)
-        pgrep_valid=1
-        pgrep_count=0
-        while IFS= read -r child || [ -n "$child" ]; do
-          case "$child" in
-            ""|*[!0-9]*) pgrep_valid=0; break ;;
-          esac
-          [ "$child" -gt 0 ] 2>/dev/null || { pgrep_valid=0; break; }
-          pgrep_count=$((pgrep_count + 1))
-          if [ "$pgrep_count" -gt "$max_descendant_pids" ]; then
-            pgrep_valid=0
-            break
-          fi
-          pgrep_children="$pgrep_children $child"
-        done <"$pgrep_out"
-        ;;
-      *)
-        reaper_warn "pgrep lookup failed for pid $parent (status $pgrep_status)"
-        ;;
-    esac
-  fi
-  pgrep_children="${pgrep_children# }"
-  if [ "$pgrep_valid" -ne 1 ]; then
-    pgrep_children=
-    pgrep_disabled=1
-  fi
-  table_valid=0
-  table_children=
-  if [ "$process_table_ready" = 1 ]; then
-    list_children_from_table "$parent"
-    table_status="$?"
-    if [ "$table_status" -eq 0 ]; then
-      table_valid=1
-    else
-      reaper_warn "process table lookup failed for pid $parent"
-    fi
-  fi
-  if [ "$pgrep_valid" -eq 0 ] && [ "$table_valid" -eq 0 ]; then
-    reaper_warn "no validated descendant snapshot for pid $parent"
-    return 1
-  fi
-  children=
-  for child in $pgrep_children; do
-    case " $children " in
-      *" $child "*) ;;
-      *) children="$children $child" ;;
-    esac
-  done
-  for child in $table_children; do
-    case " $children " in
-      *" $child "*) ;;
-      *) children="$children $child" ;;
-    esac
-  done
-  children="${children# }"
-  return 0
-}
-snapshot_branch() {
-  snapshot_parent="$1"
-  snapshot_depth="$2"
-  if [ "$snapshot_depth" -gt "$max_descendant_depth" ]; then
-    reaper_warn "descendant depth limit reached at pid $snapshot_parent"
-    snapshot_error=1
-    return 1
-  fi
-  if is_tombstoned "$snapshot_parent"; then
-    return 0
-  fi
-  # The quiesced ps table carries a start-time identity for the current tree.
-  # A PID is marked stopped only after SIGSTOP succeeds; it cannot be recycled
-  # before the direct signal without an intervening exit.
-  if [ "$process_table_ready" = 1 ] && [ -s "$work_dir/identity.$snapshot_parent" ]; then
-    snapshot_status=0
-  else
-    revalidate_identity "$snapshot_parent"
-    snapshot_status="$?"
-  fi
-  if [ "$snapshot_status" -eq 2 ]; then
-    mark_tombstoned "$snapshot_parent"
-    return 0
-  fi
-  if [ "$snapshot_status" -ne 0 ]; then
-    mark_tombstoned "$snapshot_parent"
-    snapshot_error=1
-    return 1
-  fi
-  case " $pass_seen " in
-    *" $snapshot_parent "*) return 0 ;;
-  esac
-  pass_seen="$pass_seen $snapshot_parent"
-  case " $known_parents " in
-    *" $snapshot_parent "*) ;;
-    *)
-      known_parents="$known_parents $snapshot_parent"
-      known_count=$((known_count + 1))
-      if [ "$known_count" -gt "$max_descendant_pids" ]; then
-        reaper_warn "descendant pid limit reached"
-        snapshot_error=1
-        return 1
-      fi
-      ;;
-  esac
-  list_children "$snapshot_parent"
-  snapshot_status="$?"
-  if [ "$snapshot_status" -ne 0 ]; then
-    snapshot_error=1
-    return 1
-  fi
-  # The quiesced ps table carries a start-time identity for the current tree.
-  # A PID is marked stopped only after SIGSTOP succeeds; it cannot be recycled
-  # before the direct signal without an intervening exit.
-  if [ "$process_table_ready" = 1 ] && [ -s "$work_dir/identity.$snapshot_parent" ]; then
-    snapshot_status=0
-  else
-    revalidate_identity "$snapshot_parent"
-    snapshot_status="$?"
-  fi
-  if [ "$snapshot_status" -eq 2 ]; then
-    mark_tombstoned "$snapshot_parent"
-    return 0
-  fi
-  if [ "$snapshot_status" -ne 0 ]; then
-    mark_tombstoned "$snapshot_parent"
-    snapshot_error=1
-    return 1
-  fi
-  snapshot_children="$children"
-  for snapshot_child in $snapshot_children; do
-    if is_tombstoned "$snapshot_child"; then
-      continue
-    fi
-    if [ "$process_table_ready" = 1 ] && [ -s "$work_dir/identity.$snapshot_child" ]; then
-      snapshot_status=0
-    else
-      capture_identity "$snapshot_child" "$work_dir/identity.$snapshot_child"
-      snapshot_status="$?"
-      if [ "$snapshot_status" -eq 1 ]; then
-        mark_tombstoned "$snapshot_child"
-        continue
-      fi
-      if [ "$snapshot_status" -ne 0 ]; then
-        snapshot_error=1
-        break
-      fi
-      revalidate_identity "$snapshot_child"
-      snapshot_status="$?"
-      if [ "$snapshot_status" -eq 2 ]; then
-        mark_tombstoned "$snapshot_child"
-        continue
-      fi
-      if [ "$snapshot_status" -ne 0 ]; then
-        mark_tombstoned "$snapshot_child"
-        snapshot_error=1
-        break
-      fi
-    fi
-    if kill -STOP "$snapshot_child" 2>/dev/null; then
-      mark_stopped "$snapshot_child"
-    fi
-    snapshot_branch "$snapshot_child" "$((snapshot_depth + 1))" || snapshot_error=1
-  done
-  snapshot="$snapshot $1"
-  return 0
-}
-signal_snapshot() {
-  for snapshot_pid in $snapshot; do
-    if is_tombstoned "$snapshot_pid"; then
-      continue
-    fi
-    if is_stopped "$snapshot_pid"; then
-      kill -9 "$snapshot_pid" 2>/dev/null || true
-      continue
-    fi
-    revalidate_identity "$snapshot_pid"
-    snapshot_status="$?"
-    if [ "$snapshot_status" -eq 2 ]; then
-      mark_tombstoned "$snapshot_pid"
-      continue
-    fi
-    if [ "$snapshot_status" -ne 0 ]; then
-      mark_tombstoned "$snapshot_pid"
-      reaper_warn "process identity changed before killing pid $snapshot_pid"
-      continue
-    fi
-    kill -9 "$snapshot_pid" 2>/dev/null || true
-  done
-}
-direct_snapshot_fallback() {
-  for snapshot_pid in $snapshot; do
-    if is_tombstoned "$snapshot_pid"; then
-      continue
-    fi
-    if is_stopped "$snapshot_pid"; then
-      kill -9 "$snapshot_pid" 2>/dev/null || true
-      continue
-    fi
-    revalidate_identity "$snapshot_pid"
-    snapshot_status="$?"
-    if [ "$snapshot_status" -eq 0 ]; then
-      kill -9 "$snapshot_pid" 2>/dev/null || true
-    elif [ "$snapshot_status" -eq 2 ]; then
-      mark_tombstoned "$snapshot_pid"
-    fi
-  done
-  kill_stopped_processes
-  kill -9 "$kill_root_pid" 2>/dev/null || true
-}
-same_pid_list() {
-  same_left_count=0
-  for same_pid in $1; do
-    same_left_count=$((same_left_count + 1))
-  done
-  same_right_count=0
-  for same_pid in $2; do
-    same_right_count=$((same_right_count + 1))
-  done
-  [ "$same_left_count" -eq "$same_right_count" ] || return 1
-  for same_pid in $1; do
-    case " $2 " in
-      *" $same_pid "*) ;;
-      *) return 1 ;;
-    esac
-  done
-  return 0
-}
-capture_quiesced_process_table() {
-  quiesce_root="$1"
-  quiesce_previous=
-  quiesce_previous_edges=
-  quiesce_stable=0
-  quiesce_pass=0
-  process_table_ready=0
-  while [ "$quiesce_pass" -lt 8 ]; do
-    capture_process_table || return 1
-    helper_tree_table_result=0
-    if ! build_helper_tree "$quiesce_root" "$process_table"; then
-      process_table_ready=0
-      return 1
-    fi
-    quiesce_current="$helper_tree_pids"
-    quiesce_current_edges="$helper_tree_edges"
-    if same_pid_list "$quiesce_previous" "$quiesce_current" && same_pid_list "$quiesce_previous_edges" "$quiesce_current_edges"; then
-      quiesce_stable=$((quiesce_stable + 1))
-      if [ "$quiesce_stable" -ge 1 ]; then
-        return 0
-      fi
-    else
-      quiesce_stable=0
-    fi
-    quiesce_previous="$quiesce_current"
-    quiesce_previous_edges="$quiesce_current_edges"
-    for quiesce_pid in $quiesce_current; do
-      if kill -STOP "$quiesce_pid" 2>/dev/null; then
-        mark_stopped "$quiesce_pid"
-      fi
-    done
-    quiesce_pass=$((quiesce_pass + 1))
-  done
-  reaper_warn "quiesced descendant snapshot did not reach a fixed point"
-  return 1
-}
-kill_pipeline() {
-  kill_root_pid="$1"
-  cleanup_active=1
-  cleanup_helper_budget=8
-  cleanup_pgrep_budget=2
-  cleanup_enumeration_budget=2
-  cleanup_budget_file="$work_dir/cleanup.budget.$kill_root_pid"
-  cleanup_pgrep_file="$work_dir/cleanup.pgrep.$kill_root_pid"
-  cleanup_enumeration_file="$work_dir/cleanup.enumeration.$kill_root_pid"
-  printf '%s\n' "$cleanup_helper_budget" >"$cleanup_budget_file" 2>/dev/null || cleanup_helper_budget=0
-  printf '%s\n' "$cleanup_pgrep_budget" >"$cleanup_pgrep_file" 2>/dev/null || cleanup_pgrep_budget=0
-  printf '%s\n' "$cleanup_enumeration_budget" >"$cleanup_enumeration_file" 2>/dev/null || cleanup_enumeration_budget=0
-  tombstoned_pids=
-  stopped_pids=
-  capture_identity "$kill_root_pid" "$work_dir/identity.$kill_root_pid"
-  snapshot_status="$?"
-  if [ "$snapshot_status" -ne 0 ]; then
-    reaper_warn "root process identity lookup failed for pid $kill_root_pid"
-    kill_stopped_processes
-    kill -9 "$kill_root_pid" 2>/dev/null || true
-    return 1
-  fi
-  revalidate_identity "$kill_root_pid"
-  snapshot_status="$?"
-  if [ "$snapshot_status" -ne 0 ]; then
-    kill_stopped_processes
-    kill -9 "$kill_root_pid" 2>/dev/null || true
-    return 1
-  fi
-  process_table_ready=0
-  if [ -n "$pgrep_bin" ]; then
-    pgrep_disabled=0
-  fi
-  # Stop only the validated root process. The timer and helper groups are
-  # siblings; a negative group stop could freeze the timer before it reaps
-  # its own sleep child.
-  if kill -STOP "$kill_root_pid" 2>/dev/null; then
-    mark_stopped "$kill_root_pid"
-  fi
-  capture_quiesced_process_table "$kill_root_pid" || true
-  known_parents=" $kill_root_pid"
-  known_count=1
-  snapshot=
-  pass_seen=
-  snapshot_error=0
-  descendant_lookups=0
-  snapshot_pass_parents=$known_parents
-  for snapshot_parent in $snapshot_pass_parents; do
-    snapshot_branch "$snapshot_parent" 0 || snapshot_error=1
-  done
-  if [ "$snapshot_error" -ne 0 ]; then
-    reaper_warn "descendant snapshot incomplete for pid $kill_root_pid"
-    direct_snapshot_fallback
-    return 1
-  fi
-  signal_snapshot
-  kill_stopped_processes
-  kill -9 "$kill_root_pid" 2>/dev/null || true
-  return 0
-}
+[ "$pending_attempts" -gt 0 ] 2>/dev/null || pending_attempts=1
+tab=$(printf '\t')
+
+# Keep the backend operation in a separate shell process. The same
+# operation is run either directly for an immutable ID or under flock
+# (with lockf only as a fallback) for a name-addressed generation. The
+# fixed helper contains no inspect output and is passed only validated
+# IDs and options.
+entry_script=
+while IFS= read -r entry_line
+do
+  entry_script="$entry_script$entry_line
+"
+done <<'REAPER_ENTRY'
+set -f
+set -m 2>/dev/null || true
+bin="$REAPER_BIN"
+sub="$REAPER_SUB"
+key="$REAPER_KEY"
+timeout="$REAPER_TIMEOUT"
+pending_attempts="$REAPER_PENDING_ATTEMPTS"
+entry_id="$1"
+entry_creation="$2"
+entry_pending="$3"
+shift 3
+
+# Keep a backend call bounded without leaving the sleep process behind.
+# Job control gives the command its own process group when supported.
 run_with_timeout() {
-  wait_seconds="$1"
+  seconds="$1"
   shift
-  set -m 2>/dev/null
   "$@" & command_pid=$!
   (
     timer_sleeper=
-    cleanup_timer() {
+    timer_cleanup() {
       if [ -n "$timer_sleeper" ]; then
-        kill -KILL "$timer_sleeper" 2>/dev/null || true
+        kill -9 "$timer_sleeper" 2>/dev/null || true
         wait "$timer_sleeper" 2>/dev/null || true
       fi
+      timer_sleeper=
     }
-    trap 'cleanup_timer; exit 0' HUP INT TERM
-    "$sleep_bin" "$wait_seconds" &
-    timer_sleeper="$!"
+    trap 'timer_cleanup; exit 0' HUP INT TERM
+    sleep "$seconds" &
+    timer_sleeper=$!
     wait "$timer_sleeper"
-    timer_sleeper=
-    kill_pipeline "$command_pid"
+    timer_rc=$?
+    if [ "$timer_rc" -eq 0 ]; then
+      kill -9 -"$command_pid" 2>/dev/null || kill -9 "$command_pid" 2>/dev/null || true
+    fi
+    exit 0
   ) & timer_pid=$!
   wait "$command_pid" 2>/dev/null
-  command_status="$?"
-  kill -TERM "$timer_pid" 2>/dev/null || true
+  command_rc=$?
+  kill "$timer_pid" 2>/dev/null || true
   wait "$timer_pid" 2>/dev/null || true
-  set +m
-  return "$command_status"
+  return "$command_rc"
 }
-inspect_projection() {
-  {
-    "$bin" inspect "$id" 2>/dev/null
-    printf '\n__containergo_inspect_rc__%s\n' "$?"
-  } | "$awk_bin" -v key="$key" '
-    function json_value(line, wanted,    p, rest, quote) {
-      p = 1
-      while (substr(line, p, 1) == " " || substr(line, p, 1) == "\t") p++
-      if (substr(line, p, length(wanted) + 2) != "\"" wanted "\"") return ""
-      rest = substr(line, p + length(wanted) + 2)
-      if (substr(rest, 1, 1) != ":") return ""
-      rest = substr(rest, 2)
-      while (substr(rest, 1, 1) == " " || substr(rest, 1, 1) == "\t") rest = substr(rest, 2)
-      if (substr(rest, 1, 1) != "\"") return ""
-      rest = substr(rest, 2)
-      quote = index(rest, "\"")
-      if (quote == 0) return ""
-      return substr(rest, 1, quote - 1)
-    }
-    function hex(value, width,    i, c) {
-      if (length(value) != width) return 0
-      for (i = 1; i <= width; i++) {
-        c = substr(value, i, 1)
-        if (c !~ /^[0-9a-f]$/) return 0
-      }
-      return 1
-    }
-    index($0, "__containergo_inspect_rc__") == 1 {
-      rc = $0
-      sub(/^__containergo_inspect_rc__/, "", rc)
-      next
-    }
-    {
-      value = json_value($0, key)
-      if (got == "" && hex(value, 16)) got = value
-      value = json_value($0, "Id")
-      if (uid == "" && hex(value, 64)) uid = value
-    }
-    END {
-      if (got != "") print "creation=" got
-      if (uid != "") print "id=" uid
-      print "inspect_rc=" rc
-    }
-  '
-}
+
 valid_docker_id() {
   case "$1" in
     *[!0-9a-f]*) return 1 ;;
   esac
   [ "${#1}" -eq 64 ] 2>/dev/null
 }
+
+inspect_projection() {
+  inspect_id="$1"
+  {
+    run_with_timeout 10 "$bin" inspect "$inspect_id" 2>/dev/null
+    inspect_rc=$?
+    printf '\n__containergo_inspect_rc__%s\n' "$inspect_rc"
+  } | sed -n \
+    -e "s/^[[:space:]]*\"$key\"[[:space:]]*:[[:space:]]*\"\([0-9a-f]\{16\}\)\".*/creation=\1/p" \
+    -e 's/^[[:space:]]*"Id"[[:space:]]*:[[:space:]]*"\([0-9a-f]\{64\}\)".*/id=\1/p' \
+    -e 's/^__containergo_inspect_rc__\([0-9][0-9]*\)$/rc=\1/p'
+}
+
 process_entry() {
-  bin="$1"
-  sub="$2"
-  id="$3"
-  creation="$4"
-  key="$5"
-  target="$id"
-  case "$sub" in
-    delete|rm) ;;
-    *) return 0 ;;
-  esac
-  if [ "$sub" = "rm" ] && [ -z "$creation" ]; then
-    valid_docker_id "$id" || return 0
-  fi
-  if [ -n "$creation" ]; then
-    # Project only bounded fields while inspect is streaming. The raw
-    # response may contain credentials, so it never reaches a temp file.
-    inspect_fields=$(run_with_timeout 10 inspect_projection "$id") || return 0
-    got=
-    uid=
-    inspect_rc=
-    old_ifs=$IFS
-    IFS='
-'
-    for field in $inspect_fields; do
-      case "$field" in
-        creation=*) [ -n "$got" ] || got=${field#creation=} ;;
-        id=*) [ -n "$uid" ] || uid=${field#id=} ;;
-        inspect_rc=*) inspect_rc=${field#inspect_rc=} ;;
-      esac
+  target="$entry_id"
+  if [ -n "$entry_creation" ]; then
+    tries=0
+    while :; do
+      fields=$(inspect_projection "$entry_id") || fields=
+      got=
+      uid=
+      inspect_rc=
+      for field in $fields; do
+        case "$field" in
+          creation=*) got=${field#creation=} ;;
+          id=*) uid=${field#id=} ;;
+          rc=*) inspect_rc=${field#rc=} ;;
+        esac
+      done
+      if [ "$inspect_rc" = 0 ]; then
+        if [ "$got" != "$entry_creation" ]; then
+          # A completed generation must never be deleted after it has
+          # been replaced. A pending create may still be settling.
+          [ "$entry_pending" = 1 ] && [ -z "$got" ] || return 0
+        else
+          # Exact generation match is the delete gate.
+          [ "$got" = "$entry_creation" ] || return 0
+          if [ "$sub" = rm ]; then
+            valid_docker_id "$uid" || return 0
+            target="$uid"
+          fi
+          break
+        fi
+      fi
+      [ "$entry_pending" = 1 ] || return 0
+      tries=$((tries + 1))
+      [ "$tries" -lt "$pending_attempts" ] || return 0
+      sleep 1
     done
-    IFS=$old_ifs
-    unset inspect_fields
-    [ "$inspect_rc" = 0 ] || return 0
-    [ "$got" = "$creation" ] || return 0
-    if [ "$sub" = "rm" ]; then
-      valid_docker_id "$uid" || return 0
-      target="$uid"
+  elif [ "$sub" = rm ]; then
+    valid_docker_id "$entry_id" || return 0
+  fi
+  run_with_timeout "$timeout" "$bin" "$sub" --force "$@" "$target" >/dev/null 2>&1 || true
+}
+
+process_entry "$@"
+REAPER_ENTRY
+
+run_entry() {
+  entry_state="$1"
+  entry_id="$2"
+  entry_creation="$3"
+  entry_lock="$4"
+  shift 4
+  [ -n "$entry_id" ] || return 0
+  [ "$entry_creation" = "-" ] && entry_creation=
+  [ "$entry_state" = S ] && return 0
+  pending=0
+  [ "$entry_state" = P ] && pending=1
+
+  # Every name-addressed operation must share the Go name lock. An
+  # immutable Docker ID is the only operation that may run unlocked.
+  case "$entry_id" in
+    *[!A-Za-z0-9_.-]*) [ -n "$entry_lock" ] || return 0 ;;
+  esac
+  case "$sub" in
+    delete)
+      if [ -z "$entry_lock" ]; then
+        entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"
+      fi
+      ;;
+    rm)
+      case "$entry_id" in
+        *[!0-9a-f]*)
+          if [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
+          ;;
+        *)
+          if [ "${#entry_id}" -ne 64 ] && [ -z "$entry_lock" ]; then entry_lock="${TMPDIR:-/tmp}/containergo-$entry_id.lock"; fi
+          ;;
+      esac
+      ;;
+  esac
+  if [ -n "$entry_lock" ]; then
+    [ -L "$entry_lock" ] && return 0
+    flock_bin=$(command -v flock 2>/dev/null) || flock_bin=
+    case "$flock_bin" in
+      /*) [ -x "$flock_bin" ] || flock_bin= ;;
+      *) flock_bin= ;;
+    esac
+    if [ -n "$flock_bin" ]; then
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+        "$flock_bin" -x "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@"
+      return $?
+    fi
+    lockf_bin=$(command -v lockf 2>/dev/null) || lockf_bin=
+    case "$lockf_bin" in
+      /*) [ -x "$lockf_bin" ] || lockf_bin= ;;
+      *) lockf_bin= ;;
+    esac
+    if [ -n "$lockf_bin" ]; then
+      REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+      REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+        "$lockf_bin" -k -t 30 "$entry_lock" sh -c "$entry_script" reaper-entry \
+        "$entry_id" "$entry_creation" "$pending" "$@"
+      return $?
+    else
+      return 0
     fi
   fi
-  run_with_timeout "$timeout" "$bin" "$sub" --force "$target" >/dev/null 2>&1 || true
+  REAPER_BIN="$bin" REAPER_SUB="$sub" REAPER_KEY="$key" \
+  REAPER_TIMEOUT="$timeout" REAPER_PENDING_ATTEMPTS="$pending_attempts" \
+    sh -c "$entry_script" reaper-entry "$entry_id" "$entry_creation" "$pending" "$@"
 }
-echo "$ids" | while IFS= read -r line; do
-  # The input loop runs in a pipeline subshell. Re-enable monitor mode
-  # there so each helper can receive an isolated process group.
-  set -m 2>/dev/null
-  [ -z "$line" ] && continue
-  id=${line%% *}
-  creation=${line#* }
-  [ "$id" = "$line" ] && creation=""
-  run_with_timeout "$timeout" process_entry "$bin" "$sub" "$id" "$creation" "$key" || true
+
+# The input is a small event stream. P marks a create that is still
+# settling, C changes that exact key to active, S makes it non-destructive,
+# and + is an already complete entry. The fourth field is the shared
+# name-lock path. Plain id lines remain accepted for compatibility.
+awk '
+{
+  if (index($0, "\t") != 0) { print; next }
+  n=split($0, legacy, /[[:space:]]+/)
+  if (n == 1) { print legacy[1]; next }
+  if (legacy[1] == "+" || legacy[1] == "P" || legacy[1] == "C" || legacy[1] == "S" || legacy[1] == "-") {
+    gen=(n >= 3 && legacy[3] != "" ? legacy[3] : "-")
+    line=legacy[1] "\t" legacy[2] "\t" gen
+    if (n >= 4) line=line "\t" legacy[4]
+    print line
+  } else {
+    print legacy[1] "\t" legacy[2] "\t" legacy[3]
+  }
+}
+' | awk -F '\t' '
+function key(id, gen) { return id SUBSEP gen }
+$1 == "P" && NF >= 3 { k=key($2, $3); active[k]="P"; locks[k]=$4; next }
+$1 == "C" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="A"; if (NF >= 4) locks[k]=$4; next }
+$1 == "S" && NF >= 3 { k=key($2, $3); if (k in active) active[k]="S"; if (NF >= 4) locks[k]=$4; next }
+$1 == "+" && NF >= 2 { gen=$3; if (gen == "-") gen=""; k=key($2, gen); active[k]="A"; locks[k]=$4; next }
+$1 == "-" && NF >= 2 { gen=$3; if (gen == "-") gen=""; k=key($2, gen); delete active[k]; delete locks[k]; next }
+NF == 1 { active[key($1, "")]="A"; next }
+NF >= 2 && $1 !~ /^[+PCS-]$/ { k=key($1, $2); active[k]="A"; locks[k]=$3; next }
+END {
+  for (k in active) {
+    split(k, fields, SUBSEP)
+    gen=(fields[2] == "" ? "-" : fields[2])
+    line=active[k] "\t" fields[1] "\t" gen
+    if (locks[k] != "") line=line "\t" locks[k]
+    print line
+  }
+}
+' | while IFS="$tab" read -r state entry_id entry_creation entry_lock; do
+  run_entry "$state" "$entry_id" "$entry_creation" "$entry_lock" "$@"
 done
-set +f
-helper_enumeration=1
-run_helper "$work_dir/remove.out" "$work_dir/remove.err" "$rm_bin" -f "$work_dir/pgrep.out" "$work_dir/pgrep.err" "$work_dir/process.table" "$work_dir/process-table.err" "$work_dir"/identity.* || true
-set -f
 `
 
 const (
-	maxReaperRegisteredEntries  = 1024
-	maxReaperSpawnFailures      = 3
-	defaultReaperTimeoutSeconds = 30
+	maxReaperSpawnFailures       = 3
+	defaultReaperTimeoutSeconds  = 30
+	defaultReaperPendingAttempts = 30
+
+	initialReaperSpawnBackoff = time.Second
+	maxReaperSpawnBackoff     = 30 * time.Second
 )
 
-var errReaperRegistrationOverflow = errors.New("reaper registration capacity exceeded")
+var (
+	errReaperSpawnCooldown = errors.New("reaper: spawn retry cooldown active")
+	errReaperSpawnFailed   = errors.New("reaper: giving up after repeated spawn failures")
+)
 
-// breQuote escapes a literal for the reaper's field matcher, so the label
-// key's dots remain literal characters rather than matcher syntax.
+// breQuote escapes a literal for use inside the reaper's sed basic
+// regular expression, so the label key's dots match only dots.
 func breQuote(s string) string {
 	var b strings.Builder
 	for _, c := range s {
@@ -913,208 +303,708 @@ func breQuote(s string) string {
 // creationRE validates the hex generation ID passed to the reaper.
 var creationRE = regexp.MustCompile(`^[0-9a-f]{16}$`)
 
-func validReaperID(subcommand, id string) bool {
-	return nameRE.MatchString(id) || (subcommand == "rm" && dockerIDRE.MatchString(id))
-}
-
-func validateReaperEntry(subcommand, id, creation string) (bool, error) {
-	immutableID := subcommand == "rm" && dockerIDRE.MatchString(id)
-	if !validReaperID(subcommand, id) {
-		return false, fmt.Errorf("reaper: invalid container id %q", id)
-	}
-	if immutableID {
-		return true, nil
-	}
-	if subcommand == "rm" && creation == "" {
-		return false, fmt.Errorf("reaper: Docker name entry %q has no generation", id)
-	}
-	if creation != "" && !creationRE.MatchString(creation) {
-		return false, fmt.Errorf("reaper: invalid creation id %q", creation)
-	}
-	return false, nil
-}
-
 type reaperEntry struct {
 	id       string
 	creation string
+	lockPath string
+	pending  bool
+	shared   bool
 }
 
 type reaper struct {
 	binary string
 	// subcommand deletes a container: "delete" (Apple) or "rm"
-	// (Docker); both take --force.
-	subcommand string
+	// (Docker); both take --force. deleteFlags carries backend-specific
+	// options between --force and the target.
+	subcommand  string
+	deleteFlags []string
 
-	mu                   sync.Mutex
-	cmd                  *exec.Cmd
-	stdin                io.WriteCloser
-	exited               chan struct{}
-	entries              []reaperEntry
-	spawnFailures        int
-	gaveUp               bool
-	registrationOverflow bool
-	// timeoutSeconds is an internal test seam; production reapers use
-	// defaultReaperTimeoutSeconds.
-	timeoutSeconds int
-	helperPaths    reaperHelperPaths
-	workDir        string
+	// opMu serializes registration, completion, close, and recovery.
+	// mu protects fields; waiting for a child is never done while mu is
+	// held.
+	opMu          sync.Mutex
+	mu            sync.Mutex
+	cmd           *exec.Cmd
+	pgid          int
+	stdin         io.WriteCloser
+	exited        chan struct{}
+	entries       []reaperEntry
+	spawnFailures int
+	gaveUp        bool
+	gaveUpLogged  bool
+	closed        bool
+
+	// A failed recovery burst is retried only after a bounded cooldown.
+	// retryPending allows one immediate recovery attempt before the
+	// cooldown, which lets a transient launch failure recover without
+	// turning every subsequent registration into a hot retry loop.
+	retryPending bool
+	recovering   bool
+	retryAt      time.Time
+	retryLevel   int
+
+	// These are test seams. Production values are bounded defaults.
+	timeoutSeconds  int
+	pendingAttempts int
+	spawnCommand    func() (*exec.Cmd, error)
+	now             func() time.Time
+	retryBackoff    func(int) time.Duration
 }
 
-func newReaper(binary, subcommand string) *reaper {
+func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
 	return &reaper{
-		binary:         binary,
-		subcommand:     subcommand,
-		timeoutSeconds: defaultReaperTimeoutSeconds,
+		binary:          binary,
+		subcommand:      subcommand,
+		deleteFlags:     append([]string(nil), deleteFlags...),
+		timeoutSeconds:  defaultReaperTimeoutSeconds,
+		pendingAttempts: defaultReaperPendingAttempts,
 	}
 }
 
-// register adds a container ID to the reaper's kill list, spawning or
-// respawning the reaper process as needed. creation is the generation
-// ID from creationLabel; a full immutable Docker ID is normalized to an
-// ungenerated entry.
+func validateReaperEntry(entry reaperEntry) error {
+	if !nameRE.MatchString(entry.id) && !dockerIDRE.MatchString(entry.id) {
+		return fmt.Errorf("reaper: invalid container id %q", entry.id)
+	}
+	if entry.creation != "" && !creationRE.MatchString(entry.creation) {
+		return fmt.Errorf("reaper: invalid creation id %q", entry.creation)
+	}
+	if entry.pending && entry.creation == "" {
+		return errors.New("reaper: pending entry requires a creation id")
+	}
+	if strings.ContainsAny(entry.lockPath, "\t\r\n") {
+		return errors.New("reaper: lock path contains a control character")
+	}
+	return nil
+}
+
 func (r *reaper) register(id, creation string) error {
-	immutableID, err := validateReaperEntry(r.subcommand, id, creation)
+	return r.registerEntry(reaperEntry{id: id, creation: creation})
+}
+
+func (r *reaper) registerPending(id, creation string) error {
+	return r.registerEntry(reaperEntry{id: id, creation: creation, pending: true})
+}
+
+func (r *reaper) prepareEntry(entry reaperEntry) (reaperEntry, error) {
+	if err := r.validateEntry(entry); err != nil {
+		return reaperEntry{}, err
+	}
+	// A full Docker ID is already immutable; a supplied generation is
+	// redundant and must not turn the entry into a name lookup.
+	if r.subcommand == "rm" && dockerIDRE.MatchString(entry.id) {
+		entry.creation = ""
+		entry.pending = false
+	}
+	// Apple is name-addressed, and Docker may temporarily address a
+	// generation by name before run returns its immutable ID. Both use
+	// the same lock file as Go's generation-checked name operations.
+	if r.subcommand == "delete" || !dockerIDRE.MatchString(entry.id) {
+		lockPath, err := reaperNameLockPath(entry.id)
+		if err != nil {
+			return reaperEntry{}, fmt.Errorf("reaper: prepare name lock: %w", err)
+		}
+		entry.lockPath = lockPath
+	}
+	if err := validateReaperEntry(entry); err != nil {
+		return reaperEntry{}, err
+	}
+	return entry, nil
+}
+
+func (r *reaper) registerEntry(entry reaperEntry) error {
+	entry, err := r.prepareEntry(entry)
 	if err != nil {
 		return err
 	}
-	if immutableID {
-		// A full Docker ID is already immutable; it must not be sent
-		// through the name/generation fallback path.
-		creation = ""
-	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	entry := reaperEntry{id: id, creation: creation}
-	if len(r.entries) >= maxReaperRegisteredEntries {
-		// The shell deliberately keeps draining its input after its bounded
-		// prefix. Send the first rejected record once so that a writer
-		// already talking to the child is drained, then fail explicitly so
-		// the newly-created container is never silently abandoned.
-		if !r.registrationOverflow {
-			r.registrationOverflow = true
-			if r.stdin != nil {
-				if err := r.writeLocked(entry); err != nil {
-					return errors.Join(errReaperRegistrationOverflow, err)
-				}
-			}
-		}
-		return errReaperRegistrationOverflow
+	if r.closed {
+		r.mu.Unlock()
+		return errors.New("reaper: closed")
 	}
-	r.entries = append(r.entries, entry)
-	if r.stdin != nil {
-		if r.writeLocked(entry) == nil {
+	index := -1
+	changed := false
+	for i, existing := range r.entries {
+		if existing.id == entry.id && existing.creation == entry.creation {
+			index = i
+			if existing.shared {
+				r.mu.Unlock()
+				return nil
+			}
+			if entry.pending {
+				// Never downgrade an already complete generation to
+				// pending; the existing event already protects it.
+				r.mu.Unlock()
+				return nil
+			}
+			if existing.pending {
+				r.entries[i] = entry
+				changed = true
+			} else if existing.lockPath == "" && entry.lockPath != "" {
+				existing.lockPath = entry.lockPath
+				r.entries[i] = existing
+				changed = true
+			}
+			break
+		}
+	}
+	if index < 0 {
+		r.entries = append(r.entries, entry)
+	} else if !changed {
+		// Duplicate completed registration is already represented in
+		// the event stream; replaying it is unnecessary.
+		r.mu.Unlock()
+		return nil
+	}
+	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	r.mu.Unlock()
+
+	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
+		if err := writeReaperEntry(stdin, entry); err == nil {
+			r.clearSpawnFailure()
 			return nil
 		}
 	}
 	return r.respawnAndReplayLocked()
 }
 
-func (r *reaper) writeLocked(e reaperEntry) error {
-	if e.creation == "" {
-		_, err := io.WriteString(r.stdin, e.id+"\n")
+func (r *reaper) validateEntry(entry reaperEntry) error {
+	if err := validateReaperEntry(entry); err != nil {
 		return err
 	}
-	_, err := io.WriteString(r.stdin, e.id+" "+e.creation+"\n")
+	if r.subcommand != "delete" && r.subcommand != "rm" {
+		return fmt.Errorf("reaper: invalid delete subcommand %q", r.subcommand)
+	}
+	if r.subcommand == "delete" && !nameRE.MatchString(entry.id) {
+		return fmt.Errorf("reaper: invalid Apple container name %q", entry.id)
+	}
+	return nil
+}
+
+func writeReaperEntry(stdin io.Writer, entry reaperEntry) error {
+	if stdin == nil {
+		return io.ErrClosedPipe
+	}
+	prefix := "+"
+	if entry.shared {
+		prefix = "S"
+	} else if entry.pending {
+		prefix = "P"
+	}
+	line := prefix + "\t" + entry.id
+	if entry.creation != "" {
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
+	}
+	if entry.lockPath != "" {
+		line += "\t" + entry.lockPath
+	}
+	n, err := io.WriteString(stdin, line+"\n")
+	if err == nil && n != len(line)+1 {
+		return io.ErrShortWrite
+	}
 	return err
 }
 
-// respawnAndReplayLocked starts a fresh reaper process and re-registers
-// every known ID with it. Success resets the consecutive-failure count;
-// giving up logs once so a permanently broken reaper is visible.
-func (r *reaper) respawnAndReplayLocked() error {
-	for r.spawnFailures < maxReaperSpawnFailures {
-		if err := r.spawnLocked(); err != nil {
-			// A missing dependency is an explicit, recoverable registration
-			// failure. Do not spend the consecutive-spawn budget or mark the
-			// reaper permanently unusable; a later deployment may provide it.
-			if errors.Is(err, errReaperHelperUnavailable) {
-				return fmt.Errorf("reaper: required helper unavailable: %w", err)
+func (r *reaper) writeCurrentEntry(entry reaperEntry) error {
+	r.mu.Lock()
+	stdin := r.stdin
+	r.mu.Unlock()
+	return writeReaperEntry(stdin, entry)
+}
+
+func writeReaperCompletion(stdin io.Writer, entry reaperEntry) error {
+	if stdin == nil {
+		return io.ErrClosedPipe
+	}
+	line := "C\t" + entry.id
+	if entry.creation != "" {
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
+	}
+	if entry.lockPath != "" {
+		line += "\t" + entry.lockPath
+	}
+	n, err := io.WriteString(stdin, line+"\n")
+	if err == nil && n != len(line)+1 {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+func (r *reaper) completePending(id, creation string) error {
+	entry, err := r.prepareEntry(reaperEntry{id: id, creation: creation})
+	if err != nil {
+		return err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	index := -1
+	wasPending := false
+	for i, existing := range r.entries {
+		if existing.id == id && existing.creation == creation {
+			index = i
+			if existing.shared || !existing.pending {
+				r.mu.Unlock()
+				return nil
 			}
-			r.spawnFailures++
+			wasPending = true
+			break
+		}
+	}
+	if index < 0 {
+		r.entries = append(r.entries, entry)
+	} else {
+		r.entries[index] = entry
+	}
+	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	r.mu.Unlock()
+
+	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
+		var err error
+		if wasPending {
+			err = writeReaperCompletion(stdin, entry)
+		} else {
+			err = writeReaperEntry(stdin, entry)
+		}
+		if err == nil {
+			r.clearSpawnFailure()
+			return nil
+		}
+	}
+	return r.respawnAndReplayLocked()
+}
+
+func (r *reaper) markShared(id, creation string) error {
+	entry := reaperEntry{id: id, creation: creation}
+	if err := r.validateEntry(entry); err != nil {
+		return err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil
+	}
+	index := -1
+	for i, existing := range r.entries {
+		if existing.id == id && existing.creation == creation {
+			index = i
+			break
+		}
+	}
+	if index < 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	entry = r.entries[index]
+	entry.pending = false
+	entry.shared = true
+	r.entries[index] = entry
+	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	r.mu.Unlock()
+
+	if failures < maxReaperSpawnFailures && stdin != nil && !channelClosed(exited) {
+		if err := writeReaperEntry(stdin, entry); err == nil {
+			r.clearSpawnFailure()
+			return nil
+		}
+	}
+	return r.respawnAndReplayLocked()
+}
+
+func (r *reaper) unregister(id, creation string) error {
+	entry := reaperEntry{id: id, creation: creation}
+	if err := r.validateEntry(entry); err != nil {
+		return err
+	}
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+
+	r.mu.Lock()
+	index := -1
+	for i, existing := range r.entries {
+		if existing.id == id && existing.creation == creation {
+			index = i
+			entry = existing
+			break
+		}
+	}
+	if index < 0 {
+		r.mu.Unlock()
+		return nil
+	}
+	closed := r.closed
+	stdin, exited, failures := r.stdin, r.exited, r.spawnFailures
+	r.mu.Unlock()
+
+	if closed {
+		r.removeEntryLocked(entry)
+		return nil
+	}
+	// If the child is already gone, the confirmed delete cannot be
+	// undone by a later replay; remove the durable intent immediately.
+	// A live child, however, keeps the record until it accepts the
+	// removal event so an uncertain pipe failure cannot lose cleanup.
+	if stdin == nil || channelClosed(exited) {
+		r.removeEntryLocked(entry)
+		if r.entriesEmpty() {
+			// With no retained targets there is no fail-closed state to
+			// preserve; a later registration may start a fresh bounded
+			// recovery window immediately.
+			r.clearSpawnFailure()
+			r.stopCurrentProcess()
+		}
+		return nil
+	}
+	// Keep the entry in memory until the removal event is accepted by
+	// the child. If the pipe write fails, replay the retained entry
+	// instead of silently losing a pending cleanup guarantee.
+	if failures < maxReaperSpawnFailures {
+		if err := writeReaperRemoval(stdin, entry); err == nil {
+			r.removeEntryLocked(entry)
+			r.clearSpawnFailure()
+			if r.entriesEmpty() {
+				r.stopCurrentProcess()
+			}
+			return nil
+		}
+	}
+	return r.respawnAndReplayLocked()
+}
+
+func (r *reaper) removeEntryLocked(entry reaperEntry) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i, existing := range r.entries {
+		if existing.id == entry.id && existing.creation == entry.creation {
+			r.entries = append(r.entries[:i], r.entries[i+1:]...)
+			return
+		}
+	}
+}
+
+func (r *reaper) entriesEmpty() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return len(r.entries) == 0
+}
+
+func writeReaperRemoval(stdin io.Writer, entry reaperEntry) error {
+	if stdin == nil {
+		return io.ErrClosedPipe
+	}
+	line := "-\t" + entry.id
+	if entry.creation != "" {
+		line += "\t" + entry.creation
+	} else {
+		line += "\t-"
+	}
+	n, err := io.WriteString(stdin, line+"\n")
+	if err == nil && n != len(line)+1 {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+func (r *reaper) clearSpawnFailure() {
+	r.mu.Lock()
+	r.clearSpawnFailureLocked()
+	r.mu.Unlock()
+}
+
+func (r *reaper) clearSpawnFailureLocked() {
+	r.spawnFailures = 0
+	r.gaveUp = false
+	r.gaveUpLogged = false
+	r.retryPending = false
+	r.recovering = false
+	r.retryAt = time.Time{}
+	r.retryLevel = 0
+}
+
+func (r *reaper) nowLocked() time.Time {
+	if r.now != nil {
+		return r.now()
+	}
+	return time.Now()
+}
+
+func (r *reaper) retryBackoffLocked(level int) time.Duration {
+	if level < 1 {
+		level = 1
+	}
+	if r.retryBackoff != nil {
+		delay := r.retryBackoff(level)
+		if delay < 0 {
+			return 0
+		}
+		if delay > maxReaperSpawnBackoff {
+			return maxReaperSpawnBackoff
+		}
+		return delay
+	}
+	delay := initialReaperSpawnBackoff
+	for i := 1; i < level; i++ {
+		if delay >= maxReaperSpawnBackoff/2 {
+			return maxReaperSpawnBackoff
+		}
+		delay *= 2
+	}
+	if delay > maxReaperSpawnBackoff {
+		return maxReaperSpawnBackoff
+	}
+	return delay
+}
+
+// retryReadyLocked permits one immediate recovery burst after the first
+// failed burst, then applies exponential backoff if that recovery also
+// fails. A cooldown only suppresses a best-effort reaper attempt; entries
+// remain in memory and no destructive operation can run without a child.
+func (r *reaper) retryReadyLocked() bool {
+	if !r.gaveUp {
+		// Keep recovery possible for a state assembled by an older
+		// caller that reached the limit without setting gaveUp.
+		if r.spawnFailures >= maxReaperSpawnFailures {
+			r.spawnFailures = 0
+		}
+		return true
+	}
+	if r.retryPending {
+		r.retryPending = false
+		r.recovering = true
+		r.spawnFailures = 0
+		r.gaveUp = false
+		r.retryAt = time.Time{}
+		return true
+	}
+	if !r.retryAt.IsZero() && r.nowLocked().Before(r.retryAt) {
+		return false
+	}
+	r.recovering = true
+	r.spawnFailures = 0
+	r.gaveUp = false
+	r.retryAt = time.Time{}
+	return true
+}
+
+// respawnAndReplayLocked starts a replacement and replays all retained
+// entries. The caller holds opMu.
+func (r *reaper) respawnAndReplayLocked() error {
+	r.stopCurrentProcess()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return errors.New("reaper: closed")
+	}
+	if len(r.entries) == 0 {
+		r.clearSpawnFailureLocked()
+		r.mu.Unlock()
+		return nil
+	}
+	if !r.retryReadyLocked() {
+		r.mu.Unlock()
+		return errReaperSpawnCooldown
+	}
+	entries := append([]reaperEntry(nil), r.entries...)
+	r.mu.Unlock()
+
+	var lastErr error
+	for r.spawnFailuresValue() < maxReaperSpawnFailures {
+		if err := r.spawnLocked(); err != nil {
+			lastErr = err
+			r.recordSpawnFailure()
 			continue
 		}
 		replayed := true
-		for _, e := range r.entries {
-			if r.writeLocked(e) != nil {
+		for _, entry := range entries {
+			if err := r.writeCurrentEntry(entry); err != nil {
+				lastErr = err
 				replayed = false
 				break
 			}
 		}
 		if replayed {
-			r.spawnFailures = 0
+			r.clearSpawnFailure()
 			return nil
 		}
-		r.spawnFailures++
+		r.stopCurrentProcess()
+		r.recordSpawnFailure()
 	}
-	if !r.gaveUp {
-		r.gaveUp = true
-		log.Printf("container-go: reaper giving up after %d consecutive spawn failures (binary=%q)", maxReaperSpawnFailures, r.binary)
+	r.mu.Lock()
+	logGiveUp := !r.gaveUpLogged
+	r.gaveUpLogged = true
+	r.mu.Unlock()
+	if logGiveUp {
+		log.Printf("container-go: reaper giving up temporarily after %d consecutive spawn failures (binary=%q); a later registration will retry", maxReaperSpawnFailures, r.binary)
 	}
-	return errors.New("reaper: giving up after repeated spawn failures")
+	if lastErr == nil {
+		lastErr = errReaperSpawnFailed
+	}
+	return fmt.Errorf("%w: %v", errReaperSpawnFailed, lastErr)
+}
+
+func (r *reaper) spawnFailuresValue() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.spawnFailures
+}
+
+func (r *reaper) gaveUpValue() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.gaveUp
+}
+
+func (r *reaper) recordSpawnFailure() {
+	r.mu.Lock()
+	r.spawnFailures++
+	if r.spawnFailures < maxReaperSpawnFailures {
+		r.mu.Unlock()
+		return
+	}
+	r.gaveUp = true
+	if r.recovering {
+		r.recovering = false
+		r.retryPending = false
+		if r.retryLevel < 32 {
+			r.retryLevel++
+		}
+		r.retryAt = r.nowLocked().Add(r.retryBackoffLocked(r.retryLevel))
+	} else {
+		// Leave one immediate recovery burst available. If that burst
+		// fails, recordSpawnFailure takes the cooldown path above.
+		r.retryPending = true
+		r.retryAt = time.Time{}
+	}
+	r.mu.Unlock()
 }
 
 func (r *reaper) spawnLocked() error {
-	timeout := r.timeoutSeconds
-	if timeout <= 0 {
-		timeout = defaultReaperTimeoutSeconds
-	}
-	if info, err := os.Stat("/bin/sh"); err != nil {
-		return fmt.Errorf("%w: /bin/sh: %v", errReaperHelperUnavailable, err)
-	} else if !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
-		return fmt.Errorf("%w: /bin/sh is not executable", errReaperHelperUnavailable)
-	}
-	helpers := r.helperPaths
-	if !helpers.complete() {
+	var cmd *exec.Cmd
+	if r.spawnCommand != nil {
 		var err error
-		helpers, err = trustedReaperHelpers()
+		cmd, err = r.spawnCommand()
 		if err != nil {
 			return err
 		}
+	} else {
+		timeout := r.timeoutSeconds
+		if timeout <= 0 {
+			timeout = defaultReaperTimeoutSeconds
+		}
+		attempts := r.pendingAttempts
+		if attempts <= 0 {
+			attempts = 1
+		}
+		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
+		args = append(args, r.deleteFlags...)
+		cmd = exec.Command("/bin/sh", args...)
 	}
-	if err := helpers.validate(); err != nil {
-		return err
+	if cmd == nil {
+		return errors.New("reaper: nil spawn command")
 	}
-	workDir, err := os.MkdirTemp("", "containergo-reaper-")
-	if err != nil {
-		return err
-	}
-	// The shell's portable fallback uses the stable process-start field.
-	// Darwin's Go-side identity path uses the kernel's microsecond start
-	// timestamp; CPU-time fields are never process identities.
-	psStartField := "lstart"
-	cmd := exec.Command(
-		"/bin/sh", "-c", reaperScript, "containergo-reaper",
-		r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout),
-		workDir, helpers.awk, helpers.pgrep, helpers.ps, helpers.rm, helpers.sleep, psStartField,
-	)
-	prepareReaperCommand(cmd)
+	configureReaperProcess(cmd)
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
-		_ = os.RemoveAll(workDir)
 		return err
 	}
 	if err := cmd.Start(); err != nil {
-		_ = os.RemoveAll(workDir)
+		_ = stdin.Close()
 		return err
 	}
 	exited := make(chan struct{})
 	go func() {
 		_ = cmd.Wait()
-		_ = os.RemoveAll(workDir)
 		close(exited)
 	}()
-	r.cmd, r.stdin, r.exited = cmd, stdin, exited
-	r.helperPaths, r.workDir = helpers, workDir
+	r.mu.Lock()
+	r.cmd, r.pgid, r.stdin, r.exited = cmd, reaperProcessGroupID(cmd), stdin, exited
+	r.mu.Unlock()
+	go r.monitorChild(cmd, exited)
 	return nil
 }
 
-// closeStdin hands the reaper the same EOF it would see on parent
-// death. Test hook and best-effort shutdown.
-func (r *reaper) closeStdin() {
+func (r *reaper) monitorChild(cmd *exec.Cmd, exited <-chan struct{}) {
+	<-exited
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.stdin != nil {
-		_ = r.stdin.Close()
+	current := !r.closed && r.cmd == cmd
+	r.mu.Unlock()
+	if current {
+		_ = r.respawnAndReplayLocked()
+	}
+}
+
+func (r *reaper) stopCurrentProcess() {
+	r.mu.Lock()
+	cmd, pgid, stdin, exited := r.cmd, r.pgid, r.stdin, r.exited
+	r.cmd, r.pgid, r.stdin, r.exited = nil, 0, nil, nil
+	r.mu.Unlock()
+	if cmd == nil {
+		return
+	}
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+	if !channelClosed(exited) {
+		killReaperProcess(cmd, pgid)
+	}
+	if exited != nil {
+		<-exited
+	}
+}
+
+// closeStdin hands the reaper the intentional EOF used on parent death
+// and in tests. It prevents the monitor from respawning that child.
+func (r *reaper) closeStdin() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return
+	}
+	r.closed = true
+	stdin := r.stdin
+	r.stdin = nil
+	r.mu.Unlock()
+	if stdin != nil {
+		_ = stdin.Close()
+	}
+}
+
+// killForTest kills the current child and waits for it. The monitor sees
+// that it is no longer the current child, so the next registration can
+// explicitly exercise the respawn path.
+func (r *reaper) killForTest() {
+	r.opMu.Lock()
+	defer r.opMu.Unlock()
+	r.stopCurrentProcess()
+}
+
+func channelClosed(ch <-chan struct{}) bool {
+	if ch == nil {
+		return false
+	}
+	select {
+	case <-ch:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1123,24 +1013,90 @@ var (
 	globalReapers   = map[string]*reaper{}
 )
 
-// registerWithGlobalReaper registers a container with the process-wide
-// reaper for its backend binary and logs registration failures. The reaper
-// needs /bin/sh, so on Windows this is a no-op and cleanup relies on the
-// normal paths.
-func registerWithGlobalReaper(binary, subcommand, id, creation string) error {
+// registerWithGlobalReaper best-effort registers a completed container
+// with the process-wide reaper. Reaper trouble never fails startup.
+func registerWithGlobalReaper(binary, subcommand string, deleteFlags []string, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	globalReapersMu.Lock()
-	r, ok := globalReapers[binary]
-	if !ok {
-		r = newReaper(binary, subcommand)
-		globalReapers[binary] = r
-	}
-	globalReapersMu.Unlock()
+	r := getGlobalReaper(binary, subcommand, deleteFlags)
 	if err := r.register(id, creation); err != nil {
 		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
 		return err
 	}
 	return nil
+}
+
+func preRegisterWithGlobalReaper(binary, subcommand string, deleteFlags []string, id, creation string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	r := getGlobalReaper(binary, subcommand, deleteFlags)
+	if err := r.registerPending(id, creation); err != nil {
+		log.Printf("container-go: reaper pre-registration failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
+}
+
+func completePreRegistrationWithGlobalReaper(binary, id, creation string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	globalReapersMu.Lock()
+	r, ok := globalReapers[binary]
+	globalReapersMu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := r.completePending(id, creation); err != nil {
+		log.Printf("container-go: reaper create-completion update failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
+}
+
+func markSharedWithGlobalReaper(binary, id, creation string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	globalReapersMu.Lock()
+	r, ok := globalReapers[binary]
+	globalReapersMu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := r.markShared(id, creation); err != nil {
+		log.Printf("container-go: reaper shared-state update failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
+}
+
+func unregisterWithGlobalReaper(binary, id, creation string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	globalReapersMu.Lock()
+	r, ok := globalReapers[binary]
+	globalReapersMu.Unlock()
+	if !ok {
+		return nil
+	}
+	if err := r.unregister(id, creation); err != nil {
+		log.Printf("container-go: reaper unregister failed (binary=%q): %v", binary, err)
+		return err
+	}
+	return nil
+}
+
+func getGlobalReaper(binary, subcommand string, deleteFlags []string) *reaper {
+	globalReapersMu.Lock()
+	defer globalReapersMu.Unlock()
+	r, ok := globalReapers[binary]
+	if !ok {
+		r = newReaper(binary, subcommand, deleteFlags...)
+		globalReapers[binary] = r
+	}
+	return r
 }

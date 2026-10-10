@@ -768,22 +768,12 @@ security boundary. The reaper staging exception in #111 means that
 **No shell involvement**. Every CLI call passes an argv array to
 `exec.Command`; no shell string is ever assembled. The single
 exception is the watchdog reaper's shell script. Its body is a fixed
-string; container IDs enter only as stdin data. The script defeats
-word splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted
-expansions). On this base, name-addressed reaper entries use the shared
-library guard `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63
-characters) before they are written to the pipe. This is not the
-complete Apple Container contract: Apple's CLI requires 2–63 characters
-using `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`, and the current checkout does
-not apply that backend-specific preflight check (#112). After issue #73,
-the reaper will separately accept a full lowercase 64-hex Docker ID.
-Reaper registration failures are ignored. The two layers together leave
-no command injection through registered IDs.
-expansions), and the library validates each target before writing it to
-the pipe. Apple Container names must match
-`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs must be lowercase
-64-character hexadecimal strings matching `^[0-9a-f]{64}$`. The two
-layers together leave no command injection through IDs.
+string; container IDs enter only as stdin data. The script defeats word
+splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted expansions), and
+the library validates each target before writing it to the pipe. Apple
+Container names must match `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs
+must be lowercase 64-character hexadecimal strings matching `^[0-9a-f]{64}$`.
+The two layers together leave no command injection through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -801,9 +791,6 @@ errors are returned and retried. Windows has no equivalent secrecy
 guarantee through Go `chmod`, so operations requiring an env file return
 `ErrEnvFileUnsupported` before invoking the backend.
 
-**Reaper staging**. The current reaper writes the full `inspect` output
-to an un-namespaced `mktemp` file before removing it. A killed reaper can
-leave environment data on disk; see the #111 mitigation above.
 **Validate inputs**. Container names (name rule above), label keys
 (the CLI's Docker/OCI form), ports (numeric range and `tcp`/`udp`),
 and copy paths (absolute POSIX paths with `/` separators, no backslashes,
@@ -817,19 +804,6 @@ not place it in a line-delimited env file. The CLI validates too, but
 first-party validation gives clearer errors and independence from future CLI
 changes.
 
-**Validate inputs**. The shared `WithName` guard and name-addressed
-reaper check use the rule above; label keys (the CLI's Docker/OCI form),
-ports (numeric range and `tcp`/`udp`), environment keys (no `=`, no NUL),
-and container-side copy paths (absolute, valid UTF-8) are also validated
-before reaching the CLI. This library-side guard is not a claim of full
-backend name validation: Apple's stricter minimum remains unenforced in
-this checkout (#112). Host-side copy paths are resolved to absolute
-paths. The CLI validates too, but validating first gives clearer errors
-and independence from future CLI changes. Public option validation
-remains partial: negative `LogsOptions.Tail`, zero memory, unknown mount
-types, and reuse-group grammar are not uniformly rejected before backend
-work (#102).
-
 **Handle no credentials**. Registry authentication is delegated to
 the backend CLI: use `container registry login` for Apple Container or
 `docker login` for Docker. The library has no credential input path.
@@ -839,6 +813,19 @@ hook. `CLIError` exposes the failed command arguments and bounded stderr
 for diagnostics, while environment values remain in the temporary env
 file rather than appearing in argv. The watchdog can emit one
 standard-log message if it cannot be started after repeated attempts.
+
+**Legacy reaper staging files**. The current reaper streams inspect output
+through the structural field filter and does not create a raw inspect file.
+Versions before that change used an un-namespaced `mktemp` file; a reaper
+killed during inspect could therefore leave a file containing environment
+values. Those names are not safely attributable to this library. An
+operator handling legacy files must first stop all container-go and reaper
+processes, use a metadata-only listing in the effective per-user `TMPDIR`
+restricted to regular files owned by that user and the affected time window,
+avoid printing file contents, avoid following symlinks, and remove only files
+positively tied to the affected run. A broad temp-directory cleanup is unsafe.
+Credentials that may have appeared in inspect output should be rotated;
+deletion does not revoke them.
 
 ## Performance design
 

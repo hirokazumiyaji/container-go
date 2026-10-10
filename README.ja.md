@@ -844,6 +844,20 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。
 
+### 旧バージョンの reaper staging ファイル
+
+現在の watchdog は inspect 出力を構造化フィルタへ流して処理し、raw 出力を
+ディスクへ書きません。旧バージョンは名前空間もない `mktemp` ファイルを使って
+いたため、inspect 中に reaper が kill されると、コンテナの環境変数を含む
+ファイルが残る可能性があります。旧バージョンのファイル名は本ライブラリの
+ものと安全に特定できません。調査・削除する場合は、先にすべての container-go と
+watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけません)でメタデータ
+だけを列挙し、そのユーザーと該当時間帯の通常ファイルに範囲を絞ります。ファイル
+内容を grep して端末へ表示したり、シンボリックリンクを追跡したり、広範な再帰削除
+をしたりしないでください。該当実行に確実に帰属するファイルだけを削除して
+ください。inspect 出力に含まれた可能性がある認証情報は失効済みとして扱い、
+ローテーションしてください。stale ファイルを削除しても secret 自体は失効しません。
+
 ## testcontainers-go との違い
 
 非対応（相当機能が存在しない、またはスコープ外）:

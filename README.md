@@ -702,17 +702,6 @@ Repeated reaper spawn failures are logged once after the retry limit;
 delete failures are ignored by the shell. Do not use reaper behavior as a
 cleanup acknowledgement.
 
-The current reaper stages the full `inspect` output in an un-namespaced
-`mktemp` file and removes it on its ordinary completion or inspect-error
-paths. If the reaper is killed, a file containing environment data can
-remain. Before cleanup, stop container-go and reaper processes, then use a
-metadata-only listing of regular files owned by the user in the effective
-`TMPDIR`, restricted to the affected time window. Do not print or grep
-file contents, follow symlinks, or run a broad recursive delete. Remove
-only files positively tied to the affected run, and rotate credentials
-that may have appeared in inspect output (#111). This is not a no-leak
-guarantee.
-
 `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
 automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper
 registration, and suppresses automatic rollback on failed creates, `WithFiles`
@@ -868,6 +857,21 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   `container registry login` for Apple Container or `docker login` for
   Docker. The backend CLI owns the resulting credentials and registry
   context.
+
+### Legacy reaper staging files
+
+The current watchdog streams inspect output through a structural filter and
+never writes the raw output to disk. Older versions used an un-namespaced
+`mktemp` file, so a reaper killed during inspect can leave a file containing
+container environment data. Those legacy names cannot be safely attributed
+to this library. To investigate or clean them up, first stop all
+container-go and watchdog processes, inspect the per-user temporary directory
+(the effective `TMPDIR`, not an assumed `/tmp`) using a metadata-only listing
+restricted to regular files owned by that user and the affected time window.
+Do not grep file contents into a terminal, follow symlinks, or run a broad
+recursive delete. Remove only files that you can positively attribute to the
+affected run. Treat any credentials that may have appeared in inspect output
+as exposed and rotate them; deleting a stale file does not revoke a secret.
 
 ## Differences from testcontainers-go
 

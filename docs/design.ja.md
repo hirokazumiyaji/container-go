@@ -394,6 +394,18 @@ panic、`SIGKILL`、`os.Exit` では pipe が閉じる。recover した panic �
 は `Run` に返らない。spawn failure が retry 上限に達した場合は一度だけ log に
 残り、delete failure は shell が無視する。backend 呼び出しには POSIX の
 `sleep` / `kill` による期限がある。
+各登録エントリの inspect・status marker・filter・delete 全体は 30 秒のタイムアウトで囲む。
+watchdog リーパーは 64 文字の小文字 16 進 Docker ID を不変な ID として受け入れる。
+generation を持つ Docker エントリは名前から inspect を使って ID を取り出すが、削除前に同じ 64 文字の ID が取得できた場合だけ削除する。
+generation を持たない Docker の名前エントリは拒否してログに残す。
+Apple の場合は generation を保存し、JSON の行頭にある `"key": "value"` 形式のフィールドだけを読み取る。
+一致しない場合は削除しない。
+タイムアウト時は、対象 helper の部分木だけを固定点まで取得して停止し、検証後に `setsid` を含む子孫を signal する。
+本番リーパーはテスト用の Go 製 process walker ではなく外部 shell 子プロセスであり、process ID には安定した `ps lstart`(CPU 時間ではない)を使う。識別情報を失った場合は numeric signal の許可とせず、検証不能として処理を打ち切る。
+停止済みの process には独立した force-signal budget を与え、traversal が budget 切れになっても停止したまま残さない。lookup と signal の budget は別々で、双方は有限である。
+`pgrep` は任意で、利用できない場合は固定した `ps` の process table で子孫を列挙する。
+補助 executable は固定したシステムパスから解決し、出力(file-size limit)、helper 実行時間(1 秒)、1 entry あたり helper 回数(通常 8 回と `pgrep`・列挙用の予備各 2 回)を制限する。budget 切れなら追加 cleanup を行わない。monitor mode が使えない場合も、可靠的 helper の列挙で子孫を kill して回収する。
+登録は reaper 子プロセスあたり最大 1024 件を保持・再生する。shell は上限を超える入力も読み捨て続けるため、pipe が満杯で writer が block しない。Go 側の上限超過は明示的な capacity error として返し、`Run` は新規コンテナを rollback する。
 
 reaper は実 CLI コンテナを非 reuse 経路で登録したときに遅延起動する。
 Apple Container には別の不変 ID がないため、entry はコンテナ名と creation
@@ -410,14 +422,6 @@ reaper に Docker ID を登録できない。backend が解析可能な ID を�
 Docker-ID 登録経路には issue #73 を stack する必要がある。#73 適用後は
 Docker entry が不変 ID を使い `docker rm --force` で削除する。通常の
 Docker `Terminate` と rollback handle は ID を独立して利用できる。
-
-**Reaper staging exposure**：現在の reaper は full `inspect` output を namespace の
-ない `mktemp` file に staging し、通常の完了または inspect-error path では
-削除する。reaper が kill されると、環境 data を含む file が残る可能性がある。cleanup 前に container-go と
-reaper process を停止し、実効 `TMPDIR` で user 所有の regular file だけを metadata-only
-listing し、affected time window に限定する。file content を表示・grep したり、symlink を
-追跡したり、broad recursive delete を実行しない。該当 run に確実に帰属する file だけを
-削除し、inspect output に含まれた可能性がある credential を rotate する（#111）。これは
 no-leak 保証ではない。
 
 **セッションラベル**：作成するコンテナには次のラベルを付ける。
@@ -496,12 +500,11 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 
 外部プロセスを起動するライブラリとして、次の原則は security boundary を表す。ただし #111 の reaper staging exception があるため、「情報漏洩がない」という end-to-end 保証ではない。
 
-**シェルを経由しない**。すべての CLI 呼び出しは `exec.Command` に引数配列を渡し、シェル文字列を組み立てない。唯一の例外は watchdog reaper の shell script である。本文は固定文字列で、container ID は stdin data としてだけ渡す。script は `set -f`、`IFS=`、`read -r`、変数の quote で word splitting と glob 展開を封じる。現在の base では、name-addressed reaper entry に共有 library guard `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`（1～63 文字）を適用してから pipe へ書く。この shared guard は Apple Container の完全な契約ではない。Apple の CLI は `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` の 2～63 文字を要求し、現在の checkout はその backend 固有の preflight check を適用しない（#112）。issue #73 適用後は、reaper は完全な小文字 64 桁 hex Docker ID も別々に受け付ける。reaper 登録 error は無視する。二重の防御により、登録された ID 経由の command injection を成立させない。
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
-ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+スクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
+スクリプト側は `set -f`（グロブ無効）、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
 ライブラリは、パイプへ書く前の ID を検証し、Apple Container の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または Docker の完全な小文字 64 桁の 16 進数 ID `^[0-9a-f]{64}$` だけを受け入れる。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
@@ -516,15 +519,25 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 cleanup 失敗は返し、deferred retry する。
 Windows の Go `chmod` は同等の秘密性を保証しないため、env ファイルが要る操作は backend を呼ぶ前に `ErrEnvFileUnsupported` で失敗する。
 
-**Reaper staging**。現在の reaper は full `inspect` output を namespace のない `mktemp` file へ書き込んでから削除する。kill された場合、環境 data を含む file が残るため、#111 の mitigation を参照する。
 **入力を検証する**。
 コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。環境変数キーは空でない有効な UTF-8 で、`=`、Unicode 空白、制御文字、先頭 `#`、先頭 BOM を含まない。値は有効な UTF-8 で、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029 を含まない。制御文字でない Unicode、空白、`=` は値として許可する。制御文字(タブを含む)や不正な UTF-8 を、バックエンドが受け付ける場合でも行区切り env ファイルへ書かないという意図的な互換性変更である。CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
-
-**入力を検証する**。共有 `WithName` guard と name-addressed reaper check は前述の規則を使い、ラベルキー（CLI と同じ Docker/OCI 形式）、ポート（数値範囲と `tcp`/`udp`）、環境変数キー（`=` と NUL を含まない）、コンテナ内コピー先パス（絶対パス、有効な UTF-8、NUL なし）も CLI へ渡す前に検証する。この library-side guard は backend の完全な name validation を意味しない。Apple のより厳密な minimum は現在の checkout では強制されない（#112）。ホスト側コピー元パスは絶対パスへ解決する。CLI にも検証はあるが、先にライブラリで落とすことでエラーメッセージを明確にし、将来の CLI の変化に依存しない。public option の validation は部分的で、negative `LogsOptions.Tail`、zero memory、unknown mount type、reuse-group grammar は backend work 前に一様に reject されない（#102）。
 
 **認証情報を扱わない**。レジストリ認証はバックエンド CLI に委ねる。Apple Container では `container registry login`、Docker では `docker login` を使う。ライブラリに認証情報を入力する経路はない。
 
 **ログ注入 API はない**。公開 API にロガーフックはない。`CLIError` は診断用に失敗したコマンドの引数と上限付き stderr を提供するが、環境変数の値は一時 env ファイルにあり argv には現れない。watchdog は起動を繰り返し失敗した場合に標準ログへ一度だけメッセージを出す。
+
+**旧バージョンの reaper staging ファイル**。
+現在の reaper は inspect 出力を構造化フィールドフィルタへ流して処理し、raw
+inspect ファイルを作成しません。変更前のバージョンは名前空間もない `mktemp`
+ファイルを使っていたため、inspect 中の reaper が kill されると環境値を含む
+ファイルが残る可能性があります。その名前から本ライブラリのファイルとして
+安全に特定することはできません。運用者はまず container-go と reaper の
+プロセスをすべて停止し、実効のユーザーごと `TMPDIR` でメタデータだけを列挙して、
+そのユーザーと該当時間帯の通常ファイルに範囲を絞ります。ファイル内容を表示したり、
+シンボリックリンクを追跡したりしないでください。該当実行に確実に帰属するファイル
+だけを削除してください。temp ディレクトリ全体の再帰削除は安全ではありません。
+inspect 出力に含まれた可能性がある認証情報はローテーションしてください。stale
+ファイルを削除しても secret は失効しません。
 
 ## パフォーマンス設計
 

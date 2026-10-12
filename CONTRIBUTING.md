@@ -16,10 +16,21 @@ behavior. Integration tests use the `integration` build tag and skip cleanly
 when the relevant CLI or daemon is unavailable. They pull images from the AWS
 public ECR Docker Hub mirror (`public.ecr.aws/docker/library/...`) to avoid
 anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
-and singleflight cases (`make bench-integration` covers those). Set
+and singleflight cases (`make bench-integration` covers those; the
+nested benchmark module requires Go 1.25+). Set
 `CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
+The root test binary records that value in `TestMain` and then unsets it,
+so the other backend's suites skip correctly; guards read it through
+`integrationtest.SelectedBackend` rather than `os.Getenv`, which would
+always see the empty value.
 Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
-pull other Hub images locally.
+pull other Hub images locally. The root module supports Go 1.23+; the nested
+`bench/` benchmark module requires Go 1.25+ and is documented in
+`bench/README.md`.
+
+Windows-specific copy tests use Windows build constraints and are cross-built
+with the package. Issue #119 does not add a live Windows CI runner; execute
+`go test ./...` on Windows separately when changing Windows-specific behavior.
 
 ## Pull requests
 

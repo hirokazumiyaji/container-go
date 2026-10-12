@@ -18,7 +18,11 @@ import (
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that the selected container backend is
-// not running. The classified error retains the backend-specific hint.
+// not answering: the Apple Container system service (start it with
+// `container system start`) or the Docker daemon. The value is shared
+// by both backends, so a caller cannot tell which one is down from the
+// sentinel alone. The classified error retains the backend-specific hint
+// and keeps the original CLI and probe errors in the error chain.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrLogStreamSetup reports that a log stream cannot be started with the

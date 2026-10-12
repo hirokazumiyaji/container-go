@@ -121,11 +121,6 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		}
 	}
 
-	target, err := c.verifiedOperationTarget(ctx)
-	if err != nil {
-		return 0, emptyExecOutput(), err
-	}
-
 	// Exec is a buffered, bounded operation by default. An explicit zero
 	// timeout opts out of the library default. A positive custom timeout
 	// is combined with the caller's deadline, so the earlier one wins.
@@ -138,6 +133,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// termination. Keep the output contract even for this early return.
 	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
 		return 0, emptyExecOutput(), ctxErr
+	}
+
+	target, err := c.verifiedOperationTarget(execCtx)
+	if err != nil {
+		return 0, emptyExecOutput(), err
 	}
 
 	var envFile, envDir string

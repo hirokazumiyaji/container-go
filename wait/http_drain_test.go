@@ -104,47 +104,89 @@ func TestForHTTPPollsReuseOneConnection(t *testing.T) {
 	}
 }
 
-// TestForHTTPDrainIsBounded keeps the cap honest. A body larger than
-// maxDrainBytes is deliberately not read to EOF, so an endpoint cannot
-// turn the drain into unbounded memory growth. The wait still has to
-// terminate and still has to honour the status it received.
+// TestForHTTPAcceptedStatusSkipsHangingBody proves an accepted status
+// returns before the body is consumed. Draining first would turn a
+// stalled readiness body into a false timeout after the status already
+// said the container was ready.
+func TestForHTTPAcceptedStatusSkipsHangingBody(t *testing.T) {
+	release := make(chan struct{})
+	srv := newConnCountingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	})
+	t.Cleanup(func() { close(release) })
+
+	target := newFakeTarget()
+	target.endpoint = srv.Listener.Addr().String()
+
+	done := make(chan error, 1)
+	go func() {
+		done <- ForHTTP("/").WithStartupTimeout(2*time.Second).WaitUntilReady(context.Background(), target)
+	}()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("WaitUntilReady() = %v, want nil once the 200 status arrived", err)
+		}
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("accepted status waited on a hanging body")
+	}
+}
+
+// TestForHTTPDrainIsBounded keeps the reject-path cap honest. A body
+// larger than maxDrainBytes is deliberately not read to EOF, so an
+// endpoint cannot turn the drain into unbounded memory growth. The wait
+// still has to terminate and still has to honour the status it received.
 func TestForHTTPDrainIsBounded(t *testing.T) {
 	// 8MiB, far past the 64KiB cap.
 	body := make([]byte, 8<<20)
 	for i := range body {
 		body[i] = 'x'
 	}
+	var probes atomic.Int64
 	srv := newConnCountingServer(t, func(w http.ResponseWriter, r *http.Request) {
+		n := probes.Add(1)
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write(body)
+			return
+		}
 		w.WriteHeader(http.StatusOK)
-		w.Write(body)
 	})
 
 	target := newFakeTarget()
 	target.endpoint = srv.Listener.Addr().String()
 
 	done := make(chan error, 1)
-	go func() { done <- ForHTTP("/").WaitUntilReady(context.Background(), target) }()
+	go func() {
+		done <- ForHTTP("/").WithPollInterval(time.Millisecond).WithStartupTimeout(3*time.Second).
+			WaitUntilReady(context.Background(), target)
+	}()
 
 	select {
 	case err := <-done:
 		if err != nil {
-			t.Fatalf("WaitUntilReady() = %v, want nil: the 200 status was received", err)
+			t.Fatalf("WaitUntilReady() = %v, want nil after the oversized reject body", err)
 		}
-	case <-time.After(20 * time.Second):
-		t.Fatal("WaitUntilReady did not return; the drain is not bounded")
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitUntilReady did not return; the reject-path drain is not bounded")
 	}
 }
 
 // TestForHTTPStatusVerdictSurvivesDrainError pins that a drain failure
-// does not turn a received response into a probe error. The response
-// arrived, so the matcher decides the outcome and the drain result is
-// not the wait's verdict.
+// does not turn a received reject status into a different probe error.
+// The response arrived, so the matcher decides the outcome and the drain
+// result is not the wait's verdict.
 func TestForHTTPStatusVerdictSurvivesDrainError(t *testing.T) {
-	// Announce a body, deliver part of it, then abort the connection.
-	// The client sees a 200 and then a body read error.
+	// Announce a reject body, deliver part of it, then abort. The client
+	// sees a 503 and then a body read error while draining for reuse.
 	srv := newConnCountingServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Length", "100000")
-		w.WriteHeader(http.StatusOK)
+		w.WriteHeader(http.StatusServiceUnavailable)
 		fmt.Fprint(w, "partial")
 		if f, ok := w.(http.Flusher); ok {
 			f.Flush()
@@ -155,9 +197,12 @@ func TestForHTTPStatusVerdictSurvivesDrainError(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = srv.Listener.Addr().String()
 
-	err := ForHTTP("/").WithStartupTimeout(5*time.Second).WaitUntilReady(context.Background(), target)
-	if err != nil {
-		t.Fatalf("WaitUntilReady() = %v, want nil: the 200 status arrived before the body failed", err)
+	err := ForHTTP("/").WithStartupTimeout(500*time.Millisecond).WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want timeout after repeated 503 responses")
+	}
+	if got := err.Error(); !strings.Contains(got, "status 503") && !strings.Contains(got, "timed out") {
+		t.Errorf("error = %v, want a status or timeout verdict rather than a bare drain failure", err)
 	}
 }
 

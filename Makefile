@@ -44,6 +44,8 @@ integration-docker:
 	rm -f "$$log"; \
 	exit $$status
 
+# This target intentionally includes the pull-heavy singleflight case;
+# keep its root-module command in sync with docs/benchmarks.md.
 bench-integration:
 	go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
 	cd bench && go test -tags integration -count=1 -timeout 30m ./...
@@ -67,7 +69,7 @@ bench-integration:
 # go.sum that tidy creates from nothing, because `git diff` ignores untracked
 # files, and a failing run would leave a rewritten, unreviewed go.mod in the
 # tree.
-GOVULNCHECK_VERSION := v1.1.4
+GOVULNCHECK_VERSION := v1.8.0
 ACTIONLINT_VERSION := v1.7.12
 
 release-check:

@@ -78,7 +78,7 @@ func TestPublishedPortAcceptsValidHostAddresses(t *testing.T) {
 	f := newTestRunner()
 	for _, spec := range []string{"127.0.0.1:8080:80", "[::1]:8080:80", "8080:80"} {
 		if _, err := Run(context.Background(), "redis:7-alpine",
-			WithName("myctr"), WithPublishedPort(spec), withRunner(f)); err != nil {
+			WithName("myctr"), WithPublishedPort(spec), withRunner(f), withEngine(appleEngine{})); err != nil {
 			t.Errorf("spec %q: unexpected error %v", spec, err)
 		}
 	}

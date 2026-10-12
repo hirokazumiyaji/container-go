@@ -44,18 +44,40 @@ func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
 	return s
 }
 
-func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *ExecStrategy) validate() error {
+	if err := s.options.validate(); err != nil {
+		return err
+	}
 	if len(s.cmd) == 0 {
-		return errors.New("wait for exec: command must not be empty")
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "command",
+			Reason:   "command must not be empty",
+		}
+	}
+	if s.cmd[0] == "" {
+		return &ConfigError{
+			Strategy: "ForExec",
+			Field:    "executable",
+			Reason:   "executable must not be empty",
+		}
+	}
+	return nil
+}
+
+func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+	if err := s.validate(); err != nil {
+		return err
 	}
 	matcher := s.exitMatcher
 	if matcher == nil {
 		matcher = func(code int) bool { return code == 0 }
 	}
-	// checkRunning is false: each check already talks to the container
-	// via exec, so a concurrent Running probe would only add spawns.
-	// A stopped container is still reported once at timeout.
-	return poll(ctx, s.options, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
+	pollOptions := s.options
+	if pollOptions.pollInterval == 0 {
+		pollOptions.pollInterval = defaultExecPollInterval
+	}
+	return poll(ctx, pollOptions, target, fmt.Sprintf("wait for exec %v", s.cmd), func(ctx context.Context) error {
 		code, err := target.ExecCommand(ctx, s.cmd)
 		if err != nil {
 			// Command exits are returned as codes. Only a CLI launch
@@ -71,5 +93,5 @@ func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return fmt.Errorf("exit code %d not accepted", code)
 		}
 		return nil
-	}, false)
+	})
 }

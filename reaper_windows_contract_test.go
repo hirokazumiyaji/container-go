@@ -20,7 +20,7 @@ func TestReviewReaperRegistrationIsANoOpOnWindows(t *testing.T) {
 	// no shell. The reaper has no process to spawn, so a global registry
 	// entry must not be created either.
 	before := len(globalReapers)
-	registerWithGlobalReaper("docker", "rm", strings.Repeat("a", 64), "")
+	registerWithGlobalReaper("docker", "rm", []string{dockerDeleteVolumesFlag}, strings.Repeat("a", 64), "")
 	if got := len(globalReapers); got != before {
 		t.Errorf("globalReapers grew from %d to %d on Windows; registration must be a no-op", before, got)
 	}

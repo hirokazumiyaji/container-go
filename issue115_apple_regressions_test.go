@@ -34,6 +34,7 @@ type issue115AppleAddressRunner struct {
 	originalPullErr   error
 	runImage          string
 	platform          string
+	creation          string
 	inspectTargets    []string
 	pullTargets       []string
 }
@@ -76,6 +77,11 @@ func (r *issue115AppleAddressRunner) Run(_ context.Context, args ...string) ([]b
 			if arg == "--platform" && i+1 < len(args) {
 				r.platform = args[i+1]
 			}
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = value
+				}
+			}
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
@@ -87,7 +93,7 @@ func (r *issue115AppleAddressRunner) Run(_ context.Context, args ...string) ([]b
 		if platform == "" {
 			platform = "linux/arm64/v8"
 		}
-		return issue115ReviewContainerJSON(image, "sha256:1111111111111111111111111111111111111111111111111111111111111111", platform), nil, nil
+		return issue115ReviewContainerJSON(image, "sha256:1111111111111111111111111111111111111111111111111111111111111111", platform, r.creation), nil, nil
 	default:
 		return nil, nil, nil
 	}

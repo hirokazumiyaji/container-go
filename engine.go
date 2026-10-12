@@ -1,7 +1,9 @@
 package container
 
 import (
-	"errors"
+	"context"
+	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -64,10 +66,11 @@ type imageIdentity struct {
 // engineInfo is the backend-neutral view of one inspected container.
 type engineInfo struct {
 	state  State
+	name   string
 	labels map[string]string
 	// uid is the backend-assigned immutable identity (Docker's 64-hex
 	// Id). Empty when the backend addresses containers by name only
-	// (Apple Container), where a delete cannot be bound to a generation.
+	// (Apple Container), where operations remain name-based.
 	uid string
 	// image is the image reference the container was created from. It
 	// includes a digest when the backend reports one.
@@ -80,13 +83,26 @@ type engineInfo struct {
 	// imageVariantDigest is populated when the backend reports the selected
 	// platform manifest separately from the root index.
 	imageVariantDigest string
-	// platform is the platform selected when the container was created.
-	// Empty means the backend did not report it; it must not be inferred
-	// from a root index digest.
-	platform string
+	// platform is the platform reported by inspect, normalized when
+	// possible. platformMeta retains whether each component was actually
+	// reported so an incomplete value cannot silently become a wildcard.
+	platform     string
+	platformMeta platformMetadata
 	// ip is the container's address on its first network; empty when
 	// the backend did not report one.
 	ip string
+	// networkMode is the backend's reported network mode. Docker uses
+	// this to distinguish a real host binding from a request that the
+	// daemon discarded (for example, -p with host networking).
+	networkMode string
+	// networkNames contains the actual attached network names reported by
+	// Docker. It resolves the API's special "default" mode to the daemon's
+	// concrete default network (bridge on Linux, nat on Windows).
+	networkNames []string
+	// defaultNetwork is the authoritative Docker daemon default identity
+	// (bridge on Linux, nat on Windows). It is daemon metadata rather than
+	// container identity, so it is not cached with the immutable fields.
+	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
 	bound []boundPort
@@ -108,19 +124,29 @@ type engine interface {
 	probe() cli.Probe
 	// checkConfig rejects option combinations this backend cannot
 	// honor before anything is created.
-	checkConfig(cfg *config) error
+	checkConfig(ctx context.Context, cfg *config) error
 	runArgs(cfg *config, image, envFile string) []string
 	// parseRunID extracts the immutable container ID from run output;
 	// empty when the backend has none (Apple Container prints the name).
 	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
-	stopArgs(id string, timeout *time.Duration) []string
+	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
 	copyFromArgs(id, containerPath, hostPath string) []string
+	// checkCopyFileFromContainer rejects backends whose copy-out cannot
+	// preserve file types and reject links/special files before host open.
+	checkCopyFileFromContainer() error
+	// checkCopyFileFromContainerVersion verifies backend-specific
+	// minimum versions before a copy-out creates a private temp directory.
+	checkCopyFileFromContainerVersion(context.Context, cli.Runner) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
-	logsArgs(id string, follow bool) []string
+	// logsFollowArgs builds the streaming follow argv.
+	logsFollowArgs(id string) []string
+	// logsArgsWithOptions builds snapshot args and rejects options the
+	// backend cannot honor.
+	logsArgsWithOptions(id string, opts LogsOptions) ([]string, error)
 	// logsTailArgs fetches a bounded tail for diagnostics without
 	// pulling the full log stream.
 	logsTailArgs(id string) []string
@@ -134,17 +160,20 @@ type engine interface {
 	// parseReuseGroupIDs extracts container IDs from listReuseGroupArgs
 	// output that carry the given reuse group.
 	parseReuseGroupIDs(data []byte, group string) ([]string, error)
-	// nameConflict reports whether a failed run for target means the
-	// container name is already taken by another create.
-	nameConflict(operation, target string, err error) bool
-	// createRaceMissing reports a backend-specific concurrent-create miss.
-	createRaceMissing(operation, target string, err error) bool
-	// containerMissing reports whether a lifecycle operation for target
-	// means that the container does not exist.
-	containerMissing(operation, target string, err error) bool
+	// nameConflict reports whether a failed run means the container
+	// name is already taken by another create.
+	nameConflict(err error) bool
+	nameConflictForTarget(err error, target string) bool
+	// containerMissing reports whether a backend error specifically means
+	// that the requested container is absent. It must use the CLI operation
+	// and target rather than matching arbitrary "not found" text.
+	containerMissing(err error) bool
 	// reaperSubcommand is the delete subcommand the watchdog reaper
-	// runs as `<binary> <subcommand> --force <id>`.
+	// runs as `<binary> <subcommand> --force [backend flags] <id>`.
 	reaperSubcommand() string
+	// reaperDeleteFlags returns backend-specific delete options passed
+	// after --force and before the container ID.
+	reaperDeleteFlags() []string
 	// directIP reports whether clients connect straight to the
 	// container IP (Apple Container) instead of published host ports
 	// (Docker).
@@ -161,9 +190,48 @@ type engine interface {
 	// imageMissing reports whether a failed image inspect means the
 	// image is not in the local store.
 	imageMissing(err error) bool
+	imageMissingForTarget(err error, target string) bool
 	// parseImageExists interprets image inspect output, considering the
 	// requested platform variant when set.
 	parseImageExists(data []byte, platform string) bool
+	// platformCompatible compares a requested platform selector with the
+	// platform this backend reports from container inspect.
+	platformCompatible(selector, actual string) bool
+	// imageStoreID identifies the backend's image store so a presence
+	// cache entry recorded against one daemon or default platform is not
+	// reused against another (for Docker: DOCKER_HOST, DOCKER_CONTEXT,
+	// DOCKER_CONFIG, DOCKER_DEFAULT_PLATFORM).
+	imageStoreID() string
+}
+
+func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {
+	args := []string{"stop"}
+	if timeout != nil {
+		seconds, err := stopTimeoutSeconds(*timeout, maxSeconds)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "--time", strconv.FormatInt(seconds, 10))
+	}
+	return append(args, id), nil
+}
+
+// stopTimeoutSeconds rounds up so the backend never grants less grace than
+// the caller requested, then checks the rounded value against the backend's
+// seconds limit. The result is int64 so the validation does not depend on the
+// host architecture's native int width.
+func stopTimeoutSeconds(timeout time.Duration, maxSeconds int64) (int64, error) {
+	if timeout < 0 {
+		return 0, fmt.Errorf("stop timeout must be non-negative: %s", timeout)
+	}
+	seconds := int64(timeout / time.Second)
+	if timeout%time.Second != 0 {
+		seconds++
+	}
+	if seconds > maxSeconds {
+		return 0, fmt.Errorf("stop timeout %s exceeds backend limit of %d seconds", timeout, maxSeconds)
+	}
+	return seconds, nil
 }
 
 // imageReferenceWithDigest builds the immutable reference used for run.
@@ -301,42 +369,6 @@ func applePlatformMetadataCompatible(a, b string) bool {
 	ap, aok := parseApplePlatformSelector(a)
 	bp, bok := parseApplePlatformSelector(b)
 	return aok && bok && applePlatformsEqual(ap, bp)
-}
-
-// imageCLIErrorForBackend returns a CLI error only when it came from the
-// requested backend image operation. The binary and command checks keep an
-// error from one backend from being classified as another backend's absence.
-func imageCLIErrorForBackend(err error, backend string) (*cli.CLIError, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return nil, false
-	}
-	backend = strings.ToLower(strings.TrimSpace(backend))
-	if binary := strings.ToLower(strings.TrimSpace(cliErr.Binary)); binary != "" && binary != backend {
-		return nil, false
-	}
-	if len(cliErr.Args) < 2 {
-		return nil, false
-	}
-	switch strings.ToLower(cliErr.Args[0]) {
-	case "image":
-		if len(cliErr.Args) < 3 {
-			return nil, false
-		}
-		switch strings.ToLower(cliErr.Args[1]) {
-		case "inspect", "pull":
-		default:
-			return nil, false
-		}
-	case "pull":
-	default:
-		return nil, false
-	}
-	target := strings.ToLower(strings.TrimSpace(cliErr.Args[len(cliErr.Args)-1]))
-	if target == "" || strings.HasPrefix(target, "--") {
-		return nil, false
-	}
-	return cliErr, true
 }
 
 // isImageID recognizes Docker's content-addressed local image ID. The

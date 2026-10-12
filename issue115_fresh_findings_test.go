@@ -251,33 +251,39 @@ func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testin
 		ExitCode: 1,
 		Stderr:   `Error: container "wanted" already exists`,
 	}
-	if !(appleEngine{}).nameConflict(lifecycleRun, "wanted", appleConflict) {
+	if !(appleEngine{}).nameConflictForTarget(appleConflict, "wanted") {
 		t.Fatal("Apple name conflict was not recognized")
 	}
-	if (appleEngine{}).nameConflict(lifecycleInspect, "wanted", appleConflict) {
+	inspectConflict := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"inspect", "wanted"},
+		ExitCode: 1,
+		Stderr:   `Error: container "wanted" already exists`,
+	}
+	if (appleEngine{}).nameConflictForTarget(inspectConflict, "wanted") {
 		t.Fatal("Apple name conflict was accepted for inspect")
 	}
-	if (appleEngine{}).nameConflict(lifecycleRun, "other", appleConflict) {
+	if (appleEngine{}).nameConflictForTarget(appleConflict, "other") {
 		t.Fatal("Apple name conflict was accepted for a different target")
 	}
-	if (appleEngine{}).nameConflict(lifecycleRun, "wanted", &cli.CLIError{
+	if (appleEngine{}).nameConflictForTarget(&cli.CLIError{
 		Binary:   "docker",
 		Args:     appleConflict.Args,
 		ExitCode: 1,
 		Stderr:   appleConflict.Stderr,
-	}) {
+	}, "wanted") {
 		t.Fatal("Apple name conflict accepted a Docker error")
 	}
 	for _, stderr := range []string{
 		`Error: image configuration "wanted" already exists`,
 		`Error: container configuration "wanted" already exists`,
 	} {
-		if (appleEngine{}).nameConflict(lifecycleRun, "wanted", &cli.CLIError{
+		if (appleEngine{}).nameConflictForTarget(&cli.CLIError{
 			Binary:   "container",
 			Args:     appleConflict.Args,
 			ExitCode: 1,
 			Stderr:   stderr,
-		}) {
+		}, "wanted") {
 			t.Fatalf("image/config conflict was classified as a container name conflict: %q", stderr)
 		}
 	}
@@ -288,15 +294,15 @@ func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testin
 		ExitCode: 1,
 		Stderr:   `Conflict. The container name "/wanted" is already in use by container`,
 	}
-	if !(dockerEngine{}).nameConflict(lifecycleRun, "wanted", dockerConflict) {
+	if !(dockerEngine{}).nameConflictForTarget(dockerConflict, "wanted") {
 		t.Fatal("Docker name conflict was not recognized")
 	}
-	if (dockerEngine{}).nameConflict(lifecycleRun, "wanted", &cli.CLIError{
+	if (dockerEngine{}).nameConflictForTarget(&cli.CLIError{
 		Binary:   "docker",
 		Args:     dockerConflict.Args,
 		ExitCode: 1,
 		Stderr:   `Conflict. The image configuration "wanted" already exists`,
-	}) {
+	}, "wanted") {
 		t.Fatal("Docker image configuration conflict was classified as a container name conflict")
 	}
 
@@ -306,25 +312,25 @@ func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testin
 		ExitCode: 1,
 		Stderr:   `Error: No such object: wanted`,
 	}
-	if !(dockerEngine{}).containerMissing(lifecycleInspect, "wanted", missing) {
+	if !isNotFoundForOperation(dockerEngine{}, missing, "inspect", "wanted") {
 		t.Fatal("Docker missing container was not recognized")
 	}
-	if (dockerEngine{}).containerMissing(lifecycleRun, "wanted", missing) {
+	if isNotFoundForOperation(dockerEngine{}, missing, "run", "wanted") {
 		t.Fatal("Docker missing container was accepted for run")
 	}
-	if (dockerEngine{}).containerMissing(lifecycleInspect, "other", missing) {
+	if isNotFoundForOperation(dockerEngine{}, missing, "inspect", "other") {
 		t.Fatal("Docker missing container was accepted for another target")
 	}
 	for _, stderr := range []string{
 		`/bin/sh: missing-command: not found`,
 		`application error: not found: "wanted"`,
 	} {
-		if (dockerEngine{}).containerMissing(lifecycleExec, "wanted", &cli.CLIError{
+		if isNotFoundForOperation(dockerEngine{}, &cli.CLIError{
 			Binary:   "docker",
 			Args:     []string{"exec", "wanted", "missing-command"},
 			ExitCode: 127,
 			Stderr:   stderr,
-		}) {
+		}, "exec", "wanted") {
 			t.Fatalf("application not-found was classified as a missing container: %q", stderr)
 		}
 	}
@@ -335,13 +341,24 @@ func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testin
 		ExitCode: 1,
 		Stderr:   `Error: container with id "wanted" not found`,
 	}
-	if !(appleEngine{}).createRaceMissing(lifecycleRun, "wanted", race) {
+	if !createRaceMissingForTarget(race, "wanted") {
 		t.Fatal("Apple create race was not recognized")
 	}
-	if (appleEngine{}).createRaceMissing(lifecycleInspect, "wanted", race) {
+	inspectRace := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"inspect", "wanted"},
+		ExitCode: 1,
+		Stderr:   `Error: container with id "wanted" not found`,
+	}
+	if createRaceMissingForTarget(inspectRace, "wanted") {
 		t.Fatal("Apple create race was accepted for inspect")
 	}
-	if (dockerEngine{}).createRaceMissing(lifecycleRun, "wanted", race) {
+	if createRaceMissingForTarget(&cli.CLIError{
+		Binary:   "docker",
+		Args:     race.Args,
+		ExitCode: 1,
+		Stderr:   race.Stderr,
+	}, "wanted") {
 		t.Fatal("Docker was classified as having Apple's create race")
 	}
 }
@@ -388,7 +405,7 @@ func (r *issue115ExecAppRunner) Run(ctx context.Context, args ...string) ([]byte
 }
 
 func TestIssue115ExecApplicationNotFoundDoesNotProbeAsMissingContainer(t *testing.T) {
-	base := newTestRunner()
+	base := newDockerTestRunner()
 	ctr := runTestContainer(t, base, withEngine(dockerEngine{}))
 	r := &issue115ExecAppRunner{fakeRunner: base}
 	ctr.runner = r

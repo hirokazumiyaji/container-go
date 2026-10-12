@@ -58,25 +58,40 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 				}
 			}
 		}
+		if r.docker {
+			return []byte("cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\n"), nil, nil
+		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
 		if !r.created {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+			bin := "container"
+			if r.docker {
+				bin = "docker"
+			}
+			return nil, nil, &cli.CLIError{Binary: bin, Args: args, ExitCode: 1, Stderr: "Error: container not found: myctr\nError: No such object: myctr"}
+		}
+		creation := r.creation
+		if creation == "" {
+			creation = "0123456789abcdef"
 		}
 		if r.docker {
 			return issue115JSONBytes([]map[string]any{{
-				"Id":    "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-				"Image": r.imageID,
+				"Id":         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+				"Image":      r.imageID,
+				"HostConfig": map[string]any{"NetworkMode": "bridge"},
 				"Config": map[string]any{
 					"Image": r.containerImage,
 					"Labels": map[string]string{
 						managedLabel:  "true",
 						reuseLabel:    "true",
-						creationLabel: r.creation,
+						creationLabel: creation,
 					},
 				},
-				"State":           map[string]string{"Status": "running"},
-				"NetworkSettings": map[string]any{"Ports": map[string]any{}},
+				"State": map[string]string{"Status": "running"},
+				"NetworkSettings": map[string]any{
+					"Networks": map[string]any{"bridge": map[string]any{}},
+					"Ports":    map[string]any{},
+				},
 			}}), nil, nil
 		}
 		return issue115JSONBytes([]map[string]any{{
@@ -92,7 +107,7 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 				"labels": map[string]string{
 					managedLabel:  "true",
 					reuseLabel:    "true",
-					creationLabel: r.creation,
+					creationLabel: creation,
 				},
 			},
 			"status": map[string]any{
@@ -103,6 +118,8 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 	case args[0] == "delete" || args[0] == "rm":
 		r.deleted = true
 		return nil, nil, nil
+	case args[0] == "version":
+		return []byte("linux\n"), nil, nil
 	default:
 		return nil, nil, nil
 	}

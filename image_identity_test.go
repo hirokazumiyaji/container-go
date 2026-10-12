@@ -99,6 +99,7 @@ type issue115AppleTagSwapRunner struct {
 	resolvedDigest string
 	swapOnInspect  bool
 	runImage       string
+	creation       string
 }
 
 func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -131,6 +132,11 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		return nil, nil, nil
 	case args[0] == "run":
 		r.runImage = args[len(args)-1]
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) && strings.HasPrefix(args[i+1], creationLabel+"=") {
+				r.creation = strings.TrimPrefix(args[i+1], creationLabel+"=")
+			}
+		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
 		image := stripImageDigest(r.runImage)
@@ -141,7 +147,7 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		if digest == "" {
 			digest = issue115ImageIdentityOld
 		}
-		return issue115ReviewContainerJSON(image, digest, issue115FreshHostPlatform()), nil, nil
+		return issue115ReviewContainerJSON(image, digest, issue115FreshHostPlatform(), r.creation), nil, nil
 	default:
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "unexpected command"}
 	}

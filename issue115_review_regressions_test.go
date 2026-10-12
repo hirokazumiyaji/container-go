@@ -52,6 +52,7 @@ type issue115ReviewRunner struct {
 	pullCalls        int
 	runImage         string
 	platform         string
+	creation         string
 	calls            [][]string
 }
 
@@ -78,6 +79,9 @@ func (r *issue115ReviewRunner) Run(_ context.Context, args ...string) ([]byte, [
 			if arg == "--platform" && i+1 < len(args) {
 				r.platform = args[i+1]
 			}
+			if arg == "--label" && i+1 < len(args) && strings.HasPrefix(args[i+1], creationLabel+"=") {
+				r.creation = strings.TrimPrefix(args[i+1], creationLabel+"=")
+			}
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
@@ -89,7 +93,7 @@ func (r *issue115ReviewRunner) Run(_ context.Context, args ...string) ([]byte, [
 		if platform == "" {
 			platform = "linux/amd64"
 		}
-		return issue115ReviewContainerJSON(image, issue115ReviewRoot, platform), nil, nil
+		return issue115ReviewContainerJSON(image, issue115ReviewRoot, platform, r.creation), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -101,7 +105,7 @@ func (r *issue115ReviewRunner) state() (runImage string, inspectCalls, pullCalls
 	return r.runImage, r.inspectCalls, r.pullCalls
 }
 
-func issue115ReviewContainerJSON(image, digest, platform string) []byte {
+func issue115ReviewContainerJSON(image, digest, platform string, creation ...string) []byte {
 	parts := strings.Split(platform, "/")
 	platformJSON := map[string]string{}
 	if len(parts) > 0 {
@@ -113,6 +117,12 @@ func issue115ReviewContainerJSON(image, digest, platform string) []byte {
 	if len(parts) > 2 {
 		platformJSON["variant"] = parts[2]
 	}
+	labels := map[string]string{managedLabel: "true", sessionLabel: sessionID()}
+	gen := "0123456789abcdef"
+	if len(creation) > 0 && creation[0] != "" {
+		gen = creation[0]
+	}
+	labels[creationLabel] = gen
 	data, _ := json.Marshal([]any{map[string]any{
 		"id": "myctr",
 		"configuration": map[string]any{
@@ -122,6 +132,7 @@ func issue115ReviewContainerJSON(image, digest, platform string) []byte {
 				"descriptor": map[string]string{"digest": digest},
 			},
 			"platform": platformJSON,
+			"labels":   labels,
 		},
 		"status": map[string]any{"state": "running", "networks": []any{}},
 	}})
@@ -451,7 +462,9 @@ func (r *issue115DockerIDRunner) Run(_ context.Context, args ...string) ([]byte,
 		return r.inspect, nil, nil
 	case args[0] == "run":
 		r.runImage = args[len(args)-1]
-		return []byte("myctr\n"), nil, nil
+		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
+	case args[0] == "inspect":
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Config":{"Image":%q,"Labels":{%q:"true",%q:"0123456789abcdef"}}}]`, strings.Repeat("a", 64), r.runImage, managedLabel, creationLabel)), nil, nil
 	default:
 		return nil, nil, nil
 	}

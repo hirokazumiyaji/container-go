@@ -1112,10 +1112,11 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 	if c.info != nil && !sameImmutableInfo(c.info, identity) {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if c.uid != "" && c.uid != identity.uid {
+	uid := c.immutableID()
+	if uid != "" && uid != identity.uid {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if c.uid == "" && c.info != nil && c.info.uid != "" && c.info.uid != identity.uid {
+	if uid == "" && c.info != nil && c.info.uid != "" && c.info.uid != identity.uid {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	if c.creation != "" {
@@ -1125,7 +1126,7 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 		}
 		// Once a name-only handle has observed its generation, losing
 		// the label is also evidence of a replacement.
-		if actual == "" && c.uid == "" && c.info != nil && c.info.labels[creationLabel] != "" {
+		if actual == "" && uid == "" && c.info != nil && c.info.labels[creationLabel] != "" {
 			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
 	}
@@ -1226,8 +1227,8 @@ func mergeImmutableInfo(old, current *engineInfo) *engineInfo {
 // the handle. The caller must hold inspectMu. A temporary name lookup is
 // the only path allowed to use a logical name for Docker.
 func (c *Container) inspectTargetLocked() string {
-	if c.uid != "" {
-		return c.uid
+	if uid := c.immutableID(); uid != "" {
+		return uid
 	}
 	return c.id
 }
@@ -1239,7 +1240,7 @@ func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string,
 		return "", "", err
 	}
 	defer c.inspectMu.Unlock()
-	return c.uid, c.creation, nil
+	return c.immutableID(), c.creation, nil
 }
 
 // verifiedOperationTarget is the safe target for lifecycle, copy, exec,
@@ -1254,7 +1255,7 @@ func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error)
 		return "", err
 	}
 	defer c.inspectMu.Unlock()
-	uid := c.uid
+	uid := c.immutableID()
 	creation := c.creation
 	if requiresImmutableID(c.eng) {
 		if !validImmutableID(c.eng, uid) {
@@ -1353,7 +1354,7 @@ func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
 }
 
 func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error) {
-	uid := c.uid
+	uid := c.immutableID()
 	if requiresImmutableID(c.eng) {
 		if uid != "" && !validImmutableID(c.eng, uid) {
 			return nil, identityError("Docker handle has an invalid immutable container ID")

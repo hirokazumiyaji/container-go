@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +24,7 @@ type blockingExternalRunner struct {
 func (r *blockingExternalRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "image":
-		return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+		return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 	case "run":
 		r.startOne.Do(func() { close(r.started) })
 		select {
@@ -33,7 +34,16 @@ func (r *blockingExternalRunner) Run(ctx context.Context, args ...string) ([]byt
 		}
 		return []byte("pre-shared\n"), nil, nil
 	case "inspect":
-		return []byte(fmt.Sprintf(`[{"id":"pre-shared","configuration":{"id":"pre-shared","image":{"reference":"redis:7-alpine"},"labels":{%q:"true",%q:%q,%q:"true",%q:"pre-group",%q:"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, managedLabel, sessionLabel, sessionID(), reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
+		platformParts := strings.Split(appleHostPlatform(), "/")
+		platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+		variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		if strings.Contains(platformParts[1], "arm") {
+			variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		}
+		if len(platformParts) == 3 {
+			platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+		}
+		return []byte(fmt.Sprintf(`[{"id":"pre-shared","configuration":{"id":"pre-shared","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{%q:"true",%q:%q,%q:"true",%q:"pre-group",%q:"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest, managedLabel, sessionLabel, sessionID(), reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	default:
 		return nil, nil, nil
 	}
@@ -52,7 +62,7 @@ type uncertainExternalRunner struct {
 func (r *uncertainExternalRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "image":
-		return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+		return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 	case "run":
 		return []byte("uncertain\n"), nil, nil
 	case "inspect":

@@ -26,6 +26,7 @@ func review91OwnedDockerInspect(uid, generation string, reused, bound bool) stri
 	}
 	return fmt.Sprintf(`[{
 		"Id":%q,
+		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/myctr",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"%s":"true",

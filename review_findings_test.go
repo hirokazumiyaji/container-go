@@ -94,7 +94,7 @@ func (r *reuseRollbackReviewRunner) Run(_ context.Context, args ...string) ([]by
 	switch args[0] {
 	case "image":
 		if args[1] == "inspect" {
-			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+			return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]}]`), nil, nil
 		}
 		return nil, nil, nil
 	case "run":
@@ -111,7 +111,13 @@ func (r *reuseRollbackReviewRunner) Run(_ context.Context, args ...string) ([]by
 		if r.creation == "" {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "shared"`}
 		}
-		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","image":{"reference":"redis:7-alpine"},"labels":{%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, reuseLabel, creationLabel, r.creation)), nil, nil
+		variant := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		arch := "amd64"
+		if strings.Contains(appleHostPlatform(), "arm64") {
+			variant = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+			arch = "arm64"
+		}
+		return []byte(fmt.Sprintf(`[{"id":"shared","configuration":{"id":"shared","platform":{"os":"linux","architecture":%q},"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{%q:"true",%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, arch, variant, managedLabel, reuseLabel, creationLabel, r.creation)), nil, nil
 	case "cp":
 		return nil, nil, r.copyErr
 	case "delete", "rm":

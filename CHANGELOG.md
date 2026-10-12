@@ -15,6 +15,19 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Resolve inspected image digests or Docker image IDs before create, retain
+  the identity on the handle, compare reuse by that identity, verify
+  Apple-created image identity before returning, and remove newly-created
+  containers when post-create validation fails.
+  Expose `WithAllowMutableImageTag` plus identity-related errors for
+  explicit fallback and fail-closed policies; handle foreign Docker
+  RepoDigests with the inspected local ID, require Apple pinned references
+  to be locally addressable, and keep operational addressability errors
+  distinct from successful identity-unavailable results. Treat Apple
+  `name@digest` and `name:tag@digest` references as pinned, validate
+  selected platform variants while retaining the root index digest, and
+  accept verified unprefixed Docker image IDs in canonical `sha256:`
+  form.
 - Add `LogsOptions` and `LogsWithOptions` for requesting a snapshot
   window with `Tail` and `Since`. Docker supports both options; the
   Apple-specific mapping and unsupported `Since` behavior are tracked by

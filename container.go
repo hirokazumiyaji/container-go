@@ -156,6 +156,11 @@ type Container struct {
 	uid   string
 	uidMu sync.RWMutex
 
+	// image is the image identity resolved immediately before create.
+	// reference is what was passed to run; it is immutable-pinned
+	// unless the caller explicitly allowed the mutable-tag fallback.
+	image imageIdentity
+
 	mu        sync.Mutex
 	info      *engineInfo // immutable identity snapshot; dynamic data is never cached
 	inspectMu contextLock // serializes inspect target selection and UID publication
@@ -267,6 +272,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 		}
 	}
+	materializeAppleRunPlatform(cfg)
 	if cfg.reuse {
 		if err := runCtx.Err(); err != nil {
 			return nil, err
@@ -280,8 +286,10 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 
 	// The pull policy brings the image into the local store before the
 	// run command; both share the aggregated flight so concurrent Runs
-	// of the same image pull once.
-	if err := cfg.ensureImage(runCtx, image); err != nil {
+	// of the same image pull once. The resolved reference, rather than
+	// the caller's mutable tag, is passed to run.
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
 		return nil, err
 	}
 	// Do not put secrets on disk while an image pull may be waiting for
@@ -318,7 +326,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// the reaper can wait for the pending generation instead of missing
 	// the container entirely.
 	preRegisterRunWithGlobalReaper(cfg)
-	stdout, _, attempted, runErr := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
+	stdout, _, attempted, runErr := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, resolvedImage.reference, envFile)...)
 	envCleanupErr := cleanupEnvFileAfterUseContext(runCtx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
@@ -356,6 +364,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		networkExplicit: cfg.networkExplicit,
 		creation:        cfg.creation,
 		uid:             uid,
+		image:           resolvedImage,
 	}
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
@@ -382,6 +391,9 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		if uid := c.immutableID(); uid != "" {
 			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, uid, "")
 		}
+	}
+	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
+		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 	}
 	// Do not perform file copies or readiness polling while the env file
 	// still exists. The handle is usable, and the deferred retry retains
@@ -1122,6 +1134,9 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 	} else {
 		c.info = mergeImmutableInfo(c.info, identity)
 	}
+	if c.image.reference == "" {
+		c.image = imageFromInfo(info)
+	}
 	return nil
 }
 
@@ -1137,7 +1152,16 @@ func immutableInfo(info *engineInfo) *engineInfo {
 	for key, value := range info.labels {
 		labels[key] = value
 	}
-	return &engineInfo{uid: info.uid, image: info.image, labels: labels}
+	return &engineInfo{
+		uid:                info.uid,
+		image:              info.image,
+		imageID:            info.imageID,
+		imageDigest:        info.imageDigest,
+		imageVariantDigest: info.imageVariantDigest,
+		platform:           info.platform,
+		platformMeta:       info.platformMeta,
+		labels:             labels,
+	}
 }
 
 func sameImmutableInfo(a, b *engineInfo) bool {
@@ -1148,6 +1172,15 @@ func sameImmutableInfo(a, b *engineInfo) bool {
 		return false
 	}
 	if a.image != "" && b.image != "" && a.image != b.image {
+		return false
+	}
+	if a.imageID != "" && b.imageID != "" && a.imageID != b.imageID {
+		return false
+	}
+	if a.imageDigest != "" && b.imageDigest != "" && !strings.EqualFold(a.imageDigest, b.imageDigest) {
+		return false
+	}
+	if a.imageVariantDigest != "" && b.imageVariantDigest != "" && !strings.EqualFold(a.imageVariantDigest, b.imageVariantDigest) {
 		return false
 	}
 	for key, value := range a.labels {
@@ -1165,6 +1198,21 @@ func mergeImmutableInfo(old, current *engineInfo) *engineInfo {
 	}
 	if merged.image == "" {
 		merged.image = current.image
+	}
+	if merged.imageID == "" {
+		merged.imageID = current.imageID
+	}
+	if merged.imageDigest == "" {
+		merged.imageDigest = current.imageDigest
+	}
+	if merged.imageVariantDigest == "" {
+		merged.imageVariantDigest = current.imageVariantDigest
+	}
+	if merged.platform == "" {
+		merged.platform = current.platform
+	}
+	if !merged.platformMeta.valid && current.platformMeta.valid {
+		merged.platformMeta = current.platformMeta
 	}
 	for key, value := range current.labels {
 		if _, ok := merged.labels[key]; !ok {

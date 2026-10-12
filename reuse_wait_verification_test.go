@@ -47,12 +47,16 @@ func reuseBackendFixtures() []reuseBackendFixture {
 }
 
 func (f reuseBackendFixture) runningSpec() reuseInspectSpec {
+	platform := "linux/amd64"
+	if f.eng != nil && f.eng.name() == "apple" {
+		platform = appleHostPlatform()
+	}
 	return reuseInspectSpec{
 		uid:      f.uid,
 		state:    "running",
 		image:    "redis:7-alpine",
 		creation: f.creation,
-		platform: "linux/amd64",
+		platform: platform,
 		ports: []boundPort{{
 			containerPort: 6379,
 			proto:         "tcp",
@@ -74,7 +78,7 @@ func dockerReuseInspectJSON(spec reuseInspectSpec) []byte {
 	return marshalReuseInspectJSON([]map[string]any{{
 		"Id":      spec.uid,
 		"Created": "2026-08-19T01:23:45.678901234Z",
-		"Image":   "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+		"Image":   "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":    "/shared",
 		"State":   map[string]string{"Status": spec.state},
 		"HostConfig": map[string]any{
@@ -105,13 +109,18 @@ func appleReuseInspectJSON(spec reuseInspectSpec) []byte {
 			"proto":         port.proto,
 		})
 	}
+	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if strings.Contains(spec.platform, "arm64") {
+		variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	}
 	return marshalReuseInspectJSON([]map[string]any{{
 		"id": "shared",
 		"configuration": map[string]any{
 			"id": "shared",
 			"image": map[string]any{
-				"reference":  spec.image,
-				"descriptor": map[string]string{"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+				"reference":     spec.image,
+				"descriptor":    map[string]string{"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+				"variantDigest": variantDigest,
 			},
 			"labels":         reuseInspectLabels(spec.creation),
 			"platform":       platformInspectJSON(spec.platform),
@@ -164,9 +173,14 @@ type reuseTransitionRunner struct {
 	inspectCalls      int
 }
 
-func newReuseTransitionRunner(before, after []byte) *reuseTransitionRunner {
+func newReuseTransitionRunner(before, after []byte, eng engine) *reuseTransitionRunner {
+	f := newTestRunner()
+	if eng != nil && eng.name() == "docker" {
+		f.binary = "docker"
+	}
+	f.imagePresent = true
 	return &reuseTransitionRunner{
-		fakeRunner: newTestRunner(),
+		fakeRunner: f,
 		before:     before,
 		after:      after,
 	}
@@ -220,7 +234,7 @@ func TestReuseRejectsReplacementDuringWait(t *testing.T) {
 			} else {
 				after.creation = "bbbbbbbbbbbbbbbb"
 			}
-			runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after))
+			runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after), backend.eng)
 			strategy := &replaceDuringWaitStrategy{replace: runner.replace}
 
 			ctr, err := Run(context.Background(), "redis:7-alpine",
@@ -255,7 +269,7 @@ func TestReuseVerifiesGenerationWithoutWait(t *testing.T) {
 			} else {
 				after.creation = "bbbbbbbbbbbbbbbb"
 			}
-			runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after))
+			runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after), backend.eng)
 			runner.replaceAfterFirst = true
 
 			ctr, err := Run(context.Background(), "redis:7-alpine",
@@ -280,7 +294,7 @@ func TestReuseSucceedsWhenGenerationUnchangedAfterWait(t *testing.T) {
 	for _, backend := range reuseBackendFixtures() {
 		t.Run(backend.name, func(t *testing.T) {
 			spec := backend.runningSpec()
-			runner := newReuseTransitionRunner(backend.inspect(spec), backend.inspect(spec))
+			runner := newReuseTransitionRunner(backend.inspect(spec), backend.inspect(spec), backend.eng)
 			strategy := &replaceDuringWaitStrategy{replace: func() {}}
 
 			ctr, err := Run(context.Background(), "redis:7-alpine",
@@ -345,10 +359,11 @@ func TestReuseRejectsChangedContainerDuringWait(t *testing.T) {
 		for _, mutation := range mutations {
 			t.Run(backend.name+"/"+mutation.name, func(t *testing.T) {
 				before := backend.runningSpec()
+				before.platform = "linux/amd64"
 				after := before
 				after.ports = append([]boundPort(nil), before.ports...)
 				mutation.change(&after)
-				runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after))
+				runner := newReuseTransitionRunner(backend.inspect(before), backend.inspect(after), backend.eng)
 				strategy := &replaceDuringWaitStrategy{replace: runner.replace}
 
 				ctr, err := Run(context.Background(), "redis:7-alpine",

@@ -55,6 +55,7 @@ func review91ReuseInspectJSON(uid, generation string, bound bool) string {
 	}
 	return fmt.Sprintf(`[{
 		"Id":%q,
+		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/shared",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"com.github.hirokazumiyaji.container-go":"true",
@@ -171,9 +172,13 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 type review91CreatedRunner struct{}
 
 func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
+		return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}]`), nil, nil
+	}
 	if args[0] == "inspect" {
 		return []byte(fmt.Sprintf(`[{
 			"Id":%q,
+			"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"Name":"/shared",
 			"Config":{"Image":"redis:7-alpine","Labels":{
 				"com.github.hirokazumiyaji.container-go":"true",

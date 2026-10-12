@@ -948,6 +948,9 @@ type dockerRunner struct {
 }
 
 func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if d.fakeRunner != nil && d.binary != "docker" {
+		d.binary = "docker"
+	}
 	d.calls = append(d.calls, args)
 	switch args[0] {
 	case "version":
@@ -989,6 +992,8 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 			return d.inspectResponses[index], nil, nil
 		}
 		return d.inspectJSON, nil, nil
+	case "image", "pull":
+		return d.fakeRunner.Run(ctx, args...)
 	default:
 		return nil, nil, nil
 	}

@@ -299,8 +299,8 @@ func TestImageCacheDoesNotCacheAbsence(t *testing.T) {
 	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
 		t.Fatalf("second ensureImage: %v", err)
 	}
-	if got := countInspects(r.calls, "image"); got != 1 {
-		t.Errorf("ran %d image inspects across 2 Runs, want 1", got)
+	if got := countInspects(r.calls, "image"); got != 2 {
+		t.Errorf("ran %d image inspects across 2 Runs, want 2", got)
 	}
 	if r.pullCalls != 1 {
 		t.Errorf("pullCalls = %d after the image was cached present, want 1", r.pullCalls)
@@ -504,8 +504,8 @@ func TestImageCacheIsPerPlatformAndPerBackend(t *testing.T) {
 	if err := appleCfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
 		t.Fatal(err)
 	}
-	if got := countInspects(r.calls, "image"); got != 3 {
-		t.Errorf("ran %d image inspects across two backends, want 3", got)
+	if got := countInspects(r.calls, "image"); got != 4 {
+		t.Errorf("ran %d image inspects across two backends, want 4", got)
 	}
 }
 
@@ -533,8 +533,8 @@ func TestPullNeverStillInspects(t *testing.T) {
 	if err := cfg.ensureImage(ctx, "redis:7-alpine"); err != nil {
 		t.Fatalf("second ensureImage: %v", err)
 	}
-	if got := countInspects(r.calls, "image"); got != 2 {
-		t.Errorf("ran %d image inspects under PullNever, want 2 (the cache must not apply)", got)
+	if got := countInspects(r.calls, "image"); got != 4 {
+		t.Errorf("ran %d image inspects under PullNever, want 4 (the cache must not apply)", got)
 	}
 }
 
@@ -564,8 +564,8 @@ func TestPullAlwaysStillPullsAndRecords(t *testing.T) {
 	if r.pullCalls != 2 {
 		t.Errorf("pullCalls = %d under PullAlways, want 2: the cache must not suppress a mandatory pull", r.pullCalls)
 	}
-	if got := countInspects(r.calls, "image"); got != 0 {
-		t.Errorf("ran %d image inspects under PullAlways, want 0", got)
+	if got := countInspects(r.calls, "image"); got != 2 {
+		t.Errorf("ran %d image inspects under PullAlways, want 2", got)
 	}
 	if got := cfg.imageCache.size(); got != 1 {
 		t.Errorf("cache holds %d entries after two successful pulls, want 1", got)

@@ -163,7 +163,7 @@ type freshReuseAttachRunner struct {
 func (r *freshReuseAttachRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "image":
-		return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+		return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 	case "inspect":
 		r.mu.Lock()
 		r.inspects++
@@ -172,7 +172,16 @@ func (r *freshReuseAttachRunner) Run(_ context.Context, args ...string) ([]byte,
 		if n == 1 {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "temporary inspect failure"}
 		}
-		return []byte(`[{"id":"fresh-reuse","configuration":{"id":"fresh-reuse","image":{"reference":"redis:7-alpine"},"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`), nil, nil
+		platformParts := strings.Split(appleHostPlatform(), "/")
+		platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+		variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		if strings.Contains(platformParts[1], "arm") {
+			variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		}
+		if len(platformParts) == 3 {
+			platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+		}
+		return []byte(fmt.Sprintf(`[{"id":"fresh-reuse","configuration":{"id":"fresh-reuse","platform":%s,"image":{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":%q},"labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true","com.github.hirokazumiyaji.container-go.creation":"0123456789abcdef"}},"status":{"state":"running","networks":[]}}]`, platformJSON, variantDigest)), nil, nil
 	default:
 		return nil, nil, nil
 	}

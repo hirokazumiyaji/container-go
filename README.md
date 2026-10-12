@@ -654,6 +654,68 @@ who need certainty on every `Run` should leave it off. `PullNever` always
 inspects regardless, since its contract is to fail when the image is
 absent.
 
+## Image resolution and pinning
+
+After the inspect (and after a pull, when needed), `Run` resolves the
+image identity and passes that identity to the backend instead of the
+caller's mutable tag. Docker prefers a matching `RepoDigests` entry and
+falls back to the inspected local image `Id`. A local Docker tag whose
+`RepoDigests` belong to another repository is treated as a local alias
+and safely uses that `Id`; only an explicit `image@digest` whose
+repository or digest conflicts is rejected as
+`ErrImageIdentityMismatch`. Apple Container uses the root image
+descriptor as the run/reuse identity, validates the selected platform
+variant separately, and normalizes an ID-only record to a digest
+reference when the descriptor is available. When Apple resolves an
+unqualified input to a custom default registry, `Run` preserves that
+canonical repository in the pinned reference and reuse comparison.
+Reuse compares the resolved digest/ID identity, not the original tag,
+and removes a newly-created reused container if its post-create identity
+or port validation fails.
+
+Apple has no runtime `--pull=never` switch. Before `Run` passes any
+pinned Apple reference to `container run`, it verifies that exact
+reference in the local store for `PullMissing`, `PullAlways`, and
+`PullNever`. If it is missing and the selected policy permits a fetch,
+the library performs an explicit exact-digest pull and verifies it again;
+`container run` is never allowed to perform that implicit fetch. A
+successful inspect that cannot provide a repository-bearing digest or a
+verified local image ID returns `ErrImageIdentityUnavailable`; a
+confirmed local absence returns `ErrImageIdentityNotLocal`. Transport,
+permission, and cancellation failures from the addressability check are
+returned as operational errors and do not trigger the mutable fallback.
+`WithAllowMutableImageTag` is the explicit escape hatch for a mutable
+input when identity is unavailable or the resolved reference is not
+locally addressable:
+
+```go
+package docexample
+
+import (
+    "context"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func AllowMutableImageTag(ctx context.Context) {
+    _, _ = container.Run(ctx, "redis:7-alpine",
+        container.WithAllowMutableImageTag())
+}
+```
+
+With that option, a mutable input may run the original tag; this
+deliberately retains the tag-replacement window and is not an identity
+guarantee. Apple `image@sha256:...` (including `image:tag@sha256:...`)
+is a pinned address and is never downgraded by this option. The option
+never downgrades a bare digest or a Docker image-ID-shaped value.
+Pinning cannot make a mutable registry
+tag's pull-to-inspect resolution atomic when another actor can modify
+the shared backend. Prefer a caller-supplied `image@sha256:...` when
+the backend provides an atomic address and treat its identity metadata
+as the compatibility boundary. Locally built Apple images may require
+`WithAllowMutableImageTag` when no locally addressable digest reference
+exists.
+
 ## Cleanup contract
 
 The normal, rollback, failed-create, and abnormal-exit paths have
@@ -793,13 +855,15 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Docker also requires the requested network identity to match. Omitted
-  `WithNetwork` means the daemon default; inspect's `default` mode is
-  resolved against `NetworkSettings.Networks` (`bridge` on Linux, `nat` on
-  native Windows). `host`, `none`, and named networks are not wildcards.
-  Reuse re-inspects by immutable UID before compatibility checks and before
-  returning the handle. `env` / `cmd` / `mounts` differences still attach
-  silently by design (use distinct names when they matter).
+  Image compatibility uses the resolved digest or image ID (never the
+  original mutable tag); only image and ports are compared. Docker also requires
+  the requested network identity to match. Omitted `WithNetwork` means the daemon
+  default; inspect's `default` mode is resolved against `NetworkSettings.Networks`
+  (`bridge` on Linux, `nat` on native Windows). `host`, `none`, and named networks
+  are not wildcards. Reuse re-inspects by immutable UID before compatibility
+  checks and before returning the handle. `env` / `cmd` / `mounts` differences
+  still attach silently by design (use distinct names when they matter). A
+  newly-created reused container is removed if its post-create validation fails.
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.
@@ -857,6 +921,18 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   `container registry login` for Apple Container or `docker login` for
   Docker. The backend CLI owns the resulting credentials and registry
   context.
+- `Run` passes the verified identity returned by image inspect (or a
+  Docker image ID) to the backend, so a later local tag reassignment
+  does not change that create. Apple descriptor-backed references are
+  checked for local addressability before create and the resulting
+  container identity is verified before return. Caller-supplied
+  `name@digest` references remain pinned; `WithAllowMutableImageTag`
+  applies only to mutable tags and explicitly authorized compatibility
+  fallbacks. `container run` is never
+  used as an implicit fetch. This is a backend/API guarantee, not a
+  claim that every tag-to-registry operation is atomic: a mutable tag
+  can still be replaced before the post-pull inspect, and an
+  identity-less backend requires the explicit compatibility fallback.
 
 ### Legacy reaper staging files
 
@@ -872,6 +948,7 @@ Do not grep file contents into a terminal, follow symlinks, or run a broad
 recursive delete. Remove only files that you can positively attribute to the
 affected run. Treat any credentials that may have appeared in inspect output
 as exposed and rotate them; deleting a stale file does not revoke a secret.
+
 
 ## Differences from testcontainers-go
 

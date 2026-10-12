@@ -166,6 +166,31 @@ func validationErrorf(option string, value any, format string, args ...any) erro
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
+// ErrImageIdentityUnavailable reports that an image inspect completed
+// successfully but did not provide a usable immutable identity (a
+// repository-bearing digest or a verified local image ID). It is not
+// used for transport, permission, or cancellation failures. Run fails
+// closed by default; WithAllowMutableImageTag opts into passing the
+// original mutable tag to the backend. Apple name@digest references,
+// including name:tag@digest, remain immutable and are never downgraded by
+// that option. PullNever also rejects an identity-less Apple inspect even
+// when the caller supplied a digest, because the backend has not confirmed
+// the local identity.
+var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
+
+// ErrImageIdentityMismatch reports that image inspect returned an
+// identity that does not belong to the requested image. It is never
+// downgraded to the mutable-tag fallback.
+var ErrImageIdentityMismatch = errors.New("backend reported a different image identity")
+
+// ErrImageIdentityNotLocal reports that a resolved immutable identity
+// was successfully checked but is not available from the backend's local
+// image store under the selected policy. Apple Container has no run-time
+// --pull=never switch; running an unaddressable pinned reference could
+// otherwise fetch it, so Run fails before create unless the caller opted
+// into the mutable-tag compatibility fallback.
+var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally under the selected pull policy")
+
 // ErrEnvFileUnsupported reports that the current platform cannot provide
 // the per-user private temporary storage required for environment files.
 // On Windows, Run and Exec return this error when a non-empty WithEnv or

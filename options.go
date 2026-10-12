@@ -27,29 +27,30 @@ const (
 )
 
 type config struct {
-	runner          cli.Runner
-	eng             engine
-	name            string
-	env             map[string]string
-	cmd             []string
-	entrypoint      string
-	exposed         []portSpec
-	published       []publishSpec
-	labels          map[string]string
-	mounts          []Mount
-	files           []File
-	waitStrategy    wait.Strategy
-	cpus            int
-	memory          string
-	user            string
-	workdir         string
-	network         string
-	networkExplicit bool
-	platform        string
-	pullPolicy      PullPolicy
-	reuse           bool
-	reuseGroup      string
-	creation        string
+	runner               cli.Runner
+	eng                  engine
+	name                 string
+	env                  map[string]string
+	cmd                  []string
+	entrypoint           string
+	exposed              []portSpec
+	published            []publishSpec
+	labels               map[string]string
+	mounts               []Mount
+	files                []File
+	waitStrategy         wait.Strategy
+	cpus                 int
+	memory               string
+	user                 string
+	workdir              string
+	network              string
+	networkExplicit      bool
+	platform             string
+	pullPolicy           PullPolicy
+	allowMutableImageTag bool
+	reuse                bool
+	reuseGroup           string
+	creation             string
 	// imageCache reuses image-presence answers across Runs when the
 	// caller applies a WithImagePresenceCache Option. The Option owns the
 	// cache so sequential Runs that reuse it share entries. Nil means no

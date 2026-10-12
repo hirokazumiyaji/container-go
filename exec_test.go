@@ -216,24 +216,32 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 
 type execMissingRunner struct {
 	*execRunner
+	inspectCalls int
 }
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+		m.inspectCalls++
+		if m.inspectCalls > 1 {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+		}
 	}
 	return m.execRunner.Run(ctx, args...)
 }
 
 type execInspectFailureRunner struct {
 	*execRunner
+	inspectCalls  int
 	inspectStdout []byte
 	inspectErr    error
 }
 
 func (r *execInspectFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "inspect" {
-		return r.inspectStdout, nil, r.inspectErr
+		r.inspectCalls++
+		if r.inspectCalls > 1 {
+			return r.inspectStdout, nil, r.inspectErr
+		}
 	}
 	return r.execRunner.Run(ctx, args...)
 }

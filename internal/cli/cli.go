@@ -344,6 +344,7 @@ func IsCommandExit(err error) bool {
 // cannot stall error handling forever. Caller cancellation still
 // aborts the probe via context propagation.
 const probeTimeout = 5 * time.Second
+
 func attachProbeStdout(err error, stdout string, probe Probe) error {
 	if err == nil || stdout == "" {
 		return err

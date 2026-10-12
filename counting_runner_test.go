@@ -84,24 +84,26 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 
 	ctr := runTestContainer(t, r, WithExposedPorts("6379/tcp"))
 
-	// Expected calls: image inspect (present, no pull) and run. The
-	// first container inspect is deferred until connection info is needed.
-	if got := r.count(); got != 2 {
-		t.Fatalf("after Run: calls = %d, want 2", got)
+	// Expected calls: image inspect (present, no pull), a second
+	// addressability inspect for Apple's pinned reference, run, and the
+	// post-create container identity verification. The first connection
+	// info request then reuses that verified inspect cache.
+	if got := r.count(); got != 4 {
+		t.Fatalf("after Run: calls = %d, want 4", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
 	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
 	// intentionally not cached.
-	if got := r.count(); got != 3 {
-		t.Fatalf("after Endpoint: calls = %d, want 3", got)
+	if got := r.count(); got != 5 {
+		t.Fatalf("after Endpoint: calls = %d, want 5", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 4 {
-		t.Fatalf("after refreshed Endpoint: calls = %d, want 4", got)
+	if got := r.count(); got != 6 {
+		t.Fatalf("after refreshed Endpoint: calls = %d, want 6", got)
 	}
 
 	// The wrapper forwards results unchanged.
@@ -127,9 +129,10 @@ func TestRunForLogDefersInspectUntilFinalLifecycleCheck(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	// image inspect + run + logs stream + final lifecycle inspect.
-	if got := r.count(); got != 4 {
-		t.Fatalf("after ForLog Run: calls = %d, want 4", got)
+	// image inspect + pinned-reference inspect + run + post-create
+	// verification inspect + logs stream + final lifecycle inspect.
+	if got := r.count(); got != 6 {
+		t.Fatalf("after ForLog Run: calls = %d, want 6; calls = %v", got, r.args)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -139,8 +142,8 @@ func TestRunForLogDefersInspectUntilFinalLifecycleCheck(t *testing.T) {
 			inspectCalls++
 		}
 	}
-	if inspectCalls != 1 {
-		t.Fatalf("container inspect calls = %d, want one final lifecycle check: %v", inspectCalls, r.args)
+	if inspectCalls != 2 {
+		t.Fatalf("container inspect calls = %d, want post-create verification and final lifecycle check: %v", inspectCalls, r.args)
 	}
 }
 

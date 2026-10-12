@@ -90,14 +90,16 @@ func (r *reusePullThenMismatchRunner) Run(ctx context.Context, args ...string) (
 		return nil, nil, nil
 	}
 	if args[0] == "inspect" {
-		image := "redis:7-alpine@sha256:old"
+		image := "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"
+		digest := "sha256:1111111111111111111111111111111111111111111111111111111111111111"
 		if r.pulled.Load() {
-			image = "redis:7-alpine@sha256:new"
+			image = "redis:7-alpine@sha256:2222222222222222222222222222222222222222222222222222222222222222"
+			digest = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
 		}
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		r.mu.Unlock()
-		return []byte(reuseInspectJSON(args[len(args)-1], "running", image)), nil, nil
+		return []byte(reuseInspectJSONWithDigest(args[len(args)-1], "running", image, digest)), nil, nil
 	}
 	return r.attachRunner.Run(ctx, args...)
 }
@@ -107,7 +109,7 @@ func TestReusePullAlwaysRechecksImageAfterPull(t *testing.T) {
 	base.imagePresent = true
 	f := &reusePullThenMismatchRunner{attachRunner: base}
 
-	_, err := Run(context.Background(), "redis:7-alpine@sha256:old",
+	_, err := Run(context.Background(), "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111",
 		WithName("myctr"), WithReuse(), WithPullPolicy(PullAlways),
 		withRunner(f), withEngine(appleEngine{}))
 	if err == nil || !strings.Contains(err.Error(), "does not match") {
@@ -358,4 +360,3 @@ func TestReuseConcurrentPullAlwaysBothPull(t *testing.T) {
 		t.Fatalf("pullCalls = %d, want each PullAlways caller to perform its own pull", r.pullCalls)
 	}
 }
-

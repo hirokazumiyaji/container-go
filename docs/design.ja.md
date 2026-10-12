@@ -153,7 +153,7 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-コンテナを新規作成する必要がある場合、`Run` は起動前に pull policy を適用してから待機戦略を完了する。
+コンテナを新規作成する必要がある場合、`Run` は選択した pull policy に従ってイメージを解決・適用してから待機戦略を完了する。
 既定の `PullMissing` はローカルイメージストアを検査し、イメージがないときだけ明示的に pull する。
 `PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求する。`PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck を行い、image がなければ `ErrImageNotFound` を返す。Docker は `--pull=never` も渡すため strict な no-fetch 経路を持つが、Apple Container には同等の run-time switch がないため、precheck は no-fetch 保証ではない（#112）。起動後の操作や待機が再利用でない経路で失敗した場合は、作成したコンテナをロールバックしてからエラーを返す。Reuse の共有ライフタイムは後述の別契約で扱う。
 
@@ -542,6 +542,33 @@ inspect ファイルを作成しません。変更前のバージョンは名前
 inspect 出力に含まれた可能性がある認証情報はローテーションしてください。stale
 ファイルを削除しても secret は失効しません。
 
+**create 前の image identity を固定する**。
+`PullMissing` と `PullAlways` は local store を準備した後にも image inspect を行い、解決した immutable identity を backend の `run` に渡す。
+Docker は repository が一致する registry digest を優先し、取得できない場合は inspect した local image ID にフォールバックする。
+別の repository の `RepoDigests` を持つ local alias も同じ local ID で実行し、明示的な pinned repository / digest の conflict だけを mismatch として扱う。
+Apple Container は root image descriptor を run / reuse の identity として使い、指定した platform の variant は別の検証情報として保持する。
+Apple が未指定の入力を custom default registry へ解決した場合、backend が報告した canonical repository を run 参照と identity 比較に保持する。
+descriptor が利用可能な ID だけの record は digest 参照に正規化する。
+この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
+ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
+呼び出し側の Apple `name@digest` と `name:tag@digest` は pinned として扱い、`WithAllowMutableImageTag` を指定しても mutable へ降格させない。
+利用可能な identity を返さない backend version では既定で `ErrImageIdentityUnavailable` を返して fail closed する。
+repository の provenance がない bare digest は identity として扱わず、bare Docker image ID は inspect がその local ID を検証した場合だけ受け入れる。
+
+Apple Container の `run` に `--pull=never` はないため、pinned Apple reference を `container run` に渡す前に、すべての pull policy で local store にあるかを確認する。
+存在せず選択した policy が fetch を許可する場合は exact digest を明示的に pull して再検査し、`container run` の暗黙の fetch は許さない。
+local に存在しないことが確認された場合は `ErrImageIdentityNotLocal`、成功した inspect が repository-bearing digest または検証済み local ID を返さない場合は `ErrImageIdentityUnavailable` を返す。
+addressability check の transport、permission、cancellation エラーは operational error として返し、mutable fallback の根拠にしない。
+`WithAllowMutableImageTag` は identity が取得できない、または resolved reference が local にない mutable input の明示的な互換 fallback であり、identity の保証ではない。
+呼び出し側の repository digest、bare digest、Docker image ID を mutable tag に降格させることもない。
+local build の Apple image で local digest 参照がない場合は、この明示 fallback が必要になることがある。
+
+Apple は単一 manifest の周囲に local index を合成することがある。
+この root は local store の content address として存在するが、`name@digest` で registry から取得できるとは限らない。
+そのため resolver は synthetic root を無条件に exact pull しない。
+local に addressable な tag または alias を使うか、`WithAllowMutableImageTag` による明示的な fallback を要求する。
+新規作成直後の Apple container は `container run` の後に再 inspect し、root、platform、選択された variant が異なる場合は `Run` や reuse が返す前にロールバックする。
+
 ## パフォーマンス設計
 
 **子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。起動後の inspect では接続に必要な情報がそろった結果を endpoint 関連経路が再利用する。created 状態で IP や公開ポートが未確定ならキャッシュせず、次の inspect で再取得する。状態 (`status.state`) は毎回取得する。ただし現在のキャッシュにはコンテナ IP と host 側 binding も含まれ、これらは動的な値である。`State` と一部の lifecycle 操作は再 inspect する。これは stale data の制限であり、immutable な保証ではない。動的 endpoint データの更新は #85 が担当する。
@@ -561,6 +588,9 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：backend が missing container を示す CLI failure を分類した場合。target に一致する entry がない successful inspect response はこの sentinel を保証せず、generic error になる場合がある（#103）。Docker では empty または malformed な inspect data がその generic path に入る。valid だが mismatched な object は現在の parser では no-match として拒否されない。
 - `ErrImageNotFound`：現在の `PullNever` precheck がローカルイメージを見つけなかった場合。Apple では best-effort な backend-specific precheck であり、no-fetch 保証ではない（#112）。
+- `ErrImageIdentityUnavailable`：成功した image inspect が repository-bearing digest または検証済み local image ID を返さず、mutable tag fallback も指定されていない
+- `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
+- `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。現在の reuse 経路には readiness 後の最終 check（#83、#84）がない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。

@@ -144,9 +144,18 @@ func inspectJSONWithLabels(name string, labels map[string]string) string {
 
 func inspectJSONWithStateAndLabels(name, state, image string, labels map[string]string) string {
 	labelJSON, _ := json.Marshal(labels)
+	platformParts := strings.Split(appleHostPlatform(), "/")
+	platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if strings.Contains(platformParts[1], "arm") {
+		variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	}
+	if len(platformParts) == 3 {
+		platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+	}
 	return fmt.Sprintf(`[
-  {"id": %q, "configuration": {"id": %q, "image": {"reference": %q}, "labels": %s}, "status": {"state": %q, "networks": []}}
-]`, name, name, image, labelJSON, state)
+  {"id": %q, "configuration": {"id": %q, "platform": %s, "image": {"reference": %q, "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "variantDigest": %q}, "labels": %s}, "status": {"state": %q, "networks": []}}
+]`, name, name, platformJSON, image, variantDigest, labelJSON, state)
 }
 
 func TestReuseDoesNotAdoptOrDeleteWithoutOwnershipLabels(t *testing.T) {

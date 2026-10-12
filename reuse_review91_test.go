@@ -67,6 +67,7 @@ func review91DockerInspectIdentity(bound bool, uid, creation string) string {
 	sessionLabelJSON := fmt.Sprintf(`,"com.github.hirokazumiyaji.container-go.session":%q`, sessionID())
 	return fmt.Sprintf(`[{
 		"Id":%q,
+		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/myctr",
 		"Config":{"Image":"redis:7-alpine","Labels":{"com.github.hirokazumiyaji.container-go":"true","com.github.hirokazumiyaji.container-go.reuse":"true"%s%s}},
 		"State":{"Status":"running"},

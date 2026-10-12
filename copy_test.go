@@ -465,9 +465,12 @@ type dockerCopyRunner struct {
 func (c *dockerCopyRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "cp" {
 		c.calls = append(c.calls, args)
-		dst := args[2]
-		if !strings.Contains(dst, ":") {
-			if err := os.WriteFile(dst, []byte(c.fileContent), 0o600); err != nil {
+		// Materialize only for container→host copies. Host destinations on
+		// Windows contain a drive-letter colon (C:\...), so checking the
+		// destination for ":" would skip writing the payload entirely.
+		// Container paths are POSIX and always appear as id:/path.
+		if strings.Contains(args[1], ":/") {
+			if err := os.WriteFile(args[2], []byte(c.fileContent), 0o600); err != nil {
 				return nil, nil, err
 			}
 		}

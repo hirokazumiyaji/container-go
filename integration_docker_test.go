@@ -221,13 +221,19 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 		t.Fatalf("CopyToContainer: %v", err)
 	}
 	rc, err := ctr.CopyFileFromContainer(ctx, "/tmp/hello.txt")
-	if err != nil {
-		t.Fatalf("CopyFileFromContainer: %v", err)
-	}
-	defer rc.Close()
-	round, _ := io.ReadAll(rc)
-	if string(round) != "hello docker" {
-		t.Errorf("round-tripped content = %q", round)
+	if errors.Is(err, container.ErrCopyFileFromContainerUnsupported) {
+		// Hosted runners may still ship Docker <29.7.0; copy-out is gated
+		// on that floor. CopyToContainer above already exercised the write path.
+		t.Logf("skipping copy-from round-trip: %v", err)
+	} else {
+		if err != nil {
+			t.Fatalf("CopyFileFromContainer: %v", err)
+		}
+		defer rc.Close()
+		round, _ := io.ReadAll(rc)
+		if string(round) != "hello docker" {
+			t.Errorf("round-tripped content = %q", round)
+		}
 	}
 
 	logs, err := ctr.Logs(ctx)

@@ -134,6 +134,9 @@ func TestPreviouslyValidLargeCollectionsRemainAccepted(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			if tt.name == "environment" && !envFileLocksSupported {
+				t.Skip("secure environment files are unsupported on this platform")
+			}
 			f := newTestRunner()
 			opts := append([]Option{}, tt.opts...)
 			opts = append(opts, WithName("myctr"), withRunner(f), withEngine(appleEngine{}))

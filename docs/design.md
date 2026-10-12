@@ -599,12 +599,16 @@ operations are not joined to the returned `Run` error.
 **Abnormal exit**: when the parent process exits and its reaper pipe
 closes, an external `/bin/sh` watchdog attempts force-deletion. An
 uncaught process-terminating panic, `SIGKILL`, and `os.Exit` close the
-pipe; a recovered panic does not. The reaper does nothing while the
-parent is alive. It is insurance, not a transactional guarantee, and it
-is unavailable on Windows. Registration and per-entry delete errors are
-not returned to `Run`; repeated spawn failures are logged once after the
-retry limit, and delete failures are ignored by the shell. Each backend
-call is bounded by a POSIX `sleep`/`kill` timeout.
+pipe; a recovered panic does not. The reaper accumulates registrations
+while the parent is alive and only deletes after EOF. It is insurance,
+not a transactional guarantee, and it is unavailable on Windows.
+Registration and per-entry delete errors are not returned to `Run`;
+repeated spawn failures are logged once after the retry limit, and
+delete failures are ignored by the shell. Each backend call is bounded
+by a POSIX `sleep`/`kill` timeout that cleans up its timer process, and
+the whole reap has an overall budget past which no new backend calls
+are issued. Entries are processed a few at a time so the cost is not
+strictly proportional to the container count.
 
 The reaper is started lazily for a real CLI container on the non-reuse
 path. Apple Container has no separate immutable ID, so its entries use

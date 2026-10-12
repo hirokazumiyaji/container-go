@@ -4,9 +4,20 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
+
+// skipWithoutPOSIXFakeCLI skips tests that install #!/bin/sh shims on PATH.
+// Windows cannot execute those scripts, so the real docker/container CLI
+// would be invoked against a missing daemon.
+func skipWithoutPOSIXFakeCLI(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake CLI scripts require a POSIX shell")
+	}
+}
 
 func TestDockerIdentityParsesContentAndContainerProvenance(t *testing.T) {
 	identity, err := parseDockerImageIdentity([]byte(`[{"Id":"sha256:content","RepoTags":["redis:7-alpine","redis:stable"],"RepoDigests":["redis@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499"]}]`), "redis:7-alpine")
@@ -81,6 +92,7 @@ func TestDockerRepoDigestSelectsPinnedRepository(t *testing.T) {
 }
 
 func TestDockerImageDigestReadsFullInspectOutput(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 if [ "$*" = "image inspect redis:7-alpine" ]; then
@@ -103,6 +115,7 @@ exit 1
 }
 
 func TestBackendVersionsKeepDockerClientAndServerSeparate(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -125,6 +138,7 @@ esac
 }
 
 func TestDockerImageExistsDistinguishesMissingFromOperationalFailure(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -163,6 +177,7 @@ esac
 }
 
 func TestAppleImageExistsDistinguishesMissingFromOperationalFailure(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -234,6 +249,7 @@ func TestBackendSelectionRejectsInvalidEnvironment(t *testing.T) {
 }
 
 func TestAppleVersionsRecordOnlyContainerAPIServer(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -256,6 +272,7 @@ esac
 }
 
 func TestAppleOptionalServiceVersionOnlyIgnoresUnsupportedCommand(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -336,6 +353,7 @@ func TestDockerProvenanceRejectsConnectionOverrides(t *testing.T) {
 }
 
 func TestDockerProvenanceCapturesEffectiveContextAndDaemon(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in
@@ -361,6 +379,7 @@ esac
 }
 
 func TestDockerProvenanceRejectsEndpointContextMismatch(t *testing.T) {
+	skipWithoutPOSIXFakeCLI(t)
 	dir := t.TempDir()
 	script := `#!/bin/sh
 case "$*" in

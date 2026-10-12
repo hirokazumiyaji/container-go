@@ -271,6 +271,9 @@ func TestWriteEnvFileUsesPrivatePermissions(t *testing.T) {
 }
 
 func TestWriteEnvFileCleansUpAfterLateRootCloseError(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("secure environment files are unsupported on this platform")
+	}
 	base := t.TempDir()
 	lateErr := errors.New("injected root lock close failure")
 	path, dir, err := writeEnvFileAtWithRoot(base, map[string]string{"TOKEN": "secret"}, func(base string, fn func(string) error) error {

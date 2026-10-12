@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -476,6 +477,9 @@ func (r *pruneLockScopeRunner) callSnapshot() []string {
 }
 
 func TestPruneAppleHoldsNameLockThroughInspectAndDelete(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Apple name locks are not used on Windows")
+	}
 	name := "prune-lock-scope-" + newContainerName()
 	runner := &pruneLockScopeRunner{
 		name:           name,

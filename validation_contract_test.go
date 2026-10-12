@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -181,7 +182,24 @@ func TestDockerVolumeGrammarRunsBeforeBackend(t *testing.T) {
 	}
 }
 
+// absHostBindSource builds a host-absolute bind source of exactly n bytes.
+// filepath.IsAbs("/") is false on Windows, so POSIX root spellings cannot
+// exercise bind-source length boundaries there.
+func absHostBindSource(n int) string {
+	prefix := "/"
+	if runtime.GOOS == "windows" {
+		prefix = `C:\`
+	}
+	if n < len(prefix) {
+		return prefix[:n]
+	}
+	return prefix + strings.Repeat("a", n-len(prefix))
+}
+
 func TestMountValidationBoundaries(t *testing.T) {
+	hostAtLimit := absHostBindSource(maxMountPathBytes)
+	hostOverLimit := absHostBindSource(maxMountPathBytes + 1)
+	hostShort := absHostBindSource(8)
 	tests := []struct {
 		name  string
 		mount Mount
@@ -198,29 +216,29 @@ func TestMountValidationBoundaries(t *testing.T) {
 		},
 		{
 			name:  "bind source at limit",
-			mount: Mount{Type: MountBind, Source: "/" + strings.Repeat("a", maxMountPathBytes-1), Target: "/data"},
+			mount: Mount{Type: MountBind, Source: hostAtLimit, Target: "/data"},
 			valid: true,
 		},
 		{
 			name:  "bind source over limit",
-			mount: Mount{Type: MountBind, Source: "/" + strings.Repeat("a", maxMountPathBytes), Target: "/data"},
+			mount: Mount{Type: MountBind, Source: hostOverLimit, Target: "/data"},
 		},
 		{
 			name:  "target at limit",
-			mount: Mount{Type: MountBind, Source: "/host", Target: "/" + strings.Repeat("a", maxMountPathBytes-1)},
+			mount: Mount{Type: MountBind, Source: hostShort, Target: "/" + strings.Repeat("a", maxMountPathBytes-1)},
 			valid: true,
 		},
 		{
 			name:  "target over limit",
-			mount: Mount{Type: MountBind, Source: "/host", Target: "/" + strings.Repeat("a", maxMountPathBytes)},
+			mount: Mount{Type: MountBind, Source: hostShort, Target: "/" + strings.Repeat("a", maxMountPathBytes)},
 		},
 		{
 			name:  "invalid UTF-8 source",
-			mount: Mount{Type: MountBind, Source: "/host" + string([]byte{0xff}), Target: "/data"},
+			mount: Mount{Type: MountBind, Source: hostShort + string([]byte{0xff}), Target: "/data"},
 		},
 		{
 			name:  "invalid UTF-8 target",
-			mount: Mount{Type: MountBind, Source: "/host", Target: "/data/" + string([]byte{0xff})},
+			mount: Mount{Type: MountBind, Source: hostShort, Target: "/data/" + string([]byte{0xff})},
 		},
 	}
 	for _, tt := range tests {

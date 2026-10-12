@@ -107,13 +107,17 @@ type activeEnvFile struct {
 	lockAcquired bool
 	dirInfo      os.FileInfo
 	childInfos   map[string]os.FileInfo
-	rootInfo     os.FileInfo
-	root         string
-	path         string
-	original     string
-	staging      string
-	removed      bool
-	pending      bool
+	// childFiles keep the recorded children open so Linux cannot reuse
+	// their inodes after an unlink. SameFile alone is (dev, ino); without
+	// a held descriptor, Remove+Create can collide and look identical.
+	childFiles map[string]*os.File
+	rootInfo   os.FileInfo
+	root       string
+	path       string
+	original   string
+	staging    string
+	removed    bool
+	pending    bool
 }
 
 type completedEnvCleanup struct {
@@ -1407,6 +1411,17 @@ func clearEnvCleanupStateLocked(state *activeEnvFile) {
 	deleteEnvCleanupStateKey(state.original, state)
 	deleteEnvCleanupStateKey(state.path, state)
 	deleteEnvCleanupStateKey(state.staging, state)
+	closeEnvChildFilesLocked(state)
+}
+
+func closeEnvChildFilesLocked(state *activeEnvFile) {
+	for name, f := range state.childFiles {
+		if f != nil {
+			_ = f.Close()
+		}
+		delete(state.childFiles, name)
+	}
+	state.childFiles = nil
 }
 
 func validateEnvCleanupPath(root, dir string) error {
@@ -2498,18 +2513,30 @@ func validatePrivateEnvDirIdentity(path string, expected os.FileInfo) error {
 }
 
 func recordEnvChildInfo(state *activeEnvFile, name, path string) error {
-	info, err := os.Lstat(path)
+	// Hold an open descriptor to the child inode. On Linux, a bare
+	// FileInfo snapshot is not enough: after unlink the inode number can
+	// be reused by a replacement created at the same path, and SameFile
+	// would then treat the replacement as the original.
+	f, err := openEnvFileNoFollow(path, os.O_RDONLY, 0)
 	if err != nil {
 		return err
 	}
+	info, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return err
+	}
 	if err := validatePrivateRegularInfo(path, info); err != nil {
+		_ = f.Close()
 		return err
 	}
 	confirmed, err := os.Lstat(path)
 	if err != nil {
+		_ = f.Close()
 		return err
 	}
 	if !os.SameFile(info, confirmed) {
+		_ = f.Close()
 		return fmt.Errorf("%w: environment child %q was replaced during creation", errUnsafeEnvFile, path)
 	}
 	state.mu.Lock()
@@ -2517,10 +2544,18 @@ func recordEnvChildInfo(state *activeEnvFile, name, path string) error {
 	if state.childInfos == nil {
 		state.childInfos = make(map[string]os.FileInfo)
 	}
+	if state.childFiles == nil {
+		state.childFiles = make(map[string]*os.File)
+	}
 	if previous, ok := state.childInfos[name]; ok && !os.SameFile(previous, info) {
+		_ = f.Close()
 		return fmt.Errorf("%w: environment child %q was replaced during creation", errUnsafeEnvFile, path)
 	}
+	if old := state.childFiles[name]; old != nil {
+		_ = old.Close()
+	}
 	state.childInfos[name] = info
+	state.childFiles[name] = f
 	return nil
 }
 

@@ -8,7 +8,10 @@ import (
 )
 
 func badExecutableStartError(err error) bool {
-	// ERROR_BAD_EXECUTABLE_FORMAT is 193 in the Windows system error
-	// namespace. syscall does not export a named constant for it.
-	return errors.Is(err, syscall.Errno(193))
+	// syscall does not export named constants for these Win32 codes:
+	// 193 ERROR_BAD_EXE_FORMAT ("%1 is not a valid Win32 application")
+	// 216 ERROR_EXE_MACHINE_TYPE_MISMATCH ("This version of %1 is not
+	// compatible with the version of Windows you're running")
+	// Writing a non-PE blob as .exe commonly surfaces as 216 on CI hosts.
+	return errors.Is(err, syscall.Errno(193)) || errors.Is(err, syscall.Errno(216))
 }

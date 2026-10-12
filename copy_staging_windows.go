@@ -194,7 +194,7 @@ func currentUserSecurityAttributes() (*windows.SecurityAttributes, error) {
 	if err != nil {
 		return nil, err
 	}
-	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;OICII;GA;;;" + user.User.Sid.String() + ")")
+	descriptor, err := windows.SecurityDescriptorFromString("D:P(A;OICI;GA;;;" + user.User.Sid.String() + ")")
 	if err != nil {
 		return nil, err
 	}

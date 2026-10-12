@@ -212,7 +212,7 @@ func TestReviewImmutableIDAccessIsSynchronized(t *testing.T) {
 	first := strings.Repeat("a", 64)
 	second := strings.Repeat("b", 64)
 
-	ctr := &Container{state: &containerState{}}
+	ctr := &Container{}
 	if got := ctr.immutableID(); got != "" {
 		t.Fatalf("immutableID() = %q before any promotion", got)
 	}

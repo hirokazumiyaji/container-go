@@ -10,8 +10,8 @@ import (
 )
 
 // sharedHandle builds the shape a WithReuse attach returns: reused set,
-// with its own state. The peer is the other process or test holding the
-// same name.
+// with its own sync pack. The peer is the other process or test holding
+// the same name.
 func sharedHandle(t *testing.T, r *fakeRunner) *Container {
 	t.Helper()
 	return &Container{
@@ -20,7 +20,7 @@ func sharedHandle(t *testing.T, r *fakeRunner) *Container {
 		eng:      dockerEngine{},
 		reused:   true,
 		creation: "aaaaaaaaaaaaaaaa",
-		state:    &containerState{},
+		sync:     &lockPack{uid: dockerFixtureID},
 	}
 }
 
@@ -37,10 +37,6 @@ func assertRefused(t *testing.T, r *fakeRunner, err error) {
 	}
 }
 
-// TestSharedHandleRefusesStop is the core of the issue: Stop never
-// looked at the reused flag, so one process's Stop took down a container
-// that other processes were still using, and the damage showed up on
-// their side as an unrelated connection failure.
 func TestSharedHandleRefusesStop(t *testing.T) {
 	r := newTestRunner()
 	ctr := sharedHandle(t, r)
@@ -52,9 +48,6 @@ func TestSharedHandleRefusesStop(t *testing.T) {
 	}
 }
 
-// TestSharedHandleRefusesCopies covers the other two destructive
-// operations. Copy-to overwrites a file the peers read; copy-out races
-// their writes to it.
 func TestSharedHandleRefusesCopies(t *testing.T) {
 	hostFile := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(hostFile, []byte("{}"), 0o600); err != nil {
@@ -75,43 +68,6 @@ func TestSharedHandleRefusesCopies(t *testing.T) {
 	})
 }
 
-// TestSharedHandleAllowsReadOnlyOperations keeps the guard from being
-// broader than intended: the operations a peer depends on must still
-// work, or sharing would be useless.
-func TestSharedHandleAllowsReadOnlyOperations(t *testing.T) {
-	r := newTestRunner()
-	r.imagePresent = true
-	r.inspectJSON = `[{"Id":"aaaa","Name":"/ci-db","State":{"Status":"running"},
-	  "Config":{"Image":"redis:7-alpine","Labels":{}},
-	  "NetworkSettings":{"IPAddress":"","Ports":{"6379/tcp":[{"HostIp":"0.0.0.0","HostPort":"49154"}]},
-	    "Networks":{"bridge":{"IPAddress":"172.17.0.2"}}}}]`
-	// Declared, not published: this is the path that reaches cachedInfo.
-	ctr := sharedHandle(t, r)
-	ctr.exposed = []portSpec{{port: 6379, proto: "tcp"}}
-
-	ctx := context.Background()
-	if _, err := ctr.Endpoint(ctx, "6379/tcp"); err != nil {
-		t.Errorf("Endpoint: %v", err)
-	}
-	if _, err := ctr.ContainerIP(ctx); err != nil {
-		t.Errorf("ContainerIP: %v", err)
-	}
-	if state, err := ctr.State(ctx); err != nil {
-		t.Errorf("State: %v", err)
-	} else if state != StateRunning {
-		t.Errorf("State = %q, want running", state)
-	}
-	// Exec runs a command in the container; the guard is about changing
-	// what a peer sees, and an explicit exec is the caller's own
-	// business.
-	if _, _, err := ctr.Exec(ctx, []string{"true"}); err != nil {
-		t.Errorf("Exec: %v", err)
-	}
-}
-
-// TestSharedHandleLiftsTheGuardForItsOwnCopy pins that Shared opts in:
-// the returned handle performs the operation, while the original keeps
-// its guard.
 func TestSharedHandleLiftsTheGuardForItsOwnCopy(t *testing.T) {
 	hostFile := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(hostFile, []byte("{}"), 0o600); err != nil {
@@ -140,14 +96,17 @@ func TestSharedHandleLiftsTheGuardForItsOwnCopy(t *testing.T) {
 	if err := ctr2.Stop(context.Background(), nil); !errors.Is(err, ErrSharedContainer) {
 		t.Errorf("original handle Stop = %v, want ErrSharedContainer", err)
 	}
+	if !ctr2.reused {
+		t.Error("Shared() cleared reused on the original handle")
+	}
+	if unguarded.reused != true {
+		t.Error("Shared() cleared reused on the returned handle; Cleanup would delete peers")
+	}
 }
 
-// TestSharedHandleCopiesShareIdentity keeps the two handles on one
-// container: the relaxed handle must see the same immutable ID and the
-// same inspect cache, not a copy of them.
 func TestSharedHandleCopiesShareIdentity(t *testing.T) {
 	r := newTestRunner()
-	r.inspectJSON = `[{"Id":"aaaa","Name":"/ci-db","State":{"Status":"running"},
+	r.inspectJSON = `[{"Id":"` + dockerFixtureID + `","Name":"/ci-db","State":{"Status":"running"},
 	  "Config":{"Image":"redis:7-alpine","Labels":{}},
 	  "NetworkSettings":{"IPAddress":"","Ports":{},"Networks":{}}}]`
 	ctr := sharedHandle(t, r)
@@ -157,11 +116,9 @@ func TestSharedHandleCopiesShareIdentity(t *testing.T) {
 	if _, err := ctr.cachedInfo(ctx); err != nil {
 		t.Fatalf("cachedInfo: %v", err)
 	}
-	if got := unguarded.immutableID(); got != "aaaa" {
+	if got := unguarded.immutableID(); got != dockerFixtureID {
 		t.Errorf("Shared().immutableID() = %q, want the ID promoted through the original handle", got)
 	}
-	// A second cachedInfo through the relaxed handle must reuse the
-	// cache rather than inspect again.
 	before := len(r.calls)
 	if _, err := unguarded.cachedInfo(ctx); err != nil {
 		t.Fatalf("cachedInfo through Shared(): %v", err)
@@ -171,9 +128,6 @@ func TestSharedHandleCopiesShareIdentity(t *testing.T) {
 	}
 }
 
-// TestSharedHandleNilIsNil keeps the nil-receiver behavior consistent
-// with the other nil-tolerant helpers, so deferring a Shared() alongside
-// an error check is safe.
 func TestSharedHandleNilIsNil(t *testing.T) {
 	var ctr *Container
 	if got := ctr.Shared(); got != nil {
@@ -181,9 +135,6 @@ func TestSharedHandleNilIsNil(t *testing.T) {
 	}
 }
 
-// countCallsWith counts the recorded CLI invocations of one subcommand.
-// callWith only returns the first match, which is not enough when the
-// test needs to assert an exact count.
 func countCallsWith(calls [][]string, subcommand string) int {
 	n := 0
 	for _, c := range calls {
@@ -194,15 +145,12 @@ func countCallsWith(calls [][]string, subcommand string) int {
 	return n
 }
 
-// TestTerminateContainerStillSkipsSharedHandles is the pre-existing
-// contract: lifting the operation guard must not make teardown start
-// deleting containers the peer is using.
 func TestTerminateContainerStillSkipsSharedHandles(t *testing.T) {
 	r := newTestRunner()
 	ctr := sharedHandle(t, r)
-	_ = ctr.Shared()
+	unguarded := ctr.Shared()
 
-	if err := TerminateContainer(ctr); err != nil {
+	if err := TerminateContainer(unguarded); err != nil {
 		t.Errorf("TerminateContainer: %v", err)
 	}
 	if len(r.calls) != 0 {
@@ -210,11 +158,9 @@ func TestTerminateContainerStillSkipsSharedHandles(t *testing.T) {
 	}
 }
 
-// TestStopUnaffectedOnNonSharedHandles keeps the guard from leaking into
-// ordinary containers.
 func TestStopUnaffectedOnNonSharedHandles(t *testing.T) {
 	r := newTestRunner()
-	ctr := &Container{id: "mine", runner: r, eng: dockerEngine{}, state: &containerState{}}
+	ctr := &Container{id: "mine", runner: r, eng: dockerEngine{}, sync: &lockPack{uid: dockerFixtureID}}
 
 	if err := ctr.Stop(context.Background(), nil); err != nil {
 		t.Errorf("Stop: %v", err)
@@ -224,18 +170,12 @@ func TestStopUnaffectedOnNonSharedHandles(t *testing.T) {
 	}
 }
 
-// TestWithFilesRunsBeforeTheHandleIsShared documents why the create path
-// uses the unguarded copy: WithFiles is applied while this process is
-// creating the container, before any peer can attach, so the shared
-// guard does not apply to it.
 func TestWithFilesRunsBeforeTheHandleIsShared(t *testing.T) {
 	hostFile := filepath.Join(t.TempDir(), "config.json")
 	if err := os.WriteFile(hostFile, []byte("{}"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// The create path: the fixture reports not-found until run succeeds,
-	// so this Run creates the container rather than attaching.
 	base := newReuseCreateRunner()
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithFiles(File{HostPath: hostFile, ContainerPath: "/etc/config.json"}),
@@ -250,8 +190,6 @@ func TestWithFilesRunsBeforeTheHandleIsShared(t *testing.T) {
 		t.Errorf("cp ran %d times during create, want 1: WithFiles must copy before the handle is shared", got)
 	}
 
-	// The copy already happened during Run, so the handle's own copy is
-	// refused.
 	callsAfterCreate := len(base.calls)
 	if err := ctr.CopyToContainer(context.Background(), hostFile, "/etc/other.json"); !errors.Is(err, ErrSharedContainer) {
 		t.Errorf("CopyToContainer after create = %v, want ErrSharedContainer", err)

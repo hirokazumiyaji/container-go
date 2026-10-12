@@ -150,8 +150,7 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 			}
 			base := &Container{
 				creation: review91GenA,
-				uid:      review91UIDA,
-				info:     initial,
+				sync: &lockPack{uid: review91UIDA, info: initial},
 			}
 			cfg := &config{
 				runner: review91SingleInspectRunner{data: review91ReuseInspectJSON(replacement.uid, replacement.creation, false)},
@@ -321,10 +320,10 @@ func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
 	runner := &review91LazyUIDRunner{inspectDelay: 50 * time.Millisecond}
 	ctr := &Container{
 		id:       "shared",
-		uid:      review91UIDA,
 		runner:   runner,
 		eng:      dockerEngine{},
 		creation: review91GenA,
+		sync: &lockPack{uid: review91UIDA},
 	}
 
 	start := make(chan struct{})

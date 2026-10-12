@@ -32,7 +32,7 @@ func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 		err: &cli.CLIError{Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`},
 	}
 	// Clear cached info so inspectFresh runs.
-	ctr.state.info = nil
+	ctr.pack().info = nil
 	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
 	}

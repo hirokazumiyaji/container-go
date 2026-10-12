@@ -11,7 +11,7 @@ import (
 )
 
 func TestTerminateRefusesReplacedGeneration(t *testing.T) {
-	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
+	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	// Handle knows creation A, but live container reports creation B.
 	ctr.runner = &generationRunner{
 		creation: "bbbbbbbbbbbbbbbb",
@@ -58,7 +58,7 @@ func (g *generationRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 }
 
 func TestTerminateAllowsMatchingGeneration(t *testing.T) {
-	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
+	ctr := &Container{id: "myctr", eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	ctr.runner = &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate = %v, want nil for matching generation", err)
@@ -134,7 +134,7 @@ func TestTerminateSucceedsWithoutDeleteWhenContainerIsGone(t *testing.T) {
 
 func TestTerminateFailsClosedWhenInspectFails(t *testing.T) {
 	r := &inspectErrorRunner{stderr: "daemon unavailable"}
-	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa", state: &containerState{}}
+	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
 	err := ctr.Terminate(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "verify generation") {
 		t.Fatalf("Terminate = %v, want verify-generation failure", err)

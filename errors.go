@@ -212,6 +212,13 @@ var ErrContainerNotFound = wait.ErrContainerNotFound
 // operations refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
 
+// ErrSharedContainer reports that Stop, CopyToContainer, or
+// CopyFileFromContainer was called on a WithReuse handle. Those operations
+// would disturb peers sharing the container. Use Shared to opt in, or
+// Terminate to remove the shared container outright. Cleanup and
+// TerminateContainer still skip reused handles even after Shared.
+var ErrSharedContainer = errors.New("operation refused on a shared WithReuse handle")
+
 // ErrCopySourceUnsupported reports a host source that is not a regular
 // file or directory. CopyToContainer rejects source symlinks and symlink
 // entries in source directories rather than copying devices, sockets, or

@@ -51,7 +51,7 @@ func TestNotFoundForOperationMatchesExecVerificationBranch(t *testing.T) {
 func TestDockerOperationsUseImmutableOperationTarget(t *testing.T) {
 	uid := strings.Repeat("a", 64)
 	r := &issue104FreshDockerRunner{inspectJSON: dockerInspectJSON(uid, "/myctr", "running")}
-	ctr := &Container{id: "myctr", uid: uid, runner: r, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: uid}, runner: r, eng: dockerEngine{}}
 
 	if _, err := ctr.State(context.Background()); err != nil {
 		t.Fatalf("State: %v", err)
@@ -95,7 +95,7 @@ func TestDockerRejectsSameNameReplacementByUID(t *testing.T) {
 	uid := strings.Repeat("a", 64)
 	replacementID := strings.Repeat("b", 64)
 	r := &issue104FreshDockerRunner{inspectJSON: dockerInspectJSON(replacementID, "/myctr", "running")}
-	ctr := &Container{id: "myctr", uid: uid, runner: r, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: uid}, runner: r, eng: dockerEngine{}}
 
 	if _, err := ctr.State(context.Background()); err == nil {
 		t.Fatal("State accepted a same-name replacement for an immutable Docker handle")

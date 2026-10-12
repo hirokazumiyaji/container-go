@@ -49,9 +49,9 @@ func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	}
 	ctr := &Container{
 		id:     "myctr",
-		uid:    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
 		runner: &cli.ExecRunner{Binary: backend},
 		eng:    dockerEngine{},
+		sync:   &lockPack{uid: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
 	}
 
 	start := time.Now()
@@ -73,7 +73,7 @@ func TestReview91ReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
 	cfg := &config{}
 	ready := &engineInfo{state: StateRunning}
 
-	info, err := reuseInfoForCaller(ctx, cfg, &Container{info: ready})
+	info, err := reuseInfoForCaller(ctx, cfg, &Container{sync: &lockPack{info: ready}})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}

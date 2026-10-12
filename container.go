@@ -122,6 +122,18 @@ const (
 	StateUnknown    State = "unknown"
 )
 
+// lockPack holds the mutable, synchronized fields of a Container. Shared
+// copies share one pack so promotion and inspect caches stay coherent
+// without copying mutex values.
+type lockPack struct {
+	uidMu          sync.RWMutex
+	uid            string
+	mu             sync.Mutex
+	info           *engineInfo // immutable identity snapshot; dynamic data is never cached
+	inspectMu      contextLock // serializes inspect target selection and UID publication
+	defaultNetwork string      // Docker daemon default identity, learned lazily
+}
+
 // Container is a handle to a container created by Run.
 type Container struct {
 	id        string
@@ -133,70 +145,58 @@ type Container struct {
 	// value means the backend's daemon-selected default.
 	network         string
 	networkExplicit bool
-	// defaultNetwork is Docker's authoritative daemon default identity
-	// (bridge on Linux, nat on Windows), learned lazily for implicit
-	// compatibility checks.
-	defaultNetwork string
 	// reused marks a WithReuse handle. Cleanup, TerminateContainer,
 	// and the watchdog reaper skip these so shared containers survive
-	// process exit, and Stop/CopyToContainer/CopyFileFromContainer
-	// refuse with ErrSharedContainer so this process cannot disturb the
-	// peers sharing the container. Explicit Terminate still removes it,
-	// and Container.Shared lifts the refusals; see WithReuse.
+	// process exit. Stop/CopyToContainer/CopyFileFromContainer also
+	// refuse with ErrSharedContainer unless allowDestructive is set
+	// via Shared. Explicit Terminate still removes them.
 	reused bool
+	// allowDestructive lifts Stop/Copy refusals on a reused handle
+	// without clearing reused, so Cleanup/TerminateContainer still skip.
+	allowDestructive bool
 	// creation is the unique generation ID stored in creationLabel.
 	// Terminate and the reaper verify it before deleting so a stale
 	// handle does not remove a same-name replacement made by this
 	// library; see Terminate for the limits of the name-based path.
 	creation string
-	// state is the handle's mutable state, behind a pointer so Shared can
-	// hand out a second handle onto the same container without copying a
-	// lock. Both handles then share the immutable ID and the inspect
-	// cache, so an inspect started through either is visible to both.
-	state *containerState
-}
-
-// containerState is the part of a Container that changes after the
-// handle is published. It is a separate object so a guard-relaxed
-// handle can share it instead of copying its locks.
-type containerState struct {
-	// uid is the backend's immutable container ID when it has one
-	// (Docker). Deletes target it directly, which makes the generation
-	// check unnecessary: a replacement never shares it.
-	//
-	// It is promoted from a verified inspect, so it is written long after the
-	// handle is published. Guarded by uidMu rather than mu, because readers
-	// on the Terminate path must not hold the inspect lock.
-	uid   string
-	uidMu sync.RWMutex
 
 	// image is the image identity resolved immediately before create.
 	// reference is what was passed to run; it is immutable-pinned
 	// unless the caller explicitly allowed the mutable-tag fallback.
 	image imageIdentity
 
-	mu        sync.Mutex
-	info      *engineInfo // immutable identity snapshot; dynamic data is never cached
-	inspectMu contextLock // serializes inspect target selection and UID publication
 	// nameInspect is limited to short-lived name lookups used by reuse
 	// discovery and failed-create cleanup. It never publishes an inspected
 	// Docker UID to a caller-visible handle.
 	nameInspect bool
+
+	sync *lockPack
+}
+
+func (c *Container) pack() *lockPack {
+	if c.sync == nil {
+		c.sync = &lockPack{}
+	}
+	return c.sync
+}
+
+func (c *Container) refusesSharedOps() bool {
+	return c.reused && !c.allowDestructive
 }
 
 // immutableID returns the backend's immutable container ID, or "" when the
 // backend has none. The ID is only ever promoted from empty to a real value,
 // so a caller that observes "" may re-read after a failed operation.
 func (c *Container) immutableID() string {
-	c.state.uidMu.RLock()
-	defer c.state.uidMu.RUnlock()
-	return c.state.uid
+	c.pack().uidMu.RLock()
+	defer c.pack().uidMu.RUnlock()
+	return c.pack().uid
 }
 
 func (c *Container) infoSnapshot() *engineInfo {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.info
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
+	return c.pack().info
 }
 
 // setImmutableID records the backend's immutable container ID. It never
@@ -205,11 +205,11 @@ func (c *Container) setImmutableID(uid string) {
 	if uid == "" {
 		return
 	}
-	c.state.uidMu.Lock()
-	if c.state.uid == "" {
-		c.state.uid = uid
+	c.pack().uidMu.Lock()
+	if c.pack().uid == "" {
+		c.pack().uid = uid
 	}
-	c.state.uidMu.Unlock()
+	c.pack().uidMu.Unlock()
 }
 
 // Run pulls the image if needed, creates and starts a container, and
@@ -377,8 +377,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
 		creation:        cfg.creation,
-		uid:             uid,
 		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
@@ -564,7 +564,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 			if !dockerIDRE.MatchString(uid) {
 				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
 			}
-			inspectContainer = &Container{id: uid, uid: uid, runner: c.runner, eng: c.eng}
+			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, sync: &lockPack{uid: uid}}
 		}
 		unlock := func() {}
 		if cfg.eng.name() == "apple" {
@@ -613,9 +613,9 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	} else if info.uid != "" {
 		return fmt.Errorf("verify created container %s: unexpected immutable ID", c.id)
 	}
-	c.mu.Lock()
-	c.info = info
-	c.mu.Unlock()
+	c.pack().mu.Lock()
+	c.pack().info = info
+	c.pack().mu.Unlock()
 	c.setImmutableID(info.uid)
 	return nil
 }
@@ -823,6 +823,9 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 		return newValidationErrorWithField("Stop", "timeout", *timeout,
 			fmt.Errorf("stop timeout must be >= 0, got %s", *timeout))
 	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
+	}
 	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
@@ -835,6 +838,20 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	}
 	_, _, err = c.runner.Run(stopCtx, args...)
 	return c.classifyOperation(ctx, err, "stop")
+}
+
+// Shared returns a handle to the same container with Stop/Copy refusals
+// lifted. The returned handle keeps reused set so Cleanup and
+// TerminateContainer still skip teardown; only allowDestructive differs.
+// Mutable identity state is shared through sync so both handles see the
+// same promoted UID and inspect cache.
+func (c *Container) Shared() *Container {
+	if c == nil {
+		return nil
+	}
+	out := *c
+	out.allowDestructive = true
+	return &out
 }
 
 // Terminate force-removes the container. A Docker handle must carry a
@@ -1077,9 +1094,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if c.nameInspect {
 		return c.inspectFresh(ctx)
 	}
-	c.mu.Lock()
-	cached := c.info
-	c.mu.Unlock()
+	c.pack().mu.Lock()
+	cached := c.pack().info
+	c.pack().mu.Unlock()
 	if cached != nil {
 		return cached, nil
 	}
@@ -1090,9 +1107,9 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	if err := c.rememberIdentity(ctx, info); err != nil {
 		return nil, err
 	}
-	c.mu.Lock()
-	cached = c.info
-	c.mu.Unlock()
+	c.pack().mu.Lock()
+	cached = c.pack().info
+	c.pack().mu.Unlock()
 	return cached, nil
 }
 
@@ -1117,20 +1134,20 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 
 func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) error {
 	identity := immutableInfo(info)
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return err
 	}
-	defer c.inspectMu.Unlock()
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.info != nil && !sameImmutableInfo(c.info, identity) {
+	defer c.pack().inspectMu.Unlock()
+	c.pack().mu.Lock()
+	defer c.pack().mu.Unlock()
+	if c.pack().info != nil && !sameImmutableInfo(c.pack().info, identity) {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	uid := c.immutableID()
 	if uid != "" && uid != identity.uid {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
-	if uid == "" && c.info != nil && c.info.uid != "" && c.info.uid != identity.uid {
+	if uid == "" && c.pack().info != nil && c.pack().info.uid != "" && c.pack().info.uid != identity.uid {
 		return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 	}
 	if c.creation != "" {
@@ -1140,14 +1157,14 @@ func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) erro
 		}
 		// Once a name-only handle has observed its generation, losing
 		// the label is also evidence of a replacement.
-		if actual == "" && uid == "" && c.info != nil && c.info.labels[creationLabel] != "" {
+		if actual == "" && uid == "" && c.pack().info != nil && c.pack().info.labels[creationLabel] != "" {
 			return fmt.Errorf("%w: %s", ErrGenerationReplaced, c.id)
 		}
 	}
-	if c.info == nil {
-		c.info = identity
+	if c.pack().info == nil {
+		c.pack().info = identity
 	} else {
-		c.info = mergeImmutableInfo(c.info, identity)
+		c.pack().info = mergeImmutableInfo(c.pack().info, identity)
 	}
 	if c.image.reference == "" {
 		c.image = imageFromInfo(info)
@@ -1250,10 +1267,10 @@ func (c *Container) inspectTargetLocked() string {
 // identitySnapshot reads the handle's backend identity and creation
 // generation while holding the same lock that protects their publication.
 func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string, err error) {
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return "", "", err
 	}
-	defer c.inspectMu.Unlock()
+	defer c.pack().inspectMu.Unlock()
 	return c.immutableID(), c.creation, nil
 }
 
@@ -1265,10 +1282,10 @@ func (c *Container) identitySnapshot(ctx context.Context) (uid, creation string,
 // cannot wait behind another call's inspect or default-network lookup after
 // its caller has been canceled.
 func (c *Container) verifiedOperationTarget(ctx context.Context) (string, error) {
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return "", err
 	}
-	defer c.inspectMu.Unlock()
+	defer c.pack().inspectMu.Unlock()
 	uid := c.immutableID()
 	creation := c.creation
 	if requiresImmutableID(c.eng) {
@@ -1305,18 +1322,18 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if !c.needsDefaultNetwork() {
 		return "", nil
 	}
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return "", err
 	}
-	defer c.inspectMu.Unlock()
-	if c.defaultNetwork != "" {
-		return c.defaultNetwork, nil
+	defer c.pack().inspectMu.Unlock()
+	if c.pack().defaultNetwork != "" {
+		return c.pack().defaultNetwork, nil
 	}
 	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
 	if err != nil {
 		return "", err
 	}
-	c.defaultNetwork = name
+	c.pack().defaultNetwork = name
 	return name, nil
 }
 
@@ -1349,21 +1366,21 @@ func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engin
 }
 
 func (c *Container) applyCachedDefaultNetwork(ctx context.Context, info *engineInfo) error {
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return err
 	}
-	defer c.inspectMu.Unlock()
-	if c.defaultNetwork != "" {
-		info.defaultNetwork = c.defaultNetwork
+	defer c.pack().inspectMu.Unlock()
+	if c.pack().defaultNetwork != "" {
+		info.defaultNetwork = c.pack().defaultNetwork
 	}
 	return nil
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {
-	if err := c.inspectMu.Lock(ctx); err != nil {
+	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return nil, err
 	}
-	defer c.inspectMu.Unlock()
+	defer c.pack().inspectMu.Unlock()
 	return c.inspectFreshLocked(ctx)
 }
 
@@ -1412,7 +1429,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		}
 	}
 	// A name-addressed discovery deliberately returns the inspected UID to
-	// its caller as data only. It is never published into c.uid here; the
+	// its caller as data only. It is never published into the handle UID here; the
 	// caller must first validate managed/reuse/session ownership.
 	return info, nil
 }

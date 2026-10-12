@@ -885,6 +885,13 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   制御文字でない Unicode、空白、`=` は値として許容します。
   制御文字(タブを含む)や不正な UTF-8 を拒否する方針は、backend が受け付ける
   値でも env ファイルには書かないという意図的な互換性変更です。
+- `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
+  開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
+  `WithFiles` は通常ファイル専用です。
+  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
+  保持するメタデータは名前、バイト列、Unix パーミッションだけです。
+  タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
 - レジストリ認証情報は本 library では扱いません。Apple Container では
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。

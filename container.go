@@ -403,7 +403,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 
 	for _, f := range cfg.files {
-		if err := c.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := c.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
 	}

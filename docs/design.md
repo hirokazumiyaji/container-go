@@ -380,6 +380,19 @@ not propagate the required Windows file flags through `os.OpenFile`, so
 Docker copy-out requires Go 1.26 or newer. `CopyToContainer` remains
 available on both backends.
 
+`CopyToContainer` accepts a regular file or directory and opens every
+source entry once without following a final link; directory children are
+opened relative to the already-open parent handle. It copies from those
+handles into a current-user-only staging root before invoking either CLI.
+`WithFiles` uses the same snapshot path but rejects directories. Separate
+staging and CLI deadlines prevent filesystem work from consuming the CLI
+budget, while a caller deadline remains authoritative for both. Directory
+snapshots are bounded by file bytes, entry count, depth, and aggregate
+source-path metadata. They intentionally preserve only names, bytes, and
+Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
+extended attributes, alternate data streams, sparse layout, and hardlink
+identity are not preserved.
+
 ## Connection endpoints
 
 testcontainers' Docker implementation publishes container ports to

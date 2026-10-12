@@ -28,6 +28,10 @@ pull other Hub images locally. The root module supports Go 1.23+; the nested
 `bench/` benchmark module requires Go 1.25+ and is documented in
 `bench/README.md`.
 
+Windows-specific copy tests use Windows build constraints and are cross-built
+with the package. Issue #119 does not add a live Windows CI runner; execute
+`go test ./...` on Windows separately when changing Windows-specific behavior.
+
 ## Pull requests
 
 - Use concise, imperative commit subjects (`Add ...`, `Fix ...`, `docs: ...`).

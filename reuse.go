@@ -566,7 +566,7 @@ func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error 
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 	for _, f := range files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
 		}
 	}

@@ -516,10 +516,10 @@ func runDockerCopyContainer(t *testing.T, r cli.Runner) *Container {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !dockerIDRE.MatchString(ctr.uid) {
-		t.Fatalf("published uid = %q, want a full 64-hex container ID", ctr.uid)
+	if !dockerIDRE.MatchString(ctr.immutableID()) {
+		t.Fatalf("published uid = %q, want a full 64-hex container ID", ctr.immutableID())
 	}
-	if ctr.uid == ctr.ID() {
+	if ctr.immutableID() == ctr.ID() {
 		t.Fatal("handle UID is the logical name, not a published immutable ID")
 	}
 	return ctr
@@ -528,7 +528,7 @@ func runDockerCopyContainer(t *testing.T, r cli.Runner) *Container {
 func TestDockerCopyUsesPublishedImmutableContainerID(t *testing.T) {
 	r := newDockerCopyRunner(t, "result data")
 	ctr := runDockerCopyContainer(t, r)
-	uid := ctr.uid
+	uid := ctr.immutableID()
 	if uid == "myctr" {
 		t.Fatal("copy target is the logical name, not the published immutable ID")
 	}
@@ -569,7 +569,7 @@ func TestDockerCopyIgnoresSameNameReplacement(t *testing.T) {
 	const replacementID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	r := newDockerCopyRunner(t, "replacement bytes")
 	ctr := runDockerCopyContainer(t, r)
-	uid := ctr.uid
+	uid := ctr.immutableID()
 
 	// The name now resolves to a different container. Copies must still
 	// address the UID the handle was published with.
@@ -622,7 +622,7 @@ func TestDockerCopyFailsClosedWithoutImmutableContainerID(t *testing.T) {
 			ctr := runDockerCopyContainer(t, r)
 			// Corrupt only the published identity; the handle, runner, and
 			// engine are otherwise exactly what Run returned.
-			ctr.uid = tc.uid
+			ctr.pack().uid = tc.uid
 			r.calls = nil
 
 			src := filepath.Join(t.TempDir(), "input.txt")

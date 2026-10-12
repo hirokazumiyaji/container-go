@@ -92,6 +92,9 @@ func validateHostPath(hostPath string) (string, error) {
 // identity. A directory snapshot also does not preserve a concurrent writer's
 // atomicity; the handles bound what each entry can observe.
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("copy to container %s: %w", c.id, ErrSharedContainer)
+	}
 	return c.copyToContainer(ctx, hostPath, containerPath, true)
 }
 
@@ -587,6 +590,9 @@ func cleanupCopyStagingDir(dir string) error {
 // ErrCopyFileFromContainerUnsupported before invoking the backend's
 // copy-out command. Close releases the temporary copy.
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
+	if c.refusesSharedOps() {
+		return nil, fmt.Errorf("copy file from container %s: %w", c.id, ErrSharedContainer)
+	}
 	if err := validateContainerPath(containerPath); err != nil {
 		return nil, newValidationErrorWithField("CopyFileFromContainer", "containerPath", containerPath, err)
 	}

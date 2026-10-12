@@ -308,8 +308,8 @@ func TestReuseSucceedsWhenGenerationUnchangedAfterWait(t *testing.T) {
 			if ctr == nil || ctr.creation != spec.creation {
 				t.Fatalf("handle = %+v, want creation %q", ctr, spec.creation)
 			}
-			if backend.eng.name() == "docker" && ctr.uid != spec.uid {
-				t.Fatalf("uid = %q, want %q", ctr.uid, spec.uid)
+			if backend.eng.name() == "docker" && ctr.immutableID() != spec.uid {
+				t.Fatalf("uid = %q, want %q", ctr.immutableID(), spec.uid)
 			}
 			if runner.inspectCalls < 2 {
 				t.Fatalf("inspect calls = %d, want at least initial and post-wait inspect", runner.inspectCalls)

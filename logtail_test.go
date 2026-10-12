@@ -81,9 +81,9 @@ func TestLogTailDoesNotReadReplacementLogs(t *testing.T) {
 	}
 	ctr := &Container{
 		id:     "myctr",
-		uid:    oldUID,
 		runner: runner,
 		eng:    dockerEngine{},
+		sync: &lockPack{uid: oldUID},
 	}
 
 	if tail := ctr.logTail(context.Background()); tail != "" {

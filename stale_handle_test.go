@@ -90,9 +90,9 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 	}
 	ctr := &Container{
 		id:     "replacement",
-		uid:    staleHandleUID,
 		runner: r,
 		eng:    dockerEngine{},
+		sync: &lockPack{uid: staleHandleUID},
 	}
 	ctx := context.Background()
 
@@ -153,9 +153,9 @@ func TestDockerFollowLogsUsesImmutableIDForTerminalError(t *testing.T) {
 
 	ctr := &Container{
 		id:     "replacement",
-		uid:    staleHandleUID,
 		eng:    dockerEngine{},
 		runner: &cli.ExecRunner{Binary: writeStaleFollowLogsStub(t)},
+		sync: &lockPack{uid: staleHandleUID},
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()

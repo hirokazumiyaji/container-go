@@ -109,7 +109,7 @@ func TestFreshReviewConfirmedDeleteUnregistersReaperRecords(t *testing.T) {
 		watchdog.closeStdin()
 	})
 
-	ctr := &Container{id: "delete-identity", uid: uid, creation: "0123456789abcdef", runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "delete-identity", sync: &lockPack{uid: uid}, creation: "0123456789abcdef", runner: runner, eng: dockerEngine{}}
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}

@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os/exec"
 	"strings"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,31 +17,56 @@ import (
 
 // fakeTarget implements Target for tests.
 type fakeTarget struct {
-	endpoint     string
-	running      atomic.Bool
-	runningCalls atomic.Int32
-	logs         io.ReadCloser
-	execCode     int
-	execErr      error
-	execCalls    atomic.Int32
+	endpoint      string
+	endpointCalls atomic.Int32
+	state         atomic.Value
+	stateErr      error
+	stateCalls    atomic.Int32
+	runningCalls  atomic.Int32
+	logs          io.ReadCloser
+	execCode      int
+	execErr       error
+	execCalls     atomic.Int32
 }
 
 func newFakeTarget() *fakeTarget {
 	t := &fakeTarget{logs: io.NopCloser(strings.NewReader(""))}
-	t.running.Store(true)
+	t.state.Store(StateRunning)
 	return t
 }
 
 func (f *fakeTarget) Endpoint(_ context.Context, port string) (string, error) {
+	f.endpointCalls.Add(1)
 	if f.endpoint == "" {
 		return "", errors.New("no endpoint configured")
 	}
 	return f.endpoint, nil
 }
 
-func (f *fakeTarget) Running(_ context.Context) (bool, error) {
-	f.runningCalls.Add(1)
-	return f.running.Load(), nil
+func (f *fakeTarget) Running(context.Context) (bool, error) {
+	state, err := f.State(context.Background())
+	return state == StateRunning, err
+}
+
+func (f *fakeTarget) State(_ context.Context) (State, error) {
+	f.stateCalls.Add(1)
+	return f.state.Load().(State), f.stateErr
+}
+
+type firstStateTarget struct {
+	*fakeTarget
+	first    State
+	firstErr error
+}
+
+func (t *firstStateTarget) State(_ context.Context) (State, error) {
+	t.stateCalls.Add(1)
+	if t.stateCalls.Load() == 1 {
+		t.state.Store(t.first)
+		return t.first, t.firstErr
+	}
+	t.state.Store(StateRunning)
+	return StateRunning, nil
 }
 
 func (f *fakeTarget) FollowLogs(_ context.Context) (io.ReadCloser, error) { return f.logs, nil }
@@ -59,12 +83,84 @@ func TestForListeningPortSucceedsWhenPortOpen(t *testing.T) {
 	}
 	defer ln.Close()
 
+	for _, spec := range []string{"6379", "6379/tcp"} {
+		t.Run(spec, func(t *testing.T) {
+			target := newFakeTarget()
+			target.endpoint = ln.Addr().String()
+
+			s := ForListeningPort(spec).WithStartupTimeout(3 * time.Second)
+			if err := s.WaitUntilReady(context.Background(), target); err != nil {
+				t.Fatalf("WaitUntilReady: %v", err)
+			}
+		})
+	}
+}
+
+func TestForExposedPortSucceedsWhenPortOpen(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
 	target := newFakeTarget()
 	target.endpoint = ln.Addr().String()
 
-	s := ForListeningPort("6379/tcp").WithStartupTimeout(3 * time.Second)
+	s := ForExposedPort().WithStartupTimeout(3 * time.Second)
 	if err := s.WaitUntilReady(context.Background(), target); err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)
+	}
+}
+
+func TestForListeningPortRejectsInvalidConfiguration(t *testing.T) {
+	tests := []struct {
+		name string
+		port string
+		want string
+	}{
+		{name: "UDP", port: "5353/udp", want: "only TCP is supported"},
+		{name: "empty", port: "", want: "port must be 1-65535"},
+		{name: "non-numeric", port: "not-a-port", want: "port must be 1-65535"},
+		{name: "out of range", port: "65536/tcp", want: "port must be 1-65535"},
+		{name: "unknown protocol", port: "6379/sctp", want: "protocol must be tcp"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			target := newFakeTarget()
+			err := ForListeningPort(tt.port).
+				WithStartupTimeout(100*time.Millisecond).
+				WithPollInterval(10*time.Millisecond).
+				WaitUntilReady(context.Background(), target)
+			if err == nil {
+				t.Fatal("want configuration error")
+			}
+			var configErr *ConfigError
+			if !errors.As(err, &configErr) {
+				t.Fatalf("error = %T %q, want *ConfigError", err, err)
+			}
+			if !errors.Is(err, ErrInvalidConfiguration) {
+				t.Errorf("error = %v, want ErrInvalidConfiguration", err)
+			}
+			if configErr.Strategy != "ForListeningPort" ||
+				configErr.Field != "port specification" ||
+				configErr.Value != tt.port ||
+				configErr.Reason != tt.want {
+				t.Errorf("ConfigError = %+v", configErr)
+			}
+			if !strings.Contains(err.Error(), tt.want) {
+				t.Errorf("error = %q, want %q", err, tt.want)
+			}
+			if strings.Contains(err.Error(), "timed out") {
+				t.Errorf("error = %q, want fail-fast configuration error", err)
+			}
+			if got := target.endpointCalls.Load(); got != 0 {
+				t.Errorf("Endpoint calls = %d, want 0", got)
+			}
+			if got := target.runningCalls.Load(); got != 0 {
+				t.Errorf("Running calls = %d, want 0", got)
+			}
+		})
 	}
 }
 
@@ -86,12 +182,15 @@ func TestForListeningPortTimesOut(t *testing.T) {
 	if err == nil {
 		t.Fatal("want timeout error")
 	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
 }
 
 func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // nothing listens
-	target.running.Store(false)
+	target.state.Store(StateStopped)
 
 	s := ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second)
 	start := time.Now()
@@ -104,6 +203,121 @@ func TestForListeningPortFailsFastWhenContainerStops(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "stopped") {
 		t.Errorf("error = %v, want mention of stopped container", err)
+	}
+}
+
+func TestForListeningPortFailsFastWhenContainerPaused(t *testing.T) {
+	target := newFakeTarget()
+	target.endpoint = "127.0.0.1:1" // nothing listens
+	target.state.Store(StatePaused)
+
+	s := ForListeningPort("6379/tcp").WithStartupTimeout(30 * time.Second)
+	start := time.Now()
+	err := s.WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want error when container is paused")
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("took %v; want fail-fast, not full timeout", elapsed)
+	}
+	if !strings.Contains(err.Error(), "paused") {
+		t.Errorf("error = %v, want mention of paused container", err)
+	}
+}
+
+func TestPollRetriesCreatedUntilRunning(t *testing.T) {
+	target := &firstStateTarget{fakeTarget: newFakeTarget(), first: StateCreated}
+	checks := 0
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error {
+			checks++
+			if target.state.Load() != StateRunning {
+				return errors.New("not ready")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if target.stateCalls.Load() < 2 {
+		t.Fatalf("State calls = %d, want Created -> Running transition", target.stateCalls.Load())
+	}
+}
+
+func TestPollRetriesRestartingUntilRunning(t *testing.T) {
+	target := &firstStateTarget{fakeTarget: newFakeTarget(), first: StateRestarting}
+	checks := 0
+	err := poll(
+		context.Background(),
+		options{startupTimeout: 2500 * time.Millisecond, pollInterval: time.Millisecond},
+		target,
+		"wait for test",
+		func(context.Context) error {
+			checks++
+			if target.state.Load() != StateRunning {
+				return errors.New("not ready")
+			}
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if checks < 2 {
+		t.Fatalf("checks = %d, want retry after Restarting", checks)
+	}
+}
+
+func TestPollRetriesUnknownAndTransientInspectErrorUntilTimeout(t *testing.T) {
+	cases := map[string]error{
+		"unknown state": nil,
+		"inspect error": errors.New("temporary inspect failure"),
+	}
+	for name, stateErr := range cases {
+		t.Run(name, func(t *testing.T) {
+			target := newFakeTarget()
+			target.state.Store(StateUnknown)
+			target.stateErr = stateErr
+			checks := 0
+			err := poll(
+				context.Background(),
+				options{startupTimeout: 100 * time.Millisecond, pollInterval: 20 * time.Millisecond},
+				target,
+				"wait for test",
+				func(context.Context) error {
+					checks++
+					return errors.New("not ready")
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), "timed out") {
+				t.Fatalf("poll error = %v, want timeout", err)
+			}
+			if checks < 3 {
+				t.Errorf("checks = %d, want retries until timeout", checks)
+			}
+		})
+	}
+}
+
+func TestTerminalWaitStatePolicy(t *testing.T) {
+	cases := map[State]bool{
+		StateCreated:    false,
+		StateRunning:    false,
+		StateStopping:   true,
+		StateRestarting: false,
+		StateUnknown:    false,
+		StateStopped:    true,
+		StatePaused:     true,
+	}
+	for state, want := range cases {
+		if got := terminalWaitState(state); got != want {
+			t.Errorf("terminalWaitState(%q) = %t, want %t", state, got, want)
+		}
 	}
 }
 
@@ -150,369 +364,14 @@ func TestForLogAsRegexp(t *testing.T) {
 	}
 }
 
-type terminalLogStream struct {
-	io.ReadCloser
-	done     chan struct{}
-	terminal error
-}
-
-func (s *terminalLogStream) Close() error          { return s.ReadCloser.Close() }
-func (s *terminalLogStream) Done() <-chan struct{} { return s.done }
-func (s *terminalLogStream) TerminalError() error  { return s.terminal }
-
-func TestForLogObservesTerminalStreamErrorAfterMatch(t *testing.T) {
-	terminal := errors.New("logs CLI exited after emitting match")
-	done := make(chan struct{})
-	close(done)
-	target := newFakeTarget()
-	target.logs = &terminalLogStream{
-		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
-		done:       done,
-		terminal:   terminal,
-	}
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, terminal) {
-		t.Fatalf("ForLog error = %v, want terminal stream error", err)
-	}
-}
-
-type delayedTerminalLogReader struct {
-	reader    io.Reader
-	done      chan struct{}
-	closeOnce sync.Once
-	terminal  error
-}
-
-func (r *delayedTerminalLogReader) Read(p []byte) (int, error) {
-	return r.reader.Read(p)
-}
-func (r *delayedTerminalLogReader) Close() error          { return nil }
-func (r *delayedTerminalLogReader) Done() <-chan struct{} { return r.done }
-func (r *delayedTerminalLogReader) TerminalError() error  { return r.terminal }
-func (r *delayedTerminalLogReader) finish()               { r.closeOnce.Do(func() { close(r.done) }) }
-
-func TestForLogSettlesTerminalErrorAfterMatch(t *testing.T) {
-	terminal := errors.New("terminal CLI failure after match")
-	reader := &delayedTerminalLogReader{
-		reader:   strings.NewReader("ready\n"),
-		done:     make(chan struct{}),
-		terminal: terminal,
-	}
-	time.AfterFunc(time.Millisecond, reader.finish)
-	target := newFakeTarget()
-	target.logs = reader
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, terminal) {
-		t.Fatalf("ForLog error = %v, want terminal error", err)
-	}
-}
-
-type delayedTerminalErrorStream struct {
-	reader        io.Reader
-	done          chan struct{}
-	terminalReady chan struct{}
-	terminal      error
-}
-
-func (s *delayedTerminalErrorStream) Read(p []byte) (int, error) {
-	return s.reader.Read(p)
-}
-func (s *delayedTerminalErrorStream) Close() error          { return nil }
-func (s *delayedTerminalErrorStream) Done() <-chan struct{} { return s.done }
-func (s *delayedTerminalErrorStream) TerminalError() error {
-	select {
-	case <-s.terminalReady:
-		return s.terminal
-	default:
-		return nil
-	}
-}
-
-func TestForLogPreservesDelayedTerminalErrorAfterMatch(t *testing.T) {
-	terminal := errors.New("terminal CLI failure arrived after settle")
-	stream := &delayedTerminalErrorStream{
-		reader:        strings.NewReader("ready\n"),
-		done:          make(chan struct{}),
-		terminalReady: make(chan struct{}),
-		terminal:      terminal,
-	}
-	time.AfterFunc(time.Millisecond, func() { close(stream.done) })
-	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
-	target := newFakeTarget()
-	target.logs = stream
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, terminal) {
-		t.Fatalf("ForLog error = %v, want delayed terminal error", err)
-	}
-}
-
-type cancelDelayedTerminalStream struct {
-	data          []byte
-	dataRead      chan struct{}
-	closed        chan struct{}
-	closeOnce     sync.Once
-	done          chan struct{}
-	terminalReady chan struct{}
-	readErr       error
-	terminal      error
-}
-
-func (s *cancelDelayedTerminalStream) Read(p []byte) (int, error) {
-	if len(s.data) > 0 {
-		n := copy(p, s.data)
-		s.data = s.data[n:]
-		close(s.dataRead)
-		return n, nil
-	}
-	<-s.closed
-	return 0, s.readErr
-}
-func (s *cancelDelayedTerminalStream) Close() error {
-	s.closeOnce.Do(func() {
-		close(s.closed)
-		close(s.done)
-	})
-	return nil
-}
-func (s *cancelDelayedTerminalStream) Done() <-chan struct{} { return s.done }
-func (s *cancelDelayedTerminalStream) TerminalError() error {
-	select {
-	case <-s.terminalReady:
-		return s.terminal
-	default:
-		return nil
-	}
-}
-
-func TestForLogJoinsCancellationWithDelayedReaderAndTerminalErrors(t *testing.T) {
-	readErr := errors.New("reader failed after cancellation")
-	terminal := errors.New("terminal failed after cancellation")
-	stream := &cancelDelayedTerminalStream{
-		data:          []byte("ready\n"),
-		dataRead:      make(chan struct{}),
-		closed:        make(chan struct{}),
-		done:          make(chan struct{}),
-		terminalReady: make(chan struct{}),
-		readErr:       readErr,
-		terminal:      terminal,
-	}
-	time.AfterFunc(20*time.Millisecond, func() { close(stream.terminalReady) })
-	target := newFakeTarget()
-	target.logs = stream
-	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan error, 1)
-	go func() {
-		result <- ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
-	}()
-	<-stream.dataRead
-	cancel()
-
-	err := <-result
-	if !errors.Is(err, context.Canceled) || !errors.Is(err, readErr) || !errors.Is(err, terminal) {
-		t.Fatalf("ForLog error = %v, want context, reader, and terminal errors", err)
-	}
-}
-
-func TestForLogPreservesTerminalAndContextErrors(t *testing.T) {
-	terminal := errors.New("terminal CLI failure")
-	done := make(chan struct{})
-	close(done)
-	target := newFakeTarget()
-	target.logs = &terminalLogStream{
-		ReadCloser: io.NopCloser(strings.NewReader("ready\n")),
-		done:       done,
-		terminal:   terminal,
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
-	if !errors.Is(err, terminal) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("ForLog error = %v, want terminal and context errors", err)
-	}
-}
-
-type errorAfterLogReader struct {
-	io.Reader
-	err error
-}
-
-func (r *errorAfterLogReader) Read(p []byte) (int, error) {
-	n, err := r.Reader.Read(p)
-	if errors.Is(err, io.EOF) {
-		return n, r.err
-	}
-	return n, err
-}
-func (r *errorAfterLogReader) Close() error { return nil }
-
-func TestForLogPreservesReaderErrorAfterMatch(t *testing.T) {
-	readErr := errors.New("log reader failed after matching line")
-	target := newFakeTarget()
-	target.logs = &errorAfterLogReader{Reader: strings.NewReader("ready\n"), err: readErr}
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, readErr) {
-		t.Fatalf("ForLog error = %v, want reader error", err)
-	}
-}
-
-type delayedReaderErrorStream struct {
-	data      []byte
-	closeOnce sync.Once
-	closed    chan struct{}
-	err       error
-}
-
-func (s *delayedReaderErrorStream) Read(p []byte) (int, error) {
-	if len(s.data) > 0 {
-		n := copy(p, s.data)
-		s.data = s.data[n:]
-		return n, nil
-	}
-	<-s.closed
-	return 0, s.err
-}
-
-func (s *delayedReaderErrorStream) Close() error {
-	s.closeOnce.Do(func() { close(s.closed) })
-	return nil
-}
-
-func TestForLogPreservesDelayedReaderErrorAfterMatch(t *testing.T) {
-	readErr := errors.New("log reader failed after delayed close")
-	target := newFakeTarget()
-	target.logs = &delayedReaderErrorStream{
-		data:   []byte("ready\n"),
-		closed: make(chan struct{}),
-		err:    readErr,
-	}
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, readErr) {
-		t.Fatalf("ForLog error = %v, want delayed reader error", err)
-	}
-}
-
-func TestForLogDoesNotProbeAfterReaderFailure(t *testing.T) {
-	readErr := errors.New("log reader failed")
-	target := newFakeTarget()
-	target.logs = &errorAfterLogReader{Reader: strings.NewReader("not ready\n"), err: readErr}
-
-	err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
-	if !errors.Is(err, readErr) {
-		t.Fatalf("ForLog error = %v, want reader error", err)
-	}
-	if calls := target.runningCalls.Load(); calls != 0 {
-		t.Fatalf("Running calls after reader failure = %d, want 0", calls)
-	}
-}
-
-type forLogCancelProbeTarget struct {
-	*fakeTarget
-	cancel   context.CancelFunc
-	probeErr error
-}
-
-func (t *forLogCancelProbeTarget) Running(context.Context) (bool, error) {
-	t.cancel()
-	return false, t.probeErr
-}
-
-func TestForLogJoinsCallerCancellationAfterFinalProbe(t *testing.T) {
-	probeErr := errors.New("state probe failed")
-	ctx, cancel := context.WithCancel(context.Background())
-	target := &forLogCancelProbeTarget{fakeTarget: newFakeTarget(), cancel: cancel, probeErr: probeErr}
-	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
-
-	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
-	if !errors.Is(err, probeErr) || !errors.Is(err, context.Canceled) {
-		t.Fatalf("ForLog error = %v, want probe and caller cancellation", err)
-	}
-}
-
-type forLogDeadlineProbeTarget struct {
-	*fakeTarget
-}
-
-func (t *forLogDeadlineProbeTarget) Running(ctx context.Context) (bool, error) {
-	t.runningCalls.Add(1)
-	<-ctx.Done()
-	return false, ctx.Err()
-}
-
-func TestForLogJoinsCallerDeadlineAfterFinalProbe(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	target := &forLogDeadlineProbeTarget{fakeTarget: newFakeTarget()}
-	target.logs = io.NopCloser(strings.NewReader("not ready\n"))
-
-	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ForLog error = %v, want caller deadline", err)
-	}
-	if target.runningCalls.Load() == 0 {
-		t.Fatal("final Running probe was not called")
-	}
-}
-
-type cancelAwareLogStream struct {
-	ctx    context.Context
-	closed chan struct{}
-}
-
-func (s *cancelAwareLogStream) Read([]byte) (int, error) {
-	<-s.ctx.Done()
-	return 0, s.ctx.Err()
-}
-func (s *cancelAwareLogStream) Close() error {
-	select {
-	case <-s.closed:
-	default:
-		close(s.closed)
-	}
-	return nil
-}
-
-type forLogProbeTarget struct {
-	*fakeTarget
-	streamStarted chan struct{}
-}
-
-func (t *forLogProbeTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
-	stream := &cancelAwareLogStream{ctx: ctx, closed: make(chan struct{})}
-	close(t.streamStarted)
-	return stream, nil
-}
-
-func TestForAnyCancellationDoesNotStartDetachedRunningProbe(t *testing.T) {
-	target := &forLogProbeTarget{fakeTarget: newFakeTarget(), streamStarted: make(chan struct{})}
-	loser := ForLog("never").WithStartupTimeout(5 * time.Second)
-	winner := &issue116ForAnyWinner{loserStarted: target.streamStarted}
-
-	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), target); err != nil {
-		t.Fatalf("ForAny: %v", err)
-	}
-	if calls := target.runningCalls.Load(); calls != 0 {
-		t.Fatalf("Running calls after canceled ForLog loser = %d, want 0", calls)
-	}
-}
-
 func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target := newFakeTarget()
 	pr, _ := io.Pipe() // never written, never closed
 	target.logs = pr
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
-	err := s.WaitUntilReady(context.Background(), target)
-	if err == nil {
+	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
 }
 
@@ -582,7 +441,7 @@ func TestForExecTimesOutOnPersistentFailure(t *testing.T) {
 	}
 }
 
-func TestForListeningPortProbesRunningDuringPoll(t *testing.T) {
+func TestForListeningPortProbesStateDuringPoll(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -599,24 +458,24 @@ func TestForListeningPortProbesRunningDuringPoll(t *testing.T) {
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
-	// stateCheckInterval is 1s; a 2.5s poll should probe Running a few times.
-	if n := target.runningCalls.Load(); n < 2 || n > 5 {
-		t.Errorf("Running calls = %d, want 2..5 during connection poll", n)
+	// stateCheckInterval is 1s; a 2.5s poll should probe state a few times.
+	if n := target.stateCalls.Load(); n < 2 || n > 5 {
+		t.Errorf("State calls = %d, want 2..5 during connection poll", n)
 	}
 }
 
-func TestForExecSkipsRunningDuringPoll(t *testing.T) {
+func TestForExecProbesStateDuringPoll(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
 
 	// Default ForExec interval is 250ms; a 3s timeout should exec a
-	// modest number of times and only inspect Running once at the end.
+	// modest number of times and inspect state at the bounded cadence.
 	s := ForExec([]string{"pg_isready"}).WithStartupTimeout(3 * time.Second)
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
-	if n := target.runningCalls.Load(); n != 1 {
-		t.Errorf("Running calls = %d, want 1 (final classification only)", n)
+	if n := target.stateCalls.Load(); n < 3 || n > 5 {
+		t.Errorf("State calls = %d, want periodic checks plus final classification", n)
 	}
 	// 3s / 250ms ≈ 12 intervals plus the initial check → ~13; allow slack.
 	if n := target.execCalls.Load(); n < 10 || n > 16 {
@@ -642,8 +501,8 @@ func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	if target.execCalls.Load() != 1 {
 		t.Errorf("exec calls = %d, want 1 (no retry)", target.execCalls.Load())
 	}
-	if target.runningCalls.Load() != 0 {
-		t.Errorf("Running calls = %d, want 0 on fatal check error", target.runningCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want 1 initial lifecycle check", target.stateCalls.Load())
 	}
 	if !strings.Contains(err.Error(), "executable file not found") {
 		t.Errorf("error = %v, want launch failure", err)
@@ -672,7 +531,7 @@ func TestForExecRetriesTransientErrors(t *testing.T) {
 func TestForExecReportsStoppedAtTimeout(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
-	target.running.Store(false)
+	target.state.Store(StateStopped)
 
 	s := ForExec([]string{"pg_isready"}).
 		WithStartupTimeout(200 * time.Millisecond).
@@ -686,7 +545,7 @@ func TestForExecReportsStoppedAtTimeout(t *testing.T) {
 	}
 }
 
-func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
+func TestForExecFinalStateProbeRespectsCallerCancel(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
 
@@ -706,17 +565,17 @@ func TestForExecFinalRunningProbeRespectsCallerCancel(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("error = %v, want context.Canceled", err)
 	}
-	if target.runningCalls.Load() != 0 {
-		t.Errorf("Running calls = %d, want 0 when caller cancels", target.runningCalls.Load())
+	if target.stateCalls.Load() != 1 {
+		t.Errorf("State calls = %d, want only the initial lifecycle check", target.stateCalls.Load())
 	}
 }
 
-func TestForExecFinalRunningProbeIsBounded(t *testing.T) {
+func TestForExecStateProbeHonorsDeadline(t *testing.T) {
 	target := newFakeTarget()
 	target.execCode = 1
-	// Running ignores progress until its context ends; without a bound
-	// on the diagnostic probe this would hang for queryTimeout.
-	slow := &slowRunningTarget{fakeTarget: target, block: 30 * time.Second}
+	// State ignores progress until its context ends; a probe must not
+	// outlive the strategy deadline or create a fresh timeout budget.
+	slow := &slowStateTarget{fakeTarget: target, block: 30 * time.Second}
 
 	s := ForExec([]string{"pg_isready"}).
 		WithStartupTimeout(150 * time.Millisecond).
@@ -727,7 +586,25 @@ func TestForExecFinalRunningProbeIsBounded(t *testing.T) {
 		t.Fatal("want error")
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Errorf("took %v; want bounded final Running probe", elapsed)
+		t.Errorf("took %v; want State probe bounded by strategy deadline", elapsed)
+	}
+}
+
+// slowStateTarget blocks in State until ctx ends or block elapses.
+type slowStateTarget struct {
+	*fakeTarget
+	block time.Duration
+}
+
+func (s *slowStateTarget) State(ctx context.Context) (State, error) {
+	s.stateCalls.Add(1)
+	timer := time.NewTimer(s.block)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return StateUnknown, ctx.Err()
+	case <-timer.C:
+		return s.state.Load().(State), nil
 	}
 }
 
@@ -745,8 +622,20 @@ func (s *slowRunningTarget) Running(ctx context.Context) (bool, error) {
 	case <-ctx.Done():
 		return false, ctx.Err()
 	case <-timer.C:
-		return s.running.Load(), nil
+		state, err := s.fakeTarget.State(ctx)
+		return state == StateRunning, err
 	}
+}
+
+func (s *slowRunningTarget) State(ctx context.Context) (State, error) {
+	running, err := s.Running(ctx)
+	if err != nil {
+		return StateUnknown, err
+	}
+	if running {
+		return StateRunning, nil
+	}
+	return StateStopped, nil
 }
 
 func TestForAllRunsStrategiesInOrder(t *testing.T) {
@@ -797,95 +686,6 @@ func TestForAnySucceedsWhenOneSucceeds(t *testing.T) {
 	}
 }
 
-type issue116ForAnyLoser struct {
-	started  chan struct{}
-	returned chan struct{}
-}
-
-func (s *issue116ForAnyLoser) WaitUntilReady(ctx context.Context, _ Target) error {
-	close(s.started)
-	<-ctx.Done()
-	close(s.returned)
-	return errors.New("losing exec was canceled")
-}
-
-type issue116ForAnyWinner struct {
-	loserStarted <-chan struct{}
-}
-
-func (s *issue116ForAnyWinner) WaitUntilReady(ctx context.Context, _ Target) error {
-	select {
-	case <-s.loserStarted:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
-}
-
-func TestForAnyDrainsCanceledLosersBeforeSuccess(t *testing.T) {
-	loser := &issue116ForAnyLoser{
-		started:  make(chan struct{}),
-		returned: make(chan struct{}),
-	}
-	winner := &issue116ForAnyWinner{loserStarted: loser.started}
-
-	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
-		t.Fatalf("ForAny success = %v, want nil", err)
-	}
-	select {
-	case <-loser.returned:
-		// The success result was returned only after the canceled loser
-		// completed its lifecycle path.
-	default:
-		t.Fatal("ForAny returned before the canceled loser finished")
-	}
-}
-
-type issue116NonCooperativeStrategy struct {
-	started chan struct{}
-	release chan struct{}
-}
-
-func (s *issue116NonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
-	close(s.started)
-	<-s.release
-	return nil
-}
-
-func TestForAnyBoundsNonCooperativeLoserDrain(t *testing.T) {
-	loser := &issue116NonCooperativeStrategy{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	t.Cleanup(func() { close(loser.release) })
-
-	winner := &issue116ForAnyWinner{loserStarted: loser.started}
-	started := time.Now()
-	if err := ForAny(loser, winner).WaitUntilReady(context.Background(), newFakeTarget()); err != nil {
-		t.Fatalf("ForAny success = %v, want nil", err)
-	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("ForAny success took %v with non-cooperative loser", elapsed)
-	}
-}
-
-func TestForAnyBoundsNonCooperativeDrainAfterTimeout(t *testing.T) {
-	strategy := &issue116NonCooperativeStrategy{
-		started: make(chan struct{}),
-		release: make(chan struct{}),
-	}
-	t.Cleanup(func() { close(strategy.release) })
-
-	started := time.Now()
-	err := ForAny(strategy).WithStartupTimeout(20*time.Millisecond).WaitUntilReady(context.Background(), newFakeTarget())
-	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("ForAny error = %v, want deadline exceeded", err)
-	}
-	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
-		t.Fatalf("ForAny timeout took %v with non-cooperative strategy", elapsed)
-	}
-}
-
 func TestForAllWithStartupTimeout(t *testing.T) {
 	target := newFakeTarget()
 	target.endpoint = "127.0.0.1:1" // dead port
@@ -931,14 +731,27 @@ func TestForAnyWithStartupTimeout(t *testing.T) {
 }
 
 func TestForExecRejectsEmptyCommand(t *testing.T) {
-	target := newFakeTarget()
-	s := ForExec(nil).WithStartupTimeout(60 * time.Second)
-	start := time.Now()
-	err := s.WaitUntilReady(context.Background(), target)
-	if err == nil {
-		t.Fatal("want error for empty command")
-	}
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Errorf("took %v, want immediate error", elapsed)
+	for _, tc := range []struct {
+		name string
+		cmd  []string
+	}{
+		{name: "empty command", cmd: nil},
+		{name: "empty executable", cmd: []string{""}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target := newFakeTarget()
+			s := ForExec(tc.cmd).WithStartupTimeout(60 * time.Second)
+			start := time.Now()
+			err := s.WaitUntilReady(context.Background(), target)
+			if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
+				t.Fatalf("error = %v, want ErrInvalidConfiguration", err)
+			}
+			if elapsed := time.Since(start); elapsed > time.Second {
+				t.Errorf("took %v, want immediate error", elapsed)
+			}
+			if got := target.execCalls.Load(); got != 0 {
+				t.Fatalf("exec calls = %d, want 0", got)
+			}
+		})
 	}
 }

@@ -26,6 +26,9 @@ func applyEngineBinary(cfg *config) {
 }
 
 func detectEngineFor(goos, value string) (engine, error) {
+	if err := validateBackendEnv(value); err != nil {
+		return nil, err
+	}
 	switch value {
 	case "":
 		if goos == "darwin" {
@@ -34,12 +37,19 @@ func detectEngineFor(goos, value string) (engine, error) {
 		return dockerEngine{}, nil
 	case "docker":
 		return dockerEngine{}, nil
-	case "apple":
+	default: // apple
 		if goos != "darwin" {
 			return nil, fmt.Errorf("%s=apple: Apple Container only runs on macOS (GOOS=%s)", backendEnv, goos)
 		}
 		return appleEngine{}, nil
+	}
+}
+
+func validateBackendEnv(value string) error {
+	switch value {
+	case "", "apple", "docker":
+		return nil
 	default:
-		return nil, fmt.Errorf("invalid %s=%q: valid values are \"apple\" and \"docker\"", backendEnv, value)
+		return fmt.Errorf("invalid %s=%q: valid values are \"apple\" and \"docker\"", backendEnv, value)
 	}
 }

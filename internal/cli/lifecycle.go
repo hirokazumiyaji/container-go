@@ -8,22 +8,6 @@ import (
 	"sync"
 )
 
-// processTree is the platform-specific, owned termination boundary for a
-// command. A tree is published only after cmd.Start has returned successfully
-// and is closed only after the sole cmd.Wait call has returned.
-type processTree interface {
-	terminate(*exec.Cmd) terminationResult
-	close()
-}
-
-type terminationResult struct {
-	// active is true only when the implementation proved that the direct
-	// child was still active when termination was attempted. A successful
-	// operation on an already-empty/zombie job is not active evidence.
-	active bool
-	err    error
-}
-
 // RunStatus describes what the local command lifecycle actually observed.
 // Reaped is the fact that cmd.Wait returned; it is deliberately separate from
 // whether cancellation won the race with that wait. TerminatedByCancellation
@@ -156,12 +140,6 @@ func (l *commandLifecycle) error() error {
 	return l.waitErr
 }
 
-func (l *commandLifecycle) contextError() error {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.ctxErr
-}
-
 func (l *commandLifecycle) status() RunStatus {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -171,12 +149,6 @@ func (l *commandLifecycle) status() RunStatus {
 		CancelRequested:          l.cancelRequested,
 		TerminatedByCancellation: l.terminatedByCancellation,
 	}
-}
-
-func (l *commandLifecycle) isReaped() bool {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	return l.reaped
 }
 
 // cancel is the os/exec context callback. The optional argument is used by
@@ -209,7 +181,7 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 
 		var result terminationResult
 		if l.tree == nil {
-			result = terminateDirectProcess(l.cmd)
+			result = terminateDirectProcessResult(l.cmd)
 		} else {
 			result = l.tree.terminate(l.cmd)
 		}
@@ -223,18 +195,3 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 	l.mu.Unlock()
 	return err
 }
-
-type directProcessTree struct{}
-
-func (directProcessTree) terminate(cmd *exec.Cmd) terminationResult {
-	return terminateDirectProcess(cmd)
-}
-
-func (directProcessTree) close() {}
-
-type processTreeFunc func(*exec.Cmd) error
-
-func (f processTreeFunc) terminate(cmd *exec.Cmd) terminationResult {
-	return terminationResult{active: true, err: f(cmd)}
-}
-func (processTreeFunc) close() {}

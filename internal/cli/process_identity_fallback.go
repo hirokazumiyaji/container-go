@@ -1,25 +1,21 @@
-//go:build darwin || dragonfly || freebsd || netbsd || openbsd || solaris || illumos
+//go:build dragonfly || freebsd || netbsd || openbsd || solaris || illumos
 
 package cli
 
-import "errors"
+import "os"
 
-var errStableProcessIdentityUnavailable = errors.New("stable Unix process identity is unavailable")
-
-type processIdentity struct{}
-
-func openProcessIdentity(int) (processIdentity, error) {
-	return processIdentity{}, errStableProcessIdentityUnavailable
+// These Unix targets do not expose the pidfd/waitid identity primitive used by
+// Linux (or the Darwin waitid bridge). Retain the os.Process and use only its
+// direct handle; numeric process-group signaling is deliberately disabled.
+func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
+	if process == nil {
+		return nil, os.ErrProcessDone
+	}
+	return retainedProcessIdentity{process: process}, nil
 }
 
-func (processIdentity) active() (bool, error) {
-	return false, errStableProcessIdentityUnavailable
+func observeProcessStopped(*os.Process) (bool, error) {
+	return false, errProcessStopNotObserved
 }
-func (processIdentity) stop() error { return errStableProcessIdentityUnavailable }
-func (processIdentity) stopped() (bool, error) {
-	return false, errStableProcessIdentityUnavailable
-}
-func (processIdentity) kill() error          { return errStableProcessIdentityUnavailable }
-func (processIdentity) groupID() (int, bool) { return 0, false }
-func (processIdentity) close()               {}
+
 func processGroupTerminationSupported() bool { return false }

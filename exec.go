@@ -44,13 +44,15 @@ func WithExecTimeout(d time.Duration) ExecOption {
 	}
 }
 
-// WithExecEnv sets environment variables for the exec'd process,
-// passed via a temporary env file.
+// WithExecEnv sets environment variables for the exec'd process, passed via a
+// temporary env file. It uses the same key and value validation as WithEnv.
+// Exec returns ErrEnvFileUnsupported on Windows.
 func WithExecEnv(env map[string]string) ExecOption {
 	return func(c *execConfig) error {
-		for k, v := range env {
-			if k == "" || strings.ContainsAny(k, "=\n\x00") || strings.ContainsAny(v, "\n\x00") {
-				return fmt.Errorf("invalid exec environment variable %q", k)
+		for _, k := range sortedKeys(env) {
+			v := env[k]
+			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
+				return err
 			}
 			c.env[k] = v
 		}
@@ -62,7 +64,7 @@ func WithExecEnv(env map[string]string) ExecOption {
 func WithExecUser(u string) ExecOption {
 	return func(c *execConfig) error {
 		if !userRE.MatchString(u) {
-			return fmt.Errorf("invalid exec user %q", u)
+			return validationErrorf("WithExecUser", u, "invalid exec user %q", u)
 		}
 		c.user = u
 		return nil
@@ -73,7 +75,7 @@ func WithExecUser(u string) ExecOption {
 func WithExecWorkDir(dir string) ExecOption {
 	return func(c *execConfig) error {
 		if !strings.HasPrefix(dir, "/") || strings.ContainsAny(dir, "\n\x00") {
-			return fmt.Errorf("exec working directory %q must be an absolute path", dir)
+			return validationErrorf("WithExecWorkDir", dir, "exec working directory %q must be an absolute path", dir)
 		}
 		c.workdir = dir
 		return nil
@@ -103,15 +105,25 @@ func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, con
 // ExecTerminationError even if the operating system represents the killed
 // process with a normal exit status. The backend-side process may still be
 // running because neither supported CLI exposes a common exec-instance kill.
-func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
+	for i, opt := range opts {
+		if opt == nil {
+			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
+		}
+	}
 	if len(cmd) == 0 {
-		return 0, nil, errors.New("exec: command must not be empty")
+		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")
 	}
 	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
 			return 0, nil, err
 		}
+	}
+
+	target, err := c.verifiedOperationTarget(ctx)
+	if err != nil {
+		return 0, emptyExecOutput(), err
 	}
 
 	// Exec is a buffered, bounded operation by default. An explicit zero
@@ -128,14 +140,28 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, emptyExecOutput(), ctxErr
 	}
 
-	var envFile string
+	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFile(cfg.env)
+		path, dir, err := writeEnvFileContext(execCtx, cfg.env)
 		if err != nil {
-			return 0, nil, err
+			if dir != "" {
+				// Preserve ownership when a late root-lock error is
+				// returned with a published env directory.
+				defer func() {
+					if retryErr := retryEnvFileCleanupWithError(&dir); retryErr != nil {
+						retErr = joinEnvFileCleanupError(retErr, retryErr)
+					}
+				}()
+				return 0, emptyExecOutput(), joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+			}
+			return 0, emptyExecOutput(), err
 		}
-		defer os.RemoveAll(dir)
-		envFile = path
+		envFile, envDir = path, dir
+		defer func() {
+			if retryErr := retryEnvFileCleanupWithError(&envDir); retryErr != nil {
+				retErr = joinEnvFileCleanupError(retErr, retryErr)
+			}
+		}()
 	}
 	// Setup (for example an env-file write) may itself race with
 	// cancellation. Recheck immediately before handing control to the
@@ -144,7 +170,15 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		return 0, emptyExecOutput(), ctxErr
 	}
 
-	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(c.id, cfg, envFile, cmd)...)
+	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	// The CLI has finished reading the env file. Remove it before any
+	// result classification or caller-visible output processing. Retain
+	// envDir for a deferred retry if removal fails, and preserve the error.
+	envCleanupErr := cleanupEnvFileAfterUseContext(execCtx, envDir)
+	if envCleanupErr == nil {
+		envDir = ""
+	}
+
 	// A runner call is considered a launch for legacy/custom runners that
 	// do not report lifecycle metadata. ExecRunner annotates failures with
 	// the authoritative local Start/reap/cancellation result below.
@@ -153,9 +187,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if statusReported {
 		launched = commandStatus.Started
 	}
-	output := io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
-		return 0, output, nil
+		return 0, output, envCleanupErr
 	}
 
 	// Capture whether cancellation was already present when the command
@@ -175,45 +209,73 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	}
 	finish := func(code int, classified error) (int, io.Reader, error) {
 		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
-			return code, output, contextErr
+			return code, output, joinEnvFileCleanupError(contextErr, envCleanupErr)
 		}
-		return code, output, classified
+		return code, output, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
+
+	var cliErr *cli.CLIError
+	hasSelected := false
+	if c.eng != nil {
+		var selected cliErrorBranch
+		selected, hasSelected = matchingCLIErrorBranch(err, c.eng.binary(), "exec", c.operationTarget(), c.id)
+		if hasSelected {
+			cliErr = selected.ctx.err
+		}
+	}
+	if !hasSelected {
+		_ = errors.As(err, &cliErr)
+	}
+
 	if isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil {
 		code := 0
-		var cliErr *cli.CLIError
-		if errors.As(err, &cliErr) {
+		if cliErr != nil && cliErr.ExitCode >= 0 {
 			code = cliErr.ExitCode
 		}
 		return finish(code, err)
 	}
-
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		// A launch, transport, or timeout failure has no command exit code,
-		// but the CLI may still have emitted useful diagnostics.
-		return finish(0, wrapNotFound(c.classify(execCtx, err)))
+	if cliErr != nil && cliErr.ExitCode < 0 {
+		return finish(cliErr.ExitCode, err)
 	}
 
-	// A command exit with structured timeout evidence is an operation
-	// failure, not an application result. Classify preserves the original
-	// diagnostic and does not issue a misleading liveness probe.
-	if cli.IsOperationTimeoutError(err) {
-		return finish(cliErr.ExitCode, wrapNotFound(c.classify(execCtx, err)))
+	if cliErr == nil {
+		return finish(0, wrapNotFoundForOperation(c.eng, c.classifyOperation(execCtx, err, "exec"), "exec", c.operationTarget(), c.id))
+	}
+
+	// A timeout-shaped command exit is an operation failure, not an
+	// application result. Classify returns it without probing the backend.
+	if isExecOperationTimeout(err, cliErr) {
+		return finish(cliErr.ExitCode, c.classifyOperation(execCtx, err, "exec"))
+	}
+
+	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
+		return finish(cliErr.ExitCode, nil)
+	}
+
+	// Exec diagnostics can come from the workload itself. Do not use the
+	// broad text-based liveness classifier here: a positive workload exit
+	// is still a result even when it says "permission denied" or mentions
+	// configuration. Only structured OS and timeout evidence is definitive.
+	if isDefinitiveExecError(err, cliErr) {
+		return finish(cliErr.ExitCode, err)
 	}
 
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
-	if !isNotFound(err) && !maybeInfraExecErr(err) {
+	if !isNotFoundForOperation(c.eng, err, "exec", c.operationTarget(), c.id) &&
+		!maybeInfraExecErr(c.eng, err, c.operationTarget(), c.id) {
 		return finish(cliErr.ExitCode, nil)
 	}
-	if c.execContainerRunning(execCtx) {
+	verification := c.verifyExecContainer(execCtx)
+	if verification.err == nil && verification.state == StateRunning {
 		return finish(cliErr.ExitCode, nil)
 	}
-	// Preserve both the CLI exit code and the classified infrastructure
-	// error. The output reader is intentionally non-nil on this path.
-	return finish(cliErr.ExitCode, wrapNotFound(c.classify(execCtx, err)))
+	if verification.err != nil {
+		joined := errors.Join(err, verification.err)
+		return finish(cliErr.ExitCode, wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id))
+	}
+	return finish(cliErr.ExitCode, errors.Join(err, &execInspectionStateError{state: verification.state}))
 }
 
 func emptyExecOutput() io.Reader {
@@ -249,53 +311,125 @@ func execContextualError(ctx, execCtx context.Context, err error, terminationUnk
 	return err, true
 }
 
+func isExecOperationTimeout(err error, cliErr *cli.CLIError) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	return cliErr != nil && cliErr.ExitCode < 0
+}
+
+// isDefinitiveExecError identifies client-side failures that are
+// represented by structured evidence rather than workload output. Exec
+// forwards the workload's stderr through CLIError, so diagnostic phrases
+// alone cannot establish that the backend or the CLI invocation failed.
+func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrPermission) || errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrInvalid) {
+		return true
+	}
+	var timeoutErr interface{ Timeout() bool }
+	if errors.As(err, &timeoutErr) && timeoutErr.Timeout() {
+		return true
+	}
+	return false
+}
+
 // maybeInfraExecErr reports whether an exec CLIError could be about the
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
-func maybeInfraExecErr(err error) bool {
-	// Timeout and signal-shaped errors are operation failures even when a
-	// CLI happens to print a generic application-looking stderr diagnostic.
-	// Check this before the application-result fast path below.
+func maybeInfraExecErr(eng engine, err error, targets ...string) bool {
 	if cli.IsOperationTimeoutError(err) {
 		return true
 	}
-	s, ok := execCLIStderr(err)
-	if !ok {
-		return true
+	if eng == nil {
+		return false
 	}
-	for _, sub := range []string{
-		"daemon", "cannot connect", "connection refused", "xpc",
-		"backend", "socket", "is not running", "not running",
-		"stopped", "paused", "restarting", "removing", "no such",
-	} {
-		if strings.Contains(s, sub) {
+	for _, branch := range matchingCLIErrorBranches(err, eng.binary(), "exec", targets...) {
+		stderr, _ := branchLines(branch, false)
+		if len(stderr) == 0 {
 			return true
+		}
+		for _, line := range stderr {
+			for _, sub := range []string{
+				"daemon", "cannot connect", "connection refused", "xpc",
+				"backend", "socket", "system is not running", "is not running",
+				"stopped", "paused", "restarting", "removing",
+			} {
+				if strings.Contains(line, sub) {
+					return true
+				}
+			}
 		}
 	}
 	return false
 }
 
-func execCLIStderr(err error) (string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return "", false
-	}
-	return strings.ToLower(cliErr.Stderr), true
+type execInspection struct {
+	state State
+	err   error
 }
 
-// execContainerRunning verifies via inspect that the container is still
-// running. App-level failures keep their exit code; missing, stopped,
-// or unreachable containers report an error.
-func (c *Container) execContainerRunning(ctx context.Context) bool {
+type execInspectionStateError struct {
+	state State
+}
+
+type execInspectEmptyError struct {
+	target string
+}
+
+func (e *execInspectEmptyError) Error() string {
+	return fmt.Sprintf("exec verification: empty inspect output for %q", e.target)
+}
+
+func (e *execInspectionStateError) Error() string {
+	return fmt.Sprintf("exec verification: container state is %s", e.state)
+}
+
+// verifyExecContainer returns both the verified state and the precise
+// verification error. A false state is not enough to turn a failure into
+// ErrContainerNotFound: only a structured backend absence is wrapped as
+// such. Parse, empty-output, cancellation, permission, configuration, and
+// transport failures remain visible to the caller.
+func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
-	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(c.id)...)
+	target := c.operationTarget()
+	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
 	if err != nil {
-		return false
+		return execInspection{
+			state: StateUnknown,
+			err:   wrapNotFoundForOperation(c.eng, c.classifyOperation(qCtx, err, "inspect"), "inspect", target, c.id),
+		}
 	}
-	info, err := c.eng.parseInspect(stdout, c.id)
+	if len(bytes.TrimSpace(stdout)) == 0 {
+		return execInspection{
+			state: StateUnknown,
+			err:   &execInspectEmptyError{target: target},
+		}
+	}
+	info, err := c.eng.parseInspect(stdout, target)
 	if err != nil {
-		return false
+		if errors.Is(err, errInspectTargetNotFound) {
+			return execInspection{state: StateUnknown, err: wrapInspectTargetNotFound(err)}
+		}
+		return execInspection{state: StateUnknown, err: err}
 	}
-	return info.state == StateRunning
+	if info == nil {
+		return execInspection{
+			state: StateUnknown,
+			err:   fmt.Errorf("exec verification: inspect returned no state"),
+		}
+	}
+	if c.dockerGenerationMatches(info) {
+		c.setImmutableUID(info.uid)
+	}
+	return execInspection{state: info.state}
 }

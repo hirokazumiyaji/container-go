@@ -5,10 +5,12 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -163,4 +165,33 @@ func waitForPIDFiles(t *testing.T, paths ...string) (int, int) {
 func processExists(pid int) bool {
 	err := syscall.Kill(pid, 0)
 	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
+func waitForSinglePID(t *testing.T, path, errorPath string) (int, bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if pid, err := readPID(path); err == nil {
+			return pid, true
+		}
+		if _, err := os.Stat(errorPath); err == nil {
+			return 0, false
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("PID file %q was not created", path)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func readPID(path string) (int, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("PID file %q = %q", path, data)
+	}
+	return pid, nil
 }

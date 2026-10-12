@@ -6,27 +6,45 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sys/unix"
 )
 
-const processStoppedObservationWindow = 20 * time.Millisecond
-
+// processIdentity pins the original child with a pidfd. Unlike cmd.Process's
+// numeric PID fallback, a pidfd remains tied to the original process across
+// Wait and cannot be redirected to a recycled PID.
 type processIdentity struct {
-	pid   int
-	pidfd int
+	pid      int
+	pidfd    int
+	closeOne sync.Once
+	closed   atomic.Bool
 }
 
-func openProcessIdentity(pid int) (processIdentity, error) {
-	fd, err := unix.PidfdOpen(pid, 0)
-	if err != nil {
-		return processIdentity{}, err
+func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
+	if process == nil {
+		return nil, os.ErrProcessDone
 	}
-	return processIdentity{pid: pid, pidfd: fd}, nil
+	fd, err := unix.PidfdOpen(process.Pid, 0)
+	if err != nil {
+		return nil, err
+	}
+	return &processIdentity{pid: process.Pid, pidfd: fd}, nil
 }
 
-func (p processIdentity) active() (bool, error) {
+func (p *processIdentity) usable() error {
+	if p == nil || p.closed.Load() || p.pidfd < 0 {
+		return os.ErrProcessDone
+	}
+	return nil
+}
+
+func (p *processIdentity) active() (bool, error) {
+	if err := p.usable(); err != nil {
+		return false, err
+	}
 	for {
 		fds := []unix.PollFd{{Fd: int32(p.pidfd), Events: unix.POLLIN}}
 		n, err := unix.Poll(fds, 0)
@@ -46,11 +64,17 @@ func (p processIdentity) active() (bool, error) {
 	}
 }
 
-func (p processIdentity) stop() error {
+func (p *processIdentity) stop() error {
+	if err := p.usable(); err != nil {
+		return err
+	}
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGSTOP, nil, 0)
 }
 
-func (p processIdentity) stopped() (bool, error) {
+func (p *processIdentity) stopped() (bool, error) {
+	if err := p.usable(); err != nil {
+		return false, err
+	}
 	deadline := time.Now().Add(processStoppedObservationWindow)
 	for {
 		var info unix.Siginfo
@@ -71,7 +95,7 @@ func (p processIdentity) stopped() (bool, error) {
 			return false, err
 		}
 		// CLD_TRAPPED and CLD_STOPPED are the two stopped states. WNOWAIT
-		// leaves either state available to the lifecycle's sole Wait call.
+		// leaves the state available to the lifecycle's sole Wait call.
 		if info.Code == 4 || info.Code == 5 {
 			return true, nil
 		}
@@ -82,11 +106,17 @@ func (p processIdentity) stopped() (bool, error) {
 	}
 }
 
-func (p processIdentity) kill() error {
+func (p *processIdentity) kill() error {
+	if err := p.usable(); err != nil {
+		return err
+	}
 	return unix.PidfdSendSignal(p.pidfd, unix.SIGKILL, nil, 0)
 }
 
-func (p processIdentity) groupID() (int, bool) {
+func (p *processIdentity) groupID() (int, bool) {
+	if p.usable() != nil {
+		return 0, false
+	}
 	pgid, err := unix.Getpgid(p.pid)
 	if err != nil {
 		return 0, false
@@ -94,25 +124,31 @@ func (p processIdentity) groupID() (int, bool) {
 	return pgid, true
 }
 
-func (p processIdentity) close() { _ = unix.Close(p.pidfd) }
+func (p *processIdentity) close() {
+	p.closeOne.Do(func() {
+		p.closed.Store(true)
+		if p.pidfd >= 0 {
+			_ = unix.Close(p.pidfd)
+		}
+	})
+}
+
+// A pidfd cannot be recreated safely from a bare PID here. If pidfd_open was
+// unavailable at attachment time, the retained os.Process fallback therefore
+// declines group signaling and uses its direct handle only.
+func observeProcessStopped(*os.Process) (bool, error) {
+	return false, errProcessStopNotObserved
+}
 
 func processGroupTerminationSupported() bool {
-	identity, err := openProcessIdentity(os.Getpid())
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return false
+	}
+	identity, err := openProcessIdentity(p)
 	if err != nil {
 		return false
 	}
 	defer identity.close()
-	active, err := identity.active()
-	if err != nil || !active {
-		return false
-	}
-	var info unix.Siginfo
-	err = unix.Waitid(
-		unix.P_PIDFD,
-		identity.pidfd,
-		&info,
-		unix.WSTOPPED|unix.WNOWAIT|unix.WNOHANG,
-		nil,
-	)
-	return err == nil || errors.Is(err, unix.ECHILD)
+	return true
 }

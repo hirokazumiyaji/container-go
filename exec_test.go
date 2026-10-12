@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -82,11 +83,129 @@ func TestExecReturnsCommandExitCodeWithoutError(t *testing.T) {
 	}
 }
 
+func TestExecKeepsPositiveWorkloadPermissionTextAsResult(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "workload output\n",
+		execErr: &cli.CLIError{
+			Binary:   "container",
+			Args:     []string{"exec", "myctr", "app"},
+			ExitCode: 23,
+			Stderr:   "permission denied: /var/lib/app/data\n",
+		},
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"app"})
+	if err != nil {
+		t.Fatalf("Exec: %v, want ordinary positive workload result", err)
+	}
+	if code != 23 {
+		t.Errorf("exit code = %d, want 23", code)
+	}
+	data, _ := io.ReadAll(out)
+	if got, want := string(data), "workload output\npermission denied: /var/lib/app/data\n"; got != want {
+		t.Errorf("output = %q, want %q", got, want)
+	}
+}
+
+func TestExecReturnsStructuredPermissionAndConfigFailures(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{
+			name: "permission sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 17, Stderr: "permission denied",
+				},
+				os.ErrPermission,
+			),
+			code: 17,
+		},
+		{
+			name: "configuration sentinel",
+			err: errors.Join(
+				&cli.CLIError{
+					Binary: "container", Args: []string{"exec", "myctr", "app"},
+					ExitCode: 18, Stderr: "invalid configuration",
+				},
+				os.ErrInvalid,
+			),
+			code: 18,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "diagnostic output\n",
+				execErr:    tc.err,
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"app"})
+			if err == nil {
+				t.Fatal("Exec returned nil for a structured client-side failure")
+			}
+			if code != tc.code {
+				t.Errorf("exit code = %d, want %d", code, tc.code)
+			}
+			if out == nil {
+				t.Fatal("Exec returned nil output for a structured client-side failure")
+			}
+			if !errors.Is(err, tc.err) {
+				t.Errorf("error = %v, want original structured failure", err)
+			}
+		})
+	}
+}
+
+type issue104CanceledExecRunner struct {
+	*execRunner
+}
+
+func (r *issue104CanceledExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "exec" {
+		return []byte("partial output"), []byte("process killed"), errors.Join(
+			&cli.CLIError{Args: args, ExitCode: -1, Stderr: "process killed"},
+			context.Canceled,
+		)
+	}
+	return r.execRunner.Run(ctx, args...)
+}
+
+func TestExecReturnsCancellationWhenCLIExitIsSignal(t *testing.T) {
+	f := &issue104CanceledExecRunner{execRunner: &execRunner{fakeRunner: newTestRunner()}}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"sleep"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a canceled CLI process")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != -1 {
+		t.Fatalf("error = %v, want original signal CLIError in the chain", err)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0 for an unobservable signal exit", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a canceled CLI process")
+	}
+}
+
 func TestExecReportsMissingContainerAsError(t *testing.T) {
 	f := &execMissingRunner{
 		execRunner: &execRunner{
 			fakeRunner: newTestRunner(),
-			execErr:    &cli.CLIError{Args: []string{"exec"}, ExitCode: 1, Stderr: `not found: "myctr"`},
+			execErr:    &cli.CLIError{Args: []string{"exec", "myctr"}, ExitCode: 1, Stderr: `Error: get failed: container myctr not found`},
 		},
 	}
 	ctr := runTestContainer(t, f)
@@ -98,13 +217,103 @@ func TestExecReportsMissingContainerAsError(t *testing.T) {
 
 type execMissingRunner struct {
 	*execRunner
+	inspectCalls int
 }
 
 func (m *execMissingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `not found: "myctr"`}
+		m.inspectCalls++
+		if m.inspectCalls > 1 {
+			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+		}
 	}
 	return m.execRunner.Run(ctx, args...)
+}
+
+type execInspectFailureRunner struct {
+	*execRunner
+	inspectCalls  int
+	inspectStdout []byte
+	inspectErr    error
+}
+
+func (r *execInspectFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "inspect" {
+		r.inspectCalls++
+		if r.inspectCalls > 1 {
+			return r.inspectStdout, nil, r.inspectErr
+		}
+	}
+	return r.execRunner.Run(ctx, args...)
+}
+
+func TestExecPropagatesInspectVerificationErrors(t *testing.T) {
+	cases := []struct {
+		name            string
+		inspectStdout   []byte
+		inspectErr      error
+		wantNotFound    bool
+		wantSyntaxError bool
+		wantSchema      string
+	}{
+		{
+			name: "target missing",
+			inspectErr: &cli.CLIError{
+				Args:   []string{"inspect", "myctr"},
+				Stderr: `Error: container not found: "myctr"`,
+			},
+			wantNotFound: true,
+		},
+		{
+			name:            "malformed inspect",
+			inspectStdout:   []byte(`{not json`),
+			wantSyntaxError: true,
+		},
+		{
+			name:          "null inspect",
+			inspectStdout: []byte(`null`),
+			wantSchema:    "expected a JSON array",
+		},
+		{
+			// A null entry is unreadable output, not a missing
+			// container: reporting it as not found would send a running
+			// container's exec failure down the wrong path.
+			name:          "null inspect entry",
+			inspectStdout: []byte(`[null]`),
+			wantSchema:    "got null",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execInspectFailureRunner{
+				execRunner: &execRunner{
+					fakeRunner: newTestRunner(),
+					execErr: &cli.CLIError{
+						Args:     []string{"exec"},
+						ExitCode: 1,
+						Stderr:   "daemon unavailable",
+					},
+				},
+				inspectStdout: tc.inspectStdout,
+				inspectErr:    tc.inspectErr,
+			}
+			ctr := runTestContainer(t, f)
+			_, _, err := ctr.Exec(context.Background(), []string{"true"})
+			if err == nil {
+				t.Fatal("Exec returned nil error for failed inspect verification")
+			}
+			if got := errors.Is(err, ErrContainerNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(ErrContainerNotFound) = %t, want %t: %v", got, tc.wantNotFound, err)
+			}
+			var syntaxErr *json.SyntaxError
+			if got := errors.As(err, &syntaxErr); got != tc.wantSyntaxError {
+				t.Errorf("errors.As(*json.SyntaxError) = %t, want %t: %v", got, tc.wantSyntaxError, err)
+			}
+			if tc.wantSchema != "" && (!strings.Contains(err.Error(), tc.wantSchema) || errors.Is(err, ErrContainerNotFound)) {
+				t.Errorf("error = %v, want a schema error containing %q and distinct from ErrContainerNotFound", err, tc.wantSchema)
+			}
+		})
+	}
 }
 
 func TestExecAppNotFoundStderrIsResult(t *testing.T) {
@@ -123,6 +332,72 @@ func TestExecAppNotFoundStderrIsResult(t *testing.T) {
 	}
 }
 
+func TestExecReturnsStructuredOperationTimeoutAsInfrastructureError(t *testing.T) {
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: "partial stdout",
+		execErr: errors.Join(
+			&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "command failed"},
+			context.DeadlineExceeded,
+		),
+	}
+	ctr := runTestContainer(t, f)
+
+	code, out, err := ctr.Exec(context.Background(), []string{"query"})
+	if err == nil {
+		t.Fatal("Exec returned nil error for a structured operation timeout")
+	}
+	if code != 7 {
+		t.Errorf("exit code = %d, want 7", code)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output for a structured operation timeout")
+	}
+	var cliErr *cli.CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want the original timeout CLIError", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if f.callWith("version") != nil || f.callWith("system") != nil {
+		t.Errorf("timeout triggered an infrastructure probe: %v", f.calls)
+	}
+}
+
+func TestExecKeepsTimeoutTextAsApplicationResult(t *testing.T) {
+	cases := []struct {
+		name   string
+		args   []string
+		stderr string
+	}{
+		{name: "application stderr", args: []string{"exec", "myctr", "query"}, stderr: "i/o timeout"},
+		{name: "argv", args: []string{"exec", "myctr", "command timed out"}, stderr: "application failed"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{
+				fakeRunner: newTestRunner(),
+				execStdout: "application output",
+				execErr: &cli.CLIError{
+					Args:     tc.args,
+					ExitCode: 7,
+					Stderr:   tc.stderr,
+				},
+			}
+			ctr := runTestContainer(t, f)
+
+			code, out, err := ctr.Exec(context.Background(), []string{"query"})
+			if err != nil {
+				t.Fatalf("Exec: %v, want normal non-zero application result", err)
+			}
+			if code != 7 || out == nil {
+				t.Fatalf("code/output = %d/%v, want code 7 and output", code, out)
+			}
+		})
+	}
+}
+
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)
@@ -137,6 +412,7 @@ func TestExecSuccessAddsNoProbe(t *testing.T) {
 }
 
 func TestExecPassesOptionsAndEnvFile(t *testing.T) {
+	isolateEnvFileRoot(t)
 	f := &execRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
@@ -403,17 +679,19 @@ func TestExecInfrastructureErrorPreservesOutput(t *testing.T) {
 
 type issue116InfraRunner struct {
 	*fakeRunner
+	execCalled bool
 }
 
 func (r *issue116InfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
+		r.execCalled = true
 		return []byte("partial stdout"), []byte("partial stderr"), &cli.CLIError{
 			Args:     args,
 			ExitCode: 125,
 			Stderr:   "daemon unavailable",
 		}
 	}
-	if len(args) > 0 && args[0] == "inspect" {
+	if r.execCalled && len(args) > 0 && args[0] == "inspect" {
 		return nil, nil, errors.New("inspect failed")
 	}
 	return r.fakeRunner.Run(ctx, args...)
@@ -442,13 +720,15 @@ func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
 
 type issue116InspectDeadlineRunner struct {
 	*fakeRunner
+	execCalled bool
 }
 
 func (r *issue116InspectDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
+		r.execCalled = true
 		return []byte("command output"), []byte("daemon unavailable"), &cli.CLIError{Args: args, ExitCode: 125, Stderr: "daemon unavailable"}
 	}
-	if len(args) > 0 && args[0] == "inspect" {
+	if r.execCalled && len(args) > 0 && args[0] == "inspect" {
 		<-ctx.Done()
 		return nil, nil, ctx.Err()
 	}
@@ -512,11 +792,13 @@ func TestExecContextTerminationPreservesExitStatus(t *testing.T) {
 // than the negative status used for a Unix signal.
 type issue116WindowsKillExecRunner struct {
 	*fakeRunner
-	stderr string
+	stderr     string
+	execCalled bool
 }
 
 func (r *issue116WindowsKillExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
+		r.execCalled = true
 		<-ctx.Done()
 		return []byte("windows stdout"), []byte("windows stderr"), errors.Join(
 			&cli.CLIError{Args: args, ExitCode: 1, Stderr: r.stderr},
@@ -531,7 +813,7 @@ type issue116WindowsKillInfraRunner struct {
 }
 
 func (r *issue116WindowsKillInfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
-	if len(args) > 0 && args[0] == "inspect" {
+	if r.execCalled && len(args) > 0 && args[0] == "inspect" {
 		return nil, nil, errors.New("inspect failed")
 	}
 	return r.issue116WindowsKillExecRunner.Run(ctx, args...)
@@ -694,24 +976,19 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 		code int
 	}{
 		{
-			name: "i/o timeout",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout", OperationTimeout: true},
+			name: "structured timeout",
+			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout"}, issue116TimeoutError{}),
 			code: 7,
 		},
 		{
-			name: "command timed out",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 8, Stderr: "command timed out", OperationTimeout: true},
+			name: "os deadline exceeded",
+			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 8, Stderr: "command timed out"}, os.ErrDeadlineExceeded),
 			code: 8,
 		},
 		{
-			name: "operation timed out",
-			err:  &cli.CLIError{Args: []string{"exec"}, ExitCode: 9, Stderr: "operation timed out", OperationTimeout: true},
+			name: "context deadline exceeded",
+			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 9, Stderr: "operation timed out"}, context.DeadlineExceeded),
 			code: 9,
-		},
-		{
-			name: "structured timeout",
-			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 10}, issue116TimeoutError{}),
-			code: 10,
 		},
 		{
 			name: "negative signal",
@@ -723,6 +1000,7 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := &execRunner{fakeRunner: newTestRunner(), execStdout: "partial stdout", execErr: tc.err}
 			ctr := runTestContainer(t, f)
+			f.calls = nil
 			code, out, err := ctr.Exec(context.Background(), []string{"true"})
 			if err == nil {
 				t.Fatal("Exec returned nil error for an operation timeout/signal")
@@ -752,6 +1030,7 @@ func TestExecDoesNotClassifyTimeoutTextFromStderr(t *testing.T) {
 		},
 	}
 	ctr := runTestContainer(t, f)
+	f.calls = nil
 
 	code, out, err := ctr.Exec(context.Background(), []string{"query"})
 	if err != nil {
@@ -776,6 +1055,7 @@ func TestExecDoesNotClassifyTimeoutTextFromArgs(t *testing.T) {
 		},
 	}
 	ctr := runTestContainer(t, f)
+	f.calls = nil
 
 	code, out, err := ctr.Exec(context.Background(), []string{"query"})
 	if err != nil {

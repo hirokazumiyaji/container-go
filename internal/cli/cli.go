@@ -168,7 +168,9 @@ func DiagnosticText(err error) (stdout, stderr string, ok bool) {
 }
 
 // ExecRunner runs the CLI as a child process. Arguments are passed as an
-// argv vector; no shell is involved.
+// argv vector; no shell is involved. Cancellation terminates the lifecycle-
+// owned local process tree; it does not claim to terminate a process inside
+// a backend.
 type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
@@ -186,30 +188,8 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
-	startDone := make(chan struct{})
-	var treeMu sync.Mutex
-	var tree processTree
-	var cancelCalled bool
-	var cancelResult terminationResult
-	cmd.Cancel = func() error {
-		<-startDone
-		treeMu.Lock()
-		defer treeMu.Unlock()
-		cancelCalled = true
-		if tree == nil {
-			cancelResult = terminationResult{err: os.ErrProcessDone}
-			return cancelResult.err
-		}
-		cancelResult = tree.terminate(cmd)
-		if !cancelResult.active && cancelResult.err != nil {
-			// os/exec treats a non-nil Cancel error as an injected
-			// cancellation failure. The retained result still carries the
-			// ownership/barrier cause for classification, but returning
-			// ErrProcessDone keeps a settled child result authoritative.
-			return os.ErrProcessDone
-		}
-		return cancelResult.err
-	}
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	cmd.Cancel = lifecycle.cancel
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -218,64 +198,71 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	cmd.WaitDelay = 3 * time.Second
 
 	if err := cmd.Start(); err != nil {
-		close(startDone)
+		lifecycle.failStart()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
-			return stdout.Bytes(), stderr.Bytes(), errors.Join(contextErr, err)
+			return stdout.Bytes(), stderr.Bytes(), markRunStatus(errors.Join(contextErr, err), lifecycle.status())
 		}
-		return stdout.Bytes(), stderr.Bytes(), err
+		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
 	}
-	ownedTree, treeErr := newProcessTree(cmd)
+	// On Windows, newProcessTree attaches the Job Object after Start; the
+	// short attachment-window limitation is documented by that platform
+	// implementation.
+	tree, treeErr := newProcessTree(cmd)
 	if treeErr != nil {
-		ownedTree = directProcessTree{}
+		// A platform tree is an enhancement. The direct process handle
+		// remains a safe cancellation path when attachment is unavailable.
+		tree = directProcessTree{}
 	}
-	treeMu.Lock()
-	tree = ownedTree
-	treeMu.Unlock()
-	close(startDone)
+	lifecycle.publishStart(tree)
 
-	err := cmd.Wait()
-	treeMu.Lock()
-	if tree != nil {
-		tree.close()
-	}
-	called := cancelCalled
-	result := cancelResult
-	treeMu.Unlock()
+	// Run owns the sole Wait call through the same lifecycle used by Stream.
+	// This keeps context cancellation and the eventual reap from racing a
+	// stale numeric process-group signal.
+	err := lifecycle.result()
+	status := lifecycle.status()
 	// Output buffers are returned whole: success output and non-zero
 	// exec/log results must not be silently truncated. Only the
 	// diagnostic copy inside CLIError is bounded.
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			cliErr := &CLIError{
-				Binary:   bin,
-				Args:     args,
-				ExitCode: exitErr.ExitCode(),
-				Stderr:   truncateStderr(stderr.String()),
-			}
-			commandErr := WithStdout(cliErr, stdout.String())
-			// Cancellation can race with observing a real command exit.
-			// Preserve both facts so classification can still inspect the
-			// CLIError after Run returns.
-			if ctxErr := ctx.Err(); ctxErr != nil {
-				return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), errors.Join(commandErr, ctxErr))
-			}
-			return stdout.Bytes(), stderr.Bytes(), commandErr
+	commandErr := commandError(ctx, bin, args, stdout.Bytes(), stderr.Bytes(), err)
+	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
+		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+	}
+	return stdout.Bytes(), stderr.Bytes(), markRunStatus(commandErr, status)
+}
+
+func commandError(ctx context.Context, bin string, args []string, stdout, stderr []byte, err error) error {
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		exitCode := exitErr.ExitCode()
+		if ctxErr := ctx.Err(); ctxErr != nil && exitCode < 0 {
+			// A Unix signal has no usable application status. Preserve the
+			// context contract while the lifecycle status records whether
+			// local cancellation actually terminated the process.
+			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
+		cliErr := &CLIError{
+			Binary:   bin,
+			Args:     args,
+			ExitCode: exitCode,
+			Stderr:   truncateStderr(string(stderr)),
+		}
+		commandErr := WithStdout(cliErr, string(stdout))
 		if ctxErr := ctx.Err(); ctxErr != nil {
-			// Preserve a launch failure as well as the cancellation. A
-			// context wrapper alone loses the actionable missing-binary or
-			// permission diagnosis.
-			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
-			return stdout.Bytes(), stderr.Bytes(), errors.Join(contextErr, err)
+			// The process did produce an exit status, but cancellation
+			// raced with its completion. Keep both facts observable.
+			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), errors.Join(commandErr, ctxErr))
 		}
-		return stdout.Bytes(), stderr.Bytes(), err
+		return commandErr
 	}
-	if ctx.Err() != nil && called && result.active {
-		return stdout.Bytes(), stderr.Bytes(), fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
+		return errors.Join(contextErr, err)
 	}
-	return stdout.Bytes(), stderr.Bytes(), nil
+	return err
 }
 
 // truncateOutput bounds a diagnostic copy kept in CLIError while keeping

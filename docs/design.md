@@ -324,6 +324,56 @@ values are not rejected, and the duration is added to the query budget
 without saturation. No library-side maximum is enforced; backend limits
 apply, and #89 tracks the missing validation.
 
+`Exec` is a finite, buffered operation. It returns the exit code with
+combined stdout+stderr (a non-zero exit is a result, not an error);
+this is kept for v1 compatibility. When the caller's context has no
+deadline, Exec applies a 30-second default. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default for a deliberately long-running command; it does not remove a
+caller deadline. Start persistent processes as the container's main
+command (`WithCmd`) and use `FollowLogs` for their output rather than
+holding an Exec call open.
+
+On backend, timeout, or cancellation errors, Exec retains partial
+stdout+stderr in its reader and returns the classified error; a
+CLI-reported exit status, when available, remains in the first return
+value. A context error that actually races with a launched command is
+classified independently of that status. This matters on Windows, where
+`Process.Kill` can report the killed process with exit code `1`; the
+status remains observable but does not suppress the typed error. A
+later verification inspect that consumes the deadline does not by itself
+produce `ExecTerminationError`.
+Cancellation is owned by the local command lifecycle. On Unix targets with a
+stable process identity, process-group termination is attempted only while the
+direct child handle still owns the process. On Linux, the numeric group signal
+also requires `waitid(WSTOPPED|WNOWAIT)` to confirm the stopped state; if that
+ownership proof is lost, the pidfd is used directly and the former PGID is
+never signaled. The direct child is also killed after a successful group signal
+because it may have changed process groups. Unix targets without that identity
+use the direct child handle conservatively. After
+the child is reaped, no former numeric group ID is used. Windows uses a
+lifecycle-owned Job Object handle, with direct-child fallback when assignment
+is unavailable. Assignment occurs after `Start`; descendants created during
+that short post-Start attachment window are outside the Job Object boundary.
+The supported backend CLIs do not expose a common exec-instance kill
+operation, so when active-child evidence is available Exec returns
+`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
+rather than claiming that the daemon-side process stopped. A conservative
+direct-handle fallback may return only the context error. A successful
+empty-job or already-finished-child termination is not treated as
+active-process evidence. Callers must terminate the container or use
+backend-specific cleanup. Callers must read the output reader even when the
+error is non-nil. On Linux the stable identity is a pidfd-backed process
+reference; kernels without pidfd support use the same conservative direct-handle
+fallback as other Unix targets.
+Windows-specific lifecycle tests are build-constrained. This development
+environment cross-compiles and vets Windows packages but cannot execute the
+Windows Job Object runtime tests, including the exit-259 active-child case.
+`LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
+containers. `Terminate` is generation-guarded: it refuses to delete a
+name recycled by another process (see Reuse below).
+
 `Exec` returns the exit code and combined stdout+stderr. A command
 that runs in a running container and exits non-zero is a result rather
 than an infrastructure error; a stopped or unreachable container can
@@ -930,17 +980,20 @@ closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 
 **Apply operation-specific deadlines**. Most query-like operations
-(inspect, copy, snapshot logs, delete, and prune) use a 30-second
+(inspect, copy, snapshot logs, delete, and prune) as well as public `Exec` use a 30-second
 default when the caller has no deadline. `Run` and explicit image
 fetches use a 10-minute pull/create budget. A shared pull leader is
 intentionally detached from an individual caller's cancellation so one
 caller cannot abort the pull for other waiters; each waiter still stops
-waiting when its own context is cancelled. `Exec`'s command invocation
-and `FollowLogs` pass the caller's context through without adding a
-library deadline; an `Exec` infrastructure check may use a bounded
-follow-up context. When a library default is applied to an operation
+waiting when its own context is cancelled. `FollowLogs` passes the caller's context through
+without adding a library deadline; `Exec` applies a 30-second default when the caller
+has no deadline, and an `Exec` infrastructure check may use a bounded
+follow-up context. `WithExecTimeout(0)` is the explicit escape hatch for an intentional
+long-running command. When a library default is applied to an operation
 that is not a shared pull leader, an existing caller deadline is
-preserved.
+preserved. Timeout classification uses structured context,
+`Timeout() bool`, or signal evidence; arbitrary workload stderr is never
+interpreted as a timeout.
 
 ## Error handling
 
@@ -1010,6 +1063,10 @@ these follow-up issues are applied.
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and bounded stderr diagnostic (capped at 64KiB). Classification
   also inspects bounded stdout internally for liveness probes.
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
+  expiry or cancellation terminated the local CLI, regardless of any
+  reported local exit status; the backend-side exec process may still be
+  running
 
 When a non-reuse `Run` fails after a successful backend `run`, the
 post-create rollback error is returned. If rollback deletion fails, its

@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -15,10 +16,32 @@ import (
 // ExecOption configures Exec.
 type ExecOption func(*execConfig) error
 
+// defaultExecTimeout is a var so tests can shorten the public Exec
+// deadline without waiting for the production default.
+var defaultExecTimeout = 30 * time.Second
+
 type execConfig struct {
-	env     map[string]string
-	user    string
-	workdir string
+	env        map[string]string
+	user       string
+	workdir    string
+	timeout    time.Duration
+	timeoutSet bool
+}
+
+// WithExecTimeout sets an upper bound for one Exec invocation. A
+// positive d and the caller's deadline are combined, with the earlier
+// deadline winning. The default is 30 seconds. A zero value disables
+// only the library default for deliberately long-running commands;
+// callers should then pass a cancellable context.
+func WithExecTimeout(d time.Duration) ExecOption {
+	return func(c *execConfig) error {
+		if d < 0 {
+			return fmt.Errorf("exec timeout must not be negative, got %v", d)
+		}
+		c.timeout = d
+		c.timeoutSet = true
+		return nil
+	}
 }
 
 // WithExecEnv sets environment variables for the exec'd process, passed via a
@@ -59,8 +82,29 @@ func WithExecWorkDir(dir string) ExecOption {
 	}
 }
 
+func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, context.CancelFunc) {
+	if cfg.timeoutSet {
+		if cfg.timeout == 0 {
+			return ctx, func() {}
+		}
+		// WithTimeout preserves the earlier deadline when ctx already
+		// has one, while still bounding a caller that supplied a later
+		// deadline.
+		return context.WithTimeout(ctx, cfg.timeout)
+	}
+	return withDefaultTimeout(ctx, cfg.timeout)
+}
+
 // Exec runs a command in the container and returns its exit code and
-// combined output. A non-zero exit code is a result, not an error.
+// combined output. A non-zero exit code is a result, not an error. When
+// the backend or the context fails, the reader still contains whatever
+// stdout and stderr the command produced before the failure; callers
+// should read it even when err is non-nil. If the CLI reports an exit
+// status, that status is returned alongside the classified error.
+// When a context error terminates the local CLI, Exec returns an
+// ExecTerminationError even if the operating system represents the killed
+// process with a normal exit status. The backend-side process may still be
+// running because neither supported CLI exposes a common exec-instance kill.
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
 	for i, opt := range opts {
 		if opt == nil {
@@ -70,21 +114,35 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if len(cmd) == 0 {
 		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")
 	}
-	cfg := &execConfig{env: map[string]string{}}
+	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
 			return 0, nil, err
 		}
 	}
 
-	target, err := c.verifiedOperationTarget(ctx)
+	// Exec is a buffered, bounded operation by default. An explicit zero
+	// timeout opts out of the library default. A positive custom timeout
+	// is combined with the caller's deadline, so the earlier one wins.
+	execCtx, cancel := withExecTimeout(ctx, cfg)
+	defer cancel()
+
+	// Do not hand an already-finished context to a runner. In particular,
+	// exec.CommandContext can otherwise return a plain context error before
+	// Start, which must not be reported as an unsupported remote-process
+	// termination. Keep the output contract even for this early return.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
+		return 0, emptyExecOutput(), ctxErr
+	}
+
+	target, err := c.verifiedOperationTarget(execCtx)
 	if err != nil {
-		return 0, nil, err
+		return 0, emptyExecOutput(), err
 	}
 
 	var envFile, envDir string
 	if len(cfg.env) > 0 {
-		path, dir, err := writeEnvFileContext(ctx, cfg.env)
+		path, dir, err := writeEnvFileContext(execCtx, cfg.env)
 		if err != nil {
 			if dir != "" {
 				// Preserve ownership when a late root-lock error is
@@ -94,9 +152,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 						retErr = joinEnvFileCleanupError(retErr, retryErr)
 					}
 				}()
-				return 0, nil, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+				return 0, emptyExecOutput(), joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
 			}
-			return 0, nil, err
+			return 0, emptyExecOutput(), err
 		}
 		envFile, envDir = path, dir
 		defer func() {
@@ -105,18 +163,55 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 			}
 		}()
 	}
+	// Setup (for example an env-file write) may itself race with
+	// cancellation. Recheck immediately before handing control to the
+	// runner so that path remains a no-launch result.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
+		return 0, emptyExecOutput(), ctxErr
+	}
 
-	stdout, stderr, err := c.runner.Run(ctx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(target, cfg, envFile, cmd)...)
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
-	envCleanupErr := cleanupEnvFileAfterUseContext(ctx, envDir)
+	envCleanupErr := cleanupEnvFileAfterUseContext(execCtx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
+	}
+
+	// A runner call is considered a launch for legacy/custom runners that
+	// do not report lifecycle metadata. ExecRunner annotates failures with
+	// the authoritative local Start/reap/cancellation result below.
+	launched := true
+	commandStatus, statusReported := cli.RunStatusOf(err)
+	if statusReported {
+		launched = commandStatus.Started
 	}
 	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		return 0, output, envCleanupErr
+	}
+
+	// Capture whether cancellation was already present when the command
+	// returned. A later deadline consumed by the verification inspect must
+	// not be mistaken for a cancellation race with the command itself.
+	commandContextErr := isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil
+	terminationUnknown := launched && commandContextErr
+	if statusReported {
+		terminationUnknown = commandStatus.Reaped && commandStatus.TerminatedByCancellation
+	}
+
+	// A custom runner may return a plain CLIError when cancellation races
+	// with its return. Normalize the effective context into the chain before
+	// deciding whether this is a context result.
+	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
+	}
+	finish := func(code int, classified error) (int, io.Reader, error) {
+		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
+			return code, output, joinEnvFileCleanupError(contextErr, envCleanupErr)
+		}
+		return code, output, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
 	var cliErr *cli.CLIError
@@ -132,54 +227,88 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 		_ = errors.As(err, &cliErr)
 	}
 
-	if isExecContextError(err) || (cliErr != nil && cliErr.ExitCode < 0) || ctx.Err() != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
-			err = errors.Join(err, ctxErr)
-		}
+	if isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil {
 		code := 0
 		if cliErr != nil && cliErr.ExitCode >= 0 {
 			code = cliErr.ExitCode
 		}
-		return code, output, joinEnvFileCleanupError(err, envCleanupErr)
+		return finish(code, err)
 	}
+	if cliErr != nil && cliErr.ExitCode < 0 {
+		return finish(cliErr.ExitCode, err)
+	}
+
 	if cliErr == nil {
-		return 0, output, joinEnvFileCleanupError(wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "exec"), "exec", c.operationTarget(), c.id), envCleanupErr)
+		return finish(0, wrapNotFoundForOperation(c.eng, c.classifyOperation(execCtx, err, "exec"), "exec", c.operationTarget(), c.id))
 	}
+
 	// A timeout-shaped command exit is an operation failure, not an
 	// application result. Classify returns it without probing the backend.
 	if isExecOperationTimeout(err, cliErr) {
-		return cliErr.ExitCode, output, joinEnvFileCleanupError(c.classifyOperation(ctx, err, "exec"), envCleanupErr)
+		return finish(cliErr.ExitCode, c.classifyOperation(execCtx, err, "exec"))
 	}
+
 	if cliErr.ExitCode == 126 || cliErr.ExitCode == 127 {
-		return cliErr.ExitCode, output, envCleanupErr
+		return finish(cliErr.ExitCode, nil)
 	}
+
 	// Exec diagnostics can come from the workload itself. Do not use the
 	// broad text-based liveness classifier here: a positive workload exit
 	// is still a result even when it says "permission denied" or mentions
 	// configuration. Only structured OS and timeout evidence is definitive.
 	if isDefinitiveExecError(err, cliErr) {
-		return cliErr.ExitCode, output, joinEnvFileCleanupError(err, envCleanupErr)
+		return finish(cliErr.ExitCode, err)
 	}
+
 	// App stderr alone must not decide infrastructure state. Only
 	// ambiguous failures pay for a verification inspect; clear app
 	// results return immediately with no extra CLI call.
 	if !isNotFoundForOperation(c.eng, err, "exec", c.operationTarget(), c.id) &&
 		!maybeInfraExecErr(c.eng, err, c.operationTarget(), c.id) {
-		return cliErr.ExitCode, output, envCleanupErr
+		return finish(cliErr.ExitCode, nil)
 	}
-	verification := c.verifyExecContainer(ctx)
+	verification := c.verifyExecContainer(execCtx)
 	if verification.err == nil && verification.state == StateRunning {
-		return cliErr.ExitCode, output, envCleanupErr
+		return finish(cliErr.ExitCode, nil)
 	}
 	if verification.err != nil {
 		joined := errors.Join(err, verification.err)
-		return 0, nil, joinEnvFileCleanupError(wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id), envCleanupErr)
+		return finish(cliErr.ExitCode, wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id))
 	}
-	return 0, nil, joinEnvFileCleanupError(errors.Join(err, &execInspectionStateError{state: verification.state}), envCleanupErr)
+	return finish(cliErr.ExitCode, errors.Join(err, &execInspectionStateError{state: verification.state}))
+}
+
+func emptyExecOutput() io.Reader {
+	return io.MultiReader(bytes.NewReader(nil), bytes.NewReader(nil))
 }
 
 func isExecContextError(err error) bool {
 	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func effectiveExecContextErr(ctx, execCtx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return execCtx.Err()
+}
+
+func execContextualError(ctx, execCtx context.Context, err error, terminationUnknown bool) (error, bool) {
+	ctxErr := effectiveExecContextErr(ctx, execCtx)
+	if ctxErr == nil && !isExecContextError(err) {
+		return nil, false
+	}
+	if ctxErr != nil && !errors.Is(err, ctxErr) {
+		err = errors.Join(err, ctxErr)
+	}
+	err = wrapNotFound(err)
+	// The command may have completed before a later diagnostic inspect
+	// consumed the deadline. Only a cancellation observed at runner return
+	// leaves the remote exec termination unknown.
+	if terminationUnknown {
+		err = &ExecTerminationError{Err: err}
+	}
+	return err, true
 }
 
 func isExecOperationTimeout(err error, cliErr *cli.CLIError) bool {
@@ -217,6 +346,9 @@ func isDefinitiveExecError(err error, cliErr *cli.CLIError) bool {
 // execution substrate rather than the app process. Generic app output
 // returns false so normal non-zero exits cost no extra probe.
 func maybeInfraExecErr(eng engine, err error, targets ...string) bool {
+	if cli.IsOperationTimeoutError(err) {
+		return true
+	}
 	if eng == nil {
 		return false
 	}

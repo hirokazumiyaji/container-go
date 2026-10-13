@@ -12,6 +12,8 @@ import (
 // detached descendants cannot be guaranteed.
 func configureProcessTree(*exec.Cmd) {}
 
+func processGroupTerminationSupported() bool { return false }
+
 type otherProcessTree struct{}
 
 func newProcessTree(*exec.Cmd) (processTree, error) {

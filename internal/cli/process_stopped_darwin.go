@@ -65,3 +65,5 @@ func observeProcessStopped(process *os.Process) (bool, error) {
 		time.Sleep(time.Millisecond)
 	}
 }
+
+func processGroupTerminationSupported() bool { return true }

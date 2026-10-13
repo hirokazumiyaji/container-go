@@ -15,6 +15,8 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add bounded `Exec` timeouts, partial-output retention, and typed
+  unsupported-termination errors for canceled or timed-out calls (#116).
 - Resolve inspected image digests or Docker image IDs before create, retain
   the identity on the handle, compare reuse by that identity, verify
   Apple-created image identity before returning, and remove newly-created
@@ -89,6 +91,8 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Fixed
 
+- Classify `Exec` cancellation and timeout independently of local exit
+  status, including exit code `1` used by Windows `Process.Kill` (#116).
 - Remove anonymous Docker volumes from every managed deletion path while
   preserving named volumes (#81).
 - Cleanup failures are no longer discarded. A failed-create, reuse
@@ -138,6 +142,7 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   resolution, including fail-closed remote-daemon loopback handling.
 - Accept full lowercase Docker UIDs in the reaper while retaining strict
   logical-name validation.
+>>>>>>> origin/main
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Consolidate image and reuse single-flight state in the generic

@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -31,6 +32,16 @@ func requireSystem(t *testing.T) {
 	// diagnostic retention switch.
 	t.Setenv("CONTAINERGO_KEEP", "0")
 	integrationtest.Preflight(t, "apple", integrationtest.AppleUnavailable)
+}
+
+// expectedKilledExitCode is the status reported by the local CLI after
+// context cancellation. Unix signals are normalized to a context result
+// with no usable status, while Windows Process.Kill reports status 1.
+func expectedKilledExitCode() int {
+	if runtime.GOOS == "windows" {
+		return 1
+	}
+	return 0
 }
 
 func TestIntegrationRedisLifecycle(t *testing.T) {
@@ -99,6 +110,40 @@ func TestIntegrationRedisLifecycle(t *testing.T) {
 	}
 	if _, err := ctr.State(ctx); err == nil {
 		t.Error("State after Terminate: want error, got nil")
+	}
+}
+
+func TestIntegrationExecPreservesPartialOutputOnTimeout(t *testing.T) {
+	requireSystem(t)
+
+	ctr, err := container.Run(context.Background(), integrationAlpine,
+		container.WithCmd("sleep", "60"),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	code, out, err := ctr.Exec(context.Background(), []string{"sh", "-c", "printf partial-output; sleep 30"}, container.WithExecTimeout(time.Second))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Exec error = %v, want context.DeadlineExceeded", err)
+	}
+	var terminationErr *container.ExecTerminationError
+	if !errors.As(err, &terminationErr) || !errors.Is(err, container.ErrExecTerminationUnsupported) {
+		t.Fatalf("Exec error = %v, want typed unsupported termination error", err)
+	}
+	if wantCode := expectedKilledExitCode(); code != wantCode {
+		t.Errorf("exit code = %d, want %d on infrastructure timeout", code, wantCode)
+	}
+	if out == nil {
+		t.Fatal("Exec returned nil output on timeout")
+	}
+	data, readErr := io.ReadAll(out)
+	if readErr != nil {
+		t.Fatalf("read output: %v", readErr)
+	}
+	if !strings.Contains(string(data), "partial-output") {
+		t.Fatalf("output = %q, want partial command output", data)
 	}
 }
 

@@ -225,9 +225,13 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Stop` の非 nil timeout は、両 backend が fractional value を truncate して whole seconds に変換する。negative や極端な値は reject されず、timeout を saturation なしで query budget に加算するため、library 側の maximum も強制されない。backend limit が適用され、#89 が 未実装の validation を担当する。
 
-`Exec` は終了コードと標準出力、標準エラーをまとめて返す。
-実行中コンテナで実行したコマンドが 0 以外で終了した場合、その終了コードはインフラエラーではなく結果として返す。
-停止中または到達できないコンテナの操作はエラーを返すことがある。
+`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr を返す（非ゼロ終了は結果であり error ではない）。caller の context に deadline がない場合は 30 秒の既定 deadline を適用する。正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline のみを無効化し、caller の deadline は取り除かない。長寿命のプロセスは通常 `WithCmd` で本体コマンドとして起動し、出力は `FollowLogs` で取得する（Long-open な Exec は避ける）。
+backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error とともに返す。CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。command の起動中実際に context error が競合した場合だけ、その分類は終了コードに依存しません。Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
+context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
+Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`（`errors.Is(err, ErrExecTerminationUnsupported)`）を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。したがって error が non-nil でも reader を読む必要があります。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
+
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
 `Logs` と、成功する `LogsWithOptions` 呼び出しは backend command が終了するため有限のスナップショットを返すが、単体で byte 上限は課さない。`Logs` は全出力を要求する。`LogsOptions` は backend 固有で、Docker は `Tail` と `Since` の両方を受け付ける。確認した Apple Container CLI の各 version は tail に `-n` を使い、`--since` option を持たない。このチェックアウトは Apple にも Docker 形式の `--tail` と `--since` を渡すため、`LogsWithOptions` は backend 中立ではない。Apple の機能として文書化する前に #82 を適用する必要がある。#82 の変更は `Tail` を Apple の `-n` に対応させ、`Since` を unsupported として拒否する予定である。範囲を指定しても大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `v0.2.0` にはない現在の開発 API である。generation を持つ handle では `Terminate` は世代ガードを持つが、現在の reuse と空 generation の経路には #83 と #84 が扱う制限がある（後述の Reuse を参照）。
 
@@ -588,7 +592,7 @@ local に addressable な tag または alias を使うか、`WithAllowMutableIm
 
 **要求された範囲だけスナップショットを制限する**。`Logs` と成功する `LogsWithOptions` 呼び出しは有限の CLI snapshot を完了するが、`Logs` は利用可能な全出力を buffer できる。`LogsOptions{Tail, Since}` は backend 固有で、Docker は両方を受け付けるが、確認した Apple Container CLI の各 version は Tail に `-n` を使い Since を持たない。このチェックアウトは Apple にも Docker の flag を渡すため、option の契約は #82 を待つ。どちらの経路も byte 上限を追加しない。`FollowLogs` は意図的に上限のない stream であり、`io.ReadCloser` を閉じるか context をキャンセルすると CLI process を終了する。wait failure の診断 log 末尾は 1MiB 上限である。
 
-**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`Exec` のコマンド呼び出しと `FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。
+**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。
 
 ## エラー処理
 
@@ -610,6 +614,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
 - `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr の診断情報(上限 64KiB)を保持する。liveness probe では stdout の診断情報も内部で確認する
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：報告された local の終了コードにかかわらず、context の期限切れまたは取消によって local CLI が終了した場合。backend 側 exec process は残っている可能性がある
 
 backend の `run` が成功した後に非 reuse `Run` が失敗した場合、作成後の rollback error を返す。rollback 削除にも失敗すると、コンテナが残ったことを message に含める。backend の `run` 自体の失敗は別の best-effort `cleanupFailedCreate` 経路を使い、その cleanup error は元の classified error に連結しない。reaper の登録・削除 error も返さない。Reuse は wait error を返し、共有コンテナは残す。
 

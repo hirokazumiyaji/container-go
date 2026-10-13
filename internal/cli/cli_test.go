@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -170,7 +171,7 @@ func TestExecRunnerPreservesLaunchErrorAndCancellation(t *testing.T) {
 }
 
 func TestExecRunnerHonorsContextCancellation(t *testing.T) {
-	r := &ExecRunner{Binary: writeStub(t, `sleep 30`)}
+	r := &ExecRunner{Binary: writeStub(t, `sleep 5`)}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -182,6 +183,152 @@ func TestExecRunnerHonorsContextCancellation(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Errorf("error = %v, want context.DeadlineExceeded", err)
+	}
+}
+
+func TestExecRunnerPreservesOutputOnContextCancellation(t *testing.T) {
+	r := &ExecRunner{Binary: writeStub(t, `printf 'partial stdout'; printf 'partial stderr' >&2; sleep 5`)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+
+	stdout, stderr, err := r.Run(ctx, "exec", "ctr", "true")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if string(stdout) != "partial stdout" || string(stderr) != "partial stderr" {
+		t.Fatalf("output = %q/%q, want partial output", stdout, stderr)
+	}
+}
+
+func TestCommandErrorPreservesExitStatusWhenContextExpires(t *testing.T) {
+	cmd := exec.Command("sh", "-c", "exit 7")
+	rawErr := cmd.Run()
+	if rawErr == nil {
+		t.Fatal("stub command unexpectedly succeeded")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := commandError(ctx, "stub", []string{"exec"}, nil, nil, rawErr)
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want CLIError exit code 7", err)
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+}
+
+func TestExecRunnerReportsWhetherLocalProcessStarted(t *testing.T) {
+	missing := &ExecRunner{Binary: filepath.Join(t.TempDir(), "missing")}
+	_, _, err := missing.Run(context.Background(), "exec")
+	started, reported := StartedStatus(err)
+	if !reported || started {
+		t.Fatalf("missing binary start status = %t/%t, want false/true", started, reported)
+	}
+
+	failed := &ExecRunner{Binary: writeStub(t, `exit 7`)}
+	_, _, err = failed.Run(context.Background(), "exec")
+	started, reported = StartedStatus(err)
+	if !reported || !started {
+		t.Fatalf("started command status = %t/%t, want true/true", started, reported)
+	}
+}
+
+type inactiveTerminationTree struct{}
+
+func (inactiveTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
+	_ = cmd.Process.Kill()
+	return terminationResult{active: false}
+}
+func (inactiveTerminationTree) close() {}
+
+func TestLifecycleDoesNotMarkEmptyTerminationAsActive(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cmd := exec.Command(writeStub(t, `sleep 5`))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	lifecycle.publishStart(inactiveTerminationTree{})
+	if err := lifecycle.terminate(true); err != nil {
+		t.Fatalf("terminate: %v", err)
+	}
+	lifecycle.wait()
+	if status := lifecycle.status(); status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, empty/inactive termination must not claim active child", status)
+	}
+}
+
+type blockingTerminationTree struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (t *blockingTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
+	close(t.entered)
+	<-t.release
+	_ = cmd.Process.Kill()
+	return terminationResult{active: true}
+}
+func (t *blockingTerminationTree) close() {}
+
+func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
+	ctx := context.Background()
+	cmd := exec.Command(writeStub(t, `sleep 5`))
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	tree := &blockingTerminationTree{entered: make(chan struct{}), release: make(chan struct{})}
+	defer func() {
+		select {
+		case <-tree.release:
+		default:
+			close(tree.release)
+		}
+	}()
+	lifecycle := newCommandLifecycle(ctx, cmd)
+	lifecycle.publishStart(tree)
+
+	waitDone := make(chan struct{})
+	go func() {
+		lifecycle.wait()
+		close(waitDone)
+	}()
+	terminateDone := make(chan struct{})
+	go func() {
+		_ = lifecycle.terminate(true)
+		close(terminateDone)
+	}()
+	<-tree.entered
+	select {
+	case <-waitDone:
+		t.Fatal("wait completed before termination released the lifecycle")
+	default:
+	}
+	close(tree.release)
+	<-terminateDone
+	<-waitDone
+	if status := lifecycle.status(); !status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, want active cancellation termination", status)
+	}
+}
+
+func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
+	status, reported := RunStatusOf(err)
+	if !reported || !status.Started || !status.Reaped {
+		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
+	}
+	if processGroupTerminationSupported() && !status.TerminatedByCancellation {
+		t.Fatalf("run status = %+v, want active cancellation termination", status)
+	}
+	if !processGroupTerminationSupported() && status.TerminatedByCancellation {
+		t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
 	}
 }
 

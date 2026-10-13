@@ -5,12 +5,19 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/netip"
 	"net/url"
 	"strings"
 	"time"
 )
+
+// maxDrainBytes bounds how much of a probe response body is read to
+// reach EOF. A readiness response is a status page, so a body past
+// this size is not something the wait needs; capping it keeps a
+// misbehaving endpoint from turning the drain into a memory cost.
+const maxDrainBytes = 64 * 1024
 
 // HTTPStrategy waits until an HTTP request against the container
 // returns an acceptable status code.
@@ -195,7 +202,19 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error 
 			return err
 		}
 		defer resp.Body.Close()
+		// Check status before draining. An accepted response ends the
+		// wait, so a stalled body must not delay success past the
+		// startup deadline. Only rejected responses need another poll
+		// iteration, and those need a drained body so net/http can
+		// return the connection to the idle pool instead of paying a
+		// fresh TCP (and, under WithTLSConfig, a fresh handshake) on
+		// every retry. The drain is bounded because readiness bodies
+		// are small and an endpoint that streams an unbounded body
+		// must not be able to grow the wait's memory usage. A drain
+		// error is not the probe's verdict: the response already
+		// arrived, so the status decides the outcome either way.
 		if !matcher(resp.StatusCode) {
+			_, _ = io.CopyN(io.Discard, resp.Body, maxDrainBytes)
 			return fmt.Errorf("status %d not accepted", resp.StatusCode)
 		}
 		return nil

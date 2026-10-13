@@ -72,12 +72,11 @@ func (r *freshDockerPortRunner) Run(_ context.Context, args ...string) ([]byte, 
 func TestFreshReviewRefreshesIncompletePublishedPortMetadata(t *testing.T) {
 	runner := &freshDockerPortRunner{}
 	ctr := &Container{
-		id:             strings.Repeat("b", 64),
-		uid:            strings.Repeat("b", 64),
-		runner:         runner,
-		eng:            dockerEngine{},
-		exposed:        []portSpec{{port: 6379, proto: "tcp"}},
-		defaultNetwork: "bridge",
+		id:      strings.Repeat("b", 64),
+		runner:  runner,
+		eng:     dockerEngine{},
+		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+		sync:    &lockPack{uid: strings.Repeat("b", 64), defaultNetwork: "bridge"},
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379"); err == nil {
 		t.Fatal("first incomplete published-port inspect unexpectedly succeeded")

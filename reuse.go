@@ -191,12 +191,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published:       cfg.published,
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
-		defaultNetwork:  info.defaultNetwork,
 		reused:          true,
-		info:            immutableInfo(info),
 		creation:        info.labels[creationLabel],
-		uid:             info.uid,
 		image:           containerImage,
+		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
 	}
 	// The leader's files are copied in reuseCreate. Every attaching
 	// caller applies its own files after the shared generation is known.
@@ -368,10 +366,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				network:         cfg.network,
 				networkExplicit: cfg.networkExplicit,
 				reused:          true,
-				info:            immutableInfo(info),
 				creation:        info.labels[creationLabel],
-				uid:             info.uid,
 				image:           resolvedImage,
+				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
 			}, nil
 		default:
 			if err := waitForReusePoll(ctx); err != nil {
@@ -487,8 +484,8 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		networkExplicit: cfg.networkExplicit,
 		reused:          true,
 		creation:        cfg.creation,
-		uid:             uid,
 		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
 	if target, ok := runReaperTarget(cfg); ok {
 		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
@@ -541,7 +538,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := attachDefaultNetworkForConfig(ctx, cfg, createdInfo); err != nil {
 		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 	}
-	ctr.defaultNetwork = createdInfo.defaultNetwork
+	ctr.pack().defaultNetwork = createdInfo.defaultNetwork
 	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}
@@ -566,7 +563,7 @@ func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error 
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 	for _, f := range files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
 		}
 	}
@@ -772,7 +769,7 @@ func inspectReuseBase(ctx context.Context, base *Container, cfg *config) (*engin
 			return nil, err
 		}
 		if uid != "" {
-			ctr.uid = uid
+			ctr.pack().uid = uid
 		}
 	}
 	return ctr.inspectFresh(ctx)
@@ -1339,10 +1336,10 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 		info, err := inspectReuseBase(ctx, base, cfg)
 		if err == nil {
 			if base != nil {
-				base.mu.Lock()
+				base.pack().mu.Lock()
 				creation := base.creation
-				uid := base.uid
-				base.mu.Unlock()
+				uid := base.immutableID()
+				base.pack().mu.Unlock()
 				if creation != "" && info.labels[creationLabel] != creation {
 					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 				}

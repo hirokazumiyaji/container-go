@@ -887,6 +887,15 @@ func TestReuse(t *testing.T) {
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
+- reused ハンドルでは、peer の観測結果を変えてしまう操作を
+  `ErrSharedContainer` で拒否する: `Stop`、`CopyToContainer`、
+  `CopyFileFromContainer`。ガードがなければ 1 パッケージの `Stop` が
+  他パッケージが使用中のコンテナを停止し、被害は对方側では原因の
+  特定できない接続失敗として現れる。読み取り系(`Endpoint`、`State`、
+  `Exec`、`Logs` など)は対象外。共有コンテナの lifecycle を自プロセスが
+  掌控する場合は `ctr.Shared()` で拒否を解除したハンドルを得る。
+  `Cleanup` / `TerminateContainer` は依然として reused ハンドルを消す。
+  `WithFiles` は共有前に create 時に適用されるため、ガードの対象外。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
   コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
 
@@ -920,6 +929,13 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   制御文字でない Unicode、空白、`=` は値として許容します。
   制御文字(タブを含む)や不正な UTF-8 を拒否する方針は、backend が受け付ける
   値でも env ファイルには書かないという意図的な互換性変更です。
+- `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
+  開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
+  `WithFiles` は通常ファイル専用です。
+  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
+  保持するメタデータは名前、バイト列、Unix パーミッションだけです。
+  タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
 - レジストリ認証情報は本 library では扱いません。Apple Container では
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。

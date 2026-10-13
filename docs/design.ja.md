@@ -241,6 +241,15 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 
 `CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
 
+`CopyToContainer` は通常ファイルとディレクトリを受け付ける。
+各 source entry は、最終要素のリンクを追わずに一度だけ開く。
+ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
+そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
+`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
+ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
+スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
+
 ## 接続エンドポイントの設計
 
 testcontainers の Docker 実装ではコンテナポートをホストのランダムポートへ公開し、`localhost:<mapped>` へ接続する。

@@ -164,7 +164,7 @@ func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
 		fakeRunner: newTestRunner(),
 		stream:     &stagedTerminalReader{terminalErr: terminal},
 	}
-	ctr := &Container{id: "myctr", uid: testDockerUID, runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: runner, eng: dockerEngine{}}
 
 	err := wait.ForLog("ready").
 		WithStartupTimeout(time.Second).
@@ -190,7 +190,7 @@ func TestFollowLogsClassificationProbeFailurePreservesTerminalNotFound(t *testin
 		fakeRunner: &fakeRunner{systemUp: false, binary: "docker"},
 		stream:     newTerminalStatusReader(terminal),
 	}
-	ctr := &Container{id: "myctr", uid: testDockerUID, runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: runner, eng: dockerEngine{}}
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {
 		t.Fatalf("FollowLogs: %v", err)
@@ -283,7 +283,7 @@ func TestLogsDefaultsToUnbounded(t *testing.T) {
 
 func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
 	r := &cli.ExecRunner{Binary: writeFollowLogsStub(t)}
-	ctr := &Container{id: "myctr", uid: testDockerUID, runner: r, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: r, eng: dockerEngine{}}
 
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {

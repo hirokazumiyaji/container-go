@@ -957,6 +957,17 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
+- `CopyToContainer` opens regular files and directories without following
+  final links, then snapshots the opened handles into a per-user private
+  staging path before invoking the backend. `WithFiles` is regular-file-only.
+  Symlinks/reparse points and special files are rejected. Snapshots are
+  bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
+  `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
+  (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source
+  paths). The snapshot intentionally preserves names, bytes, and Unix
+  permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
+  extended attributes, alternate data streams, sparse layout, and hardlink
+  identity are not preserved.
   script (the reaper) is a fixed string that receives validated container
   names or, after #73, Docker IDs only as stdin data.
 - On Unix, environment variables are passed through a `0600` file in a

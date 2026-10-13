@@ -27,8 +27,8 @@ func TestReuseAttachCopiesWithFiles(t *testing.T) {
 	}
 
 	call := f.callWith("cp")
-	if call == nil || call[1] != src || call[2] != "myctr:/fixture.txt" {
-		t.Fatalf("cp call = %v, want attach copy", call)
+	if call == nil || len(call) != 3 || call[0] != "cp" || call[1] == src || call[2] != "myctr:/fixture.txt" {
+		t.Fatalf("cp call = %v, want staged attach copy to myctr:/fixture.txt", call)
 	}
 }
 

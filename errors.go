@@ -18,7 +18,11 @@ import (
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that the selected container backend is
-// not running. The classified error retains the backend-specific hint.
+// not answering: the Apple Container system service (start it with
+// `container system start`) or the Docker daemon. The value is shared
+// by both backends, so a caller cannot tell which one is down from the
+// sentinel alone. The classified error retains the backend-specific hint
+// and keeps the original CLI and probe errors in the error chain.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrLogStreamSetup reports that a log stream cannot be started with the
@@ -235,6 +239,41 @@ func (e *ExecTerminationError) Unwrap() error { return e.Err }
 func (e *ExecTerminationError) Is(target error) bool {
 	return target == ErrExecTerminationUnsupported
 }
+
+// ErrSharedContainer reports that Stop, CopyToContainer, or
+// CopyFileFromContainer was called on a WithReuse handle. Those operations
+// would disturb peers sharing the container. Use Shared to opt in, or
+// Terminate to remove the shared container outright. Cleanup and
+// TerminateContainer still skip reused handles even after Shared.
+var ErrSharedContainer = errors.New("operation refused on a shared WithReuse handle")
+
+// ErrCopySourceUnsupported reports a host source that is not a regular
+// file or directory. CopyToContainer rejects source symlinks and symlink
+// entries in source directories rather than copying devices, sockets, or
+// FIFOs.
+var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or directory")
+
+// ErrCopySourceTooLarge reports a source whose regular-file bytes exceed
+// MaxCopyToContainerSize. The limit applies to a directory's total
+// snapshot size as well as to a single file.
+var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
+
+// ErrCopySourceTooManyEntries reports a source tree that exceeds
+// MaxCopyToContainerEntries, including entries whose files are empty.
+var ErrCopySourceTooManyEntries = errors.New("copy source has too many entries")
+
+// ErrCopySourceTooDeep reports a source tree deeper than
+// MaxCopyToContainerDepth.
+var ErrCopySourceTooDeep = errors.New("copy source is too deep")
+
+// ErrCopySourceMetadataTooLarge reports source path metadata that exceeds
+// MaxCopyToContainerMetadataSize while the snapshot tree is traversed.
+var ErrCopySourceMetadataTooLarge = errors.New("copy source metadata exceeds limit")
+
+// ErrCopySourceChanged reports that a source disappeared or its opened
+// handle changed while the private snapshot was being built. The triggering
+// filesystem or context error remains available through errors.Is/errors.As.
+var ErrCopySourceChanged = errors.New("copy source changed while staging")
 
 // ErrCopyFileNotRegular reports that a file copied out of a container
 // was not a regular file. Callers should not consume paths that resolve

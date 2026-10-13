@@ -204,8 +204,8 @@ func TestDockerNameInspectDoesNotPublishUnverifiedUID(t *testing.T) {
 	if info.uid != dockerFixtureID {
 		t.Fatalf("inspected UID = %q, want fixture UID", info.uid)
 	}
-	if ctr.uid != "" {
-		t.Fatalf("name inspect published unverified UID: %q", ctr.uid)
+	if ctr.immutableID() != "" {
+		t.Fatalf("name inspect published unverified UID: %q", ctr.immutableID())
 	}
 }
 
@@ -540,10 +540,10 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	}
 	ctr := &Container{
 		id:      "myctr",
-		uid:     dockerFixtureID,
 		runner:  runner,
 		eng:     dockerEngine{},
 		exposed: []portSpec{{port: 6379, proto: "tcp"}},
+		sync: &lockPack{uid: dockerFixtureID},
 	}
 
 	start := make(chan struct{})
@@ -587,7 +587,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	if result.state != StateRunning {
 		t.Fatalf("State = %q, want %q", result.state, StateRunning)
 	}
-	if got := ctr.uid; got != dockerFixtureID {
+	if got := ctr.immutableID(); got != dockerFixtureID {
 		t.Fatalf("uid = %q, want %q", got, dockerFixtureID)
 	}
 	wantTargets := []string{dockerFixtureID, dockerFixtureID}
@@ -638,7 +638,7 @@ func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
 		firstStarted: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: dockerFixtureID}, runner: runner, eng: dockerEngine{}}
 
 	release := func() {
 		select {
@@ -690,7 +690,7 @@ func TestDockerCanceledInspectDoesNotWaitBehindInspectLock(t *testing.T) {
 
 func TestDockerStopUsesBoundUID(t *testing.T) {
 	runner := &dockerRunner{fakeRunner: newTestRunner()}
-	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: dockerFixtureID}, runner: runner, eng: dockerEngine{}}
 	if err := ctr.Stop(context.Background(), nil); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
@@ -707,7 +707,7 @@ func TestDockerTerminateDoesNotWaitBehindInspectLock(t *testing.T) {
 		firstStarted: make(chan struct{}),
 		releaseFirst: make(chan struct{}),
 	}
-	ctr := &Container{id: "myctr", uid: dockerFixtureID, runner: runner, eng: dockerEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: dockerFixtureID}, runner: runner, eng: dockerEngine{}}
 	release := func() {
 		select {
 		case <-runner.releaseFirst:
@@ -784,8 +784,8 @@ func TestDockerInspectSchemaErrorIsNotNotFound(t *testing.T) {
 			}
 			// A rejected entry must not publish a UID to the handle; the
 			// handle keeps only the ID docker run itself printed.
-			if ctr.uid != dockerFixtureID {
-				t.Errorf("uid = %q, want the run ID %q", ctr.uid, dockerFixtureID)
+			if ctr.immutableID() != dockerFixtureID {
+				t.Errorf("uid = %q, want the run ID %q", ctr.immutableID(), dockerFixtureID)
 			}
 		})
 	}
@@ -1002,8 +1002,8 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 func TestDockerTerminateDeletesByRunIDWithoutInspect(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d)
-	if ctr.uid != dockerFixtureID {
-		t.Fatalf("uid = %q, want the ID docker run printed", ctr.uid)
+	if ctr.immutableID() != dockerFixtureID {
+		t.Fatalf("uid = %q, want the ID docker run printed", ctr.immutableID())
 	}
 	inspects := len(d.calls)
 	if err := ctr.Terminate(context.Background()); err != nil {
@@ -1146,9 +1146,9 @@ func TestDockerEndpointRefreshesDynamicBinding(t *testing.T) {
 	if inspectCalls != 2 {
 		t.Fatalf("inspect calls = %d, want 2", inspectCalls)
 	}
-	ctr.mu.Lock()
-	cached := ctr.info
-	ctr.mu.Unlock()
+	ctr.pack().mu.Lock()
+	cached := ctr.pack().info
+	ctr.pack().mu.Unlock()
 	if cached == nil || cached.ip != "" || cached.networkMode != "" || len(cached.bound) != 0 {
 		t.Fatalf("identity cache contains dynamic data: %+v", cached)
 	}
@@ -1880,7 +1880,7 @@ func TestDockerIPv6BindingsAreCanonicalAndPreserveFamily(t *testing.T) {
 			ctr := runDockerTestContainer(t, d,
 				WithNetwork("bridge"), WithPublishedPort(tc.publishSpec))
 			d.inspectJSON = []byte(inspectJSON)
-			ctr.info = nil
+			ctr.pack().info = nil
 			host, err := ctr.Host(context.Background())
 			if err != nil || host != tc.wantHost {
 				t.Fatalf("Host = %q, err = %v; want %q", host, err, tc.wantHost)
@@ -2127,7 +2127,7 @@ func TestDockerHostModeHostReturnsDaemonHostWithoutInventingPort(t *testing.T) {
 	d := &dockerRunner{fakeRunner: newTestRunner()}
 	ctr := runDockerTestContainer(t, d, WithNetwork("host"))
 	d.inspectJSON = []byte(inspectJSON)
-	ctr.info = nil
+	ctr.pack().info = nil
 	host, err := ctr.Host(context.Background())
 	if err != nil || host != "127.0.0.1" {
 		t.Fatalf("Host = %q, err = %v; want daemon host", host, err)

@@ -197,7 +197,7 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
+	if !eng.nameConflict(conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -214,10 +214,10 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
+	if !eng.containerMissing(missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
+	if !isNotFound(missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }
@@ -242,7 +242,7 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
+	if !eng.nameConflict(conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -259,10 +259,10 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
+	if !eng.containerMissing(missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
+	if !isNotFound(missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }

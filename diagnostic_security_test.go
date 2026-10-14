@@ -22,17 +22,23 @@ func TestRunCLIErrorUsesRedactedArgsAndStderr(t *testing.T) {
 	f.failPrefix = "run"
 	f.failStderr = "password=" + envSecret + " token=" + stderrToken + "\x1b[31m\r\n"
 
-	_, err := Run(context.Background(), "redis:7-alpine",
+	opts := []Option{
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}),
-		WithEnv(map[string]string{"PASSWORD": envSecret}),
 		WithCmd("server", commandToken),
 		WithLabels(map[string]string{"com.example.password": labelSecret}),
-	)
+	}
+	secrets := []string{commandToken, labelSecret, stderrToken}
+	if envFileLocksSupported {
+		opts = append(opts, WithEnv(map[string]string{"PASSWORD": envSecret}))
+		secrets = append(secrets, envSecret)
+	}
+
+	_, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err == nil {
 		t.Fatal("want CLI error")
 	}
 	got := err.Error()
-	for _, secret := range []string{envSecret, commandToken, labelSecret, stderrToken} {
+	for _, secret := range secrets {
 		if strings.Contains(got, secret) {
 			t.Errorf("error = %q, contains secret %q", got, secret)
 		}
@@ -70,18 +76,24 @@ func TestRunWaitDiagnosticsRedactCallerSecretsAndControlCharacters(t *testing.T)
 	}
 	strategy := &recordingStrategy{err: errors.New("not ready\x1b[2J\r\n")}
 
-	_, err := Run(context.Background(), "redis:7-alpine",
+	opts := []Option{
 		WithName("myctr"), withRunner(logs), withEngine(appleEngine{}),
-		WithEnv(map[string]string{"PASSWORD": envSecret}),
 		WithCmd("server", commandToken),
 		WithLabels(map[string]string{"com.example.token": labelSecret}),
 		WithWaitStrategy(strategy),
-	)
+	}
+	secrets := []string{commandToken, labelSecret, stderrSecret}
+	if envFileLocksSupported {
+		opts = append(opts, WithEnv(map[string]string{"PASSWORD": envSecret}))
+		secrets = append(secrets, envSecret)
+	}
+
+	_, err := Run(context.Background(), "redis:7-alpine", opts...)
 	if err == nil {
 		t.Fatal("want wait error")
 	}
 	got := err.Error()
-	for _, secret := range []string{envSecret, commandToken, labelSecret, stderrSecret} {
+	for _, secret := range secrets {
 		if strings.Contains(got, secret) {
 			t.Errorf("error = %q, contains secret %q", got, secret)
 		}
@@ -204,7 +216,9 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 
 func TestContainerUsesBoundedHashedDiagnosticMatcher(t *testing.T) {
 	const secret = "handle-lifetime-secret-117"
-	ctr := runTestContainer(t, newTestRunner(), WithEnv(map[string]string{"TOKEN": secret}))
+	// Use a label rather than WithEnv so the handle-lifetime check also runs
+	// on Windows, where secure environment files are unsupported.
+	ctr := runTestContainer(t, newTestRunner(), WithLabels(map[string]string{"com.example.token": secret}))
 	if ctr.diagnosticRedactorValue == nil {
 		t.Fatal("handle did not retain a diagnostic matcher")
 	}

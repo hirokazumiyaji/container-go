@@ -28,7 +28,17 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 	}
 	appRoot := filepath.Join(base, "containergo")
 	if err := ensureWindowsPrivateCopyStagingDir(appRoot, true); err != nil {
-		return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+		// Shared CI images can already have LocalAppData\containergo
+		// owned by another logon SID. Create a unique private parent
+		// rather than writing into that directory.
+		var random [8]byte
+		if _, randErr := rand.Read(random[:]); randErr != nil {
+			return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+		}
+		appRoot = filepath.Join(base, "containergo-"+hex.EncodeToString(random[:]))
+		if retryErr := ensureWindowsPrivateCopyStagingDir(appRoot, true); retryErr != nil {
+			return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+		}
 	}
 	root := filepath.Join(appRoot, "copy-staging")
 	if err := ensureWindowsPrivateCopyStagingDir(root, true); err != nil {

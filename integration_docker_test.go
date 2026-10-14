@@ -592,7 +592,13 @@ func TestIntegrationDockerPruneVolumePolicies(t *testing.T) {
 			waitForDockerVolume(t, anonymous, true)
 			waitForDockerVolume(t, named, true)
 
-			if err := ctr.Stop(ctx, nil); err != nil {
+			stopper := ctr
+			if tc.reuse {
+				// WithReuse refuses Stop unless the caller opts into
+				// Shared(); prune still needs a stopped container.
+				stopper = ctr.Shared()
+			}
+			if err := stopper.Stop(ctx, nil); err != nil {
 				t.Fatalf("Stop: %v", err)
 			}
 			var removed []string

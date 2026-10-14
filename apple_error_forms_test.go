@@ -91,7 +91,7 @@ func typedAppleMissing(operation string) *cli.CLIError {
 func TestAppleTypedNotFoundLifecycleSemantics(t *testing.T) {
 	t.Run("State", func(t *testing.T) {
 		ctr := runTestContainer(t, newTestRunner())
-		ctr.info = nil
+		ctr.pack().info = nil
 		ctr.runner = &appleLifecycleErrorRunner{
 			fakeRunner: newTestRunner(),
 			operation:  "inspect",
@@ -129,7 +129,7 @@ func TestAppleTypedNotFoundLifecycleSemantics(t *testing.T) {
 
 	t.Run("Terminate", func(t *testing.T) {
 		ctr := runTestContainer(t, newTestRunner())
-		ctr.info = nil
+		ctr.pack().info = nil
 		ctr.runner = &appleLifecycleErrorRunner{
 			fakeRunner:   newTestRunner(),
 			operation:    "delete",

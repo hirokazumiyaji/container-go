@@ -152,7 +152,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	if !dockerIDRE.MatchString(id) {
 		return false, nil
 	}
-	inspectContainer := &Container{id: id, uid: id, runner: r, eng: eng}
+	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
 	fresh, err := inspectContainer.inspectFresh(ctx)
 	if isNotFoundFor(eng, err) {
 		unregisterContainerReaper(&config{runner: r, eng: eng}, "", "", id)

@@ -36,7 +36,6 @@ func TestTerminateRejectsMissingOrInvalidGeneration(t *testing.T) {
 	}
 }
 
-
 type generationRunner struct {
 	creation    string
 	deleteCalls int
@@ -270,7 +269,7 @@ func TestReuseCreateHasIndependentPullBudget(t *testing.T) {
 	r := &slowPullRunner{pullDelay: 400 * time.Millisecond}
 	cfg := &config{
 		runner: r, eng: appleEngine{}, name: "shared-reuse",
-		pullPolicy: PullAlways,
+		pullPolicy: PullAlways, reuse: true,
 	}
 	ctx := context.Background()
 	ctr, err := reuseCreate(ctx, "redis:7-alpine", cfg)

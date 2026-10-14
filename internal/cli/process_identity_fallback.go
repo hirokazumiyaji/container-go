@@ -17,3 +17,5 @@ func openProcessIdentity(process *os.Process) (stableProcessIdentity, error) {
 func observeProcessStopped(*os.Process) (bool, error) {
 	return false, errProcessStopNotObserved
 }
+
+func processGroupTerminationSupported() bool { return false }

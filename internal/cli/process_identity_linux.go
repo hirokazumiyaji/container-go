@@ -139,3 +139,16 @@ func (p *processIdentity) close() {
 func observeProcessStopped(*os.Process) (bool, error) {
 	return false, errProcessStopNotObserved
 }
+
+func processGroupTerminationSupported() bool {
+	p, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		return false
+	}
+	identity, err := openProcessIdentity(p)
+	if err != nil {
+		return false
+	}
+	defer identity.close()
+	return true
+}

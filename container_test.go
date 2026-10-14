@@ -35,22 +35,26 @@ func TestMain(m *testing.M) {
 	// environment being absent.
 	integrationtest.SetSelectedBackend(os.Getenv("CONTAINERGO_BACKEND"))
 	os.Unsetenv("CONTAINERGO_BACKEND")
+	os.Unsetenv(defaultPlatformEnv)
 	os.Unsetenv("CONTAINERGO_KEEP")
 	os.Exit(m.Run())
 }
 
 // fakeRunner records CLI calls and replays canned results.
 type fakeRunner struct {
-	mu          sync.Mutex
-	calls       [][]string
-	binary      string
-	envFiles    []string // contents of --env-file captured at call time
-	inspectJSON string
-	failPrefix  string // fail calls whose first arg matches
-	systemUp    bool
+	mu                    sync.Mutex
+	calls                 [][]string
+	binary                string
+	envFiles              []string // contents of --env-file captured at call time
+	inspectJSON           string
+	failPrefix            string // fail calls whose first arg matches
+	failInspectAfter      int    // allow this many matching calls before failing (0 fails all)
+	containerInspectCalls int
+	systemUp              bool
 
 	imagePresent bool // image in the local store (image inspect/pull)
 	pullCalls    int
+	runPlatform  string
 	creations    map[string]string // container name -> creation generation from run args
 }
 
@@ -100,7 +104,13 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "XPC connection error"}
 		}
 		if f.imagePresent {
-			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+			target := args[len(args)-1]
+			digest := "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+			if d := imageDigest(target); d != "" {
+				digest = d
+			}
+			repo := stripImageDigest(target)
+			return []byte(fmt.Sprintf(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":[%q],"reference":%q,"descriptor":{"digest":%q},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`, repo+"@"+digest, repo, digest)), nil, nil
 		}
 		// The message carries both backends' not-found wording so one
 		// fake serves the docker and apple classifiers.
@@ -114,12 +124,20 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		f.pullCalls++
 		return nil, nil, nil
 	}
-	if f.failPrefix != "" && args[0] == f.failPrefix {
+	if f.failPrefix != "" && args[0] == f.failPrefix &&
+		(args[0] != "inspect" || f.failInspectAfter == 0 || f.containerInspectCalls >= f.failInspectAfter) {
 		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "injected failure"}
+	}
+	if args[0] == "inspect" {
+		f.containerInspectCalls++
 	}
 	switch args[0] {
 	case "run":
+		f.runPlatform = ""
 		for i, a := range args {
+			if a == "--platform" && i+1 < len(args) {
+				f.runPlatform = args[i+1]
+			}
 			if a == "--label" && i+1 < len(args) {
 				if v, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
 					name := ""
@@ -145,12 +163,26 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			// creation generation captured at run time so
 			// generation-verified deletes succeed.
 			name := args[len(args)-1]
+			platform := f.runPlatform
+			if platform == "" {
+				platform = appleHostPlatform()
+			}
+			platformParts := strings.Split(platform, "/")
+			platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+			variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+			if strings.Contains(platformParts[1], "arm") {
+				variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+			}
+			if len(platformParts) == 3 {
+				platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+			}
 			json = fmt.Sprintf(`[
   {
     "id": %q,
     "configuration": {
       "id": %q,
-      "image": {"reference": "docker.io/library/redis:7-alpine"},
+      "image": {"reference": "docker.io/library/redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "variantDigest": %q},
+      "platform": %s,
       "publishedPorts": [],
       "labels": {"com.github.hirokazumiyaji.container-go": "true", "com.github.hirokazumiyaji.container-go.session": %q, "com.github.hirokazumiyaji.container-go.creation": %q, "com.github.hirokazumiyaji.container-go.reuse": "true"}
     },
@@ -159,7 +191,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
       "networks": [{"ipv4Address": "192.168.64.3/24", "network": "default"}]
     }
   }
-]`, name, name, sessionID(), f.creations[name])
+]`, name, name, variantDigest, platformJSON, sessionID(), f.creations[name])
 		}
 		return []byte(json), nil, nil
 	default:
@@ -213,8 +245,8 @@ func TestRunInvokesRunDetachedWithImage(t *testing.T) {
 	if !slices.Contains(runCall, "--detach") {
 		t.Errorf("run call missing --detach: %v", runCall)
 	}
-	if runCall[len(runCall)-1] != "redis:7-alpine" {
-		t.Errorf("image not last arg: %v", runCall)
+	if !strings.HasPrefix(runCall[len(runCall)-1], "redis:7-alpine@") {
+		t.Errorf("run image is not digest-pinned: %v", runCall)
 	}
 	if ctr.ID() != "myctr" {
 		t.Errorf("ID = %q", ctr.ID())
@@ -226,9 +258,15 @@ func TestRunAppendsCmdAfterImage(t *testing.T) {
 	runTestContainer(t, f, WithCmd("redis-server", "--appendonly", "yes"))
 
 	runCall := f.callWith("run")
-	i := slices.Index(runCall, "redis:7-alpine")
+	i := -1
+	for j, arg := range runCall {
+		if strings.HasPrefix(arg, "redis:7-alpine@") {
+			i = j
+			break
+		}
+	}
 	if i < 0 || !slices.Equal(runCall[i+1:], []string{"redis-server", "--appendonly", "yes"}) {
-		t.Errorf("cmd not after image: %v", runCall)
+		t.Errorf("cmd not after pinned image: %v", runCall)
 	}
 }
 
@@ -402,13 +440,14 @@ func TestRunRejectsRelativeBindMountSource(t *testing.T) {
 func TestRunSucceedsWithoutInitialInspect(t *testing.T) {
 	f := newTestRunner()
 	f.failPrefix = "inspect"
+	f.failInspectAfter = 1
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(f), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if f.callWith("inspect") != nil {
-		t.Errorf("inspect issued during Run: %v", f.calls)
+	if f.containerInspectCalls != 1 {
+		t.Errorf("container inspect calls during Run = %d, want one post-create verification: %v", f.containerInspectCalls, f.calls)
 	}
 	if f.callWith("delete") != nil {
 		t.Errorf("unexpected delete during Run: %v", f.calls)

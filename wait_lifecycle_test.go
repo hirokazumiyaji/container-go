@@ -38,7 +38,7 @@ func (r *inspectSequenceRunner) Run(_ context.Context, args ...string) ([]byte, 
 	switch args[0] {
 	case "image":
 		if len(args) > 1 && args[1] == "inspect" && r.image {
-			return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
+			return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 		}
 		return nil, nil, nil
 	case "run":
@@ -84,15 +84,25 @@ func appleInspectWithNetwork(id, state, address string) string {
 	if address != "" {
 		network = fmt.Sprintf(`[{"ipv4Address":%q,"network":"default"}]`, address)
 	}
+	platformParts := strings.Split(appleHostPlatform(), "/")
+	platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
+	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	if strings.Contains(platformParts[1], "arm") {
+		variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	}
+	if len(platformParts) == 3 {
+		platformJSON = fmt.Sprintf(`{"os": %q, "architecture": %q, "variant": %q}`, platformParts[0], platformParts[1], platformParts[2])
+	}
 	return fmt.Sprintf(`[{
 		"id": %q,
 		"configuration": {
-			"image": {"reference": "redis:7-alpine"},
+			"platform": %s,
+			"image": {"reference": "redis:7-alpine", "descriptor": {"digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}, "variantDigest": %q},
 			"labels": {"com.github.hirokazumiyaji.container-go": "true"},
 			"publishedPorts": []
 		},
 		"status": {"state": %q, "networks": %s}
-	}]`, id, state, network)
+	}]`, id, platformJSON, variantDigest, state, network)
 }
 
 func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
@@ -141,7 +151,7 @@ func TestEndpointRefreshesIncompleteDockerBinding(t *testing.T) {
 	created := dockerInspectWithBinding(validUID, "created", "", 0)
 	running := dockerInspectWithBinding(validUID, "running", "172.17.0.2", 49153)
 	runner := newInspectSequenceRunner([]inspectStep{{data: created}, {data: running}})
-	ctr := &Container{id: "myctr", uid: validUID, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: validUID}, runner: runner, eng: dockerEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err == nil {
 		t.Fatal("first Endpoint should report that Created has no host binding yet")
@@ -224,6 +234,7 @@ func (r *dockerStateRunner) Run(ctx context.Context, args ...string) ([]byte, []
 		return []byte(fmt.Sprintf(`[{
 			"Id": %q,
 			"Name": "/myctr",
+			"Image": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"Config": {"Image": "redis:7-alpine", "Labels": {%q:"true",%q:"true",%q:"aaaaaaaaaaaaaaaa"}},
 			"State": {"Status": %q},
 			"NetworkSettings": {"IPAddress": "172.17.0.2", "Ports": {}}

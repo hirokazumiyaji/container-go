@@ -26,6 +26,7 @@ func (o LogsOptions) validate() error {
 	}
 	return nil
 }
+
 // Logs returns a snapshot of the container's log output so far.
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 	return c.LogsWithOptions(ctx, LogsOptions{})

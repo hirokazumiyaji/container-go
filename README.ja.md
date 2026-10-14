@@ -645,6 +645,84 @@ image が消えた場合はエントリ期限まで再 pull されないので�
 呼び出し側はオフのままにする。`PullNever` は契約上 image 不在で失敗するため、
 キャッシュの有無に関わらず常に inspect する。
 
+## イメージの解決と固定
+
+`Run` は `PullMissing` と `PullAlways` の両方で、image inspect の後に解決した image identity を backend の `run` に渡します。
+Docker は repository が一致する `RepoDigests` を優先し、取得できない場合は inspect した local image `Id` にフォールバックします。
+別の repository の `RepoDigests` を持つ local tag は alias として扱い、その immutable `Id` で安全に実行します。
+明示的な `image@digest` の repository または digest が一致しない場合は `ErrImageIdentityMismatch` になります。
+Apple Container は root image descriptor を run / reuse の identity として使い、指定した platform の variant は別の検証情報として保持します。
+descriptor が利用可能な ID だけの record は digest 参照に正規化します。
+Apple が未指定の入力を custom default registry へ解決した場合、`Run` は pinned 参照と reuse 比較に backend が報告した canonical repository を保持します。
+Reuse は元の mutable tag ではなく、解決済み digest / image ID で互換性を判定します。
+作成後の検証に失敗した新規 reuse container は削除します。
+
+Apple Container には実行時の `--pull=never` がないため、`Run` は `PullMissing`、`PullAlways`、`PullNever` のいずれでも、pinned された Apple reference を `container run` に渡す前に local store にあるかを確認します。
+存在せず選択した policy が fetch を許可する場合は exact digest を明示的に pull してから再確認します。
+`container run` に暗黙の fetch をさせません。
+identity を取得できない inspect の成功は `ErrImageIdentityUnavailable`、local に存在しないことが確認された場合は `ErrImageIdentityNotLocal` です。
+addressability check の transport、permission、context cancellation エラーは元の operational error として返し、mutable fallback では隠しません。
+identity を取得できない、または resolved reference が local にない mutable input では、互換 fallback として `WithAllowMutableImageTag()` を明示指定できます。
+
+```go
+package docexample
+
+import (
+    "context"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func AllowMutableImageTag(ctx context.Context) {
+    _, _ = container.Run(ctx, "redis:7-alpine",
+        container.WithAllowMutableImageTag())
+}
+```
+
+Apple の `name@digest` と `name:tag@digest` は pinned として扱い、この option を指定しても mutable へ降格させません。
+この fallback は tag の置き換えを防ぐ保証ではなく、bare digest や Docker image ID も降格しません。
+pull 完了から inspect の間に発生する mutable tag の変更や、共有 daemon に対する別 process の変更を、CLI API だけで原子的に排除できるとは仮定しません。
+再現性が重要な場合は、backend が atomic address を提供する場合の `image@sha256:...` を呼び出し側から渡してください。
+Apple が単一 manifest の周囲に合成した local index の root は registry から取得できるとは限らないため、無条件に exact pull しません。
+local に addressable な tag または alias を使うか、明示的な mutable-tag fallback を要求します。
+新規作成直後の container は再 inspect し、root、platform、選択された variant が異なる場合は `Run` が返す前にロールバックします。
+local build の Apple image に利用可能な local digest 参照がない場合は `WithAllowMutableImageTag` が必要になることがあります。
+
+## Exec のタイムアウトと長時間実行
+
+`Container.Exec` は有限時間・バッファリングされる操作です。caller の
+context に deadline がない場合、Exec は 30 秒の既定 deadline を適用し、
+ハングした backend が test を無期限にブロックしないようにします。
+正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と
+caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定
+deadline のみを無効化し、caller の deadline は取り除きません。これは
+意図的な長時間実行コマンドの場合だけ使用し、cancellable な context
+(可能なら deadline 付き)を併用してください。長寿命のプロセスは通常、
+コンテナの本体的コマンド(`WithCmd`)として起動し、出力には `FollowLogs`
+を使ってください。長-open な `Exec` 呼び出しは避けてください。
+
+Exec は既存の `(exitCode, output, error)` 契約を維持します。
+command の非ゼロ終了は結果であり、backend、timeout、cancellation のエラーは分類済み error として返されます。
+CLI が終了コードを返している場合は、その error と併せて `exitCode` にも保持されます。
+いずれのエラーでも、失敗前に生成された partial stdout/stderr を保持しているため `output` を読んでください。
+
+context error によって local CLI が終了した場合、stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ process group をベストエフォートで停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確かめられない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送るため、child が process group を変更した場合も直接の lifecycle を終了できます。他の Unix target は直接の子 handle だけを使います。直接の子を回収した後は、古い process group ID には signal を送りません。
+Windows では lifecycle が所有する Job Object handle を子孫の境界として使い、割り当てできない場合は直接の子だけを対象にします。
+Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用でき、command の起動中に context error が実際に競合した場合だけ `*ExecTerminationError`(`errors.Is(err, ErrExecTerminationUnsupported)`)を返します。保守的な direct-handle fallback では、remote process の終了を主張せず context error だけを返すことがあります。この分類は local の終了コードに依存しません。
+Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。
+後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
+backend 側 process が残っている可能性があるため、caller は container を terminate するか backend 固有の cleanup を実行してください。
+
+`FollowLogs` は起動エラーを直接返します。ストリームを返した後は EOF まで `Read` してください。
+CLI の終端エラー(CLI status と context cancel が競合した場合も含む)は `Read` から返ります。
+`Close` と context cancel は意図的な終了経路なので、EOF または context error になることがあります。
+直接 child 終了後に descendant が stdout/stderr を保持しても、stream は 제한時間だけ drain してから endpoint を閉じるため、EOF が無期限に待ちません。
+`ForLog` は match を受け入れる前に終端 stream error を確認し、終端 error と context error を `errors.Join` または `%w` で保持します。
+cancel 後に caller context から外した state probe を開始しません。
+timeout の分類は structured context、`Timeout() bool`、signal、`CLIError.OperationTimeout` の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しません。
+
 ## クリーンアップの契約
 
 通常の終了、作成後の rollback、create 失敗、異常終了では、エラーの見え方が異なります。
@@ -797,16 +875,27 @@ func TestReuse(t *testing.T) {
 - 競合する create の名前衝突は成功として扱い、既存へ attach する。
 - stopped の残骸は削除して再作成する。running のまま ready にならない
   場合は削除せずエラーを返す。
-- image / port が既存と不一致なら分かりやすいエラーを返す。
-  Docker では network も一致する必要があります。
+- image / port が既存と不一致なら分かりやすいエラーを返す。image の
+  互換性は元の mutable tag ではなく、解決済み digest / image ID で
+  判定する。対象は image と port のみ。Docker では network も一致する必要があります。
   `WithNetwork` 省略時は daemon の platform default を `default` として
   扱い、inspect の `NetworkSettings.Networks` から `bridge` (Linux) または
   `nat` (native Windows) を照合します。`host`、`none`、名前付き network は
   wildcard にしません。
-  `env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様です。
+  `env` / `cmd` / `mounts` の差は既存へ黙って attach する仕様です。作成後の検証に失敗した新規 reuse
+  container は削除する。
 - 各作成は世代ラベルを持ち、`Terminate` と stopped 再作成経路は置き換わった世代の削除を拒否する。watchdog リーパーも同様にガードする。
 - `Cleanup` / `TerminateContainer` / watchdog リーパーは reused ハンドルを
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
+- reused ハンドルでは、peer の観測結果を変えてしまう操作を
+  `ErrSharedContainer` で拒否する: `Stop`、`CopyToContainer`、
+  `CopyFileFromContainer`。ガードがなければ 1 パッケージの `Stop` が
+  他パッケージが使用中のコンテナを停止し、被害は对方側では原因の
+  特定できない接続失敗として現れる。読み取り系(`Endpoint`、`State`、
+  `Exec`、`Logs` など)は対象外。共有コンテナの lifecycle を自プロセスが
+  掌控する場合は `ctr.Shared()` で拒否を解除したハンドルを得る。
+  `Cleanup` / `TerminateContainer` は依然として reused ハンドルを消す。
+  `WithFiles` は共有前に create 時に適用されるため、ガードの対象外。
 - `container.PruneReuseGroup(ctx, "integration")` はそのグループの
   コンテナを強制削除する(CI 終了時)。通常の `Prune` は stopped のみ。
 
@@ -840,6 +929,13 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   制御文字でない Unicode、空白、`=` は値として許容します。
   制御文字(タブを含む)や不正な UTF-8 を拒否する方針は、backend が受け付ける
   値でも env ファイルには書かないという意図的な互換性変更です。
+- `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
+  開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
+  `WithFiles` は通常ファイル専用です。
+  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
+  保持するメタデータは名前、バイト列、Unix パーミッションだけです。
+  タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
 - レジストリ認証情報は本 library では扱いません。Apple Container では
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。
@@ -857,6 +953,13 @@ watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけませ
 をしたりしないでください。該当実行に確実に帰属するファイルだけを削除して
 ください。inspect 出力に含まれた可能性がある認証情報は失効済みとして扱い、
 ローテーションしてください。stale ファイルを削除しても secret 自体は失効しません。
+- `Run` は image inspect が返した検証済み identity、または Docker の image ID を backend に渡すため、inspect 後の local tag 変更で create 対象が変わりません。
+  Apple の descriptor-backed reference は create 前に local addressability を確認します。
+  呼び出し側の `name@digest` と `name:tag@digest` は pinned のまま残り、`WithAllowMutableImageTag` は mutable tag と明示的に許可された互換 fallback にだけ適用されます。
+  `container run` を暗黙の fetch として使いません。
+  これは backend API の範囲での保証であり、mutable tag の pull から inspect までの操作を原子化するものではありません。
+  identity を取得できない backend では `WithAllowMutableImageTag` による明示的な fallback が必要です。
+
 
 ## testcontainers-go との違い
 

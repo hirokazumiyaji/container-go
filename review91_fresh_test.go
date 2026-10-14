@@ -55,6 +55,7 @@ func review91ReuseInspectJSON(uid, generation string, bound bool) string {
 	}
 	return fmt.Sprintf(`[{
 		"Id":%q,
+		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/shared",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"com.github.hirokazumiyaji.container-go":"true",
@@ -149,8 +150,7 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 			}
 			base := &Container{
 				creation: review91GenA,
-				uid:      review91UIDA,
-				info:     initial,
+				sync: &lockPack{uid: review91UIDA, info: initial},
 			}
 			cfg := &config{
 				runner: review91SingleInspectRunner{data: review91ReuseInspectJSON(replacement.uid, replacement.creation, false)},
@@ -171,9 +171,13 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 type review91CreatedRunner struct{}
 
 func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
+		return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}]`), nil, nil
+	}
 	if args[0] == "inspect" {
 		return []byte(fmt.Sprintf(`[{
 			"Id":%q,
+			"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 			"Name":"/shared",
 			"Config":{"Image":"redis:7-alpine","Labels":{
 				"com.github.hirokazumiyaji.container-go":"true",
@@ -316,10 +320,10 @@ func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
 	runner := &review91LazyUIDRunner{inspectDelay: 50 * time.Millisecond}
 	ctr := &Container{
 		id:       "shared",
-		uid:      review91UIDA,
 		runner:   runner,
 		eng:      dockerEngine{},
 		creation: review91GenA,
+		sync: &lockPack{uid: review91UIDA},
 	}
 
 	start := make(chan struct{})

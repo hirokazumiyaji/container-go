@@ -15,7 +15,7 @@ func (r *appleVariantsDefaultRunner) Run(ctx context.Context, args ...string) ([
 	r.calls = append(r.calls, args)
 	r.mu.Unlock()
 	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
-		return []byte(`[{"variants":[{"platform":{"os":"linux","architecture":"arm64"}}]}]`), nil, nil
+		return []byte(`[{"reference":"redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variants":[{"platform":{"os":"linux","architecture":"arm64"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`), nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }

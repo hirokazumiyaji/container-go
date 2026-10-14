@@ -26,6 +26,7 @@ func review91OwnedDockerInspect(uid, generation string, reused, bound bool) stri
 	}
 	return fmt.Sprintf(`[{
 		"Id":%q,
+		"Image":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
 		"Name":"/myctr",
 		"Config":{"Image":"redis:7-alpine","Labels":{
 			"%s":"true",
@@ -219,10 +220,10 @@ func TestReview91LazyCacheRejectsReplacementNameLookup(t *testing.T) {
 	if !errors.Is(err, ErrGenerationReplaced) {
 		t.Fatalf("info = %+v, error = %v, want ErrGenerationReplaced", info, err)
 	}
-	ctr.mu.Lock()
-	defer ctr.mu.Unlock()
-	if ctr.uid != "" || ctr.info != nil {
-		t.Fatalf("cached identity = %q, info = %+v; replacement data was pinned", ctr.uid, ctr.info)
+	ctr.pack().mu.Lock()
+	defer ctr.pack().mu.Unlock()
+	if ctr.immutableID() != "" || ctr.pack().info != nil {
+		t.Fatalf("cached identity = %q, info = %+v; replacement data was pinned", ctr.immutableID(), ctr.pack().info)
 	}
 }
 
@@ -242,8 +243,8 @@ func TestReview91CacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 	ctr := &Container{
 		eng:      dockerEngine{},
 		creation: review91Round2GenA,
-		uid:      review91Round2UIDA,
 		exposed:  []portSpec{{port: 6379, proto: "tcp"}},
+		sync:     &lockPack{uid: review91Round2UIDA},
 	}
 	if err := ctr.cacheInfo(original); err != nil {
 		t.Fatalf("cache original: %v", err)
@@ -252,12 +253,12 @@ func TestReview91CacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 		t.Fatalf("cache replacement error = %v, want ErrGenerationReplaced", err)
 	}
 
-	ctr.mu.Lock()
-	defer ctr.mu.Unlock()
-	if ctr.uid != original.uid {
-		t.Fatalf("uid = %q, want immutable %q", ctr.uid, original.uid)
+	ctr.pack().mu.Lock()
+	defer ctr.pack().mu.Unlock()
+	if ctr.immutableID() != original.uid {
+		t.Fatalf("uid = %q, want immutable %q", ctr.immutableID(), original.uid)
 	}
-	if ctr.info == nil || ctr.info.uid != original.uid {
-		t.Fatalf("cached info = %+v, want immutable UID %q", ctr.info, original.uid)
+	if ctr.pack().info == nil || ctr.pack().info.uid != original.uid {
+		t.Fatalf("cached info = %+v, want immutable UID %q", ctr.pack().info, original.uid)
 	}
 }

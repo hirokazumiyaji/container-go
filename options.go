@@ -27,29 +27,30 @@ const (
 )
 
 type config struct {
-	runner          cli.Runner
-	eng             engine
-	name            string
-	env             map[string]string
-	cmd             []string
-	entrypoint      string
-	exposed         []portSpec
-	published       []publishSpec
-	labels          map[string]string
-	mounts          []Mount
-	files           []File
-	waitStrategy    wait.Strategy
-	cpus            int
-	memory          string
-	user            string
-	workdir         string
-	network         string
-	networkExplicit bool
-	platform        string
-	pullPolicy      PullPolicy
-	reuse           bool
-	reuseGroup      string
-	creation        string
+	runner               cli.Runner
+	eng                  engine
+	name                 string
+	env                  map[string]string
+	cmd                  []string
+	entrypoint           string
+	exposed              []portSpec
+	published            []publishSpec
+	labels               map[string]string
+	mounts               []Mount
+	files                []File
+	waitStrategy         wait.Strategy
+	cpus                 int
+	memory               string
+	user                 string
+	workdir              string
+	network              string
+	networkExplicit      bool
+	platform             string
+	pullPolicy           PullPolicy
+	allowMutableImageTag bool
+	reuse                bool
+	reuseGroup           string
+	creation             string
 	// imageCache reuses image-presence answers across Runs when the
 	// caller applies a WithImagePresenceCache Option. The Option owns the
 	// cache so sequential Runs that reuse it share entries. Nil means no
@@ -98,9 +99,6 @@ func (c *config) allLabels() map[string]string {
 	}
 	labels[managedLabel] = "true"
 	labels[sessionLabel] = sessionID()
-	if c.creation != "" {
-		labels[creationLabel] = c.creation
-	}
 	if c.creation != "" {
 		labels[creationLabel] = c.creation
 	}
@@ -169,8 +167,11 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // caller before attach. Creation-only options are intentionally
 // ignored when attaching; use distinct names when those differences
 // matter. Returned handles are shared: Cleanup, TerminateContainer,
-// and the watchdog reaper do not remove them. Explicit Terminate still
-// does — only use it when no other process still needs the container.
+// and the watchdog reaper do not remove them. Stop, CopyToContainer,
+// and CopyFileFromContainer refuse with ErrSharedContainer so one
+// process cannot disturb peers; use Shared to opt in deliberately.
+// Explicit Terminate still removes the container — only use it when no
+// other process still needs it.
 func WithReuse() Option {
 	return func(c *config) error {
 		c.reuse = true

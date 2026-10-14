@@ -567,6 +567,70 @@ unrelated delete failures still propagate.
 specifications. Use `errors.Is(err, wait.ErrInvalidConfiguration)` to
 classify either configuration error without matching its message.
 
+## Exec timeout and long-running commands
+
+`Container.Exec` is a finite, buffered operation. When the caller's
+context has no deadline, Exec applies a 30-second default so a hung
+backend cannot block a test indefinitely. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default; it does not remove a caller deadline. Use zero only for a
+deliberately long-running command and pair it with a cancellable
+context (prefer a deadline). Long-lived processes should normally be
+the container's main command (`WithCmd`) with `FollowLogs` for output
+rather than a long-lived `Exec` call.
+
+Exec keeps the existing `(exitCode, output, error)` contract: a
+command's non-zero exit is a result, while a backend, timeout, or
+cancellation error is returned with the classified error. A CLI-reported
+exit status, when available, is retained in `exitCode` even alongside
+that error. In either error case, read `output` to retain partial stdout
+and stderr produced before the failure.
+
+Cancellation is owned by the local command lifecycle. On Unix-like systems a
+best-effort process-group termination is attempted only on targets with a
+stable process identity and while the direct child handle still owns the
+process. On Linux, a numeric group signal additionally requires a
+`waitid(WSTOPPED|WNOWAIT)` stopped-state check; if that ownership proof is lost,
+termination uses the pidfd directly and never signals the former PGID. The
+direct child is also killed after a successful group signal because it may have
+changed process groups. Other Unix targets conservatively use the direct child
+handle. Once that child is reaped, no former numeric process-group ID is used.
+On Windows, a lifecycle-owned Job Object handle provides the descendant
+boundary, with direct-child fallback when assignment is unavailable. Job
+assignment happens after `Start`; descendants created during that short
+post-Start attachment window are outside the job boundary. Neither boundary
+claims remote container-process termination.
+Windows-specific lifecycle tests are build-constrained. The development
+environment cross-compiles and vets the Windows packages but cannot execute
+Windows Job Object runtime tests, including the exit-259 active-child case.
+
+Neither supported backend CLI exposes a common kill operation for an exec
+instance. When active-child evidence is available and a context error actually
+races with a launched command, Exec returns an `*ExecTerminationError`
+(`errors.Is(err, ErrExecTerminationUnsupported)`) instead of claiming that
+the container-side process stopped. A conservative direct-handle fallback may
+return the context error without that remote-termination claim. A successful
+empty-job or already-finished child termination is not active-process
+evidence. Classification does not depend on the local exit status: in
+particular, Windows `Process.Kill` may report the killed process as exit code
+`1`, and that status remains visible without suppressing the typed error. A
+deadline consumed later by a verification inspect does not by itself produce
+`ExecTerminationError`. The backend-side process may still be running; callers
+must terminate the container or use a backend-specific cleanup path.
+
+`FollowLogs` returns startup failures directly. After a stream is returned,
+read it to EOF: terminal CLI failures (including a CLI status racing context
+cancellation) are reported by `Read`. `Close` and context cancellation are
+intentional termination paths and may instead produce EOF or a context error.
+If a descendant retains stdout/stderr after the direct child exits, the stream
+uses a bounded drain and then closes its endpoints so EOF cannot wait forever.
+`ForLog` observes terminal stream errors before accepting a match, preserves
+terminal/context errors with `errors.Join`/`%w`, and does not detach a state
+probe after cancellation. Timeout classification uses structured context,
+`Timeout() bool`, signal, or `CLIError.OperationTimeout` evidence; arbitrary
+workload stderr is treated as application output.
+
 ## Image pulls
 
 When `Run` needs to create a container, it applies an explicit pull policy
@@ -654,6 +718,68 @@ removed out of band is not re-pulled until the entry expires, so callers
 who need certainty on every `Run` should leave it off. `PullNever` always
 inspects regardless, since its contract is to fail when the image is
 absent.
+
+## Image resolution and pinning
+
+After the inspect (and after a pull, when needed), `Run` resolves the
+image identity and passes that identity to the backend instead of the
+caller's mutable tag. Docker prefers a matching `RepoDigests` entry and
+falls back to the inspected local image `Id`. A local Docker tag whose
+`RepoDigests` belong to another repository is treated as a local alias
+and safely uses that `Id`; only an explicit `image@digest` whose
+repository or digest conflicts is rejected as
+`ErrImageIdentityMismatch`. Apple Container uses the root image
+descriptor as the run/reuse identity, validates the selected platform
+variant separately, and normalizes an ID-only record to a digest
+reference when the descriptor is available. When Apple resolves an
+unqualified input to a custom default registry, `Run` preserves that
+canonical repository in the pinned reference and reuse comparison.
+Reuse compares the resolved digest/ID identity, not the original tag,
+and removes a newly-created reused container if its post-create identity
+or port validation fails.
+
+Apple has no runtime `--pull=never` switch. Before `Run` passes any
+pinned Apple reference to `container run`, it verifies that exact
+reference in the local store for `PullMissing`, `PullAlways`, and
+`PullNever`. If it is missing and the selected policy permits a fetch,
+the library performs an explicit exact-digest pull and verifies it again;
+`container run` is never allowed to perform that implicit fetch. A
+successful inspect that cannot provide a repository-bearing digest or a
+verified local image ID returns `ErrImageIdentityUnavailable`; a
+confirmed local absence returns `ErrImageIdentityNotLocal`. Transport,
+permission, and cancellation failures from the addressability check are
+returned as operational errors and do not trigger the mutable fallback.
+`WithAllowMutableImageTag` is the explicit escape hatch for a mutable
+input when identity is unavailable or the resolved reference is not
+locally addressable:
+
+```go
+package docexample
+
+import (
+    "context"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func AllowMutableImageTag(ctx context.Context) {
+    _, _ = container.Run(ctx, "redis:7-alpine",
+        container.WithAllowMutableImageTag())
+}
+```
+
+With that option, a mutable input may run the original tag; this
+deliberately retains the tag-replacement window and is not an identity
+guarantee. Apple `image@sha256:...` (including `image:tag@sha256:...`)
+is a pinned address and is never downgraded by this option. The option
+never downgrades a bare digest or a Docker image-ID-shaped value.
+Pinning cannot make a mutable registry
+tag's pull-to-inspect resolution atomic when another actor can modify
+the shared backend. Prefer a caller-supplied `image@sha256:...` when
+the backend provides an atomic address and treat its identity metadata
+as the compatibility boundary. Locally built Apple images may require
+`WithAllowMutableImageTag` when no locally addressable digest reference
+exists.
 
 ## Cleanup contract
 
@@ -794,13 +920,15 @@ Contract:
 - Stopped leftovers are deleted and recreated; a running container that
   never becomes ready is left alone and returns an error.
 - Image / port mismatches vs the existing container return a clear error.
-  Docker also requires the requested network identity to match. Omitted
-  `WithNetwork` means the daemon default; inspect's `default` mode is
-  resolved against `NetworkSettings.Networks` (`bridge` on Linux, `nat` on
-  native Windows). `host`, `none`, and named networks are not wildcards.
-  Reuse re-inspects by immutable UID before compatibility checks and before
-  returning the handle. `env` / `cmd` / `mounts` differences still attach
-  silently by design (use distinct names when they matter).
+  Image compatibility uses the resolved digest or image ID (never the
+  original mutable tag); only image and ports are compared. Docker also requires
+  the requested network identity to match. Omitted `WithNetwork` means the daemon
+  default; inspect's `default` mode is resolved against `NetworkSettings.Networks`
+  (`bridge` on Linux, `nat` on native Windows). `host`, `none`, and named networks
+  are not wildcards. Reuse re-inspects by immutable UID before compatibility
+  checks and before returning the handle. `env` / `cmd` / `mounts` differences
+  still attach silently by design (use distinct names when they matter). A
+  newly-created reused container is removed if its post-create validation fails.
 - Each creation carries a generation label; `Terminate` and the
   stopped-recreate path refuse to delete a replaced generation, and the
   watchdog reaper guards deletion the same way.
@@ -830,6 +958,17 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
+- `CopyToContainer` opens regular files and directories without following
+  final links, then snapshots the opened handles into a per-user private
+  staging path before invoking the backend. `WithFiles` is regular-file-only.
+  Symlinks/reparse points and special files are rejected. Snapshots are
+  bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
+  `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
+  (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source
+  paths). The snapshot intentionally preserves names, bytes, and Unix
+  permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
+  extended attributes, alternate data streams, sparse layout, and hardlink
+  identity are not preserved.
   script (the reaper) is a fixed string that receives validated container
   names or, after #73, Docker IDs only as stdin data.
 - On Unix, environment variables are passed through a `0600` file in a
@@ -858,6 +997,18 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   `container registry login` for Apple Container or `docker login` for
   Docker. The backend CLI owns the resulting credentials and registry
   context.
+- `Run` passes the verified identity returned by image inspect (or a
+  Docker image ID) to the backend, so a later local tag reassignment
+  does not change that create. Apple descriptor-backed references are
+  checked for local addressability before create and the resulting
+  container identity is verified before return. Caller-supplied
+  `name@digest` references remain pinned; `WithAllowMutableImageTag`
+  applies only to mutable tags and explicitly authorized compatibility
+  fallbacks. `container run` is never
+  used as an implicit fetch. This is a backend/API guarantee, not a
+  claim that every tag-to-registry operation is atomic: a mutable tag
+  can still be replaced before the post-pull inspect, and an
+  identity-less backend requires the explicit compatibility fallback.
 
 ### Legacy reaper staging files
 
@@ -873,6 +1024,7 @@ Do not grep file contents into a terminal, follow symlinks, or run a broad
 recursive delete. Remove only files that you can positively attribute to the
 affected run. Treat any credentials that may have appeared in inspect output
 as exposed and rotate them; deleting a stale file does not revoke a secret.
+
 
 ## Differences from testcontainers-go
 

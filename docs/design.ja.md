@@ -153,7 +153,7 @@ func TestRedis(t *testing.T) {
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-コンテナを新規作成する必要がある場合、`Run` は起動前に pull policy を適用してから待機戦略を完了する。
+コンテナを新規作成する必要がある場合、`Run` は選択した pull policy に従ってイメージを解決・適用してから待機戦略を完了する。
 既定の `PullMissing` はローカルイメージストアを検査し、イメージがないときだけ明示的に pull する。
 `PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求する。`PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck を行い、image がなければ `ErrImageNotFound` を返す。Docker は `--pull=never` も渡すため strict な no-fetch 経路を持つが、Apple Container には同等の run-time switch がないため、precheck は no-fetch 保証ではない（#112）。起動後の操作や待機が再利用でない経路で失敗した場合は、作成したコンテナをロールバックしてからエラーを返す。Reuse の共有ライフタイムは後述の別契約で扱う。
 
@@ -225,9 +225,13 @@ func (c *Container) Terminate(ctx context.Context) error
 
 `Stop` の非 nil timeout は、両 backend が fractional value を truncate して whole seconds に変換する。negative や極端な値は reject されず、timeout を saturation なしで query budget に加算するため、library 側の maximum も強制されない。backend limit が適用され、#89 が 未実装の validation を担当する。
 
-`Exec` は終了コードと標準出力、標準エラーをまとめて返す。
-実行中コンテナで実行したコマンドが 0 以外で終了した場合、その終了コードはインフラエラーではなく結果として返す。
-停止中または到達できないコンテナの操作はエラーを返すことがある。
+`Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr を返す（非ゼロ終了は結果であり error ではない）。caller の context に deadline がない場合は 30 秒の既定 deadline を適用する。正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline のみを無効化し、caller の deadline は取り除かない。長寿命のプロセスは通常 `WithCmd` で本体コマンドとして起動し、出力は `FollowLogs` で取得する（Long-open な Exec は避ける）。
+backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error とともに返す。CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。command の起動中実際に context error が競合した場合だけ、その分類は終了コードに依存しません。Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
+context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
+Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`（`errors.Is(err, ErrExecTerminationUnsupported)`）を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。したがって error が non-nil でも reader を読む必要があります。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
+
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
 `Logs` と、成功する `LogsWithOptions` 呼び出しは backend command が終了するため有限のスナップショットを返すが、単体で byte 上限は課さない。`Logs` は全出力を要求する。`LogsOptions` は backend 固有で、Docker は `Tail` と `Since` の両方を受け付ける。確認した Apple Container CLI の各 version は tail に `-n` を使い、`--since` option を持たない。このチェックアウトは Apple にも Docker 形式の `--tail` と `--since` を渡すため、`LogsWithOptions` は backend 中立ではない。Apple の機能として文書化する前に #82 を適用する必要がある。#82 の変更は `Tail` を Apple の `-n` に対応させ、`Since` を unsupported として拒否する予定である。範囲を指定しても大きさはコンテナ出力に依存する。`FollowLogs` は意図的に上限のない stream で、リーダーを閉じるか context をキャンセルするまで続く。`LogsOptions` と `LogsWithOptions` は `v0.2.0` にはない現在の開発 API である。generation を持つ handle では `Terminate` は世代ガードを持つが、現在の reuse と空 generation の経路には #83 と #84 が扱う制限がある（後述の Reuse を参照）。
 
@@ -236,6 +240,15 @@ func (c *Container) Terminate(ctx context.Context) error
 `Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。
 
 `CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
+
+`CopyToContainer` は通常ファイルとディレクトリを受け付ける。
+各 source entry は、最終要素のリンクを追わずに一度だけ開く。
+ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
+そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
+`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
+ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
+スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
 
 ## 接続エンドポイントの設計
 
@@ -542,6 +555,33 @@ inspect ファイルを作成しません。変更前のバージョンは名前
 inspect 出力に含まれた可能性がある認証情報はローテーションしてください。stale
 ファイルを削除しても secret は失効しません。
 
+**create 前の image identity を固定する**。
+`PullMissing` と `PullAlways` は local store を準備した後にも image inspect を行い、解決した immutable identity を backend の `run` に渡す。
+Docker は repository が一致する registry digest を優先し、取得できない場合は inspect した local image ID にフォールバックする。
+別の repository の `RepoDigests` を持つ local alias も同じ local ID で実行し、明示的な pinned repository / digest の conflict だけを mismatch として扱う。
+Apple Container は root image descriptor を run / reuse の identity として使い、指定した platform の variant は別の検証情報として保持する。
+Apple が未指定の入力を custom default registry へ解決した場合、backend が報告した canonical repository を run 参照と identity 比較に保持する。
+descriptor が利用可能な ID だけの record は digest 参照に正規化する。
+この処理は inspect 後の local tag 再割り当てが create 対象を変えることを防ぐ。
+ただし、mutable tag の pull から inspect までの操作を原子化するものではない。
+呼び出し側の Apple `name@digest` と `name:tag@digest` は pinned として扱い、`WithAllowMutableImageTag` を指定しても mutable へ降格させない。
+利用可能な identity を返さない backend version では既定で `ErrImageIdentityUnavailable` を返して fail closed する。
+repository の provenance がない bare digest は identity として扱わず、bare Docker image ID は inspect がその local ID を検証した場合だけ受け入れる。
+
+Apple Container の `run` に `--pull=never` はないため、pinned Apple reference を `container run` に渡す前に、すべての pull policy で local store にあるかを確認する。
+存在せず選択した policy が fetch を許可する場合は exact digest を明示的に pull して再検査し、`container run` の暗黙の fetch は許さない。
+local に存在しないことが確認された場合は `ErrImageIdentityNotLocal`、成功した inspect が repository-bearing digest または検証済み local ID を返さない場合は `ErrImageIdentityUnavailable` を返す。
+addressability check の transport、permission、cancellation エラーは operational error として返し、mutable fallback の根拠にしない。
+`WithAllowMutableImageTag` は identity が取得できない、または resolved reference が local にない mutable input の明示的な互換 fallback であり、identity の保証ではない。
+呼び出し側の repository digest、bare digest、Docker image ID を mutable tag に降格させることもない。
+local build の Apple image で local digest 参照がない場合は、この明示 fallback が必要になることがある。
+
+Apple は単一 manifest の周囲に local index を合成することがある。
+この root は local store の content address として存在するが、`name@digest` で registry から取得できるとは限らない。
+そのため resolver は synthetic root を無条件に exact pull しない。
+local に addressable な tag または alias を使うか、`WithAllowMutableImageTag` による明示的な fallback を要求する。
+新規作成直後の Apple container は `container run` の後に再 inspect し、root、platform、選択された variant が異なる場合は `Run` や reuse が返す前にロールバックする。
+
 ## パフォーマンス設計
 
 **子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。起動後の inspect では接続に必要な情報がそろった結果を endpoint 関連経路が再利用する。created 状態で IP や公開ポートが未確定ならキャッシュせず、次の inspect で再取得する。状態 (`status.state`) は毎回取得する。ただし現在のキャッシュにはコンテナ IP と host 側 binding も含まれ、これらは動的な値である。`State` と一部の lifecycle 操作は再 inspect する。これは stale data の制限であり、immutable な保証ではない。動的 endpoint データの更新は #85 が担当する。
@@ -552,7 +592,7 @@ inspect 出力に含まれた可能性がある認証情報はローテーショ
 
 **要求された範囲だけスナップショットを制限する**。`Logs` と成功する `LogsWithOptions` 呼び出しは有限の CLI snapshot を完了するが、`Logs` は利用可能な全出力を buffer できる。`LogsOptions{Tail, Since}` は backend 固有で、Docker は両方を受け付けるが、確認した Apple Container CLI の各 version は Tail に `-n` を使い Since を持たない。このチェックアウトは Apple にも Docker の flag を渡すため、option の契約は #82 を待つ。どちらの経路も byte 上限を追加しない。`FollowLogs` は意図的に上限のない stream であり、`io.ReadCloser` を閉じるか context をキャンセルすると CLI process を終了する。wait failure の診断 log 末尾は 1MiB 上限である。
 
-**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`Exec` のコマンド呼び出しと `FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。
+**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。
 
 ## エラー処理
 
@@ -561,6 +601,9 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：backend が missing container を示す CLI failure を分類した場合。target に一致する entry がない successful inspect response はこの sentinel を保証せず、generic error になる場合がある（#103）。Docker では empty または malformed な inspect data がその generic path に入る。valid だが mismatched な object は現在の parser では no-match として拒否されない。
 - `ErrImageNotFound`：現在の `PullNever` precheck がローカルイメージを見つけなかった場合。Apple では best-effort な backend-specific precheck であり、no-fetch 保証ではない（#112）。
+- `ErrImageIdentityUnavailable`：成功した image inspect が repository-bearing digest または検証済み local image ID を返さず、mutable tag fallback も指定されていない
+- `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
+- `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。現在の reuse 経路には readiness 後の最終 check（#83、#84）がない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
@@ -571,6 +614,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrInvalidConfig` / `*ConfigError`：作成前に拒否した backend 非互換の option 組み合わせ
 - `ErrEndpointUnreachable`：リモートデーモンの loopback など、client から到達できない binding
 - `*CLIError`：上記以外の CLI 失敗。実行したサブコマンド、終了コード、stderr の診断情報(上限 64KiB)を保持する。liveness probe では stdout の診断情報も内部で確認する
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`：報告された local の終了コードにかかわらず、context の期限切れまたは取消によって local CLI が終了した場合。backend 側 exec process は残っている可能性がある
 
 backend の `run` が成功した後に非 reuse `Run` が失敗した場合、作成後の rollback error を返す。rollback 削除にも失敗すると、コンテナが残ったことを message に含める。backend の `run` 自体の失敗は別の best-effort `cleanupFailedCreate` 経路を使い、その cleanup error は元の classified error に連結しない。reaper の登録・削除 error も返さない。Reuse は wait error を返し、共有コンテナは残す。
 

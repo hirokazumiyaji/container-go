@@ -18,7 +18,11 @@ import (
 type CLIError = cli.CLIError
 
 // ErrSystemNotRunning reports that the selected container backend is
-// not running. The classified error retains the backend-specific hint.
+// not answering: the Apple Container system service (start it with
+// `container system start`) or the Docker daemon. The value is shared
+// by both backends, so a caller cannot tell which one is down from the
+// sentinel alone. The classified error retains the backend-specific hint
+// and keeps the original CLI and probe errors in the error chain.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
 // ErrLogStreamSetup reports that a log stream cannot be started with the
@@ -166,6 +170,31 @@ func validationErrorf(option string, value any, format string, args ...any) erro
 // is absent.
 var ErrImageNotFound = errors.New("image not found in local store")
 
+// ErrImageIdentityUnavailable reports that an image inspect completed
+// successfully but did not provide a usable immutable identity (a
+// repository-bearing digest or a verified local image ID). It is not
+// used for transport, permission, or cancellation failures. Run fails
+// closed by default; WithAllowMutableImageTag opts into passing the
+// original mutable tag to the backend. Apple name@digest references,
+// including name:tag@digest, remain immutable and are never downgraded by
+// that option. PullNever also rejects an identity-less Apple inspect even
+// when the caller supplied a digest, because the backend has not confirmed
+// the local identity.
+var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
+
+// ErrImageIdentityMismatch reports that image inspect returned an
+// identity that does not belong to the requested image. It is never
+// downgraded to the mutable-tag fallback.
+var ErrImageIdentityMismatch = errors.New("backend reported a different image identity")
+
+// ErrImageIdentityNotLocal reports that a resolved immutable identity
+// was successfully checked but is not available from the backend's local
+// image store under the selected policy. Apple Container has no run-time
+// --pull=never switch; running an unaddressable pinned reference could
+// otherwise fetch it, so Run fails before create unless the caller opted
+// into the mutable-tag compatibility fallback.
+var ErrImageIdentityNotLocal = errors.New("immutable image identity is not available locally under the selected pull policy")
+
 // ErrEnvFileUnsupported reports that the current platform cannot provide
 // the per-user private temporary storage required for environment files.
 // On Windows, Run and Exec return this error when a non-empty WithEnv or
@@ -182,6 +211,69 @@ var ErrContainerNotFound = wait.ErrContainerNotFound
 // generation no longer matches the live container. Destructive and endpoint
 // operations refuse to act on the replacement.
 var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+
+// ErrExecTerminationUnsupported reports that Exec stopped its local CLI
+// process after a context deadline or cancellation, but could not prove
+// that the backend-side exec process stopped. Neither supported CLI
+// exposes a common exec-instance kill operation.
+var ErrExecTerminationUnsupported = errors.New("exec process termination is unsupported by backend")
+
+// ExecTerminationError preserves the context or infrastructure error while
+// making the possible daemon-side process leak explicit. Callers should
+// terminate the container or use a backend-specific cleanup mechanism when
+// this error is returned.
+type ExecTerminationError struct {
+	// Err is the context or infrastructure error that stopped local Exec.
+	Err error
+}
+
+func (e *ExecTerminationError) Error() string {
+	if e == nil || e.Err == nil {
+		return ErrExecTerminationUnsupported.Error()
+	}
+	return fmt.Sprintf("%s: %v (terminate the container or use backend-specific cleanup)", ErrExecTerminationUnsupported, e.Err)
+}
+
+func (e *ExecTerminationError) Unwrap() error { return e.Err }
+
+func (e *ExecTerminationError) Is(target error) bool {
+	return target == ErrExecTerminationUnsupported
+}
+
+// ErrSharedContainer reports that Stop, CopyToContainer, or
+// CopyFileFromContainer was called on a WithReuse handle. Those operations
+// would disturb peers sharing the container. Use Shared to opt in, or
+// Terminate to remove the shared container outright. Cleanup and
+// TerminateContainer still skip reused handles even after Shared.
+var ErrSharedContainer = errors.New("operation refused on a shared WithReuse handle")
+
+// ErrCopySourceUnsupported reports a host source that is not a regular
+// file or directory. CopyToContainer rejects source symlinks and symlink
+// entries in source directories rather than copying devices, sockets, or
+// FIFOs.
+var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or directory")
+
+// ErrCopySourceTooLarge reports a source whose regular-file bytes exceed
+// MaxCopyToContainerSize. The limit applies to a directory's total
+// snapshot size as well as to a single file.
+var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
+
+// ErrCopySourceTooManyEntries reports a source tree that exceeds
+// MaxCopyToContainerEntries, including entries whose files are empty.
+var ErrCopySourceTooManyEntries = errors.New("copy source has too many entries")
+
+// ErrCopySourceTooDeep reports a source tree deeper than
+// MaxCopyToContainerDepth.
+var ErrCopySourceTooDeep = errors.New("copy source is too deep")
+
+// ErrCopySourceMetadataTooLarge reports source path metadata that exceeds
+// MaxCopyToContainerMetadataSize while the snapshot tree is traversed.
+var ErrCopySourceMetadataTooLarge = errors.New("copy source metadata exceeds limit")
+
+// ErrCopySourceChanged reports that a source disappeared or its opened
+// handle changed while the private snapshot was being built. The triggering
+// filesystem or context error remains available through errors.Is/errors.As.
+var ErrCopySourceChanged = errors.New("copy source changed while staging")
 
 // ErrCopyFileNotRegular reports that a file copied out of a container
 // was not a regular file. Callers should not consume paths that resolve

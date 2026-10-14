@@ -191,10 +191,10 @@ The following is a signature inventory, not an executable source file:
 func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 ```
 
-When `Run` needs to create a container, it applies the pull policy
-before starting it and then completes the wait strategy. The default
-`PullMissing` policy inspects the local image store and issues an
-explicit pull only when the image is absent. `PullAlways` issues an
+When `Run` needs to create a container, it resolves the image according to
+the selected pull policy before starting it and then completes the wait
+strategy. The default `PullMissing` policy inspects the local image store and
+issues an explicit pull only when the image is absent. `PullAlways` issues an
 explicit pull for every new-container attempt. `PullNever` is
 backend-specific: on the current checkout it performs a best-effort
 precheck and returns `ErrImageNotFound` when that precheck finds no
@@ -324,6 +324,56 @@ values are not rejected, and the duration is added to the query budget
 without saturation. No library-side maximum is enforced; backend limits
 apply, and #89 tracks the missing validation.
 
+`Exec` is a finite, buffered operation. It returns the exit code with
+combined stdout+stderr (a non-zero exit is a result, not an error);
+this is kept for v1 compatibility. When the caller's context has no
+deadline, Exec applies a 30-second default. For a positive
+`WithExecTimeout(d)`, the effective deadline is the earlier of `d` and
+the caller's deadline. `WithExecTimeout(0)` only disables the library
+default for a deliberately long-running command; it does not remove a
+caller deadline. Start persistent processes as the container's main
+command (`WithCmd`) and use `FollowLogs` for their output rather than
+holding an Exec call open.
+
+On backend, timeout, or cancellation errors, Exec retains partial
+stdout+stderr in its reader and returns the classified error; a
+CLI-reported exit status, when available, remains in the first return
+value. A context error that actually races with a launched command is
+classified independently of that status. This matters on Windows, where
+`Process.Kill` can report the killed process with exit code `1`; the
+status remains observable but does not suppress the typed error. A
+later verification inspect that consumes the deadline does not by itself
+produce `ExecTerminationError`.
+Cancellation is owned by the local command lifecycle. On Unix targets with a
+stable process identity, process-group termination is attempted only while the
+direct child handle still owns the process. On Linux, the numeric group signal
+also requires `waitid(WSTOPPED|WNOWAIT)` to confirm the stopped state; if that
+ownership proof is lost, the pidfd is used directly and the former PGID is
+never signaled. The direct child is also killed after a successful group signal
+because it may have changed process groups. Unix targets without that identity
+use the direct child handle conservatively. After
+the child is reaped, no former numeric group ID is used. Windows uses a
+lifecycle-owned Job Object handle, with direct-child fallback when assignment
+is unavailable. Assignment occurs after `Start`; descendants created during
+that short post-Start attachment window are outside the Job Object boundary.
+The supported backend CLIs do not expose a common exec-instance kill
+operation, so when active-child evidence is available Exec returns
+`*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
+rather than claiming that the daemon-side process stopped. A conservative
+direct-handle fallback may return only the context error. A successful
+empty-job or already-finished-child termination is not treated as
+active-process evidence. Callers must terminate the container or use
+backend-specific cleanup. Callers must read the output reader even when the
+error is non-nil. On Linux the stable identity is a pidfd-backed process
+reference; kernels without pidfd support use the same conservative direct-handle
+fallback as other Unix targets.
+Windows-specific lifecycle tests are build-constrained. This development
+environment cross-compiles and vets Windows packages but cannot execute the
+Windows Job Object runtime tests, including the exit-259 active-child case.
+`LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
+containers. `Terminate` is generation-guarded: it refuses to delete a
+name recycled by another process (see Reuse below).
+
 `Exec` returns the exit code and combined stdout+stderr. A command
 that runs in a running container and exits non-zero is a result rather
 than an infrastructure error; a stopped or unreachable container can
@@ -379,6 +429,19 @@ support fail closed with the same error. On Windows, Go 1.23 through 1.25 do
 not propagate the required Windows file flags through `os.OpenFile`, so
 Docker copy-out requires Go 1.26 or newer. `CopyToContainer` remains
 available on both backends.
+
+`CopyToContainer` accepts a regular file or directory and opens every
+source entry once without following a final link; directory children are
+opened relative to the already-open parent handle. It copies from those
+handles into a current-user-only staging root before invoking either CLI.
+`WithFiles` uses the same snapshot path but rejects directories. Separate
+staging and CLI deadlines prevent filesystem work from consuming the CLI
+budget, while a caller deadline remains authoritative for both. Directory
+snapshots are bounded by file bytes, entry count, depth, and aggregate
+source-path metadata. They intentionally preserve only names, bytes, and
+Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
+extended attributes, alternate data streams, sparse layout, and hardlink
+identity are not preserved.
 
 ## Connection endpoints
 
@@ -675,9 +738,10 @@ volumes must be named, and their lifecycle belongs to the caller.
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`
 (shared across processes on the same host). An existing container
 must carry the current `WithReuse` marker, and every caller reruns its
-readiness strategy. The current check does not require every ownership
-or generation label; #83 tracks the stricter boundary. Image compatibility
-is checked on both backends.
+readiness strategy. Image compatibility uses the resolved image identity
+(digest or local image ID) rather than the original mutable tag.
+A newly-created reuse container that fails its post-create identity or port
+validation is removed before the error is returned.
 Port compatibility is backend-specific. Docker compares auto-published
 bindings for `WithExposedPorts` and checks explicit `WithPublishedPort`
 bindings. Apple checks explicit published bindings, but the library's
@@ -687,11 +751,7 @@ exposed-port declaration against the shared container IP; use distinct
 names when those declarations must be isolated. `WithFiles` is
 copied for every caller, and `PullAlways` fetches the image before
 attach; a failed attach copy returns an error without deleting the
-shared container. Other creation-only differences such as `env`, `cmd`,
-and `mounts` attach silently to the existing container by design;
-callers needing isolation should use distinct names or reset state via
-`Exec`.
-(shared across processes).
+shared container.
 The compatibility check compares the image reference, declared and
 published ports, and the Docker network identity.
 An omitted Docker `WithNetwork` means the daemon-selected default. Docker's
@@ -831,6 +891,54 @@ positively tied to the affected run. A broad temp-directory cleanup is unsafe.
 Credentials that may have appeared in inspect output should be rotated;
 deletion does not revoke them.
 
+**Image identity is resolved before create**. After `PullMissing` or
+`PullAlways` prepares the local store, `Run` inspects the image again and
+passes the reported immutable identity to the backend. Docker prefers a
+matching registry digest and falls back to the inspected local image ID;
+a local alias with a foreign `RepoDigests` entry also uses that ID, while
+an explicit pinned repository/digest conflict is an error. Apple Container
+uses the root image descriptor as the run and reuse identity and keeps the
+selected platform variant as separate validation metadata. When Apple
+resolves an unqualified input to a custom default registry, the reported
+canonical repository is retained in the run reference and identity
+comparison. An ID-only image record is normalized to a digest reference
+when a repository and descriptor prove that identity. This prevents a later local tag
+reassignment from changing that create, but it does not make a mutable
+tag's pull-to-inspect operation atomic. Caller-supplied Apple
+`name@digest` and `name:tag@digest` references remain pinned, including
+when `WithAllowMutableImageTag` is set. If a backend version reports no
+usable identity, the default policy fails closed with
+`ErrImageIdentityUnavailable`. A digest without repository provenance is
+not identity proof; a bare Docker image ID is accepted only when the
+backend inspect verifies that exact local ID.
+
+Apple Container has no `--pull=never` run flag. Before a pinned Apple
+reference is passed to `container run`, the library verifies that exact
+reference locally for every pull policy. If it is absent and the policy
+allows fetching, the library performs an explicit exact-digest pull and
+inspects it again; `container run` is never allowed to perform an
+implicit fetch. A confirmed local absence returns
+`ErrImageIdentityNotLocal`; a successful inspect that cannot report a
+repository-bearing digest or verified local ID returns
+`ErrImageIdentityUnavailable`. Transport, permission, and cancellation
+errors from the addressability check remain operational errors and never
+authorize the mutable fallback. `WithAllowMutableImageTag` is an
+explicit compatibility escape hatch for a mutable input whose identity
+is unavailable or whose resolved reference is not locally addressable;
+it carries no identity guarantee and never downgrades a caller-supplied
+repository digest, a bare digest, or a Docker image-ID-shaped value.
+Locally built Apple images may therefore require the explicit
+mutable-tag fallback when no local digest reference is available.
+
+Apple can synthesize a local index around a single manifest. That index
+root is content-addressed in the local store but is not necessarily
+registry-addressable by `name@digest`. The resolver therefore does not
+blindly exact-pull a synthetic root. It requires a locally addressable
+tag or alias, or the explicit mutable-tag fallback. A newly-created Apple
+container is inspected again after `container run`; a root, platform, or
+selected-variant mismatch rolls the container back before `Run` or reuse
+returns it.
+
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one backend
@@ -872,17 +980,20 @@ closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 
 **Apply operation-specific deadlines**. Most query-like operations
-(inspect, copy, snapshot logs, delete, and prune) use a 30-second
+(inspect, copy, snapshot logs, delete, and prune) as well as public `Exec` use a 30-second
 default when the caller has no deadline. `Run` and explicit image
 fetches use a 10-minute pull/create budget. A shared pull leader is
 intentionally detached from an individual caller's cancellation so one
 caller cannot abort the pull for other waiters; each waiter still stops
-waiting when its own context is cancelled. `Exec`'s command invocation
-and `FollowLogs` pass the caller's context through without adding a
-library deadline; an `Exec` infrastructure check may use a bounded
-follow-up context. When a library default is applied to an operation
+waiting when its own context is cancelled. `FollowLogs` passes the caller's context through
+without adding a library deadline; `Exec` applies a 30-second default when the caller
+has no deadline, and an `Exec` infrastructure check may use a bounded
+follow-up context. `WithExecTimeout(0)` is the explicit escape hatch for an intentional
+long-running command. When a library default is applied to an operation
 that is not a shared pull leader, an existing caller deadline is
-preserved.
+preserved. Timeout classification uses structured context,
+`Timeout() bool`, or signal evidence; arbitrary workload stderr is never
+interpreted as a timeout.
 
 ## Error handling
 
@@ -927,6 +1038,14 @@ these follow-up issues are applied.
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrImageIdentityUnavailable`: a successful image inspect returned no
+  repository-bearing digest or verified local image ID, and the caller
+  did not opt into the mutable-tag fallback
+- `ErrImageIdentityNotLocal`: a pinned reference was confirmed absent
+  from the backend's local store under the selected policy; Apple does
+  not let `container run` perform an implicit fetch
+- `ErrImageIdentityMismatch`: inspect returned an identity for a
+  different image; the mutable-tag fallback is not used
 - `ErrPortNotExposed`: a port was not declared or has no usable host
   binding
 - `ErrEnvFileUnsupported`: a non-empty environment map needs a secure env
@@ -944,6 +1063,10 @@ these follow-up issues are applied.
 - `*CLIError`: any other CLI failure; carries the subcommand, exit
   code, and bounded stderr diagnostic (capped at 64KiB). Classification
   also inspects bounded stdout internally for liveness probes.
+- `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
+  expiry or cancellation terminated the local CLI, regardless of any
+  reported local exit status; the backend-side exec process may still be
+  running
 
 When a non-reuse `Run` fails after a successful backend `run`, the
 post-create rollback error is returned. If rollback deletion fails, its

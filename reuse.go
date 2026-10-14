@@ -132,6 +132,17 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// The ensure result may have been inspected before a peer changed
 	// network or port state. Once Docker has supplied an immutable ID,
 	// every compatibility inspect must target that ID rather than the
+	// The shared ensure may have been started with another caller's image
+	// reference; every caller must still verify that the container is
+	// compatible with its own resolved image identity.
+	resolvedImage, err := cfg.ensureImageRef(ctx, image)
+	if err != nil {
+		return nil, err
+	}
+
+	// The ensure result may have been inspected before a peer changed
+	// network or port state. Once Docker has supplied an immutable ID,
+	// every compatibility inspect must target that ID rather than the
 	// reusable name.
 	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
 	defer infoCancel()
@@ -151,8 +162,25 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if err := attachDefaultNetworkForConfig(ctx, cfg, info); err != nil {
 		return nil, err
 	}
-	if err := checkReuseCompat(info, image, cfg); err != nil {
+	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(err, leaderWarning)
+	}
+
+	if cfg.eng.name() == "apple" && resolvedImage.pinned {
+		// A pinned reuse run requires an existing container to be
+		// running the requested root digest. Docker enforces this via
+		// inspect; Apple uses the same post-bootstrap probe on fresh
+		// reuse adoption that verifyAppleCreatedImage closes for create.
+		probe := namedContainer(cfg, cfg.name)
+		probe.image = resolvedImage
+		if err := verifyAppleCreatedImage(ctx, probe, resolvedImage); err != nil {
+			return nil, err
+		}
+	}
+
+	containerImage := imageFromInfo(info)
+	if resolvedImage.pinned {
+		containerImage = resolvedImage
 	}
 
 	ctr := &Container{
@@ -163,11 +191,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		published:       cfg.published,
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
-		defaultNetwork:  info.defaultNetwork,
 		reused:          true,
-		info:            immutableInfo(info),
 		creation:        info.labels[creationLabel],
-		uid:             info.uid,
+		image:           containerImage,
+		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
 	}
 	// The leader's files are copied in reuseCreate. Every attaching
 	// caller applies its own files after the shared generation is known.
@@ -204,10 +231,10 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	if !sameEnginePlatform(info, fresh) {
 		return nil, fmt.Errorf("reuse %s: platform changed from %q to %q before return", cfg.name, info.platform, fresh.platform)
 	}
-	if err := checkReuseOwned(fresh, image, cfg); err != nil {
+	if err := checkReuseOwnedIdentity(fresh, resolvedImage, image, cfg); err != nil {
 		return nil, err
 	}
-	if err := checkReuseCompat(fresh, image, cfg); err != nil {
+	if err := checkReuseCompatIdentity(fresh, resolvedImage, image, cfg); err != nil {
 		return nil, err
 	}
 	return ctr, nil
@@ -219,6 +246,20 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Container, error) {
 	recreated := false
 	var lastInspectErr error
+	var resolvedImage imageIdentity
+	imageResolved := false
+	resolveImage := func() error {
+		if imageResolved {
+			return nil
+		}
+		var err error
+		resolvedImage, err = cfg.ensureImageRef(context.WithoutCancel(ctx), image)
+		if err != nil {
+			return err
+		}
+		imageResolved = true
+		return nil
+	}
 
 	for {
 		if err := ctx.Err(); err != nil {
@@ -244,7 +285,13 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// Creation carries its own runTimeout budget detached from
 			// the attach deadline: a leader pulling a large image must
 			// not be cut off after reuseAttachTimeout.
-			ctr, createErr := reuseCreate(context.WithoutCancel(ctx), image, cfg)
+			// Resolve the caller's image immediately before create: a
+			// tag might have changed while waiting, and we want the
+			// immutable image that will actually be passed to run.
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
+			ctr, createErr := reuseCreateResolved(context.WithoutCancel(ctx), image, cfg, resolvedImage)
 			if ctr != nil {
 				// reuseCreate can return a usable handle together with a
 				// post-create cleanup error. Do not turn that into an
@@ -273,7 +320,10 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 		lastInspectErr = nil
 
-		if err := checkReuseOwned(info, image, cfg); err != nil {
+		if err := resolveImage(); err != nil {
+			return nil, err
+		}
+		if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
 			return nil, err
 		}
 		switch info.state {
@@ -291,8 +341,11 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
 			}
 			// Only recycle containers this library created for reuse
-			// with a compatible image; never delete foreign leftovers.
-			if err := checkReuseOwned(info, image, cfg); err != nil {
+			// with a compatible resolved image; never delete foreign leftovers.
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
+			if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
 				return nil, err
 			}
 			if err := deleteStoppedReuse(ctx, cfg, info); err != nil {
@@ -301,6 +354,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			recreated = true
 			continue
 		case StateRunning:
+			if err := resolveImage(); err != nil {
+				return nil, err
+			}
 			return &Container{
 				id:              cfg.name,
 				runner:          cfg.runner,
@@ -310,9 +366,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				network:         cfg.network,
 				networkExplicit: cfg.networkExplicit,
 				reused:          true,
-				info:            immutableInfo(info),
 				creation:        info.labels[creationLabel],
-				uid:             info.uid,
+				image:           resolvedImage,
+				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
 			}, nil
 		default:
 			if err := waitForReusePoll(ctx); err != nil {
@@ -322,7 +378,17 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 	}
 }
 
-func reuseCreate(ctx context.Context, image string, cfg *config) (result *Container, retErr error) {
+func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
+	defer cancel()
+	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
+	if err != nil {
+		return nil, err
+	}
+	return reuseCreateResolved(ctx, image, cfg, resolvedImage)
+}
+
+func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolvedImage imageIdentity) (result *Container, retErr error) {
 	if cfg.creation == "" {
 		cfg.creation = newCreationID()
 	}
@@ -331,11 +397,7 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 	// even when the caller's context carries a tighter attach deadline.
 	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 	defer cancel()
-	if !cfg.imagePrepared {
-		if err := cfg.ensureImage(runCtx, image); err != nil {
-			return nil, err
-		}
-	}
+	materializeAppleRunPlatform(cfg)
 	// Keep the secret file out of the image-pull and attach/retry windows;
 	// it exists only for the run command that consumes it. A failed first
 	// removal is returned and retried by the deferred cleanup.
@@ -365,7 +427,11 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 
 	preRegisterRunWithGlobalReaper(cfg)
 	protectReuseReaper(cfg)
-	stdout, _, attempted, runErr := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, image, envFile)...)
+	runArgsImage := resolvedImage.reference
+	if runArgsImage == "" {
+		runArgsImage = image
+	}
+	stdout, _, attempted, runErr := runCreateLocked(runCtx, cfg, cfg.eng.runArgs(cfg, runArgsImage, envFile)...)
 	envCleanupErr := cleanupEnvFileAfterUseContext(runCtx, envDir)
 	if envCleanupErr == nil {
 		envDir = ""
@@ -418,7 +484,8 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 		networkExplicit: cfg.networkExplicit,
 		reused:          true,
 		creation:        cfg.creation,
-		uid:             uid,
+		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
 	if target, ok := runReaperTarget(cfg); ok {
 		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
@@ -454,8 +521,10 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 	}
 	inspectCtx, inspectCancel := context.WithTimeout(ctx, reuseAttachTimeout)
 	defer inspectCancel()
+	var createdInfo *engineInfo
 	for {
-		_, err := ctr.cachedInfo(inspectCtx)
+		var err error
+		createdInfo, err = ctr.inspectDynamic(inspectCtx)
 		if err == nil {
 			break
 		}
@@ -466,6 +535,16 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
 	}
+	if err := attachDefaultNetworkForConfig(ctx, cfg, createdInfo); err != nil {
+		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
+	}
+	ctr.pack().defaultNetwork = createdInfo.defaultNetwork
+	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
+		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
+	}
+	if err := verifyAppleCreatedImage(context.WithoutCancel(ctx), ctr, resolvedImage); err != nil {
+		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
+	}
 	if err := copyReuseFiles(ctx, ctr, cfg.files); err != nil {
 		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 	}
@@ -475,9 +554,16 @@ func reuseCreate(ctx context.Context, image string, cfg *config) (result *Contai
 	return ctr, nil
 }
 
+func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error {
+	if err := ctr.Terminate(context.WithoutCancel(ctx)); err != nil {
+		return fmt.Errorf("%w (container %s left behind: %v)", cause, ctr.id, err)
+	}
+	return cause
+}
+
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 	for _, f := range files {
-		if err := ctr.CopyToContainer(ctx, f.HostPath, f.ContainerPath); err != nil {
+		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
 		}
 	}
@@ -683,7 +769,7 @@ func inspectReuseBase(ctx context.Context, base *Container, cfg *config) (*engin
 			return nil, err
 		}
 		if uid != "" {
-			ctr.uid = uid
+			ctr.pack().uid = uid
 		}
 	}
 	return ctr.inspectFresh(ctx)
@@ -765,23 +851,44 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 	return nil
 }
 
-// checkReuseOwned reports whether an existing container may be adopted
-// or recycled for this reuse request.
-func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+// checkReuseOwnedIdentity reports whether a stopped container may be
+// deleted and recreated for this reuse request. The requested image is
+// the identity resolved immediately before the create/attach decision,
+// not the caller's mutable tag.
+func checkReuseOwnedIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
 	if err := checkReuseIdentity(info, cfg); err != nil {
 		return err
 	}
-	if !imagesCompatible(image, info.image) {
-		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, image, info.image)
+	if requested.pinned {
+		actual := imageFromInfo(info)
+		if !requestedImageIdentitiesCompatible(requested, actual) {
+			return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
+		}
+		return nil
+	}
+	compatible := imagesCompatible(original, info.image)
+	if cfg.eng != nil && cfg.eng.name() == "apple" {
+		compatible = appleImageReferencesCompatible(original, info.image)
+	}
+	if !compatible {
+		return fmt.Errorf("reuse %s: image %q does not match existing %q", cfg.name, original, info.image)
 	}
 	return nil
 }
 
-func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
-	if err := checkReuseOwned(info, image, cfg); err != nil {
+// checkReuseOwned reports whether an existing container may be adopted
+// or recycled for this reuse request.
+func checkReuseOwned(info *engineInfo, image string, cfg *config) error {
+	return checkReuseOwnedIdentity(info, imageIdentity{reference: image}, image, cfg)
+}
+
+// checkReuseCompatIdentity applies the resolved image and port checks
+// for a reuse request.
+func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, original string, cfg *config) error {
+	if err := checkReuseOwnedIdentity(info, requested, original, cfg); err != nil {
 		return err
 	}
-	if cfg.eng.name() == "docker" {
+	if cfg.eng != nil && cfg.eng.name() == "docker" {
 		requested := cfg.network
 		if !cfg.networkExplicit {
 			requested = ""
@@ -827,6 +934,79 @@ func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
 		}
 	}
 	return nil
+}
+
+func checkReuseCompat(info *engineInfo, image string, cfg *config) error {
+	return checkReuseCompatIdentity(info, imageIdentity{reference: image}, image, cfg)
+}
+
+// imageFromInfo retains the identity reported while inspecting a
+// container. When Docker has recorded an immutable repo digest (or ID)
+// that matches an index root, imageFromInfo recovers the pinned
+// identity that reuse can compare without consulting the daemon again.
+func imageFromInfo(info *engineInfo) imageIdentity {
+	if info == nil {
+		return imageIdentity{}
+	}
+	platform := info.platform
+	variantDigest := info.imageVariantDigest
+	imageID := info.imageID
+	if canonicalID, ok := canonicalDockerImageID(imageID); ok {
+		imageID = canonicalID
+	}
+	if validImageDigest(info.imageDigest) {
+		reference := info.image
+		if imageReferenceBase(reference) == "" {
+			reference = imageID
+		}
+		if imageReferenceBase(reference) == "" && isImageID(imageID) {
+			return imageIdentity{
+				reference:     imageID,
+				digest:        info.imageDigest,
+				rootDigest:    info.imageDigest,
+				repository:    "",
+				id:            imageID,
+				pinned:        true,
+				platform:      platform,
+				variantDigest: variantDigest,
+			}
+		}
+		if base := imageReferenceBase(reference); base != "" {
+			// Container inspect may report a tag plus a separate
+			// configuration descriptor digest. Synthesize the same
+			// index@digest reference used for a new run so reuse compares
+			// the root content rather than a mutable tag spelling.
+			synthesized := base + "@" + info.imageDigest
+			if !imageRE.MatchString(synthesized) {
+				return imageIdentity{}
+			}
+			return imageIdentity{
+				reference:     synthesized,
+				digest:        info.imageDigest,
+				rootDigest:    info.imageDigest,
+				repository:    imageRepository(base),
+				id:            imageID,
+				pinned:        true,
+				platform:      platform,
+				variantDigest: variantDigest,
+			}
+		}
+		// A digest without repository provenance is not a safe identity.
+		return imageIdentity{}
+	}
+	if isImageID(imageID) {
+		return imageIdentity{reference: imageID, id: imageID, pinned: true, platform: platform, variantDigest: variantDigest}
+	}
+	if digest := imageDigest(info.image); validImageDigest(digest) && imageReferenceBase(info.image) != "" {
+		return imageIdentity{reference: info.image, digest: digest, rootDigest: digest, repository: imageRepository(info.image), pinned: true, platform: platform, variantDigest: variantDigest}
+	}
+	// A bare sha256:... in a container's image field is not enough to
+	// establish a Docker local ID. Only info.imageID above is verified
+	// backend identity data.
+	if info.image != "" && !isBareImageReference(info.image) {
+		return imageIdentity{reference: info.image, repository: imageRepository(info.image), platform: platform, variantDigest: variantDigest}
+	}
+	return imageIdentity{}
 }
 
 func checkReuseBindingReachable(eng engine, b boundPort) error {
@@ -884,20 +1064,44 @@ func imagesCompatible(requested, actual string) bool {
 	if requested == "" || actual == "" {
 		return requested == actual
 	}
+	// A bare digest/ID has no repository namespace. Comparing it by its
+	// digest alone would make unrelated registries interchangeable.
+	if isBareImageReference(requested) || isBareImageReference(actual) {
+		return false
+	}
 	if requested == actual {
 		return true
 	}
 	reqDigest := imageDigest(requested)
 	actDigest := imageDigest(actual)
 	if reqDigest != "" {
-		if reqDigest != actDigest {
+		if !strings.EqualFold(reqDigest, actDigest) {
 			return false
 		}
-		return normalizeImageRef(stripImageDigest(requested)) == normalizeImageRef(stripImageDigest(actual))
+		reqBase := imageReferenceBase(requested)
+		actBase := imageReferenceBase(actual)
+		return reqBase != "" && actBase != "" &&
+			normalizeImageRef(reqBase) == normalizeImageRef(actBase)
 	}
-	req := normalizeImageRef(stripImageDigest(requested))
-	act := normalizeImageRef(stripImageDigest(actual))
-	return req == act
+	req := imageReferenceBase(requested)
+	act := imageReferenceBase(actual)
+	return req != "" && act != "" && normalizeImageRef(req) == normalizeImageRef(act)
+}
+
+// imageRepository returns the canonical repository portion of an image
+// reference, discarding any tag or digest. It is used for a digest
+// response that has no tag but still must not cross a registry or
+// namespace boundary. A bare ID/digest has no repository and returns
+// the empty string.
+func imageRepository(ref string) string {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return ""
+	}
+	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
+		base = base[:i]
+	}
+	return strings.TrimSuffix(normalizeImageRef(base), ":latest")
 }
 
 // normalizeImageRef expands Docker Hub short names to a canonical
@@ -924,7 +1128,7 @@ func normalizeImageRef(ref string) string {
 		registry = "docker.io"
 		repo = name
 	case isRegistry(parts[0]):
-		registry = parts[0]
+		registry = canonicalDockerHubRegistry(parts[0])
 		repo = strings.Join(parts[1:], "/")
 		if registry == "docker.io" && !strings.Contains(repo, "/") {
 			repo = "library/" + repo
@@ -941,6 +1145,139 @@ func normalizeImageRef(ref string) string {
 
 func isRegistry(s string) bool {
 	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
+}
+
+func canonicalDockerHubRegistry(registry string) string {
+	switch strings.ToLower(registry) {
+	case "docker.io", "registry-1.docker.io", "index.docker.io":
+		return "docker.io"
+	default:
+		return registry
+	}
+}
+
+func isUnqualifiedImageReference(ref string) bool {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return false
+	}
+	base = imageRepositoryBaseWithoutTag(base)
+	first, _, _ := strings.Cut(base, "/")
+	return !isRegistry(first)
+}
+
+func isDockerRegistryReference(ref string) bool {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return false
+	}
+	base = imageRepositoryBaseWithoutTag(base)
+	first, _, _ := strings.Cut(base, "/")
+	return canonicalDockerHubRegistry(first) == "docker.io"
+}
+
+func imageRepositoryBaseWithoutTag(base string) string {
+	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
+		return base[:i]
+	}
+	return base
+}
+
+// imageRepositoryPathsCompatible compares the repository path and tag
+// while allowing one side to be an unqualified backend-default name. It is
+// intentionally separate from imagesCompatible: the latter retains the
+// historical Docker-Hub-only policy for arbitrary public comparisons, while
+// Apple inspect responses may legitimately contain a custom default
+// registry.
+func imageRepositoryPathsCompatible(a, b string) bool {
+	aName, aTag, aExplicit := imageRepositoryParts(a)
+	bName, bTag, bExplicit := imageRepositoryParts(b)
+	if aName == "" || bName == "" {
+		return false
+	}
+	if aExplicit && bExplicit {
+		ra, rb := imageRegistryOf(a), imageRegistryOf(b)
+		if ra == "" || rb == "" || !strings.EqualFold(ra, rb) {
+			return false
+		}
+	}
+	if !tagsCompatible(aTag, bTag) {
+		return false
+	}
+	if aExplicit && bExplicit {
+		return aName == bName
+	}
+	if aExplicit {
+		return repositoryNameMatches(bName, aName)
+	}
+	if bExplicit {
+		return repositoryNameMatches(aName, bName)
+	}
+	return normalizeImageRef(stripImageDigest(a)) == normalizeImageRef(stripImageDigest(b))
+}
+
+func imageRegistryOf(ref string) string {
+	base := imageRepositoryBaseWithoutTag(imageReferenceBase(ref))
+	if base == "" {
+		return ""
+	}
+	first, _, _ := strings.Cut(base, "/")
+	if !isRegistry(first) {
+		return ""
+	}
+	return canonicalDockerHubRegistry(first)
+}
+
+func imageRepositoryParts(ref string) (name, tag string, explicit bool) {
+	base := imageReferenceBase(ref)
+	if base == "" {
+		return "", "", false
+	}
+	name = base
+	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
+		tag = name[i+1:]
+		name = name[:i]
+	}
+	parts := strings.Split(name, "/")
+	if len(parts) > 0 && isRegistry(parts[0]) {
+		explicit = true
+		registry := canonicalDockerHubRegistry(parts[0])
+		name = strings.Join(parts[1:], "/")
+		if registry == "docker.io" && !strings.Contains(name, "/") {
+			name = "library/" + name
+		}
+	}
+	return name, tag, explicit
+}
+
+func tagsCompatible(a, b string) bool {
+	if a == "" {
+		a = "latest"
+	}
+	if b == "" {
+		b = "latest"
+	}
+	return a == b
+}
+
+func repositoryNameMatches(unqualified, qualified string) bool {
+	if unqualified == qualified {
+		return true
+	}
+	parts := strings.Split(unqualified, "/")
+	if len(parts) == 1 {
+		return qualified == unqualified || qualified == "library/"+unqualified
+	}
+	return false
+}
+
+// imageRepositoriesCompatible compares canonical repository keys captured
+// from backend inspect responses. Unlike path compatibility it is strict:
+// once a backend has supplied a registry-qualified identity, another
+// registry is never interchangeable.
+func imageRepositoriesCompatible(a, b string) bool {
+	ak, bk := imageRepository(a), imageRepository(b)
+	return ak != "" && bk != "" && strings.EqualFold(ak, bk)
 }
 
 func imageDigest(ref string) string {
@@ -999,10 +1336,10 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 		info, err := inspectReuseBase(ctx, base, cfg)
 		if err == nil {
 			if base != nil {
-				base.mu.Lock()
+				base.pack().mu.Lock()
 				creation := base.creation
-				uid := base.uid
-				base.mu.Unlock()
+				uid := base.immutableID()
+				base.pack().mu.Unlock()
 				if creation != "" && info.labels[creationLabel] != creation {
 					return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
 				}

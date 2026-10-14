@@ -47,7 +47,7 @@ func TestWaitTargetBackendStatePolicy(t *testing.T) {
 			if tc.engine.name() == "apple" {
 				ctr.creation = validGen
 			} else {
-				ctr.uid = validUID
+				ctr.pack().uid = validUID
 			}
 			target := waitTarget{c: ctr}
 

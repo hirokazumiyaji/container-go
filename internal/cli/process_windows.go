@@ -17,6 +17,8 @@ import (
 // reparented descendants remain outside that guarantee.
 func configureProcessTree(*exec.Cmd) {}
 
+func processGroupTerminationSupported() bool { return true }
+
 type windowsProcessTree struct {
 	mu      sync.Mutex
 	process windows.Handle

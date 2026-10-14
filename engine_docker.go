@@ -685,10 +685,19 @@ func (dockerEngine) inspectArgs(id string) []string {
 	return []string{"inspect", "--type=container", id}
 }
 
+// dockerImageInspect mirrors the fields of `docker image inspect`
+// output needed to pin the image that will be run. RepoDigests is the
+// registry digest; Id is the immutable local image ID fallback.
+type dockerImageInspect struct {
+	ID          string   `json:"Id"`
+	RepoDigests []string `json:"RepoDigests"`
+}
+
 // dockerInspect mirrors the fields of `docker inspect` output this
 // library reads. Unknown fields are ignored.
 type dockerInspect struct {
 	ID       string `json:"Id"`
+	Image    string `json:"Image"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
 	// State is present on container inspect objects, but not on Docker
@@ -794,6 +803,8 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		labels:       c.Config.Labels,
 		uid:          c.ID,
 		image:        c.Config.Image,
+		imageID:      c.Image,
+		imageDigest:  imageDigest(c.Config.Image),
 		platform:     c.Platform,
 		platformMeta: platformMetadataFromString(c.Platform),
 		ip:           c.NetworkSettings.IPAddress,
@@ -1098,19 +1109,167 @@ func (dockerEngine) imageMissingForTarget(err error, target string) bool {
 		if branch.ctx.operation != "image inspect" || !exactImageTarget(branch, target) {
 			continue
 		}
+		if dockerImageOperationalFailure(branch.stderr) {
+			continue
+		}
 		if hasBranchImageLine(branch, dockerStderrNoSuchImage, branch.ctx.target, true) {
+			return true
+		}
+		if dockerImageMissingStderr(branch) {
 			return true
 		}
 	}
 	return false
 }
 
-func (dockerEngine) parseImageExists(data []byte, _ string) bool {
-	var images []json.RawMessage
-	if err := json.Unmarshal(data, &images); err != nil {
-		return false
+func dockerImageOperationalFailure(stderr string) bool {
+	stderr = strings.ToLower(stderr)
+	for _, marker := range []string{
+		"permission denied", "pull access denied", "access denied", "unauthorized",
+		"connection refused", "connection reset", "no such host", "network is unreachable",
+		"context deadline exceeded", "i/o timeout",
+	} {
+		if strings.Contains(stderr, marker) {
+			return true
+		}
 	}
-	return len(images) > 0
+	return false
+}
+
+func dockerImageMissingStderr(branch cliErrorBranch) bool {
+	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+	for _, raw := range strings.Split(branch.stderr, "\n") {
+		line := trimCLIErrorWrapper(raw, allowGenericError)
+		lower := strings.ToLower(line)
+		if strings.HasPrefix(lower, "manifest unknown:") {
+			rest := line[len("manifest unknown:"):]
+			if strings.TrimSpace(rest) == "" || cliTargetListExactMatches(rest, branch.ctx.target) {
+				return true
+			}
+			continue
+		}
+		if lower == "manifest unknown" ||
+			strings.Contains(lower, `"code":"manifest_unknown"`) ||
+			strings.Contains(lower, `"code": "manifest_unknown"`) {
+			return true
+		}
+		if strings.HasPrefix(lower, "no matching manifest for ") &&
+			strings.Contains(lower, " in the manifest list entries") {
+			return true
+		}
+	}
+	return false
+}
+
+func (dockerEngine) imageIdentityNeedsLocalCheck() bool { return false }
+
+func (dockerEngine) parseImageExists(data []byte, platform string) bool {
+	_, exists := (dockerEngine{}).parseImageIdentity(data, "", platform)
+	return exists
+}
+
+// parseImageIdentity prefers a registry digest because it remains tied
+// to the repository the caller requested, and falls back to Docker's
+// local image ID for locally built or otherwise digest-less images. It
+// accepts both the canonical sha256:... ID and Docker's 64-hex spelling
+// only after the inspected Id matches exactly. Both forms prevent a
+// later tag reassignment from changing run's target.
+func (dockerEngine) parseImageIdentity(data []byte, image, _ string) (imageIdentity, bool) {
+	var images []dockerImageInspect
+	if err := json.Unmarshal(data, &images); err != nil {
+		// A successful CLI invocation with malformed JSON is not proof
+		// that the image is absent. Treat it as identity-unavailable so
+		// PullMissing cannot turn a parser failure into a fetch.
+		return imageIdentity{}, true
+	}
+	if len(images) == 0 {
+		return imageIdentity{}, false
+	}
+	requestedID, requestedIsID := canonicalDockerImageID(image)
+	if image != "" && isBareImageReference(image) && !requestedIsID {
+		// A malformed or unprefixed digest/ID-shaped value is not a
+		// Docker image-ID request that inspect can verify.
+		return imageIdentity{}, true
+	}
+	explicitPinned := requestedIsID || (image != "" && validImageDigest(imageDigest(image)))
+	sawExplicitConflict := false
+	sawDifferentID := false
+	fallbackID := ""
+	for _, img := range images {
+		inspectedID, inspectedIDOK := canonicalDockerImageID(img.ID)
+		// An ID-shaped request is only accepted when inspect reports that
+		// exact verified local ID. A different, well-formed Docker ID is a
+		// known mismatch rather than an unavailable identity.
+		if requestedIsID {
+			if inspectedIDOK && strings.EqualFold(inspectedID, requestedID) {
+				identity := imageReferenceWithDigest(requestedID, "", "", inspectedID)
+				identity.rootDigest = ""
+				return identity, true
+			}
+			if inspectedIDOK {
+				sawDifferentID = true
+			}
+			continue
+		}
+		for _, repoDigest := range img.RepoDigests {
+			digest := imageDigest(repoDigest)
+			if !validImageDigest(digest) || imageReferenceBase(repoDigest) == "" {
+				continue
+			}
+			if image != "" {
+				requestedDigest := imageDigest(image)
+				if requestedDigest != "" {
+					// An explicit digest is a claim about both the
+					// manifest and its repository. A foreign RepoDigest
+					// is a conflict, even when its digest happens to be
+					// the same.
+					if !strings.EqualFold(requestedDigest, digest) || imageRepository(image) != imageRepository(repoDigest) {
+						sawExplicitConflict = true
+						continue
+					}
+				} else if !imagesCompatible(image, repoDigest) && imageRepository(image) != imageRepository(repoDigest) {
+					// Docker's RepoDigests commonly omit the tag. In
+					// that form the repository still has to match.
+					continue
+				}
+			}
+			identityID := ""
+			if inspectedIDOK {
+				identityID = inspectedID
+			}
+			identity := imageReferenceWithDigest(image, repoDigest, digest, identityID)
+			identity.repository = imageRepository(repoDigest)
+			return identity, true
+		}
+		if inspectedIDOK {
+			// A tag can be a local alias whose RepoDigests came from a
+			// different registry. The inspected local ID is still the
+			// safe immutable target for that alias. An explicit pinned
+			// request remains a conflict when a RepoDigest contradicted
+			// it, even if the local content ID is available.
+			if !explicitPinned {
+				identity := imageReferenceWithDigest(image, "", "", inspectedID)
+				identity.repository = imageRepository(image)
+				return identity, true
+			}
+			if fallbackID == "" {
+				fallbackID = inspectedID
+			}
+		}
+		// A non-empty Docker inspect array proves existence even when
+		// this old/versioned response has no usable identity fields.
+	}
+	if explicitPinned {
+		if sawExplicitConflict || sawDifferentID {
+			return imageIdentity{mismatch: true}, true
+		}
+		if fallbackID != "" {
+			identity := imageReferenceWithDigest(image, "", "", fallbackID)
+			identity.repository = imageRepository(image)
+			return identity, true
+		}
+	}
+	return imageIdentity{}, true
 }
 
 func (dockerEngine) platformCompatible(selector, actual string) bool {
@@ -1160,6 +1319,9 @@ func (dockerEngine) nameConflictForTarget(err error, target string) bool {
 
 func dockerNameConflictLine(line, target string) bool {
 	line = strings.ToLower(line)
+	if strings.Contains(line, "image configuration") {
+		return false
+	}
 	if !strings.HasPrefix(line, dockerStderrConflict) ||
 		!strings.Contains(line, dockerStderrAlreadyInUse) {
 		return false
@@ -1225,7 +1387,6 @@ func (dockerEngine) containerMissing(err error) bool {
 			})
 		}
 		return false
-	default:
-		return false
 	}
+	return false
 }

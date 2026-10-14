@@ -184,14 +184,14 @@ func lockName(ctx context.Context, name string) (unlock func(), err error) {
 			_ = f.Close()
 			return nil, err
 		}
-		err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := flockFile(int(f.Fd()), lockExclusiveNonBlocking)
 		if err == nil {
 			return func() {
-				_ = syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+				_ = flockFile(int(f.Fd()), lockUnlock)
 				_ = f.Close()
 			}, nil
 		}
-		if !errors.Is(err, syscall.EWOULDBLOCK) && !errors.Is(err, syscall.EAGAIN) {
+		if !lockWouldBlock(err) {
 			_ = f.Close()
 			return nil, err
 		}

@@ -377,7 +377,7 @@ func TestInspectTargetValidationWrapsConfirmedAbsence(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			ctr := &Container{id: "myctr", uid: tc.uid, runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng, nameInspect: true}
+			ctr := &Container{id: "myctr", sync: &lockPack{uid: tc.uid}, runner: &latestInspectRunner{stdout: tc.stdout}, eng: tc.eng, nameInspect: true}
 			_, err := ctr.State(context.Background())
 			switch {
 			case tc.wantOK && err != nil:

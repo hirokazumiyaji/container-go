@@ -102,6 +102,8 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		tree, err = newProcessTree(cmd)
 		if err != nil {
 			tree = directProcessTree{}
+		} else {
+			stream.treeAttached = true
 		}
 	}
 	stream.terminateTree = tree.terminate
@@ -166,6 +168,7 @@ type processStream struct {
 	waitErr      error
 	terminalOnce sync.Once
 	terminalErr  error
+	treeAttached bool
 	// waitCalls is an internal invariant probe: the sole cmd.Wait call
 	// must remain exactly-once even when lifecycle paths race.
 	waitCalls atomic.Int32

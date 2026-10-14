@@ -17,9 +17,14 @@ import (
 //
 // The zero value is unusable; construct it with newImageCache. A zero TTL
 // means every lookup misses.
+type imageCacheEntry struct {
+	expiry   time.Time
+	identity imageIdentity
+}
+
 type imageCache struct {
 	mu      sync.Mutex
-	entries map[string]time.Time // key -> expiry
+	entries map[string]imageCacheEntry // key -> entry
 
 	// now is the clock, injectable so the expiry behavior is testable
 	// without sleeping.
@@ -32,7 +37,7 @@ type imageCache struct {
 // zero or less yields a cache that never hits.
 func newImageCache(ttl time.Duration) *imageCache {
 	return &imageCache{
-		entries: map[string]time.Time{},
+		entries: map[string]imageCacheEntry{},
 		now:     time.Now,
 		ttl:     ttl,
 	}
@@ -51,25 +56,31 @@ func imageCacheKey(eng engine, image, platform string) string {
 	return eng.name() + "\x00" + eng.imageStoreID() + "\x00" + image + "\x00" + platform
 }
 
-// seen reports whether a fresh entry exists for key.
-func (c *imageCache) seen(eng engine, image, platform string) bool {
+// get returns the cached image identity if a fresh entry exists for key.
+func (c *imageCache) get(eng engine, image, platform string) (imageIdentity, bool) {
 	if !c.enabled() {
-		return false
+		return imageIdentity{}, false
 	}
 	key := imageCacheKey(eng, image, platform)
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	expiry, ok := c.entries[key]
+	entry, ok := c.entries[key]
 	if !ok {
-		return false
+		return imageIdentity{}, false
 	}
-	if !c.now().Before(expiry) {
+	if !c.now().Before(entry.expiry) {
 		// Expired. Drop it so the map does not grow without bound when
 		// an image is looked up repeatedly past its TTL.
 		delete(c.entries, key)
-		return false
+		return imageIdentity{}, false
 	}
-	return true
+	return entry.identity, true
+}
+
+// seen reports whether a fresh entry exists for key.
+func (c *imageCache) seen(eng engine, image, platform string) bool {
+	_, ok := c.get(eng, image, platform)
+	return ok
 }
 
 // remember records that the image is present. While inserting it also
@@ -78,6 +89,12 @@ func (c *imageCache) seen(eng engine, image, platform string) bool {
 // drops an expired key on lookup, but keys that are never queried again
 // would otherwise linger until the Option itself is discarded.
 func (c *imageCache) remember(eng engine, image, platform string) {
+	c.rememberIdentity(eng, image, platform, imageIdentity{reference: image})
+}
+
+// rememberIdentity records that the image is present along with its
+// resolved identity.
+func (c *imageCache) rememberIdentity(eng engine, image, platform string, identity imageIdentity) {
 	if !c.enabled() {
 		return
 	}
@@ -85,12 +102,15 @@ func (c *imageCache) remember(eng engine, image, platform string) {
 	now := c.now()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	for k, expiry := range c.entries {
-		if !now.Before(expiry) {
+	for k, entry := range c.entries {
+		if !now.Before(entry.expiry) {
 			delete(c.entries, k)
 		}
 	}
-	c.entries[key] = now.Add(c.ttl)
+	c.entries[key] = imageCacheEntry{
+		expiry:   now.Add(c.ttl),
+		identity: identity,
+	}
 }
 
 // forget drops any entry for key. Called after a pull, so that a pull of

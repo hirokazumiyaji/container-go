@@ -139,7 +139,7 @@ func TestIssue115AppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) 
 	image := issue115FinalFixture(t)
 	r := &issue115FinalRunner{imageJSON: image}
 	_, err := Run(context.Background(), "team/demo:stable",
-		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal for synthetic Apple root", err)
 	}
@@ -149,7 +149,7 @@ func TestIssue115AppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) 
 
 	fallback := &issue115FinalRunner{imageJSON: image}
 	ctr, err := Run(context.Background(), "team/demo:stable",
-		WithName("myctr"), WithAllowMutableImageTag(), withRunner(fallback), withEngine(appleEngine{}))
+		WithName("myctr"), WithPlatform("linux/arm64/v8"), WithAllowMutableImageTag(), withRunner(fallback), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("explicit fallback: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestIssue115AppleNameDigestWithTagIsPinned(t *testing.T) {
 	input := "registry.example/team/demo:stable@" + issue115FinalRoot
 	r := &issue115FinalRunner{imageJSON: issue115FinalFixture(t), exactAddressable: true}
 	ctr, err := Run(context.Background(), input,
-		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -174,7 +174,7 @@ func TestIssue115AppleNameDigestWithTagIsPinned(t *testing.T) {
 func TestIssue115ApplePreservesCustomDefaultRegistry(t *testing.T) {
 	r := &issue115FinalRunner{imageJSON: issue115FinalFixture(t), exactAddressable: true}
 	ctr, err := Run(context.Background(), "team/demo:stable",
-		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -193,7 +193,7 @@ func TestIssue115ApplePreservesCustomDefaultRegistryForPinnedReference(t *testin
 	r := &issue115FinalRunner{imageJSON: []byte(fixture), exactAddressable: true}
 	input := "team/demo:stable@" + issue115FinalRoot
 	ctr, err := Run(context.Background(), input,
-		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}

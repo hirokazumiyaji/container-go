@@ -284,6 +284,11 @@ func ensureOpenCopyDirectoryOutsideSource(current *os.File, reparse bool, source
 		}
 		parent, parentReparse, err := openCopySourceAt(current, "..")
 		if err != nil {
+			// NtCreateFile("..") from a Windows volume root returns
+			// ERROR_INVALID_NAME instead of the same directory handle.
+			if isCopyStagingRootParentError(err) {
+				return nil
+			}
 			return fmt.Errorf("copy to container: inspect staging ancestry: %w", err)
 		}
 		opened = append(opened, parent)

@@ -317,8 +317,9 @@ func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 }
 
 func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	time.AfterFunc(300*time.Millisecond, cancel)
 	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
 	status, reported := RunStatusOf(err)
 	if !reported || !status.Started || !status.Reaped {

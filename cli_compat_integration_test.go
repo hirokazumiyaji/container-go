@@ -26,6 +26,33 @@ func requireDockerCLI(t *testing.T) {
 	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
 }
 
+func dockerPullRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "toomanyrequests") || strings.Contains(msg, "Rate exceeded")
+}
+
+func runDockerSeedWithPullRetry(t *testing.T, r *cli.ExecRunner, ctx context.Context, args ...string) error {
+	t.Helper()
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		_, _, err = r.Run(ctx, args...)
+		if err == nil {
+			return nil
+		}
+		if !dockerPullRateLimited(err) {
+			return err
+		}
+		time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+	}
+	if dockerPullRateLimited(err) {
+		t.Skipf("docker pull rate-limited after retries: %v", err)
+	}
+	return err
+}
+
 const appleLogsCompatCLIEnv = "CONTAINERGO_APPLE_CLI"
 
 // requireAppleLogsCompatCLI returns a version-gated Apple CLI. Set
@@ -197,7 +224,7 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
+	if !eng.nameConflict(conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -214,10 +241,10 @@ func TestIntegrationAppleCLIErrorMatchers(t *testing.T) {
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
+	if !eng.containerMissing(missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
+	if !isNotFound(missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }
@@ -231,7 +258,7 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	ctx := context.Background()
 	name := fmt.Sprintf("containergo-compat-%d", time.Now().UnixNano())
 
-	if _, _, err := r.Run(ctx, "run", "-d", "--name", name, integrationRedis); err != nil {
+	if err := runDockerSeedWithPullRetry(t, r, ctx, "run", "-d", "--name", name, integrationRedis); err != nil {
 		t.Fatalf("seed run: %v", err)
 	}
 	t.Cleanup(func() {
@@ -242,7 +269,7 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	if conflictErr == nil {
 		t.Fatal("want name conflict error")
 	}
-	if !eng.nameConflict(lifecycleRun, name, conflictErr) {
+	if !eng.nameConflict(conflictErr) {
 		t.Fatalf("nameConflict = false for %v", conflictErr)
 	}
 
@@ -259,10 +286,10 @@ func TestIntegrationDockerCLIErrorMatchers(t *testing.T) {
 	if missingCtr == nil {
 		t.Fatal("want missing container error")
 	}
-	if !eng.containerMissing(lifecycleInspect, missingName, missingCtr) {
+	if !eng.containerMissing(missingCtr) {
 		t.Fatalf("containerMissing = false for %v", missingCtr)
 	}
-	if !isContainerNotFound(eng, lifecycleInspect, missingName, missingCtr) {
+	if !isNotFound(missingCtr) {
 		t.Fatalf("isNotFound = false for %v", missingCtr)
 	}
 }

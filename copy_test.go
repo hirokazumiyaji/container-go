@@ -1110,7 +1110,15 @@ func replaceCopyPathWithSameMetadata(t *testing.T, opened *os.File, path string)
 		return err
 	}
 	if err := os.Rename(replacement, path); err != nil {
-		return err
+		// Windows denies a replace-over-open-file even when the handle
+		// was opened with FILE_SHARE_DELETE. Remove unlinks the name
+		// while the snapshot handle keeps the trusted contents.
+		if removeErr := os.Remove(path); removeErr != nil {
+			return err
+		}
+		if err := os.Rename(replacement, path); err != nil {
+			return err
+		}
 	}
 	after, err := os.Lstat(path)
 	if err != nil {
@@ -1193,11 +1201,19 @@ func (r *copyDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, [
 	return r.fakeRunner.Run(ctx, args...)
 }
 func TestCleanupCopyStagingDirPropagatesFailure(t *testing.T) {
-	parentFile := filepath.Join(t.TempDir(), "not-a-directory")
-	if err := os.WriteFile(parentFile, nil, 0o600); err != nil {
-		t.Fatal(err)
+	var dir string
+	if runtime.GOOS == "windows" {
+		// Walking a file-as-parent is "not exist" on Windows, which cleanup
+		// treats as success. An illegal name still produces a walk error.
+		dir = filepath.Join(t.TempDir(), "staging*")
+	} else {
+		parentFile := filepath.Join(t.TempDir(), "not-a-directory")
+		if err := os.WriteFile(parentFile, nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		dir = filepath.Join(parentFile, "staging")
 	}
-	if err := cleanupCopyStagingDir(filepath.Join(parentFile, "staging")); err == nil {
+	if err := cleanupCopyStagingDir(dir); err == nil {
 		t.Fatal("cleanup error was discarded")
 	}
 }

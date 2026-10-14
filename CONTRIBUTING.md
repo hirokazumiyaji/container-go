@@ -17,15 +17,15 @@ when the relevant CLI or daemon is unavailable. They pull images from the AWS
 public ECR Docker Hub mirror (`public.ecr.aws/docker/library/...`) to avoid
 anonymous Docker Hub rate limits. `make integration` excludes pull-heavy bench
 and singleflight cases (`make bench-integration` covers those; the
-nested benchmark module requires Go 1.25+). Set
+nested benchmark module requires Go 1.26+). Set
 `CONTAINERGO_BACKEND=apple` or `docker` to run only that backend's tests.
 The root test binary records that value in `TestMain` and then unsets it,
 so the other backend's suites skip correctly; guards read it through
 `integrationtest.SelectedBackend` rather than `os.Getenv`, which would
 always see the empty value.
 Authenticated `docker login` (or the Apple CLI equivalent) still helps if you
-pull other Hub images locally. The root module supports Go 1.23+; the nested
-`bench/` benchmark module requires Go 1.25+ and is documented in
+pull other Hub images locally. The root module supports Go 1.26+; the nested
+`bench/` benchmark module requires Go 1.26+ and is documented in
 `bench/README.md`.
 
 Windows-specific copy tests use Windows build constraints and are cross-built

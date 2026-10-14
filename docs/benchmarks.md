@@ -21,7 +21,7 @@ Run→ready measurement infrastructure for the performance issues
   counting scenarios. Each `Run` shape runs against a real backend
   wrapped in a counting runner; every iteration records duration and
   spawn count.
-- `bench/`: separate Go module (requires Go 1.25+) holding the
+- `bench/`: separate Go module (requires Go 1.26+) holding the
   testcontainers-go comparison. The dependency on testcontainers-go
   lives only here so the library keeps its zero-dependency constraint.
   `result.go` re-exports the shared schema; `scenario_test.go`
@@ -155,8 +155,8 @@ make bench-integration
 
 This runs the root counting and pull-singleflight scenarios and the
 bench module (testcontainers-go comparison). The root module supports Go
-1.23+, but the nested `bench/` module has its own `go 1.25.0` directive for
-its testcontainers dependency; use Go 1.25+ for the second command.
+1.26+, but the nested `bench/` module has its own `go 1.26.0` directive so
+it can depend on the root module; use Go 1.26+ for the second command.
 
 ```sh
 go test -tags integration -count=1 -timeout 30m -run 'TestIntegrationBench|TestIntegrationPullSingleflight' ./...
@@ -166,7 +166,7 @@ cd bench && go test -tags integration -count=1 -timeout 30m ./...
 The repository's existing CI commands cover the root module, but a root
 `go test ./...` does not traverse the nested `bench/` module. The nested
 module therefore needs a separate test/lint invocation (and its own Go
-1.25+ toolchain); this limitation is documented here rather than changing
+1.26+ toolchain); this limitation is documented here rather than changing
 CI workflows in this issue.
 
 Backends that are not available are skipped, same as the other

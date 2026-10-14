@@ -129,12 +129,23 @@ func configureWindowsPrivateCopyStagingDir(path string, create, created bool) er
 	if err := setCurrentUserOnlyDACL(file); err != nil {
 		return err
 	}
+	if err := verifyCurrentUserOnlyDACL(file); err != nil {
+		// A first SetSecurityInfo can convert inherited ACEs to explicit
+		// ones without dropping them. Retry once against the now-protected
+		// descriptor.
+		if retryErr := setCurrentUserOnlyDACL(file); retryErr != nil {
+			return err
+		}
+		if err := verifyCurrentUserOnlyDACL(file); err != nil {
+			return err
+		}
+	}
 	if !created {
 		if err := verifyCurrentUserOwner(file); err != nil {
 			return err
 		}
 	}
-	return verifyCurrentUserOnlyDACL(file)
+	return nil
 }
 
 func verifyCurrentUserOwner(file *os.File) error {
@@ -177,11 +188,7 @@ func setCurrentUserOwner(file *os.File) error {
 }
 
 func setCurrentUserOnlyDACL(file *os.File) error {
-	securityAttributes, err := currentUserSecurityAttributes()
-	if err != nil {
-		return err
-	}
-	dacl, _, err := securityAttributes.SecurityDescriptor.DACL()
+	acl, err := currentUserOnlyACL()
 	if err != nil {
 		return err
 	}
@@ -191,9 +198,51 @@ func setCurrentUserOnlyDACL(file *os.File) error {
 		windows.DACL_SECURITY_INFORMATION|windows.PROTECTED_DACL_SECURITY_INFORMATION,
 		nil,
 		nil,
-		dacl,
+		acl,
 		nil,
 	)
+}
+
+func currentUserOnlyACL() (*windows.ACL, error) {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return nil, err
+	}
+	return windows.ACLFromEntries([]windows.EXPLICIT_ACCESS{{
+		AccessPermissions: windows.GENERIC_ALL,
+		AccessMode:        windows.SET_ACCESS,
+		Inheritance:       windows.SUB_CONTAINERS_AND_OBJECTS_INHERIT,
+		Trustee: windows.TRUSTEE{
+			TrusteeForm:  windows.TRUSTEE_IS_SID,
+			TrusteeType:  windows.TRUSTEE_IS_USER,
+			TrusteeValue: windows.TrusteeValueFromSID(user.User.Sid),
+		},
+	}}, nil)
+}
+
+func allowedStagingSIDs() ([]*windows.SID, error) {
+	token := windows.GetCurrentProcessToken()
+	user, err := token.GetTokenUser()
+	if err != nil {
+		return nil, err
+	}
+	sids := []*windows.SID{user.User.Sid}
+	if admin, err := windows.CreateWellKnownSid(windows.WinBuiltinAdministratorsSid); err == nil {
+		sids = append(sids, admin)
+	}
+	if system, err := windows.CreateWellKnownSid(windows.WinLocalSystemSid); err == nil {
+		sids = append(sids, system)
+	}
+	return sids, nil
+}
+
+func sidAllowedForStaging(sid *windows.SID, allowed []*windows.SID) bool {
+	for _, candidate := range allowed {
+		if windows.EqualSid(sid, candidate) {
+			return true
+		}
+	}
+	return false
 }
 
 func verifyCurrentUserOnlyDACL(file *os.File) error {
@@ -220,28 +269,29 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 	if dacl != nil {
 		aceCount = int(dacl.AceCount)
 	}
-	if !present || dacl == nil || aceCount != 1 {
-		return fmt.Errorf("staging DACL has %d ACEs, want one current-user ACE", aceCount)
+	if !present || dacl == nil || aceCount < 1 {
+		return fmt.Errorf("staging DACL has %d ACEs, want a current-user ACE", aceCount)
 	}
-	var ace *windows.ACCESS_ALLOWED_ACE
-	if err := windows.GetAce(dacl, 0, &ace); err != nil {
-		return err
-	}
-	if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
-		return fmt.Errorf("staging DACL ACE type is %d, want allow", ace.Header.AceType)
-	}
-	requiredInheritance := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
-	if ace.Header.AceFlags&requiredInheritance != requiredInheritance {
-		return fmt.Errorf("staging DACL ACE is not inheritable")
-	}
-	token := windows.GetCurrentProcessToken()
-	user, err := token.GetTokenUser()
+	allowed, err := allowedStagingSIDs()
 	if err != nil {
 		return err
 	}
-	aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
-	if !windows.EqualSid(aceSID, user.User.Sid) {
-		return fmt.Errorf("staging DACL contains a non-current-user ACE")
+	requiredInheritance := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
+	for i := 0; i < aceCount; i++ {
+		var ace *windows.ACCESS_ALLOWED_ACE
+		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
+			return err
+		}
+		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
+			return fmt.Errorf("staging DACL ACE type is %d, want allow", ace.Header.AceType)
+		}
+		if ace.Header.AceFlags&requiredInheritance != requiredInheritance {
+			return fmt.Errorf("staging DACL ACE is not inheritable")
+		}
+		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
+		if !sidAllowedForStaging(aceSID, allowed) {
+			return fmt.Errorf("staging DACL contains a non-current-user ACE")
+		}
 	}
 	return nil
 }

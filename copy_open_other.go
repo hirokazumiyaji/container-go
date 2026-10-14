@@ -34,3 +34,5 @@ func sameCopySourceIdentity(copySourceIdentity, copySourceIdentity) bool { retur
 func isCopySourceLinkError(error) bool { return false }
 
 func isCopySourceUnsupportedOpenError(error) bool { return false }
+
+func isCopyStagingRootParentError(error) bool { return false }

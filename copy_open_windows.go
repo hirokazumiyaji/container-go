@@ -3,6 +3,7 @@
 package container
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -133,6 +134,10 @@ func mapWindowsCopyOpenError(err error) error {
 		return status.Errno()
 	}
 	return err
+}
+
+func isCopyStagingRootParentError(err error) bool {
+	return errors.Is(err, windows.ERROR_INVALID_NAME) || errors.Is(err, windows.ERROR_BAD_PATHNAME)
 }
 
 func windowsExtendedPath(path string) string {

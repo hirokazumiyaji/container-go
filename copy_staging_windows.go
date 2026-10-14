@@ -37,7 +37,7 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 		}
 		appRoot = filepath.Join(base, "containergo-"+hex.EncodeToString(random[:]))
 		if retryErr := ensureWindowsPrivateCopyStagingDir(appRoot, true); retryErr != nil {
-			return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+			return "", fmt.Errorf("copy to container: create private staging parent: %w", retryErr)
 		}
 	}
 	root := filepath.Join(appRoot, "copy-staging")
@@ -48,6 +48,10 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 }
 
 func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
+	return configureWindowsPrivateCopyStagingDir(path, create, false)
+}
+
+func configureWindowsPrivateCopyStagingDir(path string, create, created bool) error {
 	if create {
 		securityAttributes, err := currentUserSecurityAttributes()
 		if err != nil {
@@ -58,7 +62,10 @@ func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
 			return err
 		}
 		err = windows.CreateDirectory(pathPtr, securityAttributes)
-		if err != nil && !errors.Is(err, windows.ERROR_ALREADY_EXISTS) {
+		switch {
+		case err == nil:
+			created = true
+		case !errors.Is(err, windows.ERROR_ALREADY_EXISTS):
 			return err
 		}
 	}
@@ -67,15 +74,30 @@ func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
 	if err != nil {
 		return err
 	}
+	access := uint32(windows.GENERIC_READ | windows.WRITE_DAC | windows.READ_CONTROL)
+	if created {
+		access |= windows.WRITE_OWNER
+	}
 	handle, err := windows.CreateFile(
 		pathPtr,
-		windows.GENERIC_READ|windows.WRITE_DAC|windows.READ_CONTROL,
+		access,
 		copySourceShareMode,
 		nil,
 		windows.OPEN_EXISTING,
 		windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
 		0,
 	)
+	if err != nil && created {
+		handle, err = windows.CreateFile(
+			pathPtr,
+			windows.GENERIC_READ|windows.WRITE_DAC|windows.READ_CONTROL,
+			copySourceShareMode,
+			nil,
+			windows.OPEN_EXISTING,
+			windows.FILE_FLAG_OPEN_REPARSE_POINT|windows.FILE_FLAG_BACKUP_SEMANTICS,
+			0,
+		)
+	}
 	if err != nil {
 		return err
 	}
@@ -93,14 +115,24 @@ func ensureWindowsPrivateCopyStagingDir(path string, create bool) error {
 	if reparse || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		return fmt.Errorf("%q is not a real directory", path)
 	}
-	if err := verifyCurrentUserOwner(file); err != nil {
-		return err
+	// GitHub-hosted Windows runners default new directory owners to
+	// BUILTIN\Administrators, which is not the token user SID. A directory
+	// we just created is still ours; keep the owner check for a pre-existing
+	// path that another logon may have planted.
+	if !created {
+		if err := verifyCurrentUserOwner(file); err != nil {
+			return err
+		}
+	} else {
+		_ = setCurrentUserOwner(file)
 	}
 	if err := setCurrentUserOnlyDACL(file); err != nil {
 		return err
 	}
-	if err := verifyCurrentUserOwner(file); err != nil {
-		return err
+	if !created {
+		if err := verifyCurrentUserOwner(file); err != nil {
+			return err
+		}
 	}
 	return verifyCurrentUserOnlyDACL(file)
 }
@@ -126,6 +158,22 @@ func verifyCurrentUserOwner(file *os.File) error {
 		return fmt.Errorf("staging directory is owned by a foreign SID")
 	}
 	return nil
+}
+
+func setCurrentUserOwner(file *os.File) error {
+	user, err := windows.GetCurrentProcessToken().GetTokenUser()
+	if err != nil {
+		return err
+	}
+	return windows.SetSecurityInfo(
+		windows.Handle(file.Fd()),
+		windows.SE_FILE_OBJECT,
+		windows.OWNER_SECURITY_INFORMATION,
+		user.User.Sid,
+		nil,
+		nil,
+		nil,
+	)
 }
 
 func setCurrentUserOnlyDACL(file *os.File) error {
@@ -212,6 +260,9 @@ func currentUserSecurityAttributes() (*windows.SecurityAttributes, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := absolute.SetOwner(user.User.Sid, false); err != nil {
+		return nil, err
+	}
 	return &windows.SecurityAttributes{
 		Length:             uint32(unsafe.Sizeof(windows.SecurityAttributes{})),
 		SecurityDescriptor: absolute,
@@ -240,7 +291,7 @@ func createCopyStagingDir(root string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if err := ensureWindowsPrivateCopyStagingDir(path, false); err != nil {
+		if err := configureWindowsPrivateCopyStagingDir(path, false, true); err != nil {
 			_ = os.RemoveAll(path)
 			return "", err
 		}

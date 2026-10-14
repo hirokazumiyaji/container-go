@@ -51,3 +51,5 @@ func isCopySourceLinkError(err error) bool {
 func isCopySourceUnsupportedOpenError(err error) bool {
 	return errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.ENXIO)
 }
+
+func isCopyStagingRootParentError(error) bool { return false }

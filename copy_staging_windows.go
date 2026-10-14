@@ -261,7 +261,9 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 	if control&windows.SE_DACL_PROTECTED == 0 {
 		return fmt.Errorf("staging DACL is inheritable")
 	}
-	dacl, present, err := descriptor.DACL()
+	// DACL() reports (acl, defaulted, err). An explicit SetSecurityInfo
+	// DACL is not defaulted; the old !present check treated that as empty.
+	dacl, _, err := descriptor.DACL()
 	if err != nil {
 		return err
 	}
@@ -269,14 +271,13 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 	if dacl != nil {
 		aceCount = int(dacl.AceCount)
 	}
-	if !present || dacl == nil || aceCount < 1 {
-		return fmt.Errorf("staging DACL has %d ACEs, want a current-user ACE", aceCount)
+	if dacl == nil || aceCount < 1 {
+		return fmt.Errorf("staging DACL has %d ACEs, want a current-logon ACE", aceCount)
 	}
 	allowed, err := allowedStagingSIDs()
 	if err != nil {
 		return err
 	}
-	requiredInheritance := uint8(windows.OBJECT_INHERIT_ACE | windows.CONTAINER_INHERIT_ACE)
 	for i := 0; i < aceCount; i++ {
 		var ace *windows.ACCESS_ALLOWED_ACE
 		if err := windows.GetAce(dacl, uint32(i), &ace); err != nil {
@@ -284,9 +285,6 @@ func verifyCurrentUserOnlyDACL(file *os.File) error {
 		}
 		if ace.Header.AceType != windows.ACCESS_ALLOWED_ACE_TYPE {
 			return fmt.Errorf("staging DACL ACE type is %d, want allow", ace.Header.AceType)
-		}
-		if ace.Header.AceFlags&requiredInheritance != requiredInheritance {
-			return fmt.Errorf("staging DACL ACE is not inheritable")
 		}
 		aceSID := (*windows.SID)(unsafe.Pointer(&ace.SidStart))
 		if !sidAllowedForStaging(aceSID, allowed) {

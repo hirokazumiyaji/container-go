@@ -12,7 +12,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unsafe"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -174,10 +176,15 @@ type Container struct {
 }
 
 func (c *Container) pack() *lockPack {
-	if c.sync == nil {
-		c.sync = &lockPack{}
+	ptr := (*unsafe.Pointer)(unsafe.Pointer(&c.sync))
+	if p := atomic.LoadPointer(ptr); p != nil {
+		return (*lockPack)(p)
 	}
-	return c.sync
+	created := &lockPack{}
+	if atomic.CompareAndSwapPointer(ptr, nil, unsafe.Pointer(created)) {
+		return created
+	}
+	return (*lockPack)(atomic.LoadPointer(ptr))
 }
 
 func (c *Container) refusesSharedOps() bool {
@@ -849,6 +856,7 @@ func (c *Container) Shared() *Container {
 	if c == nil {
 		return nil
 	}
+	_ = c.pack()
 	out := *c
 	out.allowDestructive = true
 	return &out

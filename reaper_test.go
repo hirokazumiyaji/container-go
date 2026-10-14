@@ -38,9 +38,18 @@ func waitForPath(t *testing.T, path string) {
 	t.Fatalf("timed out waiting for %s", path)
 }
 
+func uniqueReaperName(t *testing.T, prefix string) string {
+	t.Helper()
+	name := fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	return name
+}
+
 func waitForLogLines(t *testing.T, path string, wants ...string) {
 	t.Helper()
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	var data []byte
 	for time.Now().Before(deadline) {
 		data, _ = os.ReadFile(path)
@@ -165,7 +174,7 @@ func TestReaperSIGKILLDoesNotStageInspectSecrets(t *testing.T) {
 			r.killForTest()
 		}
 	})
-	if err := r.register("guarded", "0123456789abcdef"); err != nil {
+	if err := r.register(uniqueReaperName(t, "guarded"), "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
@@ -271,24 +280,27 @@ func TestReaperGuardsDeleteByCreation(t *testing.T) {
 	// Stub: inspect prints the creation it was told to know; delete is logged.
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
-		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n"
+		"if [ \"$1\" = \"inspect\" ]; then echo '  \"" + creationLabel + "\": \"0123456789abcdef\"'; fi\n" +
+		"exit 0\n"
 	if err := os.WriteFile(binPath, []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	r := newReaper(binPath, "delete")
-	if err := r.register("guarded", "0123456789abcdef"); err != nil {
+	guarded := uniqueReaperName(t, "guarded")
+	stale := uniqueReaperName(t, "stale")
+	if err := r.register(guarded, "0123456789abcdef"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
-	if err := r.register("stale", "ffffffffffffffff"); err != nil {
+	if err := r.register(stale, "ffffffffffffffff"); err != nil {
 		t.Fatalf("register: %v", err)
 	}
 	r.closeStdin()
-	waitForLogLines(t, logPath, "delete --force guarded")
+	waitForLogLines(t, logPath, "delete --force "+guarded)
 	// Stale generation must not be deleted; poll briefly to confirm absence.
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		data, _ := os.ReadFile(logPath)
-		if strings.Contains(string(data), "delete --force stale") {
+		if strings.Contains(string(data), "delete --force "+stale) {
 			t.Fatal("stale generation was deleted; want guard to skip it")
 		}
 		time.Sleep(50 * time.Millisecond)

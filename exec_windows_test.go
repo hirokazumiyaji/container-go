@@ -36,6 +36,7 @@ func TestExecWindowsProcessKillReturnsTerminationError(t *testing.T) {
 
 	runner := &issue116WindowsHelperRunner{runner: &cli.ExecRunner{Binary: os.Args[0]}}
 	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.setImmutableID(dockerFixtureID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

@@ -41,7 +41,7 @@ jobs:
   # need a service the hosted runner does not provide.
   #
   # The OS dimension is the point; the Go-version dimension is not. The
-  # ubuntu `test` legs already cover 1.23.0, and macOS minutes are billed
+        # ubuntu `test` legs already cover 1.26.0, and macOS minutes are billed
   # at a large multiplier, so the older-Go legs here would re-run the same
   # unit suite at high cost for no platform signal. `stable` only.
   cross-platform:
@@ -76,7 +76,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.23.0', 'stable']
+        go-version: ['1.26.0', 'stable']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -94,7 +94,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.23.0', 'stable']
+        go-version: ['1.26.0', 'stable']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
@@ -130,7 +130,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # Scan with a patched toolchain, not the go 1.25.0 floor in
+          # Scan with a patched toolchain, not the go 1.26.0 floor in
           # bench/go.mod (that release still reports fixed stdlib CVEs).
           # Pin the patch level: floating `stable` can lag security fixes.
           go-version: '1.27.2'
@@ -179,8 +179,8 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # actionlint@v1.7.12 requires go >= 1.25; the root go.mod floor is
-          # 1.23.0 and GOTOOLCHAIN=local would refuse to download a newer one.
+          # actionlint@v1.7.12 requires go >= 1.25; GOTOOLCHAIN=local would
+          # refuse to download a newer toolchain than the installed one.
           go-version-file: bench/go.mod
       # No path argument: actionlint discovers .github/workflows itself, so a
       # workflow added with the .yaml extension is covered too. A shell glob
@@ -210,7 +210,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go-version: ['1.23.0', 'stable']
+        go-version: ['1.26.0', 'stable']
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:

@@ -1,9 +1,9 @@
 # Benchmark module
 
 This directory is a separate Go module for the testcontainers-go comparison.
-The root `container-go` module supports Go 1.23+, but this module declares
-`go 1.25.0` because its pinned testcontainers-go dependency requires a newer
-Go toolchain. Run it with Go 1.25 or newer:
+The root `container-go` module supports Go 1.26+, and this module declares
+`go 1.26.0` so it can depend on the root module (and its pinned
+testcontainers-go dependency). Run it with Go 1.26 or newer:
 
 ```sh
 cd bench

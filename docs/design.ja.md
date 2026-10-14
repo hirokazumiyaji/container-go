@@ -4,7 +4,7 @@ English (primary): [design.md](design.md)
 
 作成日: 2026-08-18（v0.2 バックエンド節を 2026-08-19 追記）
 最終同期: 2026-09-25
-対象: Apple Container CLI 1.2.2 と 1.3.0（macOS 26 以降、Apple Silicon。リポジトリの根拠で表した version）、Docker 29.x（ローカル 29.7.2 と v29 inspect fixture。Linux、Windows、macOS）、root module Go 1.23 以降、nested `bench/` module Go 1.25 以降
+対象: Apple Container CLI 1.2.2 と 1.3.0（macOS 26 以降、Apple Silicon。リポジトリの根拠で表した version）、Docker 29.x（ローカル 29.7.2 と v29 inspect fixture。Linux、Windows、macOS）、root module Go 1.26 以降、nested `bench/` module Go 1.26 以降
 
 この文書は現在のチェックアウトにある実装を説明する。
 「実装フェーズ」の節は初期設計の歴史として残るが、現在の API や今後のロードマップを約束するものではない。
@@ -26,7 +26,7 @@ staging の cleanup は #111 に依存します。
 最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
 このチェックアウトはそのタグより後の開発版です。
 `v0.2.0` モジュールには Go 1.27 以降が必要ですが、現在の root チェックアウトには
-Go 1.23 以降が必要で、nested `bench/` モジュールには Go 1.25 以降が必要です。
+Go 1.26 以降が必要で、nested `bench/` モジュールには Go 1.26 以降が必要です。
 リリース版 API と現在の開発版 API は同じもの
 ではありません。`LogsOptions` / `LogsWithOptions`、追加された
 `wait.ForHTTP` の setter、公開型 `wait.AllStrategy` / `AnyStrategy` と
@@ -36,7 +36,7 @@ Go 1.23 以降が必要で、nested `bench/` モジュールには Go 1.25 以�
 `Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、backend 選択、
 元の wait strategy は `v0.2.0` に存在しています。
 作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
-対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS。copy-out には client/server 29.7.0 以上)、Go 1.23 以降
+対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS。copy-out には client/server 29.7.0 以上)、Go 1.26 以降
 
 ## 目的
 
@@ -665,9 +665,9 @@ type Runner interface {
 
 **ユニットテスト**では、固定 JSON を返すフェイク `Runner` を注入し、実機なしで argv 組み立て、JSON デコード、エラー分類、wait strategy のロジックを検証する。本番 code が非 nil を前提とする依存には、テストでもフェイク実装を渡す。integration tag のない `examples/compile_test.go` は、README の英語版・日本語版と design document の両方から fence された code block をすべて抽出し、対応する block をコメント除去後に比較する。`go` block は parse して一時 module 内で compile し、一時 module は現在の checkout への引用符付きローカル `replace` を使う。`text` のシグネシャ一覧は実行対象ではない。
 
-**統合テスト**は `integration` build tag を使う。root のテストスイートには Apple Container と Docker のライフサイクル、接続、exec、copy、cleanup、Reuse、watchdog のケースがある。各バックエンドの helper は先に CLI とサービスを確認し、利用できなければ skip する。`make integration` は両バックエンドを実行して pull が重い bench と singleflight を除外し、`make integration-docker` は Docker を選択する。`make bench-integration` は pull が重いシナリオと独立したベンチマークモジュールを実行する（nested `bench/` module は Go 1.25+）。
+**統合テスト**は `integration` build tag を使う。root のテストスイートには Apple Container と Docker のライフサイクル、接続、exec、copy、cleanup、Reuse、watchdog のケースがある。各バックエンドの helper は先に CLI とサービスを確認し、利用できなければ skip する。`make integration` は両バックエンドを実行して pull が重い bench と singleflight を除外し、`make integration-docker` は Docker を選択する。`make bench-integration` は pull が重いシナリオと独立したベンチマークモジュールを実行する（nested `bench/` module は Go 1.26+）。
 
-**CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.23.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck` を実行する。同じ runner で Docker 統合テストの行列も実行する。Apple Container 統合テストは意図的にローカル専用である。GitHub の Linux runner には Apple Container サービスと必要なホスト環境がない。ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
+**CI**：`.github/workflows/ci.yml` は `ubuntu-latest` で Go 1.26.0 と安定版 Go を使い、ユニットテスト、race テスト、lint、`govulncheck` を実行する。同じ runner で Docker 統合テストの行列も実行する。Apple Container 統合テストは意図的にローカル専用である。GitHub の Linux runner には Apple Container サービスと必要なホスト環境がない。ローカルでは `CONTAINERGO_BACKEND=apple` または `CONTAINERGO_BACKEND=docker` でバックエンドを 1 つだけ実行できる。
 **統合テスト**：ビルドタグ `integration` で分離し、実機 backend に対して実行する。Apple test は macOS 26 と起動済みの Apple Container を、Docker test は稼働中の daemon を必要とする。Apple の watchdog test は Darwin 専用で、リポジトリの Linux 限定 CI job では Windows runtime integration を実行しない。最初に backend の利用可否を確認し、daemon/service が停止していれば skip する。起動、接続、exec、コピー、通常のクリーンアップ、Darwin の watchdog を検証する。Windows の copy-out は Go 1.26 以上と Docker client/server 29.7.0 以上を使って手動検証する。
 
 **CI**：unit、race、vet、lint、Docker integration job は Ubuntu で実行する。Apple integration は service と host の条件が満たされないためローカルで実行し、Windows runtime job は設定されていない。

@@ -13,9 +13,9 @@ Go のテストから使い捨てコンテナを起動できます。サード�
 下記のインストールコマンドはリリース版 API のものです。
 このコマンドで、後述の開発版 API が入るわけではありません。
 
-root ライブラリのチェックアウトには Go 1.23 以降が必要です。
+root ライブラリのチェックアウトには Go 1.26 以降が必要です。
 `make bench-integration` が使う nested `bench/` モジュールには
-Go 1.25 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が必要です。
+Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が必要です。
 
 | API または動作 | `v0.2.0` | 現在の開発チェックアウト |
 |---|---|---|
@@ -132,9 +132,9 @@ macOS で Docker（Docker Desktop など）を使う場合は
 ライブラリが remote Docker endpoint の選択に使うのは
 `DOCKER_HOST=tcp://...` だけで、remote Docker context は検出しません。
 
-ルートモジュールには Go 1.23 以上が必要です。オプションの
-ネストした `bench/` ベンチマークモジュールは Go 1.25 以上が必要です
-(testcontainers-go の依存関係の要件)。詳細は
+ルートモジュールには Go 1.26 以上が必要です。オプションの
+ネストした `bench/` ベンチマークモジュールは Go 1.26 以上が必要です
+(root module と testcontainers-go の依存関係の要件)。詳細は
 [bench/README.md](bench/README.md) を参照してください。
 
 現在のチェックアウトで確認した backend の動作（ライブラリが照合する CLI
@@ -981,14 +981,14 @@ make test                # backend 不要の unit test
 make vet
 make integration         # integration test（bench / singleflight を除外）。backend がなければ skip
 make integration-docker  # Docker backend の integration test のみ
-make bench-integration   # pull が重い bench / singleflight（bench module は Go 1.25+）
+make bench-integration   # pull が重い bench / singleflight（bench module は Go 1.26+）
 ```
 
 Integration test の image は Docker Hub の匿名 pull 制限を避けるため
 `public.ecr.aws/docker/library/...` を使います。`CONTAINERGO_BACKEND=apple`
 または `docker` で片方だけを実行できます。
 
-GitHub Actions は `ubuntu-latest` で Go 1.23.0 と安定版 Go を使い、unit
+GitHub Actions は `ubuntu-latest` で Go 1.26.0 と安定版 Go を使い、unit
 test、race test、lint、`govulncheck` を実行します。同じ runner で Docker
 integration test の行列も実行します。Apple Container integration は
 GitHub ホストランナーに service がないためローカル専用です。

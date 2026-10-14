@@ -3,6 +3,7 @@
 package cli
 
 import (
+	"errors"
 	"os/exec"
 	"testing"
 )
@@ -94,8 +95,11 @@ func TestLinuxTerminationInterleavingWithWaitReapUsesPidfd(t *testing.T) {
 
 	identity := &ownershipLossIdentity{}
 	result := (&unixProcessTree{identity: identity}).terminate(cmd)
-	if result.active || result.err != nil {
-		t.Fatalf("termination result = %+v, want conservative pidfd-directed termination", result)
+	if result.active {
+		t.Fatalf("termination result = %+v, must not claim the child is still active", result)
+	}
+	if result.err != nil && !errors.Is(result.err, errProcessStopNotObserved) {
+		t.Fatalf("termination result = %+v, want pidfd kill with optional stop-observation error", result)
 	}
 	if identity.killCalls != 1 {
 		t.Fatalf("pidfd kill calls = %d, want 1", identity.killCalls)

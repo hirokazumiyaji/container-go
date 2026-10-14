@@ -120,9 +120,9 @@ func Pull(ctx context.Context, image string) error {
 	}
 	eng, err := detectEngine()
 	if err != nil {
-		return err
+		return safePublicError(err)
 	}
-	return pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image)
+	return safePublicError(pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image))
 }
 
 // pullWith is the fake-runner-driven core of Pull: the flight shares one

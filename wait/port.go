@@ -42,6 +42,8 @@ func (s *HostPortStrategy) WithPollInterval(d time.Duration) *HostPortStrategy {
 	return s
 }
 
+func (s *HostPortStrategy) DiagnosticValues() []string { return []string{s.port} }
+
 func (s *HostPortStrategy) validate() error {
 	if err := s.options.validate(); err != nil {
 		return err
@@ -52,7 +54,8 @@ func (s *HostPortStrategy) validate() error {
 	return nil
 }
 
-func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *HostPortStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}

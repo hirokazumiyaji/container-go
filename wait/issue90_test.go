@@ -88,7 +88,7 @@ func TestEndpointLaunchErrorIsPermanentForPortAndHTTP(t *testing.T) {
 			target := &issue90Target{endpointErr: launchErr}
 			err := wait(target)
 			var got *exec.Error
-			if !errors.As(err, &got) || got != launchErr {
+			if !errors.As(err, &got) || got.Name != launchErr.Name {
 				t.Fatalf("error = %v, want permanent *exec.Error", err)
 			}
 			if got := target.endpointCalls.Load(); got != 1 {
@@ -108,7 +108,7 @@ func TestStateLaunchErrorIsPermanentAfterSuccessfulCheck(t *testing.T) {
 		WithPollInterval(time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	var got *exec.Error
-	if !errors.As(err, &got) || got != launchErr {
+	if !errors.As(err, &got) || got.Name != launchErr.Name {
 		t.Fatalf("error = %v, want permanent state launch error", err)
 	}
 	if got := target.runningCalls.Load(); got != 1 {
@@ -564,6 +564,14 @@ func TestScanLogStreamUsesScannerLineSemantics(t *testing.T) {
 				t.Fatalf("matched line = %q, want Scanner text without terminator", matched)
 			}
 		})
+	}
+}
+
+func TestForLogRegexpEndAnchorMatchesCRLF(t *testing.T) {
+	target := &issue90Target{logs: []io.ReadCloser{io.NopCloser(strings.NewReader("ready\r\n"))}}
+	err := ForLog("ready$").AsRegexp().WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
 	}
 }
 

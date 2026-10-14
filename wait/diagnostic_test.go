@@ -111,8 +111,8 @@ func TestHTTPWaitErrorRedactsCLIErrorFromErrorsAs(t *testing.T) {
 	if strings.Contains(got.Error(), secret) || strings.Contains(got.Stderr, secret) {
 		t.Fatalf("errors.As CLIError is unsafe: %q", got.Error())
 	}
-	if !strings.Contains(got.RawError(), secret) {
-		t.Fatalf("RawError() = %q, want raw value", got.RawError())
+	if !strings.Contains(raw.RawError(), secret) {
+		t.Fatalf("original RawError() = %q, want raw value", raw.RawError())
 	}
 }
 

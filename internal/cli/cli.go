@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"regexp"
@@ -28,6 +29,63 @@ var ErrSystemNotRunning = errors.New("container backend is not running")
 // ErrStreamSetup identifies a deterministic log-stream setup failure.
 // Retrying the same runner and backend path cannot recover from it.
 var ErrStreamSetup = errors.New("log stream setup failed")
+
+type SystemNotRunningError struct {
+	hint      string
+	original  error
+	probe     error
+	redactor  *Redactor
+	rawSystem *SystemNotRunningError
+}
+
+func (e *SystemNotRunningError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	msg := fmt.Sprintf("%s: %s", ErrSystemNotRunning, e.hint)
+	if e.original != nil {
+		msg += fmt.Sprintf(" (underlying error: %v)", e.original)
+	}
+	if e.probe != nil {
+		msg += fmt.Sprintf(" (probe error: %v)", e.probe)
+	}
+	return msg
+}
+
+func (e *SystemNotRunningError) Unwrap() []error {
+	if e == nil {
+		return nil
+	}
+	errs := []error{ErrSystemNotRunning}
+	if e.original != nil {
+		errs = append(errs, e.original)
+	}
+	if e.probe != nil {
+		errs = append(errs, e.probe)
+	}
+	return errs
+}
+
+func (e *SystemNotRunningError) UnwrapRaw() error {
+	if e == nil {
+		return nil
+	}
+	return e.rawSystem
+}
+
+func (e *SystemNotRunningError) OriginalError() error {
+	if e == nil {
+		return nil
+	}
+	return e.original
+}
+
+func (e *SystemNotRunningError) ProbeError() error {
+	if e == nil {
+		return nil
+	}
+	return e.probe
+}
 
 // Probe is the backend-specific liveness check Classify runs after a
 // failure: a cheap CLI invocation plus the hint to show the user when
@@ -87,14 +145,44 @@ type CLIError struct {
 	Stderr   string
 }
 
+// Error renders a safe diagnostic. Secret-shaped arguments and stderr
+// values are redacted, and control characters are escaped so the result
+// cannot alter a terminal. Use RawError only when the unredacted text is
+// explicitly needed and the caller will keep it out of logs.
 func (e *CLIError) Error() string {
+	if e == nil {
+		return "<nil>"
+	}
+	return formatCLIError(e, NewRedactor())
+}
+
+// RawError returns the original command and stderr without redaction or
+// control-character escaping. It is an explicit escape hatch for local
+// debugging; do not write the result to CI logs or issue reports.
+func (e *CLIError) RawError() string {
+	if e == nil {
+		return "<nil>"
+	}
 	bin := e.Binary
 	if bin == "" {
 		bin = "container"
 	}
 	msg := fmt.Sprintf("%s %s: exit code %d", bin, strings.Join(e.Args, " "), e.ExitCode)
 	if e.Stderr != "" {
-		msg += ": " + strings.TrimSpace(e.Stderr)
+		msg += ": " + e.Stderr
+	}
+	return msg
+}
+
+func formatCLIError(e *CLIError, r *Redactor) string {
+	bin := e.Binary
+	if bin == "" {
+		bin = "container"
+	}
+	args := r.Args(e.Args)
+	msg := fmt.Sprintf("%s %s: exit code %d", r.Text(bin), strings.Join(args, " "), e.ExitCode)
+	if stderr := r.RedactBounded(e.Stderr, maxStderr); stderr != "" {
+		msg += ": " + strings.TrimSpace(stderr)
 	}
 	return msg
 }
@@ -191,8 +279,9 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	lifecycle := newCommandLifecycle(ctx, cmd)
 	cmd.Cancel = lifecycle.cancel
 	var stdout, stderr bytes.Buffer
+	safeStderr := NewRedactor().NewStream(maxStderr)
 	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	cmd.Stderr = io.MultiWriter(&stderr, safeStderr)
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second

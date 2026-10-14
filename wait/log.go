@@ -36,7 +36,8 @@ type LogStrategy struct {
 	occurrences int
 }
 
-// ForLog waits for a substring to appear in the logs.
+// ForLog waits for a substring to appear in the logs. Patterns and individual
+// log lines are bounded; oversized inputs are reported as matcher errors.
 func ForLog(pattern string) *LogStrategy {
 	return &LogStrategy{pattern: pattern, occurrences: 1}
 }
@@ -67,12 +68,17 @@ func (s *LogStrategy) WithPollInterval(d time.Duration) *LogStrategy {
 	return s
 }
 
+func (s *LogStrategy) DiagnosticValues() []string { return []string{s.pattern} }
+
 func (s *LogStrategy) validate() error {
 	if err := s.options.validate(); err != nil {
 		return err
 	}
 	if s.pattern == "" {
 		return invalidConfigf("log pattern must not be empty")
+	}
+	if len(s.pattern) > maxLogLineSize {
+		return &ConfigError{Strategy: "ForLog", Field: "pattern", Reason: "must not exceed 1 MiB"}
 	}
 	if s.occurrences <= 0 {
 		return invalidConfigf("log occurrence count must be positive")
@@ -545,7 +551,8 @@ func settleLogMatch(ctx context.Context, stream io.ReadCloser, reader *bufio.Rea
 	}
 }
 
-func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}

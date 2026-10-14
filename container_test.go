@@ -48,7 +48,8 @@ type fakeRunner struct {
 	envFiles              []string // contents of --env-file captured at call time
 	inspectJSON           string
 	failPrefix            string // fail calls whose first arg matches
-	failInspectAfter      int    // allow this many matching calls before failing (0 fails all)
+	failStderr            string
+	failInspectAfter      int // allow this many matching calls before failing (0 fails all)
 	containerInspectCalls int
 	systemUp              bool
 
@@ -126,7 +127,11 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 	}
 	if f.failPrefix != "" && args[0] == f.failPrefix &&
 		(args[0] != "inspect" || f.failInspectAfter == 0 || f.containerInspectCalls >= f.failInspectAfter) {
-		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "injected failure"}
+		stderr := f.failStderr
+		if stderr == "" {
+			stderr = "injected failure"
+		}
+		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: stderr}
 	}
 	if args[0] == "inspect" {
 		f.containerInspectCalls++

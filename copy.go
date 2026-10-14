@@ -633,7 +633,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 
 	dir, err := os.MkdirTemp("", "containergo-cp-")
 	if err != nil {
-		return nil, err
+		return nil, c.redactError(err, containerPath)
 	}
 	keepDir := false
 	defer func() {
@@ -721,7 +721,7 @@ func validateContainerPath(p string) error {
 		return fmt.Errorf("container path %q must use '/' as the path separator", p)
 	}
 	if !utf8.ValidString(p) || strings.ContainsRune(p, 0) {
-		return fmt.Errorf("container path %q must be valid UTF-8 without NUL bytes", p)
+		return invalidOption("container path", "must be valid UTF-8 without NUL bytes")
 	}
 	return nil
 }

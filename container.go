@@ -170,7 +170,9 @@ type Container struct {
 	// Docker UID to a caller-visible handle.
 	nameInspect bool
 
-	sync *lockPack
+	sync                    *lockPack
+	diagnosticRedactorValue *cli.Redactor
+	secretsMu               sync.RWMutex
 }
 
 func (c *Container) pack() *lockPack {
@@ -227,13 +229,22 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		return nil, err
 	}
 	cfg := newConfig()
+	defer func() {
+		if retErr != nil {
+			retErr = cfg.publicError(retErr)
+		}
+	}()
 	for i, opt := range opts {
 		if opt == nil {
 			return nil, validationErrorf("Run", i, "option %d is nil", i)
 		}
 		if err := opt(cfg); err != nil {
-			return nil, err
+			// Capture values from options that ran before a later option
+			// failed, while the validation error itself remains value-free.
+			cfg.rememberDiagnosticValues()
+			return nil, optionBoundaryError(err)
 		}
+		cfg.rememberDiagnosticValues()
 	}
 	// Validate the complete wait tree at the public Run boundary. This
 	// must happen before image inspection/pull and before a container can
@@ -250,7 +261,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if cfg.eng == nil {
 		eng, err := detectEngine()
 		if err != nil {
-			return nil, err
+			return nil, cfg.publicError(err)
 		}
 		cfg.eng = eng
 	}
@@ -369,16 +380,17 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 
 	c := &Container{
-		id:              cfg.name,
-		runner:          cfg.runner,
-		eng:             cfg.eng,
-		exposed:         cfg.exposed,
-		published:       cfg.published,
-		network:         cfg.network,
-		networkExplicit: cfg.networkExplicit,
-		creation:        cfg.creation,
-		image:           resolvedImage,
-		sync:            &lockPack{uid: uid},
+		id:                      cfg.name,
+		runner:                  cfg.runner,
+		eng:                     cfg.eng,
+		exposed:                 cfg.exposed,
+		published:               cfg.published,
+		network:                 cfg.network,
+		networkExplicit:         cfg.networkExplicit,
+		creation:                cfg.creation,
+		image:                   resolvedImage,
+		sync:                    &lockPack{uid: uid},
+		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
 	}
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
@@ -424,10 +436,13 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {
 			cleanupCtx := context.WithoutCancel(ctx)
-			tail := c.logTail(cleanupCtx)
-			err = fmt.Errorf("container %s failed to become ready: %w", c.id, err)
-			if tail != "" {
-				err = fmt.Errorf("%w\ncontainer logs:\n%s", err, tail)
+			waitValues := wait.DiagnosticValues(cfg.waitStrategy)
+			tail, tailErr := c.logTailWithError(cleanupCtx, waitValues...)
+			err = c.publicError(fmt.Errorf("container %s failed to become ready: %w", c.id, err), waitValues...)
+			if tailErr != nil {
+				err = c.publicError(fmt.Errorf("%w; container log tail unavailable: %w", err, tailErr), waitValues...)
+			} else if tail != "" {
+				err = c.publicError(fmt.Errorf("%w; container logs: %s", err, tail), waitValues...)
 			}
 			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 		}
@@ -849,9 +864,17 @@ func (c *Container) Shared() *Container {
 	if c == nil {
 		return nil
 	}
-	out := *c
-	out.allowDestructive = true
-	return &out
+	c.secretsMu.RLock()
+	diagnosticRedactor := c.diagnosticRedactorValue
+	c.secretsMu.RUnlock()
+	return &Container{
+		id: c.id, runner: c.runner, eng: c.eng,
+		exposed: c.exposed, published: c.published,
+		network: c.network, networkExplicit: c.networkExplicit,
+		reused: c.reused, allowDestructive: true, creation: c.creation,
+		image: c.image, nameInspect: c.nameInspect,
+		sync: c.sync, diagnosticRedactorValue: diagnosticRedactor,
+	}
 }
 
 // Terminate force-removes the container. A Docker handle must carry a
@@ -914,6 +937,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
+		c.clearDiagnosticSecrets()
 		return nil
 	}
 	return c.classifyOperation(ctx, err, c.deleteOperation())
@@ -925,10 +949,10 @@ func (c *Container) delete(ctx context.Context, target string) error {
 func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 	info, err := c.inspectDynamic(ctx)
 	if err != nil {
-		return "", err
+		return "", c.redactError(err)
 	}
 	if info.ip == "" {
-		return "", fmt.Errorf("container %s has no reported IP address", c.id)
+		return "", c.redactError(errors.New("container has no reported IP address"), c.id, info.ip)
 	}
 	return info.ip, nil
 }
@@ -998,7 +1022,7 @@ func (c *Container) MappedPort(ctx context.Context, port string) (int, error) {
 func (c *Container) Endpoint(ctx context.Context, port string) (string, error) {
 	host, p, err := c.resolve(ctx, port, "Endpoint")
 	if err != nil {
-		return "", err
+		return "", c.redactError(err, port)
 	}
 	return net.JoinHostPort(host, strconv.Itoa(p)), nil
 }
@@ -1056,7 +1080,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
-			return "", 0, err
+			return "", 0, c.redactError(err, port)
 		}
 		return host, b.hostPort, nil
 	}

@@ -119,6 +119,20 @@ func (s *HTTPStrategy) WithPollInterval(d time.Duration) *HTTPStrategy {
 	return s
 }
 
+func (s *HTTPStrategy) DiagnosticValues() []string {
+	values := []string{s.path, s.port, s.method, s.username, s.password}
+	for key, value := range s.headers {
+		values = append(values, key, value, key+": "+value, key+"="+value)
+		if strings.EqualFold(key, "cookie") || strings.EqualFold(key, "set-cookie") || strings.EqualFold(key, "cookie2") {
+			values = append(values, cookieDiagnosticValues(value)...)
+		}
+	}
+	if s.basicAuth {
+		values = append(values, basicAuthValues(s.username, s.password)...)
+	}
+	return values
+}
+
 func (s *HTTPStrategy) validate() error {
 	if err := s.options.validate(); err != nil {
 		return err
@@ -159,7 +173,8 @@ func (s *HTTPStrategy) validate() error {
 	return nil
 }
 
-func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}

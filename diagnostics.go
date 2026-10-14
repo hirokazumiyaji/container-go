@@ -1,7 +1,6 @@
 package container
 
 import (
-	"context"
 	"errors"
 	"fmt"
 
@@ -56,6 +55,19 @@ func safePublicError(err error, values ...string) error {
 }
 
 func (c *config) publicError(err error, extra ...string) error {
+	var validation *ValidationError
+	if errors.As(err, &validation) {
+		if validation.Value != nil {
+			switch value := validation.Value.(type) {
+			case Mount:
+				extra = append(extra, value.Source, value.Target, value.arg())
+			case string:
+				extra = append(extra, value)
+			}
+		} else if validation.Option == "Run" && validation.Err != nil {
+			extra = append(extra, validation.Err.Error())
+		}
+	}
 	return cli.WithRedactor(err, c.diagnosticRedactor(extra...))
 }
 
@@ -70,21 +82,15 @@ func composeDiagnosticMatchers(matchers ...*cli.Redactor) *cli.Redactor {
 func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 	c.secretsMu.RLock()
 	base := c.diagnosticRedactorValue
-	var values []string
-	if len(c.diagnosticSecrets) > 0 {
-		values = append(values, c.diagnosticSecrets...)
-	}
 	c.secretsMu.RUnlock()
 
 	var matchers []*cli.Redactor
 	if base != nil {
 		matchers = append(matchers, base)
 	}
-	if len(values) > 0 {
-		matchers = append(matchers, cli.NewHashedContextRedactor(values...))
-	}
 	// The handle identity and declared bindings are safe structural context
 	// too, but are kept out of the long-lived hashed matcher when possible.
+	values := make([]string, 0, len(c.exposed)+len(c.published)+1+len(extra))
 	values = append(values, c.id)
 	for _, exposed := range c.exposed {
 		values = append(values, exposed.String())
@@ -100,6 +106,15 @@ func (c *Container) diagnosticRedactor(extra ...string) *cli.Redactor {
 }
 
 func (c *Container) publicError(err error, extra ...string) error {
+	var validation *ValidationError
+	if errors.As(err, &validation) && validation.Value != nil {
+		switch value := validation.Value.(type) {
+		case string:
+			extra = append(extra, value)
+		case Mount:
+			extra = append(extra, value.Source, value.Target, value.arg())
+		}
+	}
 	return cli.WithRedactor(err, c.diagnosticRedactor(extra...))
 }
 
@@ -108,10 +123,6 @@ func (c *Container) clearDiagnosticSecrets() {
 		return
 	}
 	c.secretsMu.Lock()
-	for i := range c.diagnosticSecrets {
-		c.diagnosticSecrets[i] = ""
-	}
-	c.diagnosticSecrets = nil
 	// The matcher is immutable and may be shared with an in-flight error.
 	// Dropping the handle reference is sufficient; do not mutate it here.
 	c.diagnosticRedactorValue = nil
@@ -122,10 +133,6 @@ func (c *Container) clearDiagnosticSecrets() {
 // the container lifecycle.
 func (c *Container) redactError(err error, extra ...string) error {
 	return c.publicError(err, extra...)
-}
-
-func (c *Container) classifyWithSecrets(ctx context.Context, err error, secrets ...string) error {
-	return c.redactError(cli.Classify(ctx, c.runner, err, c.eng.probe()), secrets...)
 }
 
 func execDiagnosticValues(cfg *execConfig, cmd []string) []string {
@@ -139,7 +146,7 @@ func execDiagnosticValues(cfg *execConfig, cmd []string) []string {
 }
 
 func invalidOption(field, problem string) error {
-	return &ValidationError{Field: field, Problem: problem}
+	return newValidationError(field, nil, errors.New(problem))
 }
 
 func optionBoundaryError(err error) error {
@@ -147,7 +154,7 @@ func optionBoundaryError(err error) error {
 	if errors.As(err, &validation) {
 		return err
 	}
-	return &OptionError{cause: err}
+	return newValidationError("Run", nil, err)
 }
 
 func uniqueStrings(values []string) []string {
@@ -164,31 +171,4 @@ func uniqueStrings(values []string) []string {
 		out = append(out, value)
 	}
 	return out
-}
-
-// rollbackError preserves both the readiness cause and a cleanup failure.
-// It is intentionally a typed multi-error rather than a %v interpolation so
-// errors.Is/As continue to work after a failed rollback.
-type rollbackError struct {
-	cause   error
-	cleanup error
-	id      string
-}
-
-func (e *rollbackError) Error() string {
-	if e == nil {
-		return "<nil>"
-	}
-	return fmt.Sprintf("%v (container %s left behind: %v)", e.cause, e.id, e.cleanup)
-}
-
-func (e *rollbackError) Unwrap() []error {
-	if e == nil {
-		return nil
-	}
-	return []error{e.cause, e.cleanup}
-}
-
-func (e *rollbackError) Is(target error) bool {
-	return errors.Is(e.cause, target) || errors.Is(e.cleanup, target)
 }

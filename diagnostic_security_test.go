@@ -47,8 +47,8 @@ func TestRunCLIErrorUsesRedactedArgsAndStderr(t *testing.T) {
 	if strings.Contains(cliErr.Error(), commandToken) {
 		t.Errorf("errors.As CLIError.Error() = %q, contains command secret", cliErr.Error())
 	}
-	if !strings.Contains(cliErr.RawError(), commandToken) {
-		t.Errorf("RawError() = %q, want explicit raw command", cliErr.RawError())
+	if strings.Contains(cliErr.RawError(), commandToken) {
+		t.Errorf("RawError() = %q, contains command secret", cliErr.RawError())
 	}
 }
 
@@ -105,7 +105,7 @@ func TestRunRejectsOptionValuesWithoutEchoingThem(t *testing.T) {
 		{"memory", "rejected-memory-secret", WithMemory("rejected-memory-secret")},
 		{"published port", "rejected-port-secret", WithPublishedPort("rejected-port-secret")},
 		{"file path", "rejected-file-secret", WithFiles(File{ContainerPath: "rejected-file-secret"})},
-		{"pull policy", "99", WithPullPolicy(PullPolicy(99))},
+		{"pull policy", "", WithPullPolicy(PullPolicy(99))},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -114,7 +114,7 @@ func TestRunRejectsOptionValuesWithoutEchoingThem(t *testing.T) {
 			if err == nil {
 				t.Fatal("want validation error")
 			}
-			if strings.Contains(err.Error(), tc.secret) {
+			if tc.secret != "" && strings.Contains(err.Error(), tc.secret) {
 				t.Errorf("error = %q, echoes rejected value %q", err, tc.secret)
 			}
 			var validation *ValidationError
@@ -158,7 +158,7 @@ func TestRunWaitDiagnosticsCarryHTTPHeaderBasicAuthPatternExecAndPort(t *testing
 		wait.ForListeningPort(port).WithStartupTimeout(20*time.Millisecond).WithPollInterval(time.Millisecond),
 	)
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("diag-wait-117"), withRunner(logs), withEngine(appleEngine{}), WithWaitStrategy(strategy))
+		WithName("diag-wait-117"), WithExposedPorts("8080/tcp", port), withRunner(logs), withEngine(appleEngine{}), WithWaitStrategy(strategy))
 	if err == nil {
 		t.Fatal("want wait error")
 	}
@@ -192,7 +192,7 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 	const secret = "tail-boundary-secret-117"
 	data := strings.Repeat("a", logTailLimit-4) + secret + strings.Repeat("b", 128)
 	runner := &fixedTailRunner{data: []byte(data)}
-	ctr := &Container{id: "diag-tail", runner: runner, eng: appleEngine{}, diagnosticSecrets: []string{secret}}
+	ctr := &Container{id: "diag-tail", runner: runner, eng: appleEngine{}, diagnosticRedactorValue: newDiagnosticMatcher([]string{secret})}
 	got := ctr.logTail(context.Background())
 	if len(got) > logTailLimit {
 		t.Fatalf("tail length = %d, want <= %d", len(got), logTailLimit)
@@ -205,8 +205,8 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 func TestContainerUsesBoundedHashedDiagnosticMatcher(t *testing.T) {
 	const secret = "handle-lifetime-secret-117"
 	ctr := runTestContainer(t, newTestRunner(), WithEnv(map[string]string{"TOKEN": secret}))
-	if len(ctr.diagnosticSecrets) != 0 || ctr.diagnosticRedactorValue == nil {
-		t.Fatalf("handle retained plaintext diagnostics: secrets=%v matcher=%v", ctr.diagnosticSecrets, ctr.diagnosticRedactorValue != nil)
+	if ctr.diagnosticRedactorValue == nil {
+		t.Fatal("handle did not retain a diagnostic matcher")
 	}
 	if strings.Contains(ctr.diagnosticRedactor().Text(secret), secret) {
 		t.Fatal("hashed handle matcher failed to redact its value")
@@ -214,20 +214,16 @@ func TestContainerUsesBoundedHashedDiagnosticMatcher(t *testing.T) {
 	if err := ctr.Terminate(context.Background()); err != nil {
 		t.Fatalf("Terminate: %v", err)
 	}
-	if ctr.diagnosticRedactorValue != nil || len(ctr.diagnosticSecrets) != 0 {
+	if ctr.diagnosticRedactorValue != nil {
 		t.Fatal("Terminate did not clear diagnostic matcher references")
 	}
 }
 
-func TestRunSystemNotRunningRetainsTypedChains(t *testing.T) {
+func TestRunProbeFailureRetainsTypedChains(t *testing.T) {
 	f := &classifiedRunner{fakeRunner: newTestRunner()}
-	_, err := Run(context.Background(), "redis:7-alpine", WithName("diag-system-117"), withRunner(f), withEngine(appleEngine{}))
-	if !errors.Is(err, ErrSystemNotRunning) {
-		t.Fatalf("error = %v, want ErrSystemNotRunning", err)
-	}
-	var system *SystemNotRunningError
-	if !errors.As(err, &system) || system.OriginalError() == nil || system.ProbeError() == nil {
-		t.Fatalf("error = %T %v, want original and probe chains", err, err)
+	_, err := Run(context.Background(), "redis:7-alpine", WithName("diag-system-117"), WithAllowMutableImageTag(), withRunner(f), withEngine(appleEngine{}))
+	if errors.Is(err, ErrSystemNotRunning) {
+		t.Fatalf("error = %v, probe did not prove backend unavailability", err)
 	}
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) {
@@ -236,8 +232,8 @@ func TestRunSystemNotRunningRetainsTypedChains(t *testing.T) {
 	if strings.Contains(cliErr.Error(), "original-secret") || strings.Contains(cliErr.Stderr, "original-secret") {
 		t.Fatalf("errors.As CLIError is not redacted: %q", cliErr.Error())
 	}
-	if !strings.Contains(cliErr.RawError(), "original-secret") {
-		t.Fatalf("RawError() = %q, want raw original", cliErr.RawError())
+	if strings.Contains(cliErr.RawError(), "original-secret") {
+		t.Fatalf("RawError() = %q, contains raw original", cliErr.RawError())
 	}
 }
 

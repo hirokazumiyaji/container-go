@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"os/exec"
 	"reflect"
 
 	"github.com/hirokazumiyaji/container-go/internal/diagnostic"
@@ -11,6 +12,10 @@ import (
 // Redactor describes values that must be removed from a diagnostic in
 // addition to the structural redaction applied to every CLIError.
 type Redactor = diagnostic.Redactor
+
+const MaxStreamOverlap = diagnostic.MaxStreamOverlap
+
+func StreamValueFits(value string) bool { return diagnostic.StreamValueFits(value) }
 
 // NewRedactor creates a boundary-aware redactor for values supplied by a
 // caller.
@@ -84,9 +89,6 @@ func (e *safeError) Error() string {
 	if e == nil {
 		return "<nil>"
 	}
-	if cliErr, ok := e.err.(*CLIError); ok {
-		return cliErr.format(e.redactor)
-	}
 	return e.redactor.Text(e.err.Error())
 }
 
@@ -138,19 +140,31 @@ func (e *safeError) as(target any, r *Redactor) bool {
 	case **CLIError:
 		raw, ok := findRawCLIError(e.err)
 		if !ok {
-			return false
+			return asSafeDiagnostic(e.err, target, r)
 		}
-		*ptr = raw.withRedactor(r)
+		*ptr = &CLIError{
+			Binary:   r.Text(raw.Binary),
+			Args:     r.Args(raw.Args),
+			ExitCode: raw.ExitCode,
+			Stderr:   r.Text(raw.Stderr),
+		}
 		return true
 	case **SystemNotRunningError:
 		raw, ok := findRawSystemNotRunning(e.err)
 		if !ok {
-			return false
+			return asSafeDiagnostic(e.err, target, r)
 		}
 		*ptr = raw.withRedactor(r)
 		return true
+	case **exec.Error:
+		var raw *exec.Error
+		if !errors.As(e.err, &raw) {
+			return false
+		}
+		*ptr = &exec.Error{Name: r.Text(raw.Name), Err: WithRedactor(raw.Err, r)}
+		return true
 	default:
-		return asSafeDiagnostic(e.err, target)
+		return asSafeDiagnostic(e.err, target, r)
 	}
 }
 
@@ -226,19 +240,18 @@ func (e *SystemNotRunningError) AsRedacted(target any, r *diagnostic.Redactor) b
 	return true
 }
 
-func (e *CLIError) DiagnosticRedactor() *Redactor {
-	if e == nil {
-		return nil
-	}
-	return e.redactor
-}
-
 func (e *CLIError) AsRedacted(target any, r *diagnostic.Redactor) bool {
 	ptr, ok := target.(**CLIError)
 	if !ok || e == nil {
 		return false
 	}
-	*ptr = e.withRedactor(r)
+	if r == nil {
+		r = NewRedactor()
+	}
+	*ptr = &CLIError{
+		Binary: r.Text(e.Binary), Args: r.Args(e.Args),
+		ExitCode: e.ExitCode, Stderr: r.Text(e.Stderr),
+	}
 	return true
 }
 
@@ -251,7 +264,7 @@ func redactErrorValue(err error, r *Redactor) error {
 	}
 	switch value := err.(type) {
 	case *CLIError:
-		return value.withRedactor(r)
+		return &safeError{err: value, redactor: r}
 	case *SystemNotRunningError:
 		return value.withRedactor(r)
 	case *safeError:
@@ -356,15 +369,20 @@ func sameError(a, b error) bool {
 	return false
 }
 
-func asSafeDiagnostic(err error, target any) bool {
+func asSafeDiagnostic(err error, target any, r *Redactor) bool {
 	if err == nil {
 		return false
+	}
+	if provider, ok := err.(interface {
+		AsRedacted(any, *diagnostic.Redactor) bool
+	}); ok && provider.AsRedacted(target, r) {
+		return true
 	}
 	if _, safe := err.(interface{ DiagnosticSafe() }); safe {
 		return errors.As(err, target)
 	}
 	for _, child := range rawChildren(err) {
-		if asSafeDiagnostic(child, target) {
+		if asSafeDiagnostic(child, target, r) {
 			return true
 		}
 	}

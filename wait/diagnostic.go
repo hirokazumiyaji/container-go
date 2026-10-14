@@ -55,15 +55,16 @@ func DiagnosticValues(strategy Strategy) []string {
 			for _, value := range provider.DiagnosticSecrets() {
 				add(value)
 			}
-		}
-		switch composite := s.(type) {
-		case *AllStrategy:
-			for _, child := range composite.strategies {
-				collect(child)
-			}
-		case *AnyStrategy:
-			for _, child := range composite.strategies {
-				collect(child)
+		} else {
+			switch composite := s.(type) {
+			case *AllStrategy:
+				for _, child := range composite.strategies {
+					collect(child)
+				}
+			case *AnyStrategy:
+				for _, child := range composite.strategies {
+					collect(child)
+				}
 			}
 		}
 	}

@@ -91,8 +91,8 @@ func TestReviewFailedCreateCleanupErrorReachesCaller(t *testing.T) {
 	if !errors.As(err, &cleanupErr) {
 		t.Fatalf("err = %v (%T), want a *CleanupError", err, err)
 	}
-	if cleanupErr.Container != "myctr" {
-		t.Errorf("Container = %q, want myctr", cleanupErr.Container)
+	if cleanupErr.Container != "[REDACTED]" {
+		t.Errorf("Container = %q, want a redacted name", cleanupErr.Container)
 	}
 	// Both causes stay individually recoverable with errors.As.
 	var runErr *cli.CLIError
@@ -209,7 +209,7 @@ func TestReviewReuseRollbackPreservesBothErrors(t *testing.T) {
 	if !errors.As(err, &got) {
 		t.Fatalf("err = %v, want a *CleanupError; the rollback discarded it", err)
 	}
-	if got.Container != "reuse-rollback" {
+	if got.Container != "[REDACTED]" {
 		t.Errorf("Container = %q", got.Container)
 	}
 }

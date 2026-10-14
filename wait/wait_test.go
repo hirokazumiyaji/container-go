@@ -144,7 +144,7 @@ func TestForListeningPortRejectsInvalidConfiguration(t *testing.T) {
 			}
 			if configErr.Strategy != "ForListeningPort" ||
 				configErr.Field != "port specification" ||
-				configErr.Value != tt.port ||
+				(tt.port != "" && configErr.Value == tt.port) ||
 				configErr.Reason != tt.want {
 				t.Errorf("ConfigError = %+v", configErr)
 			}
@@ -352,6 +352,18 @@ func TestForLogCountsOccurrences(t *testing.T) {
 	}
 }
 
+func TestForLogRejectsOversizedPattern(t *testing.T) {
+	strategy := ForLog(strings.Repeat("x", maxLogLineSize+1))
+	err := strategy.validate()
+	if !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("validate error = %v, want invalid configuration", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || configErr.Field != "pattern" {
+		t.Fatalf("validate error = %v, want pattern ConfigError", err)
+	}
+}
+
 func TestForLogAsRegexp(t *testing.T) {
 	target := newFakeTarget()
 	pr, pw := io.Pipe()
@@ -391,7 +403,7 @@ func TestForLogStreamsHugeLinesWithoutScannerBufferLimit(t *testing.T) {
 func TestForLogPreservesTerminalReadError(t *testing.T) {
 	readErr := errors.New("log transport failed")
 	target := newFakeTarget()
-	target.logs = io.NopCloser(&terminalLogReader{err: readErr})
+	target.logs = io.NopCloser(&securityTerminalLogReader{err: readErr})
 
 	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
 	if !errors.Is(err, readErr) {
@@ -399,12 +411,12 @@ func TestForLogPreservesTerminalReadError(t *testing.T) {
 	}
 }
 
-type terminalLogReader struct {
+type securityTerminalLogReader struct {
 	err  error
 	sent bool
 }
 
-func (r *terminalLogReader) Read(p []byte) (int, error) {
+func (r *securityTerminalLogReader) Read(p []byte) (int, error) {
 	if !r.sent {
 		r.sent = true
 		return copy(p, []byte("not-ready")), nil

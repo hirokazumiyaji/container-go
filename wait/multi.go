@@ -31,13 +31,22 @@ func (s *AllStrategy) WithStartupTimeout(d time.Duration) *AllStrategy {
 	return s
 }
 
+func (s *AllStrategy) DiagnosticValues() []string {
+	var values []string
+	for _, child := range s.strategies {
+		values = append(values, DiagnosticValues(child)...)
+	}
+	return values
+}
+
 func (s *AllStrategy) validate() error {
 	// Negative composite timeouts historically meant unbounded. Keep
 	// that compatibility while still validating every child.
 	return validateStrategies(s.strategies)
 }
 
-func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *AllStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -166,13 +175,22 @@ func (s *AnyStrategy) WithStartupTimeout(d time.Duration) *AnyStrategy {
 	return s
 }
 
+func (s *AnyStrategy) DiagnosticValues() []string {
+	var values []string
+	for _, child := range s.strategies {
+		values = append(values, DiagnosticValues(child)...)
+	}
+	return values
+}
+
 func (s *AnyStrategy) validate() error {
 	// Negative composite timeouts historically meant unbounded. Keep
 	// that compatibility while still validating every child.
 	return validateStrategies(s.strategies)
 }
 
-func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}
@@ -256,7 +274,7 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) error {
 			return errors.Join(append([]error{terminalErr}, append(errs, childErrs...)...)...)
 		}
 	}
-	return errors.Join(errs...)
+	return safeDiagnosticError(errors.Join(errs...), s.DiagnosticValues()...)
 }
 
 func finalLifecycleCheck(ctx context.Context, target Target, what string) error {

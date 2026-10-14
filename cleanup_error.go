@@ -1,6 +1,10 @@
 package container
 
-import "errors"
+import (
+	"errors"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
+)
 
 // CleanupError reports that an operation failed and the container it created
 // could not be removed. It joins the cleanup failure onto the operation's
@@ -24,6 +28,18 @@ func (e *CleanupError) Error() string {
 }
 
 func (e *CleanupError) Unwrap() error { return e.Err }
+
+func (e *CleanupError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**CleanupError)
+	if !ok || e == nil {
+		return false
+	}
+	if r == nil {
+		r = cli.NewRedactor()
+	}
+	*ptr = &CleanupError{Container: r.Text(e.Container), Err: cli.WithRedactor(e.Err, r)}
+	return true
+}
 
 // withCleanupError attaches a cleanup failure to the error that caused it. The
 // original stays first in the chain, so errors.Is on the operation error still

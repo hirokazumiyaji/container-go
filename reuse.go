@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // reuseFlights collapses concurrent WithReuse get-or-create calls that
@@ -20,6 +21,15 @@ type reuseCleanupWarning struct {
 
 func (w *reuseCleanupWarning) Error() string { return w.err.Error() }
 func (w *reuseCleanupWarning) Unwrap() error { return w.err }
+
+func (w *reuseCleanupWarning) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**reuseCleanupWarning)
+	if !ok || w == nil {
+		return false
+	}
+	*ptr = &reuseCleanupWarning{err: cli.WithRedactor(w.err, r)}
+	return true
+}
 
 func isReuseCleanupWarning(err error) bool {
 	var warning *reuseCleanupWarning
@@ -37,6 +47,15 @@ func (e *reuseCreateError) Error() string {
 
 func (e *reuseCreateError) Unwrap() []error {
 	return []error{e.operation, e.cleanup}
+}
+
+func (e *reuseCreateError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**reuseCreateError)
+	if !ok || e == nil {
+		return false
+	}
+	*ptr = &reuseCreateError{operation: cli.WithRedactor(e.operation, r), cleanup: cli.WithRedactor(e.cleanup, r)}
+	return true
 }
 
 func newReuseCreateError(operation, cleanup error) error {
@@ -68,6 +87,15 @@ type reuseIncompleteSetupError struct {
 
 func (e *reuseIncompleteSetupError) Error() string { return e.err.Error() }
 func (e *reuseIncompleteSetupError) Unwrap() error { return e.err }
+
+func (e *reuseIncompleteSetupError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**reuseIncompleteSetupError)
+	if !ok || e == nil {
+		return false
+	}
+	*ptr = &reuseIncompleteSetupError{err: cli.WithRedactor(e.err, r)}
+	return true
+}
 func isReuseIncompleteSetupError(err error) bool {
 	var incomplete *reuseIncompleteSetupError
 	return errors.As(err, &incomplete)
@@ -338,7 +366,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
 		case StateStopped:
 			if recreated {
-				return nil, fmt.Errorf("reuse %s: container stayed stopped after recreate", cfg.name)
+				return nil, fmt.Errorf("reuse: container stayed stopped after recreate")
 			}
 			// Only recycle containers this library created for reuse
 			// with a compatible resolved image; never delete foreign leftovers.
@@ -745,11 +773,16 @@ func reuseWait(ctx context.Context, cfg *config, ctr *Container) error {
 		return nil
 	}
 	if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: ctr}); err != nil {
-		tail := ctr.logTail(context.WithoutCancel(ctx))
-		if tail != "" {
-			return fmt.Errorf("reuse %s failed to become ready: %w\ncontainer logs:\n%s", ctr.id, err, tail)
+		values := wait.DiagnosticValues(cfg.waitStrategy)
+		tail, tailErr := ctr.logTailWithError(context.WithoutCancel(ctx), values...)
+		safeErr := ctr.publicError(fmt.Errorf("reuse failed to become ready: %w", err), values...)
+		if tailErr != nil {
+			return ctr.publicError(fmt.Errorf("%w; container log tail unavailable: %w", safeErr, tailErr), values...)
 		}
-		return fmt.Errorf("reuse %s failed to become ready: %w", ctr.id, err)
+		if tail != "" {
+			return ctr.publicError(fmt.Errorf("%w; container logs: %s", safeErr, tail), values...)
+		}
+		return safeErr
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -836,7 +869,7 @@ func checkReuseIdentity(info *engineInfo, cfg *config) error {
 		return fmt.Errorf("reuse %s: existing container is not managed by container-go", cfg.name)
 	}
 	if info.labels[reuseLabel] != "true" {
-		return fmt.Errorf("reuse %s: existing container was not created with WithReuse", cfg.name)
+		return fmt.Errorf("reuse: existing container was not created with WithReuse")
 	}
 	if !validCreationID(info.labels[creationLabel]) {
 		return identityError(fmt.Sprintf("reuse %s: existing container has no valid creation generation", cfg.name))
@@ -1304,14 +1337,14 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	}
 	eng, err := detectEngine()
 	if err != nil {
-		return nil, err
+		return nil, safePublicError(err)
 	}
 	return pruneReuseGroupWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, group)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
-		return nil, err
+		return nil, safePublicError(err, group)
 	}
 	return pruneListedWithGroup(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)

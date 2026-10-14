@@ -12,8 +12,8 @@ The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The install command below is for the released
 API; it does not install the development-only APIs documented below.
 
-The root library checkout requires Go 1.23 or later. The nested
-`bench/` module used by `make bench-integration` requires Go 1.25 or
+The root library checkout requires Go 1.26 or later. The nested
+`bench/` module used by `make bench-integration` requires Go 1.26 or
 later. The `v0.2.0` module requires Go 1.27 or later.
 
 | API or behavior | `v0.2.0` | Current development checkout |
@@ -131,9 +131,10 @@ are handled by the docker CLI itself. The library uses only
 `DOCKER_HOST=tcp://...` to select a remote Docker endpoint; a remote
 Docker context is not detected.
 
-Go 1.23+ is required for the root module. The optional nested
-`bench/` benchmark module requires Go 1.25+ because it pins a newer
-testcontainers-go toolchain; see [bench/README.md](bench/README.md).
+Go 1.26+ is required for the root module. The optional nested
+`bench/` benchmark module requires Go 1.26+ because it depends on the
+root module and pins a newer testcontainers-go toolchain; see
+[bench/README.md](bench/README.md).
 
 Verified backend behavior (the CLI stderr wording and inspect JSON shapes
 this library matches against):
@@ -893,7 +894,7 @@ make test                # unit tests (no backend needed)
 make vet
 make integration         # integration tests (skips bench/singleflight); each backend skips if unavailable
 make integration-docker  # Docker-backend integration tests only
-make bench-integration   # pull-heavy bench and singleflight (bench module needs Go 1.25+)
+make bench-integration   # pull-heavy bench and singleflight (bench module needs Go 1.26+)
 ```
 
 Integration tests pull library images via `public.ecr.aws/docker/library/...`
@@ -901,7 +902,7 @@ to avoid anonymous Docker Hub rate limits. Set `CONTAINERGO_BACKEND=apple`
 or `docker` to skip the other backend.
 
 GitHub Actions runs unit tests and race tests on `ubuntu-latest` with Go
-1.23.0 and the stable Go release, then runs lint and `govulncheck`. It
+1.26.0 and the stable Go release, then runs lint and `govulncheck`. It
 also runs the Docker integration matrix on `ubuntu-latest`; Apple
 Container integration remains a local test because the hosted runners do
 not provide that service. The non-integration documentation test extracts

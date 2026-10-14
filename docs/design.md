@@ -7,7 +7,7 @@ Last synchronized: 2026-09-25
 Targets: Apple Container CLI 1.2.2 and 1.3.0 (macOS 26+, Apple Silicon;
 the versions represented by repository evidence), Docker 29.x (29.7.2
 local run and a v29 inspect fixture; Linux, Windows, macOS), root module
-Go 1.23+; nested `bench/` module Go 1.25+
+Go 1.26+; nested `bench/` module Go 1.26+
 
 This document describes the current implementation in this checkout.
 The **Implementation phases** section is retained as a historical plan;
@@ -31,8 +31,8 @@ contracts.
 
 The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The `v0.2.0` module requires Go 1.27 or
-later; the root checkout requires Go 1.23 or later, while the nested
-`bench/` module requires Go 1.25 or later. The released API and the
+later; the root checkout requires Go 1.26 or later, while the nested
+`bench/` module requires Go 1.26 or later. The released API and the
 current development API are not interchangeable: `LogsOptions` /
 `LogsWithOptions`, the additional `wait.ForHTTP` setters, exported
 `wait.AllStrategy` / `AnyStrategy` with composite `WithStartupTimeout`,
@@ -41,7 +41,7 @@ and the root `CLIError`, `ErrContainerNotFound`, and
 `v0.2.0`. The core `Run`, options, lifecycle, endpoints, `Exec`, `Logs`,
 `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and
 original wait strategies were present in `v0.2.0`.
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.23+
+Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.26+
 
 ## Purpose
 
@@ -1019,10 +1019,10 @@ its CLI/service first and skips cleanly when it is unavailable.
 `make integration` runs both backends and skips the pull-heavy bench
 and single-flight scenarios; `make integration-docker` selects Docker;
 `make bench-integration` runs the pull-heavy scenarios and the separate
-benchmark module (the nested `bench/` module requires Go 1.25+).
+benchmark module (the nested `bench/` module requires Go 1.26+).
 
 **CI**: `.github/workflows/ci.yml` runs unit tests and race tests on
-`ubuntu-latest` with Go 1.23.0 and the stable Go release, plus lint and
+`ubuntu-latest` with Go 1.26.0 and the stable Go release, plus lint and
 `govulncheck`. It also runs the Docker integration matrix on
 `ubuntu-latest`. Apple Container integration is intentionally local:
 the hosted Linux runners do not provide the Apple Container service or

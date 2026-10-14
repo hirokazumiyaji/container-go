@@ -116,7 +116,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # Prefer a patched toolchain over the go 1.25.0 floor in
+          # Prefer a patched toolchain over the go 1.26.0 floor in
           # bench/go.mod: release-check runs govulncheck against the stdlib,
           # and 1.25.0 still reports CVEs fixed in later patch releases.
           # Pin the patch level so the gate does not float.

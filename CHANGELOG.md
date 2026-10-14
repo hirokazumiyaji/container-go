@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 This section describes development after the tagged `v0.2.0` release.
 The APIs listed under this section are not part of `v0.2.0` unless a
 release note explicitly says otherwise. The root checkout requires Go
-1.23 or later; the nested `bench/` module requires Go 1.25 or later;
+1.26 or later; the nested `bench/` module requires Go 1.26 or later;
 the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
@@ -34,6 +34,10 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- Raise the root module Go floor from 1.23.0 to 1.26.0 so
+  `golang.org/x/sys` v0.49.0 can be used. CI older-Go legs now run
+  1.26.0 instead of 1.23.0. The nested `bench/` module matches the
+  same floor.
 - Apply `WithFiles` and `WithPullPolicy(PullAlways)` for every
   `WithReuse` caller, including attach callers (#94). Pull failures and
   post-pull image mismatches are returned without replacing a running

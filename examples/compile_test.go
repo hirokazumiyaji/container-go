@@ -84,6 +84,23 @@ func TestDocumentationModuleQuotesLocalReplacePath(t *testing.T) {
 	}
 }
 
+func TestDocumentationModuleUsesRootGoVersion(t *testing.T) {
+	root := documentationRoot(t)
+	data, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		t.Fatalf("read root go.mod: %v", err)
+	}
+	version := documentationGoVersion(data)
+	if version == "" {
+		t.Fatal("root go.mod has no go directive")
+	}
+	got := documentationModule(root)
+	want := "\ngo " + version + "\n"
+	if !strings.Contains(got, want) {
+		t.Fatalf("temporary go.mod does not use root go version %s:\n%s", version, got)
+	}
+}
+
 func documentationRoot(t *testing.T) string {
 	t.Helper()
 	_, file, _, ok := runtime.Caller(0)
@@ -176,9 +193,21 @@ func normalizedTextSource(source string) []byte {
 	return []byte(strings.Join(lines, "\n"))
 }
 
+func documentationGoVersion(data []byte) string {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "go" {
+			return fields[1]
+		}
+	}
+	return ""
+}
+
 func documentationModule(root string) string {
+	goVersion := ""
 	extraRequires := ""
 	if data, err := os.ReadFile(filepath.Join(root, "go.mod")); err == nil {
+		goVersion = documentationGoVersion(data)
 		lines := strings.Split(string(data), "\n")
 		var requires []string
 		inRequire := false
@@ -204,7 +233,11 @@ func documentationModule(root string) string {
 			extraRequires = "\n" + strings.Join(requires, "\n")
 		}
 	}
-	return fmt.Sprintf("module documentation-example\n\ngo 1.23.0\n\nrequire (\n\tgithub.com/hirokazumiyaji/container-go v0.0.0%s\n)\n\nreplace github.com/hirokazumiyaji/container-go => %s\n", extraRequires, strconv.Quote(filepath.ToSlash(root)))
+	if goVersion == "" {
+		// Used when the caller passes a synthetic root (no go.mod).
+		goVersion = "1.26.0"
+	}
+	return fmt.Sprintf("module documentation-example\n\ngo %s\n\nrequire (\n\tgithub.com/hirokazumiyaji/container-go v0.0.0%s\n)\n\nreplace github.com/hirokazumiyaji/container-go => %s\n", goVersion, extraRequires, strconv.Quote(filepath.ToSlash(root)))
 }
 
 func compileDocumentationBlocks(t *testing.T, root string, blocks []documentationBlock) {

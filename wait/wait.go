@@ -1536,47 +1536,74 @@ func expandArrowJunctions(orig string, start, end int, occupied []bool) (int, in
 }
 
 // expandPairedDelimiters absorbs a balanced (), [], {}, <>, or quote/backtick
-// pair that wraps only the discarded span (after separator expansion). Internal
-// whitespace between the delimiters and the span is included so "[ canceled ]"
-// does not leave "[ ]". Pairs around retained children stay intact because
-// those spans remain occupied and block walking out to the closer.
+// pair (including common Unicode smart quotes) that wraps only the discarded
+// span (after separator expansion). Internal whitespace between the delimiters
+// and the span is included so "[ canceled ]" does not leave "[ ]". Pairs around
+// retained children stay intact because those spans remain occupied and block
+// walking out to the closer.
 func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, int) {
+	pairs := [][2]rune{
+		{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
+		{'"', '"'}, {'\'', '\''}, {'`', '`'},
+		{'\u201c', '\u201d'}, // “ ”
+		{'\u2018', '\u2019'}, // ‘ ’
+		{'\u00ab', '\u00bb'}, // « »
+		{'\u2039', '\u203a'}, // ‹ ›
+	}
 	for {
 		expanded := false
-		for _, pair := range [][2]byte{
-			{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
-			{'"', '"'}, {'\'', '\''}, {'`', '`'},
-		} {
-			open := start
+		for _, pair := range pairs {
+			openEnd := start
 			for {
-				n := separatorExtentBefore(orig, open, occupied)
+				n := separatorExtentBefore(orig, openEnd, occupied)
 				if n == 0 {
 					break
 				}
-				open -= n
+				openEnd -= n
 			}
-			open--
-			close := end
-			for {
-				n := separatorExtentAt(orig, close, occupied)
-				if n == 0 {
-					break
-				}
-				close += n
-			}
-			if open < 0 || close >= len(orig) || occupied[open] || occupied[close] {
+			if openEnd <= 0 {
 				continue
 			}
-			if orig[open] == pair[0] && orig[close] == pair[1] {
-				start, end = open, close+1
-				expanded = true
-				break
+			openRune, openSize := utf8.DecodeLastRuneInString(orig[:openEnd])
+			openStart := openEnd - openSize
+			if openRune != pair[0] || spanOccupied(occupied, openStart, openEnd) {
+				continue
 			}
+
+			closeStart := end
+			for {
+				n := separatorExtentAt(orig, closeStart, occupied)
+				if n == 0 {
+					break
+				}
+				closeStart += n
+			}
+			if closeStart >= len(orig) {
+				continue
+			}
+			closeRune, closeSize := utf8.DecodeRuneInString(orig[closeStart:])
+			closeEnd := closeStart + closeSize
+			if closeRune != pair[1] || spanOccupied(occupied, closeStart, closeEnd) {
+				continue
+			}
+
+			start, end = openStart, closeEnd
+			expanded = true
+			break
 		}
 		if !expanded {
 			return start, end
 		}
 	}
+}
+
+func spanOccupied(occupied []bool, start, end int) bool {
+	for i := start; i < end; i++ {
+		if occupied[i] {
+			return true
+		}
+	}
+	return false
 }
 
 func isErrorSeparator(b byte) bool {

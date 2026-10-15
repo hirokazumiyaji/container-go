@@ -1076,8 +1076,11 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			order:   i,
 		})
 	}
-	// A phrase shared by a retained child and a discarded child cannot be
-	// attributed safely without the format string; keep the original safe text.
+	// Phrases shared by, or nested inside, retained and discarded children
+	// cannot be attributed safely without the format string (for example
+	// discarded "context canceled" vs retained "canceled"); keep the original
+	// safe text rather than letting the longer discarded claim erase the
+	// retained diagnostic.
 	retainedPhrase := make(map[string]struct{})
 	discardedPhrase := make(map[string]struct{})
 	for _, it := range items {
@@ -1087,9 +1090,11 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			retainedPhrase[it.phrase] = struct{}{}
 		}
 	}
-	for phrase := range discardedPhrase {
-		if _, ok := retainedPhrase[phrase]; ok {
-			return orig
+	for d := range discardedPhrase {
+		for r := range retainedPhrase {
+			if d == r || strings.Contains(d, r) || strings.Contains(r, d) {
+				return orig
+			}
 		}
 	}
 	sort.SliceStable(items, func(i, j int) bool {

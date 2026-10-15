@@ -1819,6 +1819,21 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	if got.Error() != "context canceled" {
 		t.Fatalf("mixed duplicate partial sanitizing = %q, want original safe rendering", got.Error())
 	}
+
+	overlapDup := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("canceled"), errors.New(secret)},
+		msg:  "context canceled",
+	}
+	got = nonContextCause(overlapDup)
+	if got == nil {
+		t.Fatal("overlapping retained phrase partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("overlapping retained phrase partial sanitizing leaked secret: %q", got.Error())
+	}
+	if got.Error() != "context canceled" {
+		t.Fatalf("overlapping retained phrase partial sanitizing = %q, want original safe rendering", got.Error())
+	}
 }
 
 func TestIsStdlibPackagePathAllowlist(t *testing.T) {

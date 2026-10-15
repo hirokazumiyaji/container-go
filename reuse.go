@@ -566,7 +566,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := attachDefaultNetworkForConfig(ctx, cfg, createdInfo); err != nil {
 		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 	}
-	ctr.pack().defaultNetwork = createdInfo.defaultNetwork
+	ctr.storeDefaultNetwork(createdInfo.defaultNetwork)
 	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}

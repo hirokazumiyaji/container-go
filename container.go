@@ -1521,15 +1521,14 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer c.pack().inspectMu.Unlock()
-	if c.pack().defaultNetwork != "" {
-		return c.pack().defaultNetwork, nil
+	if name := c.cachedDefaultNetwork(); name != "" {
+		return name, nil
 	}
 	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
 	if err != nil {
 		return "", err
 	}
-	c.pack().defaultNetwork = name
-	return name, nil
+	return c.storeDefaultNetwork(name), nil
 }
 
 func (c *Container) attachDefaultNetwork(ctx context.Context, info *engineInfo) error {
@@ -1565,10 +1564,30 @@ func (c *Container) applyCachedDefaultNetwork(ctx context.Context, info *engineI
 		return err
 	}
 	defer c.pack().inspectMu.Unlock()
-	if c.pack().defaultNetwork != "" {
-		info.defaultNetwork = c.pack().defaultNetwork
+	if name := c.cachedDefaultNetwork(); name != "" {
+		info.defaultNetwork = name
 	}
 	return nil
+}
+
+// cachedDefaultNetwork and storeDefaultNetwork synchronize the lazily learned
+// Docker daemon default with pack.mu. Endpoint's short-TTL cache reads the
+// same field under that lock; writing it under inspectMu alone races.
+func (c *Container) cachedDefaultNetwork() string {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.defaultNetwork
+}
+
+func (c *Container) storeDefaultNetwork(name string) string {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.defaultNetwork == "" && name != "" {
+		p.defaultNetwork = name
+	}
+	return p.defaultNetwork
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

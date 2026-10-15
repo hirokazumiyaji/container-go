@@ -2,6 +2,7 @@ package wait
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"text/template"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -917,6 +919,26 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	}
 	if errors.Is(gotMarshal.Err, context.Canceled) {
 		t.Fatalf("json marshaler error Err = %v, must not retain canceled", gotMarshal.Err)
+	}
+
+	execTemplateErr := template.ExecError{Name: "tmpl", Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(execTemplateErr)
+	var gotExecTemplate template.ExecError
+	if !errors.As(got, &gotExecTemplate) {
+		t.Fatalf("template exec error = %v, want template.ExecError", got)
+	}
+	if errors.Is(gotExecTemplate.Err, context.Canceled) {
+		t.Fatalf("template exec error Err = %v, must not retain canceled", gotExecTemplate.Err)
+	}
+
+	rootsErr := x509.SystemRootsError{Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(rootsErr)
+	var gotRoots x509.SystemRootsError
+	if !errors.As(got, &gotRoots) {
+		t.Fatalf("system roots error = %v, want x509.SystemRootsError", got)
+	}
+	if errors.Is(gotRoots.Err, context.Canceled) {
+		t.Fatalf("system roots error Err = %v, must not retain canceled", gotRoots.Err)
 	}
 }
 

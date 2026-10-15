@@ -565,28 +565,33 @@ func replaceUnwrappedCause(err, filtered error) error {
 	return &contextStrippedCause{original: err, cause: filtered}
 }
 
-// cloneExportedErrField rebuilds a standard-library pointer error whose
-// exported Err field holds the wrapped cause.
+// cloneExportedErrField rebuilds a standard-library error whose exported Err
+// field holds the wrapped cause, preserving whether the original was a pointer
+// or value type (for example template.ExecError vs *os.PathError).
 func cloneExportedErrField(err, filtered error) (error, bool) {
 	if !isStdlibPackagePath(errorPkgPath(err)) {
 		return nil, false
 	}
 	v := reflect.ValueOf(err)
-	if v.Kind() != reflect.Pointer || v.IsNil() {
-		return nil, false
+	wasPointer := false
+	if v.Kind() == reflect.Pointer {
+		if v.IsNil() {
+			return nil, false
+		}
+		wasPointer = true
+		v = v.Elem()
 	}
-	elem := v.Elem()
-	if elem.Kind() != reflect.Struct {
+	if v.Kind() != reflect.Struct {
 		return nil, false
 	}
 	errorType := reflect.TypeOf((*error)(nil)).Elem()
-	field := elem.FieldByName("Err")
+	field := v.FieldByName("Err")
 	if !field.IsValid() || field.Type() != errorType {
 		return nil, false
 	}
-	clonePtr := reflect.New(elem.Type())
-	clonePtr.Elem().Set(elem)
-	errField := clonePtr.Elem().FieldByName("Err")
+	clone := reflect.New(v.Type()).Elem()
+	clone.Set(v)
+	errField := clone.FieldByName("Err")
 	if !errField.CanSet() {
 		return nil, false
 	}
@@ -595,7 +600,13 @@ func cloneExportedErrField(err, filtered error) (error, bool) {
 	} else {
 		errField.Set(reflect.ValueOf(filtered))
 	}
-	cloned, ok := clonePtr.Interface().(error)
+	if wasPointer {
+		ptr := reflect.New(v.Type())
+		ptr.Elem().Set(clone)
+		cloned, ok := ptr.Interface().(error)
+		return cloned, ok
+	}
+	cloned, ok := clone.Interface().(error)
 	return cloned, ok
 }
 

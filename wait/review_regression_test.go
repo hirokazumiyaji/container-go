@@ -1434,6 +1434,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("single-quote-discarded wrap = %q, want quotes removed with discarded child", got.Error())
 	}
 
+	backtickDiscarded := fmt.Errorf("`%w` %w", context.Canceled, commaCause)
+	got = nonContextCause(backtickDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("backtick-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("backtick-discarded wrap = %q, want backticks removed with discarded child", got.Error())
+	}
+
+	backtickRetained := fmt.Errorf("%w `%w`", context.Canceled, commaCause)
+	got = nonContextCause(backtickRetained)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("backtick retained wrap = %v, want cause", got)
+	}
+	if got.Error() != "`backend`" {
+		t.Fatalf("backtick retained wrap = %q, want backticks around retained child", got.Error())
+	}
+
 	nestedPairs := fmt.Errorf("[(%w)] %w", context.Canceled, commaCause)
 	got = nonContextCause(nestedPairs)
 	if !errors.Is(got, commaCause) {

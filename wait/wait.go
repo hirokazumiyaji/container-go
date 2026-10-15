@@ -18,6 +18,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -1457,8 +1459,12 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 // "follow logs:" or "cancellation:" are not consumed. Expansion never enters
 // spans already claimed by another child.
 func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
-	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
-		end++
+	for {
+		n := separatorExtentAt(orig, end, occupied)
+		if n == 0 {
+			break
+		}
+		end += n
 	}
 	prevEnd := -1
 	for i := start - 1; i >= 0; i-- {
@@ -1467,36 +1473,22 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 			break
 		}
 	}
-	if prevEnd >= 0 {
-		onlySeparators := true
-		for i := prevEnd; i < start; i++ {
-			if !isErrorSeparator(orig[i]) {
-				onlySeparators = false
-				break
-			}
-		}
-		if onlySeparators {
-			start = prevEnd
-		}
+	if prevEnd >= 0 && regionOnlySeparators(orig, prevEnd, start, occupied) {
+		start = prevEnd
 	}
 	start, end = expandPairedDelimiters(orig, start, end, occupied)
 	start, end = expandArrowJunctions(orig, start, end, occupied)
 	// Absorb any separators left beside a removed pair or arrow (for example
 	// the space after "[canceled] backend" or "canceled -> backend").
-	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
-		end++
+	for {
+		n := separatorExtentAt(orig, end, occupied)
+		if n == 0 {
+			break
+		}
+		end += n
 	}
-	if prevEnd >= 0 {
-		onlySeparators := true
-		for i := prevEnd; i < start; i++ {
-			if !isErrorSeparator(orig[i]) {
-				onlySeparators = false
-				break
-			}
-		}
-		if onlySeparators {
-			start = prevEnd
-		}
+	if prevEnd >= 0 && regionOnlySeparators(orig, prevEnd, start, occupied) {
+		start = prevEnd
 	}
 	return start, end
 }
@@ -1513,25 +1505,29 @@ func expandArrowJunctions(orig string, start, end int, occupied []bool) (int, in
 		end++
 	}
 	if start > 0 && !occupied[start-1] {
-		i := start - 1
-		for i >= 0 && !occupied[i] && isErrorSeparator(orig[i]) {
-			i--
+		i := start
+		for {
+			n := separatorExtentBefore(orig, i, occupied)
+			if n == 0 {
+				break
+			}
+			i -= n
 		}
-		if i >= 0 && !occupied[i] {
+		if i > 0 && !occupied[i-1] {
 			switch {
-			case orig[i] == '>' && i > 0 && !occupied[i-1] &&
-				(orig[i-1] == '-' || orig[i-1] == '='):
-				start = i - 1
-			case orig[i] == '<':
+			case orig[i-1] == '>' && i > 1 && !occupied[i-2] &&
+				(orig[i-2] == '-' || orig[i-2] == '='):
+				start = i - 2
+			case orig[i-1] == '<':
 				hasShaft := false
-				for j := i + 1; j < start; j++ {
+				for j := i; j < start; j++ {
 					if orig[j] == '-' || orig[j] == '=' {
 						hasShaft = true
 						break
 					}
 				}
 				if hasShaft {
-					start = i
+					start = i - 1
 				}
 			}
 		}
@@ -1551,13 +1547,22 @@ func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, 
 			{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
 			{'"', '"'}, {'\'', '\''}, {'`', '`'},
 		} {
-			open := start - 1
-			for open >= 0 && !occupied[open] && isErrorSeparator(orig[open]) {
-				open--
+			open := start
+			for {
+				n := separatorExtentBefore(orig, open, occupied)
+				if n == 0 {
+					break
+				}
+				open -= n
 			}
+			open--
 			close := end
-			for close < len(orig) && !occupied[close] && isErrorSeparator(orig[close]) {
-				close++
+			for {
+				n := separatorExtentAt(orig, close, occupied)
+				if n == 0 {
+					break
+				}
+				close += n
 			}
 			if open < 0 || close >= len(orig) || occupied[open] || occupied[close] {
 				continue
@@ -1575,19 +1580,84 @@ func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, 
 }
 
 func isErrorSeparator(b byte) bool {
-	// Treat control/whitespace and unpaired framing punctuation as separators
-	// so compact multi-wraps (%w - %w, %w/%w, etc.) do not leave leading junk.
+	return isErrorSeparatorRune(rune(b))
+}
+
+func isErrorSeparatorRune(r rune) bool {
+	// Treat whitespace and unpaired framing punctuation as separators so
+	// compact multi-wraps (%w - %w, %w — %w, etc.) do not leave leading junk.
 	// Paired delimiters such as ()[]{}<> are not absorbed independently; that
 	// would leave a dangling closer around a retained child.
-	if b <= ' ' {
+	if r <= ' ' || unicode.IsSpace(r) {
 		return true
 	}
-	switch b {
-	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '.', '!', '?', '#', '@', '&', '*', '%', '^':
+	switch r {
+	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '.', '!', '?', '#', '@', '&', '*', '%', '^',
+		'\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2015', '\u2212':
 		return true
 	default:
 		return false
 	}
+}
+
+// separatorExtentAt returns the byte length of a separator rune starting at i,
+// or 0 if i is not a free separator.
+func separatorExtentAt(orig string, i int, occupied []bool) int {
+	if i < 0 || i >= len(orig) || occupied[i] {
+		return 0
+	}
+	r, size := utf8.DecodeRuneInString(orig[i:])
+	if r == utf8.RuneError && size == 1 {
+		if isErrorSeparator(orig[i]) {
+			return 1
+		}
+		return 0
+	}
+	if !isErrorSeparatorRune(r) {
+		return 0
+	}
+	for j := i; j < i+size; j++ {
+		if occupied[j] {
+			return 0
+		}
+	}
+	return size
+}
+
+// separatorExtentBefore returns the byte length of a separator rune ending at
+// end, or 0 if that position is not a free separator.
+func separatorExtentBefore(orig string, end int, occupied []bool) int {
+	if end <= 0 || end > len(orig) || occupied[end-1] {
+		return 0
+	}
+	r, size := utf8.DecodeLastRuneInString(orig[:end])
+	if r == utf8.RuneError && size == 1 {
+		if isErrorSeparator(orig[end-1]) {
+			return 1
+		}
+		return 0
+	}
+	start := end - size
+	if !isErrorSeparatorRune(r) {
+		return 0
+	}
+	for j := start; j < end; j++ {
+		if occupied[j] {
+			return 0
+		}
+	}
+	return size
+}
+
+func regionOnlySeparators(orig string, from, to int, occupied []bool) bool {
+	for i := from; i < to; {
+		n := separatorExtentAt(orig, i, occupied)
+		if n == 0 {
+			return false
+		}
+		i += n
+	}
+	return true
 }
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a

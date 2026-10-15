@@ -1014,6 +1014,32 @@ func allDiscardedContextChildren(inners []error) bool {
 }
 
 func allChildTextAppearsIn(orig string, inners []error) bool {
+	// Each child needs its own occurrence. A coalesced rendering such as
+	// "context canceled; public" must not count as fully rendering two
+	// identical "public" children.
+	occupied := make([]bool, len(orig))
+	claim := func(phrase string) bool {
+		for i := 0; i+len(phrase) <= len(orig); i++ {
+			if orig[i:i+len(phrase)] != phrase {
+				continue
+			}
+			overlap := false
+			for j := i; j < i+len(phrase); j++ {
+				if occupied[j] {
+					overlap = true
+					break
+				}
+			}
+			if overlap {
+				continue
+			}
+			for j := i; j < i+len(phrase); j++ {
+				occupied[j] = true
+			}
+			return true
+		}
+		return false
+	}
 	for _, inner := range inners {
 		if inner == nil {
 			continue
@@ -1022,7 +1048,7 @@ func allChildTextAppearsIn(orig string, inners []error) bool {
 		if phrase == "" {
 			continue
 		}
-		if !strings.Contains(orig, phrase) {
+		if !claim(phrase) {
 			return false
 		}
 	}

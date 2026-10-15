@@ -1913,6 +1913,24 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("overlapping retained phrase partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 
+	coalescedDup := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("public"), errors.New("public")},
+		msg:  "context canceled; public",
+	}
+	got = nonContextCause(coalescedDup)
+	if got == nil {
+		t.Fatal("coalesced duplicate partial sanitizing wrapper dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("coalesced duplicate partial sanitizing = %v, must drop canceled", got)
+	}
+	if got.Error() != "public" {
+		t.Fatalf("coalesced duplicate partial sanitizing = %q, want framed coalesced retained text", got.Error())
+	}
+	if strings.Count(got.Error(), "public") != 1 {
+		t.Fatalf("coalesced duplicate partial sanitizing = %q, must not expand coalesced duplicates", got.Error())
+	}
+
 	nestedBackend := &reviewTypedCause{message: "backend"}
 	nestedMixed := errors.Join(context.Canceled, nestedBackend)
 	nestedPartial := &reviewSanitizingMultiWrapper{

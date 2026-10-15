@@ -158,6 +158,28 @@ func TestReceiveLogScanResultPrefersQueuedTerminalCause(t *testing.T) {
 	}
 }
 
+type reviewLogCauseTarget struct {
+	cause   error
+	started chan struct{}
+	once    sync.Once
+}
+
+func (t *reviewLogCauseTarget) Endpoint(context.Context, string) (string, error) {
+	return "", t.cause
+}
+func (t *reviewLogCauseTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *reviewLogCauseTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	t.once.Do(func() {
+		if t.started != nil {
+			close(t.started)
+		}
+	})
+	return &waitContractErrorReadCloser{err: t.cause}, nil
+}
+func (t *reviewLogCauseTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, t.cause
+}
+
 func TestForLogKeepsContextAndStreamCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "scanner backend failure"}
 	cases := []struct {
@@ -184,15 +206,20 @@ func TestForLogKeepsContextAndStreamCause(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			callerCtx, cancel := tc.ctx()
 			defer cancel()
-			target := &waitCauseTarget{cause: cause}
+			started := make(chan struct{})
+			target := &reviewLogCauseTarget{cause: cause, started: started}
 			done := make(chan error, 1)
 			start := time.Now()
 			go func() {
 				done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(callerCtx, target)
 			}()
 			if tc.name == "caller-cancel" {
-				time.Sleep(5 * time.Millisecond)
-				cancel()
+				select {
+				case <-started:
+					cancel()
+				case <-time.After(time.Second):
+					t.Fatal("FollowLogs did not start")
+				}
 			}
 			var err error
 			select {
@@ -422,12 +449,13 @@ func TestForAllClassifiesDeadlineSourceAtRaceBoundary(t *testing.T) {
 				t.Fatal("child did not start")
 			}
 			if tc.wantStartupLabel {
+				// Leave the caller unexpired so classification cannot race
+				// onto callerCtx.Err() and mislabel a startup timeout.
 				select {
 				case <-canceled:
 				case <-time.After(time.Second):
 					t.Fatal("internal startup timeout did not reach child")
 				}
-				caller.expire()
 			} else {
 				caller.expire()
 				select {

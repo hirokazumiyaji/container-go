@@ -1415,24 +1415,13 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 
 // expandRemovalSeparators absorbs unoccupied separators adjacent to a discarded
 // child on either side. Expansion never enters spans already claimed by another
-// child, which would otherwise produce overlapping edits or drop retained text.
+// child (for example the leading ':' of ":backend:"), which would otherwise
+// produce overlapping edits or drop retained text.
 func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
 	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
-		// Stop before consuming ':'/';' that belongs to the next child when
-		// that punctuation is not yet marked occupied (for example the leading
-		// ':' of an unclaimed ":backend:"). Commas and newlines between
-		// children are always framing and are absorbed until the next claim.
-		if (orig[end] == ':' || orig[end] == ';') &&
-			end+1 < len(orig) && !isErrorSeparator(orig[end+1]) {
-			break
-		}
 		end++
 	}
 	for start > 0 && !occupied[start-1] && isErrorSeparator(orig[start-1]) {
-		if (orig[start-1] == ':' || orig[start-1] == ';') &&
-			start >= 2 && !isErrorSeparator(orig[start-2]) {
-			break
-		}
 		start--
 	}
 	return start, end

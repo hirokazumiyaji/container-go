@@ -1229,6 +1229,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("pipe-delimited wrap = %q, want absorbed pipe framing", got.Error())
 	}
 
+	compactColon := fmt.Errorf("%w:%w", context.Canceled, commaCause)
+	got = nonContextCause(compactColon)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("compact colon wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("compact colon wrap = %q, want absorbed colon framing", got.Error())
+	}
+
+	compactSemi := fmt.Errorf("%w;%w", context.Canceled, commaCause)
+	got = nonContextCause(compactSemi)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("compact semicolon wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("compact semicolon wrap = %q, want absorbed semicolon framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2124,6 +2142,38 @@ func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	if !errors.As(err, &gotCLI) {
 		t.Fatalf("error = %v, want *cli.CLIError via As", err)
 	}
+}
+
+func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
+	target := &reviewPermanentProbeJoinedContextTarget{}
+	err := ForLog("never").
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected permanent probe error")
+	}
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+}
+
+type reviewPermanentProbeJoinedContextTarget struct{}
+
+func (*reviewPermanentProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*reviewPermanentProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+	return false, errors.Join(context.Canceled, ErrTargetNotFound)
+}
+func (*reviewPermanentProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewPermanentProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
 }
 
 type reviewTerminalJoinedContextTarget struct {

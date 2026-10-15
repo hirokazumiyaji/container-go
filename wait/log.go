@@ -739,7 +739,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			// the wait; transient daemon/inspect failures remain causes and
 			// are retried with the next log connection.
 			if isPermanentCheckError(probeErr) {
-				return wrapWaitCause(what, probeErr, retained())
+				cause := probeErr
+				if filtered := nonContextCause(probeErr); filtered != nil {
+					cause = filtered
+				}
+				return wrapWaitCause(what, cause, retained())
 			}
 		} else if terminalWaitState(state) {
 			return waitStoppedStateError(what, state, retained())

@@ -673,6 +673,15 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if got := nonContextCause(multi); got != multi {
 		t.Fatalf("untouched multi wrapper = %v (%T), want original", got, got)
 	}
+	emptyMulti := &reviewMultiWrapper{errs: nil}
+	gotEmpty := nonContextCause(emptyMulti)
+	if gotEmpty != emptyMulti {
+		t.Fatalf("empty multi wrapper = %v (%T), want original", gotEmpty, gotEmpty)
+	}
+	var gotEmptyMulti *reviewMultiWrapper
+	if !errors.As(gotEmpty, &gotEmptyMulti) || gotEmptyMulti != emptyMulti {
+		t.Fatalf("empty multi wrapper lost *reviewMultiWrapper via As: %v (%T)", gotEmpty, gotEmpty)
+	}
 	mixed := &reviewMultiWrapper{errs: []error{context.Canceled, a}}
 	got := nonContextCause(mixed)
 	if got == mixed {

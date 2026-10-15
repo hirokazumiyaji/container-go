@@ -355,6 +355,14 @@ func nonContextCause(err error) error {
 			kept = append(kept, cause)
 		}
 		if len(kept) == 0 {
+			if !changed {
+				// Empty Unwrap with nothing removed: keep the original so
+				// callers retain errors.As on the concrete multi-wrapper.
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return preserveEmptyContextWrapper(err)
+				}
+				return err
+			}
 			return preserveEmptyContextWrapper(err)
 		}
 		joined := joinNonNil(kept...)

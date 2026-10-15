@@ -2501,6 +2501,26 @@ func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestForLogContextOnlyPermanentLaunchRetries(t *testing.T) {
+	target := &reviewLogContextOnlyPermanentTarget{}
+	err := ForLog("never").
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout after context-only permanent retries")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded after retries", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.followCalls.Load() < 2 {
+		t.Fatalf("FollowLogs calls = %d, want retries for context-only permanent launch error", target.followCalls.Load())
+	}
+}
+
 type reviewPermanentProbeJoinedContextTarget struct{}
 
 func (*reviewPermanentProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
@@ -2528,5 +2548,23 @@ func (t *reviewTerminalJoinedContextTarget) FollowLogs(context.Context) (io.Read
 	return nil, t.err
 }
 func (*reviewTerminalJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewLogContextOnlyPermanentTarget struct {
+	followCalls atomic.Int32
+}
+
+func (*reviewLogContextOnlyPermanentTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*reviewLogContextOnlyPermanentTarget) Running(context.Context) (bool, error) {
+	return true, nil
+}
+func (t *reviewLogContextOnlyPermanentTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	t.followCalls.Add(1)
+	return nil, &exec.Error{Name: "container", Err: context.Canceled}
+}
+func (*reviewLogContextOnlyPermanentTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }

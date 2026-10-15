@@ -657,11 +657,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				return terminalErr
 			}
 			if isPermanentCheckError(err) || isTerminalStreamError(err) {
-				cause := err
 				if filtered := nonContextCause(err); filtered != nil {
-					cause = filtered
+					return wrapWaitCause(what, filtered, lastProbeErr)
 				}
-				return wrapWaitCause(what, cause, lastProbeErr)
+				// Context-only permanent/terminal wrapper while the wait is
+				// still active: reconnect like a transient stream failure.
 			}
 		} else {
 			result := scanLogStreamTarget(waitCtx, target, stream, match, s.occurrences, replay)
@@ -704,11 +704,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 					return terminalErr
 				}
 				if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
-					cause := result.err
 					if filtered := nonContextCause(result.err); filtered != nil {
-						cause = filtered
+						return wrapWaitCause(what, filtered, lastProbeErr)
 					}
-					return wrapWaitCause(what, cause, lastProbeErr)
+					// Context-only: reconnect rather than return canceled.
 				}
 			}
 		}
@@ -739,11 +738,10 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			// the wait; transient daemon/inspect failures remain causes and
 			// are retried with the next log connection.
 			if isPermanentCheckError(probeErr) {
-				cause := probeErr
 				if filtered := nonContextCause(probeErr); filtered != nil {
-					cause = filtered
+					return wrapWaitCause(what, filtered, retained())
 				}
-				return wrapWaitCause(what, cause, retained())
+				// Context-only permanent probe wrapper: retry.
 			}
 		} else if terminalWaitState(state) {
 			return waitStoppedStateError(what, state, retained())

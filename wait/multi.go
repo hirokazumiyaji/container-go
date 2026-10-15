@@ -323,7 +323,7 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 			continue
 		}
 		if err != nil {
-			if permanentProbeError(err) {
+			if permanentProbeError(err) || isPermanentCheckError(err) {
 				return fmt.Errorf("%s: final lifecycle check: %w", what, err)
 			}
 			if waitErr := waitForReconnect(checkCtx, defaultPollInterval); waitErr != nil {
@@ -377,7 +377,7 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 				return true
 			}
 			if err != nil {
-				if permanentProbeError(err) {
+				if permanentProbeError(err) || isPermanentCheckError(err) {
 					lifecycleErr <- fmt.Errorf("%s: %w", what, err)
 					return false
 				}

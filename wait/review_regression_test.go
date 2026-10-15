@@ -2516,6 +2516,32 @@ func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) 
 	}
 }
 
+func TestCompositeFinalLifecyclePermanentCheckErrorFailsFast(t *testing.T) {
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(&reviewCompositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&reviewCompositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := &reviewCompositeContainerNotFoundTarget{}
+			start := time.Now()
+			err := strategy.WaitUntilReady(context.Background(), target)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatal("expected permanent final lifecycle failure")
+			}
+			if !errors.Is(err, ErrContainerNotFound) {
+				t.Fatalf("error = %v, want ErrContainerNotFound", err)
+			}
+			if errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, must fail immediately without startup deadline", err)
+			}
+			if elapsed > 300*time.Millisecond {
+				t.Fatalf("WaitUntilReady took %v, want immediate permanent failure", elapsed)
+			}
+		})
+	}
+}
+
 func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	backend := &reviewTypedCause{message: "backend inspect failed"}
 	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
@@ -2732,6 +2758,35 @@ type reviewCompositeAlwaysTransientStrategy struct{}
 
 func (*reviewCompositeAlwaysTransientStrategy) WaitUntilReady(_ context.Context, target Target) error {
 	if t, ok := target.(*reviewCompositeAlwaysTransientTarget); ok {
+		t.childDone.Store(true)
+	}
+	return nil
+}
+
+type reviewCompositeContainerNotFoundTarget struct {
+	childDone atomic.Bool
+}
+
+func (*reviewCompositeContainerNotFoundTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewCompositeContainerNotFoundTarget) Running(context.Context) (bool, error) {
+	if !t.childDone.Load() {
+		return true, nil
+	}
+	return false, ErrContainerNotFound
+}
+func (*reviewCompositeContainerNotFoundTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewCompositeContainerNotFoundTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewCompositeContainerNotFoundStrategy struct{}
+
+func (*reviewCompositeContainerNotFoundStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*reviewCompositeContainerNotFoundTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil

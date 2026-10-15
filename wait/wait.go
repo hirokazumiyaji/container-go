@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"reflect"
+	"sort"
 	"strings"
 	"time"
 
@@ -495,6 +496,10 @@ func replaceUnwrappedCause(err, filtered error) error {
 		clone := *typed
 		clone.Err = filtered
 		return &clone
+	case *os.LinkError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
 	case *url.Error:
 		clone := *typed
 		clone.Err = filtered
@@ -519,11 +524,16 @@ func (e *contextStrippedCause) Error() string {
 	}
 	orig := e.original.Error()
 	causeText := e.cause.Error()
-	// Preserve wrapper framing (for example "follow logs: ") while replacing
-	// the unfiltered inner rendering so stripped context sentinels do not
-	// remain in user-facing diagnostics.
-	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && strings.HasSuffix(orig, innerText) {
-		return strings.TrimSuffix(orig, innerText) + causeText
+	// Preserve wrapper framing (for example "follow logs: " or "follow %w failed")
+	// while replacing the unfiltered inner rendering so stripped context
+	// sentinels do not remain in user-facing diagnostics.
+	if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
+		if strings.HasSuffix(orig, innerText) {
+			return strings.TrimSuffix(orig, innerText) + causeText
+		}
+		if idx := strings.Index(orig, innerText); idx >= 0 {
+			return orig[:idx] + causeText + orig[idx+len(innerText):]
+		}
 	}
 	if inners := multiUnwrap(e.original); len(inners) > 0 {
 		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
@@ -540,13 +550,39 @@ func multiUnwrap(err error) []error {
 	return nil
 }
 
-// replaceDiscardedErrorText removes only the renderings of children that
-// nonContextCause drops. Children are matched in Unwrap order so a retained
-// cause whose text equals a discarded sentinel (for example both say
-// "context canceled") keeps its own occurrence.
+// replaceDiscardedErrorText removes or rewrites child renderings independently
+// of Unwrap order so indexed %w verbs that reorder children still strip the
+// discarded sentinel occurrence and emit each retained child's filtered text.
 func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
-	remaining := orig
-	var b strings.Builder
+	type edit struct {
+		start, end int
+		repl       string
+	}
+	occupied := make([]bool, len(orig))
+	claim := func(phrase string) (int, bool) {
+		for i := 0; i+len(phrase) <= len(orig); i++ {
+			if orig[i:i+len(phrase)] != phrase {
+				continue
+			}
+			overlap := false
+			for j := i; j < i+len(phrase); j++ {
+				if occupied[j] {
+					overlap = true
+					break
+				}
+			}
+			if overlap {
+				continue
+			}
+			for j := i; j < i+len(phrase); j++ {
+				occupied[j] = true
+			}
+			return i, true
+		}
+		return 0, false
+	}
+
+	var edits []edit
 	changed := false
 	for _, inner := range inners {
 		phrase := ""
@@ -556,27 +592,29 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 		if phrase == "" {
 			continue
 		}
-		idx := strings.Index(remaining, phrase)
-		if idx < 0 {
+		start, ok := claim(phrase)
+		if !ok {
 			continue
 		}
-		b.WriteString(remaining[:idx])
 		if filtered := nonContextCause(inner); filtered != nil {
-			rendered := filtered.Error()
-			b.WriteString(rendered)
-			if rendered != phrase {
+			repl := filtered.Error()
+			edits = append(edits, edit{start: start, end: start + len(phrase), repl: repl})
+			if repl != phrase {
 				changed = true
 			}
 		} else {
+			edits = append(edits, edit{start: start, end: start + len(phrase), repl: ""})
 			changed = true
 		}
-		remaining = remaining[idx+len(phrase):]
 	}
 	if !changed {
 		return ""
 	}
-	b.WriteString(remaining)
-	masked := b.String()
+	sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
+	masked := orig
+	for _, e := range edits {
+		masked = masked[:e.start] + e.repl + masked[e.end:]
+	}
 	masked = strings.ReplaceAll(masked, ": ;", ":")
 	masked = strings.ReplaceAll(masked, "; ;", ";")
 	masked = strings.ReplaceAll(masked, "  ", " ")

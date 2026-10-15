@@ -732,6 +732,16 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	if errors.Is(gotURL.Err, context.Canceled) {
 		t.Fatalf("url error Err = %v, must not retain canceled", gotURL.Err)
 	}
+
+	linkErr := &os.LinkError{Op: "link", Old: "/tmp/a", New: "/tmp/b", Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(linkErr)
+	var gotLink *os.LinkError
+	if !errors.As(got, &gotLink) {
+		t.Fatalf("link error = %v, want *os.LinkError", got)
+	}
+	if errors.Is(gotLink.Err, context.Canceled) {
+		t.Fatalf("link error Err = %v, must not retain canceled", gotLink.Err)
+	}
 }
 
 func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
@@ -793,6 +803,28 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "nested backend failure") {
 		t.Fatalf("nested filtered child = %q, want cause text", got.Error())
+	}
+
+	mid := fmt.Errorf("follow %w failed", errors.Join(context.Canceled, cause))
+	got = nonContextCause(mid)
+	if !strings.Contains(got.Error(), "follow") || !strings.Contains(got.Error(), "failed") {
+		t.Fatalf("mid %%w framing = %q, want follow/failed framing", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("mid %%w framing = %q, must not render stripped context", got.Error())
+	}
+
+	a := errors.New("alpha failure")
+	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
+	got = nonContextCause(reordered)
+	if !errors.Is(got, a) || !errors.Is(got, nestedCause) {
+		t.Fatalf("reordered %%w = %v, want retained causes", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("reordered %%w = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("reordered %%w = %q, must not render stripped context", got.Error())
 	}
 }
 

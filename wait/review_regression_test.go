@@ -158,85 +158,83 @@ func TestReceiveLogScanResultPrefersQueuedTerminalCause(t *testing.T) {
 	}
 }
 
-type reviewLogCauseTarget struct {
-	cause   error
+type reviewLogReadStartTarget struct {
+	started chan struct{}
+}
+
+func (t *reviewLogReadStartTarget) Endpoint(context.Context, string) (string, error) {
+	return "", errors.New("endpoint not used")
+}
+func (t *reviewLogReadStartTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *reviewLogReadStartTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	// Signal from the reader's first Read (not FollowLogs) so cancellation
+	// cannot precede the scan goroutine observing the stream.
+	return &reviewLogReadStartCloser{ctx: ctx, started: t.started}, nil
+}
+func (*reviewLogReadStartTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, errors.New("exec not used")
+}
+
+type reviewLogReadStartCloser struct {
+	ctx     context.Context
 	started chan struct{}
 	once    sync.Once
 }
 
-func (t *reviewLogCauseTarget) Endpoint(context.Context, string) (string, error) {
-	return "", t.cause
-}
-func (t *reviewLogCauseTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *reviewLogCauseTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
-	t.once.Do(func() {
-		if t.started != nil {
-			close(t.started)
+func (r *reviewLogReadStartCloser) Read([]byte) (int, error) {
+	r.once.Do(func() {
+		if r.started != nil {
+			close(r.started)
 		}
 	})
-	return &waitContractErrorReadCloser{err: t.cause}, nil
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
 }
-func (t *reviewLogCauseTarget) ExecCommand(context.Context, []string) (int, error) {
-	return 0, t.cause
+func (*reviewLogReadStartCloser) Close() error { return nil }
+
+func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() {
+		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &reviewLogReadStartTarget{started: started})
+	}()
+	select {
+	case <-started:
+		cancel()
+	case <-time.After(time.Second):
+		t.Fatal("log Read did not start")
+	}
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ForLog did not return after cancellation")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForLog took %v after cancellation", elapsed)
+	}
 }
 
-func TestForLogKeepsContextAndStreamCause(t *testing.T) {
+func TestForLogDeadlineRetainsStreamCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "scanner backend failure"}
-	cases := []struct {
-		name string
-		ctx  func() (context.Context, context.CancelFunc)
-		want error
-	}{
-		{
-			name: "caller-cancel",
-			ctx: func() (context.Context, context.CancelFunc) {
-				return context.WithCancel(context.Background())
-			},
-			want: context.Canceled,
-		},
-		{
-			name: "caller-deadline",
-			ctx: func() (context.Context, context.CancelFunc) {
-				return context.WithTimeout(context.Background(), 25*time.Millisecond)
-			},
-			want: context.DeadlineExceeded,
-		},
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &waitCauseTarget{cause: cause})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			callerCtx, cancel := tc.ctx()
-			defer cancel()
-			started := make(chan struct{})
-			target := &reviewLogCauseTarget{cause: cause, started: started}
-			done := make(chan error, 1)
-			start := time.Now()
-			go func() {
-				done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(callerCtx, target)
-			}()
-			if tc.name == "caller-cancel" {
-				select {
-				case <-started:
-					cancel()
-				case <-time.After(time.Second):
-					t.Fatal("FollowLogs did not start")
-				}
-			}
-			var err error
-			select {
-			case err = <-done:
-			case <-time.After(time.Second):
-				t.Fatal("ForLog did not return")
-			}
-			if !errors.Is(err, tc.want) {
-				t.Fatalf("error = %v, want %v", err, tc.want)
-			}
-			if !errors.Is(err, cause) {
-				t.Fatalf("error = %v, want stream cause", err)
-			}
-			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-				t.Fatalf("ForLog took %v, want bounded context handling", elapsed)
-			}
-		})
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want stream cause", err)
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("ForLog took %v, want bounded context handling", elapsed)
 	}
 }
 

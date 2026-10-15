@@ -727,6 +727,69 @@ func TestNonContextCauseAsDoesNotExposeDiscardedTransportChildren(t *testing.T) 
 	}
 }
 
+// reviewVirtualCode is a classification supplied only via a wrapper As method,
+// not present on the wrapped cause tree.
+type reviewVirtualCode struct {
+	Code string
+}
+
+func (e *reviewVirtualCode) Error() string {
+	if e == nil {
+		return "virtual code"
+	}
+	return "virtual code: " + e.Code
+}
+
+type reviewVirtualAsWrapper struct {
+	err  error
+	code *reviewVirtualCode
+}
+
+func (e *reviewVirtualAsWrapper) Error() string { return "virtual: " + e.err.Error() }
+func (e *reviewVirtualAsWrapper) Unwrap() error { return e.err }
+func (e *reviewVirtualAsWrapper) As(target any) bool {
+	if t, ok := target.(**reviewVirtualCode); ok && e != nil && e.code != nil {
+		*t = e.code
+		return true
+	}
+	return false
+}
+
+func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	code := &reviewVirtualCode{Code: "E_BACKEND"}
+	wrapped := &reviewVirtualAsWrapper{err: errors.Join(context.Canceled, cause), code: code}
+	got := nonContextCause(wrapped)
+	if !errors.Is(got, cause) {
+		t.Fatalf("virtual As wrapper = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("virtual As wrapper = %v, must drop canceled", got)
+	}
+	var gotCode *reviewVirtualCode
+	if !errors.As(got, &gotCode) || gotCode != code {
+		t.Fatalf("virtual As wrapper = %v, want virtual classification via As", got)
+	}
+	var gotWrapper *reviewVirtualAsWrapper
+	if !errors.As(got, &gotWrapper) {
+		t.Fatalf("virtual As wrapper = %v, want original type via As", got)
+	}
+
+	// A custom As that walks unfiltered children must still not expose a
+	// discarded context-bearing transport wrapper.
+	leaky := &reviewOpaqueFacade{
+		err: errors.Join(&os.PathError{Op: "open", Path: "/tmp/x", Err: context.Canceled}, cause),
+	}
+	got = nonContextCause(leaky)
+	if !errors.Is(got, cause) {
+		t.Fatalf("leaky As facade = %v, want cause", got)
+	}
+	var leakedPath *os.PathError
+	if errors.As(got, &leakedPath) {
+		t.Fatalf("leaky As facade exposed discarded *os.PathError: %#v", leakedPath)
+	}
+}
+
 func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failure"}
 	pathErr := &os.PathError{Op: "open", Path: "/tmp/x", Err: errors.Join(context.Canceled, cause)}
@@ -832,6 +895,28 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		if !strings.Contains(got.Error(), "context canceled") || strings.Contains(got.Error(), "backend=") {
 			t.Fatalf("ambiguous indexed duplicate = %q, want cause-only fallback", got.Error())
 		}
+	}
+
+	// Indexed reorder where the discarded sentinel is a substring of the
+	// retained backend diagnostic must not claim inside that diagnostic.
+	overlapBackend := errors.New("peer reported context canceled")
+	overlap := fmt.Errorf("backend=%[2]w; ctx=%[1]w", context.Canceled, overlapBackend)
+	got = nonContextCause(overlap)
+	if !errors.Is(got, overlapBackend) {
+		t.Fatalf("overlapping child text = %v, want backend", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("overlapping child text = %v, must drop canceled", got)
+	}
+	if !strings.Contains(got.Error(), "peer reported context canceled") {
+		t.Fatalf("overlapping child text = %q, want intact backend diagnostic", got.Error())
+	}
+	if strings.Contains(got.Error(), "ctx=context canceled") {
+		t.Fatalf("overlapping child text = %q, discarded sentinel still rendered", got.Error())
+	}
+	// Corrupted rewrite such as "peer reported ; ctx=context canceled" must not appear.
+	if strings.Contains(got.Error(), "peer reported ;") || strings.Contains(got.Error(), "peer reported  ") {
+		t.Fatalf("overlapping child text = %q, backend diagnostic corrupted", got.Error())
 	}
 
 	nestedCause := &reviewTypedCause{message: "nested backend failure"}

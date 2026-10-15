@@ -568,9 +568,10 @@ func multiUnwrap(err error) []error {
 // replaceDiscardedErrorText removes or rewrites child renderings independently
 // of Unwrap order so indexed %w verbs that reorder children still strip the
 // discarded sentinel occurrence and emit each retained child's filtered text.
-// When multiple children share identical Error text, positions cannot be
-// associated safely without the format string; return "" so callers fall back
-// to the filtered cause text.
+// When multiple children share identical Error text, or a shorter discarded
+// phrase can only be placed inside a longer retained child's rendering,
+// positions cannot be associated safely without the format string; return ""
+// so callers fall back to the filtered cause text.
 func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 	phraseCount := make(map[string]int)
 	for _, inner := range inners {
@@ -586,6 +587,32 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			return ""
 		}
 	}
+
+	type item struct {
+		inner  error
+		phrase string
+		order  int
+	}
+	items := make([]item, 0, len(inners))
+	for i, inner := range inners {
+		if inner == nil {
+			continue
+		}
+		phrase := inner.Error()
+		if phrase == "" {
+			continue
+		}
+		items = append(items, item{inner: inner, phrase: phrase, order: i})
+	}
+	// Claim longer phrases first so a discarded sentinel such as
+	// "context canceled" is not taken from inside a retained diagnostic like
+	// "peer reported context canceled".
+	sort.SliceStable(items, func(i, j int) bool {
+		if len(items[i].phrase) != len(items[j].phrase) {
+			return len(items[i].phrase) > len(items[j].phrase)
+		}
+		return items[i].order < items[j].order
+	})
 
 	type edit struct {
 		start, end int
@@ -617,26 +644,21 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 
 	var edits []edit
 	changed := false
-	for _, inner := range inners {
-		phrase := ""
-		if inner != nil {
-			phrase = inner.Error()
-		}
-		if phrase == "" {
-			continue
-		}
-		start, ok := claim(phrase)
+	for _, it := range items {
+		start, ok := claim(it.phrase)
 		if !ok {
-			continue
+			// A child rendering could not be placed without overlapping another
+			// claimed span; framed rewrite would mis-associate occurrences.
+			return ""
 		}
-		if filtered := nonContextCause(inner); filtered != nil {
+		if filtered := nonContextCause(it.inner); filtered != nil {
 			repl := filtered.Error()
-			edits = append(edits, edit{start: start, end: start + len(phrase), repl: repl})
-			if repl != phrase {
+			edits = append(edits, edit{start: start, end: start + len(it.phrase), repl: repl})
+			if repl != it.phrase {
 				changed = true
 			}
 		} else {
-			edits = append(edits, edit{start: start, end: start + len(phrase), repl: ""})
+			edits = append(edits, edit{start: start, end: start + len(it.phrase), repl: ""})
 			changed = true
 		}
 	}
@@ -672,9 +694,44 @@ func (e *contextStrippedCause) As(target any) bool {
 	if errors.As(e.cause, target) {
 		return true
 	}
+	// Preserve the original wrapper's own As classifications (virtual types
+	// not present on the filtered cause). Probe a temporary target first so a
+	// custom As that walks unfiltered children cannot leave a discarded
+	// context-bearing value in the caller's target.
+	if as, ok := e.original.(interface{ As(any) bool }); ok {
+		if matchOriginalAsWithoutDiscardedContext(as, target, e.cause) {
+			return true
+		}
+	}
 	// Match the original wrapper's concrete type without recursively searching
 	// discarded children that may still carry context sentinels.
 	return asExactType(e.original, target)
+}
+
+// matchOriginalAsWithoutDiscardedContext runs original.As into a temporary
+// slot and copies the result only when it does not reintroduce a context
+// sentinel that the filtered cause suppressed.
+func matchOriginalAsWithoutDiscardedContext(as interface{ As(any) bool }, target any, filteredCause error) bool {
+	val := reflect.ValueOf(target)
+	if val.Kind() != reflect.Pointer || val.IsNil() {
+		return false
+	}
+	tmp := reflect.New(val.Elem().Type())
+	if !as.As(tmp.Interface()) {
+		return false
+	}
+	matched := tmp.Elem().Interface()
+	if errMatched, ok := matched.(error); ok {
+		carriesContext := errors.Is(errMatched, context.Canceled) ||
+			errors.Is(errMatched, context.DeadlineExceeded)
+		filteredCarriesContext := errors.Is(filteredCause, context.Canceled) ||
+			errors.Is(filteredCause, context.DeadlineExceeded)
+		if carriesContext && !filteredCarriesContext {
+			return false
+		}
+	}
+	val.Elem().Set(tmp.Elem())
+	return true
 }
 
 func asExactType(err error, target any) bool {

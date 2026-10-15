@@ -361,6 +361,11 @@ func retainedNonContextCause(err error) error {
 			return filtered
 		}
 		if stripped.cause == nil {
+			// Opaque facades may keep permanent classifications via Is/As on
+			// original after context matches are stripped from the Is surface.
+			if permanentProbeError(stripped) || isPermanentCheckError(stripped) {
+				return filtered
+			}
 			return nil
 		}
 		cur = stripped.cause

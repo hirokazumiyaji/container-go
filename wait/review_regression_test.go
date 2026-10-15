@@ -2827,6 +2827,35 @@ func TestForExecNestedWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	}
 }
 
+func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = &reviewOpaquePermanentFacade{}
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected permanent opaque failure")
+	}
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound via opaque classification", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.execCalls.Load() != 1 {
+		t.Fatalf("execCalls = %d, want immediate permanent failure without retries", target.execCalls.Load())
+	}
+}
+
+type reviewOpaquePermanentFacade struct{}
+
+func (*reviewOpaquePermanentFacade) Error() string { return "opaque permanent" }
+func (*reviewOpaquePermanentFacade) Is(target error) bool {
+	return target == context.Canceled || target == ErrTargetNotFound
+}
+
 type reviewLaunchWrapper struct {
 	err error
 }

@@ -526,39 +526,38 @@ func multiUnwrap(err error) []error {
 }
 
 // replaceDiscardedErrorText removes only the renderings of children that
-// nonContextCause drops, leaving legitimate phrases inside retained causes.
-func replaceDiscardedErrorText(orig string, inners []error, kept error) string {
-	keptText := ""
-	if kept != nil {
-		keptText = kept.Error()
-	}
-	masked := orig
-	placeholder := ""
-	if keptText != "" {
-		placeholder = strings.Repeat("\x01", len(keptText))
-		masked = strings.ReplaceAll(masked, keptText, placeholder)
-	}
+// nonContextCause drops. Children are matched in Unwrap order so a retained
+// cause whose text equals a discarded sentinel (for example both say
+// "context canceled") keeps its own occurrence.
+func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
+	remaining := orig
+	var b strings.Builder
 	changed := false
 	for _, inner := range inners {
-		if nonContextCause(inner) != nil {
-			continue
-		}
 		phrase := ""
 		if inner != nil {
 			phrase = inner.Error()
 		}
-		if phrase == "" || !strings.Contains(masked, phrase) {
+		if phrase == "" {
 			continue
 		}
-		masked = strings.ReplaceAll(masked, phrase, "")
-		changed = true
+		idx := strings.Index(remaining, phrase)
+		if idx < 0 {
+			continue
+		}
+		b.WriteString(remaining[:idx])
+		if nonContextCause(inner) != nil {
+			b.WriteString(phrase)
+		} else {
+			changed = true
+		}
+		remaining = remaining[idx+len(phrase):]
 	}
 	if !changed {
 		return ""
 	}
-	if placeholder != "" {
-		masked = strings.ReplaceAll(masked, placeholder, keptText)
-	}
+	b.WriteString(remaining)
+	masked := b.String()
 	masked = strings.ReplaceAll(masked, ": ;", ":")
 	masked = strings.ReplaceAll(masked, "; ;", ";")
 	masked = strings.ReplaceAll(masked, "  ", " ")

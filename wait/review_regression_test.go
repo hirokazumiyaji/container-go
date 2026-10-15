@@ -734,6 +734,20 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	if strings.HasPrefix(strings.TrimSpace(got.Error()), "context canceled") {
 		t.Fatalf("fmt multi-wrap with phrase = %q, discarded sentinel still leads", got.Error())
 	}
+
+	sameText := errors.New("context canceled")
+	other := errors.New("other backend failure")
+	dup := fmt.Errorf("stream: %w; backend: %w; other: %w", context.Canceled, sameText, other)
+	got = nonContextCause(dup)
+	if !errors.Is(got, sameText) || !errors.Is(got, other) {
+		t.Fatalf("fmt multi-wrap with duplicate phrase = %v, want both retained causes", got)
+	}
+	if !strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("fmt multi-wrap with duplicate phrase = %q, want retained cause text", got.Error())
+	}
+	if !strings.Contains(got.Error(), "other backend failure") {
+		t.Fatalf("fmt multi-wrap with duplicate phrase = %q, want other cause text", got.Error())
+	}
 }
 
 type reviewContextMatchingMulti struct {

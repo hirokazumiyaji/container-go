@@ -625,12 +625,29 @@ func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 	if errors.Is(got, context.Canceled) {
 		t.Fatalf("mixed non-comparable = %v, must drop canceled", got)
 	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("mixed non-comparable = %q, must not render stripped context", got.Error())
+	}
 	if !errors.Is(got, nc) && got.Error() != nc.Error() {
 		// reviewSliceError is not comparable for errors.Is equality by value;
 		// at least retain its diagnostic text through the filtered tree.
 		if !strings.Contains(got.Error(), "backend") {
 			t.Fatalf("mixed non-comparable = %v, want retained diagnostic", got)
 		}
+	}
+}
+
+func TestNonContextCauseRebuildsStdlibJoinWithoutContextText(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	got := nonContextCause(errors.Join(context.Canceled, cause))
+	if !errors.Is(got, cause) {
+		t.Fatalf("filtered join = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("filtered join = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("filtered join = %q, must not render stripped context", got.Error())
 	}
 }
 

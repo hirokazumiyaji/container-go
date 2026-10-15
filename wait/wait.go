@@ -340,7 +340,13 @@ func nonContextCause(err error) error {
 		if !changed {
 			return err
 		}
-		return replaceUnwrappedCause(err, joinNonNil(kept...))
+		joined := joinNonNil(kept...)
+		// Stdlib joins only exist to carry children; rebuild from the filtered
+		// set so Error() no longer mentions stripped context sentinels.
+		if keepsClassificationWithoutChildren(err) {
+			return replaceUnwrappedCause(err, joined)
+		}
+		return joined
 	}
 	// Only unwrap a single-error wrapper when the tree contains a context
 	// branch that must be stripped. Otherwise keep wrappers such as

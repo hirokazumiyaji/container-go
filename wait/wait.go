@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -331,16 +332,45 @@ func nonContextCause(err error) error {
 	// *net.OpError so callers retain errors.As and operation diagnostics.
 	if unwrapper, ok := err.(interface{ Unwrap() error }); ok &&
 		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
-		if inner := unwrapper.Unwrap(); inner != nil {
-			return nonContextCause(inner)
+		inner := unwrapper.Unwrap()
+		if inner == nil {
+			return nil
 		}
-		return nil
+		filtered := nonContextCause(inner)
+		if filtered == nil {
+			return nil
+		}
+		if filtered == inner {
+			return err
+		}
+		return replaceUnwrappedCause(err, filtered)
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}
 	return err
 }
+
+// replaceUnwrappedCause keeps wrapper diagnostics after a nested context
+// branch was stripped. Typed net.OpError values are cloned; other wrappers
+// keep their Error() text while exposing the filtered cause to errors.Is.
+func replaceUnwrappedCause(err, filtered error) error {
+	var op *net.OpError
+	if errors.As(err, &op) {
+		clone := *op
+		clone.Err = filtered
+		return &clone
+	}
+	return &diagnosticCause{message: err.Error(), cause: filtered}
+}
+
+type diagnosticCause struct {
+	message string
+	cause   error
+}
+
+func (e *diagnosticCause) Error() string { return e.message }
+func (e *diagnosticCause) Unwrap() error { return e.cause }
 
 func wrapWaitCause(what string, cause error, previous ...error) error {
 	if cause == nil {

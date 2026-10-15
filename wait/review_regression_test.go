@@ -584,6 +584,21 @@ func TestNonContextCausePreservesNonContextWrappers(t *testing.T) {
 	}
 }
 
+func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	wrapped := fmt.Errorf("follow logs: %w", errors.Join(context.Canceled, cause))
+	got := nonContextCause(wrapped)
+	if !errors.Is(got, cause) {
+		t.Fatalf("nonContextCause = %v, want typed cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("nonContextCause = %v, must not retain canceled branch", got)
+	}
+	if !strings.Contains(got.Error(), "follow logs:") {
+		t.Fatalf("nonContextCause = %v, want wrapper diagnostic text", got)
+	}
+}
+
 func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 	cause := &reviewTypedCause{message: "transient stream failure"}
 	cases := []struct {
@@ -624,6 +639,9 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 			}
 			if errors.Is(err, context.Canceled) {
 				t.Fatalf("error = %v, must not retain stale context.Canceled branch", err)
+			}
+			if tc.name == "wrapped-join" && !strings.Contains(err.Error(), "follow logs:") {
+				t.Fatalf("error = %v, want wrapper diagnostic text", err)
 			}
 		})
 	}

@@ -234,20 +234,32 @@ func TestBuiltInWaitContextErrorMatrix(t *testing.T) {
 var errWaitContractTransient = errors.New("transient readiness failure")
 
 type waitCauseTarget struct {
-	cause error
+	cause   error
+	started chan struct{}
+	once    sync.Once
+}
+
+func (t *waitCauseTarget) markStarted() {
+	t.once.Do(func() {
+		if t.started != nil {
+			close(t.started)
+		}
+	})
 }
 
 func (t *waitCauseTarget) Endpoint(context.Context, string) (string, error) {
+	t.markStarted()
 	return "", t.cause
 }
 
 func (t *waitCauseTarget) Running(context.Context) (bool, error) { return true, nil }
 
 func (t *waitCauseTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
-	return &waitContractErrorReadCloser{err: t.cause}, nil
+	return &waitContractStartedErrorReadCloser{err: t.cause, mark: t.markStarted}, nil
 }
 
 func (t *waitCauseTarget) ExecCommand(context.Context, []string) (int, error) {
+	t.markStarted()
 	return 0, t.cause
 }
 
@@ -257,6 +269,19 @@ type waitContractErrorReadCloser struct {
 
 func (r *waitContractErrorReadCloser) Read([]byte) (int, error) { return 0, r.err }
 func (*waitContractErrorReadCloser) Close() error               { return nil }
+
+type waitContractStartedErrorReadCloser struct {
+	err  error
+	mark func()
+}
+
+func (r *waitContractStartedErrorReadCloser) Read([]byte) (int, error) {
+	if r.mark != nil {
+		r.mark()
+	}
+	return 0, r.err
+}
+func (*waitContractStartedErrorReadCloser) Close() error { return nil }
 
 func TestWaitErrorRetainsLastTransientCause(t *testing.T) {
 	factories := []waitContractFactory{
@@ -305,7 +330,27 @@ func TestWaitErrorRetainsLastTransientCause(t *testing.T) {
 	for _, factory := range factories {
 		factory := factory
 		t.Run(factory.name, func(t *testing.T) {
-			err := factory.make(35*time.Millisecond).WaitUntilReady(context.Background(), &waitCauseTarget{cause: errWaitContractTransient})
+			caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				done <- factory.make(time.Hour).WaitUntilReady(caller, &waitCauseTarget{
+					cause:   errWaitContractTransient,
+					started: started,
+				})
+			}()
+			select {
+			case <-started:
+				caller.expire()
+			case <-time.After(time.Second):
+				t.Fatal("readiness probe did not start")
+			}
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("wait did not return after deadline")
+			}
 			if err == nil {
 				t.Fatal("wait unexpectedly succeeded")
 			}
@@ -322,8 +367,25 @@ func TestWaitErrorRetainsLastTransientCause(t *testing.T) {
 	}
 
 	t.Run("log-stream", func(t *testing.T) {
-		err := ForLog("never").WithStartupTimeout(35*time.Millisecond).
-			WaitUntilReady(context.Background(), &waitCauseTarget{cause: errWaitContractTransient})
+		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+		started := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			done <- ForLog("never").WithStartupTimeout(time.Hour).
+				WaitUntilReady(caller, &waitCauseTarget{cause: errWaitContractTransient, started: started})
+		}()
+		select {
+		case <-started:
+			caller.expire()
+		case <-time.After(time.Second):
+			t.Fatal("log stream probe did not start")
+		}
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(time.Second):
+			t.Fatal("wait did not return after deadline")
+		}
 		if err == nil {
 			t.Fatal("wait unexpectedly succeeded")
 		}

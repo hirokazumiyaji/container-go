@@ -572,6 +572,18 @@ func TestForAllClassifiesDeadlineSourceAtRaceBoundary(t *testing.T) {
 	}
 }
 
+func TestNonContextCausePreservesNonContextWrappers(t *testing.T) {
+	inner := errors.New("connection refused")
+	wrapped := fmt.Errorf("dial tcp 127.0.0.1:1: %w", inner)
+	got := nonContextCause(wrapped)
+	if got != wrapped {
+		t.Fatalf("nonContextCause = %v (%T), want original wrapper", got, got)
+	}
+	if !errors.Is(got, inner) {
+		t.Fatalf("nonContextCause = %v, want inner cause", got)
+	}
+}
+
 func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 	cause := &reviewTypedCause{message: "transient stream failure"}
 	cases := []struct {

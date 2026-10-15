@@ -326,12 +326,15 @@ func nonContextCause(err error) error {
 		}
 		return joinNonNil(kept...)
 	}
-	if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
+	// Only unwrap a single-error wrapper when the tree contains a context
+	// branch that must be stripped. Otherwise keep wrappers such as
+	// *net.OpError so callers retain errors.As and operation diagnostics.
+	if unwrapper, ok := err.(interface{ Unwrap() error }); ok &&
+		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		if inner := unwrapper.Unwrap(); inner != nil {
-			if cause := nonContextCause(inner); cause != nil {
-				return cause
-			}
+			return nonContextCause(inner)
 		}
+		return nil
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil

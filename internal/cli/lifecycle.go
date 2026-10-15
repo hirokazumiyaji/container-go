@@ -55,6 +55,10 @@ func StartedStatus(err error) (started, reported bool) {
 	return status.Started, ok
 }
 
+// commandLifecycle is the sole owner of Wait and termination for one
+// command. Stream and Run both publish a process tree through this type so
+// context cancel, Close, and a natural exit cannot leak the child or race a
+// stale handle.
 type commandLifecycle struct {
 	cmd *exec.Cmd
 	ctx context.Context
@@ -71,6 +75,7 @@ type commandLifecycle struct {
 	waitErr      error
 	ctxErr       error
 	terminateErr error
+	lastResult   terminationResult
 
 	cancelRequested          bool
 	terminatedByCancellation bool
@@ -105,8 +110,8 @@ func (l *commandLifecycle) failStart() {
 }
 
 // wait is the only place that calls cmd.Wait. In particular, no other
-// lifecycle path may reap the process and then race a numeric process-group
-// signal against that reap.
+// lifecycle path may reap the process and then race a platform termination
+// operation or numeric process-group signal against that reap.
 func (l *commandLifecycle) wait() {
 	l.waitOnce.Do(func() {
 		err := l.cmd.Wait()
@@ -118,9 +123,10 @@ func (l *commandLifecycle) wait() {
 		tree := l.tree
 		l.mu.Unlock()
 
-		// On platforms with a job object this also releases any descendants
-		// that outlived the direct child. The tree implementations serialize
-		// this close with a concurrent termination request.
+		// tree.close releases platform-owned termination state. Windows
+		// only closes the retained process handle; it does not terminate
+		// descendants. The tree implementations serialize this close with
+		// a concurrent termination request.
 		if tree != nil {
 			tree.close()
 		}
@@ -138,6 +144,24 @@ func (l *commandLifecycle) error() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.waitErr
+}
+
+func (l *commandLifecycle) contextError() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.ctxErr
+}
+
+func (l *commandLifecycle) isReaped() bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.reaped
+}
+
+func (l *commandLifecycle) lastTermination() terminationResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastResult
 }
 
 func (l *commandLifecycle) status() RunStatus {
@@ -176,6 +200,7 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 		}
 		if !l.started || l.startFailed || l.reaped {
 			l.terminateErr = os.ErrProcessDone
+			l.lastResult = terminationResult{err: os.ErrProcessDone}
 			return
 		}
 
@@ -185,6 +210,7 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 		} else {
 			result = l.tree.terminate(l.cmd)
 		}
+		l.lastResult = result
 		l.terminateErr = result.err
 		if contextTermination && result.err == nil && result.active {
 			l.terminatedByCancellation = true

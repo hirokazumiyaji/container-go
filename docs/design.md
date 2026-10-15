@@ -61,8 +61,8 @@ but with a different implementation strategy, described below.
 
 Three constraints shape the design.
 
-- **Zero dependencies**: no third-party Go modules; the standard
-  library only.
+- **Minimal dependencies**: the standard library plus `golang.org/x/sys`
+  for platform process and file handling; no third-party container-client module.
 - **Security**: subprocess argv prevents injection; reaper staging still has
   an environment-data exposure on abnormal termination (#111), so the
   no-leak property is not a current guarantee.
@@ -123,10 +123,10 @@ Two candidate strategies exist.
 
 This library adopts the CLI wrapper, for three reasons.
 
-First, the zero-dependency constraint. Direct XPC needs cgo and a
+First, the minimal-dependency constraint. Direct XPC needs cgo and a
 hand-written C bridge, dragging the macOS SDK into the build. The CLI
-wrapper is pure Go on the standard library and builds with
-`CGO_ENABLED=0`.
+wrapper is pure Go apart from `golang.org/x/sys` for platform process
+handling and builds with `CGO_ENABLED=0`.
 
 Second, stability. XPC route names and message shapes are Apple
 Container's internal implementation with no compatibility promise. The
@@ -357,16 +357,16 @@ ownership proof is lost, the pidfd is used directly and the former PGID is
 never signaled. The direct child is also killed after a successful group signal
 because it may have changed process groups. Unix targets without that identity
 use the direct child handle conservatively. After
-the child is reaped, no former numeric group ID is used. Windows uses a
-lifecycle-owned Job Object handle, with direct-child fallback when assignment
-is unavailable. Assignment occurs after `Start`; descendants created during
-that short post-Start attachment window are outside the Job Object boundary.
+the child is reaped, no former numeric group ID is used. Windows retains an
+`OpenProcess` handle and terminates only the direct child with
+`TerminateProcess`; detached or reparented descendants are outside that
+guarantee.
 The supported backend CLIs do not expose a common exec-instance kill
 operation, so when active-child evidence is available Exec returns
 `*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
 rather than claiming that the daemon-side process stopped. A conservative
 direct-handle fallback may return only the context error. A successful
-empty-job or already-finished-child termination is not treated as
+already-finished-child termination is not treated as
 active-process evidence. Callers must terminate the container or use
 backend-specific cleanup. Callers must read the output reader even when the
 error is non-nil. On Linux the stable identity is a pidfd-backed process
@@ -374,7 +374,7 @@ reference; kernels without pidfd support use the same conservative direct-handle
 fallback as other Unix targets.
 Windows-specific lifecycle tests are build-constrained. This development
 environment cross-compiles and vets Windows packages but cannot execute the
-Windows Job Object runtime tests, including the exit-259 active-child case.
+Windows process-handle runtime tests, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -984,6 +984,24 @@ path adds a byte cap. `FollowLogs` is intentionally an unbounded stream;
 closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 
+**Keep streams finite**. `FollowLogs` returns the `container logs --follow`
+child as an `io.ReadCloser`. `Close` or context cancellation terminates
+and reaps the direct CLI child. Unix makes a best-effort `SIGKILL` of the
+CLI process group after a stopped-state check, then kills the direct child
+as well; helpers that remain in the group may be terminated but are not
+reaped. If that check fails, termination uses the direct child (pidfd on
+Linux) and never signals the former PGID. After the child is reaped, no
+former numeric group ID is used. Windows uses the retained process handle
+for the direct CLI child only; descendants are not terminated here. Other
+supported platforms cover only the direct child. ForLog's diagnostic
+buffer caps at 1MiB.
+
+A stream has two error phases. `Stream` (and the public `FollowLogs`
+wrapper) returns startup errors. Once a stream has been returned, a
+terminal CLI failure is delivered by `Read`; callers must read the stream
+to observe `CLIError` details. `Close` and context cancellation are
+intentional terminal paths and may instead produce EOF or a context error.
+
 **Apply operation-specific deadlines**. Most query-like operations
 (inspect, copy, snapshot logs, delete, and prune) as well as public `Exec` use a 30-second
 default when the caller has no deadline. `Run` and explicit image
@@ -998,7 +1016,12 @@ long-running command. When a library default is applied to an operation
 that is not a shared pull leader, an existing caller deadline is
 preserved. Timeout classification uses structured context,
 `Timeout() bool`, or signal evidence; arbitrary workload stderr is never
-interpreted as a timeout.
+interpreted as a timeout. On cancellation the direct CLI child is killed
+and reaped. Unix may also best-effort `SIGKILL` descendants that remain in
+the CLI process group while that child is owned; they are not reaped, and
+a former numeric PGID is never signaled after the child is reaped or when
+the stopped-state check fails. Windows terminates only the direct child
+through the retained process handle. Descendant cleanup is not claimed.
 
 ## Error handling
 

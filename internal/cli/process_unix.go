@@ -19,7 +19,11 @@ func configureProcessTree(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-const processStoppedObservationWindow = 20 * time.Millisecond
+// processStoppedObservationWindow is the budget for observing SIGSTOP before
+// falling back to a direct-child kill. It must remain usable under the race
+// detector and loaded CI hosts; a too-short window skips group signaling and
+// withholds TerminatedByCancellation even though the child was still alive.
+const processStoppedObservationWindow = 200 * time.Millisecond
 
 // stableProcessIdentity is an ownership-safe reference retained after Start.
 // A numeric PGID is never used until the identity has positively observed

@@ -115,7 +115,9 @@ type stdoutRunner struct {
 
 func (s *stdoutRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "logs" {
+		s.mu.Lock()
 		s.calls = append(s.calls, args)
+		s.mu.Unlock()
 		return []byte(s.stdout), nil, nil
 	}
 	return s.fakeRunner.Run(ctx, args...)
@@ -307,6 +309,63 @@ func TestFollowLogsClassifiesTerminalNotFound(t *testing.T) {
 	}
 }
 
+func TestForLogPreservesFollowLogsTerminalNotFound(t *testing.T) {
+	r := &cli.ExecRunner{Binary: writeFollowLogsNotFoundStub(t)}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: r, eng: dockerEngine{}}
+
+	err := wait.ForLog("No such container: "+testDockerUID).
+		WithStartupTimeout(3*time.Second).
+		WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want ErrContainerNotFound", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+	if cliErr.ExitCode != 1 {
+		t.Errorf("ExitCode = %d, want 1", cliErr.ExitCode)
+	}
+	if !strings.Contains(cliErr.Stderr, "Error response from daemon") {
+		t.Fatalf("stderr = %q, want terminal diagnostic", cliErr.Stderr)
+	}
+}
+
+func TestForLogRejectsMatchBeforeTerminalStderrError(t *testing.T) {
+	r := &cli.ExecRunner{Binary: writeFollowLogsLateErrorStub(t)}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: r, eng: dockerEngine{}}
+
+	err := wait.ForLog("ready").
+		WithStartupTimeout(3*time.Second).
+		WaitUntilReady(context.Background(), waitTarget{c: ctr})
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want terminal not-found error", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want *CLIError", err)
+	}
+}
+
+func TestFollowLogsTerminalErrorSurvivesFailedClassificationProbe(t *testing.T) {
+	r := &cli.ExecRunner{Binary: writeFollowLogsProbeFailureStub(t)}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: testDockerUID}, runner: r, eng: dockerEngine{}}
+
+	stream, err := ctr.FollowLogs(context.Background())
+	if err != nil {
+		t.Fatalf("FollowLogs: %v", err)
+	}
+	defer stream.Close()
+	_, readErr := io.ReadAll(stream)
+	if !errors.Is(readErr, ErrContainerNotFound) {
+		t.Fatalf("read error = %v, want ErrContainerNotFound", readErr)
+	}
+	var cliErr *CLIError
+	if !errors.As(readErr, &cliErr) {
+		t.Fatalf("read error = %v, want *CLIError", readErr)
+	}
+}
+
 func writeFollowLogsStub(t *testing.T) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
@@ -319,6 +378,66 @@ if [ "$1" = "version" ]; then
   exit 0
 fi
 head -c 70000 /dev/zero >&2
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeFollowLogsNotFoundStub(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("follow-log shell stub requires a POSIX shell")
+	}
+	path := filepath.Join(t.TempDir(), "docker")
+	script := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '29.7\n'
+  exit 0
+fi
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeFollowLogsProbeFailureStub(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("follow-log shell stub requires a POSIX shell")
+	}
+	path := filepath.Join(t.TempDir(), "docker")
+	script := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  exit 1
+fi
+printf 'Error response from daemon: No such container: %s\n' "$3" >&2
+exit 1
+`
+	if err := os.WriteFile(path, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func writeFollowLogsLateErrorStub(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("follow-log shell stub requires a POSIX shell")
+	}
+	path := filepath.Join(t.TempDir(), "docker")
+	script := `#!/bin/sh
+if [ "$1" = "version" ]; then
+  printf '29.7\n'
+  exit 0
+fi
+printf 'ready\n'
 printf 'Error response from daemon: No such container: %s\n' "$3" >&2
 exit 1
 `

@@ -381,6 +381,62 @@ func TestStreamReapsChildAfterCancellationWithoutClose(t *testing.T) {
 	}
 }
 
+func TestStreamCancellationDuringStartUsesPublicationBarrier(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancelObserved := make(chan struct{})
+	terminateEntered := make(chan struct{})
+	releaseTerminate := make(chan struct{})
+	r := &ExecRunner{Binary: writeStub(t, `exec sleep 30`)}
+	hooks := streamHooks{
+		start: func(cmd *exec.Cmd) error {
+			if err := cmd.Start(); err != nil {
+				return err
+			}
+			// This is inside the real Start/publication window: the child
+			// exists, but Stream has not opened its ownership barrier yet.
+			cancel()
+			return nil
+		},
+		beforePublish: func(stream *processStream) {
+			select {
+			case <-cancelObserved:
+			case <-time.After(5 * time.Second):
+				t.Error("context cancellation did not reach the publication barrier")
+			}
+			if stream.lifecycle.isReaped() {
+				t.Error("child was reaped before lifecycle publication")
+			}
+			select {
+			case <-terminateEntered:
+				t.Error("termination ran before lifecycle publication")
+			default:
+			}
+		},
+		cancelObserved: func() { close(cancelObserved) },
+		terminate: func(cmd *exec.Cmd) error {
+			close(terminateEntered)
+			<-releaseTerminate
+			return terminateProcessTree(cmd)
+		},
+	}
+
+	stream, err := r.stream(ctx, hooks, "logs", "--follow", "x")
+	if err != nil {
+		t.Fatalf("Stream: %v", err)
+	}
+	close(releaseTerminate)
+	ps := stream.(*processStream)
+	select {
+	case <-ps.waitDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("child was not reaped after cancellation during start")
+	}
+	if _, err := io.ReadAll(stream); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReadAll error = %v, want context.Canceled", err)
+	}
+}
+
 func TestStreamCancellationDuringStartUsesImmutableEndpointOwnership(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

@@ -15,17 +15,18 @@ Run→ready measurement infrastructure for the performance issues
   library, pinned image digest, source commit and Git tree, dirty state,
   scenario, planned/actual iteration, duration, subprocess count),
   aggregation (median / min / max), JSON output, and the backend harness
-  (probe, image ensure / pull / remove). Zero-dependency, part of the root
-  module.
+  (probe, image ensure / pull / remove). It is part of the root module and
+  uses only the root module's standard-library code plus the
+  `golang.org/x/sys` dependency.
 - Root package, `bench_integration_test.go` (`integration` tag):
   counting scenarios. Each `Run` shape runs against a real backend
   wrapped in a counting runner; every iteration records duration and
   spawn count.
 - `bench/`: separate Go module (requires Go 1.26+) holding the
   testcontainers-go comparison. The dependency on testcontainers-go
-  lives only here so the library keeps its zero-dependency constraint.
-  `result.go` re-exports the shared schema; `scenario_test.go`
-  (`integration` tag)
+  lives only here; the root module's only non-standard dependency is
+  `golang.org/x/sys` for platform process and file handling. `result.go` re-exports the shared
+  schema; `scenario_test.go` (`integration` tag)
   runs the wall-clock scenarios.
 
 ## Scenarios

@@ -272,12 +272,29 @@ func (r *ExecRunner) binary() string {
 	return r.Binary
 }
 
+type runHooks struct {
+	start          func(*exec.Cmd) error
+	beforePublish  func()
+	cancelObserved func()
+	terminate      func(*exec.Cmd) error
+}
+
 func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	return r.run(ctx, runHooks{}, args...)
+}
+
+func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([]byte, []byte, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
-	cmd.Cancel = lifecycle.cancel
+	var cancelObservedOnce sync.Once
+	cmd.Cancel = func() error {
+		if hooks.cancelObserved != nil {
+			cancelObservedOnce.Do(hooks.cancelObserved)
+		}
+		return lifecycle.cancel()
+	}
 	var stdout, stderr bytes.Buffer
 	safeStderr := NewRedactor().NewStream(maxStderr)
 	cmd.Stdout = &stdout
@@ -286,7 +303,11 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
 
-	if err := cmd.Start(); err != nil {
+	start := hooks.start
+	if start == nil {
+		start = func(command *exec.Cmd) error { return command.Start() }
+	}
+	if err := start(cmd); err != nil {
 		lifecycle.failStart()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
@@ -294,20 +315,29 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 		}
 		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
 	}
-	// On Windows, newProcessTree attaches the Job Object after Start; the
+	if hooks.beforePublish != nil {
+		hooks.beforePublish()
+	}
+	// On Windows, newProcessTree retains a process handle after Start; the
 	// short attachment-window limitation is documented by that platform
 	// implementation.
-	tree, treeErr := newProcessTree(cmd)
-	if treeErr != nil {
-		// A platform tree is an enhancement. The direct process handle
-		// remains a safe cancellation path when attachment is unavailable.
-		tree = directProcessTree{}
+	var tree processTree
+	if hooks.terminate != nil {
+		tree = processTreeFunc(hooks.terminate)
+	} else {
+		var treeErr error
+		tree, treeErr = newProcessTree(cmd)
+		if treeErr != nil {
+			// A platform tree is an enhancement. The direct process handle
+			// remains a safe cancellation path when attachment is unavailable.
+			tree = directProcessTree{}
+		}
 	}
 	lifecycle.publishStart(tree)
 
 	// Run owns the sole Wait call through the same lifecycle used by Stream.
 	// This keeps context cancellation and the eventual reap from racing a
-	// stale numeric process-group signal.
+	// stale process-handle or numeric process-group signal.
 	err := lifecycle.result()
 	status := lifecycle.status()
 	// Output buffers are returned whole: success output and non-zero

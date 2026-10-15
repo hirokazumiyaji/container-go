@@ -10,6 +10,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -150,6 +151,7 @@ func scanLogStream(ctx context.Context, stream io.ReadCloser, match func(string)
 
 func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadCloser, match func(string) int, occurrences int, replay logReplay) logScanResult {
 	results := make(chan logScanResult, 1)
+	var matched atomic.Bool
 	go func() {
 		reader := bufio.NewReader(stream)
 		var lines [][sha256.Size]byte
@@ -218,8 +220,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				if errors.Is(err, io.EOF) {
 					committed := observedLines >= replay.previousLines
 					if count >= occurrences {
-						terminalErr := settleLogMatch(ctx, stream, reader)
-						results <- result(true, committed, nil, terminalErr)
+						results <- publishObservedMatch(ctx, &matched, stream, reader, result, committed)
 					} else {
 						results <- result(false, committed, nil, nil)
 					}
@@ -229,14 +230,13 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				return
 			}
 			if count >= occurrences {
-				terminalErr := settleLogMatch(ctx, stream, reader)
-				results <- result(true, false, nil, terminalErr)
+				results <- publishObservedMatch(ctx, &matched, stream, reader, result, false)
 				return
 			}
 		}
 	}()
 
-	if result, ok := receiveLogScanResult(ctx, target, results, ctx.Done()); ok {
+	if result, ok := receiveLogScanResult(ctx, target, results, ctx.Done(), &matched); ok {
 		return result
 	}
 	terminalErr := settledTerminalError(stream)
@@ -266,7 +266,7 @@ func settledTerminalError(stream io.ReadCloser) error {
 	}
 }
 
-func receiveLogScanResult(ctx context.Context, target Target, results <-chan logScanResult, done <-chan struct{}) (logScanResult, bool) {
+func receiveLogScanResult(ctx context.Context, target Target, results <-chan logScanResult, done <-chan struct{}, matched *atomic.Bool) (logScanResult, bool) {
 	// Prefer a result queued before the context became ready. This keeps
 	// a terminal CLI error visible when EOF and a deadline race.
 	select {
@@ -294,11 +294,59 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 				return logScanResult{state: state}, true
 			}
 		case <-done:
-			select {
-			case result := <-results:
-				return result, true
-			default:
+			return receiveLogScanResultAfterCancel(results, matched)
+		}
+	}
+}
+
+func publishObservedMatch(
+	ctx context.Context,
+	matched *atomic.Bool,
+	stream io.ReadCloser,
+	reader *bufio.Reader,
+	result func(found, committed bool, scanErr, terminalErr error) logScanResult,
+	committed bool,
+) logScanResult {
+	// Counted after the wait context ended: do not treat this as readiness.
+	// A custom Target may unblock Read on cancel and then emit a buffered
+	// matching line that was never observed before the deadline.
+	if ctx.Err() != nil {
+		return result(false, committed, ctx.Err(), nil)
+	}
+	matched.Store(true)
+	return result(true, committed, nil, settleLogMatch(ctx, stream, reader))
+}
+
+func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atomic.Bool) (logScanResult, bool) {
+	if matched == nil || !matched.Load() {
+		// No pre-cancel match. Do not wait: cancellation may unblock a
+		// custom reader that then emits a matching line for the first time.
+		select {
+		case result := <-results:
+			if result.found {
+				result.found = false
+				if result.err == nil {
+					result.err = context.Canceled
+				}
 			}
+			return result, true
+		default:
+			return logScanResult{}, false
+		}
+	}
+	// The pattern was counted before cancel; settlement watches the same
+	// context and should publish promptly. Keep a safety bound so a stuck
+	// Read still cannot hold WaitUntilReady after the deadline.
+	timer := time.NewTimer(maxLogSettleWindow)
+	defer timer.Stop()
+	select {
+	case result := <-results:
+		return result, true
+	case <-timer.C:
+		select {
+		case result := <-results:
+			return result, true
+		default:
 			return logScanResult{}, false
 		}
 	}
@@ -616,22 +664,21 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			}
 			terminalStreamErr := result.terminalErr
 			resultErr := record(terminalStreamErr, nil)
-			if result.found {
-				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
-					_ = stream.Close()
-					return terminalErr
-				}
-			}
 			_ = stream.Close()
 			if result.found {
-				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
-					return terminalErr
+				if cause := nonContextCause(terminalStreamErr); cause != nil {
+					if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
+						return terminalErr
+					}
+					return wrapWaitCause(what, cause, lastProbeErr)
 				}
-				if terminalStreamErr != nil {
-					return wrapWaitCause(what, terminalStreamErr, lastProbeErr)
-				}
-				if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, resultErr); err != nil {
-					return err
+				// The pattern was observed before settlement. A diagnostic
+				// settle delay, or a deadline that fires during that delay,
+				// must not turn the match into a timeout.
+				if callerCtx.Err() == nil && waitCtx.Err() == nil {
+					if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, resultErr); err != nil {
+						return err
+					}
 				}
 				return nil
 			}

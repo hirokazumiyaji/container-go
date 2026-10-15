@@ -52,7 +52,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 
 設計上の制約は次の三つである。
 
-- **依存ゼロ**：サードパーティの Go モジュールに依存せず、標準ライブラリだけで実装する。
+- **最小依存**：標準ライブラリと、プラットフォームの process と file 操作に使う `golang.org/x/sys` のみを依存する。コンテナクライアントのサードパーティ Go モジュールは使わない。
 - **セキュリティ**：subprocess argv でインジェクションは防ぐが、異常終了時の reaper staging には環境データ 노출の余地があるため、現行の no-leak 保証ではない（#111）。
 - **パフォーマンス**：テストスイートを左右するのはコンテナ（VM）の起動時間である。ライブラリ側のオーバーヘッドをそれに対して無視できる水準に保ち、並列起動を妨げない。
 
@@ -91,9 +91,9 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 本ライブラリは CLI ラッパー方式を採用する。
 理由は次の三点である。
 
-第一に、依存ゼロ要件との整合である。
+第一に、最小依存要件との整合である。
 XPC 直結方式は cgo と自前の C ブリッジを必要とし、ビルドに macOS SDK が絡む。
-CLI ラッパー方式は純 Go と標準ライブラリだけで完結し、`CGO_ENABLED=0` でもビルドできる。
+CLI ラッパー方式は、プラットフォームの process 操作に使う `golang.org/x/sys` を除いて純 Go・標準ライブラリで完結し、`CGO_ENABLED=0` でもビルドできる。
 
 第二に、安定性である。
 XPC のルート名やメッセージ構造は Apple Container の内部実装であり、互換性の保証がない。
@@ -232,8 +232,8 @@ func (c *Container) Terminate(ctx context.Context) error
 `Exec` は有限時間かつバッファリングされる操作で、終了コードと stdout+stderr を返す（非ゼロ終了は結果であり error ではない）。caller の context に deadline がない場合は 30 秒の既定 deadline を適用する。正の `WithExecTimeout(d)` を指定した場合、effective deadline は `d` と caller の deadline の早い方です。`WithExecTimeout(0)` は library の既定 deadline のみを無効化し、caller の deadline は取り除かない。長寿命のプロセスは通常 `WithCmd` で本体コマンドとして起動し、出力は `FollowLogs` で取得する（Long-open な Exec は避ける）。
 backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error とともに返す。CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。command の起動中実際に context error が競合した場合だけ、その分類は終了コードに依存しません。Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
-Windows では lifecycle が所有する Job Object handle を使い、割り当てできない場合は直接の子だけを対象にします。Job Object の割り当てが Start 後に行われるため、その短い attachment window 中に生成された descendant は Job Object の境界外です。空の Job Object への kill 成功や終了済み child の kill 成功は、active process の証拠として扱いません。
-Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows Job Object の runtime test や exit-259 の active-child test は実行できません。
+Windows では lifecycle が `OpenProcess` handle を保持し、`TerminateProcess` で直接の子だけを終了します。detach された descendant や親を付け替えられた descendant は保証外です。終了済み child への kill 成功は active process の証拠として扱いません。
+Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows の process-handle runtime test や exit-259 の active-child test は実行できません。
 backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`（`errors.Is(err, ErrExecTerminationUnsupported)`）を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。したがって error が non-nil でも reader を読む必要があります。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
 
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
@@ -592,7 +592,23 @@ local に addressable な tag または alias を使うか、`WithAllowMutableIm
 
 **要求された範囲だけスナップショットを制限する**。`Logs` と成功する `LogsWithOptions` 呼び出しは有限の CLI snapshot を完了するが、`Logs` は利用可能な全出力を buffer できる。`LogsOptions{Tail, Since}` は backend 固有で、Docker は両方を受け付けるが、確認した Apple Container CLI の各 version は Tail に `-n` を使い Since を持たない。このチェックアウトは Apple にも Docker の flag を渡すため、option の契約は #82 を待つ。どちらの経路も byte 上限を追加しない。`FollowLogs` は意図的に上限のない stream であり、`io.ReadCloser` を閉じるか context をキャンセルすると CLI process を終了する。wait failure の診断 log 末尾は 1MiB 上限である。
 
-**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。
+**ストリームを有限に保つ**。
+`FollowLogs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返す。
+`Close` またはコンテキスト取消では、直接の CLI 子プロセスを終了して回収します。
+Unix では停止状態を確認したあと CLI の process group へベストエフォートの `SIGKILL` を送り、続けて直接の子にも kill を送ります。
+同じグループに残った helper は終了することがありますが、回収は保証しません。
+停止状態を確認できない場合は直接の子（Linux では pidfd）だけを対象にし、古い PGID には signal を送りません。
+直接の子を回収した後は、古い数値の process-group ID は使いません。
+Windows では保持した process handle で直接の CLI 子だけを終了し、descendant は終了しません。
+その他の対応 OS でも直接の子だけを対象とします。
+ForLog が診断用に保持するログは 1MiB を上限とする。
+
+ストリームのエラーは 2 つの段階に分かれる。
+`Stream` と公開 API の `FollowLogs` は起動エラーを返す。
+ストリームを返した後の CLI 終了エラーは `Read` から返るため、呼び出し側は必ず EOF まで読む必要がある。
+`Close` とコンテキスト取消は意図的な終了経路なので、EOF またはコンテキストエラーになることがある。
+
+**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。Unix は所有中の CLI process group に残った descendant へベストエフォートの `SIGKILL` を送ることがあるが、回収はせず、停止状態を確認できない場合や回収後は古い数値 PGID に signal を送らない。Windows は保持した process handle で直接の子だけを終了する。子孫の回収は保証しない。
 
 ## エラー処理
 

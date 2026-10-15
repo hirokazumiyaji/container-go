@@ -66,11 +66,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // or the context is cancelled. Close terminates the underlying CLI
 // process. A startup failure is returned by FollowLogs; after the stream
 // is returned, a terminal CLI failure is delivered by Read. The direct
-// CLI child is reaped; Unix process groups provide best-effort descendant
-// termination while that child is owned. Windows uses the retained process
-// handle for direct-child termination; descendants are not reaped by this
-// package. Once the child is reaped, Close does not signal its former
-// process group.
+// CLI child is always reaped. Unix process groups provide best-effort
+// descendant termination while that child is owned. Windows uses the
+// retained process handle for direct-child termination; detached
+// descendants are not terminated. Once the child is reaped, Close does
+// not signal its former process group.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
@@ -95,10 +95,7 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 		ctx:        ctx,
 		container:  c,
 	}
-	status, ok := stream.(interface {
-		Done() <-chan struct{}
-		TerminalError() error
-	})
+	status, ok := stream.(terminalStreamStatus)
 	if !ok || status.Done() == nil {
 		return classified, nil
 	}
@@ -116,18 +113,41 @@ type classifyingStream struct {
 	terminalErr  error
 }
 
+type terminalStreamStatus interface {
+	Done() <-chan struct{}
+	TerminalError() error
+}
+
 func (s *classifyingStream) Read(p []byte) (int, error) {
 	n, err := s.ReadCloser.Read(p)
 	if err == nil || errors.Is(err, io.EOF) {
 		return n, err
 	}
+	if _, ok := s.ReadCloser.(terminalStreamStatus); ok {
+		if terminalErr := s.TerminalError(); terminalErr != nil {
+			return n, terminalErr
+		}
+	}
 	var cliErr *cli.CLIError
 	if errors.As(err, &cliErr) {
 		return n, s.classifyTerminal(err)
 	}
-	return n, wrapNotFoundFor(s.container.eng, s.container.classify(s.ctx, err))
+	return n, s.wrap(err)
 }
 
+// Done forwards the optional process status exposed by the underlying stream.
+// A nil channel means that the reader has no status capability; wait.ForLog
+// then falls back to its ordinary io.Reader contract.
+func (s *classifyingStream) Done() <-chan struct{} {
+	if status, ok := s.ReadCloser.(interface{ Done() <-chan struct{} }); ok {
+		return status.Done()
+	}
+	return nil
+}
+
+// TerminalError returns the classified terminal CLI error, if the stream
+// implementation exposes one. It is cached so Read and readiness handling
+// observe the same cause and classification probe result.
 func (s *classifyingStream) TerminalError() error {
 	if status, ok := s.ReadCloser.(interface{ TerminalError() error }); ok {
 		return s.classifyTerminal(status.TerminalError())
@@ -144,10 +164,7 @@ func (s *classifyingStream) classifyTerminal(err error) error {
 
 type classifyingStatusStream struct {
 	*classifyingStream
-	status interface {
-		Done() <-chan struct{}
-		TerminalError() error
-	}
+	status terminalStreamStatus
 }
 
 func (s *classifyingStatusStream) Done() <-chan struct{} {
@@ -171,5 +188,12 @@ func (s *classifyingStream) wrap(err error) error {
 	if err == nil || errors.Is(err, io.EOF) {
 		return err
 	}
-	return wrapNotFoundFor(s.container.eng, s.container.classify(s.ctx, err))
+	classified := s.container.classify(s.ctx, err)
+	if classified == nil || errors.Is(classified, err) || errors.Is(err, classified) {
+		return wrapNotFoundFor(s.container.eng, classified)
+	}
+	// A backend probe can classify a terminal CLI failure as an
+	// infrastructure problem. Keep both causes so Read/ForLog callers can
+	// still recover CLIError and ErrContainerNotFound with errors.Is/As.
+	return wrapNotFoundFor(s.container.eng, errors.Join(classified, err))
 }

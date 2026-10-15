@@ -708,6 +708,46 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 	}
 }
 
+// reviewOpaqueFacade mirrors cli.safeError: Is/As over an inner tree without
+// Unwrap, so ordinary errors.Unwrap traversal cannot reach the causes.
+type reviewOpaqueFacade struct {
+	err error
+}
+
+func (e *reviewOpaqueFacade) Error() string { return "opaque: " + e.err.Error() }
+func (e *reviewOpaqueFacade) Is(target error) bool {
+	return e != nil && errors.Is(e.err, target)
+}
+func (e *reviewOpaqueFacade) As(target any) bool {
+	return e != nil && errors.As(e.err, target)
+}
+
+func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
+	cause := &reviewTypedCause{message: "logs follow exited 1"}
+	opaque := &reviewOpaqueFacade{err: errors.Join(context.Canceled, cause)}
+	got := nonContextCause(opaque)
+	if got == nil {
+		t.Fatal("opaque mixed facade dropped entirely")
+	}
+	if !errors.Is(got, cause) {
+		t.Fatalf("opaque facade = %v, want typed cause via Is", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("opaque facade = %v, must suppress canceled", got)
+	}
+	var gotCause *reviewTypedCause
+	if !errors.As(got, &gotCause) || gotCause != cause {
+		t.Fatalf("opaque facade = %v, want typed cause via As", got)
+	}
+	var gotFacade *reviewOpaqueFacade
+	if !errors.As(got, &gotFacade) {
+		t.Fatalf("opaque facade = %v, want original facade via As", got)
+	}
+	if !strings.Contains(got.Error(), "opaque:") {
+		t.Fatalf("opaque facade = %v, want original diagnostic text", got)
+	}
+}
+
 func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 	cause := &reviewTypedCause{message: "transient stream failure"}
 	cases := []struct {

@@ -361,7 +361,14 @@ func nonContextCause(err error) error {
 		return replaceUnwrappedCause(err, filtered)
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return nil
+		// Pure context sentinels have nothing else to retain. Opaque facades
+		// (Is/As without Unwrap), such as cli.WithRedactor over a mixed join,
+		// still expose non-context causes through Is/As — preserve that
+		// surface while suppressing context matches.
+		if err == context.Canceled || err == context.DeadlineExceeded {
+			return nil
+		}
+		return &contextStrippedCause{original: err, cause: nil}
 	}
 	return err
 }

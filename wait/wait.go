@@ -433,21 +433,31 @@ func preserveEmptyContextWrapper(err error) error {
 }
 
 func keepsClassificationWithoutChildren(err error) bool {
-	switch errorPkgPath(err) {
+	path := errorPkgPath(err)
+	switch path {
 	case "", "errors", "fmt":
 		return false
-	default:
-		return !isStdlibTransportWrapper(err)
 	}
+	// Standard-library package paths never contain a dot. Carrier-only
+	// wrappers such as os/exec.Error or strconv.NumError exist only to wrap
+	// children, so once those are gone nothing independent remains.
+	if isStdlibPackagePath(path) {
+		return false
+	}
+	return true
 }
 
 func isStdlibTransportWrapper(err error) bool {
-	switch errorPkgPath(err) {
-	case "net", "os", "net/url", "io/fs":
+	return isStdlibPackagePath(errorPkgPath(err))
+}
+
+func isStdlibPackagePath(path string) bool {
+	switch path {
+	case "", "errors", "fmt":
 		return true
-	default:
-		return false
 	}
+	// Stdlib paths look like "os/exec"; module paths contain a dot.
+	return path != "" && !strings.Contains(path, ".")
 }
 
 func errorPkgPath(err error) string {

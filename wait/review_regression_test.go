@@ -8,6 +8,8 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -735,6 +737,12 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	}
 	if got := nonContextCause(&url.Error{Op: "Get", URL: "http://example", Err: context.DeadlineExceeded}); got != nil {
 		t.Fatalf("context-only *url.Error = %v, want nil", got)
+	}
+	if got := nonContextCause(&exec.Error{Name: "docker", Err: context.Canceled}); got != nil {
+		t.Fatalf("context-only *exec.Error = %v, want nil", got)
+	}
+	if got := nonContextCause(&strconv.NumError{Func: "ParseInt", Num: "x", Err: context.Canceled}); got != nil {
+		t.Fatalf("context-only *strconv.NumError = %v, want nil", got)
 	}
 }
 

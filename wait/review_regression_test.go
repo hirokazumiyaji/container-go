@@ -1407,7 +1407,7 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 	}
 
 	ambiguous := &reviewOpaqueAmbiguousContextTextFacade{backend: backend}
-	got = nonContextCause(ambiguous) //nolint:staticcheck // reassignment intentional
+	got = nonContextCause(ambiguous)
 	if got == nil {
 		t.Fatal("ambiguous opaque facade dropped entirely")
 	}
@@ -1425,6 +1425,24 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 	if got.Error() == "peer reported" {
 		t.Fatalf("ambiguous opaque facade = %q, stripped inside retained diagnostic", got.Error())
 	}
+
+	embedded := &reviewOpaqueEmbeddedContextTextFacade{backend: backend}
+	got = nonContextCause(embedded)
+	if got == nil {
+		t.Fatal("embedded opaque facade dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("embedded opaque facade = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, backend) {
+		t.Fatalf("embedded opaque facade = %v, want backend via Is", got)
+	}
+	if got.Error() == "peer reported" {
+		t.Fatalf("embedded opaque facade = %q, stripped legitimate diagnostic text", got.Error())
+	}
+	if got.Error() != "" && strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("embedded opaque facade = %q, must not keep canceled wording", got.Error())
+	}
 }
 
 type reviewOpaqueAmbiguousContextTextFacade struct {
@@ -1441,6 +1459,26 @@ func (e *reviewOpaqueAmbiguousContextTextFacade) Is(target error) bool {
 	return target == context.Canceled || errors.Is(e.backend, target)
 }
 func (e *reviewOpaqueAmbiguousContextTextFacade) As(target any) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	return errors.As(e.backend, target)
+}
+
+type reviewOpaqueEmbeddedContextTextFacade struct {
+	backend error
+}
+
+func (e *reviewOpaqueEmbeddedContextTextFacade) Error() string {
+	return "peer reported context canceled"
+}
+func (e *reviewOpaqueEmbeddedContextTextFacade) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return target == context.Canceled || errors.Is(e.backend, target)
+}
+func (e *reviewOpaqueEmbeddedContextTextFacade) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
@@ -1541,6 +1579,27 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	}
 	if got.Error() != "operation failed: public" {
 		t.Fatalf("partial sanitizing multi wrapper = %q, want original safe rendering", got.Error())
+	}
+
+	partialWithContext := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
+		msg:  "context canceled: public",
+	}
+	got = nonContextCause(partialWithContext)
+	if got == nil {
+		t.Fatal("partial sanitizing multi wrapper with context text dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("partial sanitizing with context text = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("partial sanitizing with context text leaked secret: %q", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("partial sanitizing with context text = %q, must strip discarded context", got.Error())
+	}
+	if !strings.Contains(got.Error(), "public") {
+		t.Fatalf("partial sanitizing with context text = %q, want retained public text", got.Error())
 	}
 }
 

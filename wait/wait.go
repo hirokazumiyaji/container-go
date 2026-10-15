@@ -657,9 +657,10 @@ func (e *contextStrippedCause) Error() string {
 			return cleaned
 		}
 		// When Error() omits any child rendering (full or partial sanitization),
-		// keep that safe text instead of exposing cause.Error().
+		// keep the safe text but still remove discarded context spans that are
+		// present, without synthesizing omitted child text.
 		if !allChildTextAppearsIn(orig, inners) {
-			return orig
+			return stripVerifiedDiscardedChildText(orig, inners)
 		}
 		// Ambiguous multi-child framing: prefer filtered cause text.
 		return causeText
@@ -733,6 +734,30 @@ func allChildTextAppearsIn(orig string, inners []error) bool {
 		}
 	}
 	return true
+}
+
+// stripVerifiedDiscardedChildText removes discarded child renderings that are
+// present in orig without inventing text for omitted (sanitized) children.
+func stripVerifiedDiscardedChildText(orig string, inners []error) string {
+	cleaned := orig
+	for _, inner := range inners {
+		if inner == nil || nonContextCause(inner) != nil {
+			continue
+		}
+		phrase := inner.Error()
+		if phrase == "" || !strings.Contains(cleaned, phrase) {
+			continue
+		}
+		if strings.Count(cleaned, phrase) != 1 {
+			continue
+		}
+		cleaned = strings.Replace(cleaned, phrase, "", 1)
+	}
+	cleaned = strings.ReplaceAll(cleaned, ": ;", ":")
+	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")
+	cleaned = strings.TrimSpace(cleaned)
+	cleaned = strings.Trim(cleaned, ":;")
+	return strings.TrimSpace(cleaned)
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently
@@ -930,26 +955,23 @@ func isErrorSeparator(b byte) bool {
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a
 // context-only wrapper's Error text when framed reconstruction is unavailable.
-// If a sentinel phrase occurs more than once, stripping would be ambiguous
-// (classification vs legitimate diagnostic text), so return a neutral empty
-// message instead of corrupting the retained wording.
+// Only a clear classification prefix is stripped; any other occurrence is
+// treated as ambiguous and yields a neutral empty message.
 func stripContextSentinelPhrases(orig string) string {
 	cleaned := orig
 	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
-		switch strings.Count(cleaned, phrase) {
-		case 0:
+		if strings.HasPrefix(cleaned, phrase) {
+			cleaned = strings.TrimPrefix(cleaned, phrase)
+			cleaned = strings.TrimSpace(cleaned)
+			cleaned = strings.TrimLeft(cleaned, ":;")
+			cleaned = strings.TrimSpace(cleaned)
 			continue
-		case 1:
-			cleaned = strings.Replace(cleaned, phrase, "", 1)
-		default:
+		}
+		if strings.Contains(cleaned, phrase) {
 			return ""
 		}
 	}
-	cleaned = strings.ReplaceAll(cleaned, ": ;", ":")
-	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")
-	cleaned = strings.TrimSpace(cleaned)
-	cleaned = strings.Trim(cleaned, ":;")
-	return strings.TrimSpace(cleaned)
+	return cleaned
 }
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 

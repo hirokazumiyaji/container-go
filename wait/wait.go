@@ -553,7 +553,25 @@ func multiUnwrap(err error) []error {
 // replaceDiscardedErrorText removes or rewrites child renderings independently
 // of Unwrap order so indexed %w verbs that reorder children still strip the
 // discarded sentinel occurrence and emit each retained child's filtered text.
+// When multiple children share identical Error text, positions cannot be
+// associated safely without the format string; return "" so callers fall back
+// to the filtered cause text.
 func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
+	phraseCount := make(map[string]int)
+	for _, inner := range inners {
+		if inner == nil {
+			continue
+		}
+		if phrase := inner.Error(); phrase != "" {
+			phraseCount[phrase]++
+		}
+	}
+	for _, n := range phraseCount {
+		if n > 1 {
+			return ""
+		}
+	}
+
 	type edit struct {
 		start, end int
 		repl       string
@@ -615,9 +633,10 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 	for _, e := range edits {
 		masked = masked[:e.start] + e.repl + masked[e.end:]
 	}
+	// Only tidy delimiters left by removals; do not collapse intentional
+	// whitespace inside retained backend diagnostics.
 	masked = strings.ReplaceAll(masked, ": ;", ":")
 	masked = strings.ReplaceAll(masked, "; ;", ";")
-	masked = strings.ReplaceAll(masked, "  ", " ")
 	masked = strings.TrimSpace(masked)
 	masked = strings.Trim(masked, ":;")
 	return strings.TrimSpace(masked)

@@ -781,11 +781,35 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	if !errors.Is(got, sameText) || !errors.Is(got, other) {
 		t.Fatalf("fmt multi-wrap with duplicate phrase = %v, want both retained causes", got)
 	}
+	// Duplicate child text makes framed reconstruction ambiguous; fall back to
+	// the filtered cause tree while still suppressing context matches.
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("fmt multi-wrap with duplicate phrase = %v, must drop canceled", got)
+	}
 	if !strings.Contains(got.Error(), "context canceled") {
 		t.Fatalf("fmt multi-wrap with duplicate phrase = %q, want retained cause text", got.Error())
 	}
 	if !strings.Contains(got.Error(), "other backend failure") {
 		t.Fatalf("fmt multi-wrap with duplicate phrase = %q, want other cause text", got.Error())
+	}
+
+	spaced := errors.New("syntax  near token")
+	spacedWrap := fmt.Errorf("stream: %w; backend: %w", context.Canceled, spaced)
+	got = nonContextCause(spacedWrap)
+	if !strings.Contains(got.Error(), "syntax  near token") {
+		t.Fatalf("spaced backend diagnostic = %q, want preserved double space", got.Error())
+	}
+
+	ambiguous := fmt.Errorf("backend=%[2]w; ctx=%[1]w", context.Canceled, errors.New("context canceled"))
+	got = nonContextCause(ambiguous)
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("ambiguous indexed duplicate = %v, must drop canceled", got)
+	}
+	if got.Error() != "context canceled" {
+		// Fall back to the filtered cause text rather than a mis-associated frame.
+		if !strings.Contains(got.Error(), "context canceled") || strings.Contains(got.Error(), "backend=") {
+			t.Fatalf("ambiguous indexed duplicate = %q, want cause-only fallback", got.Error())
+		}
 	}
 
 	nestedCause := &reviewTypedCause{message: "nested backend failure"}

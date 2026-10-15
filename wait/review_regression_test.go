@@ -152,12 +152,13 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
 		target := newReviewExecTarget(cause, false)
 		done := make(chan error, 1)
-		start := time.Now()
 		go func() {
 			done <- ForExec([]string{"probe"}).WithStartupTimeout(time.Hour).WithPollInterval(5*time.Millisecond).WaitUntilReady(caller, target)
 		}()
+		var start time.Time
 		select {
 		case <-target.started:
+			start = time.Now()
 			caller.expire()
 		case <-time.After(time.Second):
 			t.Fatal("exec check did not start")
@@ -230,12 +231,13 @@ func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
 	defer cancel()
 	started := make(chan struct{})
 	done := make(chan error, 1)
-	start := time.Now()
 	go func() {
 		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &reviewLogReadStartTarget{started: started})
 	}()
+	var start time.Time
 	select {
 	case <-started:
+		start = time.Now()
 		cancel()
 	case <-time.After(time.Second):
 		t.Fatal("log Read did not start")
@@ -288,13 +290,14 @@ func TestForLogDeadlineRetainsStreamCause(t *testing.T) {
 	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
 	started := make(chan struct{})
 	done := make(chan error, 1)
-	start := time.Now()
 	go func() {
 		done <- ForLog("never").WithStartupTimeout(time.Hour).
 			WaitUntilReady(caller, &reviewLogDeadlineCauseTarget{cause: cause, started: started})
 	}()
+	var start time.Time
 	select {
 	case <-started:
+		start = time.Now()
 		caller.expire()
 	case <-time.After(time.Second):
 		t.Fatal("log stream cause was not retained before deadline")

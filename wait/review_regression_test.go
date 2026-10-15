@@ -3,6 +3,7 @@ package wait
 import (
 	"context"
 	"crypto/x509"
+	"encoding/csv"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -934,6 +935,19 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 		t.Fatalf("json marshaler error Err = %v, must not retain canceled", gotMarshal.Err)
 	}
 
+	csvErr := &csv.ParseError{StartLine: 1, Line: 1, Column: 1, Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(csvErr)
+	var gotCSV *csv.ParseError
+	if !errors.As(got, &gotCSV) {
+		t.Fatalf("csv parse error = %v, want *csv.ParseError", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("csv parse error = %v, must not match canceled at top level", got)
+	}
+	if errors.Is(gotCSV.Err, context.Canceled) {
+		t.Fatalf("csv parse error Err = %v, must not retain canceled", gotCSV.Err)
+	}
+
 	execTemplateErr := template.ExecError{Name: "tmpl", Err: errors.Join(context.Canceled, cause)}
 	got = nonContextCause(execTemplateErr)
 	var gotExecTemplate template.ExecError
@@ -1708,7 +1722,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 }
 
 func TestIsStdlibPackagePathAllowlist(t *testing.T) {
-	for _, path := range []string{"os/exec", "strconv", "encoding/json", "text/template", "crypto/x509", "net", "errors", "fmt"} {
+	for _, path := range []string{"os/exec", "strconv", "encoding/json", "encoding/csv", "text/template", "crypto/x509", "net", "errors", "fmt"} {
 		if !isStdlibPackagePath(path) {
 			t.Fatalf("isStdlibPackagePath(%q) = false, want true", path)
 		}

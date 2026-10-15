@@ -1424,6 +1424,19 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("trailing arrow-discarded wrap = %q, want arrow junction removed", got.Error())
 	}
 
+	diskFull := errors.New("disk full")
+	adjacentContexts := fmt.Errorf("operation failed: %w, %w; backend: %w", context.Canceled, context.DeadlineExceeded, diskFull)
+	got = nonContextCause(adjacentContexts)
+	if !errors.Is(got, diskFull) {
+		t.Fatalf("adjacent context removals = %v, want disk full", got)
+	}
+	if errors.Is(got, context.Canceled) || errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("adjacent context removals = %v, must drop context", got)
+	}
+	if got.Error() != "operation failed: backend: disk full" {
+		t.Fatalf("adjacent context removals = %q, want merged empty removals keeping framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)

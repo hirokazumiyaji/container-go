@@ -1398,6 +1398,11 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 		start, end := p.start, p.end
 		if p.removal {
 			start, end = expandRemovalSeparators(orig, start, end, occupied)
+			// Mark the expanded region so a later adjacent discarded child
+			// cannot claim the same separator and produce overlapping offsets.
+			for j := start; j < end; j++ {
+				occupied[j] = true
+			}
 			edits = append(edits, edit{start: start, end: end, repl: ""})
 			changed = true
 			continue
@@ -1411,20 +1416,39 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 	if !changed {
 		return ""
 	}
+	// Merge overlapping or abutting empty removals (adjacent context-only
+	// children that both expanded across a shared separator) so framed
+	// reconstruction is not abandoned.
 	sort.Slice(edits, func(i, j int) bool {
 		if edits[i].start != edits[j].start {
-			return edits[i].start > edits[j].start
+			return edits[i].start < edits[j].start
 		}
-		return edits[i].end > edits[j].end
+		return edits[i].end < edits[j].end
 	})
-	for i := 1; i < len(edits); i++ {
-		// Overlapping edits are unsafe to apply from original offsets.
-		if edits[i].end > edits[i-1].start {
+	merged := make([]edit, 0, len(edits))
+	for _, e := range edits {
+		if e.repl == "" && len(merged) > 0 && merged[len(merged)-1].repl == "" && e.start <= merged[len(merged)-1].end {
+			if e.end > merged[len(merged)-1].end {
+				merged[len(merged)-1].end = e.end
+			}
+			continue
+		}
+		merged = append(merged, e)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].start != merged[j].start {
+			return merged[i].start > merged[j].start
+		}
+		return merged[i].end > merged[j].end
+	})
+	for i := 1; i < len(merged); i++ {
+		// Non-empty overlapping edits remain unsafe to apply from original offsets.
+		if merged[i].end > merged[i-1].start {
 			return ""
 		}
 	}
 	masked := orig
-	for _, e := range edits {
+	for _, e := range merged {
 		if e.start < 0 || e.end > len(masked) || e.start > e.end {
 			return ""
 		}

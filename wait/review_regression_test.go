@@ -474,8 +474,16 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 			defer cancel()
 			strategy := ForAny(child).WithStartupTimeout(tc.startup)
 			done := make(chan error, 1)
-			start := time.Now()
 			go func() { done <- strategy.WaitUntilReady(ctx, &reviewNoopTarget{}) }()
+			var start time.Time
+			select {
+			case <-child.started:
+				start = time.Now()
+			case err := <-done:
+				t.Fatalf("ForAny returned before child started: %v", err)
+			case <-time.After(time.Second):
+				t.Fatal("child strategy did not start")
+			}
 			var err error
 			select {
 			case err = <-done:
@@ -727,7 +735,7 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 }
 
 // reviewOpaqueFacade mirrors cli.safeError: Is/As over an inner tree without
-// Unwrap, so ordinary errors.Unwrap traversal cannot reach the causes.
+// Unwrap, with UnwrapRaw as the explicit opt-in to the source error.
 type reviewOpaqueFacade struct {
 	err error
 }
@@ -738,6 +746,12 @@ func (e *reviewOpaqueFacade) Is(target error) bool {
 }
 func (e *reviewOpaqueFacade) As(target any) bool {
 	return e != nil && errors.As(e.err, target)
+}
+func (e *reviewOpaqueFacade) UnwrapRaw() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
 }
 
 func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
@@ -763,6 +777,13 @@ func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "opaque:") {
 		t.Fatalf("opaque facade = %v, want original diagnostic text", got)
+	}
+
+	if got := nonContextCause(&reviewOpaqueFacade{err: context.Canceled}); got != nil {
+		t.Fatalf("context-only opaque facade = %v, want nil", got)
+	}
+	if got := nonContextCause(&reviewOpaqueFacade{err: errors.Join(context.Canceled, context.DeadlineExceeded)}); got != nil {
+		t.Fatalf("context-only opaque join = %v, want nil", got)
 	}
 }
 

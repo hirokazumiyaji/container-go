@@ -361,14 +361,22 @@ func nonContextCause(err error) error {
 		return replaceUnwrappedCause(err, filtered)
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		// Pure context sentinels have nothing else to retain. Opaque facades
-		// (Is/As without Unwrap), such as cli.WithRedactor over a mixed join,
-		// still expose non-context causes through Is/As — preserve that
-		// surface while suppressing context matches.
+		// Pure context sentinels have nothing else to retain.
 		if err == context.Canceled || err == context.DeadlineExceeded {
 			return nil
 		}
-		return &contextStrippedCause{original: err, cause: nil}
+		// Opaque facades (Is/As without Unwrap), such as cli.WithRedactor,
+		// expose the source tree only via UnwrapRaw. Filter that tree so a
+		// context-only facade is dropped while a mixed join keeps its
+		// non-context surface under the original facade diagnostics.
+		if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
+			filtered := nonContextCause(raw.UnwrapRaw())
+			if filtered == nil {
+				return nil
+			}
+			return &contextStrippedCause{original: err, cause: filtered}
+		}
+		return nil
 	}
 	return err
 }

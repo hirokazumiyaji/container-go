@@ -590,9 +590,17 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	if got := ctr.immutableID(); got != dockerFixtureID {
 		t.Fatalf("uid = %q, want %q", got, dockerFixtureID)
 	}
-	wantTargets := []string{dockerFixtureID, dockerFixtureID}
-	if got := runner.targets(); !slices.Equal(got, wantTargets) {
-		t.Errorf("inspect targets = %v, want %v", got, wantTargets)
+	// Endpoint may reuse State's fresh snapshot within the dynamic TTL, so
+	// the number of inspects can be 1 or 2. Every inspect must still target
+	// the resolved Docker UID rather than the logical name.
+	got := runner.targets()
+	if len(got) == 0 {
+		t.Fatal("no inspect calls")
+	}
+	for _, target := range got {
+		if target != dockerFixtureID {
+			t.Errorf("inspect target = %q, want resolved UID %q (all targets %v)", target, dockerFixtureID, got)
+		}
 	}
 }
 

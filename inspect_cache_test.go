@@ -355,6 +355,50 @@ func (r *blockingDynamicInspectRunner) Run(ctx context.Context, args ...string) 
 	return r.fakeRunner.Run(ctx, args...)
 }
 
+func TestClearDynamicDropsInFlightRefresh(t *testing.T) {
+	base := newTestRunner()
+	base.inspectResponses = []string{
+		dockerInspectWithPort("49153"),
+		dockerInspectWithPort("49154"),
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var inspectN atomic.Int32
+	runner := &blockingDynamicInspectRunner{
+		fakeRunner: base,
+		started:    started,
+		release:    release,
+		count:      &inspectN,
+	}
+	ctr := testDockerContainer(base, portSpec{port: 6379, proto: "tcp"})
+	ctr.runner = runner
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := ctr.Endpoint(context.Background(), "6379/tcp")
+		errCh <- err
+	}()
+	<-started
+	ctr.clearDynamic()
+	close(release)
+	if err := <-errCh; err != nil {
+		t.Fatalf("in-flight Endpoint: %v", err)
+	}
+	if info := ctr.cachedDynamic(); info != nil {
+		t.Fatalf("dynamic cache = %+v after clear during refresh, want empty", info)
+	}
+	endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("Endpoint after clear: %v", err)
+	}
+	if endpoint != "127.0.0.1:49154" {
+		t.Fatalf("Endpoint = %q, want post-clear inspect", endpoint)
+	}
+	if got := inspectN.Load(); got != 2 {
+		t.Fatalf("inspect calls = %d, want dropped in-flight + fresh", got)
+	}
+}
+
 func TestEndpointReinspectsAfterDynamicTTL(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{

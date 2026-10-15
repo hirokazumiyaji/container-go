@@ -141,6 +141,7 @@ type lockPack struct {
 	info           *engineInfo // immutable identity snapshot; excludes network/port/state
 	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
 	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
+	dynamicGen     uint64      // bumped by clearDynamic so in-flight refreshes cannot repopulate
 	now            func() time.Time // optional test clock; nil means time.Now
 	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
 	inspectMu      contextLock // serializes inspect target selection and UID publication
@@ -1239,6 +1240,7 @@ func (c *Container) cachedDynamic() *engineInfo {
 }
 
 func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
+	gen := c.dynamicGeneration()
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
@@ -1252,14 +1254,27 @@ func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
 	if err := c.rememberIdentity(ctx, info); err != nil {
 		return nil, err
 	}
-	c.storeDynamic(info)
+	c.storeDynamic(info, gen)
 	return info, nil
 }
 
-func (c *Container) storeDynamic(info *engineInfo) {
+func (c *Container) dynamicGeneration() uint64 {
 	p := c.pack()
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.dynamicGen
+}
+
+func (c *Container) storeDynamic(info *engineInfo, gen uint64) {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Delete/Terminate bump dynamicGen while an inspect may still be in
+	// flight. Drop that result so endpoint reads cannot revive a deleted
+	// container's IP/port under a fresh TTL.
+	if p.dynamicGen != gen {
+		return
+	}
 	p.dynamic = cloneEngineInfo(info)
 	p.dynamicAt = p.currentTime()
 }
@@ -1270,6 +1285,7 @@ func (c *Container) clearDynamic() {
 	defer p.mu.Unlock()
 	p.dynamic = nil
 	p.dynamicAt = time.Time{}
+	p.dynamicGen++
 }
 
 // usableDynamicSnapshot reports whether a cached inspect has network or

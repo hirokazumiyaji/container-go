@@ -1439,7 +1439,12 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 func isErrorSeparator(b byte) bool {
-	return b == ';' || b == ':' || b == ',' || b == ' ' || b == '\t' || b == '\n' || b == '\r'
+	switch b {
+	case ';', ':', ',', '|', ' ', '\t', '\n', '\r':
+		return true
+	default:
+		return false
+	}
 }
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a
@@ -1598,9 +1603,15 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	}
 	if err != nil {
 		if permanentProbeError(err) || isPermanentCheckError(err) {
-			return wrapWaitCause(what, permanentCause(err), lastProbeErr)
+			cause := permanentCause(err)
+			if filtered := nonContextCause(cause); filtered != nil {
+				cause = filtered
+			}
+			return wrapWaitCause(what, cause, lastProbeErr)
 		}
-		lastProbeErr = err
+		if filtered := nonContextCause(err); filtered != nil {
+			lastProbeErr = filtered
+		}
 	} else if terminalWaitState(state) {
 		return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
 	}
@@ -1612,15 +1623,22 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		}
 
 		if err := check(waitCtx); err != nil {
-			// Keep the latest check cause even when it races with the
-			// context becoming done; the terminal classification must not
-			// erase a typed backend error.
-			lastErr = err
+			// Keep the latest non-context check cause even when it races with
+			// the context becoming done; the terminal classification must not
+			// erase a typed backend error, and mixed Join(context, cause)
+			// must not keep the stale context half for later timeouts.
+			if filtered := nonContextCause(err); filtered != nil {
+				lastErr = filtered
+			}
 			if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
 			}
 			if isPermanentCheckError(err) {
-				return wrapWaitCause(what, permanentCause(err), joinNonNil(lastErr, lastProbeErr))
+				cause := permanentCause(err)
+				if filtered := nonContextCause(cause); filtered != nil {
+					cause = filtered
+				}
+				return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
 			}
 		} else {
 			if terminalErr := terminationErr(); terminalErr != nil {
@@ -1641,13 +1659,21 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			state, err := targetState(waitCtx, target)
 			if err != nil {
 				if terminalErr := terminationErr(); terminalErr != nil {
-					lastProbeErr = err
+					if filtered := nonContextCause(err); filtered != nil {
+						lastProbeErr = filtered
+					}
 					return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
 				}
 				if isPermanentCheckError(err) || permanentProbeError(err) {
-					return wrapWaitCause(what, permanentCause(err), joinNonNil(lastErr, lastProbeErr))
+					cause := permanentCause(err)
+					if filtered := nonContextCause(cause); filtered != nil {
+						cause = filtered
+					}
+					return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
 				}
-				lastProbeErr = err
+				if filtered := nonContextCause(err); filtered != nil {
+					lastProbeErr = filtered
+				}
 			} else if terminalErr := terminationErr(); terminalErr != nil {
 				return terminalErr
 			} else if terminalWaitState(state) {

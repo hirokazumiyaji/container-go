@@ -1220,6 +1220,15 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("tab-delimited wrap = %q, want absorbed tab framing", got.Error())
 	}
 
+	pipeWrap := fmt.Errorf("%w | %w", context.Canceled, commaCause)
+	got = nonContextCause(pipeWrap)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("pipe-delimited wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("pipe-delimited wrap = %q, want absorbed pipe framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2064,6 +2073,30 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 				t.Fatalf("error = %v, want wrapper diagnostic text", err)
 			}
 		})
+	}
+}
+
+func TestForExecTimeoutStripsJoinedContext(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend probe failed"}
+	target := newFakeTarget()
+	target.execCode = 1
+	target.execErr = errors.Join(context.Canceled, backend)
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(200 * time.Millisecond).
+		WithPollInterval(20 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if !errors.Is(err, backend) {
+		t.Fatalf("error = %v, want retained backend cause", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
 	}
 }
 

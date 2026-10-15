@@ -541,6 +541,12 @@ func (e *contextStrippedCause) Error() string {
 			if cleaned := replaceDiscardedErrorText(orig, inners, nil); cleaned != "" {
 				return cleaned
 			}
+			// Duplicate identical context children make framed reconstruction
+			// ambiguous; with nothing retained, treat the rewrite as empty
+			// rather than restoring the original context-only text.
+			if allDiscardedContextChildren(inners) {
+				return ""
+			}
 		}
 		if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
 			if cleaned, ok := rewriteInnerErrorText(orig, innerText, ""); ok {
@@ -604,6 +610,20 @@ func multiUnwrap(err error) []error {
 		return unwrapper.Unwrap()
 	}
 	return nil
+}
+
+func allDiscardedContextChildren(inners []error) bool {
+	saw := false
+	for _, inner := range inners {
+		if inner == nil {
+			continue
+		}
+		saw = true
+		if nonContextCause(inner) != nil {
+			return false
+		}
+	}
+	return saw
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently

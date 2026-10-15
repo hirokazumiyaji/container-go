@@ -715,6 +715,18 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("context-only passthrough wrapper = %q, must not restore stripped text", got.Error())
 	}
 
+	dupContextOnly := &reviewMultiWrapper{errs: []error{context.Canceled, context.Canceled}}
+	got = nonContextCause(dupContextOnly)
+	if got == nil {
+		t.Fatal("duplicate context-only multi wrapper dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("duplicate context-only multi wrapper = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("duplicate context-only multi wrapper = %q, must not restore duplicate context text", got.Error())
+	}
+
 	if got := nonContextCause(&net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}); got != nil {
 		t.Fatalf("context-only *net.OpError = %v, want nil", got)
 	}

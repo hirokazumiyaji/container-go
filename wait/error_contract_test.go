@@ -495,13 +495,14 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			defer cancel()
 
 			done := make(chan error, 1)
-			start := time.Now()
 			go func() { done <- tc.make().WaitUntilReady(ctx, target) }()
 
+			var start time.Time
 			switch tc.trigger {
 			case "exec":
 				select {
 				case <-target.execStarted:
+					start = time.Now()
 					cancel()
 				case err := <-done:
 					t.Fatalf("wait returned before exec probe started: %v", err)
@@ -511,6 +512,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			case "exec-deadline":
 				select {
 				case <-target.execStarted:
+					start = time.Now()
 					expire()
 				case err := <-done:
 					t.Fatalf("wait returned before exec probe started: %v", err)
@@ -520,6 +522,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			case "running":
 				select {
 				case <-target.runningStarted:
+					start = time.Now()
 					cancel()
 				case err := <-done:
 					t.Fatalf("wait returned before diagnostic probe started: %v", err)
@@ -529,6 +532,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			case "running-deadline":
 				select {
 				case <-target.runningStarted:
+					start = time.Now()
 					expire()
 				case err := <-done:
 					t.Fatalf("wait returned before diagnostic probe started: %v", err)

@@ -646,6 +646,21 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if !errors.As(got, &gotMulti) {
 		t.Fatalf("mixed multi wrapper = %v, want original type via As", got)
 	}
+
+	onlyContext := &reviewMultiWrapper{errs: []error{context.Canceled, context.DeadlineExceeded}}
+	got = nonContextCause(onlyContext)
+	if got == nil {
+		t.Fatal("context-only custom multi wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) || errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("context-only multi wrapper = %v, must suppress context", got)
+	}
+	if !errors.As(got, &gotMulti) {
+		t.Fatalf("context-only multi wrapper = %v, want original type via As", got)
+	}
+	if join := errors.Join(context.Canceled, context.DeadlineExceeded); nonContextCause(join) != nil {
+		t.Fatalf("stdlib join of only context = %v, want nil", nonContextCause(join))
+	}
 }
 
 type reviewStreamWrapper struct {

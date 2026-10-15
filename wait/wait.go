@@ -335,7 +335,7 @@ func nonContextCause(err error) error {
 			kept = append(kept, cause)
 		}
 		if len(kept) == 0 {
-			return nil
+			return preserveEmptyContextWrapper(err)
 		}
 		if !changed {
 			return err
@@ -349,11 +349,11 @@ func nonContextCause(err error) error {
 		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		inner := unwrapper.Unwrap()
 		if inner == nil {
-			return nil
+			return preserveEmptyContextWrapper(err)
 		}
 		filtered := nonContextCause(inner)
 		if filtered == nil {
-			return nil
+			return preserveEmptyContextWrapper(err)
 		}
 		if sameError(filtered, inner) {
 			return err
@@ -371,6 +371,32 @@ func nonContextCause(err error) error {
 		return &contextStrippedCause{original: err, cause: nil}
 	}
 	return err
+}
+
+// preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface
+// after every child was a context sentinel. Stdlib join/wrap errors exist
+// only to carry children, so they are dropped once nothing remains.
+func preserveEmptyContextWrapper(err error) error {
+	if !keepsClassificationWithoutChildren(err) {
+		return nil
+	}
+	return &contextStrippedCause{original: err, cause: nil}
+}
+
+func keepsClassificationWithoutChildren(err error) bool {
+	t := reflect.TypeOf(err)
+	if t == nil {
+		return false
+	}
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	switch t.PkgPath() {
+	case "errors", "fmt":
+		return false
+	default:
+		return t.PkgPath() != ""
+	}
 }
 
 // sameError reports whether a and b are the same error value without

@@ -291,7 +291,7 @@ func finalLifecycleError(
 		if probeErr != nil {
 			if isPermanentCheckError(probeErr) {
 				cause := permanentCause(probeErr)
-				if filtered := nonContextCause(cause); filtered != nil {
+				if filtered := retainedNonContextCause(cause); filtered != nil {
 					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 				}
 				// Context-only permanent wrapper while the wait is still
@@ -341,6 +341,21 @@ func joinNonNil(errs ...error) error {
 // success. Joined non-context causes, such as a terminal CLIError, remain.
 func nonContextCause(err error) error {
 	filtered, _ := filterNonContext(err)
+	return filtered
+}
+
+// retainedNonContextCause is like nonContextCause but treats a fully stripped
+// diagnostic facade (contextStrippedCause with a nil cause) as absent for
+// permanent-failure control flow. Custom wrappers around context-only
+// *exec.Error trees must retry, not stop on the first check.
+func retainedNonContextCause(err error) error {
+	filtered := nonContextCause(err)
+	if filtered == nil {
+		return nil
+	}
+	if stripped, ok := filtered.(*contextStrippedCause); ok && stripped.cause == nil {
+		return nil
+	}
 	return filtered
 }
 
@@ -1857,7 +1872,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	if err != nil {
 		if permanentProbeError(err) || isPermanentCheckError(err) {
 			cause := permanentCause(err)
-			if filtered := nonContextCause(cause); filtered != nil {
+			if filtered := retainedNonContextCause(cause); filtered != nil {
 				return wrapWaitCause(what, filtered, lastProbeErr)
 			}
 			// Context-only permanent wrapper: continue polling rather than
@@ -1888,7 +1903,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			}
 			if isPermanentCheckError(err) {
 				cause := permanentCause(err)
-				if filtered := nonContextCause(cause); filtered != nil {
+				if filtered := retainedNonContextCause(cause); filtered != nil {
 					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 				}
 				// Context-only permanent wrapper while the wait is still
@@ -1920,7 +1935,7 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				}
 				if isPermanentCheckError(err) || permanentProbeError(err) {
 					cause := permanentCause(err)
-					if filtered := nonContextCause(cause); filtered != nil {
+					if filtered := retainedNonContextCause(cause); filtered != nil {
 						return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 					}
 					// Context-only permanent wrapper: keep polling.

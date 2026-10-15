@@ -657,7 +657,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				return terminalErr
 			}
 			if isPermanentCheckError(err) || isTerminalStreamError(err) {
-				if filtered := nonContextCause(err); filtered != nil {
+				if filtered := retainedNonContextCause(err); filtered != nil {
 					return wrapWaitCause(what, filtered, lastProbeErr)
 				}
 				// Context-only permanent/terminal wrapper while the wait is
@@ -704,7 +704,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 					return terminalErr
 				}
 				if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
-					if filtered := nonContextCause(result.err); filtered != nil {
+					if filtered := retainedNonContextCause(result.err); filtered != nil {
 						return wrapWaitCause(what, filtered, lastProbeErr)
 					}
 					// Context-only: reconnect rather than return canceled.
@@ -738,7 +738,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			// the wait; transient daemon/inspect failures remain causes and
 			// are retried with the next log connection.
 			if isPermanentCheckError(probeErr) {
-				if filtered := nonContextCause(probeErr); filtered != nil {
+				if filtered := retainedNonContextCause(probeErr); filtered != nil {
 					return wrapWaitCause(what, filtered, retained())
 				}
 				// Context-only permanent probe wrapper: retry.

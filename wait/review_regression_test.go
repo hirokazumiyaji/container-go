@@ -2783,6 +2783,35 @@ func TestForExecContextOnlyPermanentLaunchRetries(t *testing.T) {
 	}
 }
 
+func TestForExecWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}}
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout after wrapped context-only permanent retries")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded after retries", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.execCalls.Load() < 2 {
+		t.Fatalf("execCalls = %d, want retries for wrapped context-only permanent launch error", target.execCalls.Load())
+	}
+}
+
+type reviewLaunchWrapper struct {
+	err error
+}
+
+func (e *reviewLaunchWrapper) Error() string { return "launch: " + e.err.Error() }
+func (e *reviewLaunchWrapper) Unwrap() error  { return e.err }
+
 func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	terminal := &cli.CLIError{
 		Args:     []string{"logs", "--follow", "ctr"},

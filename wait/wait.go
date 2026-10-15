@@ -545,17 +545,12 @@ func replaceUnwrappedCause(err, filtered error) error {
 	case *net.DNSError:
 		clone := *typed
 		clone.UnwrapErr = filtered
-		// Err is the cached rendering used by Error(); refresh it so the
-		// filtered value does not keep mixed context wording.
-		if filtered != nil {
-			if typed.UnwrapErr != nil {
-				if old := typed.UnwrapErr.Error(); old != "" && strings.Contains(clone.Err, old) {
-					clone.Err = strings.ReplaceAll(clone.Err, old, filtered.Error())
-				} else {
-					clone.Err = filtered.Error()
-				}
-			} else {
-				clone.Err = filtered.Error()
+		// Err is the cached rendering used by Error(). Refresh it only when it
+		// embeds the old UnwrapErr text; otherwise it is an independent DNS
+		// reason such as "no such host" and must be preserved.
+		if filtered != nil && typed.UnwrapErr != nil {
+			if old := typed.UnwrapErr.Error(); old != "" && strings.Contains(clone.Err, old) {
+				clone.Err = strings.ReplaceAll(clone.Err, old, filtered.Error())
 			}
 		}
 		return &clone
@@ -811,7 +806,14 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 		return items[i].order < items[j].order
 	})
 
-	var removals []span
+	// Claim every child span before expanding removals so separators that
+	// belong to a retained phrase (for example the leading space of
+	// " backend ") stay occupied and are not absorbed into a discarded span.
+	type claimed struct {
+		start, end int
+		removal    bool
+	}
+	claimedSpans := make([]claimed, 0, len(items))
 	for _, it := range items {
 		start, ok := claim(it.phrase)
 		if !ok {
@@ -819,8 +821,40 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			// continue so verified discarded spans can still be removed.
 			continue
 		}
-		if it.removal {
-			removals = append(removals, span{start: start, end: start + len(it.phrase), removal: true})
+		claimedSpans = append(claimedSpans, claimed{
+			start:   start,
+			end:     start + len(it.phrase),
+			removal: it.removal,
+		})
+	}
+	var removals []span
+	for _, c := range claimedSpans {
+		if !c.removal {
+			continue
+		}
+		rs, re := expandRemovalSeparators(orig, c.start, c.end, occupied)
+		removals = append(removals, span{start: rs, end: re, removal: true})
+	}
+	// Ambiguous framing copies of a discarded phrase are unsafe to rewrite.
+	for _, it := range items {
+		if !it.removal {
+			continue
+		}
+		phrase := it.phrase
+		for i := 0; i+len(phrase) <= len(orig); i++ {
+			if orig[i:i+len(phrase)] != phrase {
+				continue
+			}
+			free := true
+			for j := i; j < i+len(phrase); j++ {
+				if occupied[j] {
+					free = false
+					break
+				}
+			}
+			if free {
+				return orig
+			}
 		}
 	}
 	if len(removals) == 0 {
@@ -833,44 +867,8 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			return orig
 		}
 		cleaned = cleaned[:r.start] + cleaned[r.end:]
-		cleaned = tidyPartialRemovalJunction(cleaned, r.start)
 	}
 	return cleaned
-}
-
-// tidyPartialRemovalJunction cleans only framing characters adjacent to a
-// removal site so retained diagnostics such as "parser saw: ; token" stay intact.
-func tidyPartialRemovalJunction(s string, at int) string {
-	if at < 0 {
-		at = 0
-	}
-	if at > len(s) {
-		at = len(s)
-	}
-	lo := at
-	for lo > 0 && (s[lo-1] == ' ' || s[lo-1] == ':' || s[lo-1] == ';') {
-		// Stop before eating punctuation glued to retained token text.
-		if (s[lo-1] == ':' || s[lo-1] == ';') && lo >= 2 && s[lo-2] != ' ' && s[lo-2] != ':' && s[lo-2] != ';' {
-			break
-		}
-		lo--
-	}
-	hi := at
-	for hi < len(s) && (s[hi] == ' ' || s[hi] == ':' || s[hi] == ';') {
-		if (s[hi] == ':' || s[hi] == ';') && hi+1 < len(s) && s[hi+1] != ' ' && s[hi+1] != ':' && s[hi+1] != ';' {
-			break
-		}
-		hi++
-	}
-	if lo == hi {
-		return s
-	}
-	// Keep a single space when both sides still have content.
-	junction := ""
-	if lo > 0 && hi < len(s) && s[lo-1] != ' ' && s[hi] != ' ' {
-		junction = " "
-	}
-	return s[:lo] + junction + s[hi:]
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently

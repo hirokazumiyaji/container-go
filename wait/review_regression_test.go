@@ -891,6 +891,19 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 		t.Fatalf("dns error = %q, want filtered cause text", gotDNS.Error())
 	}
 
+	independentDNS := &net.DNSError{Err: "no such host", Name: "example", UnwrapErr: mixedDNS}
+	got = nonContextCause(independentDNS)
+	var gotIndependentDNS *net.DNSError
+	if !errors.As(got, &gotIndependentDNS) {
+		t.Fatalf("independent dns error = %v, want *net.DNSError", got)
+	}
+	if gotIndependentDNS.Err != "no such host" {
+		t.Fatalf("independent dns error Err = %q, want preserved DNS reason", gotIndependentDNS.Err)
+	}
+	if errors.Is(gotIndependentDNS.UnwrapErr, context.Canceled) {
+		t.Fatalf("independent dns UnwrapErr = %v, must not retain canceled", gotIndependentDNS.UnwrapErr)
+	}
+
 	numErr := &strconv.NumError{Func: "ParseInt", Num: "x", Err: errors.Join(context.Canceled, cause)}
 	got = nonContextCause(numErr)
 	var gotNum *strconv.NumError
@@ -1636,6 +1649,38 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "parser saw: ; token") {
 		t.Fatalf("delimiter partial sanitizing = %q, want intact retained delimiters", got.Error())
+	}
+
+	ambiguousPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
+		msg:  "note=context canceled; ctx=context canceled; public",
+	}
+	got = nonContextCause(ambiguousPartial)
+	if got == nil {
+		t.Fatal("ambiguous partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("ambiguous partial sanitizing leaked secret: %q", got.Error())
+	}
+	// Ambiguous framing copies fall back to the original safe text rather than
+	// removing the wrong occurrence.
+	if got.Error() != "note=context canceled; ctx=context canceled; public" {
+		t.Fatalf("ambiguous partial sanitizing = %q, want original safe rendering", got.Error())
+	}
+
+	spacedPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New(" backend "), errors.New(secret)},
+		msg:  "context canceled;  backend ",
+	}
+	got = nonContextCause(spacedPartial)
+	if got == nil {
+		t.Fatal("spaced partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("spaced partial sanitizing leaked secret: %q", got.Error())
+	}
+	if got.Error() != " backend " {
+		t.Fatalf("spaced partial sanitizing = %q, want retained leading whitespace", got.Error())
 	}
 }
 

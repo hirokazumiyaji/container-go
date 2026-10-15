@@ -1084,6 +1084,16 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("middle discarded child = %q, must not render stripped context", got.Error())
 	}
 
+	spacedCause := errors.New(" backend ")
+	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
+	got = nonContextCause(spacedWrap)
+	if !errors.Is(got, spacedCause) {
+		t.Fatalf("boundary whitespace cause = %v, want cause", got)
+	}
+	if got.Error() != " backend " {
+		t.Fatalf("boundary whitespace cause = %q, want verbatim retained whitespace", got.Error())
+	}
+
 	a := errors.New("alpha failure")
 	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
 	got = nonContextCause(reordered)
@@ -1326,6 +1336,46 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 	if !strings.Contains(got.Error(), "backend failed") {
 		t.Fatalf("opaque context-text facade = %q, want backend diagnostic text", got.Error())
 	}
+
+	ambiguous := &reviewOpaqueAmbiguousContextTextFacade{backend: backend}
+	got = nonContextCause(ambiguous) //nolint:staticcheck // reassignment intentional
+	if got == nil {
+		t.Fatal("ambiguous opaque facade dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("ambiguous opaque facade = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, backend) {
+		t.Fatalf("ambiguous opaque facade = %v, want backend via Is", got)
+	}
+	// Ambiguous repeated sentinel phrases fall back to empty rather than
+	// corrupting the legitimate "peer reported context canceled" wording.
+	if strings.Contains(got.Error(), "peer reported") && !strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("ambiguous opaque facade = %q, corrupted retained phrase", got.Error())
+	}
+	if got.Error() == "peer reported" {
+		t.Fatalf("ambiguous opaque facade = %q, stripped inside retained diagnostic", got.Error())
+	}
+}
+
+type reviewOpaqueAmbiguousContextTextFacade struct {
+	backend error
+}
+
+func (e *reviewOpaqueAmbiguousContextTextFacade) Error() string {
+	return "context canceled: peer reported context canceled"
+}
+func (e *reviewOpaqueAmbiguousContextTextFacade) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return target == context.Canceled || errors.Is(e.backend, target)
+}
+func (e *reviewOpaqueAmbiguousContextTextFacade) As(target any) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	return errors.As(e.backend, target)
 }
 
 func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {

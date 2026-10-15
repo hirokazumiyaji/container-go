@@ -785,11 +785,11 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 		}
 		masked = masked[:e.start] + e.repl + masked[e.end:]
 	}
-	// Trim only whitespace. Do not strip leading/trailing :/; which may be
-	// part of a retained diagnostic such as ":backend:". Separator cleanup for
-	// discarded children happens in expandRemovalSeparators before edits apply,
-	// so we never mutate offsets of remaining edits.
-	return strings.TrimSpace(masked)
+	// Do not TrimSpace or strip :/; here: retained causes may intentionally
+	// begin/end with whitespace or punctuation (for example " backend ").
+	// Separator cleanup for discarded children happens in
+	// expandRemovalSeparators before edits apply.
+	return masked
 }
 
 // expandRemovalSeparators absorbs unoccupied separators adjacent to a discarded
@@ -821,10 +821,20 @@ func isErrorSeparator(b byte) bool {
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a
 // context-only wrapper's Error text when framed reconstruction is unavailable.
+// If a sentinel phrase occurs more than once, stripping would be ambiguous
+// (classification vs legitimate diagnostic text), so return a neutral empty
+// message instead of corrupting the retained wording.
 func stripContextSentinelPhrases(orig string) string {
 	cleaned := orig
 	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
-		cleaned = strings.ReplaceAll(cleaned, phrase, "")
+		switch strings.Count(cleaned, phrase) {
+		case 0:
+			continue
+		case 1:
+			cleaned = strings.Replace(cleaned, phrase, "", 1)
+		default:
+			return ""
+		}
 	}
 	cleaned = strings.ReplaceAll(cleaned, ": ;", ":")
 	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")

@@ -5,6 +5,7 @@ package wait
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -551,8 +552,51 @@ func replaceUnwrappedCause(err, filtered error) error {
 		clone := *typed
 		clone.Err = filtered
 		return &clone
+	case *json.MarshalerError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	}
+	// Generic fallback for other stdlib carriers with an exported Err error
+	// field so As keeps the concrete type with the filtered child.
+	if cloned, ok := cloneExportedErrField(err, filtered); ok {
+		return cloned
 	}
 	return &contextStrippedCause{original: err, cause: filtered}
+}
+
+// cloneExportedErrField rebuilds a standard-library pointer error whose
+// exported Err field holds the wrapped cause.
+func cloneExportedErrField(err, filtered error) (error, bool) {
+	if !isStdlibPackagePath(errorPkgPath(err)) {
+		return nil, false
+	}
+	v := reflect.ValueOf(err)
+	if v.Kind() != reflect.Pointer || v.IsNil() {
+		return nil, false
+	}
+	elem := v.Elem()
+	if elem.Kind() != reflect.Struct {
+		return nil, false
+	}
+	errorType := reflect.TypeOf((*error)(nil)).Elem()
+	field := elem.FieldByName("Err")
+	if !field.IsValid() || field.Type() != errorType {
+		return nil, false
+	}
+	clonePtr := reflect.New(elem.Type())
+	clonePtr.Elem().Set(elem)
+	errField := clonePtr.Elem().FieldByName("Err")
+	if !errField.CanSet() {
+		return nil, false
+	}
+	if filtered == nil {
+		errField.Set(reflect.Zero(errorType))
+	} else {
+		errField.Set(reflect.ValueOf(filtered))
+	}
+	cloned, ok := clonePtr.Interface().(error)
+	return cloned, ok
 }
 
 // contextStrippedCause retains an original wrapper's diagnostics and As

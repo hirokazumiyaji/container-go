@@ -2,6 +2,7 @@ package wait
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -905,6 +907,16 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	}
 	if errors.Is(gotExec.Err, context.Canceled) {
 		t.Fatalf("exec error Err = %v, must not retain canceled", gotExec.Err)
+	}
+
+	marshalErr := &json.MarshalerError{Type: reflect.TypeOf(0), Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(marshalErr)
+	var gotMarshal *json.MarshalerError
+	if !errors.As(got, &gotMarshal) {
+		t.Fatalf("json marshaler error = %v, want *json.MarshalerError", got)
+	}
+	if errors.Is(gotMarshal.Err, context.Canceled) {
+		t.Fatalf("json marshaler error Err = %v, must not retain canceled", gotMarshal.Err)
 	}
 }
 

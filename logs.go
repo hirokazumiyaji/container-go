@@ -68,9 +68,9 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 // is returned, a terminal CLI failure is delivered by Read. The direct
 // CLI child is always reaped. Unix process groups provide best-effort
 // descendant termination while that child is owned. Windows uses the
-// retained process handle for direct-child termination; descendants
-// attached to its Job Object may also be terminated. Once the child is
-// reaped, Close does not signal its former process group.
+// retained process handle for direct-child termination; detached
+// descendants are not terminated. Once the child is reaped, Close does
+// not signal its former process group.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {

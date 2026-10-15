@@ -24,8 +24,8 @@ Run→ready measurement infrastructure for the performance issues
   spawn count.
 - `bench/`: separate Go module (requires Go 1.26+) holding the
   testcontainers-go comparison. The dependency on testcontainers-go
-  lives only here; the root module's only non-standard dependency is the
-  Windows Job Object support module. `result.go` re-exports the shared
+  lives only here; the root module's only non-standard dependency is
+  `golang.org/x/sys` for Windows process handles. `result.go` re-exports the shared
   schema; `scenario_test.go` (`integration` tag)
   runs the wall-clock scenarios.
 

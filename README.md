@@ -6,7 +6,7 @@ A [testcontainers](https://testcontainers.com/)-style Go library for
 [Apple Container](https://github.com/apple/container) and Docker: run
 throwaway containers from Go tests, with no runtime dependency on a
 third-party container client. The Windows build uses `golang.org/x/sys`
-for Job Objects; the rest of the library uses the standard library.
+for retained process handles; the rest of the library uses the standard library.
 
 ## Version scope
 
@@ -598,14 +598,13 @@ termination uses the pidfd directly and never signals the former PGID. The
 direct child is also killed after a successful group signal because it may have
 changed process groups. Other Unix targets conservatively use the direct child
 handle. Once that child is reaped, no former numeric process-group ID is used.
-On Windows, a lifecycle-owned Job Object handle provides the descendant
-boundary, with direct-child fallback when assignment is unavailable. Job
-assignment happens after `Start`; descendants created during that short
-post-Start attachment window are outside the job boundary. Neither boundary
-claims remote container-process termination.
+On Windows, the lifecycle retains an `OpenProcess` handle and terminates only
+the direct child with `TerminateProcess`. Detached or reparented descendants
+are outside that guarantee. Neither Unix nor Windows claims remote
+container-process termination.
 Windows-specific lifecycle tests are build-constrained. The development
 environment cross-compiles and vets the Windows packages but cannot execute
-Windows Job Object runtime tests, including the exit-259 active-child case.
+Windows process-handle runtime tests, including the exit-259 active-child case.
 
 Neither supported backend CLI exposes a common kill operation for an exec
 instance. When active-child evidence is available and a context error actually
@@ -613,8 +612,7 @@ races with a launched command, Exec returns an `*ExecTerminationError`
 (`errors.Is(err, ErrExecTerminationUnsupported)`) instead of claiming that
 the container-side process stopped. A conservative direct-handle fallback may
 return the context error without that remote-termination claim. A successful
-empty-job or already-finished child termination is not active-process
-evidence. Classification does not depend on the local exit status: in
+already-finished child termination is not active-process evidence. Classification does not depend on the local exit status: in
 particular, Windows `Process.Kill` may report the killed process as exit code
 `1`, and that status remains visible without suppressing the typed error. A
 deadline consumed later by a verification inspect does not by itself produce
@@ -647,13 +645,10 @@ The library always waits for and reaps the direct CLI child. On Unix-like
 systems it intentionally guarantees only that direct child: process-group
 signals are not used because a numeric PGID cannot be made safe across a
 concurrent reap. Descendants may outlive the CLI and are not reaped here.
-On Windows, an attached Job Object provides a best-effort descendant
-boundary. Attachment happens immediately after the child is started, so
-helpers created before that attachment, or explicitly detached from the
-job, are outside the guarantee; if the host prevents assignment, only the
-direct process handle is covered. Other supported platforms cover only the
-direct child. Do not rely on descendant cleanup when a CLI deliberately
-detaches helpers.
+On Windows, Close and context cancellation use the retained process handle
+for the direct CLI child only; descendants are not terminated here. Other
+supported platforms cover only the direct child. Do not rely on descendant
+cleanup when a CLI deliberately detaches helpers.
 
 ## Image pulls
 

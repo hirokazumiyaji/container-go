@@ -123,9 +123,10 @@ func (l *commandLifecycle) wait() {
 		tree := l.tree
 		l.mu.Unlock()
 
-		// On platforms with a job object this also releases any descendants
-		// that outlived the direct child. The tree implementations serialize
-		// this close with a concurrent termination request.
+		// tree.close releases platform-owned termination state. Windows
+		// only closes the retained process handle; it does not terminate
+		// descendants. The tree implementations serialize this close with
+		// a concurrent termination request.
 		if tree != nil {
 			tree.close()
 		}

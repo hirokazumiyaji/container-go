@@ -72,7 +72,7 @@ func TestWindowsExit259IsNotActive(t *testing.T) {
 	if err != nil {
 		releaseHelper()
 		_ = cmd.Wait()
-		t.Skipf("Windows Job Object assignment is unavailable on this host: %v", err)
+		t.Skipf("Windows process handle is unavailable on this host: %v", err)
 	}
 	windowsTree, ok := tree.(*windowsProcessTree)
 	if !ok {
@@ -108,7 +108,7 @@ func TestWindowsEmptyJobTerminationDoesNotClaimActiveChild(t *testing.T) {
 	tree, err := newProcessTree(cmd)
 	if err != nil {
 		_ = cmd.Wait()
-		t.Skipf("Windows Job Object assignment is unavailable on this host: %v", err)
+		t.Skipf("Windows process handle is unavailable on this host: %v", err)
 	}
 	if err := cmd.Wait(); err != nil {
 		tree.close()

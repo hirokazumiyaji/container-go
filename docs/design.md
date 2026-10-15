@@ -62,7 +62,7 @@ but with a different implementation strategy, described below.
 Three constraints shape the design.
 
 - **Minimal dependencies**: the standard library plus `golang.org/x/sys`
-  for Windows Job Objects; no third-party container-client module.
+  for Windows process handles; no third-party container-client module.
 - **Security**: subprocess argv prevents injection; reaper staging still has
   an environment-data exposure on abnormal termination (#111), so the
   no-leak property is not a current guarantee.
@@ -357,16 +357,16 @@ ownership proof is lost, the pidfd is used directly and the former PGID is
 never signaled. The direct child is also killed after a successful group signal
 because it may have changed process groups. Unix targets without that identity
 use the direct child handle conservatively. After
-the child is reaped, no former numeric group ID is used. Windows uses a
-lifecycle-owned Job Object handle, with direct-child fallback when assignment
-is unavailable. Assignment occurs after `Start`; descendants created during
-that short post-Start attachment window are outside the Job Object boundary.
+the child is reaped, no former numeric group ID is used. Windows retains an
+`OpenProcess` handle and terminates only the direct child with
+`TerminateProcess`; detached or reparented descendants are outside that
+guarantee.
 The supported backend CLIs do not expose a common exec-instance kill
 operation, so when active-child evidence is available Exec returns
 `*ExecTerminationError` (also `errors.Is(..., ErrExecTerminationUnsupported)`)
 rather than claiming that the daemon-side process stopped. A conservative
 direct-handle fallback may return only the context error. A successful
-empty-job or already-finished-child termination is not treated as
+already-finished-child termination is not treated as
 active-process evidence. Callers must terminate the container or use
 backend-specific cleanup. Callers must read the output reader even when the
 error is non-nil. On Linux the stable identity is a pidfd-backed process
@@ -374,7 +374,7 @@ reference; kernels without pidfd support use the same conservative direct-handle
 fallback as other Unix targets.
 Windows-specific lifecycle tests are build-constrained. This development
 environment cross-compiles and vets Windows packages but cannot execute the
-Windows Job Object runtime tests, including the exit-259 active-child case.
+Windows process-handle runtime tests, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
 containers. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
@@ -989,12 +989,9 @@ child as an `io.ReadCloser`. `Close` or context cancellation terminates
 and reaps the direct CLI child. Unix does not issue process-group signals:
 a numeric PGID cannot be made safe across a concurrent reap, so Unix
 guarantees only the direct child and descendants may outlive it. Windows
-uses a Job Object handle for a best-effort descendant boundary, but the
-child is started before assignment; helpers created in that attachment
-window, or detached from the job, are outside the guarantee. If assignment
-is unavailable, the direct process handle is the fallback. Other
-supported platforms cover only the direct child. ForLog's diagnostic
-buffer caps at 1MiB.
+uses the retained process handle for the direct CLI child only;
+descendants are not terminated here. Other supported platforms cover only
+the direct child. ForLog's diagnostic buffer caps at 1MiB.
 
 A stream has two error phases. `Stream` (and the public `FollowLogs`
 wrapper) returns startup errors. Once a stream has been returned, a
@@ -1018,10 +1015,9 @@ preserved. Timeout classification uses structured context,
 `Timeout() bool`, or signal evidence; arbitrary workload stderr is never
 interpreted as a timeout. On cancellation the direct CLI child is killed
 and reaped. Unix does not terminate descendants because no portable
-process-group handle is safe across a concurrent reap. Windows Job Object
-termination is handle-based, with direct-child fallback when assignment
-fails. Descendant cleanup is best effort and this package does not claim
-descendant reaping.
+process-group handle is safe across a concurrent reap. Windows terminates
+only the direct child through the retained process handle. Descendant
+cleanup is not claimed.
 
 ## Error handling
 

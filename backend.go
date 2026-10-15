@@ -39,7 +39,7 @@ func detectEngineFor(goos, value string) (engine, error) {
 		return dockerEngine{}, nil
 	default: // apple
 		if goos != "darwin" {
-			return nil, fmt.Errorf("%s=apple: Apple Container only runs on macOS (GOOS=%s)", backendEnv, goos)
+			return nil, invalidOption("backend", "Apple Container is available only on macOS")
 		}
 		return appleEngine{}, nil
 	}

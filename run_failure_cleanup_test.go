@@ -151,6 +151,9 @@ func ownedDockerInspectJSON(name, id string) string {
 }
 
 func cliErrorWithStderr(err error, text string) *cli.CLIError {
+	if safe, ok := err.(interface{ UnwrapRaw() error }); ok {
+		err = safe.UnwrapRaw()
+	}
 	return findCLIErrorWithStderr(err, text)
 }
 
@@ -244,7 +247,7 @@ func TestDockerRunFailurePreservesVolumeCleanupError(t *testing.T) {
 	if cliErrorWithStderr(err, cleanupErr.Stderr) == nil {
 		t.Fatalf("error = %v, want cleanup CLIError", err)
 	}
-	if !strings.Contains(err.Error(), "cleanup") || !strings.Contains(err.Error(), "myctr") {
+	if !strings.Contains(err.Error(), "cleanup") || strings.Contains(err.Error(), "myctr") {
 		t.Fatalf("error = %v, want cleanup context", err)
 	}
 }

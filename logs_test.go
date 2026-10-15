@@ -174,8 +174,8 @@ func TestForLogUsesReadErrorFromStatuslessStream(t *testing.T) {
 		t.Fatal("status-less stream terminal error was hidden by readiness")
 	}
 	var got *CLIError
-	if !errors.As(err, &got) || got != terminal {
-		t.Fatalf("error = %v, want read CLIError %v", err, terminal)
+	if !errors.As(err, &got) || got == terminal {
+		t.Fatalf("error = %v, want a redacted clone of read CLIError %v", err, terminal)
 	}
 }
 

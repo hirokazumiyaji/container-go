@@ -24,10 +24,18 @@ type Streamer interface {
 	Stream(ctx context.Context, args ...string) (io.ReadCloser, error)
 }
 
+type SnapshotStreamer interface {
+	StreamSnapshot(ctx context.Context, args ...string) (io.ReadCloser, error)
+}
+
 // Stream starts a long-lived CLI invocation. Startup errors are returned
 // directly; after a stream is returned, terminal process errors are
 // delivered by Read.
 func (r *ExecRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {
+	return r.stream(ctx, streamHooks{}, args...)
+}
+
+func (r *ExecRunner) StreamSnapshot(ctx context.Context, args ...string) (io.ReadCloser, error) {
 	return r.stream(ctx, streamHooks{}, args...)
 }
 

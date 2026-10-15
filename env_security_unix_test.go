@@ -1388,7 +1388,7 @@ func TestIssue97ReuseConflictPreservesCleanupAndDoesNotAttach(t *testing.T) {
 	if err == nil || reuseCreateCleanupError(err) == nil || !errors.Is(err, errUnsafeEnvFile) {
 		t.Fatalf("conflict error = %v, want separately preserved cleanup failure", err)
 	}
-	if !(appleEngine{}).nameConflict(err) {
+	if !strings.Contains(err.Error(), "already exists") {
 		t.Fatalf("conflict cause was not preserved: %v", err)
 	}
 	if runner.attachInspect.Load() != 0 {

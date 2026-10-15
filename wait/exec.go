@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"strings"
 	"time"
 )
 
@@ -44,6 +45,11 @@ func (s *ExecStrategy) WithPollInterval(d time.Duration) *ExecStrategy {
 	return s
 }
 
+func (s *ExecStrategy) DiagnosticValues() []string {
+	values := append([]string(nil), s.cmd...)
+	return append(values, strings.Join(s.cmd, " "))
+}
+
 func (s *ExecStrategy) validate() error {
 	if err := s.options.validate(); err != nil {
 		return err
@@ -65,7 +71,8 @@ func (s *ExecStrategy) validate() error {
 	return nil
 }
 
-func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) error {
+func (s *ExecStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr error) {
+	defer func() { retErr = safeDiagnosticError(retErr, s.DiagnosticValues()...) }()
 	if err := s.validate(); err != nil {
 		return err
 	}

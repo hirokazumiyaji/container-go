@@ -59,7 +59,7 @@ func TestWithFilesRejectsUnusableHostPathBeforeBackend(t *testing.T) {
 	if !errors.As(err, &validationErr) {
 		t.Fatalf("error = %T %v, want *ValidationError", err, err)
 	}
-	if validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" || validationErr.Value != missing {
+	if validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" || validationErr.Value != "[REDACTED]" {
 		t.Fatalf("validation metadata = %#v, want WithFiles/hostPath/missing", validationErr)
 	}
 	if !errors.Is(err, os.ErrNotExist) {
@@ -97,8 +97,8 @@ func TestWithFilesReportsContainerPathField(t *testing.T) {
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithFiles(File{HostPath: "testdata/docker_inspect_v29.json", ContainerPath: containerPath}),
 		withRunner(f), withEngine(appleEngine{}))
-	assertPublicValidationError(t, err, "WithFiles", "containerPath", containerPath,
-		fmt.Sprintf("container path %q must be absolute", containerPath))
+	assertPublicValidationError(t, err, "WithFiles", "containerPath", "[REDACTED]",
+		`container path "[REDACTED]" must be absolute`)
 	if len(f.calls) != 0 {
 		t.Fatalf("backend was called for an invalid container path: %v", f.calls)
 	}

@@ -36,6 +36,20 @@ func assertPublicValidationError(t *testing.T, err error, option, field string, 
 	}
 }
 
+func assertRedactedMountValidationError(t *testing.T, err error, message string) {
+	t.Helper()
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithMounts" || validationErr.Field != "mount" {
+		t.Fatalf("error = %v, want WithMounts mount validation", err)
+	}
+	if got, ok := validationErr.Value.(Mount); !ok || got.Source != "[REDACTED]" || got.Target != "[REDACTED]" {
+		t.Fatalf("validation mount = %#v, want redacted source and target", validationErr.Value)
+	}
+	if err.Error() != message {
+		t.Fatalf("error = %q, want %q", err, message)
+	}
+}
+
 func TestCopyMethodsRejectInvalidContainerPathAsValidationError(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -179,8 +193,13 @@ func TestMappedPortAndEndpointRejectInvalidPortAsValidationError(t *testing.T) {
 			f.calls = nil
 
 			err := tt.call(ctr)
-			assertPublicValidationError(t, err, tt.option, "port", port,
-				fmt.Sprintf("invalid port %q: port must be 1-65535", port))
+			value := any(port)
+			message := fmt.Sprintf("invalid port %q: port must be 1-65535", port)
+			if tt.option == "Endpoint" {
+				value = "[REDACTED]"
+				message = `invalid port "[REDACTED]": port must be 1-65535`
+			}
+			assertPublicValidationError(t, err, tt.option, "port", value, message)
 			if len(f.calls) != 0 {
 				t.Fatalf("backend was called despite invalid port: %v", f.calls)
 			}
@@ -241,8 +260,8 @@ func TestMountValidationPreservesLegacyDelimiterErrors(t *testing.T) {
 			f := newTestRunner()
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithMounts(mount), withRunner(f), withEngine(appleEngine{}))
-			want := fmt.Sprintf("mount %q -> %q: paths must not contain ',' or '='", mount.Source, mount.Target)
-			assertPublicValidationError(t, err, "WithMounts", "mount", mount, want)
+			want := `mount "[REDACTED]" -> "[REDACTED]": paths must not contain ',' or '='`
+			assertRedactedMountValidationError(t, err, want)
 			if len(f.calls) != 0 {
 				t.Fatalf("backend was called despite invalid mount: %v", f.calls)
 			}
@@ -257,8 +276,8 @@ func TestMountValidationRejectsCRLFSeparately(t *testing.T) {
 			f := newTestRunner()
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithMounts(mount), withRunner(f), withEngine(appleEngine{}))
-			want := fmt.Sprintf("mount %q -> %q: paths must not contain control characters", mount.Source, mount.Target)
-			assertPublicValidationError(t, err, "WithMounts", "mount", mount, want)
+			want := `mount "[REDACTED]" -> "[REDACTED]": paths must not contain control characters`
+			assertRedactedMountValidationError(t, err, want)
 			if len(f.calls) != 0 {
 				t.Fatalf("backend was called despite invalid mount: %v", f.calls)
 			}

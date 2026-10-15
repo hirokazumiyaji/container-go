@@ -77,7 +77,7 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 func Prune(ctx context.Context) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
-		return nil, err
+		return nil, safePublicError(err)
 	}
 	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
 }
@@ -104,15 +104,16 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 }
 
 func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string) ([]string, error) {
+	redactor := cli.NewHashedContextRedactor(reuseGroup)
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if err != nil {
-		return nil, cli.Classify(ctx, r, err, eng.probe())
+		return nil, cli.WithRedactor(cli.Classify(ctx, r, err, eng.probe()), redactor)
 	}
 	ids, err := parse(stdout)
 	if err != nil {
-		return nil, err
+		return nil, cli.WithRedactor(err, redactor)
 	}
 
 	var listed map[string]pruneCandidate
@@ -145,7 +146,7 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 			removed = append(removed, id)
 		}
 	}
-	return removed, errors.Join(errs...)
+	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
 }
 
 func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, errKind, reuseGroup string) (bool, error) {

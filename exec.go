@@ -54,6 +54,11 @@ func WithExecEnv(env map[string]string) ExecOption {
 			if err := validateEnvironmentEntry("WithExecEnv", "exec environment variable", k, v); err != nil {
 				return err
 			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("exec environment variable", "value is too large to redact safely from streamed diagnostics")
+			}
+		}
+		for k, v := range env {
 			c.env[k] = v
 		}
 		return nil
@@ -117,7 +122,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return 0, nil, err
+			return 0, nil, c.redactError(optionBoundaryError(err), execDiagnosticValues(cfg, cmd)...)
 		}
 	}
 

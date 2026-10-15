@@ -63,7 +63,9 @@ type config struct {
 	// reusedCreated is set only on the caller whose flight callback
 	// created the container. Other callers still apply their own files
 	// after attaching to the shared generation.
-	reusedCreated bool
+	reusedCreated         bool
+	diagnosticSecrets     []string
+	waitDiagnosticSecrets []string
 }
 
 func newConfig() *config {
@@ -270,6 +272,11 @@ func WithEnv(env map[string]string) Option {
 			if err := validateEnvironmentEntry("WithEnv", "environment variable", k, v); err != nil {
 				return err
 			}
+			if len(v) > cli.MaxStreamOverlap || !cli.StreamValueFits(v) {
+				return invalidOption("environment variable value", "is too large to redact safely from streamed diagnostics")
+			}
+		}
+		for k, v := range env {
 			c.env[k] = v
 		}
 		return nil
@@ -371,6 +378,8 @@ func WithLabels(labels map[string]string) Option {
 				return newValidationErrorWithField("WithLabels", "value", nil,
 					fmt.Errorf("label %q: value must not contain NUL", k))
 			}
+		}
+		for k, v := range labels {
 			c.labels[k] = v
 		}
 		return nil
@@ -578,6 +587,8 @@ func (m Mount) validate() error {
 		if m.Source != "" {
 			return mountValidationErrorf(m, "tmpfs mount for %q must not have a source", m.Target)
 		}
+	default:
+		return invalidOption("mount type", "is unknown")
 	}
 	return nil
 }
@@ -632,7 +643,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 	rest := s
 	if portsPart, proto, ok := strings.Cut(s, "/"); ok {
 		if proto != "tcp" && proto != "udp" {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q: protocol must be tcp or udp", s)
+			return publishSpec{}, invalidOption("published port", "protocol must be tcp or udp")
 		}
 		spec.proto = proto
 		rest = portsPart
@@ -642,7 +653,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 		// Bracketed IPv6 host: [addr]:host-port:container-port
 		end := strings.Index(rest, "]:")
 		if end < 0 {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q", s)
+			return publishSpec{}, invalidOption("published port", "bracketed IPv6 form is malformed")
 		}
 		spec.hostAddr = rest[1:end]
 		rest = rest[end+2:]
@@ -660,14 +671,14 @@ func parsePublishSpec(s string) (publishSpec, error) {
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")
 	if !ok || strings.Contains(ctrPart, ":") {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: want [host-ip:]host-port:container-port[/proto]", s)
+		return publishSpec{}, invalidOption("published port", "want [host-ip:]host-port:container-port[/proto]")
 	}
 	var err error
 	if spec.hostPort, err = parsePortNumber(hostPart); err != nil {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: %w", s, err)
+		return publishSpec{}, err
 	}
 	if spec.containerPort, err = parsePortNumber(ctrPart); err != nil {
-		return publishSpec{}, fmt.Errorf("invalid publish spec %q: %w", s, err)
+		return publishSpec{}, err
 	}
 	return spec, nil
 }
@@ -675,7 +686,7 @@ func parsePublishSpec(s string) (publishSpec, error) {
 func parsePortNumber(s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 || n > 65535 {
-		return 0, fmt.Errorf("port %q must be 1-65535", s)
+		return 0, invalidOption("port", "must be 1-65535")
 	}
 	return n, nil
 }

@@ -5,17 +5,22 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-// CLIError is a non-zero exit from the backend CLI. It aliases
+// CLIError is a non-zero exit from the backend CLI. Its Error method
+// redacts diagnostic secrets and escapes control characters; RawError is
+// the explicit local-debugging escape hatch. It aliases
 // internal/cli.CLIError so callers can use errors.As without importing
 // an internal package. The public four-field layout is retained for
 // compatibility; classification may use additional bounded diagnostics.
 type CLIError = cli.CLIError
+
+type SystemNotRunningError = cli.SystemNotRunningError
 
 // ErrSystemNotRunning reports that the selected container backend is
 // not answering: the Apple Container system service (start it with
@@ -66,6 +71,18 @@ func (e *ConfigError) Error() string {
 }
 
 func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
+
+func (e *ConfigError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**ConfigError)
+	if !ok || e == nil {
+		return false
+	}
+	if r == nil {
+		r = cli.NewRedactor()
+	}
+	*ptr = &ConfigError{Backend: e.Backend, Network: e.Network, Option: e.Option, Detail: r.Text(e.Detail)}
+	return true
+}
 
 // ErrPortNotExposed reports a port that was not declared via
 // WithExposedPorts or WithPublishedPort, or that has no usable host
@@ -138,6 +155,41 @@ func (e *ValidationError) Is(target error) bool {
 		return true
 	}
 	return e.Err != nil && errors.Is(e.Err, target)
+}
+
+func (e *ValidationError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**ValidationError)
+	if !ok || e == nil {
+		return false
+	}
+	if r == nil {
+		r = cli.NewRedactor()
+	}
+	var value any
+	switch v := e.Value.(type) {
+	case Mount:
+		value = Mount{Type: v.Type, Source: r.Text(v.Source), Target: r.Text(v.Target), ReadOnly: v.ReadOnly}
+	default:
+		if e.Value != nil {
+			reflected := reflect.ValueOf(e.Value)
+			switch reflected.Kind() {
+			case reflect.String:
+				clone := reflect.New(reflected.Type()).Elem()
+				redacted := r.Text(reflected.String())
+				clone.SetString(redacted)
+				value = clone.Interface()
+			case reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+				reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+				value = e.Value
+			}
+		}
+	}
+	var cause error
+	if e.Err != nil {
+		cause = cli.WithRedactor(e.Err, r)
+	}
+	*ptr = &ValidationError{Option: r.Text(e.Option), Field: r.Text(e.Field), Value: value, Message: r.Text(e.Message), Err: cause}
+	return true
 }
 
 func newValidationError(option string, value any, err error) error {
@@ -235,6 +287,15 @@ func (e *ExecTerminationError) Error() string {
 }
 
 func (e *ExecTerminationError) Unwrap() error { return e.Err }
+
+func (e *ExecTerminationError) AsRedacted(target any, r *cli.Redactor) bool {
+	ptr, ok := target.(**ExecTerminationError)
+	if !ok || e == nil {
+		return false
+	}
+	*ptr = &ExecTerminationError{Err: cli.WithRedactor(e.Err, r)}
+	return true
+}
 
 func (e *ExecTerminationError) Is(target error) bool {
 	return target == ErrExecTerminationUnsupported

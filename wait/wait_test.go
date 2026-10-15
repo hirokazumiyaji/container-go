@@ -144,7 +144,7 @@ func TestForListeningPortRejectsInvalidConfiguration(t *testing.T) {
 			}
 			if configErr.Strategy != "ForListeningPort" ||
 				configErr.Field != "port specification" ||
-				configErr.Value != tt.port ||
+				(tt.port != "" && configErr.Value == tt.port) ||
 				configErr.Reason != tt.want {
 				t.Errorf("ConfigError = %+v", configErr)
 			}
@@ -352,6 +352,18 @@ func TestForLogCountsOccurrences(t *testing.T) {
 	}
 }
 
+func TestForLogRejectsOversizedPattern(t *testing.T) {
+	strategy := ForLog(strings.Repeat("x", maxLogLineSize+1))
+	err := strategy.validate()
+	if !errors.Is(err, ErrInvalidConfiguration) {
+		t.Fatalf("validate error = %v, want invalid configuration", err)
+	}
+	var configErr *ConfigError
+	if !errors.As(err, &configErr) || configErr.Field != "pattern" {
+		t.Fatalf("validate error = %v, want pattern ConfigError", err)
+	}
+}
+
 func TestForLogAsRegexp(t *testing.T) {
 	target := newFakeTarget()
 	pr, pw := io.Pipe()
@@ -373,6 +385,43 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	if err := s.WaitUntilReady(context.Background(), target); err == nil {
 		t.Fatal("want timeout error")
 	}
+}
+
+func TestForLogStreamsHugeLinesWithoutScannerBufferLimit(t *testing.T) {
+	target := newFakeTarget()
+	target.logs = io.NopCloser(strings.NewReader(strings.Repeat("x", 8*1024*1024)))
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("want stream-ended error")
+	}
+	if strings.Contains(err.Error(), "token too long") {
+		t.Fatalf("error = %v, want bounded streaming behavior", err)
+	}
+}
+
+func TestForLogPreservesTerminalReadError(t *testing.T) {
+	readErr := errors.New("log transport failed")
+	target := newFakeTarget()
+	target.logs = io.NopCloser(&securityTerminalLogReader{err: readErr})
+
+	err := ForLog("never").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, readErr) {
+		t.Fatalf("error = %v, want terminal read error", err)
+	}
+}
+
+type securityTerminalLogReader struct {
+	err  error
+	sent bool
+}
+
+func (r *securityTerminalLogReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, []byte("not-ready")), nil
+	}
+	return 0, r.err
 }
 
 func TestForHTTPMatchesStatusCode(t *testing.T) {

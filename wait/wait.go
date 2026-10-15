@@ -110,6 +110,18 @@ func (e *waitError) As(target any) bool {
 	return false
 }
 
+func (e *waitError) AsRedacted(target any, redactor *cli.Redactor) bool {
+	if e == nil {
+		return false
+	}
+	for _, cause := range e.causes {
+		if errors.As(cli.WithRedactor(cause, redactor), target) {
+			return true
+		}
+	}
+	return false
+}
+
 func newWaitError(message string, causes ...error) error {
 	filtered := make([]error, 0, len(causes))
 	for _, cause := range causes {

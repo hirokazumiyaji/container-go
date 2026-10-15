@@ -196,8 +196,8 @@ func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T)
 			if !errors.As(err, &got) {
 				t.Fatalf("error = %v, want settled terminal *cli.CLIError", err)
 			}
-			if got != terminal {
-				t.Fatalf("CLIError = %p, want original terminal error %p", got, terminal)
+			if got == terminal {
+				t.Fatalf("errors.As exposed the raw CLIError: %q", got.Error())
 			}
 		})
 	}

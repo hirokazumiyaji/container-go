@@ -8,6 +8,7 @@ import (
 	"io"
 	"strconv"
 
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -21,6 +22,7 @@ func WithWaitStrategy(s wait.Strategy) Option {
 			return err
 		}
 		c.waitStrategy = s
+		c.waitDiagnosticSecrets = wait.DiagnosticValues(s)
 		return nil
 	}
 }
@@ -136,46 +138,28 @@ func (c *Container) logTailTarget(ctx context.Context, target string) string {
 	if err != nil {
 		return ""
 	}
-	return lastNBytes(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	tail, _ := c.diagnosticRedactor().RedactTail(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	return tail
 }
 
-// lastNBytes keeps only the trailing n bytes of r using a fixed-size
-// ring buffer.
-func lastNBytes(r io.Reader, n int) string {
-	if n <= 0 {
-		_, _ = io.Copy(io.Discard, r)
-		return ""
-	}
-	buf := make([]byte, n)
-	pos := 0
-	full := false
-	tmp := make([]byte, 32*1024)
-	for {
-		m, err := r.Read(tmp)
-		if m > 0 {
-			chunk := tmp[:m]
-			for len(chunk) > 0 {
-				space := n - pos
-				if len(chunk) < space {
-					copy(buf[pos:], chunk)
-					pos += len(chunk)
-					break
-				}
-				copy(buf[pos:], chunk[:space])
-				chunk = chunk[space:]
-				pos = 0
-				full = true
-			}
-		}
+func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	redactor := c.diagnosticRedactor(extra...)
+	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {
+		stream, err := streamer.StreamSnapshot(qCtx, c.eng.logsTailArgs(c.id)...)
 		if err != nil {
-			break
+			return "", err
 		}
+		defer stream.Close()
+		return redactor.RedactTail(stream, logTailLimit)
 	}
-	if !full {
-		return string(buf[:pos])
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
+	if err != nil {
+		return "", err
 	}
-	out := make([]byte, n)
-	copy(out, buf[pos:])
-	copy(out[n-pos:], buf[:pos])
-	return string(out)
+	return redactor.RedactTail(
+		io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)),
+		logTailLimit,
+	)
 }

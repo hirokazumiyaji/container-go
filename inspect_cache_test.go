@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -280,6 +281,78 @@ func TestEndpointReusesDynamicInspectWithinTTL(t *testing.T) {
 	if runner.inspectCalls != 1 {
 		t.Fatalf("inspect calls = %d, want 1 within TTL", runner.inspectCalls)
 	}
+}
+
+func TestConcurrentEndpointRefreshDoesNotReuseStaleSnapshot(t *testing.T) {
+	// Two cache-miss Endpoint calls must not let an older inspect finish
+	// last and stamp a fresh TTL over a newer snapshot. Serialization on
+	// dynamicMu coalesces the second caller onto the first refresh.
+	base := newTestRunner()
+	base.inspectResponses = []string{
+		dockerInspectWithPort("49153"),
+		dockerInspectWithPort("49154"),
+	}
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var inspectN atomic.Int32
+	runner := &blockingDynamicInspectRunner{
+		fakeRunner: base,
+		started:    started,
+		release:    release,
+		count:      &inspectN,
+	}
+	ctr := testDockerContainer(base, portSpec{port: 6379, proto: "tcp"})
+	ctr.runner = runner
+
+	errCh := make(chan error, 2)
+	go func() {
+		_, err := ctr.Endpoint(context.Background(), "6379/tcp")
+		errCh <- err
+	}()
+	<-started
+	go func() {
+		_, err := ctr.Endpoint(context.Background(), "6379/tcp")
+		errCh <- err
+	}()
+	// Second caller waits on dynamicMu while the first inspect is in flight.
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	for range 2 {
+		if err := <-errCh; err != nil {
+			t.Fatalf("Endpoint: %v", err)
+		}
+	}
+	if got := inspectN.Load(); got != 1 {
+		t.Fatalf("inspect calls = %d, want 1 coalesced refresh", got)
+	}
+	endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("cached Endpoint: %v", err)
+	}
+	if endpoint != "127.0.0.1:49153" {
+		t.Fatalf("Endpoint = %q, want first inspect result", endpoint)
+	}
+}
+
+type blockingDynamicInspectRunner struct {
+	*fakeRunner
+	started chan struct{}
+	release chan struct{}
+	count   *atomic.Int32
+	once    sync.Once
+}
+
+func (r *blockingDynamicInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "inspect" {
+		r.count.Add(1)
+		r.once.Do(func() { close(r.started) })
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
 }
 
 func TestEndpointReinspectsAfterDynamicTTL(t *testing.T) {

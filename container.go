@@ -142,6 +142,7 @@ type lockPack struct {
 	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
 	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
 	now            func() time.Time // optional test clock; nil means time.Now
+	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
 	inspectMu      contextLock // serializes inspect target selection and UID publication
 	defaultNetwork string      // Docker daemon default identity, learned lazily
 }
@@ -1192,6 +1193,15 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 		if info := c.cachedDynamic(); info != nil {
 			return info, nil
 		}
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
+		// A concurrent refresh may have populated the snapshot while we
+		// waited; reuse it instead of launching another inspect.
+		if info := c.cachedDynamic(); info != nil {
+			return info, nil
+		}
 	}
 	return c.refreshDynamic(ctx)
 }
@@ -1201,6 +1211,12 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 func (c *Container) inspectDynamicFresh(ctx context.Context) (*engineInfo, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if !c.nameInspect {
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
 	}
 	return c.refreshDynamic(ctx)
 }

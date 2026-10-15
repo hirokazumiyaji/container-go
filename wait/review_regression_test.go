@@ -1003,6 +1003,19 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("delimiter in backend diagnostic = %q, must not render stripped context", got.Error())
 	}
 
+	punctCause := errors.New(":backend:")
+	punctWrap := fmt.Errorf("%w; %w", context.Canceled, punctCause)
+	got = nonContextCause(punctWrap)
+	if !errors.Is(got, punctCause) {
+		t.Fatalf("punctuated backend diagnostic = %v, want cause", got)
+	}
+	if !strings.Contains(got.Error(), ":backend:") {
+		t.Fatalf("punctuated backend diagnostic = %q, want intact leading/trailing colons", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("punctuated backend diagnostic = %q, must not render stripped context", got.Error())
+	}
+
 	a := errors.New("alpha failure")
 	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
 	got = nonContextCause(reordered)

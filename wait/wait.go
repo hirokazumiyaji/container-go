@@ -587,8 +587,6 @@ func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
 	}
 	if repl == "" {
 		cleaned = strings.TrimSpace(cleaned)
-		cleaned = strings.Trim(cleaned, ":;")
-		cleaned = strings.TrimSpace(cleaned)
 	}
 	return cleaned, true
 }
@@ -693,7 +691,8 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 				changed = true
 			}
 		} else {
-			edits = append(edits, edit{start: start, end: start + len(it.phrase), repl: ""})
+			rs, re := expandRemovalSeparators(orig, start, start+len(it.phrase))
+			edits = append(edits, edit{start: rs, end: re, repl: ""})
 			changed = true
 		}
 	}
@@ -732,9 +731,42 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			masked = tidyDelimiterJunction(masked, e.start)
 		}
 	}
-	masked = strings.TrimSpace(masked)
-	masked = strings.Trim(masked, ":;")
+	// Trim only whitespace. Do not strip leading/trailing :/; which may be
+	// part of a retained diagnostic such as ":backend:".
 	return strings.TrimSpace(masked)
+}
+
+// expandRemovalSeparators absorbs separators adjacent to a discarded child when
+// that child sits at the start or end of the message, so a retained cause like
+// ":backend:" is not left with a leading "; " that later cleanup would have to
+// strip by trimming meaningful punctuation from the cause itself.
+func expandRemovalSeparators(orig string, start, end int) (int, int) {
+	if start == 0 {
+		for end < len(orig) && (orig[end] == ';' || orig[end] == ':' || orig[end] == ' ') {
+			// Stop before consuming punctuation that belongs to the next child
+			// (for example the leading ':' of ":backend:").
+			if orig[end] == ':' || orig[end] == ';' {
+				if end+1 < len(orig) && orig[end+1] != ' ' && orig[end+1] != ';' && orig[end+1] != ':' {
+					// Lone delimiter glued to the next token — leave it.
+					break
+				}
+			}
+			end++
+		}
+		return start, end
+	}
+	if end == len(orig) {
+		for start > 0 && (orig[start-1] == ';' || orig[start-1] == ':' || orig[start-1] == ' ') {
+			if orig[start-1] == ':' || orig[start-1] == ';' {
+				if start >= 2 && orig[start-2] != ' ' && orig[start-2] != ';' && orig[start-2] != ':' {
+					break
+				}
+			}
+			start--
+		}
+		return start, end
+	}
+	return start, end
 }
 
 // tidyDelimiterJunction collapses delimiter pairs created by removing a child

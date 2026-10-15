@@ -369,6 +369,17 @@ func retainedNonContextCause(err error) error {
 			if permanentProbeError(cur) || isPermanentCheckError(cur) || isTerminalStreamError(cur) {
 				return filtered
 			}
+			if multi, ok := cur.(interface{ Unwrap() []error }); ok {
+				// errors.Join of only empty stripped facades must retry; keep
+				// the aggregate only when at least one branch still retains a
+				// non-context cause.
+				for _, inner := range multi.Unwrap() {
+					if retainedNonContextCause(inner) != nil {
+						return filtered
+					}
+				}
+				return nil
+			}
 			if raw, ok := cur.(interface{ UnwrapRaw() error }); ok {
 				next := raw.UnwrapRaw()
 				if next == nil {

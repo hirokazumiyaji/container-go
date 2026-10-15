@@ -3041,6 +3041,41 @@ func TestForExecIndependentDNSAfterContextLaunchFailsFast(t *testing.T) {
 	}
 }
 
+func TestRetainedNonContextCauseJoinedEmptyStrippedFacades(t *testing.T) {
+	err := errors.Join(
+		&reviewLaunchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
+		&reviewLaunchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
+	)
+	if got := retainedNonContextCause(err); got != nil {
+		t.Fatalf("retainedNonContextCause = %v (%T), want nil for joined empty facades", got, got)
+	}
+}
+
+func TestForExecJoinedContextOnlyPermanentLaunchRetries(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = errors.Join(
+		&reviewLaunchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
+		&reviewLaunchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
+	)
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout after joined context-only permanent retries")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded after retries", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.execCalls.Load() < 2 {
+		t.Fatalf("execCalls = %d, want retries for joined context-only permanent launch error", target.execCalls.Load())
+	}
+}
+
 func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
 	target := newFakeTarget()
 	target.execErr = &reviewOpaquePermanentFacade{}

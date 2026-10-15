@@ -2904,11 +2904,66 @@ func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
 	}
 }
 
+func TestRetainedNonContextCauseNestedPermanentFacade(t *testing.T) {
+	// Outer permanent Is over an inner custom wrapper of only context.Canceled
+	// filters to nested contextStrippedCause values. Permanence must be checked
+	// on every facade, not only the empty leaf.
+	inner := &reviewLaunchWrapper{err: context.Canceled}
+	outer := &reviewNestedPermanentFacade{err: inner}
+
+	got := retainedNonContextCause(outer)
+	if got == nil {
+		t.Fatal("retainedNonContextCause = nil, want outer permanent facade")
+	}
+	if !errors.Is(got, ErrTargetNotFound) {
+		t.Fatalf("retained = %v, want ErrTargetNotFound", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("retained = %v, must not match canceled", got)
+	}
+}
+
+func TestForExecNestedPermanentFacadeFailsFast(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = &reviewNestedPermanentFacade{
+		err: &reviewLaunchWrapper{err: context.Canceled},
+	}
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected permanent nested facade failure")
+	}
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound via outer permanent facade", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.execCalls.Load() != 1 {
+		t.Fatalf("execCalls = %d, want immediate permanent failure without retries", target.execCalls.Load())
+	}
+}
+
 type reviewOpaquePermanentFacade struct{}
 
 func (*reviewOpaquePermanentFacade) Error() string { return "opaque permanent" }
 func (*reviewOpaquePermanentFacade) Is(target error) bool {
 	return target == context.Canceled || target == ErrTargetNotFound
+}
+
+type reviewNestedPermanentFacade struct {
+	err error
+}
+
+func (e *reviewNestedPermanentFacade) Error() string {
+	return "nested permanent: " + e.err.Error()
+}
+func (e *reviewNestedPermanentFacade) Unwrap() error { return e.err }
+func (e *reviewNestedPermanentFacade) Is(target error) bool {
+	return target == ErrTargetNotFound
 }
 
 type reviewLaunchWrapper struct {
@@ -2961,6 +3016,26 @@ func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestForLogNestedPermanentFacadeFailsFast(t *testing.T) {
+	target := &reviewLogNestedPermanentFacadeTarget{}
+	err := ForLog("never").
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected permanent nested facade failure")
+	}
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound via outer permanent facade", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.runningCalls.Load() != 1 {
+		t.Fatalf("Running calls = %d, want immediate permanent failure without retries", target.runningCalls.Load())
+	}
+}
+
 func TestForLogContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := &reviewLogContextOnlyPermanentTarget{}
 	err := ForLog("never").
@@ -2993,6 +3068,26 @@ func (*reviewPermanentProbeJoinedContextTarget) FollowLogs(context.Context) (io.
 	return io.NopCloser(strings.NewReader("")), nil
 }
 func (*reviewPermanentProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewLogNestedPermanentFacadeTarget struct {
+	runningCalls atomic.Int32
+}
+
+func (*reviewLogNestedPermanentFacadeTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewLogNestedPermanentFacadeTarget) Running(context.Context) (bool, error) {
+	t.runningCalls.Add(1)
+	return false, &reviewNestedPermanentFacade{
+		err: &reviewLaunchWrapper{err: context.Canceled},
+	}
+}
+func (*reviewLogNestedPermanentFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewLogNestedPermanentFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 

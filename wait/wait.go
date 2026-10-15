@@ -348,7 +348,10 @@ func nonContextCause(err error) error {
 // diagnostic facades as absent for permanent-failure control flow. Nested
 // contextStrippedCause layers whose only remaining cause is another empty
 // facade (for example fmt wrapping a custom wrapper around context-only
-// *exec.Error) must also retry, not stop on the first check.
+// *exec.Error) must also retry, not stop on the first check. Permanent
+// classifications on any facade in that chain still fail fast: an outer
+// Is(ErrTargetNotFound) wrapper over an empty inner stripped cause must not
+// be treated as context-only.
 func retainedNonContextCause(err error) error {
 	filtered := nonContextCause(err)
 	if filtered == nil {
@@ -360,12 +363,13 @@ func retainedNonContextCause(err error) error {
 		if !ok {
 			return filtered
 		}
+		// Opaque and nested facades may keep permanent classifications via
+		// Is/As on original after context matches are stripped from the Is
+		// surface. Check every facade, not only the leaf whose cause is nil.
+		if permanentProbeError(stripped) || isPermanentCheckError(stripped) {
+			return filtered
+		}
 		if stripped.cause == nil {
-			// Opaque facades may keep permanent classifications via Is/As on
-			// original after context matches are stripped from the Is surface.
-			if permanentProbeError(stripped) || isPermanentCheckError(stripped) {
-				return filtered
-			}
 			return nil
 		}
 		cur = stripped.cause

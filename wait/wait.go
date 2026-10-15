@@ -362,6 +362,20 @@ func retainedNonContextCause(err error) error {
 	for {
 		stripped, ok := cur.(*contextStrippedCause)
 		if !ok {
+			// cli.WithRedactor hides the filtered child behind UnwrapRaw, so a
+			// contextStrippedCause → safeError → empty stripped chain must not
+			// stop at the redactor and treat the whole tree as retained.
+			if permanentProbeError(cur) || isPermanentCheckError(cur) || isTerminalStreamError(cur) {
+				return filtered
+			}
+			if raw, ok := cur.(interface{ UnwrapRaw() error }); ok {
+				next := raw.UnwrapRaw()
+				if next == nil {
+					return nil
+				}
+				cur = next
+				continue
+			}
 			return filtered
 		}
 		// Opaque and nested facades may keep permanent or terminal

@@ -493,8 +493,12 @@ func retainDiagnosticFacade(facade, filtered error) error {
 // preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface
 // after every child was a context sentinel. Stdlib join/wrap errors and
 // transport wrappers exist only to carry children, so they are dropped once
-// nothing remains.
+// nothing remains. *net.DNSError is an exception when Err or DNS flags still
+// describe an independent lookup failure after UnwrapErr is discarded.
 func preserveEmptyContextWrapper(err error) error {
+	if retained := retainDNSErrorWithoutContextChild(err); retained != nil {
+		return retained
+	}
 	if !keepsClassificationWithoutChildren(err) {
 		return nil
 	}
@@ -502,6 +506,32 @@ func preserveEmptyContextWrapper(err error) error {
 		return nil
 	}
 	return &contextStrippedCause{original: err, cause: nil}
+}
+
+// retainDNSErrorWithoutContextChild keeps a *net.DNSError whose UnwrapErr was
+// only a context sentinel but whose Err text or DNS result flags still report
+// an independent lookup failure (for example Err "no such host").
+func retainDNSErrorWithoutContextChild(err error) error {
+	dns, ok := err.(*net.DNSError)
+	if !ok || dns == nil {
+		return nil
+	}
+	clone := *dns
+	clone.UnwrapErr = nil
+	if dns.UnwrapErr != nil {
+		if old := dns.UnwrapErr.Error(); old != "" && clone.Err != "" {
+			switch {
+			case clone.Err == old:
+				clone.Err = ""
+			case strings.Contains(clone.Err, old):
+				clone.Err = strings.TrimSpace(strings.ReplaceAll(clone.Err, old, ""))
+			}
+		}
+	}
+	if clone.Err == "" && !clone.IsNotFound && !clone.IsTimeout && !clone.IsTemporary {
+		return nil
+	}
+	return &clone
 }
 
 func keepsClassificationWithoutChildren(err error) bool {

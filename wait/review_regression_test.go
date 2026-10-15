@@ -968,6 +968,39 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 		t.Fatalf("independent dns UnwrapErr = %v, must not retain canceled", gotIndependentDNS.UnwrapErr)
 	}
 
+	// Context-only UnwrapErr with an independent DNS reason must still keep
+	// *net.DNSError for As, not disappear as a fully stripped carrier.
+	contextOnlyUnwrapDNS := &net.DNSError{
+		Err:       "no such host",
+		Name:      "example.com",
+		IsNotFound: true,
+		UnwrapErr: context.Canceled,
+	}
+	got = nonContextCause(contextOnlyUnwrapDNS)
+	var gotContextOnlyDNS *net.DNSError
+	if !errors.As(got, &gotContextOnlyDNS) {
+		t.Fatalf("context-only unwrap dns = %v (%T), want *net.DNSError", got, got)
+	}
+	if gotContextOnlyDNS.Err != "no such host" {
+		t.Fatalf("context-only unwrap dns Err = %q, want preserved DNS reason", gotContextOnlyDNS.Err)
+	}
+	if !gotContextOnlyDNS.IsNotFound {
+		t.Fatal("context-only unwrap dns IsNotFound = false, want true")
+	}
+	if gotContextOnlyDNS.UnwrapErr != nil {
+		t.Fatalf("context-only unwrap dns UnwrapErr = %v, want nil", gotContextOnlyDNS.UnwrapErr)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("context-only unwrap dns = %v, must not match canceled", got)
+	}
+	if got := nonContextCause(&net.DNSError{
+		Err:       context.Canceled.Error(),
+		Name:      "example.com",
+		UnwrapErr: context.Canceled,
+	}); got != nil {
+		t.Fatalf("dns with only context Err/UnwrapErr = %v, want nil", got)
+	}
+
 	numErr := &strconv.NumError{Func: "ParseInt", Num: "x", Err: errors.Join(context.Canceled, cause)}
 	got = nonContextCause(numErr)
 	var gotNum *strconv.NumError

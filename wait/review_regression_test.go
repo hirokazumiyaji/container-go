@@ -886,6 +886,26 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	if !strings.Contains(gotDNS.Error(), "backend failure") {
 		t.Fatalf("dns error = %q, want filtered cause text", gotDNS.Error())
 	}
+
+	numErr := &strconv.NumError{Func: "ParseInt", Num: "x", Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(numErr)
+	var gotNum *strconv.NumError
+	if !errors.As(got, &gotNum) {
+		t.Fatalf("num error = %v, want *strconv.NumError", got)
+	}
+	if errors.Is(gotNum.Err, context.Canceled) {
+		t.Fatalf("num error Err = %v, must not retain canceled", gotNum.Err)
+	}
+
+	execErr := &exec.Error{Name: "docker", Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(execErr)
+	var gotExec *exec.Error
+	if !errors.As(got, &gotExec) {
+		t.Fatalf("exec error = %v, want *exec.Error", got)
+	}
+	if errors.Is(gotExec.Err, context.Canceled) {
+		t.Fatalf("exec error Err = %v, must not retain canceled", gotExec.Err)
+	}
 }
 
 func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
@@ -1456,7 +1476,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("sanitizing wrapper = %q, want original safe rendering", got.Error())
 	}
 
-	multi := &reviewSanitizingMultiWrapper{errs: []error{context.Canceled, errors.New(secret)}}
+	multi := &reviewSanitizingMultiWrapper{errs: []error{context.Canceled, errors.New(secret)}, msg: "operation failed"}
 	got = nonContextCause(multi)
 	if got == nil {
 		t.Fatal("sanitizing multi wrapper dropped entirely")
@@ -1470,13 +1490,32 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	if got.Error() != "operation failed" {
 		t.Fatalf("sanitizing multi wrapper = %q, want original safe rendering", got.Error())
 	}
+
+	partial := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
+		msg:  "operation failed: public",
+	}
+	got = nonContextCause(partial)
+	if got == nil {
+		t.Fatal("partial sanitizing multi wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("partial sanitizing multi wrapper = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("partial sanitizing multi wrapper Error leaked secret: %q", got.Error())
+	}
+	if got.Error() != "operation failed: public" {
+		t.Fatalf("partial sanitizing multi wrapper = %q, want original safe rendering", got.Error())
+	}
 }
 
 type reviewSanitizingMultiWrapper struct {
 	errs []error
+	msg  string
 }
 
-func (e *reviewSanitizingMultiWrapper) Error() string { return "operation failed" }
+func (e *reviewSanitizingMultiWrapper) Error() string { return e.msg }
 func (e *reviewSanitizingMultiWrapper) Unwrap() []error {
 	out := make([]error, len(e.errs))
 	copy(out, e.errs)

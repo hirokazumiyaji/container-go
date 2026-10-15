@@ -11,8 +11,10 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"os/exec"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -541,6 +543,14 @@ func replaceUnwrappedCause(err, filtered error) error {
 			}
 		}
 		return &clone
+	case *strconv.NumError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	case *exec.Error:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
 	}
 	return &contextStrippedCause{original: err, cause: filtered}
 }
@@ -591,9 +601,9 @@ func (e *contextStrippedCause) Error() string {
 		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
 			return cleaned
 		}
-		// When Error() sanitizes away every child rendering, keep that safe
-		// text instead of exposing cause.Error().
-		if !childTextAppearsIn(orig, inners) {
+		// When Error() omits any child rendering (full or partial sanitization),
+		// keep that safe text instead of exposing cause.Error().
+		if !allChildTextAppearsIn(orig, inners) {
 			return orig
 		}
 		// Ambiguous multi-child framing: prefer filtered cause text.
@@ -654,16 +664,20 @@ func allDiscardedContextChildren(inners []error) bool {
 	return saw
 }
 
-func childTextAppearsIn(orig string, inners []error) bool {
+func allChildTextAppearsIn(orig string, inners []error) bool {
 	for _, inner := range inners {
 		if inner == nil {
 			continue
 		}
-		if phrase := inner.Error(); phrase != "" && strings.Contains(orig, phrase) {
-			return true
+		phrase := inner.Error()
+		if phrase == "" {
+			continue
+		}
+		if !strings.Contains(orig, phrase) {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently
@@ -906,6 +920,11 @@ func (e *contextStrippedCause) As(target any) bool {
 		if matchOriginalAsWithoutDiscardedContext(as, target, e.cause) {
 			return true
 		}
+	}
+	// Do not expose unfiltered standard-library carriers via As; their Err
+	// fields may still match context even after the top-level error strips it.
+	if isStdlibPackagePath(errorPkgPath(e.original)) {
+		return false
 	}
 	// Match the original wrapper's concrete type without recursively searching
 	// discarded children that may still carry context sentinels.

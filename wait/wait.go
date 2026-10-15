@@ -510,22 +510,61 @@ func (e *contextStrippedCause) Error() string {
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && strings.HasSuffix(orig, innerText) {
 		return strings.TrimSuffix(orig, innerText) + causeText
 	}
-	if cleaned := stripContextSentinelText(orig); cleaned != "" && cleaned != orig {
-		return cleaned
+	if inners := multiUnwrap(e.original); len(inners) > 0 {
+		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
+			return cleaned
+		}
 	}
 	return causeText
 }
 
-func stripContextSentinelText(s string) string {
-	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
-		s = strings.ReplaceAll(s, phrase, "")
+func multiUnwrap(err error) []error {
+	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
+		return unwrapper.Unwrap()
 	}
-	s = strings.ReplaceAll(s, ": ;", ":")
-	s = strings.ReplaceAll(s, "; ;", ";")
-	s = strings.ReplaceAll(s, "  ", " ")
-	s = strings.TrimSpace(s)
-	s = strings.Trim(s, ":;")
-	return strings.TrimSpace(s)
+	return nil
+}
+
+// replaceDiscardedErrorText removes only the renderings of children that
+// nonContextCause drops, leaving legitimate phrases inside retained causes.
+func replaceDiscardedErrorText(orig string, inners []error, kept error) string {
+	keptText := ""
+	if kept != nil {
+		keptText = kept.Error()
+	}
+	masked := orig
+	placeholder := ""
+	if keptText != "" {
+		placeholder = strings.Repeat("\x01", len(keptText))
+		masked = strings.ReplaceAll(masked, keptText, placeholder)
+	}
+	changed := false
+	for _, inner := range inners {
+		if nonContextCause(inner) != nil {
+			continue
+		}
+		phrase := ""
+		if inner != nil {
+			phrase = inner.Error()
+		}
+		if phrase == "" || !strings.Contains(masked, phrase) {
+			continue
+		}
+		masked = strings.ReplaceAll(masked, phrase, "")
+		changed = true
+	}
+	if !changed {
+		return ""
+	}
+	if placeholder != "" {
+		masked = strings.ReplaceAll(masked, placeholder, keptText)
+	}
+	masked = strings.ReplaceAll(masked, ": ;", ":")
+	masked = strings.ReplaceAll(masked, "; ;", ";")
+	masked = strings.ReplaceAll(masked, "  ", " ")
+	masked = strings.TrimSpace(masked)
+	masked = strings.Trim(masked, ":;")
+	return strings.TrimSpace(masked)
 }
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 

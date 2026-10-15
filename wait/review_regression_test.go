@@ -821,6 +821,23 @@ func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
 		t.Fatalf("virtual As wrapper exposed unfiltered *reviewVirtualAsWrapper via As")
 	}
 
+	// Wrapper and retained child both match *reviewVirtualCode: wrapper As
+	// must win, matching errors.As depth-first order on the original tree.
+	childCode := &reviewVirtualCode{Code: "CHILD"}
+	wrapperCode := &reviewVirtualCode{Code: "WRAP"}
+	competing := &reviewVirtualAsWrapper{
+		err:  errors.Join(context.Canceled, childCode),
+		code: wrapperCode,
+	}
+	got = nonContextCause(competing)
+	if !errors.Is(got, childCode) {
+		t.Fatalf("competing As wrapper = %v, want child code via Is", got)
+	}
+	var gotCompeting *reviewVirtualCode
+	if !errors.As(got, &gotCompeting) || gotCompeting != wrapperCode {
+		t.Fatalf("competing As wrapper = %#v, want wrapper code via As precedence", gotCompeting)
+	}
+
 	// A custom As that walks unfiltered children must still not expose a
 	// discarded context-bearing transport wrapper.
 	leaky := &reviewOpaqueFacade{
@@ -1387,6 +1404,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	}
 	if got.Error() != "backend" {
 		t.Fatalf("nested-pair-discarded wrap = %q, want all enclosing pairs removed", got.Error())
+	}
+
+	arrowDiscarded := fmt.Errorf("%w -> %w", context.Canceled, commaCause)
+	got = nonContextCause(arrowDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("arrow-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("arrow-discarded wrap = %q, want arrow junction removed", got.Error())
+	}
+
+	arrowTrailing := fmt.Errorf("%w -> %w", commaCause, context.Canceled)
+	got = nonContextCause(arrowTrailing)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("trailing arrow-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("trailing arrow-discarded wrap = %q, want arrow junction removed", got.Error())
 	}
 
 	spacedCause := errors.New(" backend ")

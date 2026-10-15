@@ -1468,8 +1468,9 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 		}
 	}
 	start, end = expandPairedDelimiters(orig, start, end, occupied)
-	// Absorb any separators left beside a removed pair (for example the space
-	// after "[canceled] backend").
+	start, end = expandArrowJunctions(orig, start, end, occupied)
+	// Absorb any separators left beside a removed pair or arrow (for example
+	// the space after "[canceled] backend" or "canceled -> backend").
 	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
 		end++
 	}
@@ -1483,6 +1484,44 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 		}
 		if onlySeparators {
 			start = prevEnd
+		}
+	}
+	return start, end
+}
+
+// expandArrowJunctions absorbs ->, =>, <-, and <= junctions that frame a
+// discarded child. Angle brackets are not treated as independent separators
+// so retained forms like "<%w>" stay intact.
+func expandArrowJunctions(orig string, start, end int, occupied []bool) (int, int) {
+	if end+1 < len(orig) && !occupied[end] && !occupied[end+1] &&
+		orig[end] == '<' && (orig[end+1] == '-' || orig[end+1] == '=') {
+		end += 2
+	} else if end < len(orig) && !occupied[end] && orig[end] == '>' &&
+		end > start && (orig[end-1] == '-' || orig[end-1] == '=') {
+		end++
+	}
+	if start > 0 && !occupied[start-1] {
+		i := start - 1
+		for i >= 0 && !occupied[i] && isErrorSeparator(orig[i]) {
+			i--
+		}
+		if i >= 0 && !occupied[i] {
+			switch {
+			case orig[i] == '>' && i > 0 && !occupied[i-1] &&
+				(orig[i-1] == '-' || orig[i-1] == '='):
+				start = i - 1
+			case orig[i] == '<':
+				hasShaft := false
+				for j := i + 1; j < start; j++ {
+					if orig[j] == '-' || orig[j] == '=' {
+						hasShaft = true
+						break
+					}
+				}
+				if hasShaft {
+					start = i
+				}
+			}
 		}
 	}
 	return start, end
@@ -1572,17 +1611,16 @@ func (e *contextStrippedCause) Is(target error) bool {
 }
 
 func (e *contextStrippedCause) As(target any) bool {
-	if errors.As(e.cause, target) {
-		return true
-	}
-	// Preserve the original wrapper's own As classifications (virtual types
-	// not present on the filtered cause). Probe a temporary target first so a
-	// custom As that walks unfiltered children cannot leave a discarded
-	// context-bearing value in the caller's target.
+	// Match errors.As depth-first order: probe the wrapper's own As surface
+	// before traversing the filtered cause, so a virtual classification on
+	// the wrapper wins over the same type on a retained child.
 	if as, ok := e.original.(interface{ As(any) bool }); ok {
 		if matchOriginalAsWithoutDiscardedContext(as, target, e.cause) {
 			return true
 		}
+	}
+	if errors.As(e.cause, target) {
+		return true
 	}
 	// Do not expose unfiltered wrappers that still Unwrap to discarded context
 	// children. Opaque facades without Unwrap may keep their concrete As type.

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -694,6 +696,30 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 
 	if got := nonContextCause(&net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}); got != nil {
 		t.Fatalf("context-only *net.OpError = %v, want nil", got)
+	}
+	if got := nonContextCause(&os.PathError{Op: "open", Path: "/tmp/x", Err: context.Canceled}); got != nil {
+		t.Fatalf("context-only *os.PathError = %v, want nil", got)
+	}
+	if got := nonContextCause(&url.Error{Op: "Get", URL: "http://example", Err: context.DeadlineExceeded}); got != nil {
+		t.Fatalf("context-only *url.Error = %v, want nil", got)
+	}
+}
+
+func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	wrapped := fmt.Errorf("follow logs: %w; backend: %w", context.Canceled, cause)
+	got := nonContextCause(wrapped)
+	if !errors.Is(got, cause) {
+		t.Fatalf("fmt multi-wrap = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("fmt multi-wrap = %v, must drop canceled", got)
+	}
+	if !strings.Contains(got.Error(), "follow logs") || !strings.Contains(got.Error(), "backend") {
+		t.Fatalf("fmt multi-wrap = %q, want preserved framing", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("fmt multi-wrap = %q, must not render stripped context", got.Error())
 	}
 }
 

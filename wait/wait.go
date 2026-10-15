@@ -347,9 +347,10 @@ func nonContextCause(err error) error {
 			}
 			return err
 		}
-		// Stdlib joins only exist to carry children; rebuild from the filtered
-		// set so Error() no longer mentions stripped context sentinels.
-		if keepsClassificationWithoutChildren(err) {
+		// Custom wrappers and fmt multi-%w errors keep framing via
+		// contextStrippedCause. Plain errors.Join trees are rebuilt from the
+		// filtered children so Error() no longer mentions stripped sentinels.
+		if keepsClassificationWithoutChildren(err) || errorPkgPath(err) == "fmt" {
 			return replaceUnwrappedCause(err, joined)
 		}
 		return joined
@@ -410,32 +411,45 @@ func retainDiagnosticFacade(facade, filtered error) error {
 
 // preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface
 // after every child was a context sentinel. Stdlib join/wrap errors and
-// transport wrappers such as *net.OpError exist only to carry children, so
-// they are dropped once nothing remains.
+// transport wrappers exist only to carry children, so they are dropped once
+// nothing remains.
 func preserveEmptyContextWrapper(err error) error {
 	if !keepsClassificationWithoutChildren(err) {
 		return nil
 	}
-	if _, ok := err.(*net.OpError); ok {
+	if isStdlibTransportWrapper(err) {
 		return nil
 	}
 	return &contextStrippedCause{original: err, cause: nil}
 }
 
 func keepsClassificationWithoutChildren(err error) bool {
+	switch errorPkgPath(err) {
+	case "", "errors", "fmt":
+		return false
+	default:
+		return !isStdlibTransportWrapper(err)
+	}
+}
+
+func isStdlibTransportWrapper(err error) bool {
+	switch errorPkgPath(err) {
+	case "net", "os", "net/url", "io/fs":
+		return true
+	default:
+		return false
+	}
+}
+
+func errorPkgPath(err error) string {
 	t := reflect.TypeOf(err)
 	if t == nil {
-		return false
+		return ""
 	}
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
-	switch t.PkgPath() {
-	case "errors", "fmt":
-		return false
-	default:
-		return t.PkgPath() != ""
-	}
+	return t.PkgPath()
 }
 
 // sameError reports whether a and b are the same error value without
@@ -496,7 +510,22 @@ func (e *contextStrippedCause) Error() string {
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && strings.HasSuffix(orig, innerText) {
 		return strings.TrimSuffix(orig, innerText) + causeText
 	}
+	if cleaned := stripContextSentinelText(orig); cleaned != "" && cleaned != orig {
+		return cleaned
+	}
 	return causeText
+}
+
+func stripContextSentinelText(s string) string {
+	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
+		s = strings.ReplaceAll(s, phrase, "")
+	}
+	s = strings.ReplaceAll(s, ": ;", ":")
+	s = strings.ReplaceAll(s, "; ;", ";")
+	s = strings.ReplaceAll(s, "  ", " ")
+	s = strings.TrimSpace(s)
+	s = strings.Trim(s, ":;")
+	return strings.TrimSpace(s)
 }
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 

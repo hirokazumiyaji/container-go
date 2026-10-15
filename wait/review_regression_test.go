@@ -1344,6 +1344,33 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("spaced angle-bracket-discarded wrap = %q, want angle brackets and inner whitespace removed", got.Error())
 	}
 
+	doubleQuoteDiscarded := fmt.Errorf("\"%w\" %w", context.Canceled, commaCause)
+	got = nonContextCause(doubleQuoteDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("double-quote-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("double-quote-discarded wrap = %q, want quotes removed with discarded child", got.Error())
+	}
+
+	doubleQuoteRetained := fmt.Errorf("%w \"%w\"", context.Canceled, commaCause)
+	got = nonContextCause(doubleQuoteRetained)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("double-quote retained wrap = %v, want cause", got)
+	}
+	if got.Error() != "\"backend\"" {
+		t.Fatalf("double-quote retained wrap = %q, want quotes around retained child", got.Error())
+	}
+
+	singleQuoteDiscarded := fmt.Errorf("'%w' %w", context.Canceled, commaCause)
+	got = nonContextCause(singleQuoteDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("single-quote-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("single-quote-discarded wrap = %q, want quotes removed with discarded child", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)

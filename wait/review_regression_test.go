@@ -1448,6 +1448,44 @@ func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
 	if strings.Contains(got.Error(), "context canceled") {
 		t.Fatalf("spaced single-child wrapper = %q, must strip unique child text", got.Error())
 	}
+
+	framedBackend := &reviewTypedCause{message: "backend"}
+	framed := &reviewFramedUnchangedChildWrapper{child: framedBackend}
+	got = nonContextCause(framed)
+	if got == nil {
+		t.Fatal("framed unchanged-child wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("framed unchanged-child wrapper = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, framedBackend) {
+		t.Fatalf("framed unchanged-child wrapper = %v, want backend via Is", got)
+	}
+	if got.Error() != "operation failed: backend" {
+		t.Fatalf("framed unchanged-child wrapper = %q, want preserved framing", got.Error())
+	}
+}
+
+// reviewFramedUnchangedChildWrapper matches context itself while wrapping an
+// unchanged backend child whose Error text already appears in the frame.
+type reviewFramedUnchangedChildWrapper struct {
+	child error
+}
+
+func (e *reviewFramedUnchangedChildWrapper) Error() string {
+	return "operation failed: " + e.child.Error()
+}
+func (e *reviewFramedUnchangedChildWrapper) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.child
+}
+func (e *reviewFramedUnchangedChildWrapper) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return target == context.Canceled || errors.Is(e.child, target)
 }
 
 // reviewSpacedSingleChildWrapper keeps intentional boundary whitespace around
@@ -1864,6 +1902,29 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	}
 	if got.Error() != "context canceled" {
 		t.Fatalf("overlapping retained phrase partial sanitizing = %q, want original safe rendering", got.Error())
+	}
+
+	nestedBackend := &reviewTypedCause{message: "backend"}
+	nestedMixed := errors.Join(context.Canceled, nestedBackend)
+	nestedPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{nestedMixed, errors.New(secret)},
+		msg:  nestedMixed.Error(),
+	}
+	got = nonContextCause(nestedPartial)
+	if got == nil {
+		t.Fatal("nested mixed partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("nested mixed partial sanitizing leaked secret: %q", got.Error())
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("nested mixed partial sanitizing = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("nested mixed partial sanitizing = %q, must rewrite nested mixed child", got.Error())
+	}
+	if !strings.Contains(got.Error(), "backend") {
+		t.Fatalf("nested mixed partial sanitizing = %q, want filtered backend text", got.Error())
 	}
 }
 

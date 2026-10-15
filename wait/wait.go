@@ -978,6 +978,12 @@ func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
 	}
 	cleaned := strings.Replace(orig, innerText, repl, 1)
 	if cleaned == orig {
+		// Unique child text already matches the filtered rendering; still a
+		// successful reconstruction so callers keep wrapper framing instead of
+		// falling back to cause-only text.
+		if repl == innerText {
+			return orig, true
+		}
 		return "", false
 	}
 	// Do not TrimSpace: retained diagnostics may intentionally begin or end
@@ -1024,13 +1030,14 @@ func allChildTextAppearsIn(orig string, inners []error) bool {
 }
 
 // stripVerifiedDiscardedChildText removes discarded child renderings that are
-// present in orig without inventing text for omitted (sanitized) children.
-// Retained child spans are claimed first so a discarded sentinel is not taken
-// from inside a legitimate diagnostic such as "peer reported context canceled".
+// present in orig and rewrites retained children to their filtered text,
+// without inventing text for omitted (sanitized) children. Retained child
+// spans are claimed first so a discarded sentinel is not taken from inside a
+// legitimate diagnostic such as "peer reported context canceled".
 func stripVerifiedDiscardedChildText(orig string, inners []error) string {
-	type span struct {
+	type edit struct {
 		start, end int
-		removal    bool
+		repl       string
 	}
 	occupied := make([]bool, len(orig))
 	claim := func(phrase string) (int, bool) {
@@ -1057,6 +1064,7 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 	}
 
 	type item struct {
+		inner   error
 		phrase  string
 		removal bool
 		order   int
@@ -1071,6 +1079,7 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			continue
 		}
 		items = append(items, item{
+			inner:   inner,
 			phrase:  phrase,
 			removal: nonContextCause(inner) == nil,
 			order:   i,
@@ -1108,6 +1117,7 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 	// belong to a retained phrase (for example the leading space of
 	// " backend ") stay occupied and are not absorbed into a discarded span.
 	type claimed struct {
+		inner      error
 		start, end int
 		removal    bool
 	}
@@ -1120,23 +1130,32 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			continue
 		}
 		claimedSpans = append(claimedSpans, claimed{
+			inner:   it.inner,
 			start:   start,
 			end:     start + len(it.phrase),
 			removal: it.removal,
 		})
 	}
-	var removals []span
+	edits := make([]edit, 0, len(claimedSpans))
+	changed := false
 	for _, c := range claimedSpans {
-		if !c.removal {
+		if c.removal {
+			rs, re := expandRemovalSeparators(orig, c.start, c.end, occupied)
+			// Mark the expanded region so a later adjacent discarded child cannot
+			// claim the same separator and produce overlapping original offsets.
+			for j := rs; j < re; j++ {
+				occupied[j] = true
+			}
+			edits = append(edits, edit{start: rs, end: re, repl: ""})
+			changed = true
 			continue
 		}
-		rs, re := expandRemovalSeparators(orig, c.start, c.end, occupied)
-		// Mark the expanded region so a later adjacent discarded child cannot
-		// claim the same separator and produce overlapping original offsets.
-		for j := rs; j < re; j++ {
-			occupied[j] = true
+		filtered := nonContextCause(c.inner)
+		repl := filtered.Error()
+		edits = append(edits, edit{start: c.start, end: c.end, repl: repl})
+		if repl != orig[c.start:c.end] {
+			changed = true
 		}
-		removals = append(removals, span{start: rs, end: re, removal: true})
 	}
 	// Ambiguous framing copies of a discarded phrase are unsafe to rewrite.
 	for _, it := range items {
@@ -1160,30 +1179,44 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			}
 		}
 	}
-	if len(removals) == 0 {
+	if !changed {
 		return orig
 	}
-	// Merge overlapping or abutting removals so applying original offsets
-	// cannot shift a later span into retained text (for example eating the
-	// leading "p" of "public" after two discarded context phrases).
-	sort.Slice(removals, func(i, j int) bool { return removals[i].start < removals[j].start })
-	merged := make([]span, 0, len(removals))
-	for _, r := range removals {
-		if len(merged) == 0 || r.start > merged[len(merged)-1].end {
-			merged = append(merged, r)
+	// Merge overlapping or abutting removals (empty replacements) so applying
+	// original offsets cannot shift a later span into retained text.
+	sort.Slice(edits, func(i, j int) bool {
+		if edits[i].start != edits[j].start {
+			return edits[i].start < edits[j].start
+		}
+		return edits[i].end < edits[j].end
+	})
+	merged := make([]edit, 0, len(edits))
+	for _, e := range edits {
+		if e.repl == "" && len(merged) > 0 && merged[len(merged)-1].repl == "" && e.start <= merged[len(merged)-1].end {
+			if e.end > merged[len(merged)-1].end {
+				merged[len(merged)-1].end = e.end
+			}
 			continue
 		}
-		if r.end > merged[len(merged)-1].end {
-			merged[len(merged)-1].end = r.end
-		}
+		merged = append(merged, e)
 	}
-	sort.Slice(merged, func(i, j int) bool { return merged[i].start > merged[j].start })
-	cleaned := orig
-	for _, r := range merged {
-		if r.start < 0 || r.end > len(cleaned) || r.start > r.end {
+	sort.Slice(merged, func(i, j int) bool {
+		if merged[i].start != merged[j].start {
+			return merged[i].start > merged[j].start
+		}
+		return merged[i].end > merged[j].end
+	})
+	for i := 1; i < len(merged); i++ {
+		if merged[i].end > merged[i-1].start {
 			return orig
 		}
-		cleaned = cleaned[:r.start] + cleaned[r.end:]
+	}
+	cleaned := orig
+	for _, e := range merged {
+		if e.start < 0 || e.end > len(cleaned) || e.start > e.end {
+			return orig
+		}
+		cleaned = cleaned[:e.start] + e.repl + cleaned[e.end:]
 	}
 	return cleaned
 }

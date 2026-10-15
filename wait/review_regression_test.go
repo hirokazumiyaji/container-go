@@ -585,6 +585,44 @@ func TestNonContextCausePreservesNonContextWrappers(t *testing.T) {
 	}
 }
 
+type reviewMultiWrapper struct {
+	errs []error
+}
+
+func (e *reviewMultiWrapper) Error() string {
+	return "multi wrapper: " + errors.Join(e.errs...).Error()
+}
+func (e *reviewMultiWrapper) Unwrap() []error {
+	out := make([]error, len(e.errs))
+	copy(out, e.errs)
+	return out
+}
+
+func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
+	a := errors.New("backend a")
+	b := errors.New("backend b")
+	joined := errors.Join(a, b)
+	if got := nonContextCause(joined); got != joined {
+		t.Fatalf("untouched join = %v (%T), want original", got, got)
+	}
+	multi := &reviewMultiWrapper{errs: []error{a, b}}
+	if got := nonContextCause(multi); got != multi {
+		t.Fatalf("untouched multi wrapper = %v (%T), want original", got, got)
+	}
+	mixed := &reviewMultiWrapper{errs: []error{context.Canceled, a}}
+	got := nonContextCause(mixed)
+	if got == mixed {
+		t.Fatal("mixed multi wrapper should be rebuilt")
+	}
+	if !errors.Is(got, a) || errors.Is(got, context.Canceled) {
+		t.Fatalf("mixed multi wrapper = %v", got)
+	}
+	var gotMulti *reviewMultiWrapper
+	if !errors.As(got, &gotMulti) {
+		t.Fatalf("mixed multi wrapper = %v, want original type via As", got)
+	}
+}
+
 type reviewStreamWrapper struct {
 	err error
 }

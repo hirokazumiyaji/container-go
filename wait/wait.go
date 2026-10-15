@@ -319,13 +319,27 @@ func nonContextCause(err error) error {
 		return nil
 	}
 	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
-		var kept []error
-		for _, inner := range unwrapper.Unwrap() {
-			if cause := nonContextCause(inner); cause != nil {
-				kept = append(kept, cause)
+		inners := unwrapper.Unwrap()
+		kept := make([]error, 0, len(inners))
+		changed := false
+		for _, inner := range inners {
+			cause := nonContextCause(inner)
+			if cause == nil {
+				changed = true
+				continue
 			}
+			if cause != inner {
+				changed = true
+			}
+			kept = append(kept, cause)
 		}
-		return joinNonNil(kept...)
+		if len(kept) == 0 {
+			return nil
+		}
+		if !changed {
+			return err
+		}
+		return replaceUnwrappedCause(err, joinNonNil(kept...))
 	}
 	// Only unwrap a single-error wrapper when the tree contains a context
 	// branch that must be stripped. Otherwise keep wrappers such as

@@ -694,6 +694,15 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("stdlib join of only context = %v, want nil", nonContextCause(join))
 	}
 
+	onlyContextCustom := &reviewMultiWrapper{errs: []error{context.Canceled}}
+	got = nonContextCause(onlyContextCustom)
+	if got == nil {
+		t.Fatal("context-only custom wrapper dropped")
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("context-only custom wrapper = %q, must not render stripped context", got.Error())
+	}
+
 	if got := nonContextCause(&net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}); got != nil {
 		t.Fatalf("context-only *net.OpError = %v, want nil", got)
 	}
@@ -702,6 +711,19 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	}
 	if got := nonContextCause(&url.Error{Op: "Get", URL: "http://example", Err: context.DeadlineExceeded}); got != nil {
 		t.Fatalf("context-only *url.Error = %v, want nil", got)
+	}
+}
+
+func TestNonContextCauseAsDoesNotExposeDiscardedTransportChildren(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend failure"}
+	wrapped := fmt.Errorf("%w; %w", &os.PathError{Op: "open", Path: "/tmp/x", Err: context.Canceled}, backend)
+	got := nonContextCause(wrapped)
+	if !errors.Is(got, backend) {
+		t.Fatalf("filtered wrap = %v, want backend", got)
+	}
+	var pathErr *os.PathError
+	if errors.As(got, &pathErr) {
+		t.Fatalf("filtered wrap exposed discarded *os.PathError: %#v", pathErr)
 	}
 }
 

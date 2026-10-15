@@ -519,10 +519,25 @@ func (e *contextStrippedCause) Error() string {
 	if e == nil || e.original == nil {
 		return "<nil>"
 	}
-	if e.cause == nil {
-		return e.original.Error()
-	}
 	orig := e.original.Error()
+	if e.cause == nil {
+		// Context-only wrappers still need their discarded child text removed
+		// so retained diagnostics do not contradict the filtered Is surface.
+		if inners := multiUnwrap(e.original); len(inners) > 0 {
+			if cleaned := replaceDiscardedErrorText(orig, inners, nil); cleaned != "" {
+				return cleaned
+			}
+		}
+		if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
+			if idx := strings.Index(orig, innerText); idx >= 0 {
+				cleaned := strings.TrimSpace(strings.Trim(orig[:idx]+orig[idx+len(innerText):], ":;"))
+				if cleaned != "" {
+					return cleaned
+				}
+			}
+		}
+		return orig
+	}
 	causeText := e.cause.Error()
 	// Preserve wrapper framing (for example "follow logs: " or "follow %w failed")
 	// while replacing the unfiltered inner rendering so stripped context
@@ -657,7 +672,26 @@ func (e *contextStrippedCause) As(target any) bool {
 	if errors.As(e.cause, target) {
 		return true
 	}
-	return errors.As(e.original, target)
+	// Match the original wrapper's concrete type without recursively searching
+	// discarded children that may still carry context sentinels.
+	return asExactType(e.original, target)
+}
+
+func asExactType(err error, target any) bool {
+	if err == nil || target == nil {
+		return false
+	}
+	val := reflect.ValueOf(target)
+	if val.Kind() != reflect.Pointer || val.IsNil() {
+		return false
+	}
+	dest := val.Elem()
+	errVal := reflect.ValueOf(err)
+	if !errVal.IsValid() || !errVal.Type().AssignableTo(dest.Type()) {
+		return false
+	}
+	dest.Set(errVal)
+	return true
 }
 
 func unfilteredInnerErrorText(err error) string {

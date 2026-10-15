@@ -147,11 +147,25 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 	})
 
 	t.Run("deadline", func(t *testing.T) {
-		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-		defer cancel()
+		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
 		target := newReviewExecTarget(cause, false)
+		done := make(chan error, 1)
 		start := time.Now()
-		err := ForExec([]string{"probe"}).WithStartupTimeout(time.Hour).WithPollInterval(5*time.Millisecond).WaitUntilReady(ctx, target)
+		go func() {
+			done <- ForExec([]string{"probe"}).WithStartupTimeout(time.Hour).WithPollInterval(5*time.Millisecond).WaitUntilReady(caller, target)
+		}()
+		select {
+		case <-target.started:
+			caller.expire()
+		case <-time.After(time.Second):
+			t.Fatal("exec check did not start")
+		}
+		var err error
+		select {
+		case err = <-done:
+		case <-time.After(time.Second):
+			t.Fatal("wait did not return after deadline")
+		}
 		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) {
 			t.Fatalf("error = %v, want deadline and typed cause", err)
 		}
@@ -554,5 +568,40 @@ func TestForAllClassifiesDeadlineSourceAtRaceBoundary(t *testing.T) {
 				t.Fatalf("error = %v, startup=%v caller=%v; want startup=%v", err, hasStartup, hasCaller, tc.wantStartupLabel)
 			}
 		})
+	}
+}
+
+func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
+	cause := &reviewTypedCause{message: "transient stream failure"}
+	mixed := errors.Join(context.Canceled, cause)
+	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+	started := make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(
+			caller,
+			&reviewLogDeadlineCauseTarget{cause: mixed, started: started},
+		)
+	}()
+	select {
+	case <-started:
+		caller.expire()
+	case <-time.After(time.Second):
+		t.Fatal("log stream cause was not retained before deadline")
+	}
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ForLog did not return after deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if !errors.Is(err, cause) {
+		t.Fatalf("error = %v, want typed stream cause", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not retain stale context.Canceled branch", err)
 	}
 }

@@ -3,6 +3,7 @@ package wait
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
@@ -573,35 +574,45 @@ func TestForAllClassifiesDeadlineSourceAtRaceBoundary(t *testing.T) {
 
 func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 	cause := &reviewTypedCause{message: "transient stream failure"}
-	mixed := errors.Join(context.Canceled, cause)
-	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
-	started := make(chan struct{})
-	done := make(chan error, 1)
-	go func() {
-		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(
-			caller,
-			&reviewLogDeadlineCauseTarget{cause: mixed, started: started},
-		)
-	}()
-	select {
-	case <-started:
-		caller.expire()
-	case <-time.After(time.Second):
-		t.Fatal("log stream cause was not retained before deadline")
+	cases := []struct {
+		name  string
+		mixed error
+	}{
+		{name: "joined", mixed: errors.Join(context.Canceled, cause)},
+		{name: "wrapped-join", mixed: fmt.Errorf("follow logs: %w", errors.Join(context.Canceled, cause))},
 	}
-	var err error
-	select {
-	case err = <-done:
-	case <-time.After(time.Second):
-		t.Fatal("ForLog did not return after deadline")
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
-	}
-	if !errors.Is(err, cause) {
-		t.Fatalf("error = %v, want typed stream cause", err)
-	}
-	if errors.Is(err, context.Canceled) {
-		t.Fatalf("error = %v, must not retain stale context.Canceled branch", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(
+					caller,
+					&reviewLogDeadlineCauseTarget{cause: tc.mixed, started: started},
+				)
+			}()
+			select {
+			case <-started:
+				caller.expire()
+			case <-time.After(time.Second):
+				t.Fatal("log stream cause was not retained before deadline")
+			}
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("ForLog did not return after deadline")
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+			}
+			if !errors.Is(err, cause) {
+				t.Fatalf("error = %v, want typed stream cause", err)
+			}
+			if errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, must not retain stale context.Canceled branch", err)
+			}
+		})
 	}
 }

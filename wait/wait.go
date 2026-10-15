@@ -326,6 +326,13 @@ func nonContextCause(err error) error {
 		}
 		return joinNonNil(kept...)
 	}
+	if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
+		if inner := unwrapper.Unwrap(); inner != nil {
+			if cause := nonContextCause(inner); cause != nil {
+				return cause
+			}
+		}
+	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return nil
 	}

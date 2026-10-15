@@ -662,6 +662,28 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			changed = true
 		}
 	}
+	// If a child phrase still occurs outside every claimed span, the message
+	// has ambiguous framing copies (for example a literal "context canceled"
+	// beside a %w of the same text). Fall back rather than rewriting the
+	// wrong occurrence.
+	for _, it := range items {
+		phrase := it.phrase
+		for i := 0; i+len(phrase) <= len(orig); i++ {
+			if orig[i:i+len(phrase)] != phrase {
+				continue
+			}
+			free := true
+			for j := i; j < i+len(phrase); j++ {
+				if occupied[j] {
+					free = false
+					break
+				}
+			}
+			if free {
+				return ""
+			}
+		}
+	}
 	if !changed {
 		return ""
 	}

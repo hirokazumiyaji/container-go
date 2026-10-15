@@ -919,6 +919,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("overlapping child text = %q, backend diagnostic corrupted", got.Error())
 	}
 
+	// Literal framing that copies a child phrase must not steal the claim.
+	framedCause := &reviewTypedCause{message: "backend failure"}
+	framed := fmt.Errorf("note=context canceled; ctx=%w; backend=%w", context.Canceled, framedCause)
+	got = nonContextCause(framed)
+	if !errors.Is(got, framedCause) {
+		t.Fatalf("ambiguous framing copy = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("ambiguous framing copy = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "ctx=context canceled") {
+		t.Fatalf("ambiguous framing copy = %q, discarded sentinel still rendered at ctx=", got.Error())
+	}
+	// Prefer the filtered cause text over a mis-associated frame rewrite.
+	if strings.Contains(got.Error(), "note=") && strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("ambiguous framing copy = %q, want cause-only fallback without framing copies", got.Error())
+	}
+
 	nestedCause := &reviewTypedCause{message: "nested backend failure"}
 	nestedChild := fmt.Errorf("attempt: %w", errors.Join(context.Canceled, nestedCause))
 	nested := fmt.Errorf("stream: %w; backend: %w", context.Canceled, nestedChild)

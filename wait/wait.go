@@ -675,8 +675,12 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 		return 0, false
 	}
 
-	var edits []edit
-	changed := false
+	type pendingEdit struct {
+		inner      error
+		start, end int
+		removal    bool
+	}
+	pending := make([]pendingEdit, 0, len(items))
 	for _, it := range items {
 		start, ok := claim(it.phrase)
 		if !ok {
@@ -684,17 +688,12 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			// claimed span; framed rewrite would mis-associate occurrences.
 			return ""
 		}
-		if filtered := nonContextCause(it.inner); filtered != nil {
-			repl := filtered.Error()
-			edits = append(edits, edit{start: start, end: start + len(it.phrase), repl: repl})
-			if repl != it.phrase {
-				changed = true
-			}
-		} else {
-			rs, re := expandRemovalSeparators(orig, start, start+len(it.phrase))
-			edits = append(edits, edit{start: rs, end: re, repl: ""})
-			changed = true
-		}
+		pending = append(pending, pendingEdit{
+			inner:   it.inner,
+			start:   start,
+			end:     start + len(it.phrase),
+			removal: nonContextCause(it.inner) == nil,
+		})
 	}
 	// If a child phrase still occurs outside every claimed span, the message
 	// has ambiguous framing copies (for example a literal "context canceled"
@@ -718,12 +717,44 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			}
 		}
 	}
+	// Expand removals only after every child span is claimed so separator
+	// absorption cannot walk into a retained cause's trailing spaces.
+	var edits []edit
+	changed := false
+	for _, p := range pending {
+		start, end := p.start, p.end
+		if p.removal {
+			start, end = expandRemovalSeparators(orig, start, end, occupied)
+			edits = append(edits, edit{start: start, end: end, repl: ""})
+			changed = true
+			continue
+		}
+		repl := nonContextCause(p.inner).Error()
+		edits = append(edits, edit{start: start, end: end, repl: repl})
+		if repl != orig[start:end] {
+			changed = true
+		}
+	}
 	if !changed {
 		return ""
 	}
-	sort.Slice(edits, func(i, j int) bool { return edits[i].start > edits[j].start })
+	sort.Slice(edits, func(i, j int) bool {
+		if edits[i].start != edits[j].start {
+			return edits[i].start > edits[j].start
+		}
+		return edits[i].end > edits[j].end
+	})
+	for i := 1; i < len(edits); i++ {
+		// Overlapping edits are unsafe to apply from original offsets.
+		if edits[i].end > edits[i-1].start {
+			return ""
+		}
+	}
 	masked := orig
 	for _, e := range edits {
+		if e.start < 0 || e.end > len(masked) || e.start > e.end {
+			return ""
+		}
 		masked = masked[:e.start] + e.repl + masked[e.end:]
 		if e.repl == "" {
 			// Tidy delimiters only at the removal junction so retained causes
@@ -740,9 +771,11 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 // that child sits at the start or end of the message, so a retained cause like
 // ":backend:" is not left with a leading "; " that later cleanup would have to
 // strip by trimming meaningful punctuation from the cause itself.
-func expandRemovalSeparators(orig string, start, end int) (int, int) {
+// Expansion never enters spans already claimed by another child, which would
+// otherwise produce overlapping edits and panic while rebuilding the message.
+func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
 	if start == 0 {
-		for end < len(orig) && (orig[end] == ';' || orig[end] == ':' || orig[end] == ' ') {
+		for end < len(orig) && !occupied[end] && (orig[end] == ';' || orig[end] == ':' || orig[end] == ' ') {
 			// Stop before consuming punctuation that belongs to the next child
 			// (for example the leading ':' of ":backend:").
 			if orig[end] == ':' || orig[end] == ';' {
@@ -756,7 +789,7 @@ func expandRemovalSeparators(orig string, start, end int) (int, int) {
 		return start, end
 	}
 	if end == len(orig) {
-		for start > 0 && (orig[start-1] == ';' || orig[start-1] == ':' || orig[start-1] == ' ') {
+		for start > 0 && !occupied[start-1] && (orig[start-1] == ';' || orig[start-1] == ':' || orig[start-1] == ' ') {
 			if orig[start-1] == ':' || orig[start-1] == ';' {
 				if start >= 2 && orig[start-2] != ' ' && orig[start-2] != ';' && orig[start-2] != ':' {
 					break

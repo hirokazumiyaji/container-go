@@ -1016,6 +1016,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("punctuated backend diagnostic = %q, must not render stripped context", got.Error())
 	}
 
+	// Retained cause ending in a space must not let separator expansion walk
+	// backward into that claimed span (overlapping edits would panic).
+	spacedTail := errors.New("backend ")
+	adjacent := fmt.Errorf("%w%w", spacedTail, context.Canceled)
+	got = nonContextCause(adjacent)
+	if !errors.Is(got, spacedTail) {
+		t.Fatalf("adjacent spaced cause = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("adjacent spaced cause = %v, must drop canceled", got)
+	}
+	if !strings.Contains(got.Error(), "backend") {
+		t.Fatalf("adjacent spaced cause = %q, want retained cause text", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("adjacent spaced cause = %q, must not render stripped context", got.Error())
+	}
+
 	a := errors.New("alpha failure")
 	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
 	got = nonContextCause(reordered)

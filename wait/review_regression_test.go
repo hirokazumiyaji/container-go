@@ -624,12 +624,30 @@ type reviewSliceError []string
 
 func (e reviewSliceError) Error() string { return strings.Join(e, ",") }
 
+// reviewStructSliceError is a non-comparable struct error (value receiver)
+// used to ensure untouched multi-wrappers are not replaced.
+type reviewStructSliceError struct {
+	Parts []string
+}
+
+func (e reviewStructSliceError) Error() string { return strings.Join(e.Parts, ",") }
+
 func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 	nc := reviewSliceError{"backend", "failure"}
 	joined := errors.Join(nc, errors.New("other"))
 	got := nonContextCause(joined)
 	if got != joined {
 		t.Fatalf("non-comparable join = %v (%T), want original", got, got)
+	}
+	structChild := reviewStructSliceError{Parts: []string{"backend", "failure"}}
+	structMulti := &reviewMultiWrapper{errs: []error{structChild}}
+	got = nonContextCause(structMulti)
+	if got != structMulti {
+		t.Fatalf("struct-slice multi wrapper = %v (%T), want original", got, got)
+	}
+	var gotStructMulti *reviewMultiWrapper
+	if !errors.As(got, &gotStructMulti) || gotStructMulti != structMulti {
+		t.Fatalf("struct-slice multi wrapper lost *reviewMultiWrapper via As: %v (%T)", got, got)
 	}
 	mixed := errors.Join(context.Canceled, nc)
 	got = nonContextCause(mixed)

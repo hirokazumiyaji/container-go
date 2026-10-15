@@ -774,7 +774,9 @@ func errorPkgPath(err error) string {
 }
 
 // sameError reports whether a and b are the same error value without
-// panicking on non-comparable dynamic types.
+// panicking on non-comparable dynamic types. Non-comparable structs (for
+// example a value error holding a slice) are compared with DeepEqual so an
+// untouched child is not mistaken for a filtered rewrite.
 func sameError(a, b error) bool {
 	if a == nil || b == nil {
 		return a == nil && b == nil
@@ -790,7 +792,7 @@ func sameError(a, b error) bool {
 	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer, reflect.Slice:
 		return va.Pointer() == vb.Pointer()
 	default:
-		return false
+		return reflect.DeepEqual(a, b)
 	}
 }
 

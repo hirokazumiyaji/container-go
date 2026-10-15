@@ -1351,6 +1351,56 @@ func (e *reviewOpaqueFacade) UnwrapRaw() error {
 	return e.err
 }
 
+// reviewRepeatedChildTextWrapper unwraps a context sentinel while its Error
+// text also embeds that sentinel as independent diagnostic prose.
+type reviewRepeatedChildTextWrapper struct {
+	backend error
+	child   error
+}
+
+func (e *reviewRepeatedChildTextWrapper) Error() string {
+	return "peer reported context canceled; context canceled"
+}
+func (e *reviewRepeatedChildTextWrapper) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.child
+}
+func (e *reviewRepeatedChildTextWrapper) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return errors.Is(e.child, target) || errors.Is(e.backend, target)
+}
+func (e *reviewRepeatedChildTextWrapper) As(target any) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	return errors.As(e.backend, target)
+}
+
+func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend failure"}
+	wrapped := &reviewRepeatedChildTextWrapper{backend: backend, child: context.Canceled}
+	got := nonContextCause(wrapped)
+	if got == nil {
+		t.Fatal("repeated child-text wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("repeated child-text wrapper = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, backend) {
+		t.Fatalf("repeated child-text wrapper = %v, want backend via Is", got)
+	}
+	if got.Error() != "peer reported context canceled; context canceled" {
+		t.Fatalf("repeated child-text wrapper = %q, want original safe rendering", got.Error())
+	}
+	if strings.Contains(got.Error(), "peer reported ;") || got.Error() == "peer reported" {
+		t.Fatalf("repeated child-text wrapper = %q, corrupted retained diagnostic", got.Error())
+	}
+}
+
 // reviewOpaqueIsAsFacade matches context and a backend sentinel via Is/As only.
 type reviewOpaqueIsAsFacade struct {
 	backend error

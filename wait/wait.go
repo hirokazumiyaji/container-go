@@ -914,6 +914,11 @@ func (e *contextStrippedCause) Error() string {
 			if cleaned, ok := rewriteInnerErrorText(orig, innerText, ""); ok {
 				return cleaned
 			}
+			// Multiple copies of the child text are ambiguous (diagnostic prose
+			// vs the actual unwrap rendering); keep the original safe message.
+			if strings.Count(orig, innerText) > 1 {
+				return orig
+			}
 		}
 		return stripContextSentinelPhrases(orig)
 	}
@@ -925,6 +930,9 @@ func (e *contextStrippedCause) Error() string {
 		if cleaned, ok := rewriteInnerErrorText(orig, innerText, causeText); ok {
 			return cleaned
 		}
+		// Repeated copies of the same inner text are ambiguous; fall through
+		// so multi-child framing or the filtered cause text is preferred over
+		// ReplaceAll corruption of independent diagnostic prose.
 	}
 	if inners := multiUnwrap(e.original); len(inners) > 0 {
 		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
@@ -954,16 +962,21 @@ func (e *contextStrippedCause) Error() string {
 	return causeText
 }
 
-// rewriteInnerErrorText replaces every rendering of the unfiltered inner text.
-// A single-%w wrapper may also interpolate the same inner via %s/%v, so only
-// rewriting the suffix/%w occurrence would leave context sentinel text behind.
-// ok is true when at least one occurrence was rewritten, even if the result is
+// rewriteInnerErrorText replaces the sole rendering of the unfiltered inner
+// text. When the same phrase appears more than once, the copy may be
+// independent diagnostic prose rather than the unwrap rendering (for example
+// "peer reported context canceled; context canceled"); callers must treat that
+// as ambiguous instead of ReplaceAll-corrupting the retained wording.
+// ok is true when the unique occurrence was rewritten, even if the result is
 // empty (fully stripped context-only wrappers must not restore orig).
 func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
 	if innerText == "" || !strings.Contains(orig, innerText) {
 		return "", false
 	}
-	cleaned := strings.ReplaceAll(orig, innerText, repl)
+	if strings.Count(orig, innerText) != 1 {
+		return "", false
+	}
+	cleaned := strings.Replace(orig, innerText, repl, 1)
 	if cleaned == orig {
 		return "", false
 	}

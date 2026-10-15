@@ -1353,6 +1353,15 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("paren wrap = %q, want intact paired parentheses around retained child", got.Error())
 	}
 
+	parenThenArrow := fmt.Errorf("(%w) -> %w", context.Canceled, commaCause)
+	got = nonContextCause(parenThenArrow)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("paren-then-arrow wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("paren-then-arrow wrap = %q, want pair and arrow framing removed", got.Error())
+	}
+
 	bracketDiscarded := fmt.Errorf("[%w] %w", context.Canceled, commaCause)
 	got = nonContextCause(bracketDiscarded)
 	if !errors.Is(got, commaCause) {

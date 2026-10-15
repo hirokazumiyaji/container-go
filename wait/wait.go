@@ -1478,8 +1478,16 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 	}
 	start, end = expandPairedDelimiters(orig, start, end, occupied)
 	start, end = expandArrowJunctions(orig, start, end, occupied)
-	// Absorb any separators left beside a removed pair or arrow (for example
-	// the space after "[canceled] backend" or "canceled -> backend").
+	// Absorb separators left beside a removed pair or arrow, then recognize
+	// arrows again so forms like "(%w) -> %w" do not leave a dangling ">".
+	for {
+		n := separatorExtentAt(orig, end, occupied)
+		if n == 0 {
+			break
+		}
+		end += n
+	}
+	start, end = expandArrowJunctions(orig, start, end, occupied)
 	for {
 		n := separatorExtentAt(orig, end, occupied)
 		if n == 0 {

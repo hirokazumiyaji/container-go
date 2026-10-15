@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -31,8 +32,7 @@ func TestInspectFreshWrapsErrContainerNotFound(t *testing.T) {
 	ctr.runner = &inspectNotFoundRunner{
 		err: &cli.CLIError{Binary: "container", Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`},
 	}
-	// Clear cached info so inspectFresh runs.
-	ctr.pack().info = nil
+	// State always performs a fresh inspect, even with identity cached.
 	if _, err := ctr.State(context.Background()); !errors.Is(err, ErrContainerNotFound) {
 		t.Fatalf("State error = %v, want ErrContainerNotFound", err)
 	}
@@ -81,6 +81,16 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		}
 	}
 	return nil, nil, n.err
+}
+
+func TestErrGenerationReplacedDescribesHandleMismatch(t *testing.T) {
+	message := ErrGenerationReplaced.Error()
+	if !strings.Contains(message, "handle") || !strings.Contains(message, "replaced") {
+		t.Fatalf("ErrGenerationReplaced = %q, want handle/replaced wording", message)
+	}
+	if strings.Contains(message, "delete") {
+		t.Fatalf("ErrGenerationReplaced = %q, must not be delete-specific", message)
+	}
 }
 
 func TestCleanupErrorUnwrapsOperationAndCleanup(t *testing.T) {

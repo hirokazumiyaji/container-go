@@ -260,9 +260,9 @@ var ErrEnvFileUnsupported = errors.New("secure environment files are not support
 var ErrContainerNotFound = wait.ErrContainerNotFound
 
 // ErrGenerationReplaced reports that a handle's immutable identity or
-// generation no longer matches the live container. Destructive and endpoint
-// operations refuse to act on the replacement.
-var ErrGenerationReplaced = errors.New("container was recreated; refusing to delete replaced container")
+// generation no longer matches the live container. Read, state, endpoint,
+// and destructive operations refuse to act on the replacement.
+var ErrGenerationReplaced = errors.New("container was recreated; handle refers to a replaced container")
 
 // ErrExecTerminationUnsupported reports that Exec stopped its local CLI
 // process after a context deadline or cancellation, but could not prove

@@ -86,24 +86,24 @@ func TestCountingRunnerCountsEveryCall(t *testing.T) {
 
 	// Expected calls: image inspect (present, no pull), a second
 	// addressability inspect for Apple's pinned reference, run, and the
-	// post-create container identity verification. The first connection
-	// info request then reuses that verified inspect cache.
+	// post-create container identity verification. Endpoint then pays for
+	// a fresh dynamic inspect rather than reusing that identity cache.
 	if got := r.count(); got != 4 {
 		t.Fatalf("after Run: calls = %d, want 4", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint: %v", err)
 	}
-	// Endpoint triggers a fresh dynamic inspect. Dynamic endpoint data is
-	// intentionally not cached.
+	// Endpoint triggers a dynamic inspect and stores a short-TTL snapshot.
 	if got := r.count(); got != 5 {
 		t.Fatalf("after Endpoint: calls = %d, want 5", got)
 	}
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); err != nil {
 		t.Fatalf("Endpoint again: %v", err)
 	}
-	if got := r.count(); got != 6 {
-		t.Fatalf("after refreshed Endpoint: calls = %d, want 6", got)
+	// A second Endpoint within the dynamic TTL reuses the snapshot.
+	if got := r.count(); got != 5 {
+		t.Fatalf("after Endpoint within TTL: calls = %d, want 5", got)
 	}
 
 	// The wrapper forwards results unchanged.

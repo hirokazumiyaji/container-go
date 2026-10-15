@@ -12,16 +12,20 @@ English (primary): [design.md](design.md)
 
 このチェックアウトは、バックエンド固有の動作を改修する後続 issue の
 修正を統合した状態ではありません。Apple の log option は #82、
-動的な endpoint の更新は #85、reuse の ownership と最終 generation
-確認は #83 と #84、stale Docker operation の target 修正は #74、
-Docker inspect target validation は #103、Docker の dead-state prune は
-#113 に依存します。
+reuse の ownership と最終 generation 確認は #83 と #84、stale Docker
+operation の target 修正は #74、Docker inspect target validation は
+#103、Docker の dead-state prune は #113 に依存します。動的な
+endpoint の更新（#85）はこのチェックアウトに含まれ、`Host`、
+`Endpoint`、`MappedPort`、`ContainerIP` は短い（約 1 秒）同一性検証済み
+inspect スナップショットを再利用し、readiness の毎回の retry で
+backend CLI を起動しないようにしつつ、ネットワークとポートデータを
+無期限には保持しません。
 missing inspect の分類は #103、error chain の保持は #104、Apple PullNever の
 capability handling は #112 に依存します。Windows / remote の bind source は
 #76、TCP 専用 readiness の validation は #77、Stop timeout の validation は
 #89、wait error chain の統一は #92、public option の validation は #102、reaper
 staging の cleanup は #111 に依存します。
-以下の現在の節は、その変更前の動作を説明します。
+#85 を除き、以下の現在の節はその変更前の動作を説明します。
 
 最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
 このチェックアウトはそのタグより後の開発版です。
@@ -261,16 +265,12 @@ Apple Container では、`Host` は inspect の最初の `status.networks[].ipv4
 - ホストポート衝突がないので、テストの並列実行を無制限に拡張できる。
 - ポート転送プロキシを経由しないため、転送実装の不具合（大きな転送が途中で切れる事例が報告されている）の影響を受けない。
 
-ローカルの Docker daemon でクライアントが `localhost` を要求する場合、またはコンテナ IP に到達できない構成では、`WithPublishedPort("127.0.0.1:15432:5432")` のように明示的に公開する。この loopback example は local-only であり、non-loopback の `DOCKER_HOST` では loopback binding を reject する。検出した non-loopback `DOCKER_HOST` デーモンでは remote-safe な binding と endpoint を使う。公開すると `Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。
+ローカルの Docker daemon でクライアントが `localhost` を要求する場合、またはコンテナ IP に到達できない構成では、`WithPublishedPort("127.0.0.1:15432:5432")` のように明示的に公開する。この loopback example は local-only であり、non-loopback の `DOCKER_HOST` では loopback binding を reject する。検出した non-loopback `DOCKER_HOST` デーモンでは remote-safe な binding と endpoint を使う。公開すると `Host` は指定したホストアドレスを、`MappedPort` はホストポートを返す。`Host`、`Endpoint`、`MappedPort`、`ContainerIP` の解決は、同一性を検証した動的 inspect を短い（約 1 秒）TTL で `Shared()` handle 間でも共有し、readiness の 100ms ごとの retry で毎回 inspect しないようにする一方、stale なネットワークとポートデータは無期限には保持しない（#85）。利用可能な IP（direct-IP）や host binding（published-port）が無い不完全な結果は cache hit にしない。`State` は常に再 inspect し、lifecycle の fail-fast を遅らせない。
 
 `MappedPort` と `Endpoint` は、`WithExposedPorts` で宣言したポートと明示的に公開したポート、または利用できる host binding がないポートを `ErrPortNotExposed` にする。
 宣言は wait strategy にも使われる。`ForExposedPort` は最初に宣言したポートを使い、`Target.Endpoint` の空 port も同じ最初の宣言を選ぶ。
 
-現在の実装は、endpoint 関連メソッドが最初に行う inspect の結果をキャッシュする。
-キャッシュにはコンテナ IP と host 側 binding が含まれるが、どちらも
-container の lifecycle 中に変更される。`State` は新しい inspect を使うが、
-endpoint の結果には古い値が含まれることがある。これは immutable な保証
-ではなく snapshot の動作であり、動的データの更新は #85 が担当する。Docker が
+不変な同一性情報（UID、イメージ、ラベル）は検証後にキャッシュし、動的なネットワーク、IP、ポート束縛は上記の短い TTL で endpoint 読み取りに使い、`State` は呼び出しのたびに再 inspect する。Docker が
 複数 network を報告し top-level address がない場合、現在の network selection は
 決定的な first-network contract ではなく unspecified である。
 Docker の `host` と `none` モードは、このライブラリが管理するポート束縛を
@@ -584,7 +584,7 @@ local に addressable な tag または alias を使うか、`WithAllowMutableIm
 
 ## パフォーマンス設計
 
-**子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。起動後の inspect では接続に必要な情報がそろった結果を endpoint 関連経路が再利用する。created 状態で IP や公開ポートが未確定ならキャッシュせず、次の inspect で再取得する。状態 (`status.state`) は毎回取得する。ただし現在のキャッシュにはコンテナ IP と host 側 binding も含まれ、これらは動的な値である。`State` と一部の lifecycle 操作は再 inspect する。これは stale data の制限であり、immutable な保証ではない。動的 endpoint データの更新は #85 が担当する。
+**子プロセス数を最小にする**。作成と起動はバックエンドの `run --detach` 1 回で行う。不変な UID、イメージ、ラベルの同一性は検証後にキャッシュする。`Endpoint`、`Host`、`MappedPort`、`ContainerIP` は短い（約 1 秒）動的 inspect スナップショットを再利用する。これは wait パッケージのライフサイクル照会（最大 1 秒に 1 回）に揃え、接続 readiness の 100ms ごとの retry で毎回 CLI を起動しないためである。created などで利用可能な IP や host binding が無い結果は cache hit にしない。`State` と reuse 後の検証は常に再 inspect する。これにより公開ポートを不変扱いせず、stale なネットワーク／ポートデータを無期限に保持することもなく、子プロセス数を抑える。
 
 **接続で確認できる待機は接続で行う**。`ForListeningPort` と `ForHTTP` は解決したエンドポイントへ直接接続する。`ForExec` と状態照会はバックエンド CLI を呼び出し、`ForLog` はログストリーム API を使う。接続 probe の既定間隔は 100ms、exec probe は 250ms である。通常のライフサイクル照会を最大 1 秒間隔に制限し、ログストリームの失敗時は直ちに状態を分類する。
 
@@ -681,7 +681,7 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 
 **方式**：Docker も `os/exec` の CLI ラッパーにする。container-rs は Docker Engine API を直接呼ぶが、本ライブラリは直接 API を使わない。直接 API クライアントは tar の生成、ログストリームの逆多重化、レジストリ認証、Windows の名前付きパイプを自前実装することになるため、CLI ラッパーを使う方が既存の runner 層（argv 実行、timeout、streaming）を共有できる。`DOCKER_HOST`、Docker context、認証の解決は docker CLI に委ねる。ただし、このライブラリが remote endpoint として検出するのは `DOCKER_HOST` だけで、Docker context の remote daemon は検出しない。
 
-**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。正規化した情報には、ライフサイクル状態(created、running、restarting、stopping、stopped、paused、unknown)、ラベル、image 参照、利用できる場合の backend ID、コンテナ IP、Docker network mode、公開ポートの束縛（コンテナポート → ホストアドレスとポート）を含める。backend ID が stable identity で、IP と binding は動的である。現在の endpoint cache は後者を保持する。
+**内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。正規化した情報には、ライフサイクル状態(created、running、restarting、stopping、stopped、paused、unknown)、ラベル、image 参照、利用できる場合の backend ID、コンテナ IP、Docker network mode、公開ポートの束縛（コンテナポート → ホストアドレスとポート）を含める。backend ID が stable identity で、IP と binding は動的であり、endpoint 読み取りでは短い dynamic-inspect TTL の間だけ再利用する。
 
 **Image 処理**：両バックエンドとも、明示的な image inspect と pull コマンドで pull policy を実装する。Docker の run argv は `--pull=never` を追加し、Apple Container も同じ明示的な policy 経路を使う。並行 pull は同一プロセス内で、backend、image、platform、操作が同じ場合だけ集約する。
 

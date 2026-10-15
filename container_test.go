@@ -47,6 +47,8 @@ type fakeRunner struct {
 	binary                string
 	envFiles              []string // contents of --env-file captured at call time
 	inspectJSON           string
+	inspectResponses      []string // sequential inspect bodies for refresh tests
+	inspectCalls          int
 	failPrefix            string // fail calls whose first arg matches
 	failStderr            string
 	failInspectAfter      int // allow this many matching calls before failing (0 fails all)
@@ -164,6 +166,14 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 		}
 		return []byte(strings.Repeat("a", 64) + "\n"), nil, nil
 	case "inspect":
+		if len(f.inspectResponses) > 0 {
+			n := f.inspectCalls
+			f.inspectCalls++
+			if n >= len(f.inspectResponses) {
+				n = len(f.inspectResponses) - 1
+			}
+			return []byte(f.inspectResponses[n]), nil, nil
+		}
 		json := f.inspectJSON
 		if json == "" {
 			// Answer for whatever id was asked, echoing back the

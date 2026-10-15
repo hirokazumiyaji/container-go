@@ -30,6 +30,13 @@ const (
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
 	runTimeout = 10 * time.Minute
+
+	// dynamicInspectTTL bounds how long Host/Endpoint/MappedPort/ContainerIP
+	// may reuse a dynamic inspect snapshot. It matches the wait package's
+	// lifecycle probe cadence (once per second) so readiness polls do not
+	// spawn a backend CLI process on every 100ms Endpoint retry, while
+	// network and port data are still not retained indefinitely.
+	dynamicInspectTTL = time.Second
 )
 
 var (
@@ -131,9 +138,21 @@ type lockPack struct {
 	uidMu          sync.RWMutex
 	uid            string
 	mu             sync.Mutex
-	info           *engineInfo // immutable identity snapshot; dynamic data is never cached
+	info           *engineInfo // immutable identity snapshot; excludes network/port/state
+	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
+	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
+	dynamicGen     uint64      // bumped by clearDynamic so in-flight refreshes cannot repopulate
+	now            func() time.Time // optional test clock; nil means time.Now
+	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
 	inspectMu      contextLock // serializes inspect target selection and UID publication
 	defaultNetwork string      // Docker daemon default identity, learned lazily
+}
+
+func (p *lockPack) currentTime() time.Time {
+	if p.now != nil {
+		return p.now()
+	}
+	return time.Now()
 }
 
 // Container is a handle to a container created by Run.
@@ -826,8 +845,12 @@ func (c *Container) deleteOperation() string {
 }
 
 // State returns the current lifecycle state.
+//
+// Unlike Host/Endpoint/MappedPort/ContainerIP, State always performs a
+// fresh inspect so wait fail-fast-on-stop and other lifecycle checks are
+// not delayed by the short dynamic-inspect TTL.
 func (c *Container) State(ctx context.Context) (State, error) {
-	info, err := c.inspectDynamic(ctx)
+	info, err := c.inspectDynamicFresh(ctx)
 	if err != nil {
 		return StateUnknown, err
 	}
@@ -951,6 +974,7 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	}
 	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
+		c.clearDynamic()
 		c.clearDiagnosticSecrets()
 		return nil
 	}
@@ -966,6 +990,7 @@ func (c *Container) ContainerIP(ctx context.Context) (string, error) {
 		return "", c.redactError(err)
 	}
 	if info.ip == "" {
+		c.clearDynamic()
 		return "", c.redactError(errors.New("container has no reported IP address"), c.id, info.ip)
 	}
 	return info.ip, nil
@@ -990,6 +1015,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 			return c.published[0].connectAddr(), nil
 		}
 		if info.ip == "" {
+			c.clearDynamic()
 			return "", fmt.Errorf("container %s has no reported IP address", c.id)
 		}
 		return info.ip, nil
@@ -1013,6 +1039,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		p := c.published[0]
 		b, ok := matchingPublishedBinding(info.bound, p)
 		if !ok {
+			c.clearDynamic()
 			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
@@ -1058,10 +1085,11 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 	if published == nil && !slices.Contains(c.exposed, spec) {
 		return "", 0, fmt.Errorf("%w: %s", ErrPortNotExposed, spec)
 	}
-	// Always perform one fresh identity-checked inspect before returning
-	// an endpoint. This is especially important for direct-IP backends:
-	// a published address is otherwise just a stale option value and can
-	// be returned for a replacement container without any backend read.
+	// Resolve through an identity-checked dynamic inspect (short TTL)
+	// before returning an endpoint. This is especially important for
+	// direct-IP backends: a published address is otherwise just a stale
+	// option value and can be returned for a replacement container
+	// without any backend read.
 	info, err := c.inspectDynamic(ctx)
 	if err != nil {
 		return "", 0, err
@@ -1071,6 +1099,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 			return published.connectAddr(), published.hostPort, nil
 		}
 		if info.ip == "" {
+			c.clearDynamic()
 			return "", 0, fmt.Errorf("container %s has no reported IP address", c.id)
 		}
 		return info.ip, spec.port, nil
@@ -1090,6 +1119,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 	if published != nil {
 		b, ok := matchingPublishedBinding(info.bound, *published)
 		if !ok {
+			c.clearDynamic()
 			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
 		}
 		host, err := dockerBindingConnectHost(b, c.eng)
@@ -1105,6 +1135,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		}
 		return host, b.hostPort, nil
 	}
+	c.clearDynamic()
 	return "", 0, fmt.Errorf("%w: %s has no host binding in Docker network mode %q", ErrPortNotExposed, spec, info.networkMode)
 }
 
@@ -1151,9 +1182,65 @@ func (c *Container) cachedInfo(ctx context.Context) (*engineInfo, error) {
 	return cached, nil
 }
 
-// inspectDynamic reads lifecycle, network, and port data on every call.
-// These values can change after a container has been inspected.
+// inspectDynamic returns lifecycle, network, and port data, reusing a
+// short-TTL snapshot on lockPack when the data is still usable. Callers
+// that must observe stop/replace immediately (State, post-reuse checks)
+// use inspectDynamicFresh instead.
 func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.nameInspect {
+		if info := c.cachedDynamic(); info != nil {
+			return info, nil
+		}
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
+		// A concurrent refresh may have populated the snapshot while we
+		// waited; reuse it instead of launching another inspect.
+		if info := c.cachedDynamic(); info != nil {
+			return info, nil
+		}
+	}
+	return c.refreshDynamic(ctx)
+}
+
+// inspectDynamicFresh always performs an identity-checked inspect and
+// refreshes the short-TTL dynamic snapshot shared with Shared() handles.
+func (c *Container) inspectDynamicFresh(ctx context.Context) (*engineInfo, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !c.nameInspect {
+		if err := c.pack().dynamicMu.Lock(ctx); err != nil {
+			return nil, err
+		}
+		defer c.pack().dynamicMu.Unlock()
+	}
+	return c.refreshDynamic(ctx)
+}
+
+func (c *Container) cachedDynamic() *engineInfo {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !usableDynamicSnapshot(p.dynamic) {
+		return nil
+	}
+	if !p.currentTime().Before(p.dynamicAt.Add(dynamicInspectTTL)) {
+		return nil
+	}
+	info := cloneEngineInfo(p.dynamic)
+	if p.defaultNetwork != "" {
+		info.defaultNetwork = p.defaultNetwork
+	}
+	return info
+}
+
+func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
+	gen := c.dynamicGeneration()
 	info, err := c.inspectFresh(ctx)
 	if err != nil {
 		return nil, err
@@ -1167,7 +1254,77 @@ func (c *Container) inspectDynamic(ctx context.Context) (*engineInfo, error) {
 	if err := c.rememberIdentity(ctx, info); err != nil {
 		return nil, err
 	}
+	c.storeDynamic(info, gen)
 	return info, nil
+}
+
+func (c *Container) dynamicGeneration() uint64 {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dynamicGen
+}
+
+func (c *Container) storeDynamic(info *engineInfo, gen uint64) {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	// Delete/Terminate bump dynamicGen while an inspect may still be in
+	// flight. Drop that result so endpoint reads cannot revive a deleted
+	// container's IP/port under a fresh TTL.
+	if p.dynamicGen != gen {
+		return
+	}
+	p.dynamic = cloneEngineInfo(info)
+	p.dynamicAt = p.currentTime()
+}
+
+func (c *Container) clearDynamic() {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dynamic = nil
+	p.dynamicAt = time.Time{}
+	p.dynamicGen++
+}
+
+// usableDynamicSnapshot reports whether a cached inspect has network or
+// port payload worth returning. Callers that still cannot resolve (empty
+// IP, missing host binding) clear the snapshot so the next read re-inspects
+// immediately instead of waiting out the TTL.
+func usableDynamicSnapshot(info *engineInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.ip != "" {
+		return true
+	}
+	for _, b := range info.bound {
+		if b.hostPort > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func cloneEngineInfo(info *engineInfo) *engineInfo {
+	if info == nil {
+		return nil
+	}
+	out := *info
+	if info.labels != nil {
+		out.labels = make(map[string]string, len(info.labels))
+		for key, value := range info.labels {
+			out.labels[key] = value
+		}
+	}
+	if info.networkNames != nil {
+		out.networkNames = append([]string(nil), info.networkNames...)
+	}
+	if info.bound != nil {
+		out.bound = append([]boundPort(nil), info.bound...)
+	}
+	return &out
 }
 
 func (c *Container) rememberIdentity(ctx context.Context, info *engineInfo) error {
@@ -1364,15 +1521,14 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 		return "", err
 	}
 	defer c.pack().inspectMu.Unlock()
-	if c.pack().defaultNetwork != "" {
-		return c.pack().defaultNetwork, nil
+	if name := c.cachedDefaultNetwork(); name != "" {
+		return name, nil
 	}
 	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
 	if err != nil {
 		return "", err
 	}
-	c.pack().defaultNetwork = name
-	return name, nil
+	return c.storeDefaultNetwork(name), nil
 }
 
 func (c *Container) attachDefaultNetwork(ctx context.Context, info *engineInfo) error {
@@ -1408,10 +1564,30 @@ func (c *Container) applyCachedDefaultNetwork(ctx context.Context, info *engineI
 		return err
 	}
 	defer c.pack().inspectMu.Unlock()
-	if c.pack().defaultNetwork != "" {
-		info.defaultNetwork = c.pack().defaultNetwork
+	if name := c.cachedDefaultNetwork(); name != "" {
+		info.defaultNetwork = name
 	}
 	return nil
+}
+
+// cachedDefaultNetwork and storeDefaultNetwork synchronize the lazily learned
+// Docker daemon default with pack.mu. Endpoint's short-TTL cache reads the
+// same field under that lock; writing it under inspectMu alone races.
+func (c *Container) cachedDefaultNetwork() string {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.defaultNetwork
+}
+
+func (c *Container) storeDefaultNetwork(name string) string {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.defaultNetwork == "" && name != "" {
+		p.defaultNetwork = name
+	}
+	return p.defaultNetwork
 }
 
 func (c *Container) inspectFresh(ctx context.Context) (*engineInfo, error) {

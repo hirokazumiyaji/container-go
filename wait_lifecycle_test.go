@@ -127,8 +127,8 @@ func TestEndpointRefreshesIncompleteCreatedInspect(t *testing.T) {
 	runner.mu.Lock()
 	inspects := runner.inspects
 	runner.mu.Unlock()
-	if inspects != 3 {
-		t.Fatalf("inspect calls = %d, want incomplete then complete then refreshed", inspects)
+	if inspects != 2 {
+		t.Fatalf("inspect calls = %d, want incomplete then complete (third reuses TTL)", inspects)
 	}
 }
 

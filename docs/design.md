@@ -16,18 +16,22 @@ The public API and behavior described in the current sections come from
 the implementation and its tests.
 
 This checkout is not a merge of the follow-up issue branches that harden
-backend-specific behavior. Apple log options depend on #82, dynamic
-endpoint refreshes depend on #85, reuse ownership and final generation
-verification depend on #83 and #84, stale Docker operation targeting
-depends on #74, and Docker inspect target validation depends on #103.
+backend-specific behavior. Apple log options depend on #82, reuse
+ownership and final generation verification depend on #83 and #84,
+stale Docker operation targeting depends on #74, and Docker inspect
+target validation depends on #103. Dynamic endpoint refreshes (#85) are
+in this checkout: Host, Endpoint, MappedPort, and ContainerIP reuse a
+short (~1s) identity-checked inspect snapshot so readiness polls do not
+spawn a backend CLI process on every retry, while network and port data
+are still not retained indefinitely.
 Docker dead-state pruning depends on #113; missing-inspect
 classification depends on #103; error-chain preservation depends on
 #104; and Apple PullNever capability handling depends on #112. Windows and remote bind-source handling depend
 on #76, TCP-only readiness validation on #77, Stop timeout validation on
 #89, wait error-chain normalization on #92, public option validation on
-#102, and reaper staging cleanup on #111. The current sections describe
-the behavior before those changes; they do not promise the follow-up
-contracts.
+#102, and reaper staging cleanup on #111. Aside from #85, the current
+sections describe the behavior before those changes; they do not
+promise the remaining follow-up contracts.
 
 The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The `v0.2.0` module requires Go 1.27 or
@@ -471,7 +475,14 @@ For a local Docker daemon, when a client demands a `localhost` endpoint
 with `WithPublishedPort("127.0.0.1:15432:5432")`. This loopback example
 is local-only; a non-loopback `DOCKER_HOST` rejects loopback bindings.
 For a detected non-loopback `DOCKER_HOST` daemon, use a remote-safe
-binding and endpoint instead.
+binding and endpoint instead. `Host`, `Endpoint`, `MappedPort`, and
+`ContainerIP` resolve through an identity-checked dynamic inspect with a
+short (~1s) TTL shared across `Shared()` handles so readiness polling
+does not re-inspect on every 100ms retry, while stale network and port
+data are still not retained indefinitely (#85). Incomplete results (no
+usable IP on direct-IP backends, or no host binding on published-port
+backends) are not treated as cache hits. `State` always re-inspects so
+lifecycle fail-fast paths stay immediate.
 
 `MappedPort` and `Endpoint` return `ErrPortNotExposed` for ports that
 are neither declared via `WithExposedPorts` nor explicitly published, or
@@ -479,12 +490,9 @@ for a declared port with no usable host binding. The declarations also
 feed wait strategies: `ForExposedPort` uses the first declared port, and
 an empty `Target.Endpoint` port selects that same first declaration.
 
-The current implementation caches the first successful inspect used by
-endpoint-related methods. That record includes the container IP and
-host-side bindings, although either can change during the container's
-lifetime. `State` uses a fresh inspect, but an endpoint result can
-therefore be stale. This is a snapshot behavior, not an immutability
-guarantee; #85 tracks refreshing dynamic endpoint data. For Docker with
+Immutable identity (UID, image, labels) is cached after validation;
+dynamic network, IP, and port-binding data use the short TTL above on
+endpoint reads, while `State` refreshes on every call. For Docker with
 multiple networks and no top-level address, current network selection is
 unspecified rather than a deterministic first-network contract.
 Docker's `host` and `none` network modes cannot create
@@ -943,18 +951,14 @@ returns it.
 ## Performance design
 
 **Minimize subprocess count**. Create+start is one backend
-`run --detach` call. The first successful inspect is cached and reused by
-endpoint-related paths for performance. The current cache also retains the
-container IP and host-side bindings, even though those values are dynamic;
-`State` and some lifecycle operations re-inspect. This is a stale-data
-limitation, not an immutability guarantee; #85 tracks refreshing dynamic
-endpoint data.
-**Minimize subprocess count**. Create+start is one
-`container run --detach` call. The immutable UID, image, and label identity
-is cached after validation, while endpoint, Host, lifecycle, and reuse
-operations refresh dynamic network, IP, state, and port-binding data from
-inspect. Incomplete Created data is refreshed instead of cached, and the
-lifecycle state is re-queried. This avoids stale endpoint data without treating
+`run --detach` call. The immutable UID, image, and label identity
+is cached after validation. Endpoint, Host, MappedPort, and ContainerIP
+reuse a short (~1s) dynamic inspect snapshot—aligned with the wait
+package's once-per-second lifecycle probe cadence—so connection readiness
+retries do not spawn a CLI process every 100ms. Incomplete Created data
+(no usable IP or host binding) is not treated as a cache hit. `State` and
+post-reuse verification always re-inspect. This limits subprocess fan-out
+without retaining stale network or port data indefinitely or treating
 published ports as immutable.
 
 **Wait via connections where possible**. `ForListeningPort` and
@@ -1191,8 +1195,8 @@ normalized record holds lifecycle state (created, running, restarting,
 stopping, stopped, paused, or unknown), labels, image reference, a backend ID
 when available, container IP, and host-side port bindings (container port
 → host address and port). The backend ID is the stable identity; IP
-addresses and bindings are dynamic, even though the current endpoint cache
-retains them.
+addresses and bindings are dynamic and may be reused only for the short
+dynamic-inspect TTL on endpoint reads.
 
 **Image handling**: both backends implement the pull policy through
 explicit image inspection and pull commands. The Docker run argv adds

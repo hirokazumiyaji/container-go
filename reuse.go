@@ -246,7 +246,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// A readiness wait can outlive the generation returned by the
 	// ensure. Re-inspect by the immutable ID and repeat compatibility checks
 	// before exposing the handle.
-	fresh, err := ctr.inspectDynamic(ctx)
+	fresh, err := ctr.inspectDynamicFresh(ctx)
 	if err != nil {
 		if isNotFound(err) {
 			return nil, fmt.Errorf("reuse %s: %w", cfg.name, ErrGenerationReplaced)
@@ -552,7 +552,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	var createdInfo *engineInfo
 	for {
 		var err error
-		createdInfo, err = ctr.inspectDynamic(inspectCtx)
+		createdInfo, err = ctr.inspectDynamicFresh(inspectCtx)
 		if err == nil {
 			break
 		}
@@ -566,7 +566,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if err := attachDefaultNetworkForConfig(ctx, cfg, createdInfo); err != nil {
 		return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 	}
-	ctr.pack().defaultNetwork = createdInfo.defaultNetwork
+	ctr.storeDefaultNetwork(createdInfo.defaultNetwork)
 	if err := checkReuseCompatIdentity(createdInfo, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(cleanupReuseCreate(ctx, ctr, err), envCleanupErr)
 	}

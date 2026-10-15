@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -456,7 +457,23 @@ type contextStrippedCause struct {
 	cause    error
 }
 
-func (e *contextStrippedCause) Error() string { return e.original.Error() }
+func (e *contextStrippedCause) Error() string {
+	if e == nil || e.original == nil {
+		return "<nil>"
+	}
+	if e.cause == nil {
+		return e.original.Error()
+	}
+	orig := e.original.Error()
+	causeText := e.cause.Error()
+	// Preserve wrapper framing (for example "follow logs: ") while replacing
+	// the unfiltered inner rendering so stripped context sentinels do not
+	// remain in user-facing diagnostics.
+	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && strings.HasSuffix(orig, innerText) {
+		return strings.TrimSuffix(orig, innerText) + causeText
+	}
+	return causeText
+}
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 
 func (e *contextStrippedCause) Is(target error) bool {
@@ -474,6 +491,25 @@ func (e *contextStrippedCause) As(target any) bool {
 		return true
 	}
 	return errors.As(e.original, target)
+}
+
+func unfilteredInnerErrorText(err error) string {
+	if unwrapper, ok := err.(interface{ Unwrap() error }); ok {
+		if inner := unwrapper.Unwrap(); inner != nil {
+			return inner.Error()
+		}
+	}
+	if unwrapper, ok := err.(interface{ UnwrapRaw() error }); ok {
+		if inner := unwrapper.UnwrapRaw(); inner != nil {
+			return inner.Error()
+		}
+	}
+	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
+		if inners := unwrapper.Unwrap(); len(inners) > 0 {
+			return errors.Join(inners...).Error()
+		}
+	}
+	return ""
 }
 
 func wrapWaitCause(what string, cause error, previous ...error) error {

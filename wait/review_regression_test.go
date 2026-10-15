@@ -716,6 +716,9 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 	if !strings.Contains(got.Error(), "follow logs:") {
 		t.Fatalf("nonContextCause = %v, want wrapper diagnostic text", got)
 	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("nonContextCause = %q, must not render stripped context", got.Error())
+	}
 
 	op := &net.OpError{Op: "read", Net: "tcp", Err: errors.Join(context.Canceled, cause)}
 	nested := fmt.Errorf("follow logs: %w", op)
@@ -728,6 +731,9 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 	}
 	if !strings.Contains(got.Error(), "follow logs:") {
 		t.Fatalf("nested wrapper = %v, want outer diagnostic text", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("nested wrapper = %q, must not render stripped context", got.Error())
 	}
 	var gotOp *net.OpError
 	if !errors.As(got, &gotOp) {

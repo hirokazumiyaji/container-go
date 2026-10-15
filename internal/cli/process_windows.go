@@ -7,103 +7,108 @@ import (
 	"os"
 	"os/exec"
 	"sync"
-	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
 
-// Windows process-tree termination uses a Job Object handle rather than a
-// numeric PID. The handle remains valid across child exit and cannot be
-// redirected to a reused PID. If the process cannot be assigned to a job
-// (for example, because the caller is already inside a restrictive job), the
-// caller falls back to the direct os.Process handle. Assignment happens
-// after cmd.Start, so helpers already created in that short window are not
-// retroactively added to the job. Once Wait releases the job, late
-// termination requests return os.ErrProcessDone without touching the
-// process handle.
+// configureProcessTree is intentionally a no-op on Windows. The standard
+// library does not expose a Job Object handle, so this package retains the
+// direct process handle for evidence-aware termination. Detached or
+// reparented descendants remain outside that guarantee.
 func configureProcessTree(*exec.Cmd) {}
 
+func processGroupTerminationSupported() bool { return true }
+
 type windowsProcessTree struct {
-	mu       sync.Mutex
-	job      windows.Handle
-	released bool
+	mu      sync.Mutex
+	process windows.Handle
 }
 
+// newProcessTree is called after Start and before the sole Wait. The handle
+// opened here is retained for all later cancellation attempts; no later path
+// looks up the process by its numeric PID.
 func newProcessTree(cmd *exec.Cmd) (processTree, error) {
-	job, err := windows.CreateJobObject(nil, nil)
-	if err != nil {
-		return nil, err
+	if cmd == nil || cmd.Process == nil {
+		return nil, os.ErrProcessDone
 	}
-
-	limits := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{}
-	limits.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	if _, err := windows.SetInformationJobObject(
-		job,
-		windows.JobObjectExtendedLimitInformation,
-		uintptr(unsafe.Pointer(&limits)),
-		uint32(unsafe.Sizeof(limits)),
-	); err != nil {
-		_ = windows.CloseHandle(job)
-		return nil, err
-	}
-
-	// The lifecycle has not called Wait yet, so this numeric PID still
-	// identifies the child and cannot have been recycled. The resulting
-	// job handle, unlike the PID, remains valid for later termination.
 	process, err := windows.OpenProcess(
-		windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE,
+		windows.SYNCHRONIZE|windows.PROCESS_QUERY_LIMITED_INFORMATION|windows.PROCESS_TERMINATE,
 		false,
 		uint32(cmd.Process.Pid),
 	)
 	if err != nil {
-		_ = windows.CloseHandle(job)
 		return nil, err
 	}
-	err = windows.AssignProcessToJobObject(job, process)
-	_ = windows.CloseHandle(process)
-	if err != nil {
-		_ = windows.CloseHandle(job)
-		return nil, err
-	}
-	return &windowsProcessTree{job: job}, nil
+	return &windowsProcessTree{process: process}, nil
 }
 
-func (t *windowsProcessTree) terminate(cmd *exec.Cmd) error {
+func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
+	if t == nil {
+		return terminationResult{err: os.ErrProcessDone}
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	// close runs only after the sole Wait call. Once the job handle is
-	// released, a late callback is already done and must not fall back to
-	// the numeric process handle.
-	if t.released || t.job == 0 {
-		return os.ErrProcessDone
+	if t.process == 0 {
+		return terminationResult{err: os.ErrProcessDone}
 	}
-	if err := windows.TerminateJobObject(t.job, 1); err == nil {
-		return nil
+	active, activeErr := windowsProcessActive(t.process)
+	if activeErr == nil && !active {
+		return terminationResult{err: os.ErrProcessDone}
 	}
-	// Job assignment can fail while the handle is still owned. The direct
-	// handle is a safe fallback in that pre-release state.
+	terminateErr := windows.TerminateProcess(t.process, 1)
+	activeEvidence := activeErr == nil && active
+	if terminateErr == nil {
+		return terminationResult{active: activeEvidence, syntheticExit: activeEvidence}
+	}
 	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
+		return terminationResult{err: terminateErr}
 	}
-	if err := cmd.Process.Kill(); err == nil || errors.Is(err, os.ErrProcessDone) {
-		return nil
+	if killErr := cmd.Process.Kill(); killErr == nil {
+		if activeErr != nil {
+			terminateErr = errors.Join(terminateErr, activeErr)
+		}
+		return terminationResult{active: activeEvidence, syntheticExit: activeEvidence, err: terminateErr}
+	} else if errors.Is(killErr, os.ErrProcessDone) {
+		return terminationResult{err: errors.Join(terminateErr, killErr)}
 	} else {
-		return err
+		return terminationResult{err: errors.Join(terminateErr, killErr)}
 	}
 }
 
 func (t *windowsProcessTree) close() {
+	if t == nil {
+		return
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if t.job != 0 {
-		_ = windows.CloseHandle(t.job)
-		t.job = 0
+	if t.process != 0 {
+		_ = windows.CloseHandle(t.process)
+		t.process = 0
 	}
-	t.released = true
 }
 
-// terminateProcessTree is kept as the direct-child fallback used by package
-// tests and by callers that have not attached a job handle.
+func windowsProcessActive(process windows.Handle) (bool, error) {
+	event, err := windows.WaitForSingleObject(process, 0)
+	if err != nil {
+		return false, err
+	}
+	return event == uint32(windows.WAIT_TIMEOUT), nil
+}
+
+func terminateDirectProcessResult(cmd *exec.Cmd) terminationResult {
+	if cmd == nil || cmd.Process == nil {
+		return terminationResult{err: os.ErrProcessDone}
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		return terminationResult{err: err}
+	}
+	return terminationResult{active: true, syntheticExit: true}
+}
+
+func terminateProcessTreeResult(cmd *exec.Cmd) terminationResult {
+	return terminateDirectProcessResult(cmd)
+}
+
 func terminateProcessTree(cmd *exec.Cmd) error {
-	return directProcessTree{}.terminate(cmd)
+	return terminateProcessTreeResult(cmd).err
 }

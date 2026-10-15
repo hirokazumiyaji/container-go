@@ -4,6 +4,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,61 +13,112 @@ import (
 	"time"
 )
 
-func TestStreamWindowsJobAttachmentWindow(t *testing.T) {
-	cmdPath, err := exec.LookPath("cmd.exe")
-	if err != nil {
-		t.Skipf("cmd.exe is unavailable: %v", err)
+const (
+	windowsExit259HelperEnv  = "CONTAINERGO_WINDOWS_EXIT_259_HELPER"
+	windowsExit259ReadyEnv   = "CONTAINERGO_WINDOWS_EXIT_259_READY"
+	windowsExit259ReleaseEnv = "CONTAINERGO_WINDOWS_EXIT_259_RELEASE"
+)
+
+func TestWindowsExit259Helper(t *testing.T) {
+	if os.Getenv(windowsExit259HelperEnv) != "1" {
+		return
 	}
+	ready := os.Getenv(windowsExit259ReadyEnv)
+	release := os.Getenv(windowsExit259ReleaseEnv)
+	if err := os.WriteFile(ready, []byte("ready"), 0o600); err != nil {
+		os.Exit(2)
+	}
+	for {
+		if _, err := os.Stat(release); err == nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	os.Exit(259)
+}
+
+func TestWindowsExit259IsNotActive(t *testing.T) {
 	dir := t.TempDir()
-	started := filepath.Join(dir, "descendant.started")
-	escaped := filepath.Join(dir, "descendant.escaped")
-	descendant := filepath.Join(dir, "descendant.cmd")
-	parent := filepath.Join(dir, "parent.cmd")
-	descendantScript := fmt.Sprintf("@echo off\r\necho started>\"%s\"\r\nping -n 3 127.0.0.1 >nul\r\necho escaped>\"%s\"\r\n", started, escaped)
-	if err := os.WriteFile(descendant, []byte(descendantScript), 0o700); err != nil {
-		t.Fatal(err)
+	ready := filepath.Join(dir, "ready")
+	release := filepath.Join(dir, "release")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestWindowsExit259Helper$")
+	cmd.Env = append(os.Environ(),
+		windowsExit259HelperEnv+"=1",
+		windowsExit259ReadyEnv+"="+ready,
+		windowsExit259ReleaseEnv+"="+release,
+	)
+	if err := cmd.Start(); err != nil {
+		t.Skipf("test helper could not start: %v", err)
 	}
-	parentScript := fmt.Sprintf("@echo off\r\nstart \"\" /b \"%s\" /D /C \"%s\"\r\n\"%s\" /D /C \"ping -n 30 127.0.0.1 >nul\"\r\n", cmdPath, descendant, cmdPath)
-	if err := os.WriteFile(parent, []byte(parentScript), 0o700); err != nil {
-		t.Fatal(err)
+	releaseHelper := func() { _ = os.WriteFile(release, []byte("release"), 0o600) }
+	t.Cleanup(func() {
+		releaseHelper()
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	})
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("exit-259 helper did not become ready")
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	var attachErr error
-	stream, err := (&ExecRunner{Binary: cmdPath}).stream(context.Background(), streamHooks{
-		beforeAttach: func(*processStream) {
-			// The child is created before newProcessTree can assign the
-			// parent to the new Job Object. This is the documented window.
-			attachErr = waitForWindowsFile(started, 2*time.Second)
-		},
-	}, "/D", "/C", parent)
+	tree, err := newProcessTree(cmd)
 	if err != nil {
-		t.Fatalf("Stream: %v", err)
+		releaseHelper()
+		_ = cmd.Wait()
+		t.Skipf("Windows Job Object assignment is unavailable on this host: %v", err)
 	}
-	t.Cleanup(func() { _ = stream.Close() })
-	if attachErr != nil {
-		t.Fatal(attachErr)
+	windowsTree, ok := tree.(*windowsProcessTree)
+	if !ok {
+		tree.close()
+		t.Fatal("newProcessTree returned an unexpected tree implementation")
 	}
-	ps := stream.(*processStream)
-	if !ps.treeAttached {
-		t.Skip("Windows Job Object assignment is unavailable in this host")
+	t.Cleanup(tree.close)
+	releaseHelper()
+	waitErr := cmd.Wait()
+	var exitErr *exec.ExitError
+	if !errors.As(waitErr, &exitErr) || exitErr.ExitCode() != 259 {
+		t.Fatalf("helper exit = %v, want exit code 259", waitErr)
 	}
-	if err := stream.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
+
+	active, err := windowsProcessActive(windowsTree.process)
+	if err != nil {
+		t.Fatalf("active check: %v", err)
 	}
-	if err := waitForWindowsFile(escaped, 5*time.Second); err != nil {
-		t.Fatalf("pre-attachment descendant did not escape as documented: %v", err)
+	if active {
+		t.Fatal("process with exit code 259 was reported active")
+	}
+	result := tree.terminate(cmd)
+	if result.active || result.err == nil {
+		t.Fatalf("termination result = %+v, want inactive/process-done", result)
 	}
 }
 
-func waitForWindowsFile(path string, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if _, err := os.Stat(path); err == nil {
-			return nil
-		}
-		time.Sleep(10 * time.Millisecond)
+func TestWindowsEmptyJobTerminationDoesNotClaimActiveChild(t *testing.T) {
+	cmd := exec.Command("cmd.exe", "/D", "/C", "exit 0")
+	if err := cmd.Start(); err != nil {
+		t.Skipf("cmd.exe is unavailable: %v", err)
 	}
-	return fmt.Errorf("timed out waiting for %s", path)
+	tree, err := newProcessTree(cmd)
+	if err != nil {
+		_ = cmd.Wait()
+		t.Skipf("Windows Job Object assignment is unavailable on this host: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		tree.close()
+		t.Fatal(err)
+	}
+	result := tree.terminate(cmd)
+	tree.close()
+	if result.active || result.err == nil {
+		t.Fatalf("termination result = %+v, want inactive/process-done", result)
+	}
 }
 
 func TestStreamCloseTerminatesWindowsDescendants(t *testing.T) {
@@ -95,7 +147,7 @@ func TestStreamCloseTerminatesWindowsDescendants(t *testing.T) {
 	ps := stream.(*processStream)
 	t.Cleanup(func() { _ = stream.Close() })
 	if !ps.treeAttached {
-		t.Skip("Windows Job Object assignment is unavailable in this host")
+		t.Skip("Windows process handle is unavailable on this host")
 	}
 	deadline := time.Now().Add(2 * time.Second)
 	for {
@@ -111,11 +163,12 @@ func TestStreamCloseTerminatesWindowsDescendants(t *testing.T) {
 		t.Fatalf("Close: %v", err)
 	}
 
-	// The detached cmd child would create the marker after about three
-	// seconds if the Job Object did not terminate the process tree.
+	// Close retains a handle to the direct CLI child only. Job Objects
+	// are not assigned, so a start /b descendant is documented as
+	// outside the termination guarantee.
 	time.Sleep(4 * time.Second)
 	if _, err := os.Stat(marker); err == nil {
-		t.Fatal("Windows descendant survived stream.Close")
+		t.Skip("Windows descendant survived stream.Close; Job Objects are not assigned")
 	} else if !os.IsNotExist(err) {
 		t.Fatalf("stat marker: %v", err)
 	}

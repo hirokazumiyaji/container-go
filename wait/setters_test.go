@@ -13,8 +13,8 @@ import (
 func TestStrategySetters(t *testing.T) {
 	t.Run("HTTP WithPort/WithMethod", func(t *testing.T) {
 		s := ForHTTP("/health").WithPort("8080/tcp").WithMethod(http.MethodPost)
-		if s.port != "8080/tcp" || s.method != http.MethodPost {
-			t.Errorf("port=%q method=%q", s.port, s.method)
+		if s.port != "8080/tcp" || !s.portSet || s.method != http.MethodPost {
+			t.Errorf("port=%q portSet=%v method=%q", s.port, s.portSet, s.method)
 		}
 	})
 	t.Run("HTTP headers and basic auth", func(t *testing.T) {

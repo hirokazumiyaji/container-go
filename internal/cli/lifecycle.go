@@ -2,19 +2,63 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"sync"
 )
 
-// processTree is the platform-specific, owned termination boundary for a
-// command. A tree is published only after cmd.Start has returned successfully
-// and is closed only after the sole cmd.Wait call has returned.
-type processTree interface {
-	terminate(*exec.Cmd) error
-	close()
+// RunStatus describes what the local command lifecycle actually observed.
+// Reaped is the fact that cmd.Wait returned; it is deliberately separate from
+// whether cancellation won the race with that wait. TerminatedByCancellation
+// is set only after a platform implementation proved the direct child was
+// active and successfully accepted a termination action.
+type RunStatus struct {
+	Started                  bool
+	Reaped                   bool
+	CancelRequested          bool
+	TerminatedByCancellation bool
 }
 
+type runStatusError struct {
+	err    error
+	status RunStatus
+}
+
+func (e *runStatusError) Error() string { return e.err.Error() }
+func (e *runStatusError) Unwrap() error { return e.err }
+func (e *runStatusError) RunStatus() RunStatus {
+	return e.status
+}
+
+func markRunStatus(err error, status RunStatus) error {
+	if err == nil {
+		return nil
+	}
+	return &runStatusError{err: err, status: status}
+}
+
+// RunStatusOf returns the lifecycle status attached to err, when the runner
+// supplied one. Test doubles and legacy wrappers may omit the capability.
+func RunStatusOf(err error) (RunStatus, bool) {
+	var status interface{ RunStatus() RunStatus }
+	if !errors.As(err, &status) {
+		return RunStatus{}, false
+	}
+	return status.RunStatus(), true
+}
+
+// StartedStatus is retained for callers of the earlier start-only status
+// capability.
+func StartedStatus(err error) (started, reported bool) {
+	status, ok := RunStatusOf(err)
+	return status.Started, ok
+}
+
+// commandLifecycle is the sole owner of Wait and termination for one
+// command. Stream and Run both publish a process tree through this type so
+// context cancel, Close, and a natural exit cannot leak the child or race a
+// stale handle.
 type commandLifecycle struct {
 	cmd *exec.Cmd
 	ctx context.Context
@@ -31,8 +75,11 @@ type commandLifecycle struct {
 	waitErr      error
 	ctxErr       error
 	terminateErr error
+	lastResult   terminationResult
 
-	terminateOnce sync.Once
+	cancelRequested          bool
+	terminatedByCancellation bool
+	terminateOnce            sync.Once
 }
 
 func newCommandLifecycle(ctx context.Context, cmd *exec.Cmd) *commandLifecycle {
@@ -64,7 +111,7 @@ func (l *commandLifecycle) failStart() {
 
 // wait is the only place that calls cmd.Wait. In particular, no other
 // lifecycle path may reap the process and then race a platform termination
-// operation against that reap.
+// operation or numeric process-group signal against that reap.
 func (l *commandLifecycle) wait() {
 	l.waitOnce.Do(func() {
 		err := l.cmd.Wait()
@@ -104,53 +151,72 @@ func (l *commandLifecycle) contextError() error {
 	return l.ctxErr
 }
 
-func (l *commandLifecycle) terminate() error {
-	l.terminateOnce.Do(func() {
-		// os/exec starts its context watcher during Start. Waiting here
-		// makes cancellation before publication harmless and deterministic.
-		<-l.startDone
-
-		l.mu.Lock()
-		if !l.started || l.startFailed || l.reaped {
-			l.mu.Unlock()
-			l.terminateErr = os.ErrProcessDone
-			return
-		}
-		tree := l.tree
-		cmd := l.cmd
-		l.mu.Unlock()
-
-		if tree == nil {
-			// The direct handle is synchronized with the sole Wait call and
-			// cannot be redirected to a reused PID.
-			l.terminateErr = cmd.Process.Kill()
-			return
-		}
-		// Platform trees use the direct process handle (or a Job Object
-		// handle) as their identity gate before any group-wide operation.
-		l.terminateErr = tree.terminate(cmd)
-	})
-	return l.terminateErr
-}
-
 func (l *commandLifecycle) isReaped() bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.reaped
 }
 
-type directProcessTree struct{}
-
-func (directProcessTree) terminate(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return os.ErrProcessDone
-	}
-	return cmd.Process.Kill()
+func (l *commandLifecycle) lastTermination() terminationResult {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastResult
 }
 
-func (directProcessTree) close() {}
+func (l *commandLifecycle) status() RunStatus {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return RunStatus{
+		Started:                  l.started,
+		Reaped:                   l.reaped,
+		CancelRequested:          l.cancelRequested,
+		TerminatedByCancellation: l.terminatedByCancellation,
+	}
+}
 
-type processTreeFunc func(*exec.Cmd) error
+// cancel is the os/exec context callback. The optional argument is used by
+// the stream Close path so an intentional close is not recorded as a
+// cancellation race.
+func (l *commandLifecycle) cancel() error {
+	return l.terminate(true)
+}
 
-func (f processTreeFunc) terminate(cmd *exec.Cmd) error { return f(cmd) }
-func (processTreeFunc) close()                          {}
+func (l *commandLifecycle) terminate(cancelled ...bool) error {
+	contextTermination := len(cancelled) > 0 && cancelled[0]
+	l.terminateOnce.Do(func() {
+		// os/exec starts its context watcher during Start. Waiting here
+		// makes cancellation before publication harmless and deterministic.
+		<-l.startDone
+
+		// Keep the lifecycle lock through the termination decision and
+		// platform call. Wait cannot mark the child reaped between the active
+		// check and the signal, so numeric handles and job state cannot race
+		// the sole Wait owner.
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		if contextTermination {
+			l.cancelRequested = true
+		}
+		if !l.started || l.startFailed || l.reaped {
+			l.terminateErr = os.ErrProcessDone
+			l.lastResult = terminationResult{err: os.ErrProcessDone}
+			return
+		}
+
+		var result terminationResult
+		if l.tree == nil {
+			result = terminateDirectProcessResult(l.cmd)
+		} else {
+			result = l.tree.terminate(l.cmd)
+		}
+		l.lastResult = result
+		l.terminateErr = result.err
+		if contextTermination && result.err == nil && result.active {
+			l.terminatedByCancellation = true
+		}
+	})
+	l.mu.Lock()
+	err := l.terminateErr
+	l.mu.Unlock()
+	return err
+}

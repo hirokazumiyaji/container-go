@@ -839,6 +839,26 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	if errors.Is(gotLink.Err, context.Canceled) {
 		t.Fatalf("link error Err = %v, must not retain canceled", gotLink.Err)
 	}
+
+	dnsCfg := &net.DNSConfigError{Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(dnsCfg)
+	var gotDNSCfg *net.DNSConfigError
+	if !errors.As(got, &gotDNSCfg) {
+		t.Fatalf("dns config error = %v, want *net.DNSConfigError", got)
+	}
+	if errors.Is(gotDNSCfg.Err, context.Canceled) {
+		t.Fatalf("dns config error Err = %v, must not retain canceled", gotDNSCfg.Err)
+	}
+
+	dnsErr := &net.DNSError{Err: "lookup", Name: "example", UnwrapErr: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(dnsErr)
+	var gotDNS *net.DNSError
+	if !errors.As(got, &gotDNS) {
+		t.Fatalf("dns error = %v, want *net.DNSError", got)
+	}
+	if errors.Is(gotDNS.UnwrapErr, context.Canceled) {
+		t.Fatalf("dns error UnwrapErr = %v, must not retain canceled", gotDNS.UnwrapErr)
+	}
 }
 
 func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {

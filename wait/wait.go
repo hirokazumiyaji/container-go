@@ -510,6 +510,14 @@ func replaceUnwrappedCause(err, filtered error) error {
 		clone := *typed
 		clone.Err = filtered
 		return &clone
+	case *net.DNSConfigError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	case *net.DNSError:
+		clone := *typed
+		clone.UnwrapErr = filtered
+		return &clone
 	}
 	return &contextStrippedCause{original: err, cause: filtered}
 }

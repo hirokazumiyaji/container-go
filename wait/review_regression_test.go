@@ -1263,6 +1263,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("compact semicolon wrap = %q, want absorbed semicolon framing", got.Error())
 	}
 
+	hyphenWrap := fmt.Errorf("%w - %w", context.Canceled, commaCause)
+	got = nonContextCause(hyphenWrap)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("hyphen-delimited wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("hyphen-delimited wrap = %q, want absorbed hyphen framing", got.Error())
+	}
+
+	hyphenTrailing := fmt.Errorf("%w - %w", commaCause, context.Canceled)
+	got = nonContextCause(hyphenTrailing)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("trailing hyphen wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("trailing hyphen wrap = %q, want absorbed trailing hyphen framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2108,6 +2126,44 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
+	target := &reviewFinalProbeJoinedContextTarget{}
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected final lifecycle probe error")
+	}
+	if !errors.Is(err, ErrTargetNotFound) {
+		t.Fatalf("error = %v, want ErrTargetNotFound", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+}
+
+type reviewFinalProbeJoinedContextTarget struct {
+	execDone atomic.Bool
+}
+
+func (*reviewFinalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewFinalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+	if t.execDone.Load() {
+		return false, errors.Join(context.Canceled, ErrTargetNotFound)
+	}
+	return true, nil
+}
+func (*reviewFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (t *reviewFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	t.execDone.Store(true)
+	return 0, nil
 }
 
 func TestForExecTimeoutStripsJoinedContext(t *testing.T) {

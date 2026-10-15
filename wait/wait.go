@@ -278,9 +278,15 @@ func finalLifecycleError(
 			return terminalErr
 		}
 		if probeErr != nil {
-			lastProbeErr = probeErr
+			if filtered := nonContextCause(probeErr); filtered != nil {
+				lastProbeErr = filtered
+			}
 			if isPermanentCheckError(probeErr) {
-				return wrapWaitCause(what, permanentCause(probeErr), joinNonNil(lastErr, lastProbeErr))
+				cause := permanentCause(probeErr)
+				if filtered := nonContextCause(cause); filtered != nil {
+					cause = filtered
+				}
+				return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
 			}
 			if err := waitForReconnect(waitCtx, interval); err != nil {
 				return waitContextTerminationError(
@@ -1446,8 +1452,14 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 func isErrorSeparator(b byte) bool {
+	// Treat control/whitespace and common framing punctuation as separators so
+	// compact multi-wraps (%w - %w, %w/%w, etc.) do not leave leading junk.
+	// Alphanumeric bytes and claimed child spans stay intact.
+	if b <= ' ' {
+		return true
+	}
 	switch b {
-	case ';', ':', ',', '|', ' ', '\t', '\n', '\r':
+	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '_', '.', '!', '?', '#', '@', '&', '*', '%', '^', '`', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>':
 		return true
 	default:
 		return false

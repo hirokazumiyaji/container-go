@@ -1371,6 +1371,15 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("single-quote-discarded wrap = %q, want quotes removed with discarded child", got.Error())
 	}
 
+	nestedPairs := fmt.Errorf("[(%w)] %w", context.Canceled, commaCause)
+	got = nonContextCause(nestedPairs)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("nested-pair-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("nested-pair-discarded wrap = %q, want all enclosing pairs removed", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2424,6 +2433,28 @@ func TestForExecTimeoutStripsJoinedContext(t *testing.T) {
 	}
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+}
+
+func TestForExecContextOnlyPermanentLaunchRetries(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = &exec.Error{Name: "container", Err: context.Canceled}
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(150 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout after context-only permanent retries")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded after retries", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.execCalls.Load() < 2 {
+		t.Fatalf("execCalls = %d, want retries for context-only permanent launch error", target.execCalls.Load())
 	}
 }
 

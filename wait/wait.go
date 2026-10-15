@@ -287,11 +287,13 @@ func finalLifecycleError(
 			if isPermanentCheckError(probeErr) {
 				cause := permanentCause(probeErr)
 				if filtered := nonContextCause(cause); filtered != nil {
-					cause = filtered
-				} else if lastProbeErr != nil {
-					cause = lastProbeErr
+					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 				}
-				return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
+				if lastProbeErr != nil {
+					return wrapWaitCause(what, lastProbeErr, joinNonNil(lastErr, lastProbeErr))
+				}
+				// Context-only permanent wrapper while the wait is still
+				// active: retry like a transient probe failure.
 			}
 			if err := waitForReconnect(waitCtx, interval); err != nil {
 				return waitContextTerminationError(
@@ -1484,26 +1486,33 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 // does not leave "[ ]". Pairs around retained children stay intact because
 // those spans remain occupied and block walking out to the closer.
 func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, int) {
-	for _, pair := range [][2]byte{
-		{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
-		{'"', '"'}, {'\'', '\''},
-	} {
-		open := start - 1
-		for open >= 0 && !occupied[open] && isErrorSeparator(orig[open]) {
-			open--
+	for {
+		expanded := false
+		for _, pair := range [][2]byte{
+			{'(', ')'}, {'[', ']'}, {'{', '}'}, {'<', '>'},
+			{'"', '"'}, {'\'', '\''},
+		} {
+			open := start - 1
+			for open >= 0 && !occupied[open] && isErrorSeparator(orig[open]) {
+				open--
+			}
+			close := end
+			for close < len(orig) && !occupied[close] && isErrorSeparator(orig[close]) {
+				close++
+			}
+			if open < 0 || close >= len(orig) || occupied[open] || occupied[close] {
+				continue
+			}
+			if orig[open] == pair[0] && orig[close] == pair[1] {
+				start, end = open, close+1
+				expanded = true
+				break
+			}
 		}
-		close := end
-		for close < len(orig) && !occupied[close] && isErrorSeparator(orig[close]) {
-			close++
-		}
-		if open < 0 || close >= len(orig) || occupied[open] || occupied[close] {
-			continue
-		}
-		if orig[open] == pair[0] && orig[close] == pair[1] {
-			return open, close + 1
+		if !expanded {
+			return start, end
 		}
 	}
-	return start, end
 }
 
 func isErrorSeparator(b byte) bool {
@@ -1681,11 +1690,11 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if permanentProbeError(err) || isPermanentCheckError(err) {
 			cause := permanentCause(err)
 			if filtered := nonContextCause(cause); filtered != nil {
-				cause = filtered
+				return wrapWaitCause(what, filtered, lastProbeErr)
 			}
-			return wrapWaitCause(what, cause, lastProbeErr)
-		}
-		if filtered := nonContextCause(err); filtered != nil {
+			// Context-only permanent wrapper: continue polling rather than
+			// returning an error that still matches context.Canceled.
+		} else if filtered := nonContextCause(err); filtered != nil {
 			lastProbeErr = filtered
 		}
 	} else if terminalWaitState(state) {
@@ -1712,9 +1721,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 			if isPermanentCheckError(err) {
 				cause := permanentCause(err)
 				if filtered := nonContextCause(cause); filtered != nil {
-					cause = filtered
+					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 				}
-				return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
+				// Context-only permanent wrapper while the wait is still
+				// active: treat as transient and keep polling.
 			}
 		} else {
 			if terminalErr := terminationErr(); terminalErr != nil {
@@ -1743,11 +1753,10 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 				if isPermanentCheckError(err) || permanentProbeError(err) {
 					cause := permanentCause(err)
 					if filtered := nonContextCause(cause); filtered != nil {
-						cause = filtered
+						return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 					}
-					return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
-				}
-				if filtered := nonContextCause(err); filtered != nil {
+					// Context-only permanent wrapper: keep polling.
+				} else if filtered := nonContextCause(err); filtered != nil {
 					lastProbeErr = filtered
 				}
 			} else if terminalErr := terminationErr(); terminalErr != nil {

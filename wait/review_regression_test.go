@@ -2426,6 +2426,29 @@ func TestCompositeFinalLifecycleRetriesContextOnlyProbe(t *testing.T) {
 	}
 }
 
+func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) {
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(&reviewCompositeAlwaysTransientStrategy{}),
+		"any": ForAny(&reviewCompositeAlwaysTransientStrategy{}),
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := &reviewCompositeAlwaysTransientTarget{}
+			start := time.Now()
+			err := strategy.WaitUntilReady(context.Background(), target)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Fatal("expected bounded final lifecycle failure")
+			}
+			if elapsed > finalLifecycleProbeTimeout+2*time.Second {
+				t.Fatalf("WaitUntilReady took %v, want bounded by finalLifecycleProbeTimeout", elapsed)
+			}
+			if !strings.Contains(err.Error(), "final lifecycle check") && !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("error = %v, want final lifecycle check deadline", err)
+			}
+		})
+	}
+}
+
 func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	backend := &reviewTypedCause{message: "backend inspect failed"}
 	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
@@ -2613,6 +2636,35 @@ type reviewCompositeContextOnlyProbeStrategy struct{}
 
 func (*reviewCompositeContextOnlyProbeStrategy) WaitUntilReady(_ context.Context, target Target) error {
 	if t, ok := target.(*reviewCompositeContextOnlyProbeTarget); ok {
+		t.childDone.Store(true)
+	}
+	return nil
+}
+
+type reviewCompositeAlwaysTransientTarget struct {
+	childDone atomic.Bool
+}
+
+func (*reviewCompositeAlwaysTransientTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewCompositeAlwaysTransientTarget) Running(context.Context) (bool, error) {
+	if !t.childDone.Load() {
+		return true, nil
+	}
+	return false, errors.New("transient inspect glitch")
+}
+func (*reviewCompositeAlwaysTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewCompositeAlwaysTransientTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewCompositeAlwaysTransientStrategy struct{}
+
+func (*reviewCompositeAlwaysTransientStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*reviewCompositeAlwaysTransientTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil

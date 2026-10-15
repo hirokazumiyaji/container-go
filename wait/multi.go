@@ -285,19 +285,24 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	// Cap the whole retry sequence even when the composite wait context is
+	// unbounded (no WithStartupTimeout + Background). Child startup timeouts
+	// no longer apply once WaitUntilReady has returned successfully.
+	checkCtx, cancel := context.WithTimeout(ctx, finalLifecycleProbeTimeout)
+	defer cancel()
 	var lastErr error
 	for {
-		if err := ctx.Err(); err != nil {
+		if err := checkCtx.Err(); err != nil {
 			return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, err), err, lastErr)
 		}
-		probeCtx, cancel := context.WithTimeout(ctx, finalLifecycleProbeTimeout)
+		probeCtx, probeCancel := context.WithTimeout(checkCtx, lifecycleProbeTimeout)
 		if err := probeCtx.Err(); err != nil {
-			cancel()
-			return fmt.Errorf("%s: final lifecycle check: %w", what, err)
+			probeCancel()
+			return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, err), err, lastErr)
 		}
 		state, err := targetState(probeCtx, target)
 		probeErr := probeCtx.Err()
-		cancel()
+		probeCancel()
 		// Retain only non-context branches so a mixed Join(context, backend)
 		// probe cannot make the composite result match context.Canceled while
 		// the caller context is still active.
@@ -308,11 +313,11 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 		} else {
 			err = nil
 		}
-		if ctxErr := ctx.Err(); ctxErr != nil {
+		if ctxErr := checkCtx.Err(); ctxErr != nil {
 			return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, ctxErr), ctxErr, lastErr)
 		}
 		if probeErr != nil {
-			if err := waitForReconnect(ctx, defaultPollInterval); err != nil {
+			if err := waitForReconnect(checkCtx, defaultPollInterval); err != nil {
 				return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, err), err, lastErr)
 			}
 			continue
@@ -321,16 +326,16 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 			if permanentProbeError(err) {
 				return fmt.Errorf("%s: final lifecycle check: %w", what, err)
 			}
-			if waitErr := waitForReconnect(ctx, defaultPollInterval); waitErr != nil {
+			if waitErr := waitForReconnect(checkCtx, defaultPollInterval); waitErr != nil {
 				return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, waitErr), waitErr, lastErr)
 			}
 			continue
 		}
 		if rawErr != nil {
-			// Context-only probe while the composite context remains active:
-			// retry within the startup budget instead of treating StateUnknown
-			// as a hard failure (mirrors finalLifecycleError).
-			if waitErr := waitForReconnect(ctx, defaultPollInterval); waitErr != nil {
+			// Context-only probe while the check budget remains: retry instead
+			// of treating StateUnknown as a hard failure (mirrors
+			// finalLifecycleError).
+			if waitErr := waitForReconnect(checkCtx, defaultPollInterval); waitErr != nil {
 				return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, waitErr), waitErr, lastErr)
 			}
 			continue

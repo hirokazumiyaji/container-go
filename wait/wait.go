@@ -527,6 +527,19 @@ func replaceUnwrappedCause(err, filtered error) error {
 	case *net.DNSError:
 		clone := *typed
 		clone.UnwrapErr = filtered
+		// Err is the cached rendering used by Error(); refresh it so the
+		// filtered value does not keep mixed context wording.
+		if filtered != nil {
+			if typed.UnwrapErr != nil {
+				if old := typed.UnwrapErr.Error(); old != "" && strings.Contains(clone.Err, old) {
+					clone.Err = strings.ReplaceAll(clone.Err, old, filtered.Error())
+				} else {
+					clone.Err = filtered.Error()
+				}
+			} else {
+				clone.Err = filtered.Error()
+			}
+		}
 		return &clone
 	}
 	return &contextStrippedCause{original: err, cause: filtered}
@@ -577,6 +590,11 @@ func (e *contextStrippedCause) Error() string {
 	if inners := multiUnwrap(e.original); len(inners) > 0 {
 		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
 			return cleaned
+		}
+		// When Error() sanitizes away every child rendering, keep that safe
+		// text instead of exposing cause.Error().
+		if !childTextAppearsIn(orig, inners) {
+			return orig
 		}
 		// Ambiguous multi-child framing: prefer filtered cause text.
 		return causeText
@@ -634,6 +652,18 @@ func allDiscardedContextChildren(inners []error) bool {
 		}
 	}
 	return saw
+}
+
+func childTextAppearsIn(orig string, inners []error) bool {
+	for _, inner := range inners {
+		if inner == nil {
+			continue
+		}
+		if phrase := inner.Error(); phrase != "" && strings.Contains(orig, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently

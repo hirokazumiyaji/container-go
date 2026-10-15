@@ -870,7 +870,8 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 		t.Fatalf("dns config error Err = %v, must not retain canceled", gotDNSCfg.Err)
 	}
 
-	dnsErr := &net.DNSError{Err: "lookup", Name: "example", UnwrapErr: errors.Join(context.Canceled, cause)}
+	mixedDNS := errors.Join(context.Canceled, cause)
+	dnsErr := &net.DNSError{Err: mixedDNS.Error(), Name: "example", UnwrapErr: mixedDNS}
 	got = nonContextCause(dnsErr)
 	var gotDNS *net.DNSError
 	if !errors.As(got, &gotDNS) {
@@ -878,6 +879,12 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	}
 	if errors.Is(gotDNS.UnwrapErr, context.Canceled) {
 		t.Fatalf("dns error UnwrapErr = %v, must not retain canceled", gotDNS.UnwrapErr)
+	}
+	if strings.Contains(gotDNS.Err, "context canceled") || strings.Contains(gotDNS.Error(), "context canceled") {
+		t.Fatalf("dns error = %q (Err=%q), must not render stripped context", gotDNS.Error(), gotDNS.Err)
+	}
+	if !strings.Contains(gotDNS.Error(), "backend failure") {
+		t.Fatalf("dns error = %q, want filtered cause text", gotDNS.Error())
 	}
 }
 
@@ -1448,6 +1455,32 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	if got.Error() != "operation failed" {
 		t.Fatalf("sanitizing wrapper = %q, want original safe rendering", got.Error())
 	}
+
+	multi := &reviewSanitizingMultiWrapper{errs: []error{context.Canceled, errors.New(secret)}}
+	got = nonContextCause(multi)
+	if got == nil {
+		t.Fatal("sanitizing multi wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("sanitizing multi wrapper = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("sanitizing multi wrapper Error leaked secret: %q", got.Error())
+	}
+	if got.Error() != "operation failed" {
+		t.Fatalf("sanitizing multi wrapper = %q, want original safe rendering", got.Error())
+	}
+}
+
+type reviewSanitizingMultiWrapper struct {
+	errs []error
+}
+
+func (e *reviewSanitizingMultiWrapper) Error() string { return "operation failed" }
+func (e *reviewSanitizingMultiWrapper) Unwrap() []error {
+	out := make([]error, len(e.errs))
+	copy(out, e.errs)
+	return out
 }
 
 func TestNonContextCauseRetainsRedactorOnFilteredCause(t *testing.T) {

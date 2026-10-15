@@ -1360,15 +1360,15 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
 	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
 		// Stop before consuming punctuation that belongs to the next child
-		// (for example the leading ':' of ":backend:").
-		if (orig[end] == ':' || orig[end] == ';') &&
+		// (for example the leading ':' of ":backend:" or ',' of ",backend").
+		if (orig[end] == ':' || orig[end] == ';' || orig[end] == ',') &&
 			end+1 < len(orig) && !isErrorSeparator(orig[end+1]) {
 			break
 		}
 		end++
 	}
 	for start > 0 && !occupied[start-1] && isErrorSeparator(orig[start-1]) {
-		if (orig[start-1] == ':' || orig[start-1] == ';') &&
+		if (orig[start-1] == ':' || orig[start-1] == ';' || orig[start-1] == ',') &&
 			start >= 2 && !isErrorSeparator(orig[start-2]) {
 			break
 		}
@@ -1378,7 +1378,7 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 func isErrorSeparator(b byte) bool {
-	return b == ';' || b == ':' || b == ' '
+	return b == ';' || b == ':' || b == ',' || b == ' '
 }
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a

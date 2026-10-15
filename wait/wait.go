@@ -1479,15 +1479,25 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 // expandPairedDelimiters absorbs a balanced (), [], or {} pair that wraps only
-// the discarded span (after separator expansion). Pairs around retained children
-// stay intact because those spans remain occupied.
+// the discarded span (after separator expansion). Internal whitespace between
+// the delimiters and the span is included so "[ canceled ]" does not leave
+// "[ ]". Pairs around retained children stay intact because those spans remain
+// occupied and block walking out to the closer.
 func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, int) {
-	if start <= 0 || end >= len(orig) || occupied[start-1] || occupied[end] {
-		return start, end
-	}
 	for _, pair := range [][2]byte{{'(', ')'}, {'[', ']'}, {'{', '}'}} {
-		if orig[start-1] == pair[0] && orig[end] == pair[1] {
-			return start - 1, end + 1
+		open := start - 1
+		for open >= 0 && !occupied[open] && isErrorSeparator(orig[open]) {
+			open--
+		}
+		close := end
+		for close < len(orig) && !occupied[close] && isErrorSeparator(orig[close]) {
+			close++
+		}
+		if open < 0 || close >= len(orig) || occupied[open] || occupied[close] {
+			continue
+		}
+		if orig[open] == pair[0] && orig[close] == pair[1] {
+			return open, close + 1
 		}
 	}
 	return start, end

@@ -705,6 +705,35 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	}
 }
 
+func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	pathErr := &os.PathError{Op: "open", Path: "/tmp/x", Err: errors.Join(context.Canceled, cause)}
+	got := nonContextCause(pathErr)
+	if !errors.Is(got, cause) {
+		t.Fatalf("path error = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("path error = %v, must drop canceled", got)
+	}
+	var gotPath *os.PathError
+	if !errors.As(got, &gotPath) {
+		t.Fatalf("path error = %v, want *os.PathError", got)
+	}
+	if errors.Is(gotPath.Err, context.Canceled) {
+		t.Fatalf("path error Err = %v, must not retain canceled", gotPath.Err)
+	}
+
+	urlErr := &url.Error{Op: "Get", URL: "http://example", Err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(urlErr)
+	var gotURL *url.Error
+	if !errors.As(got, &gotURL) {
+		t.Fatalf("url error = %v, want *url.Error", got)
+	}
+	if errors.Is(gotURL.Err, context.Canceled) {
+		t.Fatalf("url error Err = %v, must not retain canceled", gotURL.Err)
+	}
+}
+
 func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failure"}
 	wrapped := fmt.Errorf("follow logs: %w; backend: %w", context.Canceled, cause)
@@ -747,6 +776,23 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "other backend failure") {
 		t.Fatalf("fmt multi-wrap with duplicate phrase = %q, want other cause text", got.Error())
+	}
+
+	nestedCause := &reviewTypedCause{message: "nested backend failure"}
+	nestedChild := fmt.Errorf("attempt: %w", errors.Join(context.Canceled, nestedCause))
+	nested := fmt.Errorf("stream: %w; backend: %w", context.Canceled, nestedChild)
+	got = nonContextCause(nested)
+	if !errors.Is(got, nestedCause) {
+		t.Fatalf("nested filtered child = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("nested filtered child = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("nested filtered child = %q, must render filtered child text", got.Error())
+	}
+	if !strings.Contains(got.Error(), "nested backend failure") {
+		t.Fatalf("nested filtered child = %q, want cause text", got.Error())
 	}
 }
 

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
+	"os"
 	"reflect"
 	"strings"
 	"time"
@@ -478,10 +480,23 @@ func sameError(a, b error) bool {
 // keep their Error() text and As/classification surface while suppressing
 // context sentinel matches.
 func replaceUnwrappedCause(err, filtered error) error {
-	// Match only the current node. Nested *net.OpError values are rebuilt by
+	// Match only the current node. Nested transport wrappers are rebuilt by
 	// recursion so outer wrappers keep their diagnostics.
-	if op, ok := err.(*net.OpError); ok {
-		clone := *op
+	switch typed := err.(type) {
+	case *net.OpError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	case *os.PathError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	case *os.SyscallError:
+		clone := *typed
+		clone.Err = filtered
+		return &clone
+	case *url.Error:
+		clone := *typed
 		clone.Err = filtered
 		return &clone
 	}
@@ -546,8 +561,12 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			continue
 		}
 		b.WriteString(remaining[:idx])
-		if nonContextCause(inner) != nil {
-			b.WriteString(phrase)
+		if filtered := nonContextCause(inner); filtered != nil {
+			rendered := filtered.Error()
+			b.WriteString(rendered)
+			if rendered != phrase {
+				changed = true
+			}
 		} else {
 			changed = true
 		}

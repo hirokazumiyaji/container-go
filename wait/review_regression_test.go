@@ -691,6 +691,63 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if join := errors.Join(context.Canceled, context.DeadlineExceeded); nonContextCause(join) != nil {
 		t.Fatalf("stdlib join of only context = %v, want nil", nonContextCause(join))
 	}
+
+	if got := nonContextCause(&net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}); got != nil {
+		t.Fatalf("context-only *net.OpError = %v, want nil", got)
+	}
+}
+
+type reviewContextMatchingMulti struct {
+	errs []error
+}
+
+func (e *reviewContextMatchingMulti) Error() string {
+	return "context matching multi: " + errors.Join(e.errs...).Error()
+}
+func (e *reviewContextMatchingMulti) Unwrap() []error {
+	out := make([]error, len(e.errs))
+	copy(out, e.errs)
+	return out
+}
+func (e *reviewContextMatchingMulti) Is(target error) bool {
+	return target == context.Canceled || target == context.DeadlineExceeded
+}
+
+type reviewContextMatchingWrapper struct {
+	err error
+}
+
+func (e *reviewContextMatchingWrapper) Error() string { return "context matching: " + e.err.Error() }
+func (e *reviewContextMatchingWrapper) Unwrap() error  { return e.err }
+func (e *reviewContextMatchingWrapper) Is(target error) bool {
+	return target == context.Canceled || errors.Is(e.err, target)
+}
+
+func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
+	cause := &reviewTypedCause{message: "backend failure"}
+	multi := &reviewContextMatchingMulti{errs: []error{cause}}
+	got := nonContextCause(multi)
+	if got == nil {
+		t.Fatal("wrapper with non-context children dropped")
+	}
+	if errors.Is(got, context.Canceled) || errors.Is(got, context.DeadlineExceeded) {
+		t.Fatalf("multi wrapper = %v, must suppress wrapper-supplied context", got)
+	}
+	if !errors.Is(got, cause) {
+		t.Fatalf("multi wrapper = %v, want child cause", got)
+	}
+
+	wrapped := &reviewContextMatchingWrapper{err: cause}
+	got = nonContextCause(wrapped)
+	if got == nil {
+		t.Fatal("single wrapper with non-context child dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("single wrapper = %v, must suppress wrapper-supplied context", got)
+	}
+	if !errors.Is(got, cause) {
+		t.Fatalf("single wrapper = %v, want child cause", got)
+	}
 }
 
 type reviewStreamWrapper struct {

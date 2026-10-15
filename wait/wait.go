@@ -338,10 +338,15 @@ func nonContextCause(err error) error {
 		if len(kept) == 0 {
 			return preserveEmptyContextWrapper(err)
 		}
+		joined := joinNonNil(kept...)
 		if !changed {
+			// Children are unchanged, but the wrapper itself may still
+			// contribute a context match via its own Is method.
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return replaceUnwrappedCause(err, joined)
+			}
 			return err
 		}
-		joined := joinNonNil(kept...)
 		// Stdlib joins only exist to carry children; rebuild from the filtered
 		// set so Error() no longer mentions stripped context sentinels.
 		if keepsClassificationWithoutChildren(err) {
@@ -362,9 +367,8 @@ func nonContextCause(err error) error {
 		if filtered == nil {
 			return preserveEmptyContextWrapper(err)
 		}
-		if sameError(filtered, inner) {
-			return err
-		}
+		// Even when the inner value is unchanged, the wrapper may still
+		// contribute a context match via its own Is method.
 		return replaceUnwrappedCause(err, filtered)
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -405,10 +409,14 @@ func retainDiagnosticFacade(facade, filtered error) error {
 }
 
 // preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface
-// after every child was a context sentinel. Stdlib join/wrap errors exist
-// only to carry children, so they are dropped once nothing remains.
+// after every child was a context sentinel. Stdlib join/wrap errors and
+// transport wrappers such as *net.OpError exist only to carry children, so
+// they are dropped once nothing remains.
 func preserveEmptyContextWrapper(err error) error {
 	if !keepsClassificationWithoutChildren(err) {
+		return nil
+	}
+	if _, ok := err.(*net.OpError); ok {
 		return nil
 	}
 	return &contextStrippedCause{original: err, cause: nil}

@@ -107,6 +107,46 @@ func TestForLogPreservesMatchWhenSettleHitsDeadline(t *testing.T) {
 	}
 }
 
+// cancelThenMatchStream unblocks only after the wait context ends and then
+// returns a matching line. That late line must not count as readiness.
+type cancelThenMatchStream struct {
+	ctx  context.Context
+	mu   sync.Mutex
+	sent bool
+}
+
+func (s *cancelThenMatchStream) Read(p []byte) (int, error) {
+	<-s.ctx.Done()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sent {
+		return 0, io.EOF
+	}
+	s.sent = true
+	return copy(p, []byte("ready\n")), nil
+}
+
+func (s *cancelThenMatchStream) Close() error { return nil }
+
+type cancelThenMatchTarget struct {
+	*fakeTarget
+}
+
+func (t *cancelThenMatchTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	return &cancelThenMatchStream{ctx: ctx}, nil
+}
+
+func TestForLogRejectsMatchFirstObservedAfterCancel(t *testing.T) {
+	target := &cancelThenMatchTarget{fakeTarget: newFakeTarget()}
+	err := ForLog("ready").WithStartupTimeout(40*time.Millisecond).WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("accepted a match first observed after the wait deadline")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want deadline", err)
+	}
+}
+
 func TestNonContextCauseDropsDeadlineButKeepsCLIFailure(t *testing.T) {
 	if cause := nonContextCause(context.DeadlineExceeded); cause != nil {
 		t.Fatalf("deadline-only cause = %v, want nil", cause)

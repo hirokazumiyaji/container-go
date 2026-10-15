@@ -22,10 +22,6 @@ const (
 	// active live --follow stream so readiness cannot wait forever.
 	terminalSettleWindow = 100 * time.Millisecond
 	maxLogSettleWindow   = 250 * time.Millisecond
-	// logScanCancelBound caps how long WaitUntilReady waits for a scanner
-	// result after the wait context ends. Close is not guaranteed to
-	// unblock a custom Target's Read, so this receive must stay bounded.
-	logScanCancelBound = 50 * time.Millisecond
 )
 
 var errLogLineTooLong = errors.New("log line exceeds 1 MiB")
@@ -224,9 +220,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				if errors.Is(err, io.EOF) {
 					committed := observedLines >= replay.previousLines
 					if count >= occurrences {
-						matched.Store(true)
-						terminalErr := settleLogMatch(ctx, stream, reader)
-						results <- result(true, committed, nil, terminalErr)
+						results <- publishObservedMatch(ctx, &matched, stream, reader, result, committed)
 					} else {
 						results <- result(false, committed, nil, nil)
 					}
@@ -236,9 +230,7 @@ func scanLogStreamTarget(ctx context.Context, target Target, stream io.ReadClose
 				return
 			}
 			if count >= occurrences {
-				matched.Store(true)
-				terminalErr := settleLogMatch(ctx, stream, reader)
-				results <- result(true, false, nil, terminalErr)
+				results <- publishObservedMatch(ctx, &matched, stream, reader, result, false)
 				return
 			}
 		}
@@ -307,15 +299,45 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 	}
 }
 
-func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atomic.Bool) (logScanResult, bool) {
-	bound := logScanCancelBound
-	if matched != nil && matched.Load() {
-		// Settlement watches the same context, so it should publish
-		// promptly. Keep a safety bound so a stuck Read still cannot
-		// hold WaitUntilReady after the deadline.
-		bound = maxLogSettleWindow
+func publishObservedMatch(
+	ctx context.Context,
+	matched *atomic.Bool,
+	stream io.ReadCloser,
+	reader *bufio.Reader,
+	result func(found, committed bool, scanErr, terminalErr error) logScanResult,
+	committed bool,
+) logScanResult {
+	// Counted after the wait context ended: do not treat this as readiness.
+	// A custom Target may unblock Read on cancel and then emit a buffered
+	// matching line that was never observed before the deadline.
+	if ctx.Err() != nil {
+		return result(false, committed, ctx.Err(), nil)
 	}
-	timer := time.NewTimer(bound)
+	matched.Store(true)
+	return result(true, committed, nil, settleLogMatch(ctx, stream, reader))
+}
+
+func receiveLogScanResultAfterCancel(results <-chan logScanResult, matched *atomic.Bool) (logScanResult, bool) {
+	if matched == nil || !matched.Load() {
+		// No pre-cancel match. Do not wait: cancellation may unblock a
+		// custom reader that then emits a matching line for the first time.
+		select {
+		case result := <-results:
+			if result.found {
+				result.found = false
+				if result.err == nil {
+					result.err = context.Canceled
+				}
+			}
+			return result, true
+		default:
+			return logScanResult{}, false
+		}
+	}
+	// The pattern was counted before cancel; settlement watches the same
+	// context and should publish promptly. Keep a safety bound so a stuck
+	// Read still cannot hold WaitUntilReady after the deadline.
+	timer := time.NewTimer(maxLogSettleWindow)
 	defer timer.Stop()
 	select {
 	case result := <-results:

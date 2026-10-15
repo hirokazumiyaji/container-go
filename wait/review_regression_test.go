@@ -2472,6 +2472,10 @@ func TestCompositeFinalLifecycleRetriesContextOnlyProbe(t *testing.T) {
 }
 
 func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) {
+	old := finalLifecycleProbeTimeout
+	finalLifecycleProbeTimeout = 200 * time.Millisecond
+	defer func() { finalLifecycleProbeTimeout = old }()
+
 	for name, strategy := range map[string]Strategy{
 		"all": ForAll(&reviewCompositeAlwaysTransientStrategy{}),
 		"any": ForAny(&reviewCompositeAlwaysTransientStrategy{}),
@@ -2484,8 +2488,8 @@ func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) 
 			if err == nil {
 				t.Fatal("expected bounded final lifecycle failure")
 			}
-			if elapsed > finalLifecycleProbeTimeout+2*time.Second {
-				t.Fatalf("WaitUntilReady took %v, want bounded by finalLifecycleProbeTimeout", elapsed)
+			if elapsed > time.Second {
+				t.Fatalf("WaitUntilReady took %v, want bounded by shortened finalLifecycleProbeTimeout", elapsed)
 			}
 			if !strings.Contains(err.Error(), "final lifecycle check") && !errors.Is(err, context.DeadlineExceeded) {
 				t.Fatalf("error = %v, want final lifecycle check deadline", err)

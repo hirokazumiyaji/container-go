@@ -25,12 +25,15 @@ import (
 )
 
 const (
-	defaultStartupTimeout      = 60 * time.Second
-	defaultPollInterval        = 100 * time.Millisecond
-	stateCheckInterval         = time.Second
-	lifecycleProbeTimeout      = 5 * time.Second
-	finalLifecycleProbeTimeout = 30 * time.Second
+	defaultStartupTimeout = 60 * time.Second
+	defaultPollInterval   = 100 * time.Millisecond
+	stateCheckInterval    = time.Second
+	lifecycleProbeTimeout = 5 * time.Second
 )
+
+// finalLifecycleProbeTimeout bounds composite final lifecycle retries even
+// when the wait context is otherwise unbounded. Overridable in tests.
+var finalLifecycleProbeTimeout = 30 * time.Second
 
 // Target is the container surface strategies probe. *container.Container
 // is adapted to it by container.Run.

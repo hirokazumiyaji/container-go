@@ -23,7 +23,8 @@ func TestDockerBindMountPolicy(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Setenv(backendEnv, "docker")
 			t.Setenv("DOCKER_HOST", tt.dockerHost)
-			f := newTestRunner()
+			f := newDockerTestRunner()
+			f.imagePresent = true
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), withRunner(f),
 				WithMounts(Mount{Type: MountBind, Source: source, Target: "/data"}))

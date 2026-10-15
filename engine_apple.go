@@ -22,26 +22,23 @@ type appleEngine struct{}
 const maxAppleStopSeconds int64 = math.MaxInt32
 
 // Verified against Apple Container CLI 1.2.x–1.3.x (local: 1.3.0).
-// Matchers are both command- and binary-aware. Apple 1.3 renders typed
-// ContainerizationError values (notFound/internalError with nested causes),
-// while older releases used the plain forms below:
-//   - inspect: "container not found: …"
-//   - exec: "get failed: container <id> not found"
-//   - stop/delete: "container with ID <id> not found" (often wrapped by
-//     "failed to stop/delete container: …")
-//   - logs: "failed to get logs for container <id>: …"
-//
+// Matchers are command-, binary-, code-, and target-aware. Apple's
+// ContainerizationError envelope is either a direct code/message pair
+// (run conflict, inspect, image inspect, exec) or an internalError wrapper
+// whose cause is notFound (create race, stop, delete, logs). Legacy flat
+// spellings remain accepted only for the same operation-specific forms.
 // Generic application output containing "not found" is not a backend match;
 // an application-prefixed typed message is rejected as well.
 const (
 	appleStderrNameConflict  = "container with id"
 	appleStderrAlreadyExists = "already exists"
 	appleStderrImageNotFound = "image not found:"
-	appleStderrAlready       = "already"
-	appleStderrExist         = "exist"
-	appleStderrInUse         = "in use"
-	appleStderrTaken         = "taken"
-	appleStderrNotFound      = "not found"
+	// appleLogsGetPrefix and appleLogsOpenPrefix are the two exact markers
+	// the 1.2/1.3 logs client wraps an absent container in. They appear
+	// both in the flat spelling and as the root and cause messages of the
+	// nested internalError envelope.
+	appleLogsGetPrefix  = "failed to get logs for container "
+	appleLogsOpenPrefix = "failed to open container logs: "
 )
 
 func (appleEngine) name() string   { return "apple" }
@@ -250,7 +247,7 @@ func (appleEngine) defaultHost() string { return "127.0.0.1" }
 func (appleEngine) probe() cli.Probe {
 	return cli.Probe{
 		Args:          []string{"system", "status"},
-		Hint:          "run `container system start`",
+		Hint:          "Ensure container system service has been started with `container system start`.",
 		Binary:        "container",
 		Operation:     "system",
 		IsUnavailable: appleProbeUnavailable,
@@ -258,25 +255,32 @@ func (appleEngine) probe() cli.Probe {
 }
 
 func appleProbeUnavailable(err error) bool {
-	branches := backendCLIErrorBranches(err, "container")
-	if len(branches) == 0 {
+	if isContextError(err) {
 		return false
 	}
-	// A reachable daemon can fail for client-side configuration or
-	// authentication reasons. Those diagnostics veto only the matching
-	// system-status branch.
+	branches := backendCLIErrorBranches(err, "container")
+	var systemBranches []cliErrorBranch
 	for _, branch := range branches {
-		if branch.ctx.operation != "system" {
-			continue
+		if branch.ctx.operation == "system" {
+			systemBranches = append(systemBranches, branch)
 		}
+	}
+	if len(systemBranches) == 0 {
+		return false
+	}
+	for _, branch := range systemBranches {
 		if cli.IsProbeConfigurationError(branch.cause) {
 			return false
 		}
 	}
-	for _, branch := range branches {
-		if branch.ctx.operation != "system" {
-			continue
+	var nonCLI []error
+	collectNonCLIErrorBranches(err, &nonCLI)
+	for _, extra := range nonCLI {
+		if cli.IsProbeConfigurationError(extra) {
+			return false
 		}
+	}
+	for _, branch := range systemBranches {
 		stderr, stdout := branchLines(branch, true)
 		for _, line := range stderr {
 			if appleProbeLivenessText(line) {
@@ -287,6 +291,11 @@ func appleProbeUnavailable(err error) bool {
 			if appleProbeLivenessText(line) {
 				return true
 			}
+		}
+	}
+	for _, extra := range nonCLI {
+		if appleProbeLivenessText(strings.ToLower(extra.Error())) {
+			return true
 		}
 	}
 	return false
@@ -567,6 +576,9 @@ func (appleEngine) imageMissing(err error) bool {
 }
 
 func (appleEngine) imageMissingForTarget(err error, target string) bool {
+	if isContextError(err) {
+		return false
+	}
 	branches := backendCLIErrorBranches(err, "container")
 	if target == "" && ambiguousBranchTargets(branches) {
 		return false
@@ -987,6 +999,9 @@ func (appleEngine) nameConflict(err error) bool {
 }
 
 func (appleEngine) nameConflictForTarget(err error, target string) bool {
+	if isContextError(err) {
+		return false
+	}
 	branches := backendCLIErrorBranches(err, "container")
 	if target == "" && ambiguousBranchTargets(branches) {
 		return false
@@ -998,13 +1013,26 @@ func (appleEngine) nameConflictForTarget(err error, target string) bool {
 		if !exactBranchTarget(branch, target) {
 			continue
 		}
-		if hasBranchLine(branch, func(line string) bool {
-			return appleNameConflictLine(line, branch.ctx.target)
+		branchTarget := branch.ctx.target
+		if hasAppleContainerizationError(branch.cause, "exists", func(message string) bool {
+			return appleNameConflictLine(message, branchTarget) || appleServerConflictLine(message, branchTarget)
+		}) {
+			return true
+		}
+		if hasAppleContainerizationErrorPath(branch.cause, "internalerror", func(message string) bool {
+			return message == "failed to create container"
+		}, "exists", func(message string) bool {
+			return appleServerConflictLine(message, branchTarget) || appleNameConflictLine(message, branchTarget)
 		}) {
 			return true
 		}
 		if hasBranchLine(branch, func(line string) bool {
-			return appleTypedNameConflictLine(line, branch.ctx.target)
+			return appleNameConflictLine(line, branchTarget) || appleServerConflictLine(line, branchTarget)
+		}) {
+			return true
+		}
+		if hasBranchLine(branch, func(line string) bool {
+			return appleTypedNameConflictLine(line, branchTarget)
 		}) {
 			return true
 		}
@@ -1032,6 +1060,18 @@ func appleNameConflictLine(line, target string) bool {
 			}
 		}
 	}
+	// Quoted create conflict: container "wanted" already exists
+	if rest, ok := strings.CutPrefix(line, "container "); ok {
+		rest = strings.TrimSpace(rest)
+		suffix := " " + appleStderrAlreadyExists
+		if strings.HasSuffix(rest, suffix) {
+			id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, suffix)), `"'`)
+			if id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+				(target == "" || sameCLITarget(id, target)) {
+				return true
+			}
+		}
+	}
 	if rest, ok := strings.CutPrefix(line, "already exists: container"); ok {
 		id := strings.TrimSpace(rest)
 		id = strings.Trim(id, `"'`)
@@ -1040,40 +1080,39 @@ func appleNameConflictLine(line, target string) bool {
 			return true
 		}
 	}
-	if strings.Contains(line, appleStderrAlready) &&
-		(strings.Contains(line, appleStderrExist) ||
-			strings.Contains(line, appleStderrInUse) ||
-			strings.Contains(line, appleStderrTaken)) {
-		if target == "" {
-			return true
-		}
-		if strings.Contains(line, strings.ToLower(target)) {
-			return true
-		}
+	// Server-side create race spelling: "container already exists: <id>".
+	if appleServerConflictLine(line, target) {
+		return true
 	}
+	// Reject loose "already"/"exist"/"in use"/"taken" co-occurrence: that
+	// matches application phrases such as "address already in use".
 	return false
+}
+
+func appleServerConflictLine(message, target string) bool {
+	rest, ok := strings.CutPrefix(message, "container already exists:")
+	if !ok {
+		return false
+	}
+	id := strings.Trim(strings.TrimSpace(rest), `"'`)
+	return id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+		(target == "" || sameCLITarget(id, target))
 }
 
 // containerMissing matches the command-specific Apple Container forms
 // for an absent container. The command, binary, and exact target are
 // required so application output containing "not found" is not treated
-// as a backend result.
+// as a backend result. Typed envelopes are accepted through the escape-
+// aware notFound unwrapper, then validated with operation-specific leaves.
 func (appleEngine) containerMissing(err error) bool {
-	if !cliErrorBelongsTo(err, "container") {
+	ctx, ok := backendCLIError(err, "container")
+	if !ok || !hasParsedCLITarget(ctx) {
 		return false
 	}
-	command, args, ok := cliCommandParts(err)
-	if !ok {
-		return false
-	}
-	target := cliCommandTarget(command, args)
-	if target == "" {
-		return false
-	}
-	switch command {
+	switch ctx.operation {
 	case "inspect", "exec", "stop", "delete", "rm", "logs":
 		return hasCLIErrorLine(err, func(line string) bool {
-			return appleContainerMissingLine(line, target, command)
+			return appleContainerMissingLine(line, ctx.target, ctx.operation)
 		})
 	default:
 		return false
@@ -1119,11 +1158,6 @@ func appleContainerMissingLine(line, target, command string) bool {
 func appleTypedNotFoundLine(line, target, command string) bool {
 	message, ok := appleTypedNotFoundMessage(line)
 	return ok && appleContainerNotFoundMessage(line, message, target, command)
-}
-
-func appleTypedContainerIDNotFoundLine(line, target string) bool {
-	message, ok := appleTypedNotFoundMessage(line)
-	return ok && appleIDMessageMatches(message, target)
 }
 
 // appleTypedNotFoundMessage unwraps only the typed wrapper grammar. The
@@ -1208,6 +1242,7 @@ func decodeAppleQuotedValue(value string) string {
 func appleContainerNotFoundMessage(line, message, target, command string) bool {
 	message = strings.TrimSpace(strings.Trim(message, `"'`))
 	generic, hasGeneric := strings.CutPrefix(message, "container not found:")
+	lowerLine := strings.ToLower(line)
 	switch command {
 	case "inspect":
 		// Inspect emits the generic list/inspect spelling. A lifecycle
@@ -1216,19 +1251,54 @@ func appleContainerNotFoundMessage(line, message, target, command string) bool {
 		return hasGeneric && cliTargetListMatches(generic, target)
 	case "exec":
 		if hasGeneric && cliTargetListMatches(generic, target) {
-			return strings.Contains(strings.ToLower(line), "failed to get container")
+			return strings.Contains(lowerLine, "failed to get container") ||
+				strings.Contains(lowerLine, "operation failed")
 		}
 		return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
-	case "stop", "delete", "rm":
+	case "stop":
 		if hasGeneric && cliTargetListMatches(generic, target) {
 			return true
 		}
+		// Bare notFound ID spelling is a real Apple 1.3 stop form.
 		return appleIDMessageMatches(message, target)
-	case "logs":
+	case "delete", "rm":
 		if hasGeneric && cliTargetListMatches(generic, target) {
+			return strings.Contains(lowerLine, "failed to delete container") ||
+				strings.Contains(lowerLine, "operation failed")
+		}
+		// Bare notFound ID envelopes without a delete root are application
+		// output, not a backend delete absence.
+		return strings.Contains(lowerLine, "failed to delete container") &&
+			appleIDMessageMatches(message, target)
+	case "logs":
+		// A get-logs root that names another container must not be accepted
+		// just because a nested open-logs cause mentions the argv target.
+		if idx := strings.Index(lowerLine, appleLogsGetPrefix); idx >= 0 {
+			rest := lowerLine[idx+len(appleLogsGetPrefix):]
+			if end := strings.IndexAny(rest, `"'`); end >= 0 {
+				rest = rest[:end]
+			}
+			rootID := strings.TrimSpace(rest)
+			if rootID != "" && !sameCLITarget(rootID, target) {
+				return false
+			}
+		}
+		if hasGeneric && cliTargetListMatches(generic, target) {
+			return strings.Contains(lowerLine, "failed to get logs") ||
+				strings.Contains(lowerLine, "operation failed") ||
+				strings.Contains(lowerLine, appleLogsOpenPrefix)
+		}
+		if appleLogsEnvelopeRoot(message, target) ||
+			appleLogsOpenMissingLine(message, target) ||
+			appleLogsMissingLine(message, target) {
 			return true
 		}
-		return appleIDMessageMatches(message, target) || appleExecMissingLine(message, target)
+		if appleIDMessageMatches(message, target) || appleExecMissingLine(message, target) {
+			return strings.Contains(lowerLine, "failed to get logs") ||
+				strings.Contains(lowerLine, "operation failed") ||
+				strings.Contains(lowerLine, appleLogsOpenPrefix)
+		}
+		return false
 	default:
 		return false
 	}
@@ -1278,32 +1348,71 @@ func appleStateMissingLine(line, target, wrapper string) bool {
 	return false
 }
 
-func appleLogsMissingLine(line, target string) bool {
-	const prefix = "failed to get logs for container "
-	rest, ok := strings.CutPrefix(line, prefix)
+func appleLogsEnvelopeRoot(message, target string) bool {
+	// The 1.2/1.3 logs envelope roots at "failed to get logs for container
+	// <id>" with nothing after the ID, so an explanatory suffix (an
+	// application's own sentence) cannot satisfy the anchor.
+	rest, ok := strings.CutPrefix(message, appleLogsGetPrefix)
+	return ok && sameCLITarget(rest, target)
+}
+
+// appleLogsOpenMissingLine accepts the notFound cause of that envelope: the
+// absence reported behind the same "failed to open container logs: " marker
+// the flat spelling uses, followed by one of the known missing-ID leaves.
+func appleLogsOpenMissingLine(message, target string) bool {
+	rest, ok := strings.CutPrefix(message, appleLogsOpenPrefix)
 	if !ok {
-		return appleIDMissingLine(line, target)
+		return false
 	}
 	rest = strings.TrimSpace(rest)
-	separator := strings.Index(rest, ":")
-	if separator < 0 {
-		return false
-	}
-	logID := strings.TrimSpace(rest[:separator])
-	if logID == "" || (target != "" && !strings.EqualFold(logID, target)) {
-		return false
-	}
-	nested := strings.TrimSpace(rest[separator+1:])
-	const openPrefix = "failed to open container logs: "
-	for range 3 {
-		if appleIDMissingLine(nested, target) || appleExecMissingLine(nested, target) {
-			return true
-		}
-		openRest, ok := strings.CutPrefix(nested, openPrefix)
-		if !ok {
+	return appleIDMissingLine(rest, target) || appleExecMissingLine(rest, target)
+}
+
+func appleLogsMissingLine(line, target string) bool {
+	current := line
+	// Flat logs absence roots at a logs-specific wrapper. A bare notFound
+	// ID leaf without get-logs/open-logs anchoring is application output.
+	if rest, ok := strings.CutPrefix(current, appleLogsGetPrefix); ok {
+		rest = strings.TrimSpace(rest)
+		separator := strings.Index(rest, ":")
+		if separator < 0 {
 			return false
 		}
-		nested = strings.TrimSpace(openRest)
+		logID := strings.TrimSpace(rest[:separator])
+		if logID == "" || (target != "" && !sameCLITarget(logID, target)) {
+			return false
+		}
+		current = strings.TrimSpace(rest[separator+1:])
+	} else if rest, ok := strings.CutPrefix(current, appleLogsOpenPrefix); ok {
+		current = strings.TrimSpace(rest)
+	} else {
+		return false
+	}
+
+	// Client and API versions wrap the same absence in a small, known set
+	// of prefixes. Bound the depth so arbitrary nested diagnostics cannot
+	// grow the classifier without limit.
+	for range 3 {
+		if appleIDMissingLine(current, target) || appleExecMissingLine(current, target) {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(current, appleLogsOpenPrefix); ok {
+			current = strings.TrimSpace(rest)
+			continue
+		}
+		if rest, ok := strings.CutPrefix(current, "get failed:"); ok {
+			current = strings.TrimSpace(rest)
+			rest, ok = strings.CutPrefix(current, "container ")
+			if ok && strings.HasSuffix(rest, " not found") {
+				id := strings.Trim(strings.TrimSpace(strings.TrimSuffix(rest, " not found")), `"'`)
+				if id != "" && !strings.ContainsAny(id, " \t\r\n") &&
+					(target == "" || sameCLITarget(id, target)) {
+					return true
+				}
+			}
+			continue
+		}
+		return false
 	}
 	return false
 }

@@ -914,6 +914,9 @@ func (c *Container) Terminate(ctx context.Context) error {
 		}
 		defer unlock()
 		info, err := c.inspectFresh(ctx)
+		if contextErr := commandContextError(ctx, err); contextErr != nil {
+			return contextErr
+		}
 		if isNotFound(err) {
 			unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, "")
 			return nil
@@ -943,6 +946,9 @@ func (c *Container) delete(ctx context.Context, target string) error {
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
+	if contextErr := commandContextError(delCtx, err); contextErr != nil {
+		return contextErr
+	}
 	if err == nil || isNotFoundForOperation(c.eng, err, c.deleteOperation(), target, c.id) {
 		unregisterContainerReaper(&config{runner: c.runner, eng: c.eng, name: c.id, creation: c.creation}, c.id, c.creation, target)
 		c.clearDiagnosticSecrets()
@@ -1434,6 +1440,9 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
 		return nil, wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "inspect"), "inspect", target, c.id)
 	}

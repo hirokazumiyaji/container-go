@@ -595,11 +595,17 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, eng.imageInspectArgs(image, platform)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return imageIdentity{}, false, contextErr
+	}
 	if err != nil {
 		if eng.imageMissingForTarget(err, image) || imageMissingError(eng, err) {
 			return imageIdentity{}, false, nil
 		}
 		return imageIdentity{}, false, classifyErrorFor(ctx, r, err, eng, commandOperation(eng.imageInspectArgs(image, platform)), image)
+	}
+	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
+		return imageIdentity{}, false, contextErr
 	}
 	if parser, ok := eng.(imageIdentityParser); ok {
 		identity, exists := parser.parseImageIdentity(stdout, image, platform)

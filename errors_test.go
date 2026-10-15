@@ -74,6 +74,12 @@ func (n *execNotFoundRunner) Run(_ context.Context, args ...string) ([]byte, []b
 	if len(args) > 0 && args[0] == "version" {
 		return []byte("29.7"), nil, nil
 	}
+	if len(args) > 0 && args[0] == "inspect" {
+		return nil, nil, &cli.CLIError{
+			Binary: "container", Args: args, ExitCode: 1,
+			Stderr: `Error: container not found: "myctr"`,
+		}
+	}
 	return nil, nil, n.err
 }
 
@@ -116,7 +122,9 @@ func TestAppleInspectTargetedNotFound(t *testing.T) {
 	}
 }
 
-func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
+// Typed Apple 1.3 create-race forms from main; the overlapping flat-form
+// matrix lives in error_classification_test.go under the historical name.
+func TestCreateRaceMissingAcceptsTypedAppleEnvelopes(t *testing.T) {
 	cases := []struct {
 		name string
 		err  *cli.CLIError
@@ -139,12 +147,13 @@ func TestCreateRaceMissingIsAnchoredAndCommandAware(t *testing.T) {
 			want: true,
 		},
 		{
+			// A bare notFound envelope without the bootstrap/run wrapper is
+			// application-shaped output and must not drive create-race reuse.
 			name: "typed Apple race",
 			err: &cli.CLIError{
 				Binary: "container", Args: []string{"run", "--name", "myctr"},
 				Stderr: `Error: notFound: "container with id myctr not found"`,
 			},
-			want: true,
 		},
 		{
 			name: "nested typed Apple race",

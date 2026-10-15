@@ -194,6 +194,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	}
 	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
+		if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
+			return 0, output, joinEnvFileCleanupError(ctxErr, envCleanupErr)
+		}
 		return 0, output, envCleanupErr
 	}
 
@@ -234,7 +237,7 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 
 	if isExecContextError(err) || effectiveExecContextErr(ctx, execCtx) != nil {
 		code := 0
-		if cliErr != nil && cliErr.ExitCode >= 0 {
+		if cliErr != nil && cliErr.ExitCode > 0 {
 			code = cliErr.ExitCode
 		}
 		return finish(code, err)
@@ -278,7 +281,15 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	}
 	if verification.err != nil {
 		joined := errors.Join(err, verification.err)
-		return finish(cliErr.ExitCode, wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id))
+		// Only a verified inspect absence (or an already-wrapped sentinel)
+		// may promote the exec failure to ErrContainerNotFound. TLS,
+		// permission, parse, and application inspect failures stay joined
+		// without that sentinel even when the exec branch looked missing.
+		if isNotFoundForOperation(c.eng, verification.err, "inspect", c.operationTarget(), c.id) ||
+			errors.Is(verification.err, ErrContainerNotFound) {
+			return finish(cliErr.ExitCode, wrapNotFoundForOperation(c.eng, joined, "exec", c.operationTarget(), c.id))
+		}
+		return finish(cliErr.ExitCode, joined)
 	}
 	return finish(cliErr.ExitCode, errors.Join(err, &execInspectionStateError{state: verification.state}))
 }
@@ -408,10 +419,19 @@ func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
 	defer cancel()
 	target := c.operationTarget()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return execInspection{state: StateUnknown, err: contextErr}
+	}
 	if err != nil {
+		classified := err
+		// Configuration/TLS inspect failures are already precise. Do not
+		// spend a liveness probe that the caller must not observe.
+		if !cli.IsProbeConfigurationError(err) && !cli.IsDefinitiveNonLivenessError(err) {
+			classified = c.classifyOperation(qCtx, err, "inspect")
+		}
 		return execInspection{
 			state: StateUnknown,
-			err:   wrapNotFoundForOperation(c.eng, c.classifyOperation(qCtx, err, "inspect"), "inspect", target, c.id),
+			err:   wrapNotFoundForOperation(c.eng, classified, "inspect", target, c.id),
 		}
 	}
 	if len(bytes.TrimSpace(stdout)) == 0 {

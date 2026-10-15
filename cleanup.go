@@ -108,10 +108,16 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, cli.WithRedactor(cli.Classify(ctx, r, err, eng.probe()), redactor)
+		return nil, cli.WithRedactor(classifyError(ctx, r, err, eng), redactor)
 	}
 	ids, err := parse(stdout)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
 		return nil, cli.WithRedactor(err, redactor)
 	}
@@ -155,6 +161,9 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	}
 	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
 	fresh, err := inspectContainer.inspectFresh(ctx)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, id, contextErr)
+	}
 	if isNotFoundFor(eng, err) {
 		unregisterContainerReaper(&config{runner: r, eng: eng}, "", "", id)
 		return false, nil
@@ -180,6 +189,9 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	defer dCancel()
 	deleteArgs := eng.deleteArgs(id)
 	_, _, err = r.Run(dCtx, deleteArgs...)
+	if contextErr := commandContextError(dCtx, err); contextErr != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
+	}
 	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, err)
 	}
@@ -266,6 +278,9 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	defer unlock()
 
 	fresh, err := (&Container{id: candidate.id, runner: r, eng: eng, nameInspect: true}).inspectFreshLocked(guardCtx)
+	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
+		return false, fmt.Errorf("%s %s: verify before delete: %w", errKind, candidate.id, contextErr)
+	}
 	if isNotFoundFor(eng, err) {
 		unregisterContainerReaper(&config{runner: r, eng: eng, name: candidate.id, creation: candidate.creation}, candidate.id, candidate.creation, "")
 		return false, nil
@@ -278,6 +293,9 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	}
 	deleteArgs := eng.deleteArgs(candidate.id)
 	_, _, err = r.Run(guardCtx, deleteArgs...)
+	if contextErr := commandContextError(guardCtx, err); contextErr != nil {
+		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, contextErr)
+	}
 	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), candidate.id) {
 		return false, fmt.Errorf("%s %s: %w", errKind, candidate.id, err)
 	}

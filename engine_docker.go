@@ -408,25 +408,35 @@ func (dockerEngine) probe() cli.Probe {
 }
 
 func dockerProbeUnavailable(err error) bool {
-	branches := backendCLIErrorBranches(err, "docker")
-	if len(branches) == 0 {
+	if isContextError(err) {
 		return false
 	}
-	// A reachable daemon can fail the client for TLS, certificate, SSH,
-	// proxy, authentication, or endpoint-configuration reasons. Those
-	// diagnostics veto only the matching version branch.
+	branches := backendCLIErrorBranches(err, "docker")
+	var versionBranches []cliErrorBranch
 	for _, branch := range branches {
-		if branch.ctx.operation != "version" {
-			continue
+		if branch.ctx.operation == "version" {
+			versionBranches = append(versionBranches, branch)
 		}
+	}
+	if len(versionBranches) == 0 {
+		return false
+	}
+	// Configuration/TLS diagnostics on the version branch or on non-CLI
+	// joined probe text (withProbeOutput stderr) veto liveness. Other
+	// operations' CLI branches must not suppress a real version failure.
+	for _, branch := range versionBranches {
 		if cli.IsProbeConfigurationError(branch.cause) {
 			return false
 		}
 	}
-	for _, branch := range branches {
-		if branch.ctx.operation != "version" {
-			continue
+	var nonCLI []error
+	collectNonCLIErrorBranches(err, &nonCLI)
+	for _, extra := range nonCLI {
+		if cli.IsProbeConfigurationError(extra) {
+			return false
 		}
+	}
+	for _, branch := range versionBranches {
 		stderr, stdout := branchLines(branch, true)
 		for _, line := range stderr {
 			if dockerProbeLivenessText(line) {
@@ -439,42 +449,75 @@ func dockerProbeUnavailable(err error) bool {
 			}
 		}
 	}
-	return false
-}
-
-func dockerProbeLivenessText(line string) bool {
-	if dockerDesktopStartupFailure(line) {
-		return true
-	}
-	for _, fragment := range []string{
-		"cannot connect to the docker daemon",
-		"is the docker daemon running",
-		"docker daemon is not running",
-		"error during connect",
-		"connection refused",
-		"connection reset by peer",
-		"broken pipe",
-		"no such host",
-		"host is down",
-		"network is unreachable",
-		"pipe: The system cannot find the file specified",
-		"open //./pipe/docker_engine",
-		"open \\\\.\\pipe\\docker_engine",
-		"failed to connect to socket",
-		"dial unix",
-		"dial tcp",
-	} {
-		if strings.Contains(line, fragment) {
+	// Desktop/npipe fixtures often arrive as joined non-CLI stderr text
+	// from withProbeOutput rather than CLIError.Stderr.
+	for _, extra := range nonCLI {
+		if dockerProbeLivenessText(extra.Error()) {
 			return true
 		}
 	}
 	return false
 }
 
-var dockerDesktopUnableToStartRE = regexp.MustCompile(`(?i)^(?:error response from daemon:\s*)?docker desktop is unable to start\b`)
+func dockerProbeLivenessText(line string) bool {
+	lower := strings.ToLower(strings.TrimSpace(line))
+	if dockerDesktopStartupFailure(lower) {
+		return true
+	}
+	// Do not treat bare "error during connect" as daemon-down: the same
+	// prefix introduces TLS, SSH, proxy, and configuration failures.
+	// Windows named-pipe absence is handled by dockerWindowsNpipeUnavailable
+	// so a missing file outside the Docker pipe namespace stays unclassified.
+	if dockerWindowsNpipeUnavailable(line) {
+		return true
+	}
+	for _, fragment := range []string{
+		"cannot connect to the docker daemon",
+		"is the docker daemon running",
+		"docker daemon is not running",
+		"connection refused",
+		"connection reset by peer",
+		"broken pipe",
+		"no such host",
+		"host is down",
+		"network is unreachable",
+		"failed to connect to socket",
+		"dial unix",
+		"dial tcp",
+	} {
+		if strings.Contains(lower, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+var dockerDesktopUnableToStartRE = regexp.MustCompile(`(?i)^(?:error response from daemon:\s*)?docker desktop is unable to start\.?$`)
 
 func dockerDesktopStartupFailure(line string) bool {
+	// Only the bare Desktop startup failure is liveness evidence. A
+	// configuration/proxy diagnosis after the phrase means the client
+	// rejected a setting while still being reachable enough to say so.
 	return dockerDesktopUnableToStartRE.MatchString(strings.TrimSpace(line))
+}
+
+// Windows reports a stopped daemon as a missing named pipe rather than a
+// refused connection, so "error during connect" on its own is not usable
+// evidence: the same prefix introduces TLS, SSH, and proxy failures.
+// Require both halves of the real diagnostic instead — the Docker client's
+// own pipe namespace plus the OS error that opening it produced. Any other
+// pipe, or any other file-not-found, stays unclassified.
+func dockerWindowsNpipeUnavailable(text string) bool {
+	const missingFile = "the system cannot find the file specified"
+	lower := strings.ToLower(text)
+	if !strings.Contains(lower, missingFile) {
+		return false
+	}
+	// Go's npipe package reports the forward-slash form while the Windows
+	// CLI spells the same path with backslashes.
+	normalized := strings.ReplaceAll(lower, `\`, "/")
+	return strings.Contains(normalized, "//./pipe/docker") ||
+		strings.Contains(normalized, "getnamedpipeinfo")
 }
 
 // defaultHost returns the address the client should dial to reach the
@@ -1101,6 +1144,9 @@ func (dockerEngine) imageMissing(err error) bool {
 }
 
 func (dockerEngine) imageMissingForTarget(err error, target string) bool {
+	if isContextError(err) {
+		return false
+	}
 	branches := backendCLIErrorBranches(err, "docker")
 	if target == "" && ambiguousBranchTargets(branches) {
 		return false
@@ -1139,7 +1185,7 @@ func dockerImageOperationalFailure(stderr string) bool {
 func dockerImageMissingStderr(branch cliErrorBranch) bool {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
 	for _, raw := range strings.Split(branch.stderr, "\n") {
-		line := trimCLIErrorWrapper(raw, allowGenericError)
+		line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
 		lower := strings.ToLower(line)
 		if strings.HasPrefix(lower, "manifest unknown:") {
 			rest := line[len("manifest unknown:"):]
@@ -1297,6 +1343,9 @@ func (dockerEngine) nameConflict(err error) bool {
 }
 
 func (dockerEngine) nameConflictForTarget(err error, target string) bool {
+	if isContextError(err) {
+		return false
+	}
 	branches := backendCLIErrorBranches(err, "docker")
 	if target == "" && ambiguousBranchTargets(branches) {
 		return false
@@ -1350,7 +1399,7 @@ func sameDockerContainerName(got, want string) bool {
 
 // containerMissing matches a CLI failure for an absent container.
 func (dockerEngine) containerMissing(err error) bool {
-	if !cliErrorBelongsTo(err, "docker") {
+	if isContextError(err) || !cliErrorBelongsTo(err, "docker") {
 		return false
 	}
 	command, args, ok := cliCommandParts(err)
@@ -1370,7 +1419,7 @@ func (dockerEngine) containerMissing(err error) bool {
 			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
 			return ok && cliTargetListMatches(rest, target)
 		})
-	case "rm", "delete", "stop", "exec", "logs", "cp":
+	case "rm", "stop", "exec", "logs", "cp":
 		if hasCLIErrorLine(err, func(line string) bool {
 			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
 			return ok && cliTargetListMatches(rest, target)
@@ -1380,7 +1429,7 @@ func (dockerEngine) containerMissing(err error) bool {
 		// Older Docker clients used a target-qualified generic phrase for
 		// rm. Keep that narrow fallback; it is not used for exec/logs,
 		// whose stderr may be application output.
-		if command == "rm" || command == "delete" {
+		if command == "rm" {
 			return hasCLIErrorLine(err, func(line string) bool {
 				rest, ok := strings.CutPrefix(line, dockerStderrNotFound+":")
 				return ok && cliTargetListMatches(strings.TrimSpace(rest), target)

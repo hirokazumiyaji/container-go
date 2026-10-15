@@ -51,8 +51,11 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 		return nil, err
 	}
 	stdout, stderr, err := c.runner.Run(qCtx, args...)
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	// docker logs splits the container's streams across the CLI's
 	// stdout and stderr; a snapshot carries both.
@@ -78,8 +81,14 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 		return nil, fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup)
 	}
 	stream, err := s.Stream(ctx, c.eng.logsFollowArgs(target)...)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		if stream != nil {
+			_ = stream.Close()
+		}
+		return nil, contextErr
+	}
 	if err != nil {
-		return nil, wrapNotFound(c.classify(ctx, err))
+		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
 	}
 	classified := &classifyingStream{
 		ReadCloser: stream,
@@ -116,7 +125,7 @@ func (s *classifyingStream) Read(p []byte) (int, error) {
 	if errors.As(err, &cliErr) {
 		return n, s.classifyTerminal(err)
 	}
-	return n, wrapNotFound(s.container.classify(s.ctx, err))
+	return n, wrapNotFoundFor(s.container.eng, s.container.classify(s.ctx, err))
 }
 
 func (s *classifyingStream) TerminalError() error {
@@ -162,5 +171,5 @@ func (s *classifyingStream) wrap(err error) error {
 	if err == nil || errors.Is(err, io.EOF) {
 		return err
 	}
-	return wrapNotFound(s.container.classify(s.ctx, err))
+	return wrapNotFoundFor(s.container.eng, s.container.classify(s.ctx, err))
 }

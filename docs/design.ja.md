@@ -75,7 +75,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。copy-out には型を保持し symlink を追跡しないモードがなく、確認したバージョンでは host 側の検証前に symlink、FIFO、device node を dereference/consume することがある。そのため `CopyFileFromContainer` は Apple Container では `ErrCopyFileFromContainerUnsupported` を返し fail closed する。Docker では型を保持する extractor を利用するため client/server の両方が 29.7.0 以上を必要とし、必要な flag を host が扱える場合に host 側の Lstat/open 検査を維持する。どちらの条件も満たさない場合は fail closed する。
 - `--rm` で削除しても匿名ボリュームは残る。
-- エラー分類は `engine_apple.go` が保持する CLI stderr の部分文字列に依存する（名前衝突、イメージやコンテナの不在）。ライブ CLI に対する回帰テストは `cli_compat_integration_test.go` にある。
+- エラー分類は `engine_apple.go` と `engine_docker.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。
 
 ## 実現方式の選定
 

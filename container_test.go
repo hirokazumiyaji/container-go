@@ -60,13 +60,10 @@ type fakeRunner struct {
 }
 
 func (f *fakeRunner) binaryName() string {
-	if f.binary != "" {
-		return f.binary
+	if f.binary == "" {
+		return "container"
 	}
-	if os.Getenv(backendEnv) == "docker" {
-		return "docker"
-	}
-	return "container"
+	return f.binary
 }
 
 func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -113,9 +110,14 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			repo := stripImageDigest(target)
 			return []byte(fmt.Sprintf(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":[%q],"reference":%q,"descriptor":{"digest":%q},"variants":[{"platform":{"os":"linux","architecture":"amd64"},"digest":"sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]}]`, repo+"@"+digest, repo, digest)), nil, nil
 		}
-		// The message carries both backends' not-found wording so one
-		// fake serves the docker and apple classifiers.
-		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "image not found: redis:7-alpine\nError response from daemon: No such image: redis:7-alpine"}
+		// The message carries both backends' verified not-found lines
+		// so one fake serves the Docker and Apple classifiers.
+		return nil, nil, &cli.CLIError{
+			Binary:   f.binaryName(),
+			Args:     args,
+			ExitCode: 1,
+			Stderr:   "image not found: redis:7-alpine\nError response from daemon: No such image: redis:7-alpine",
+		}
 	}
 	if (args[0] == "image" && len(args) > 1 && args[1] == "pull") || args[0] == "pull" {
 		if !f.systemUp {
@@ -214,11 +216,7 @@ func (f *fakeRunner) callWith(subcommand string) []string {
 }
 
 func newTestRunner() *fakeRunner {
-	binary := "container"
-	if os.Getenv(backendEnv) == "docker" {
-		binary = "docker"
-	}
-	return &fakeRunner{systemUp: true, binary: binary}
+	return &fakeRunner{systemUp: true, binary: "container"}
 }
 
 func newDockerTestRunner() *fakeRunner {
@@ -496,7 +494,12 @@ func TestTerminateIsIdempotent(t *testing.T) {
 	// Second terminate: CLI reports not found; still success.
 	f.failPrefix = "delete"
 	f.calls = nil
-	ferr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: `Error: failed to delete container: container with ID myctr not found`}
+	ferr := &cli.CLIError{
+		Binary:   "container",
+		Args:     []string{"delete", "--force", "myctr"},
+		ExitCode: 1,
+		Stderr:   `Error: internalError: "failed to delete container" (cause: "notFound: "container with ID myctr not found"")`,
+	}
 	f2 := &notFoundRunner{inner: f, err: ferr}
 	ctr.runner = f2
 	if err := ctr.Terminate(context.Background()); err != nil {

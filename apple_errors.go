@@ -108,7 +108,7 @@ func appleTypedImageMissingLine(line, target string) bool {
 func hasAppleTypedImageLine(branch cliErrorBranch, target string) bool {
 	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
 	for _, raw := range strings.Split(branch.stderr, "\n") {
-		line := trimCLIErrorWrapper(raw, allowGenericError)
+		line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
 		if appleTypedImageMissingLine(line, target) {
 			return true
 		}

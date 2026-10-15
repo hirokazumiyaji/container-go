@@ -471,7 +471,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := cli.Classify(ctx, cfg.runner, runErr, cfg.eng.probe())
+		classified := classifyErrorFor(ctx, cfg.runner, runErr, cfg.eng, "run", cfg.name)
 		if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(runErr) || createRaceMissing(classified) {
 			// Keep the backend conflict and cleanup failure as separate
@@ -578,6 +578,12 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	}
 	if envCleanupErr != nil {
 		return ctr, &reuseCleanupWarning{err: envCleanupErr}
+	}
+	if contextErr := commandContextError(runCtx, nil); contextErr != nil {
+		if cleanupErr := ctr.Terminate(context.WithoutCancel(ctx)); cleanupErr != nil {
+			return nil, errors.Join(contextErr, fmt.Errorf("cleanup reused failed create: %w", cleanupErr))
+		}
+		return nil, contextErr
 	}
 	return ctr, nil
 }
@@ -821,14 +827,19 @@ func namedContainer(cfg *config, id string) *Container {
 	}
 }
 
-// createRaceMissing reports a create/run failure that means the named
-// container vanished mid-start (Apple concurrent-create race), not a
-// generic "… not found" such as a missing entrypoint binary.
+// createRaceMissing reports only Apple's anchored concurrent-create form:
+// a run command that reaches bootstrap and then loses the named object.
+// Generic "container not found" output is deliberately excluded because
+// it is commonly emitted by the application process and must remain an
+// ordinary original error.
 func createRaceMissing(err error) bool {
 	return createRaceMissingForTarget(err, "")
 }
 
 func createRaceMissingForTarget(err error, target string) bool {
+	if isContextError(err) {
+		return false
+	}
 	command, args, ok := cliCommandParts(err)
 	if !ok || command != "run" || !cliErrorBelongsTo(err, "container") {
 		return false
@@ -837,8 +848,18 @@ func createRaceMissingForTarget(err error, target string) bool {
 	if cliTarget == "" || (target != "" && !strings.EqualFold(cliTarget, target)) {
 		return false
 	}
+	// Prefer the nested ContainerizationError path (issue #118): a run that
+	// reaches bootstrap/run and then loses the named object. A bare
+	// notFound envelope without that run wrapper is application output.
+	if hasAppleContainerizationErrorPath(err, "internalerror", func(message string) bool {
+		return message == "failed to bootstrap container" || message == "failed to run container"
+	}, "notfound", func(message string) bool {
+		return appleIDMissingLine(message, cliTarget)
+	}) {
+		return true
+	}
 	return hasCLIErrorLine(err, func(line string) bool {
-		if appleTypedContainerIDNotFoundLine(line, cliTarget) || appleIDMissingLine(line, cliTarget) {
+		if appleIDMissingLine(line, cliTarget) {
 			return true
 		}
 		for _, wrapper := range []string{
@@ -846,11 +867,8 @@ func createRaceMissingForTarget(err error, target string) bool {
 			"failed to run container:",
 		} {
 			rest, found := strings.CutPrefix(line, wrapper)
-			if found {
-				rest = strings.TrimSpace(rest)
-				if appleIDMissingLine(rest, cliTarget) || appleTypedContainerIDNotFoundLine(rest, cliTarget) {
-					return true
-				}
+			if found && appleIDMissingLine(strings.TrimSpace(rest), cliTarget) {
+				return true
 			}
 		}
 		return false

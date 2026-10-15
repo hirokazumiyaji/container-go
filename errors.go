@@ -382,6 +382,30 @@ func wrapInspectTargetNotFound(err error) error {
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
 }
 
+func isContextError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+// commandContextError returns a cancellation/deadline error that must veto
+// backend-derived success or absence verdicts. The error chain is checked in
+// addition to ctx.Err so a joined CommandRunError remains authoritative
+// even when a derived operation context has already been detached.
+func commandContextError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		if err == nil {
+			return ctxErr
+		}
+		if errors.Is(err, ctxErr) {
+			return err
+		}
+		return errors.Join(err, ctxErr)
+	}
+	if isContextError(err) {
+		return err
+	}
+	return nil
+}
+
 func isBareContainerNotFound(err error) bool {
 	if err == nil || !errors.Is(err, ErrContainerNotFound) {
 		return false
@@ -421,7 +445,7 @@ func isBareContainerNotFound(err error) bool {
 // exist. It is retained for callers that do not have an engine context;
 // the concrete backend and command still have to pass their own matcher.
 func isNotFound(err error) bool {
-	if err == nil {
+	if err == nil || isContextError(err) {
 		return false
 	}
 	if isBareContainerNotFound(err) {
@@ -451,7 +475,7 @@ func isNotFound(err error) bool {
 // separate from isNotFound prevents a Docker error from being accepted by
 // an Apple operation (and vice versa) when callers do have engine context.
 func isNotFoundFor(eng engine, err error) bool {
-	if err == nil {
+	if err == nil || isContextError(err) {
 		return false
 	}
 	if eng == nil {
@@ -477,6 +501,9 @@ func isNotFoundFor(eng engine, err error) bool {
 }
 
 func isNotFoundForOperation(eng engine, err error, operation string, targets ...string) bool {
+	if err == nil || isContextError(err) {
+		return false
+	}
 	if eng == nil {
 		return isNotFound(err)
 	}
@@ -539,7 +566,7 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 	if err == errInspectTargetNotFound {
 		return target == "", target != ""
 	}
-	if err == ErrContainerNotFound {
+	if err == ErrContainerNotFound || errors.Is(err, ErrSystemNotRunning) {
 		return false, false
 	}
 	var cliErr *cli.CLIError
@@ -548,7 +575,12 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 			return false, true
 		}
 		operation := commandOperation(cliErr.Args)
-		if operation != "inspect" || (target != "" && !sameCLITarget(commandTarget(cliErr.Args, operation), target)) {
+		if operation != "inspect" {
+			// Probe or unrelated CLI branches joined after Classify must
+			// not veto a confirmed inspect absence.
+			return false, false
+		}
+		if target != "" && !sameCLITarget(commandTarget(cliErr.Args, operation), target) {
 			return false, true
 		}
 		if eng.containerMissing(cliErr) {
@@ -556,6 +588,8 @@ func inspectAbsenceStatus(eng engine, err error, target string) (found, conflict
 		}
 		return false, true
 	}
+	// Unknown non-CLI failures conflict with a confirmed absence so a
+	// joined permission/config error cannot collapse into not-found.
 	return false, true
 }
 
@@ -722,36 +756,25 @@ func cliOptionTakesValue(option string) bool {
 	}
 }
 
+// cliErrorLines returns normalized, non-empty stderr lines. Only wrappers
+// verified for the selected binary and operation are removed. In
+// particular, Docker exec never treats a workload's generic "Error: " line
+// as backend evidence; arbitrary application/configuration prefixes remain
+// visible and cannot satisfy an anchored backend matcher.
 func cliErrorLines(err error) ([]string, bool) {
 	var cliErr *cli.CLIError
 	if !errors.As(err, &cliErr) {
 		return nil, false
 	}
+	allowGenericError := genericErrorWrapperAllowed(cliErr)
 	var lines []string
 	for _, line := range strings.Split(cliErr.Stderr, "\n") {
-		line = normalizeDaemonErrorLine(line)
+		line = normalizeCLIErrorLine(line, cliErr, allowGenericError)
 		if line != "" {
 			lines = append(lines, line)
 		}
 	}
 	return lines, true
-}
-
-func normalizeDaemonErrorLine(line string) string {
-	line = strings.ToLower(strings.Trim(line, "\x00 \t\r\n"))
-	for {
-		changed := false
-		for _, prefix := range []string{"docker: ", "container: ", "error response from daemon: ", "error: "} {
-			if strings.HasPrefix(line, prefix) {
-				line = strings.Trim(strings.TrimPrefix(line, prefix), "\x00 \t\r\n")
-				changed = true
-				break
-			}
-		}
-		if !changed {
-			return line
-		}
-	}
 }
 
 func hasCLIErrorLine(err error, match func(string) bool) bool {
@@ -795,18 +818,15 @@ func wrapNotFoundForOperation(eng engine, err error, operation string, targets .
 // unchanged even if a runner would report its probe as unavailable.
 func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) error {
 	if err == nil {
-		return nil
+		return commandContextError(ctx, nil)
+	}
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return contextErr
 	}
 	if eng == nil {
-		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
-			return errors.Join(err, ctxErr)
-		}
 		return wrapNotFound(err)
 	}
 	if isAmbiguousApplicationError(eng, err) {
-		if ctxErr := ctx.Err(); ctxErr != nil && !errors.Is(err, ctxErr) {
-			return errors.Join(err, ctxErr)
-		}
 		return err
 	}
 	return cli.Classify(ctx, r, err, eng.probe())
@@ -815,6 +835,9 @@ func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) err
 func classifyErrorFor(ctx context.Context, r cli.Runner, err error, eng engine, operation string, targets ...string) error {
 	if err == nil || eng == nil || operation == "" {
 		return classifyError(ctx, r, err, eng)
+	}
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
+		return contextErr
 	}
 	branch, ok := matchingCLIErrorBranch(err, eng.binary(), operation, targets...)
 	if !ok {

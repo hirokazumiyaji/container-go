@@ -366,8 +366,8 @@ func TestRunFailurePreservesNameConflict(t *testing.T) {
 	base.imagePresent = true
 	r := &failRunRunner{
 		fakeRunner: base,
-		runErr: &cli.CLIError{Args: []string{"run"}, ExitCode: 1,
-			Stderr: `Error: already exists: container "myctr"`},
+		runErr: &cli.CLIError{Args: []string{"run", "--name", "myctr"}, ExitCode: 1,
+			Stderr: `Error: container with id myctr already exists`},
 		inspectJSON: ownedInspectJSON("myctr"),
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -465,6 +465,37 @@ func TestReuseCreateFailureCleansUpOwned(t *testing.T) {
 	}
 }
 
+// TestReuseCreateTimeoutCleansUpOwned covers a timed-out create that still
+// left an owned container behind. ExecRunner joins the CLI exit with
+// context.DeadlineExceeded; that non-nil error must not skip ownership-
+// checked cleanup the way an err == nil context-only guard would.
+func TestReuseCreateTimeoutCleansUpOwned(t *testing.T) {
+	base := newTestRunner()
+	base.imagePresent = true
+	calls := 0
+	runErr := errors.Join(
+		&cli.CLIError{Binary: "container", Args: []string{"run", "--name", "myctr"}, ExitCode: -1, Stderr: ""},
+		context.DeadlineExceeded,
+	)
+	inner := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      runErr,
+		inspectJSON: ownedReuseInspectJSON("myctr"),
+	}
+	wrapper := &reuseFailWrapper{failRunRunner: inner, calls: &calls}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(), withRunner(wrapper), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if len(inner.deleted) != 1 || inner.deleted[0] != "myctr" {
+		t.Fatalf("deleted = %v, want ownership-checked cleanup of myctr", inner.deleted)
+	}
+}
+
 type reuseFailWrapper struct {
 	*failRunRunner
 	calls *int
@@ -474,7 +505,10 @@ func (w *reuseFailWrapper) Run(ctx context.Context, args ...string) ([]byte, []b
 	if args[0] == "inspect" {
 		*w.calls++
 		if *w.calls == 1 {
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}
+			return nil, nil, &cli.CLIError{
+				Binary: "container", Args: args, ExitCode: 1,
+				Stderr: `Error: notFound: "container not found: myctr"`,
+			}
 		}
 	}
 	return w.failRunRunner.Run(ctx, args...)

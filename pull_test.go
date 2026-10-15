@@ -36,7 +36,7 @@ func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
 }
 
 func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-	f := newDockerTestRunner()
+f := newDockerTestRunner()
 	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
@@ -77,7 +77,7 @@ func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 }
 
 func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
-	f := newDockerTestRunner()
+f := newDockerTestRunner()
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(f), withEngine(dockerEngine{}))
 	if !errors.Is(err, ErrImageNotFound) {
@@ -92,7 +92,7 @@ func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
 }
 
 func TestRunPullNeverRunsWhenImagePresent(t *testing.T) {
-	f := newDockerTestRunner()
+f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, WithPullPolicy(PullNever), withEngine(dockerEngine{}))
 	_ = ctr
@@ -155,6 +155,39 @@ func TestImageMissingClassification(t *testing.T) {
 	if (appleEngine{}).imageMissing(imageErr("container", "XPC connection error")) {
 		t.Error("apple: transport error classified as missing")
 	}
+}
+
+func TestAppleEnvelopeDrivesPullMissingFlow(t *testing.T) {
+	base := newTestRunner()
+	imageErr := &cli.CLIError{
+		Binary: "container", Args: []string{"image", "inspect", "redis:7-alpine"},
+		ExitCode: 1,
+		Stderr:   `Error: notFound: "image not found: redis:7-alpine"`,
+	}
+	r := &imageInspectMissingThenPresentRunner{fakeRunner: base, missing: imageErr}
+	cfg := &config{runner: r, eng: appleEngine{}, pullPolicy: PullMissing}
+
+	if err := cfg.ensureImage(context.Background(), "redis:7-alpine"); err != nil {
+		t.Fatalf("ensureImage: %v", err)
+	}
+	if base.pullCalls != 1 {
+		t.Fatalf("pull calls = %d, want 1 after Apple notFound envelope", base.pullCalls)
+	}
+}
+
+// imageInspectMissingThenPresentRunner returns a typed Apple notFound
+// envelope until pull succeeds, then delegates to fakeRunner so
+// ensureImageRef can resolve an identity after PullMissing.
+type imageInspectMissingThenPresentRunner struct {
+	*fakeRunner
+	missing *cli.CLIError
+}
+
+func (r *imageInspectMissingThenPresentRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" && !r.imagePresent {
+		return nil, nil, r.missing
+	}
+	return r.fakeRunner.Run(ctx, args...)
 }
 
 func TestParseImageExists(t *testing.T) {

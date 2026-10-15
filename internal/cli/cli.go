@@ -354,6 +354,28 @@ func commandError(ctx context.Context, bin string, args []string, stdout, stderr
 	return err
 }
 
+// commandRunError is the historical helper name retained for tests that
+// exercise cancellation races without a stdout side channel.
+func commandRunError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
+	return commandError(ctx, bin, args, nil, stderr, err)
+}
+
+// withProbeOutput attaches captured probe streams to an error so
+// configuration/liveness classifiers can see them. Prefer withStdout for
+// new code that only needs the stdout side channel.
+func withProbeOutput(err error, stdout, stderr []byte) error {
+	if err == nil {
+		return nil
+	}
+	if text := strings.TrimSpace(string(stdout)); text != "" {
+		err = withStdout(err, text)
+	}
+	if text := strings.TrimSpace(string(stderr)); text != "" {
+		err = errors.Join(err, errors.New(text))
+	}
+	return err
+}
+
 // truncateOutput bounds a diagnostic copy kept in CLIError while keeping
 // both its beginning and its decisive tail. Backend diagnostics often put
 // the actionable daemon/object error after a long prefix.
@@ -597,11 +619,12 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 
 	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
 	defer cancel()
-	probeStdout, _, probeErr := r.Run(probeCtx, probe.Args...)
+	probeStdout, probeStderr, probeErr := r.Run(probeCtx, probe.Args...)
 	if probeErr != nil {
-		// Runners may return stdout separately from the error. Attach it
-		// to the matching binary/operation branch before backend classifiers
-		// inspect the probe, without replacing the probe's original chain.
+		// Runners may return stdout/stderr separately from the error.
+		// Attach both before backend classifiers inspect the probe so
+		// Windows npipe and Desktop diagnostics on stderr remain visible.
+		probeErr = withProbeOutput(probeErr, probeStdout, probeStderr)
 		probeErr = attachProbeStdout(probeErr, string(probeStdout), probe)
 	}
 	if probeErr == nil {
@@ -762,18 +785,34 @@ func probeVetoError(err error) bool {
 		return true
 	}
 	s := strings.ToLower(classificationText(err))
+	// Cancellation diagnostics must veto before deadline phrasing is
+	// stripped: a probe that prints "context canceled" and is also joined
+	// with DeadlineExceeded is a client-side abort, not liveness evidence.
+	if containsCancellationDiagnostic(s) && !isOnlyDeadlineDiagnostic(s) {
+		return true
+	}
 	for _, fragment := range []string{
 		"context deadline exceeded",
 		"deadline exceeded",
-		"context canceled",
-		"context cancelled",
 	} {
 		s = strings.ReplaceAll(s, fragment, "")
 	}
 	return containsPermissionDiagnostic(s) || containsConfigurationDiagnostic(s) ||
 		containsAuthenticationDiagnostic(s) || containsTransportDiagnostic(s) ||
-		containsContextDiagnostic(s) || containsInvalidOptionDiagnostic(s) ||
-		containsCancellationDiagnostic(s)
+		containsContextDiagnostic(s) || containsInvalidOptionDiagnostic(s)
+}
+
+// isOnlyDeadlineDiagnostic reports text whose only cancellation/timeout
+// wording is a deadline. Pure probe timeouts remain liveness evidence.
+func isOnlyDeadlineDiagnostic(s string) bool {
+	trimmed := s
+	for _, fragment := range []string{
+		"context deadline exceeded",
+		"deadline exceeded",
+	} {
+		trimmed = strings.ReplaceAll(trimmed, fragment, "")
+	}
+	return !containsCancellationDiagnostic(trimmed)
 }
 
 func probeUnavailable(probe Probe, err error) bool {
@@ -933,6 +972,8 @@ func containsConfigurationDiagnostic(s string) bool {
 	for _, fragment := range []string{
 		"invalid config",
 		"invalid configuration",
+		"configuration is invalid",
+		"proxy configuration",
 		"config file",
 		"config directory",
 		"config error",

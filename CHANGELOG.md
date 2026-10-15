@@ -146,7 +146,6 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   resolution, including fail-closed remote-daemon loopback handling.
 - Accept full lowercase Docker UIDs in the reaper while retaining strict
   logical-name validation.
->>>>>>> origin/main
 - Share Apple/Docker `runArgs` common flags via `config.commonRunArgs` and
   call `allLabels()` once.
 - Consolidate image and reuse single-flight state in the generic

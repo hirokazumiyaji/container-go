@@ -1682,6 +1682,29 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	if got.Error() != " backend " {
 		t.Fatalf("spaced partial sanitizing = %q, want retained leading whitespace", got.Error())
 	}
+
+	adjacentDiscarded := &reviewSanitizingMultiWrapper{
+		errs: []error{
+			context.Canceled,
+			context.DeadlineExceeded,
+			errors.New("public"),
+			errors.New(secret),
+		},
+		msg: "context canceled; context deadline exceeded; public",
+	}
+	got = nonContextCause(adjacentDiscarded)
+	if got == nil {
+		t.Fatal("adjacent discarded partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("adjacent discarded partial sanitizing leaked secret: %q", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") || strings.Contains(got.Error(), "context deadline exceeded") {
+		t.Fatalf("adjacent discarded partial sanitizing = %q, must strip both context spans", got.Error())
+	}
+	if got.Error() != "public" {
+		t.Fatalf("adjacent discarded partial sanitizing = %q, want intact retained diagnostic", got.Error())
+	}
 }
 
 func TestIsStdlibPackagePathAllowlist(t *testing.T) {
@@ -1690,7 +1713,13 @@ func TestIsStdlibPackagePathAllowlist(t *testing.T) {
 			t.Fatalf("isStdlibPackagePath(%q) = false, want true", path)
 		}
 	}
-	for _, path := range []string{"corp/errors", "github.com/hirokazumiyaji/container-go/wait", "example.com/lib"} {
+	for _, path := range []string{
+		"corp/errors",
+		"net/corp",
+		"text/errors",
+		"github.com/hirokazumiyaji/container-go/wait",
+		"example.com/lib",
+	} {
 		if isStdlibPackagePath(path) {
 			t.Fatalf("isStdlibPackagePath(%q) = true, want false", path)
 		}

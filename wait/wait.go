@@ -454,28 +454,26 @@ func isStdlibTransportWrapper(err error) bool {
 	return isStdlibPackagePath(errorPkgPath(err))
 }
 
-// stdlibPackageRoots are top-level packages of the Go standard library.
-// Dotless paths alone are not enough: a local module such as corp/errors is
-// also dotless but must keep custom wrapper classifications.
-var stdlibPackageRoots = []string{
-	"archive", "bufio", "bytes", "cmp", "compress", "container", "context",
-	"crypto", "database", "debug", "embed", "encoding", "errors", "expvar",
-	"flag", "fmt", "go", "hash", "html", "image", "index", "io", "log", "maps",
-	"math", "mime", "net", "os", "path", "plugin", "reflect", "regexp",
-	"runtime", "slices", "sort", "strconv", "strings", "sync", "syscall",
-	"testing", "text", "time", "unicode", "unique", "unsafe", "weak",
+// stdlibPackagePaths are exact standard-library import paths that may carry
+// wrapped errors. Exact membership only: prefix matching on roots such as
+// "net/" would treat consumer modules like net/corp or text/errors as stdlib
+// and drop their concrete As/classification surface.
+var stdlibPackagePaths = map[string]struct{}{
+	"archive/tar": {}, "compress/gzip": {}, "context": {},
+	"crypto/tls": {}, "crypto/x509": {}, "database/sql": {},
+	"encoding/asn1": {}, "encoding/json": {}, "encoding/xml": {},
+	"errors": {}, "fmt": {}, "html/template": {}, "io": {}, "io/fs": {},
+	"mime": {}, "mime/multipart": {}, "net": {}, "net/http": {}, "net/url": {},
+	"os": {}, "os/exec": {}, "path/filepath": {}, "strconv": {},
+	"text/template": {}, "time": {},
 }
 
 func isStdlibPackagePath(path string) bool {
 	if path == "" {
 		return true
 	}
-	for _, root := range stdlibPackageRoots {
-		if path == root || strings.HasPrefix(path, root+"/") {
-			return true
-		}
-	}
-	return false
+	_, ok := stdlibPackagePaths[path]
+	return ok
 }
 
 func errorPkgPath(err error) string {
@@ -833,6 +831,11 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			continue
 		}
 		rs, re := expandRemovalSeparators(orig, c.start, c.end, occupied)
+		// Mark the expanded region so a later adjacent discarded child cannot
+		// claim the same separator and produce overlapping original offsets.
+		for j := rs; j < re; j++ {
+			occupied[j] = true
+		}
 		removals = append(removals, span{start: rs, end: re, removal: true})
 	}
 	// Ambiguous framing copies of a discarded phrase are unsafe to rewrite.
@@ -860,9 +863,23 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 	if len(removals) == 0 {
 		return orig
 	}
-	sort.Slice(removals, func(i, j int) bool { return removals[i].start > removals[j].start })
-	cleaned := orig
+	// Merge overlapping or abutting removals so applying original offsets
+	// cannot shift a later span into retained text (for example eating the
+	// leading "p" of "public" after two discarded context phrases).
+	sort.Slice(removals, func(i, j int) bool { return removals[i].start < removals[j].start })
+	merged := make([]span, 0, len(removals))
 	for _, r := range removals {
+		if len(merged) == 0 || r.start > merged[len(merged)-1].end {
+			merged = append(merged, r)
+			continue
+		}
+		if r.end > merged[len(merged)-1].end {
+			merged[len(merged)-1].end = r.end
+		}
+	}
+	sort.Slice(merged, func(i, j int) bool { return merged[i].start > merged[j].start })
+	cleaned := orig
+	for _, r := range merged {
 		if r.start < 0 || r.end > len(cleaned) || r.start > r.end {
 			return orig
 		}

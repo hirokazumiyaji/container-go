@@ -585,6 +585,18 @@ func TestNonContextCausePreservesNonContextWrappers(t *testing.T) {
 	}
 }
 
+type reviewStreamWrapper struct {
+	err error
+}
+
+func (e *reviewStreamWrapper) Error() string { return "stream wrapper: " + e.err.Error() }
+func (e *reviewStreamWrapper) Unwrap() error { return e.err }
+func (e *reviewStreamWrapper) Is(target error) bool {
+	return target == errReviewStreamSentinel || errors.Is(e.err, target)
+}
+
+var errReviewStreamSentinel = errors.New("review stream sentinel")
+
 func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failure"}
 	wrapped := fmt.Errorf("follow logs: %w", errors.Join(context.Canceled, cause))
@@ -614,6 +626,22 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 	var gotOp *net.OpError
 	if !errors.As(got, &gotOp) {
 		t.Fatalf("nested wrapper = %v, want *net.OpError via As", got)
+	}
+
+	custom := &reviewStreamWrapper{err: errors.Join(context.Canceled, cause)}
+	got = nonContextCause(custom)
+	if !errors.Is(got, cause) {
+		t.Fatalf("custom wrapper = %v, want typed cause", got)
+	}
+	if !errors.Is(got, errReviewStreamSentinel) {
+		t.Fatalf("custom wrapper = %v, want sentinel via original Is", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("custom wrapper = %v, must not retain canceled branch", got)
+	}
+	var gotWrapper *reviewStreamWrapper
+	if !errors.As(got, &gotWrapper) {
+		t.Fatalf("custom wrapper = %v, want *reviewStreamWrapper via As", got)
 	}
 }
 

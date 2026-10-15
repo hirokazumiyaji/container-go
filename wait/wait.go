@@ -353,7 +353,8 @@ func nonContextCause(err error) error {
 
 // replaceUnwrappedCause keeps wrapper diagnostics after a nested context
 // branch was stripped. Typed net.OpError values are cloned; other wrappers
-// keep their Error() text while exposing the filtered cause to errors.Is.
+// keep their Error() text and As/classification surface while suppressing
+// context sentinel matches.
 func replaceUnwrappedCause(err, filtered error) error {
 	// Match only the current node. Nested *net.OpError values are rebuilt by
 	// recursion so outer wrappers keep their diagnostics.
@@ -362,16 +363,35 @@ func replaceUnwrappedCause(err, filtered error) error {
 		clone.Err = filtered
 		return &clone
 	}
-	return &diagnosticCause{message: err.Error(), cause: filtered}
+	return &contextStrippedCause{original: err, cause: filtered}
 }
 
-type diagnosticCause struct {
-	message string
-	cause   error
+// contextStrippedCause retains an original wrapper's diagnostics and As
+// surface after nested context branches were removed from the cause chain.
+type contextStrippedCause struct {
+	original error
+	cause    error
 }
 
-func (e *diagnosticCause) Error() string { return e.message }
-func (e *diagnosticCause) Unwrap() error { return e.cause }
+func (e *contextStrippedCause) Error() string { return e.original.Error() }
+func (e *contextStrippedCause) Unwrap() error { return e.cause }
+
+func (e *contextStrippedCause) Is(target error) bool {
+	if errors.Is(e.cause, target) {
+		return true
+	}
+	if errors.Is(target, context.Canceled) || errors.Is(target, context.DeadlineExceeded) {
+		return false
+	}
+	return errors.Is(e.original, target)
+}
+
+func (e *contextStrippedCause) As(target any) bool {
+	if errors.As(e.cause, target) {
+		return true
+	}
+	return errors.As(e.original, target)
+}
 
 func wrapWaitCause(what string, cause error, previous ...error) error {
 	if cause == nil {

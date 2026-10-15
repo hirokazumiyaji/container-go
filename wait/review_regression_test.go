@@ -1144,6 +1144,48 @@ func (e *reviewOpaqueFacade) UnwrapRaw() error {
 	return e.err
 }
 
+// reviewOpaqueIsAsFacade matches context and a backend sentinel via Is/As only.
+type reviewOpaqueIsAsFacade struct {
+	backend error
+}
+
+func (e *reviewOpaqueIsAsFacade) Error() string { return "opaque is/as facade" }
+func (e *reviewOpaqueIsAsFacade) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return errors.Is(target, context.Canceled) || errors.Is(e.backend, target)
+}
+func (e *reviewOpaqueIsAsFacade) As(target any) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	return errors.As(e.backend, target)
+}
+
+func TestNonContextCauseRetainsOpaqueIsAsWithoutUnwrap(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend failure"}
+	facade := &reviewOpaqueIsAsFacade{backend: backend}
+	got := nonContextCause(facade)
+	if got == nil {
+		t.Fatal("opaque Is/As facade dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("opaque Is/As facade = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, backend) {
+		t.Fatalf("opaque Is/As facade = %v, want backend via Is", got)
+	}
+	var gotCause *reviewTypedCause
+	if !errors.As(got, &gotCause) || gotCause != backend {
+		t.Fatalf("opaque Is/As facade = %v, want backend via As", got)
+	}
+	var gotFacade *reviewOpaqueIsAsFacade
+	if !errors.As(got, &gotFacade) {
+		t.Fatalf("opaque Is/As facade = %v, want original type via As", got)
+	}
+}
+
 func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 	cause := &reviewTypedCause{message: "logs follow exited 1"}
 	opaque := &reviewOpaqueFacade{err: errors.Join(context.Canceled, cause)}
@@ -1228,6 +1270,9 @@ func TestNonContextCauseRetainsRedactorOnFilteredCause(t *testing.T) {
 	}
 	if strings.Contains(got.Error(), secret) {
 		t.Fatalf("redacted facade Error leaked secret: %q", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("redacted facade = %q, must not render stripped context", got.Error())
 	}
 	var gotCLI *cli.CLIError
 	if !errors.As(got, &gotCLI) {

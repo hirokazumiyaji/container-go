@@ -392,6 +392,12 @@ func nonContextCause(err error) error {
 			filtered = retainDiagnosticFacade(err, filtered)
 			return &contextStrippedCause{original: err, cause: filtered}
 		}
+		// Custom Is/As facades with no unwrap surface still need their
+		// non-context classifications retained after context matches are
+		// stripped.
+		if keepsClassificationWithoutChildren(err) {
+			return &contextStrippedCause{original: err, cause: nil}
+		}
 		return nil
 	}
 	return err
@@ -551,10 +557,16 @@ func (e *contextStrippedCause) Error() string {
 		// Ambiguous multi-child framing: prefer filtered cause text.
 		return causeText
 	}
-	// Single-error wrapper whose Error() omits the inner text (redactors /
-	// secret-scrubbing wrappers): keep that safe rendering rather than
-	// exposing cause.Error().
+	// Single-error wrapper whose Error() omits the inner text: prefer the
+	// sanitized original rendering, except diagnostic-redactor facades whose
+	// cause was already re-redacted and must not keep mixed context wording.
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && !strings.Contains(orig, innerText) {
+		type redactorProvider interface {
+			DiagnosticRedactor() *cli.Redactor
+		}
+		if _, ok := e.original.(redactorProvider); ok {
+			return causeText
+		}
 		return orig
 	}
 	return causeText

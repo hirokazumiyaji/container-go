@@ -979,8 +979,8 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	if errors.Is(got, context.Canceled) {
 		t.Fatalf("fmt multi-wrap = %v, must drop canceled", got)
 	}
-	if !strings.Contains(got.Error(), "follow logs") || !strings.Contains(got.Error(), "backend") {
-		t.Fatalf("fmt multi-wrap = %q, want preserved framing", got.Error())
+	if got.Error() != "follow logs: backend: backend failure" {
+		t.Fatalf("fmt multi-wrap = %q, want preserved wrapper-prefix framing", got.Error())
 	}
 	if strings.Contains(got.Error(), "context canceled") {
 		t.Fatalf("fmt multi-wrap = %q, must not render stripped context", got.Error())

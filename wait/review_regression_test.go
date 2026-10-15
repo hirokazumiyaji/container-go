@@ -2992,6 +2992,55 @@ func TestForExecPathErrorContextOnlyPermanentLaunchRetries(t *testing.T) {
 	}
 }
 
+func TestRetainedNonContextCauseKeepsIndependentDNSAfterPeel(t *testing.T) {
+	// Permanent via *exec.Error in UnwrapErr, but after stripping the retained
+	// leaf is *net.DNSError with nil UnwrapErr. Peeling must not discard it.
+	err := &net.DNSError{
+		Err:        "no such host",
+		Name:       "example.com",
+		IsNotFound: true,
+		UnwrapErr:  &exec.Error{Name: "container", Err: context.Canceled},
+	}
+	got := retainedNonContextCause(err)
+	var dns *net.DNSError
+	if !errors.As(got, &dns) {
+		t.Fatalf("retained = %v (%T), want *net.DNSError", got, got)
+	}
+	if dns.Err != "no such host" {
+		t.Fatalf("retained DNS Err = %q, want independent reason", dns.Err)
+	}
+	if dns.UnwrapErr != nil {
+		t.Fatalf("retained DNS UnwrapErr = %v, want nil", dns.UnwrapErr)
+	}
+}
+
+func TestForExecIndependentDNSAfterContextLaunchFailsFast(t *testing.T) {
+	target := newFakeTarget()
+	target.execErr = &net.DNSError{
+		Err:        "no such host",
+		Name:       "example.com",
+		IsNotFound: true,
+		UnwrapErr:  &exec.Error{Name: "container", Err: context.Canceled},
+	}
+
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected independent DNS failure")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want immediate DNS failure, not startup timeout", err)
+	}
+	if !strings.Contains(err.Error(), "no such host") {
+		t.Fatalf("error = %v, want independent DNS reason in message", err)
+	}
+	if target.execCalls.Load() != 1 {
+		t.Fatalf("execCalls = %d, want immediate permanent failure without retries", target.execCalls.Load())
+	}
+}
+
 func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
 	target := newFakeTarget()
 	target.execErr = &reviewOpaquePermanentFacade{}

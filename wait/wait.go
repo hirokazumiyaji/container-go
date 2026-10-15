@@ -372,7 +372,9 @@ func retainedNonContextCause(err error) error {
 			if raw, ok := cur.(interface{ UnwrapRaw() error }); ok {
 				next := raw.UnwrapRaw()
 				if next == nil {
-					return nil
+					// Leaf with no further child (for example a retained
+					// *net.DNSError whose UnwrapErr was context-only).
+					return filtered
 				}
 				cur = next
 				continue
@@ -380,7 +382,9 @@ func retainedNonContextCause(err error) error {
 			if u, ok := cur.(interface{ Unwrap() error }); ok {
 				next := u.Unwrap()
 				if next == nil {
-					return nil
+					// Same as UnwrapRaw: a nil child means this node is the
+					// retained leaf, not an empty carrier to discard.
+					return filtered
 				}
 				cur = next
 				continue

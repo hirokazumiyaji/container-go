@@ -986,6 +986,22 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("fmt multi-wrap = %q, must not render stripped context", got.Error())
 	}
 
+	trailingCanceled := fmt.Errorf("follow logs: %w; cancellation: %w", cause, context.Canceled)
+	got = nonContextCause(trailingCanceled)
+	if !errors.Is(got, cause) {
+		t.Fatalf("trailing labeled canceled = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("trailing labeled canceled = %v, must drop canceled", got)
+	}
+	if got.Error() != "follow logs: backend failure; cancellation: " &&
+		got.Error() != "follow logs: backend failure; cancellation:" {
+		t.Fatalf("trailing labeled canceled = %q, want preserved cancellation label", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("trailing labeled canceled = %q, must not render stripped context", got.Error())
+	}
+
 	backend := errors.New("peer reported context canceled")
 	mixed := fmt.Errorf("stream: %w; backend: %w", context.Canceled, backend)
 	got = nonContextCause(mixed)

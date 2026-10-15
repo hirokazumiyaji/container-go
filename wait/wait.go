@@ -1415,23 +1415,31 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 
 // expandRemovalSeparators absorbs unoccupied separators adjacent to a discarded
 // child. Rightward expansion always cleans framing before the next claimed
-// child (or end). Leftward expansion only runs when another claimed child
-// exists to the left, so wrapper-prefix punctuation such as "follow logs:" is
-// not consumed. Expansion never enters spans already claimed by another child.
+// child (or end). Leftward expansion runs only when the entire region back to
+// the previous claimed child is separators, so wrapper labels such as
+// "follow logs:" or "cancellation:" are not consumed. Expansion never enters
+// spans already claimed by another child.
 func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
 	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
 		end++
 	}
-	hasClaimedLeft := false
+	prevEnd := -1
 	for i := start - 1; i >= 0; i-- {
 		if occupied[i] {
-			hasClaimedLeft = true
+			prevEnd = i + 1
 			break
 		}
 	}
-	if hasClaimedLeft {
-		for start > 0 && !occupied[start-1] && isErrorSeparator(orig[start-1]) {
-			start--
+	if prevEnd >= 0 {
+		onlySeparators := true
+		for i := prevEnd; i < start; i++ {
+			if !isErrorSeparator(orig[i]) {
+				onlySeparators = false
+				break
+			}
+		}
+		if onlySeparators {
+			start = prevEnd
 		}
 	}
 	return start, end

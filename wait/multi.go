@@ -248,10 +248,14 @@ func (s *AnyStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			}
 			if err == nil {
 				if finalErr := finalLifecycleCheck(waitCtx, target, "wait for any"); finalErr != nil {
-					cancel()
+					// Classify against the still-live wait context before
+					// canceling so a filtered backend probe cause is not
+					// joined with a synthetic context.Canceled from cleanup.
 					if terminal := anyContextError(callerCtx, waitCtx, s.startupTimeout, startupDeadline, callerDeadline, callerHasDeadline); terminal != nil {
+						cancel()
 						return errors.Join(terminal, finalErr)
 					}
+					cancel()
 					return finalErr
 				}
 				select {
@@ -288,6 +292,14 @@ func finalLifecycleCheck(ctx context.Context, target Target, what string) error 
 	}
 	state, err := targetState(probeCtx, target)
 	probeErr := probeCtx.Err()
+	// Retain only non-context branches so a mixed Join(context, backend)
+	// probe cannot make the composite result match context.Canceled while
+	// the caller context is still active.
+	if filtered := nonContextCause(err); filtered != nil {
+		err = filtered
+	} else {
+		err = nil
+	}
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return newWaitError(fmt.Sprintf("%s: final lifecycle check: %s", what, ctxErr), ctxErr, err)
 	}
@@ -320,6 +332,11 @@ func startLifecycleMonitor(ctx context.Context, target Target, what string) (<-c
 			cancel()
 			if ctxErr := ctx.Err(); ctxErr != nil {
 				return false
+			}
+			if filtered := nonContextCause(err); filtered != nil {
+				err = filtered
+			} else {
+				err = nil
 			}
 			if probeErr != nil {
 				if err != nil {

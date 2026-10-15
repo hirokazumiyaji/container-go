@@ -1326,6 +1326,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("trailing spaced bracket-discarded wrap = %q, want brackets and inner whitespace removed", got.Error())
 	}
 
+	angleDiscarded := fmt.Errorf("<%w> %w", context.Canceled, commaCause)
+	got = nonContextCause(angleDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("angle-bracket-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("angle-bracket-discarded wrap = %q, want balanced angle brackets removed", got.Error())
+	}
+
+	angleSpaced := fmt.Errorf("< %w > %w", context.Canceled, commaCause)
+	got = nonContextCause(angleSpaced)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("spaced angle-bracket-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("spaced angle-bracket-discarded wrap = %q, want angle brackets and inner whitespace removed", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2207,6 +2225,27 @@ func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestCompositeFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(&reviewCompositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&reviewCompositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := &reviewCompositeFinalProbeJoinedContextTarget{}
+			err := strategy.WaitUntilReady(context.Background(), target)
+			if err == nil {
+				t.Fatal("expected composite final lifecycle probe error")
+			}
+			if !errors.Is(err, ErrTargetNotFound) {
+				t.Fatalf("error = %v, want ErrTargetNotFound", err)
+			}
+			if errors.Is(err, context.Canceled) {
+				t.Fatalf("error = %v, must not match canceled while caller is active", err)
+			}
+		})
+	}
+}
+
 func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	backend := &reviewTypedCause{message: "backend inspect failed"}
 	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
@@ -2306,6 +2345,35 @@ func (*reviewFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.Read
 func (t *reviewFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
+}
+
+type reviewCompositeFinalProbeJoinedContextTarget struct {
+	childDone atomic.Bool
+}
+
+func (*reviewCompositeFinalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewCompositeFinalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+	if t.childDone.Load() {
+		return false, errors.Join(context.Canceled, ErrTargetNotFound)
+	}
+	return true, nil
+}
+func (*reviewCompositeFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewCompositeFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewCompositeMarkDoneStrategy struct{}
+
+func (*reviewCompositeMarkDoneStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*reviewCompositeFinalProbeJoinedContextTarget); ok {
+		t.childDone.Store(true)
+	}
+	return nil
 }
 
 func TestForExecTimeoutStripsJoinedContext(t *testing.T) {

@@ -1399,6 +1399,40 @@ func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
 	if strings.Contains(got.Error(), "peer reported ;") || got.Error() == "peer reported" {
 		t.Fatalf("repeated child-text wrapper = %q, corrupted retained diagnostic", got.Error())
 	}
+
+	spaced := &reviewSpacedSingleChildWrapper{child: context.Canceled}
+	got = nonContextCause(spaced)
+	if got == nil {
+		t.Fatal("spaced single-child wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("spaced single-child wrapper = %v, must suppress canceled", got)
+	}
+	if got.Error() == "backend:" || !strings.HasPrefix(got.Error(), " ") {
+		t.Fatalf("spaced single-child wrapper = %q, want retained boundary whitespace", got.Error())
+	}
+	if !strings.Contains(got.Error(), "backend:") {
+		t.Fatalf("spaced single-child wrapper = %q, want backend diagnostic", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("spaced single-child wrapper = %q, must strip unique child text", got.Error())
+	}
+}
+
+// reviewSpacedSingleChildWrapper keeps intentional boundary whitespace around
+// a unique context child rendering.
+type reviewSpacedSingleChildWrapper struct {
+	child error
+}
+
+func (e *reviewSpacedSingleChildWrapper) Error() string {
+	return " backend: context canceled "
+}
+func (e *reviewSpacedSingleChildWrapper) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.child
 }
 
 // reviewOpaqueIsAsFacade matches context and a backend sentinel via Is/As only.
@@ -1768,6 +1802,22 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	}
 	if got.Error() != "public" {
 		t.Fatalf("adjacent discarded partial sanitizing = %q, want intact retained diagnostic", got.Error())
+	}
+
+	mixedDup := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("context canceled"), errors.New(secret)},
+		msg:  "context canceled",
+	}
+	got = nonContextCause(mixedDup)
+	if got == nil {
+		t.Fatal("mixed duplicate partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("mixed duplicate partial sanitizing leaked secret: %q", got.Error())
+	}
+	// Shared phrase between discarded and retained children is ambiguous.
+	if got.Error() != "context canceled" {
+		t.Fatalf("mixed duplicate partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 }
 

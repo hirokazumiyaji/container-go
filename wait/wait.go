@@ -980,9 +980,9 @@ func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
 	if cleaned == orig {
 		return "", false
 	}
-	if repl == "" {
-		cleaned = strings.TrimSpace(cleaned)
-	}
+	// Do not TrimSpace: retained diagnostics may intentionally begin or end
+	// with whitespace (for example " backend: context canceled "). Only the
+	// child phrase itself is removed; adjacent framing stays with the caller.
 	return cleaned, true
 }
 
@@ -1075,6 +1075,22 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			removal: nonContextCause(inner) == nil,
 			order:   i,
 		})
+	}
+	// A phrase shared by a retained child and a discarded child cannot be
+	// attributed safely without the format string; keep the original safe text.
+	retainedPhrase := make(map[string]struct{})
+	discardedPhrase := make(map[string]struct{})
+	for _, it := range items {
+		if it.removal {
+			discardedPhrase[it.phrase] = struct{}{}
+		} else {
+			retainedPhrase[it.phrase] = struct{}{}
+		}
+	}
+	for phrase := range discardedPhrase {
+		if _, ok := retainedPhrase[phrase]; ok {
+			return orig
+		}
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		if len(items[i].phrase) != len(items[j].phrase) {

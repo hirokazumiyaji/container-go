@@ -2408,6 +2408,24 @@ func TestCompositeFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestCompositeFinalLifecycleRetriesContextOnlyProbe(t *testing.T) {
+	for name, strategy := range map[string]Strategy{
+		"all": ForAll(&reviewCompositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&reviewCompositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
+	} {
+		t.Run(name, func(t *testing.T) {
+			target := &reviewCompositeContextOnlyProbeTarget{}
+			err := strategy.WaitUntilReady(context.Background(), target)
+			if err != nil {
+				t.Fatalf("WaitUntilReady = %v, want success after context-only final probe retries", err)
+			}
+			if target.probes.Load() < 2 {
+				t.Fatalf("lifecycle probes = %d, want context-only then success", target.probes.Load())
+			}
+		})
+	}
+}
+
 func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	backend := &reviewTypedCause{message: "backend inspect failed"}
 	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
@@ -2562,6 +2580,39 @@ type reviewCompositeMarkDoneStrategy struct{}
 
 func (*reviewCompositeMarkDoneStrategy) WaitUntilReady(_ context.Context, target Target) error {
 	if t, ok := target.(*reviewCompositeFinalProbeJoinedContextTarget); ok {
+		t.childDone.Store(true)
+	}
+	return nil
+}
+
+type reviewCompositeContextOnlyProbeTarget struct {
+	childDone atomic.Bool
+	probes    atomic.Int32
+}
+
+func (*reviewCompositeContextOnlyProbeTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewCompositeContextOnlyProbeTarget) Running(context.Context) (bool, error) {
+	if !t.childDone.Load() {
+		return true, nil
+	}
+	if t.probes.Add(1) == 1 {
+		return false, context.Canceled
+	}
+	return true, nil
+}
+func (*reviewCompositeContextOnlyProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (*reviewCompositeContextOnlyProbeTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewCompositeContextOnlyProbeStrategy struct{}
+
+func (*reviewCompositeContextOnlyProbeStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*reviewCompositeContextOnlyProbeTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil

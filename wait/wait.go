@@ -310,6 +310,28 @@ func joinNonNil(errs ...error) error {
 	return errors.Join(filtered...)
 }
 
+// nonContextCause drops cancellation and deadline errors so a diagnostic
+// settle that races the wait budget cannot hide an already-observed
+// success. Joined non-context causes, such as a terminal CLIError, remain.
+func nonContextCause(err error) error {
+	if err == nil {
+		return nil
+	}
+	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
+		var kept []error
+		for _, inner := range unwrapper.Unwrap() {
+			if cause := nonContextCause(inner); cause != nil {
+				kept = append(kept, cause)
+			}
+		}
+		return joinNonNil(kept...)
+	}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return nil
+	}
+	return err
+}
+
 func wrapWaitCause(what string, cause error, previous ...error) error {
 	if cause == nil {
 		return nil

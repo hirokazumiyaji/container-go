@@ -268,19 +268,24 @@ func finalLifecycleError(
 		if probeCtxErr != nil {
 			probeErr = joinNonNil(probeErr, probeCtxErr)
 		}
+		// Filter before terminal classification so a mixed probe cause that
+		// races the startup deadline cannot reintroduce context.Canceled.
+		if filtered := nonContextCause(probeErr); filtered != nil {
+			lastProbeErr = filtered
+			probeErr = filtered
+		} else if probeErr != nil {
+			probeErr = nil
+		}
 		if terminalErr := waitContextTerminationError(
 			callerCtx,
 			waitCtx,
 			what,
 			timeout,
-			joinNonNil(lastErr, lastProbeErr, probeErr),
+			joinNonNil(lastErr, lastProbeErr),
 		); terminalErr != nil {
 			return terminalErr
 		}
 		if probeErr != nil {
-			if filtered := nonContextCause(probeErr); filtered != nil {
-				lastProbeErr = filtered
-			}
 			if isPermanentCheckError(probeErr) {
 				cause := permanentCause(probeErr)
 				if filtered := nonContextCause(cause); filtered != nil {
@@ -1452,14 +1457,15 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 func isErrorSeparator(b byte) bool {
-	// Treat control/whitespace and common framing punctuation as separators so
-	// compact multi-wraps (%w - %w, %w/%w, etc.) do not leave leading junk.
-	// Alphanumeric bytes and claimed child spans stay intact.
+	// Treat control/whitespace and unpaired framing punctuation as separators
+	// so compact multi-wraps (%w - %w, %w/%w, etc.) do not leave leading junk.
+	// Paired delimiters such as ()[]{}<> are not absorbed independently; that
+	// would leave a dangling closer around a retained child.
 	if b <= ' ' {
 		return true
 	}
 	switch b {
-	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '_', '.', '!', '?', '#', '@', '&', '*', '%', '^', '`', '\'', '"', '(', ')', '[', ']', '{', '}', '<', '>':
+	case ';', ':', ',', '|', '-', '/', '\\', '=', '+', '~', '.', '!', '?', '#', '@', '&', '*', '%', '^':
 		return true
 	default:
 		return false

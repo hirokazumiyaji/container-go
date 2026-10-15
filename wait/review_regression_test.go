@@ -1281,6 +1281,15 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("trailing hyphen wrap = %q, want absorbed trailing hyphen framing", got.Error())
 	}
 
+	parenWrap := fmt.Errorf("%w (%w)", context.Canceled, commaCause)
+	got = nonContextCause(parenWrap)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("paren wrap = %v, want cause", got)
+	}
+	if got.Error() != "(backend)" {
+		t.Fatalf("paren wrap = %q, want intact paired parentheses", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2143,6 +2152,47 @@ func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, must not match canceled while caller is active", err)
 	}
+}
+
+func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend inspect failed"}
+	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(80 * time.Millisecond).
+		WithPollInterval(5 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected timeout or probe error")
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled on deadline race", err)
+	}
+	if !errors.Is(err, backend) && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want backend cause and/or deadline", err)
+	}
+}
+
+type reviewFinalProbeDeadlineRaceTarget struct {
+	backend  error
+	execDone atomic.Bool
+}
+
+func (*reviewFinalProbeDeadlineRaceTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewFinalProbeDeadlineRaceTarget) Running(ctx context.Context) (bool, error) {
+	if !t.execDone.Load() {
+		return true, nil
+	}
+	<-ctx.Done()
+	return false, errors.Join(context.Canceled, t.backend, ctx.Err())
+}
+func (*reviewFinalProbeDeadlineRaceTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (t *reviewFinalProbeDeadlineRaceTarget) ExecCommand(context.Context, []string) (int, error) {
+	t.execDone.Store(true)
+	return 0, nil
 }
 
 type reviewFinalProbeJoinedContextTarget struct {

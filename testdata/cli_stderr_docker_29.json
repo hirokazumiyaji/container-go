@@ -1,0 +1,82 @@
+[
+  {
+    "name": "name_conflict",
+    "operation": "run",
+    "stderr": "docker: Error response from daemon: Conflict. The container name \"/myctr\" is already in use by container \"0123456789abcdef\". You have to remove (or rename) that container to be able to reuse that name.",
+    "nameConflict": true,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "image_missing",
+    "operation": "image inspect",
+    "stderr": "Error response from daemon: No such image: redis:7-alpine",
+    "nameConflict": false,
+    "imageMissing": true,
+    "containerMissing": false
+  },
+  {
+    "name": "container_missing_inspect",
+    "operation": "inspect",
+    "stderr": "error: no such object: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_exec",
+    "operation": "exec",
+    "stderr": "Error response from daemon: No such container: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_stop",
+    "operation": "stop",
+    "stderr": "Error response from daemon: No such container: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_rm",
+    "operation": "rm",
+    "stderr": "Error response from daemon: No such container: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "container_missing_logs",
+    "operation": "logs",
+    "stderr": "Error: No such container: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": true
+  },
+  {
+    "name": "image_missing_wording_on_pull",
+    "operation": "pull",
+    "stderr": "Error response from daemon: No such image: redis:7-alpine",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "application_container_not_found_on_run",
+    "operation": "run",
+    "stderr": "Error: application: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  },
+  {
+    "name": "apple_wording_on_docker",
+    "operation": "inspect",
+    "stderr": "Error: container not found: myctr",
+    "nameConflict": false,
+    "imageMissing": false,
+    "containerMissing": false
+  }
+]

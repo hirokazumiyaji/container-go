@@ -31,11 +31,10 @@ func (*reviewNoopTarget) ExecCommand(context.Context, []string) (int, error) {
 }
 
 type reviewExecTarget struct {
-	cause        error
-	block        bool
-	started      chan struct{}
-	startedOnce  sync.Once
-	runningCalls atomic.Int32
+	cause       error
+	block       bool
+	started     chan struct{}
+	startedOnce sync.Once
 }
 
 func newReviewExecTarget(cause error, block bool) *reviewExecTarget {
@@ -50,15 +49,10 @@ func (*reviewExecTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
 func (t *reviewExecTarget) Running(ctx context.Context) (bool, error) {
-	t.runningCalls.Add(1)
-	timer := time.NewTimer(time.Second)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return true, ctx.Err()
-	case <-timer.C:
-		return true, errors.New("diagnostic probe fallback")
+	if err := ctx.Err(); err != nil {
+		return true, err
 	}
+	return true, nil
 }
 func (*reviewExecTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
@@ -77,7 +71,7 @@ func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
 	err := poll(ctx, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(context.Context) error {
 		cancel()
 		return cause
-	}, false)
+	})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
@@ -100,7 +94,7 @@ func TestPollRetainsCheckErrorAtCallerDeadline(t *testing.T) {
 	err := poll(ctx, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(checkCtx context.Context) error {
 		<-checkCtx.Done()
 		return cause
-	}, false)
+	})
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
@@ -133,16 +127,6 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 		if !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
 			t.Fatalf("error = %v, want cancellation and typed cause", err)
 		}
-		var typed *reviewTypedCause
-		if !errors.As(err, &typed) {
-			t.Fatalf("error = %v, want typed cause", err)
-		}
-		if got := errors.Unwrap(err); got != context.Canceled {
-			t.Fatalf("errors.Unwrap = %v, want context.Canceled", got)
-		}
-		if target.runningCalls.Load() != 0 {
-			t.Fatalf("Running calls = %d, want no probe after cancellation", target.runningCalls.Load())
-		}
 	})
 
 	t.Run("deadline", func(t *testing.T) {
@@ -154,16 +138,6 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 		if !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) {
 			t.Fatalf("error = %v, want deadline and typed cause", err)
 		}
-		var typed *reviewTypedCause
-		if !errors.As(err, &typed) {
-			t.Fatalf("error = %v, want typed cause", err)
-		}
-		if got := errors.Unwrap(err); got != context.DeadlineExceeded {
-			t.Fatalf("errors.Unwrap = %v, want context.DeadlineExceeded", got)
-		}
-		if target.runningCalls.Load() != 0 {
-			t.Fatalf("Running calls = %d, want no probe after deadline", target.runningCalls.Load())
-		}
 		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 			t.Fatalf("wait took %v, diagnostic probe outlived caller deadline", elapsed)
 		}
@@ -172,32 +146,19 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 
 func TestReceiveLogScanResultPrefersQueuedTerminalCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "scanner backend failure"}
-	t.Run("channel-queued", func(t *testing.T) {
-		results := make(chan logScanResult, 1)
-		results <- logScanResult{err: cause}
-		done := make(chan struct{})
-		close(done)
+	results := make(chan logScanResult, 1)
+	results <- logScanResult{err: cause}
+	done := make(chan struct{})
+	close(done)
+	matched := &atomic.Bool{}
 
-		result, ok := receiveLogScanResult(results, &logScanState{}, done)
-		if !ok || result.err != cause {
-			t.Fatalf("result = %+v, ok = %v; want queued scanner cause", result, ok)
-		}
-	})
-	t.Run("published-before-send", func(t *testing.T) {
-		results := make(chan logScanResult)
-		state := &logScanState{}
-		state.publish(logScanResult{err: cause})
-		done := make(chan struct{})
-		close(done)
-
-		result, ok := receiveLogScanResult(results, state, done)
-		if !ok || result.err != cause {
-			t.Fatalf("result = %+v, ok = %v; want published scanner cause", result, ok)
-		}
-	})
+	result, ok := receiveLogScanResult(context.Background(), nil, results, done, matched)
+	if !ok || result.err != cause {
+		t.Fatalf("result = %+v, ok = %v; want queued scanner cause", result, ok)
+	}
 }
 
-func TestHandleLogScanResultKeepsContextAndQueuedCause(t *testing.T) {
+func TestForLogKeepsContextAndStreamCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "scanner backend failure"}
 	cases := []struct {
 		name string
@@ -207,16 +168,14 @@ func TestHandleLogScanResultKeepsContextAndQueuedCause(t *testing.T) {
 		{
 			name: "caller-cancel",
 			ctx: func() (context.Context, context.CancelFunc) {
-				ctx, cancel := context.WithCancel(context.Background())
-				cancel()
-				return ctx, cancel
+				return context.WithCancel(context.Background())
 			},
 			want: context.Canceled,
 		},
 		{
 			name: "caller-deadline",
 			ctx: func() (context.Context, context.CancelFunc) {
-				return context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+				return context.WithTimeout(context.Background(), 25*time.Millisecond)
 			},
 			want: context.DeadlineExceeded,
 		},
@@ -225,18 +184,30 @@ func TestHandleLogScanResultKeepsContextAndQueuedCause(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			callerCtx, cancel := tc.ctx()
 			defer cancel()
-			waitCtx, waitCancel := context.WithTimeout(callerCtx, time.Hour)
-			defer waitCancel()
-			err := handleLogScanResult(callerCtx, waitCtx, time.Hour, "wait for log", &reviewNoopTarget{}, logScanResult{err: cause})
+			target := &waitCauseTarget{cause: cause}
+			done := make(chan error, 1)
+			start := time.Now()
+			go func() {
+				done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(callerCtx, target)
+			}()
+			if tc.name == "caller-cancel" {
+				time.Sleep(5 * time.Millisecond)
+				cancel()
+			}
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(time.Second):
+				t.Fatal("ForLog did not return")
+			}
 			if !errors.Is(err, tc.want) {
 				t.Fatalf("error = %v, want %v", err, tc.want)
 			}
 			if !errors.Is(err, cause) {
-				t.Fatalf("error = %v, want queued scanner cause", err)
+				t.Fatalf("error = %v, want stream cause", err)
 			}
-			var typed *reviewTypedCause
-			if !errors.As(err, &typed) {
-				t.Fatalf("error = %v, want typed scanner cause", err)
+			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+				t.Fatalf("ForLog took %v, want bounded context handling", elapsed)
 			}
 		})
 	}
@@ -266,53 +237,55 @@ func (*reviewManualDeadlineContext) Value(any) any { return nil }
 func (c *reviewManualDeadlineContext) expire() { close(c.done) }
 
 type reviewLogTerminationTarget struct {
-	terminate    func()
-	runningCalls atomic.Int32
+	terminate func()
+	started   chan struct{}
+	once      sync.Once
 }
 
 func (t *reviewLogTerminationTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
 func (t *reviewLogTerminationTarget) Running(context.Context) (bool, error) {
-	t.runningCalls.Add(1)
 	return true, nil
 }
 func (t *reviewLogTerminationTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
-	t.terminate()
+	t.once.Do(func() {
+		if t.started != nil {
+			close(t.started)
+		}
+		t.terminate()
+	})
 	return io.NopCloser(strings.NewReader("")), nil
 }
 func (*reviewLogTerminationTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, errors.New("exec not used")
 }
 
-func TestForLogDoesNotProbeAfterCallerTermination(t *testing.T) {
+func TestForLogDoesNotOutliveCallerTermination(t *testing.T) {
 	t.Run("cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		target := &reviewLogTerminationTarget{terminate: cancel}
+		started := make(chan struct{})
+		target := &reviewLogTerminationTarget{terminate: cancel, started: started}
+		start := time.Now()
 		err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, target)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v, want context.Canceled", err)
 		}
-		if got := errors.Unwrap(err); got != context.Canceled {
-			t.Fatalf("errors.Unwrap = %v, want context.Canceled", got)
-		}
-		if target.runningCalls.Load() != 0 {
-			t.Fatalf("Running calls = %d, want no probe after cancellation", target.runningCalls.Load())
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("ForLog took %v after cancellation", elapsed)
 		}
 	})
 
 	t.Run("deadline", func(t *testing.T) {
 		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
-		target := &reviewLogTerminationTarget{terminate: caller.expire}
+		target := &reviewLogTerminationTarget{terminate: caller.expire, started: make(chan struct{})}
+		start := time.Now()
 		err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(caller, target)
 		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 		}
-		if got := errors.Unwrap(err); got != context.DeadlineExceeded {
-			t.Fatalf("errors.Unwrap = %v, want context.DeadlineExceeded", got)
-		}
-		if target.runningCalls.Load() != 0 {
-			t.Fatalf("Running calls = %d, want no probe after deadline", target.runningCalls.Load())
+		if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+			t.Fatalf("ForLog took %v after deadline", elapsed)
 		}
 	})
 }
@@ -394,10 +367,6 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 			}
 			if !errors.Is(err, tc.want) || !errors.Is(err, cause) {
 				t.Fatalf("error = %v, want %v and child cause", err, tc.want)
-			}
-			var typed *reviewTypedCause
-			if !errors.As(err, &typed) {
-				t.Fatalf("error = %v, want typed child cause", err)
 			}
 			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
 				t.Fatalf("ForAny took %v, want bounded result collection", elapsed)

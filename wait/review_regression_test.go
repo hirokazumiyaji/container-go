@@ -1601,6 +1601,55 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	if !strings.Contains(got.Error(), "public") {
 		t.Fatalf("partial sanitizing with context text = %q, want retained public text", got.Error())
 	}
+
+	overlapPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("peer reported context canceled"), errors.New(secret)},
+		msg:  "peer reported context canceled",
+	}
+	got = nonContextCause(overlapPartial)
+	if got == nil {
+		t.Fatal("overlap partial sanitizing wrapper dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("overlap partial sanitizing = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("overlap partial sanitizing leaked secret: %q", got.Error())
+	}
+	if got.Error() != "peer reported context canceled" {
+		t.Fatalf("overlap partial sanitizing = %q, want intact retained diagnostic", got.Error())
+	}
+
+	delimPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{context.Canceled, errors.New("parser saw: ; token"), errors.New(secret)},
+		msg:  "context canceled; parser saw: ; token",
+	}
+	got = nonContextCause(delimPartial)
+	if got == nil {
+		t.Fatal("delimiter partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("delimiter partial sanitizing leaked secret: %q", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("delimiter partial sanitizing = %q, must strip discarded context", got.Error())
+	}
+	if !strings.Contains(got.Error(), "parser saw: ; token") {
+		t.Fatalf("delimiter partial sanitizing = %q, want intact retained delimiters", got.Error())
+	}
+}
+
+func TestIsStdlibPackagePathAllowlist(t *testing.T) {
+	for _, path := range []string{"os/exec", "strconv", "encoding/json", "text/template", "crypto/x509", "net", "errors", "fmt"} {
+		if !isStdlibPackagePath(path) {
+			t.Fatalf("isStdlibPackagePath(%q) = false, want true", path)
+		}
+	}
+	for _, path := range []string{"corp/errors", "github.com/hirokazumiyaji/container-go/wait", "example.com/lib"} {
+		if isStdlibPackagePath(path) {
+			t.Fatalf("isStdlibPackagePath(%q) = true, want false", path)
+		}
+	}
 }
 
 type reviewSanitizingMultiWrapper struct {

@@ -454,13 +454,28 @@ func isStdlibTransportWrapper(err error) bool {
 	return isStdlibPackagePath(errorPkgPath(err))
 }
 
+// stdlibPackageRoots are top-level packages of the Go standard library.
+// Dotless paths alone are not enough: a local module such as corp/errors is
+// also dotless but must keep custom wrapper classifications.
+var stdlibPackageRoots = []string{
+	"archive", "bufio", "bytes", "cmp", "compress", "container", "context",
+	"crypto", "database", "debug", "embed", "encoding", "errors", "expvar",
+	"flag", "fmt", "go", "hash", "html", "image", "index", "io", "log", "maps",
+	"math", "mime", "net", "os", "path", "plugin", "reflect", "regexp",
+	"runtime", "slices", "sort", "strconv", "strings", "sync", "syscall",
+	"testing", "text", "time", "unicode", "unique", "unsafe", "weak",
+}
+
 func isStdlibPackagePath(path string) bool {
-	switch path {
-	case "", "errors", "fmt":
+	if path == "" {
 		return true
 	}
-	// Stdlib paths look like "os/exec"; module paths contain a dot.
-	return path != "" && !strings.Contains(path, ".")
+	for _, root := range stdlibPackageRoots {
+		if path == root || strings.HasPrefix(path, root+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 func errorPkgPath(err error) string {
@@ -738,26 +753,124 @@ func allChildTextAppearsIn(orig string, inners []error) bool {
 
 // stripVerifiedDiscardedChildText removes discarded child renderings that are
 // present in orig without inventing text for omitted (sanitized) children.
+// Retained child spans are claimed first so a discarded sentinel is not taken
+// from inside a legitimate diagnostic such as "peer reported context canceled".
 func stripVerifiedDiscardedChildText(orig string, inners []error) string {
-	cleaned := orig
-	for _, inner := range inners {
-		if inner == nil || nonContextCause(inner) != nil {
+	type span struct {
+		start, end int
+		removal    bool
+	}
+	occupied := make([]bool, len(orig))
+	claim := func(phrase string) (int, bool) {
+		for i := 0; i+len(phrase) <= len(orig); i++ {
+			if orig[i:i+len(phrase)] != phrase {
+				continue
+			}
+			overlap := false
+			for j := i; j < i+len(phrase); j++ {
+				if occupied[j] {
+					overlap = true
+					break
+				}
+			}
+			if overlap {
+				continue
+			}
+			for j := i; j < i+len(phrase); j++ {
+				occupied[j] = true
+			}
+			return i, true
+		}
+		return 0, false
+	}
+
+	type item struct {
+		phrase  string
+		removal bool
+		order   int
+	}
+	items := make([]item, 0, len(inners))
+	for i, inner := range inners {
+		if inner == nil {
 			continue
 		}
 		phrase := inner.Error()
-		if phrase == "" || !strings.Contains(cleaned, phrase) {
+		if phrase == "" {
 			continue
 		}
-		if strings.Count(cleaned, phrase) != 1 {
-			continue
-		}
-		cleaned = strings.Replace(cleaned, phrase, "", 1)
+		items = append(items, item{
+			phrase:  phrase,
+			removal: nonContextCause(inner) == nil,
+			order:   i,
+		})
 	}
-	cleaned = strings.ReplaceAll(cleaned, ": ;", ":")
-	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")
-	cleaned = strings.TrimSpace(cleaned)
-	cleaned = strings.Trim(cleaned, ":;")
-	return strings.TrimSpace(cleaned)
+	sort.SliceStable(items, func(i, j int) bool {
+		if len(items[i].phrase) != len(items[j].phrase) {
+			return len(items[i].phrase) > len(items[j].phrase)
+		}
+		return items[i].order < items[j].order
+	})
+
+	var removals []span
+	for _, it := range items {
+		start, ok := claim(it.phrase)
+		if !ok {
+			// Discarded or omitted (sanitized) child text may be absent;
+			// continue so verified discarded spans can still be removed.
+			continue
+		}
+		if it.removal {
+			removals = append(removals, span{start: start, end: start + len(it.phrase), removal: true})
+		}
+	}
+	if len(removals) == 0 {
+		return orig
+	}
+	sort.Slice(removals, func(i, j int) bool { return removals[i].start > removals[j].start })
+	cleaned := orig
+	for _, r := range removals {
+		if r.start < 0 || r.end > len(cleaned) || r.start > r.end {
+			return orig
+		}
+		cleaned = cleaned[:r.start] + cleaned[r.end:]
+		cleaned = tidyPartialRemovalJunction(cleaned, r.start)
+	}
+	return cleaned
+}
+
+// tidyPartialRemovalJunction cleans only framing characters adjacent to a
+// removal site so retained diagnostics such as "parser saw: ; token" stay intact.
+func tidyPartialRemovalJunction(s string, at int) string {
+	if at < 0 {
+		at = 0
+	}
+	if at > len(s) {
+		at = len(s)
+	}
+	lo := at
+	for lo > 0 && (s[lo-1] == ' ' || s[lo-1] == ':' || s[lo-1] == ';') {
+		// Stop before eating punctuation glued to retained token text.
+		if (s[lo-1] == ':' || s[lo-1] == ';') && lo >= 2 && s[lo-2] != ' ' && s[lo-2] != ':' && s[lo-2] != ';' {
+			break
+		}
+		lo--
+	}
+	hi := at
+	for hi < len(s) && (s[hi] == ' ' || s[hi] == ':' || s[hi] == ';') {
+		if (s[hi] == ':' || s[hi] == ';') && hi+1 < len(s) && s[hi+1] != ' ' && s[hi+1] != ':' && s[hi+1] != ';' {
+			break
+		}
+		hi++
+	}
+	if lo == hi {
+		return s
+	}
+	// Keep a single space when both sides still have content.
+	junction := ""
+	if lo > 0 && hi < len(s) && s[lo-1] != ' ' && s[hi] != ' ' {
+		junction = " "
+	}
+	return s[:lo] + junction + s[hi:]
 }
 
 // replaceDiscardedErrorText removes or rewrites child renderings independently

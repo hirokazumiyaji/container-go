@@ -335,20 +335,30 @@ func joinNonNil(errs ...error) error {
 // settle that races the wait budget cannot hide an already-observed
 // success. Joined non-context causes, such as a terminal CLIError, remain.
 func nonContextCause(err error) error {
+	filtered, _ := filterNonContext(err)
+	return filtered
+}
+
+// filterNonContext is the implementation of nonContextCause. The changed
+// flag reports whether any context branch was stripped, so multi-wrappers
+// with non-comparable children are not treated as rewritten merely because
+// equality cannot prove the child identical.
+func filterNonContext(err error) (filtered error, changed bool) {
 	if err == nil {
-		return nil
+		return nil, false
 	}
 	if unwrapper, ok := err.(interface{ Unwrap() []error }); ok {
 		inners := unwrapper.Unwrap()
 		kept := make([]error, 0, len(inners))
-		changed := false
 		for _, inner := range inners {
-			cause := nonContextCause(inner)
+			cause, childChanged := filterNonContext(inner)
 			if cause == nil {
-				changed = true
+				if inner != nil {
+					changed = true
+				}
 				continue
 			}
-			if !sameError(cause, inner) {
+			if childChanged {
 				changed = true
 			}
 			kept = append(kept, cause)
@@ -358,28 +368,28 @@ func nonContextCause(err error) error {
 				// Empty Unwrap with nothing removed: keep the original so
 				// callers retain errors.As on the concrete multi-wrapper.
 				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return preserveEmptyContextWrapper(err)
+					return preserveEmptyContextWrapper(err), true
 				}
-				return err
+				return err, false
 			}
-			return preserveEmptyContextWrapper(err)
+			return preserveEmptyContextWrapper(err), true
 		}
 		joined := joinNonNil(kept...)
 		if !changed {
 			// Children are unchanged, but the wrapper itself may still
 			// contribute a context match via its own Is method.
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				return replaceUnwrappedCause(err, joined)
+				return replaceUnwrappedCause(err, joined), true
 			}
-			return err
+			return err, false
 		}
 		// Custom wrappers and fmt multi-%w errors keep framing via
 		// contextStrippedCause. Plain errors.Join trees are rebuilt from the
 		// filtered children so Error() no longer mentions stripped sentinels.
 		if keepsClassificationWithoutChildren(err) || errorPkgPath(err) == "fmt" {
-			return replaceUnwrappedCause(err, joined)
+			return replaceUnwrappedCause(err, joined), true
 		}
-		return joined
+		return joined, true
 	}
 	// Only unwrap a single-error wrapper when the tree contains a context
 	// branch that must be stripped. Otherwise keep wrappers such as
@@ -388,42 +398,42 @@ func nonContextCause(err error) error {
 		(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 		inner := unwrapper.Unwrap()
 		if inner == nil {
-			return preserveEmptyContextWrapper(err)
+			return preserveEmptyContextWrapper(err), true
 		}
-		filtered := nonContextCause(inner)
+		filtered, _ := filterNonContext(inner)
 		if filtered == nil {
-			return preserveEmptyContextWrapper(err)
+			return preserveEmptyContextWrapper(err), true
 		}
 		// Even when the inner value is unchanged, the wrapper may still
 		// contribute a context match via its own Is method.
-		return replaceUnwrappedCause(err, filtered)
+		return replaceUnwrappedCause(err, filtered), true
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		// Pure context sentinels have nothing else to retain.
 		if err == context.Canceled || err == context.DeadlineExceeded {
-			return nil
+			return nil, true
 		}
 		// Opaque facades (Is/As without Unwrap), such as cli.WithRedactor,
 		// expose the source tree only via UnwrapRaw. Filter that tree so a
 		// context-only facade is dropped while a mixed join keeps its
 		// non-context surface under the original facade diagnostics.
 		if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
-			filtered := nonContextCause(raw.UnwrapRaw())
+			filtered, _ := filterNonContext(raw.UnwrapRaw())
 			if filtered == nil {
-				return nil
+				return nil, true
 			}
 			filtered = retainDiagnosticFacade(err, filtered)
-			return &contextStrippedCause{original: err, cause: filtered}
+			return &contextStrippedCause{original: err, cause: filtered}, true
 		}
 		// Custom Is/As facades with no unwrap surface still need their
 		// non-context classifications retained after context matches are
 		// stripped.
 		if keepsClassificationWithoutChildren(err) {
-			return &contextStrippedCause{original: err, cause: nil}
+			return &contextStrippedCause{original: err, cause: nil}, true
 		}
-		return nil
+		return nil, true
 	}
-	return err
+	return err, false
 }
 
 // retainDiagnosticFacade reapplies an opaque facade's redactor onto the
@@ -771,29 +781,6 @@ func errorPkgPath(err error) string {
 		t = t.Elem()
 	}
 	return t.PkgPath()
-}
-
-// sameError reports whether a and b are the same error value without
-// panicking on non-comparable dynamic types. Non-comparable structs (for
-// example a value error holding a slice) are compared with DeepEqual so an
-// untouched child is not mistaken for a filtered rewrite.
-func sameError(a, b error) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
-	if !va.IsValid() || !vb.IsValid() || va.Type() != vb.Type() {
-		return false
-	}
-	if va.Comparable() {
-		return va.Interface() == vb.Interface()
-	}
-	switch va.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer, reflect.Slice:
-		return va.Pointer() == vb.Pointer()
-	default:
-		return reflect.DeepEqual(a, b)
-	}
 }
 
 // replaceUnwrappedCause keeps wrapper diagnostics after a nested context

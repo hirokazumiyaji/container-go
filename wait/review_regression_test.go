@@ -632,6 +632,15 @@ type reviewStructSliceError struct {
 
 func (e reviewStructSliceError) Error() string { return strings.Join(e.Parts, ",") }
 
+// reviewFuncBearingError is non-comparable and fails reflect.DeepEqual between
+// boxed copies because of the function field.
+type reviewFuncBearingError struct {
+	Label string
+	Fn    func()
+}
+
+func (e reviewFuncBearingError) Error() string { return e.Label }
+
 func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 	nc := reviewSliceError{"backend", "failure"}
 	joined := errors.Join(nc, errors.New("other"))
@@ -648,6 +657,16 @@ func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 	var gotStructMulti *reviewMultiWrapper
 	if !errors.As(got, &gotStructMulti) || gotStructMulti != structMulti {
 		t.Fatalf("struct-slice multi wrapper lost *reviewMultiWrapper via As: %v (%T)", got, got)
+	}
+	funcChild := reviewFuncBearingError{Label: "backend", Fn: func() {}}
+	funcMulti := &reviewMultiWrapper{errs: []error{funcChild}}
+	got = nonContextCause(funcMulti)
+	if got != funcMulti {
+		t.Fatalf("func-bearing multi wrapper = %v (%T), want original", got, got)
+	}
+	var gotFuncMulti *reviewMultiWrapper
+	if !errors.As(got, &gotFuncMulti) || gotFuncMulti != funcMulti {
+		t.Fatalf("func-bearing multi wrapper lost *reviewMultiWrapper via As: %v (%T)", got, got)
 	}
 	mixed := errors.Join(context.Canceled, nc)
 	got = nonContextCause(mixed)

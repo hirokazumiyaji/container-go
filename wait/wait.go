@@ -268,13 +268,11 @@ func finalLifecycleError(
 		if probeCtxErr != nil {
 			probeErr = joinNonNil(probeErr, probeCtxErr)
 		}
-		// Filter before terminal classification so a mixed probe cause that
-		// races the startup deadline cannot reintroduce context.Canceled.
+		// Retain only non-context branches for diagnostics/timeout wrapping,
+		// but keep the raw probeErr for control flow so a pure probe-context
+		// deadline still retries instead of falling through as StateUnknown.
 		if filtered := nonContextCause(probeErr); filtered != nil {
 			lastProbeErr = filtered
-			probeErr = filtered
-		} else if probeErr != nil {
-			probeErr = nil
 		}
 		if terminalErr := waitContextTerminationError(
 			callerCtx,
@@ -290,6 +288,8 @@ func finalLifecycleError(
 				cause := permanentCause(probeErr)
 				if filtered := nonContextCause(cause); filtered != nil {
 					cause = filtered
+				} else if lastProbeErr != nil {
+					cause = lastProbeErr
 				}
 				return wrapWaitCause(what, cause, joinNonNil(lastErr, lastProbeErr))
 			}
@@ -1194,12 +1194,16 @@ func stripVerifiedDiscardedChildText(orig string, inners []error) string {
 			changed = true
 		}
 	}
-	// Ambiguous framing copies of a discarded phrase are unsafe to rewrite.
+	// Ambiguous framing copies of a discarded phrase, or extra copies of a
+	// changed retained phrase, are unsafe to rewrite (one filtered + one stale).
 	for _, it := range items {
-		if !it.removal {
-			continue
-		}
 		phrase := it.phrase
+		if !it.removal {
+			filtered := nonContextCause(it.inner)
+			if filtered == nil || filtered.Error() == phrase {
+				continue
+			}
+		}
 		for i := 0; i+len(phrase) <= len(orig); i++ {
 			if orig[i:i+len(phrase)] != phrase {
 				continue

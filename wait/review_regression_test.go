@@ -2003,6 +2003,23 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 
 	nestedBackend := &reviewTypedCause{message: "backend"}
 	nestedMixed := errors.Join(context.Canceled, nestedBackend)
+	// One changed retained child rendered twice (plus an omitted secret): the
+	// extra copy is ambiguous framing and must not leave a stale context span.
+	dupNestedPartial := &reviewSanitizingMultiWrapper{
+		errs: []error{nestedMixed, errors.New(secret)},
+		msg:  nestedMixed.Error() + "; " + nestedMixed.Error(),
+	}
+	got = nonContextCause(dupNestedPartial)
+	if got == nil {
+		t.Fatal("duplicate nested mixed partial sanitizing wrapper dropped")
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("duplicate nested mixed partial sanitizing leaked secret: %q", got.Error())
+	}
+	if got.Error() != nestedMixed.Error()+"; "+nestedMixed.Error() {
+		t.Fatalf("duplicate nested mixed partial sanitizing = %q, want original safe rendering", got.Error())
+	}
+
 	nestedPartial := &reviewSanitizingMultiWrapper{
 		errs: []error{nestedMixed, errors.New(secret)},
 		msg:  nestedMixed.Error(),
@@ -2170,6 +2187,45 @@ func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	if !errors.Is(err, backend) && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want backend cause and/or deadline", err)
 	}
+}
+
+func TestFinalLifecycleProbeTimeoutRetriesInsteadOfUnknownState(t *testing.T) {
+	target := &reviewFinalProbeTimeoutOnlyTarget{}
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(250 * time.Millisecond).
+		WithPollInterval(10 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected startup timeout after probe retries")
+	}
+	if strings.Contains(err.Error(), "final lifecycle state unknown") {
+		t.Fatalf("error = %v, must retry probe-context deadline instead of unknown-state failure", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want startup deadline after retries", err)
+	}
+}
+
+type reviewFinalProbeTimeoutOnlyTarget struct {
+	execDone atomic.Bool
+}
+
+func (*reviewFinalProbeTimeoutOnlyTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewFinalProbeTimeoutOnlyTarget) Running(ctx context.Context) (bool, error) {
+	if !t.execDone.Load() {
+		return true, nil
+	}
+	<-ctx.Done()
+	return false, ctx.Err()
+}
+func (*reviewFinalProbeTimeoutOnlyTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (t *reviewFinalProbeTimeoutOnlyTarget) ExecCommand(context.Context, []string) (int, error) {
+	t.execDone.Store(true)
+	return 0, nil
 }
 
 type reviewFinalProbeDeadlineRaceTarget struct {

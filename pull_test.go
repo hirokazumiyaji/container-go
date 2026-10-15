@@ -36,8 +36,7 @@ func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
 }
 
 func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-	f := newTestRunner()
-	f.binary = "docker"
+f := newDockerTestRunner()
 	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
@@ -50,7 +49,7 @@ func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
 }
 
 func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, withEngine(dockerEngine{}))
 	_ = ctr
@@ -64,7 +63,7 @@ func TestRunPullMissingDoesNotPullWhenImagePresent(t *testing.T) {
 }
 
 func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
-	f := newTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	opts := []Option{WithName("myctr"), WithPullPolicy(PullAlways), withRunner(f), withEngine(dockerEngine{})}
 	for i := range 2 {
@@ -78,8 +77,7 @@ func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 }
 
 func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
-	f := newTestRunner()
-	f.binary = "docker"
+f := newDockerTestRunner()
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(f), withEngine(dockerEngine{}))
 	if !errors.Is(err, ErrImageNotFound) {
@@ -94,8 +92,7 @@ func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
 }
 
 func TestRunPullNeverRunsWhenImagePresent(t *testing.T) {
-	f := newTestRunner()
-	f.binary = "docker"
+f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, WithPullPolicy(PullNever), withEngine(dockerEngine{}))
 	_ = ctr
@@ -167,7 +164,7 @@ func TestAppleEnvelopeDrivesPullMissingFlow(t *testing.T) {
 		ExitCode: 1,
 		Stderr:   `Error: notFound: "image not found: redis:7-alpine"`,
 	}
-	r := &imageInspectErrorRunner{fakeRunner: base, err: imageErr}
+	r := &imageInspectMissingThenPresentRunner{fakeRunner: base, missing: imageErr}
 	cfg := &config{runner: r, eng: appleEngine{}, pullPolicy: PullMissing}
 
 	if err := cfg.ensureImage(context.Background(), "redis:7-alpine"); err != nil {
@@ -176,6 +173,21 @@ func TestAppleEnvelopeDrivesPullMissingFlow(t *testing.T) {
 	if base.pullCalls != 1 {
 		t.Fatalf("pull calls = %d, want 1 after Apple notFound envelope", base.pullCalls)
 	}
+}
+
+// imageInspectMissingThenPresentRunner returns a typed Apple notFound
+// envelope until pull succeeds, then delegates to fakeRunner so
+// ensureImageRef can resolve an identity after PullMissing.
+type imageInspectMissingThenPresentRunner struct {
+	*fakeRunner
+	missing *cli.CLIError
+}
+
+func (r *imageInspectMissingThenPresentRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" && !r.imagePresent {
+		return nil, nil, r.missing
+	}
+	return r.fakeRunner.Run(ctx, args...)
 }
 
 func TestParseImageExists(t *testing.T) {
@@ -387,13 +399,20 @@ func TestEnsureImagePullAlwaysDoesNotJoinMissingFlight(t *testing.T) {
 
 	inspectEntered := make(chan struct{})
 	releaseInspect := make(chan struct{})
-	var inspectOnce sync.Once
+	var inspectMu sync.Mutex
+	inspectCalls := 0
 	r := &hookRunner{
 		fakeRunner: base,
 		before: func(args []string) {
 			if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
-				inspectOnce.Do(func() { close(inspectEntered) })
-				<-releaseInspect
+				inspectMu.Lock()
+				inspectCalls++
+				first := inspectCalls == 1
+				inspectMu.Unlock()
+				if first {
+					close(inspectEntered)
+					<-releaseInspect
+				}
 			}
 		},
 	}
@@ -476,13 +495,14 @@ func TestPullWithClassifiesBackendDown(t *testing.T) {
 	}
 }
 
-func TestPullWithRejectsInvalidImageBeforeCLICall(t *testing.T) {
-	f := newTestRunner()
-	if err := Pull(context.Background(), "-bad"); err == nil {
-		t.Fatal("want error for invalid image")
-	}
-	if len(f.calls) != 0 {
-		t.Errorf("CLI was called despite invalid image: %v", f.calls)
+func TestPullRejectsInvalidImageAsValidationErrorBeforeBackend(t *testing.T) {
+	t.Setenv(backendEnv, "not-a-backend")
+	const image = "-bad"
+
+	err := Pull(context.Background(), image)
+	assertImageValidationError(t, err, image)
+	if strings.Contains(err.Error(), backendEnv) {
+		t.Fatalf("error = %v, want validation before backend detection", err)
 	}
 }
 
@@ -490,7 +510,10 @@ func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
 	f := newTestRunner()
 	// fakeRunner answers list calls with empty output by default; drive
 	// the parse/remove path through a stub runner instead.
-	r := &reuseGroupRunner{ids: []string{"a", "b"}}
+	r := &reuseGroupRunner{ids: []string{
+		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+	}}
 	removed, err := pruneReuseGroupWith(context.Background(), r, dockerEngine{}, "integration")
 	if err != nil {
 		t.Fatalf("pruneReuseGroupWith: %v", err)
@@ -515,7 +538,10 @@ func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byt
 	case "ps":
 		r.listCalls++
 		// docker parseReuseGroupIDs splits lines; return the stub ids.
-		return []byte("a\nb\n"), nil, nil
+		return []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\nbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/group-%s","State":{"Status":"running"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"integration",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`, id, id[:1], managedLabel, reuseLabel, reuseGroupLabel, creationLabel)), nil, nil
 	case "ls":
 		r.listCalls++
 		return []byte(`[{"id":"a","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}},{"id":"b","configuration":{"labels":{"com.github.hirokazumiyaji.container-go.reuse-group":"integration"}}}]`), nil, nil

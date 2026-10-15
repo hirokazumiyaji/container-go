@@ -7,10 +7,14 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
+// cliErrorLinePrefixes lists Docker/daemon wrappers that any Docker
+// operation may strip. The Apple "container: " prefix is handled
+// separately by cliErrorLinePrefix so Docker workload text cannot spoof it.
+
 // cliErrorContext is the small, structured part of a CLI failure that a
-// backend matcher is allowed to use.  In particular, stderr by itself is
+// backend matcher is allowed to use. In particular, stderr by itself is
 // not enough: a process running in a container can print the same words as
-// the backend.  The command and executable are therefore part of the
+// the backend. The command and executable are therefore part of the
 // classification contract.
 type cliErrorContext struct {
 	err       *cli.CLIError
@@ -18,39 +22,165 @@ type cliErrorContext struct {
 	target    string
 }
 
-// backendCLIError returns the first CLIError in err when it can belong to
-// backend. CLIError defines an empty Binary as the historical `container`
-// executable, so a Docker classifier never accepts an error without an
-// explicit Docker binary. ExecRunner always records the executable name.
+type cliErrorBranch struct {
+	ctx    cliErrorContext
+	stdout string
+	stderr string
+	cause  error
+}
+
+// backendCLIErrorBranches returns every CLIError branch in an error tree
+// that belongs to backend. Stdout is keyed by the CLIError that owns it:
+// joined parents and siblings never lend their diagnostics to another
+// branch.
+func backendCLIErrorBranches(err error, backend string) []cliErrorBranch {
+	if err == nil {
+		return nil
+	}
+	var branches []cliErrorBranch
+	stdoutByCLIError := make(map[*cli.CLIError]string)
+	branchIndex := make(map[*cli.CLIError]int)
+	var walk func(error)
+	walk = func(cur error) {
+		if cur == nil {
+			return
+		}
+		if joined, ok := cur.(interface{ Unwrap() []error }); ok {
+			for _, child := range joined.Unwrap() {
+				walk(child)
+			}
+			return
+		}
+		if stdout, _, _ := cli.DiagnosticText(cur); stdout != "" {
+			var owner *cli.CLIError
+			if errors.As(cur, &owner) {
+				stdoutByCLIError[owner] = stdout
+			}
+		}
+		if cliErr, ok := cur.(*cli.CLIError); ok {
+			// Empty Binary is the historical `container` executable, so a
+			// Docker classifier never accepts an error without an explicit
+			// Docker binary. ExecRunner always records the executable name.
+			if backend != "" && !cliBinaryMatches(cliErr.Binary, backend) {
+				return
+			}
+			operation := commandOperation(cliErr.Args)
+			stdout := stdoutByCLIError[cliErr]
+			cause := error(cliErr)
+			if stdout != "" {
+				cause = cli.WithStdout(cliErr, stdout)
+			}
+			if index, ok := branchIndex[cliErr]; ok {
+				if stdout != "" {
+					branches[index].stdout = stdout
+					branches[index].cause = cause
+				}
+				return
+			}
+			branchIndex[cliErr] = len(branches)
+			branches = append(branches, cliErrorBranch{
+				ctx: cliErrorContext{
+					err:       cliErr,
+					operation: operation,
+					target:    commandTarget(cliErr.Args, operation),
+				},
+				stdout: stdout,
+				stderr: cliErr.Stderr,
+				cause:  cause,
+			})
+			return
+		}
+		if wrapped, ok := cur.(interface{ Unwrap() error }); ok {
+			walk(wrapped.Unwrap())
+		}
+	}
+	walk(err)
+	return branches
+}
+
+func matchingCLIErrorBranches(err error, backend, operation string, targets ...string) []cliErrorBranch {
+	branches := backendCLIErrorBranches(err, backend)
+	operationBranches := make([]cliErrorBranch, 0, len(branches))
+	hasTarget := false
+	for _, target := range targets {
+		if target != "" {
+			hasTarget = true
+			break
+		}
+	}
+	for _, branch := range branches {
+		if branch.ctx.operation == operation {
+			operationBranches = append(operationBranches, branch)
+		}
+	}
+	if !hasTarget {
+		return operationBranches
+	}
+
+	targetless := make([]cliErrorBranch, 0, len(operationBranches))
+	for _, branch := range operationBranches {
+		if strings.TrimSpace(branch.ctx.target) == "" {
+			targetless = append(targetless, branch)
+		}
+	}
+	for _, target := range targets {
+		if target == "" {
+			continue
+		}
+		exact := make([]cliErrorBranch, 0, len(operationBranches))
+		for _, branch := range operationBranches {
+			if strings.TrimSpace(branch.ctx.target) != "" && sameCLITarget(branch.ctx.target, target) {
+				exact = append(exact, branch)
+			}
+		}
+		if len(exact) > 0 {
+			return exact
+		}
+	}
+	return targetless
+}
+
+func exactBranchTarget(branch cliErrorBranch, target string) bool {
+	if strings.TrimSpace(branch.ctx.target) == "" {
+		return false
+	}
+	return target == "" || sameCLITarget(branch.ctx.target, target)
+}
+
+func exactImageTarget(branch cliErrorBranch, target string) bool {
+	if strings.TrimSpace(branch.ctx.target) == "" {
+		return false
+	}
+	return target == "" || strings.TrimSpace(branch.ctx.target) == strings.TrimSpace(target)
+}
+
+func ambiguousBranchTargets(branches []cliErrorBranch) bool {
+	seen := make(map[string]struct{}, len(branches))
+	for _, branch := range branches {
+		seen[strings.ToLower(strings.TrimSpace(branch.ctx.target))] = struct{}{}
+	}
+	return len(seen) > 1
+}
+
+func matchingCLIErrorBranch(err error, backend, operation string, targets ...string) (cliErrorBranch, bool) {
+	branches := matchingCLIErrorBranches(err, backend, operation, targets...)
+	if len(branches) == 0 {
+		return cliErrorBranch{}, false
+	}
+	return branches[0], true
+}
+
+// backendCLIError returns the first CLIError branch that belongs to backend.
+// Context cancellation alone is never treated as a backend diagnostic.
 func backendCLIError(err error, backend string) (cliErrorContext, bool) {
 	if isContextError(err) {
 		return cliErrorContext{}, false
 	}
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
+	branches := backendCLIErrorBranches(err, backend)
+	if len(branches) == 0 {
 		return cliErrorContext{}, false
 	}
-	if !cliBinaryMatches(cliErr.Binary, backend) {
-		return cliErrorContext{}, false
-	}
-	operation := commandOperation(cliErr.Args)
-	return cliErrorContext{
-		err:       cliErr,
-		operation: operation,
-		target:    commandTarget(cliErr.Args, operation),
-	}, true
-}
-
-// backendCLIErrorText validates a matching backend command before returning
-// the complete wrapped/joined error text. Probe predicates use this instead
-// of reading only the first CLIError.Stderr so instrumentation branches are
-// not silently discarded.
-func backendCLIErrorText(err error, backend, operation string) (string, bool) {
-	ctx, ok := backendCLIError(err, backend)
-	if !ok || ctx.operation != operation {
-		return "", false
-	}
-	return strings.ToLower(err.Error()), true
+	return branches[0].ctx, true
 }
 
 func hasParsedCLITarget(ctx cliErrorContext) bool {
@@ -95,7 +225,7 @@ func commandTarget(args []string, operation string) string {
 				return value
 			}
 		}
-	case "image inspect":
+	case "image inspect", "image pull":
 		return firstPositional(args, 2, "--platform")
 	case "inspect":
 		return firstPositional(args, 1)
@@ -103,10 +233,18 @@ func commandTarget(args []string, operation string) string {
 		return firstPositional(args, 1, "--env-file", "--user", "--workdir")
 	case "logs":
 		return firstPositional(args, 1, "--tail", "--since", "-n")
+	case "pull":
+		return firstPositional(args, 1, "--platform")
 	case "stop":
 		return firstPositional(args, 1, "--time")
 	case "delete", "rm":
 		return firstPositional(args, 1)
+	case "cp":
+		for _, arg := range args[1:] {
+			if target, path, ok := strings.Cut(arg, ":"); ok && target != "" && strings.HasPrefix(path, "/") {
+				return target
+			}
+		}
 	}
 	return ""
 }
@@ -137,29 +275,29 @@ func firstPositional(args []string, start int, valueOptions ...string) string {
 	return ""
 }
 
-// cliErrorLines returns normalized, non-empty stderr lines. Only wrappers
-// verified for the selected binary and operation are removed. In
-// particular, Docker exec never treats a workload's generic "Error: " line
-// as backend evidence; arbitrary application/configuration prefixes remain
-// visible and cannot satisfy an anchored backend matcher.
-func cliErrorLines(err error) ([]string, bool) {
-	var cliErr *cli.CLIError
-	if !errors.As(err, &cliErr) {
-		return nil, false
-	}
-
-	allowGenericError := genericErrorWrapperAllowed(cliErr)
-	var lines []string
-	for _, line := range strings.Split(cliErr.Stderr, "\n") {
-		line = normalizeCLIErrorLine(line, cliErr, allowGenericError)
+func branchLines(branch cliErrorBranch, includeStdout bool) (stderr, stdout []string) {
+	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+	for _, line := range strings.Split(branch.stderr, "\n") {
+		line = normalizeCLIErrorLine(line, branch.ctx.err, allowGenericError)
 		if line != "" {
-			lines = append(lines, line)
+			stderr = append(stderr, line)
 		}
 	}
-	return lines, true
+	if includeStdout {
+		for _, line := range strings.Split(branch.stdout, "\n") {
+			line = normalizeCLIErrorLine(line, branch.ctx.err, allowGenericError)
+			if line != "" {
+				stdout = append(stdout, line)
+			}
+		}
+	}
+	return stderr, stdout
 }
 
 func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
+	if cliErr == nil {
+		return false
+	}
 	operation := commandOperation(cliErr.Args)
 	if cliBinaryMatches(cliErr.Binary, "container") {
 		return true
@@ -175,22 +313,40 @@ func genericErrorWrapperAllowed(cliErr *cli.CLIError) bool {
 	}
 }
 
-func normalizeCLIErrorLine(line string, cliErr *cli.CLIError, allowGenericError bool) string {
-	line = strings.ToLower(strings.TrimSpace(line))
+// trimCLIErrorWrapper removes only verified CLI wrappers while preserving
+// the case of the diagnostic payload. Image target comparisons need that
+// case; backend phrase matching can use normalizeCLIErrorLine below.
+func trimCLIErrorWrapper(line string, cliErr *cli.CLIError, allowGenericError bool) string {
+	// Streamed Docker diagnostics can prefix the decisive line with a
+	// bounded null-byte flood; trim those before wrapper matching.
+	line = strings.Trim(line, "\x00 \t\r\n")
 	for {
-		prefix, ok := cliErrorLinePrefix(line, cliErr)
-		if !ok || !strings.HasPrefix(line, prefix) {
+		lower := strings.ToLower(line)
+		prefix, ok := cliErrorLinePrefix(lower, cliErr)
+		if !ok || !strings.HasPrefix(lower, prefix) {
 			break
 		}
-		line = strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		line = strings.Trim(line[len(prefix):], "\x00 \t\r\n")
 	}
-	if allowGenericError && strings.HasPrefix(line, "error: ") {
-		line = strings.TrimSpace(strings.TrimPrefix(line, "error: "))
+	lower := strings.ToLower(line)
+	if allowGenericError && strings.HasPrefix(lower, "error: ") {
+		line = strings.Trim(line[len("error: "):], "\x00 \t\r\n")
 	}
 	return line
 }
 
+func normalizeCLIErrorLine(line string, cliErr *cli.CLIError, allowGenericError bool) string {
+	return strings.ToLower(trimCLIErrorWrapper(line, cliErr, allowGenericError))
+}
+
+// cliErrorLinePrefix returns a backend- and operation-scoped wrapper that
+// may be stripped from a diagnostic line. Docker never strips Apple's
+// "container: " prefix, and Apple exec/logs never treat that prefix as
+// backend evidence on its own.
 func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
+	if cliErr == nil {
+		return "", false
+	}
 	operation := commandOperation(cliErr.Args)
 	if cliBinaryMatches(cliErr.Binary, "docker") {
 		for _, prefix := range []string{"docker: ", "error response from daemon: "} {
@@ -198,9 +354,12 @@ func cliErrorLinePrefix(line string, cliErr *cli.CLIError) (string, bool) {
 				return prefix, true
 			}
 		}
+		return "", false
 	}
 	if cliBinaryMatches(cliErr.Binary, "container") && appleContainerPrefixAllowed(operation) {
-		return "container: ", true
+		if strings.HasPrefix(line, "container: ") {
+			return "container: ", true
+		}
 	}
 	return "", false
 }
@@ -216,13 +375,30 @@ func appleContainerPrefixAllowed(operation string) bool {
 	}
 }
 
-func hasCLIErrorLine(err error, match func(string) bool) bool {
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
+func hasBranchLine(branch cliErrorBranch, match func(string) bool) bool {
+	stderr, _ := branchLines(branch, false)
+	for _, line := range stderr {
 		if match(line) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasBranchImageLine(branch cliErrorBranch, prefix, target string, exact bool) bool {
+	allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+	for _, raw := range strings.Split(branch.stderr, "\n") {
+		line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
+		lower := strings.ToLower(line)
+		if !strings.HasPrefix(lower, prefix) {
+			continue
+		}
+		rest := line[len(prefix):]
+		if exact {
+			if cliTargetListExactMatches(rest, target) {
+				return true
+			}
+		} else if cliTargetListMatches(rest, target) {
 			return true
 		}
 	}
@@ -320,22 +496,52 @@ func hasAppleContainerizationErrorPath(
 	code string,
 	match func(string) bool,
 ) bool {
-	lines, ok := cliErrorLines(err)
-	if !ok {
+	for _, branch := range backendCLIErrorBranches(err, "container") {
+		allowGenericError := genericErrorWrapperAllowed(branch.ctx.err)
+		for _, raw := range strings.Split(branch.stderr, "\n") {
+			line := trimCLIErrorWrapper(raw, branch.ctx.err, allowGenericError)
+			if line == "" {
+				continue
+			}
+			// Prefer the escape-aware typed parser for 1.3 CLI output; fall
+			// back to the unescaped ContainerizationError grammar.
+			if typed, ok := parseAppleTypedErrorLine(line); ok {
+				if appleTypedErrorMatchesPath(typed, rootCode, matchRootMessage, code, match) {
+					return true
+				}
+				continue
+			}
+			envelope, ok := parseAppleContainerizationEnvelope(line)
+			if !ok {
+				continue
+			}
+			if rootCode != "" && (envelope.code != rootCode ||
+				(matchRootMessage != nil && !matchRootMessage(envelope.message))) {
+				continue
+			}
+			if envelope.walk(func(gotCode, message string) bool {
+				return gotCode == code && match(message)
+			}) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func appleTypedErrorMatchesPath(
+	root appleTypedError,
+	rootCode string,
+	matchRootMessage func(string) bool,
+	code string,
+	match func(string) bool,
+) bool {
+	if rootCode != "" && (root.code != rootCode ||
+		(matchRootMessage != nil && !matchRootMessage(strings.ToLower(root.message)))) {
 		return false
 	}
-	for _, line := range lines {
-		envelope, ok := parseAppleContainerizationEnvelope(line)
-		if !ok {
-			continue
-		}
-		if rootCode != "" && (envelope.code != rootCode ||
-			(matchRootMessage != nil && !matchRootMessage(envelope.message))) {
-			continue
-		}
-		if envelope.walk(func(gotCode, message string) bool {
-			return gotCode == code && match(message)
-		}) {
+	for node := &root; node != nil; node = node.cause {
+		if node.code == code && match(strings.ToLower(node.message)) {
 			return true
 		}
 	}
@@ -345,52 +551,93 @@ func hasAppleContainerizationErrorPath(
 func sameCLITarget(got, want string) bool {
 	got = strings.Trim(strings.TrimSpace(got), `"'`)
 	want = strings.Trim(strings.TrimSpace(want), `"'`)
-	if got == "" || want == "" {
-		return false
+	if want == "" {
+		return got != ""
 	}
 	return strings.EqualFold(got, want)
 }
 
-// cliTargetListMatches accepts Apple's inspect spelling for one or more
-// missing IDs, but rejects an arbitrary explanatory suffix.  This is what
-// keeps "application: container not found: ..." from looking like a
-// backend error.
+// cliTargetListMatches accepts one or more missing IDs, but rejects an
+// arbitrary explanatory suffix. Container identifiers are matched
+// case-insensitively for compatibility with backend display formatting.
 func cliTargetListMatches(rest, want string) bool {
+	return cliTargetListMatchesWith(rest, want, strings.EqualFold)
+}
+
+// cliTargetListExactMatches is used for image references, whose target
+// spelling is case-sensitive.
+func cliTargetListExactMatches(rest, want string) bool {
+	return cliTargetListMatchesWith(rest, want, func(a, b string) bool { return a == b })
+}
+
+func cliTargetListMatchesWith(rest, want string, equal func(string, string) bool) bool {
 	rest = strings.TrimSpace(rest)
-	want = strings.Trim(strings.TrimSpace(want), `"'`)
-	if rest == "" || want == "" {
+	if rest == "" {
 		return false
 	}
 	found := false
+	want = strings.Trim(want, `"'`)
 	for _, part := range strings.Split(rest, ",") {
 		part = strings.Trim(strings.TrimSpace(part), `"'`)
 		if part == "" || strings.ContainsAny(part, " \t\r\n") {
 			return false
 		}
-		if want == "" || strings.EqualFold(part, strings.Trim(want, `"'`)) {
+		if want == "" || equal(part, want) {
 			found = true
 		}
 	}
 	return found
 }
 
-// ambiguousContainerNotFound recognizes the generic phrase that is
-// intentionally not part of Apple's anchored backend forms.  It is used to
-// avoid probing/attaching on application output such as "container not
-// found: record"; a real inspect error is handled by the operation-specific
-// matcher instead.
-func ambiguousContainerNotFound(err error) bool {
-	lines, ok := cliErrorLines(err)
-	if !ok {
-		return false
-	}
-	for _, line := range lines {
-		// Do not mistake the real Apple "container with ID ... not found"
-		// form for this phrase.
-		if strings.Contains(line, "container not found") &&
-			!strings.Contains(line, "container with id") {
+// ambiguousNoSuchLine recognizes application wording that resembles an
+// object-absence message without satisfying the selected backend's
+// command-specific matcher.
+func ambiguousNoSuchLine(line string) bool {
+	line = strings.ToLower(line)
+	for _, fragment := range []string{
+		"container not found",
+		"no such container",
+		"no such object",
+		"image not found",
+		"no such image",
+	} {
+		if strings.Contains(line, fragment) {
 			return true
 		}
+	}
+	return false
+}
+
+func hasNonCLIAmbiguousObjectText(err error) bool {
+	if err == nil || errors.Is(err, ErrContainerNotFound) {
+		return false
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if hasNonCLIAmbiguousObjectText(child) {
+				return true
+			}
+		}
+		return false
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		child := wrapped.Unwrap()
+		if _, joined := child.(interface{ Unwrap() []error }); joined {
+			return hasNonCLIAmbiguousObjectText(child)
+		}
+	}
+	if _, ok := err.(*cli.CLIError); ok {
+		return false
+	}
+	var cliErr *cli.CLIError
+	if errors.As(err, &cliErr) {
+		return false
+	}
+	if ambiguousNoSuchLine(err.Error()) {
+		return true
+	}
+	if wrapped, ok := err.(interface{ Unwrap() error }); ok {
+		return hasNonCLIAmbiguousObjectText(wrapped.Unwrap())
 	}
 	return false
 }
@@ -399,12 +646,18 @@ func isAmbiguousApplicationError(eng engine, err error) bool {
 	if eng == nil || err == nil {
 		return false
 	}
-	ctx, ok := backendCLIError(err, eng.binary())
-	if !ok {
-		return false
+	branches := backendCLIErrorBranches(err, eng.binary())
+	if len(branches) == 0 {
+		return hasNonCLIAmbiguousObjectText(err)
 	}
-	// Apple's inspect command uses this exact phrase for a real missing
-	// object.  Other container operations do not, so the same wording there
-	// is an application/process diagnostic.
-	return ctx.operation != "inspect" && ambiguousContainerNotFound(err)
+	for _, branch := range branches {
+		verified := eng.containerMissing(branch.ctx.err) || eng.imageMissing(branch.ctx.err) || eng.nameConflict(branch.ctx.err)
+		if verified || createRaceMissing(branch.ctx.err) {
+			continue
+		}
+		if hasBranchLine(branch, ambiguousNoSuchLine) {
+			return true
+		}
+	}
+	return hasNonCLIAmbiguousObjectText(err)
 }

@@ -276,32 +276,36 @@ func TestImageInspectPermissionErrorPreservesCLIError(t *testing.T) {
 	cases := []struct {
 		name   string
 		engine engine
+		binary string
 		stderr string
 	}{
 		{
 			name:   "apple",
 			engine: appleEngine{},
+			binary: "container",
 			stderr: "permission denied: image not found: redis:7-alpine",
 		},
 		{
 			name:   "docker",
 			engine: dockerEngine{},
+			binary: "docker",
 			stderr: "permission denied: no such image: redis:7-alpine",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			original := &cli.CLIError{
-				Binary:   tc.name,
+				Binary:   tc.binary,
 				Args:     []string{"image", "inspect", "redis:7-alpine"},
 				ExitCode: 1,
 				Stderr:   tc.stderr,
 			}
 			base := newTestRunner()
+			base.binary = tc.binary
 			r := &imageInspectErrorRunner{fakeRunner: base, err: original}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithPullPolicy(PullMissing), withRunner(r), withEngine(tc.engine))
-			if err != original {
+			if !errors.Is(err, original) {
 				t.Fatalf("Run error = %v, want original CLIError", err)
 			}
 			if r.inspectCalls != 1 {
@@ -331,7 +335,7 @@ func (r *imageInspectErrorRunner) Run(ctx context.Context, args ...string) ([]by
 }
 
 func TestConfigErrorDoesNotSkipFailedCreateCleanup(t *testing.T) {
-	base := newTestRunner()
+	base := newDockerTestRunner()
 	base.imagePresent = true
 	original := &cli.CLIError{
 		Binary:   "docker",
@@ -340,7 +344,7 @@ func TestConfigErrorDoesNotSkipFailedCreateCleanup(t *testing.T) {
 		Stderr:   "image config contains a conflict",
 	}
 	id := strings.Repeat("0", 64)
-	inspectJSON := fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q}},"NetworkSettings":{}}]`, id, managedLabel, sessionLabel, sessionID())
+	inspectJSON := fmt.Sprintf(`[{"Id":%q,"Name":"/myctr","State":{"Status":"created"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:%q,%q:"__CONTAINER_CREATION__"}},"NetworkSettings":{}}]`, id, managedLabel, sessionLabel, sessionID(), creationLabel)
 	r := &failRunRunner{
 		fakeRunner:  base,
 		runErr:      original,
@@ -348,7 +352,7 @@ func TestConfigErrorDoesNotSkipFailedCreateCleanup(t *testing.T) {
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(dockerEngine{}))
-	if err != original {
+	if !errors.Is(err, original) {
 		t.Fatalf("Run error = %v, want original CLIError", err)
 	}
 	if len(r.deleted) != 1 || r.deleted[0] != id {
@@ -362,7 +366,7 @@ func TestReuseConfigConflictDoesNotEnterAttachLoop(t *testing.T) {
 	reusePollInterval = time.Millisecond
 	defer func() { reuseAttachTimeout, reusePollInterval = oldTimeout, oldPoll }()
 
-	base := newTestRunner()
+	base := newDockerTestRunner()
 	base.imagePresent = true
 	original := &cli.CLIError{
 		Binary:   "docker",
@@ -373,7 +377,7 @@ func TestReuseConfigConflictDoesNotEnterAttachLoop(t *testing.T) {
 	r := &ambiguousReuseRunner{fakeRunner: base, runErr: original}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("ambiguous-reuse"), WithReuse(), withRunner(r), withEngine(dockerEngine{}))
-	if err != original {
+	if !errors.Is(err, original) {
 		t.Fatalf("Run error = %v, want original CLIError", err)
 	}
 	if !strings.Contains(err.Error(), "image config contains a conflict") {
@@ -421,12 +425,13 @@ func TestAmbiguousInspectErrorPreservesCLIError(t *testing.T) {
 		Stderr:   "permission denied: not found",
 	}
 	ctr := &Container{
-		id:     "myctr",
-		runner: &fixedInspectErrorRunner{err: original},
-		eng:    appleEngine{},
+		id:       "myctr",
+		creation: "aaaaaaaaaaaaaaaa",
+		runner:   &fixedInspectErrorRunner{err: original},
+		eng:      appleEngine{},
 	}
 	_, err := ctr.State(context.Background())
-	if err != original {
+	if !errors.Is(err, original) {
 		t.Fatalf("State error = %v, want original CLIError", err)
 	}
 }
@@ -987,6 +992,7 @@ type ambiguousOriginalRunner struct {
 	inspectCalls int
 	probeCalls   int
 	deleteCalls  int
+	creation     string
 }
 
 func (r *ambiguousOriginalRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -995,6 +1001,13 @@ func (r *ambiguousOriginalRunner) Run(ctx context.Context, args ...string) ([]by
 		r.mu.Lock()
 		r.runCalls++
 		r.calls = append(r.calls, args)
+		for i, arg := range args {
+			if arg == "--label" && i+1 < len(args) {
+				if value, ok := strings.CutPrefix(args[i+1], creationLabel+"="); ok {
+					r.creation = value
+				}
+			}
+		}
 		r.mu.Unlock()
 		return nil, nil, r.original
 	case "system":
@@ -1010,10 +1023,18 @@ func (r *ambiguousOriginalRunner) Run(ctx context.Context, args ...string) ([]by
 		r.mu.Lock()
 		r.inspectCalls++
 		n := r.inspectCalls
+		creation := r.creation
 		r.calls = append(r.calls, args)
 		r.mu.Unlock()
 		if r.partial && ((!r.reuse && n > 0) || (r.reuse && n > 1)) {
-			return []byte(ownedInspectJSON(args[len(args)-1])), nil, nil
+			body := ownedInspectJSON(args[len(args)-1])
+			if r.reuse {
+				body = ownedReuseInspectJSON(args[len(args)-1])
+			}
+			if creation != "" {
+				body = strings.ReplaceAll(body, "__CONTAINER_CREATION__", creation)
+			}
+			return []byte(body), nil, nil
 		}
 		return nil, nil, &cli.CLIError{
 			Binary: "container", Args: args, ExitCode: 1,
@@ -1060,7 +1081,7 @@ func TestAmbiguousRunPreservesOriginalAndCleansPartialCreate(t *testing.T) {
 				opts = append(opts, WithReuse())
 			}
 			_, err := Run(context.Background(), "redis:7-alpine", opts...)
-			if err != original {
+			if !errors.Is(err, original) {
 				t.Fatalf("Run error = %v, want original CLIError", err)
 			}
 			if errors.Is(err, ErrSystemNotRunning) {
@@ -1087,18 +1108,28 @@ func TestAmbiguousRunPreservesOriginalAndCleansPartialCreate(t *testing.T) {
 }
 
 type pruneDeleteRunner struct {
-	list        string
-	deleteErr   error
-	deleteCalls int
+	list         string
+	inspectJSON  string
+	deleteErr    error
+	deleteCalls  int
 }
 
 func (r *pruneDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "ls" {
 		return []byte(r.list), nil, nil
 	}
+	if args[0] == "inspect" {
+		if r.inspectJSON != "" {
+			return []byte(r.inspectJSON), nil, nil
+		}
+		return []byte(r.list), nil, nil
+	}
 	if args[0] == "delete" || args[0] == "rm" {
 		r.deleteCalls++
 		return nil, nil, r.deleteErr
+	}
+	if args[0] == "system" {
+		return []byte("running"), nil, nil
 	}
 	return nil, nil, nil
 }
@@ -1135,11 +1166,36 @@ func TestCleanupDeleteClassifierIsOperationAndBackendAware(t *testing.T) {
 			wantErr: true,
 		},
 	}
+	listJSON := fmt.Sprintf(`[
+  {
+    "id": "id",
+    "configuration": {
+      "id": "id",
+      "image": {"reference": "redis:7-alpine"},
+      "labels": {
+        %q: "true",
+        %q: %q,
+        %q: "aaaaaaaaaaaaaaaa",
+        %q: "true"
+      }
+    },
+    "status": {"state": "stopped", "networks": []}
+  }
+]`, managedLabel, sessionLabel, sessionID(), creationLabel, reuseLabel)
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &pruneDeleteRunner{list: "id\n", deleteErr: tc.err}
+			r := &pruneDeleteRunner{list: listJSON, inspectJSON: listJSON, deleteErr: tc.err}
 			ids, err := pruneListed(context.Background(), r, appleEngine{}, []string{"ls"}, func(data []byte) ([]string, error) {
-				return splitNonEmptyLines(data), nil
+				candidates, err := applePruneCandidates(data)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]string, 0, len(candidates))
+				for id := range candidates {
+					out = append(out, id)
+				}
+				slices.Sort(out)
+				return out, nil
 			}, "prune")
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("prune error = %v, want error=%v", err, tc.wantErr)

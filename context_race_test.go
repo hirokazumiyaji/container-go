@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -56,7 +57,7 @@ func TestDeleteContextVetoesNotFoundSuccess(t *testing.T) {
 				ExitCode: 1, Stderr: "Error: failed to delete container: container with ID myctr not found",
 			}
 			runner := &contextRaceRunner{err: errors.Join(cliErr, cause)}
-			ctr := &Container{id: "myctr", uid: "immutable", runner: runner, eng: appleEngine{}}
+			ctr := &Container{id: "myctr", sync: &lockPack{uid: "immutable"}, runner: runner, eng: appleEngine{}}
 			err := ctr.delete(context.Background(), "immutable")
 			if !errors.Is(err, cause) {
 				t.Fatalf("delete error = %v, want %v", err, cause)
@@ -71,7 +72,7 @@ func TestTerminateInspectContextVetoesNotFoundSuccess(t *testing.T) {
 		ExitCode: 1, Stderr: "Error: container not found: myctr",
 	}
 	runner := &contextRaceRunner{err: errors.Join(cliErr, context.Canceled)}
-	ctr := &Container{id: "myctr", creation: "generation", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: appleEngine{}}
 	if err := ctr.Terminate(context.Background()); !errors.Is(err, context.Canceled) {
 		t.Fatalf("Terminate error = %v, want context cancellation", err)
 	}
@@ -80,7 +81,7 @@ func TestTerminateInspectContextVetoesNotFoundSuccess(t *testing.T) {
 func TestDeleteChecksContextAtTerminalReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := &contextRaceRunner{cancel: cancel}
-	ctr := &Container{id: "myctr", uid: "immutable", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", sync: &lockPack{uid: "immutable"}, runner: runner, eng: appleEngine{}}
 	if err := ctr.delete(ctx, "immutable"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("delete error = %v, want context cancellation", err)
 	}
@@ -92,8 +93,8 @@ type pruneContextRunner struct {
 }
 
 func (r *pruneContextRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
-	if args[0] == "ls" {
-		return []byte("id\n"), nil, nil
+	if args[0] == "ps" {
+		return []byte(testDockerUID + "\n"), nil, nil
 	}
 	if r.cancel != nil {
 		r.cancel()
@@ -102,8 +103,8 @@ func (r *pruneContextRunner) Run(_ context.Context, args ...string) ([]byte, []b
 		return nil, nil, nil
 	}
 	cliErr := &cli.CLIError{
-		Binary: "container", Args: args, ExitCode: 1,
-		Stderr: "Error: failed to delete container: container with ID id not found",
+		Binary: "docker", Args: args, ExitCode: 1,
+		Stderr: "Error: No such container: " + testDockerUID,
 	}
 	return nil, nil, errors.Join(cliErr, r.cause)
 }
@@ -122,7 +123,7 @@ func TestPruneContextVetoesRemovedIDs(t *testing.T) {
 		{name: "joined deadline", runner: &pruneContextRunner{cause: context.DeadlineExceeded}, want: context.DeadlineExceeded},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			removed, err := pruneListed(context.Background(), tc.runner, appleEngine{}, []string{"ls"}, parsePruneIDs, "prune")
+			removed, err := pruneListed(context.Background(), tc.runner, dockerEngine{}, []string{"ps"}, parsePruneIDs, "prune")
 			if len(removed) != 0 || !errors.Is(err, tc.want) {
 				t.Fatalf("prune removed/error = %v, %v; want no IDs and %v", removed, err, tc.want)
 			}
@@ -133,7 +134,7 @@ func TestPruneContextVetoesRemovedIDs(t *testing.T) {
 func TestPruneChecksContextAtTerminalReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := &pruneContextRunner{cancel: cancel}
-	removed, err := pruneListed(ctx, runner, appleEngine{}, []string{"ls"}, parsePruneIDs, "prune")
+	removed, err := pruneListed(ctx, runner, dockerEngine{}, []string{"ps"}, parsePruneIDs, "prune")
 	if len(removed) != 0 || !errors.Is(err, context.Canceled) {
 		t.Fatalf("prune removed/error = %v, %v; want no IDs and context cancellation", removed, err)
 	}
@@ -213,7 +214,7 @@ func TestClassifyAmbiguityPreservesTerminalContext(t *testing.T) {
 func TestExecChecksContextAtSuccessfulTerminalReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	runner := &contextRaceRunner{stdout: []byte("application output"), cancel: cancel}
-	ctr := &Container{id: "myctr", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: appleEngine{}}
 	code, _, err := ctr.Exec(ctx, []string{"query"})
 	if code != 0 || !errors.Is(err, context.Canceled) {
 		t.Fatalf("Exec result = %d, %v; want context cancellation error", code, err)
@@ -233,7 +234,8 @@ func (r *cancelAfterStreamRunner) Stream(context.Context, ...string) (io.ReadClo
 func TestFollowLogsChecksContextAtSuccessfulTerminalReturn(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ctr := &Container{
-		id: "myctr", runner: &cancelAfterStreamRunner{cancel: cancel}, eng: appleEngine{},
+		id: "myctr", creation: strings.Repeat("a", 16),
+		runner: &cancelAfterStreamRunner{cancel: cancel}, eng: appleEngine{},
 	}
 	stream, err := ctr.FollowLogs(ctx)
 	if stream != nil || !errors.Is(err, context.Canceled) {
@@ -259,9 +261,14 @@ func TestContextErrorVetoesBackendMatchers(t *testing.T) {
 			if (appleEngine{}).nameConflict(conflict) || (appleEngine{}).containerMissing(missing) || (appleEngine{}).imageMissing(imageMissing) {
 				t.Fatal("joined context did not veto backend matcher")
 			}
-			confirmedMissing := errors.Join(&inspectTargetNotFoundError{id: "myctr"}, cause)
-			if isNotFound(confirmedMissing) || isNotFoundFor(appleEngine{}, confirmedMissing) || errors.Is(confirmedMissing, ErrContainerNotFound) {
+			confirmedMissing := errors.Join(&inspectTargetNotFoundError{target: "myctr"}, cause)
+			// Classifiers must veto; errors.Is may still observe the typed
+			// detail sentinel that main equates with ErrContainerNotFound.
+			if isNotFound(confirmedMissing) || isNotFoundFor(appleEngine{}, confirmedMissing) {
 				t.Fatal("joined context did not veto an already-confirmed absence")
+			}
+			if !isContextError(confirmedMissing) {
+				t.Fatal("joined context was not visible on the confirmed absence")
 			}
 		})
 	}
@@ -315,6 +322,11 @@ func TestInspectEmptyOutputWrapsContainerNotFound(t *testing.T) {
 		t.Run(eng.name(), func(t *testing.T) {
 			runner := &contextRaceRunner{stdout: []byte("[]")}
 			ctr := &Container{id: "myctr", runner: runner, eng: eng}
+			if eng.name() == "docker" {
+				ctr.sync = &lockPack{uid: testDockerUID}
+			} else {
+				ctr.creation = strings.Repeat("a", 16)
+			}
 			_, err := ctr.State(context.Background())
 			if !errors.Is(err, ErrContainerNotFound) {
 				t.Fatalf("State error = %v, want ErrContainerNotFound", err)

@@ -15,6 +15,8 @@
 - `make integration` runs tagged integration tests against the available default backend (skips pull-heavy bench/singleflight cases); `make integration-docker` limits them to Docker; `make bench-integration` runs the pull-heavy scenarios. These require the relevant CLI and daemon/service. Integration images use the AWS public ECR Docker Hub mirror to avoid anonymous pull rate limits. Set `CONTAINERGO_BACKEND` to skip the other backend's tests.
 - `go fmt ./...` formats all packages.
 
+Backend selection in tests is read through `integrationtest.SelectedBackend`, never `os.Getenv`. The root test binary's `TestMain` unsets `CONTAINERGO_BACKEND` before any test runs so a developer's shell cannot redirect fixture-backed tests, which means a guard reading the environment sees `""` and can never skip. `TestMain` records the value first; anything deciding which backend to run must go through `SelectedBackend`. A test that needs a specific engine pins it explicitly (e.g. `withEngine(appleEngine{})`) rather than relying on the environment being absent.
+
 ## Coding Style & Naming
 
 Use standard `gofmt` formatting and idiomatic Go names: mixedCaps for identifiers, short package names, and `TestXxx` test functions. Keep APIs and implementations simple, and write comments only to explain intent. Do not add defensive nil handling unless nil is a valid runtime state or API contract; tests should provide the dependencies production code expects.
@@ -32,3 +34,8 @@ Never let a worktree branch inherit an upstream it did not create. `git worktree
 ## Security and Configuration
 
 Never commit credentials or environment files. Configure backend selection with `CONTAINERGO_BACKEND` and use the backend CLI’s own authentication and host settings. Keep integration-only configuration local to the developer environment.
+
+## Cursor Cloud specific instructions
+
+- `mise install` reads `mise.toml` (Go 1.27 and golangci-lint 2.13.0). Non-interactive login shells do not source `~/.bashrc`, so the environment links `go` and `golangci-lint` onto `/usr/local/bin`.
+- Docker Engine 29.7.2 is the CLI this repository checks. systemd is not running in the VM, so the environment `start` script launches `containerd` and `dockerd` (fuse-overlayfs). Wait until `docker info` succeeds before `make integration` or `make integration-docker`. Apple Container is not available here; use the Docker backend.

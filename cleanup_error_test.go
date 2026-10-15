@@ -31,19 +31,28 @@ func (r *cleanupErrRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 		// inspect below echoes a generation the ownership check accepts.
 		recordCreation(r.fakeRunner, args)
 		// A failed create: the container exists but never started.
-		return nil, nil, &cli.CLIError{Args: args, ExitCode: 125, Stderr: "start failed"}
+		return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 125, Stderr: "start failed"}
 	case "inspect":
 		r.mu.Lock()
 		r.calls = append(r.calls, args)
 		inspectErr := r.inspectErr
 		failInspect := r.failInspect
+		creation := r.creations[args[len(args)-1]]
 		r.mu.Unlock()
 		if failInspect {
 			if inspectErr != nil {
 				return nil, nil, inspectErr
 			}
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "inspect failed"}
+			return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: "inspect failed"}
 		}
+		// Failed creates leave a created/stopped generation. A running
+		// fixture would make identity-safe cleanup refuse deletion.
+		name := args[len(args)-1]
+		return []byte(`[{"id":` + quote(name) + `,"configuration":{"id":` + quote(name) +
+			`,"image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{` +
+			quote(managedLabel) + `:"true",` + quote(sessionLabel) + `:` + quote(sessionID()) + `,` +
+			quote(creationLabel) + `:` + quote(creation) + `}},` +
+			`"status":{"state":"created","networks":[]}}]`), nil, nil
 	case "rm", "delete":
 		r.mu.Lock()
 		r.deletedCalls++
@@ -54,7 +63,7 @@ func (r *cleanupErrRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 			if deleteErr != nil {
 				return nil, nil, deleteErr
 			}
-			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "daemon down"}
+			return nil, nil, &cli.CLIError{Binary: "container", Args: args, ExitCode: 1, Stderr: "daemon down"}
 		}
 	}
 	return r.fakeRunner.Run(ctx, args...)
@@ -64,7 +73,7 @@ func (r *cleanupErrRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 // discarded and Run returned only the classified run error, so a leftover
 // container was undetectable.
 func TestReviewFailedCreateCleanupErrorReachesCaller(t *testing.T) {
-	deleteErr := &cli.CLIError{Args: []string{"rm"}, ExitCode: 1, Stderr: "daemon down"}
+	deleteErr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: "daemon down"}
 	r := &cleanupErrRunner{fakeRunner: newTestRunner(), failDelete: true, deleteErr: deleteErr}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -82,8 +91,8 @@ func TestReviewFailedCreateCleanupErrorReachesCaller(t *testing.T) {
 	if !errors.As(err, &cleanupErr) {
 		t.Fatalf("err = %v (%T), want a *CleanupError", err, err)
 	}
-	if cleanupErr.Container != "myctr" {
-		t.Errorf("Container = %q, want myctr", cleanupErr.Container)
+	if cleanupErr.Container != "[REDACTED]" {
+		t.Errorf("Container = %q, want a redacted name", cleanupErr.Container)
 	}
 	// Both causes stay individually recoverable with errors.As.
 	var runErr *cli.CLIError
@@ -102,7 +111,12 @@ func TestReviewFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
 	r := &cleanupErrRunner{
 		fakeRunner:  newTestRunner(),
 		failInspect: true,
-		inspectErr:  &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "Error: container not found: myctr"},
+		inspectErr: &cli.CLIError{
+			Binary:   "container",
+			Args:     []string{"inspect", "myctr"},
+			ExitCode: 1,
+			Stderr:   `Error: container not found: "myctr"`,
+		},
 	}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -147,7 +161,7 @@ func TestReviewFailedCreateUninspectableIsReported(t *testing.T) {
 	if !errors.As(err, &cleanupErr) {
 		t.Fatalf("err = %v, want a *CleanupError for an uninspectable container", err)
 	}
-	if !strings.Contains(cleanupErr.Error(), "inspect before cleanup") {
+	if !strings.Contains(cleanupErr.Error(), "inspect") {
 		t.Errorf("err = %v, want the inspect failure named", err)
 	}
 }
@@ -174,8 +188,8 @@ func TestReviewFailedCreateNameConflictIsNotACleanupFailure(t *testing.T) {
 // The reuse inspect/copy rollback must keep both errors recoverable, and must
 // no longer discard the Terminate result.
 func TestReviewReuseRollbackPreservesBothErrors(t *testing.T) {
-	copyErr := &cli.CLIError{Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
-	cleanupErr := &cli.CLIError{Args: []string{"rm"}, ExitCode: 1, Stderr: "daemon down"}
+	copyErr := &cli.CLIError{Binary: "container", Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
+	cleanupErr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "reuse-rollback"}, ExitCode: 1, Stderr: "daemon down"}
 	r := &reuseRollbackCleanupRunner{
 		fakeRunner: newTestRunner(),
 		copyErr:    copyErr,
@@ -195,7 +209,7 @@ func TestReviewReuseRollbackPreservesBothErrors(t *testing.T) {
 	if !errors.As(err, &got) {
 		t.Fatalf("err = %v, want a *CleanupError; the rollback discarded it", err)
 	}
-	if got.Container != "reuse-rollback" {
+	if got.Container != "[REDACTED]" {
 		t.Errorf("Container = %q", got.Container)
 	}
 }
@@ -297,15 +311,32 @@ func (r *reuseRollbackCleanupRunner) Run(ctx context.Context, args ...string) ([
 		if first {
 			// The adoption probe: not there yet, so a create follows.
 			return nil, nil, &cli.CLIError{
-				Args: args, ExitCode: 1, Stderr: "Error: container not found: " + args[len(args)-1],
+				Binary: "container",
+				Args:   args, ExitCode: 1,
+				Stderr: `Error: container not found: "` + args[len(args)-1] + `"`,
 			}
 		}
 		name := args[len(args)-1]
+		// Stopped so identity-safe reuse rollback is allowed to delete.
+		// Mirror the default fakeRunner inspect identity so post-create
+		// image-identity checks (issue #115) succeed and the test can reach
+		// the intended copy-failure path.
+		platform := appleHostPlatform()
+		platformParts := strings.Split(platform, "/")
+		platformJSON := `{"os":` + quote(platformParts[0]) + `,"architecture":` + quote(platformParts[1]) + `}`
+		variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+		if strings.Contains(platformParts[1], "arm") {
+			variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+		}
+		if len(platformParts) == 3 {
+			platformJSON = `{"os":` + quote(platformParts[0]) + `,"architecture":` + quote(platformParts[1]) + `,"variant":` + quote(platformParts[2]) + `}`
+		}
 		return []byte(`[{"id":` + quote(name) + `,"configuration":{"id":` + quote(name) +
-			`,"image":{"reference":"redis:7-alpine"},"publishedPorts":[],"labels":{` +
+			`,"image":{"reference":"docker.io/library/redis:7-alpine","descriptor":{"digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},"variantDigest":` + quote(variantDigest) + `},` +
+			`"platform":` + platformJSON + `,"publishedPorts":[],"labels":{` +
 			quote(managedLabel) + `:"true",` + quote(sessionLabel) + `:` + quote(sessionID()) + `,` +
 			quote(creationLabel) + `:` + quote(creation) + `,` + quote(reuseLabel) + `:"true"}},` +
-			`"status":{"state":"running","networks":[]}}]`), nil, nil
+			`"status":{"state":"stopped","networks":[]}}]`), nil, nil
 	case "cp":
 		if r.copyErr != nil {
 			return nil, nil, r.copyErr

@@ -5,8 +5,9 @@
 A [testcontainers](https://testcontainers.com/)-style Go library for
 [Apple Container](https://github.com/apple/container) and Docker: run
 throwaway containers from Go tests, with no runtime dependency on a
-third-party container client. The Windows build uses `golang.org/x/sys`
-for retained process handles; the rest of the library uses the standard library.
+third-party container client. The library's only non-standard Go module
+is `golang.org/x/sys`, used for platform process and file handling; the
+rest of the implementation uses the standard library.
 
 ## Version scope
 
@@ -642,13 +643,16 @@ checks the optional terminal status before treating a matching line as
 readiness, so a merged CLI diagnostic cannot mask a terminal failure.
 
 The library always waits for and reaps the direct CLI child. On Unix-like
-systems it intentionally guarantees only that direct child: process-group
-signals are not used because a numeric PGID cannot be made safe across a
-concurrent reap. Descendants may outlive the CLI and are not reaped here.
-On Windows, Close and context cancellation use the retained process handle
-for the direct CLI child only; descendants are not terminated here. Other
-supported platforms cover only the direct child. Do not rely on descendant
-cleanup when a CLI deliberately detaches helpers.
+systems, Close and context cancellation make a best-effort attempt to
+`SIGKILL` the CLI's process group after a stopped-state check, then kill
+the direct child as well. Helpers that remain in that group can therefore
+be terminated; they are not reaped. If the stopped-state check fails,
+termination uses the direct child (pidfd on Linux) and never signals the
+former PGID. Once the child is reaped, no former numeric process-group ID
+is used. On Windows, Close and context cancellation use the retained
+process handle for the direct CLI child only; descendants are not
+terminated here. Other supported platforms cover only the direct child.
+Do not rely on descendant cleanup when a CLI deliberately detaches helpers.
 
 ## Image pulls
 

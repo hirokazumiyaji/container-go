@@ -132,9 +132,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `FollowLogs`, terminal CLI failures are delivered by `Read`, and the
   direct CLI child is the process this package always reaps.
 - Give each CLI invocation one lifecycle owner for Start/Wait/termination.
-  Unix intentionally guarantees only the direct child; Windows retains a
-  process handle and terminates that direct child only. Descendants are
-  not part of that guarantee.
+  Unix makes a best-effort process-group `SIGKILL` while the direct child
+  is owned; Windows retains a process handle and terminates that direct
+  child only. Descendants are not reaped.
 - Serialize stream endpoint ownership and stop process-tree signaling
   after the direct child is reaped, so delayed cancellation cannot target a
   reused PID or process-group ID.

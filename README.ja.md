@@ -4,7 +4,7 @@ English (primary): [README.md](README.md)
 
 [Apple Container](https://github.com/apple/container) と Docker を実行基盤とする、
 [testcontainers](https://testcontainers.com/) スタイルの Go ライブラリです。
-Go のテストから使い捨てコンテナを起動できます。コンテナクライアントのサードパーティ依存はありません。Windows ビルドでは保持した process handle に `golang.org/x/sys` を使い、それ以外は標準ライブラリだけで実装しています。
+Go のテストから使い捨てコンテナを起動できます。コンテナクライアントのサードパーティ依存はありません。唯一の非標準 Go モジュールはプラットフォームの process と file 操作に使う `golang.org/x/sys` で、それ以外は標準ライブラリだけで実装しています。
 
 ## バージョンの適用範囲
 
@@ -733,8 +733,10 @@ EOF まで `Read` してください。CLI の起動後に異常終了した場�
 マージされた CLI 診断が終端エラーを隠すことはありません。
 
 ライブラリは直接の CLI 子プロセスを必ず待って回収します。
-Unix 系では、同時回収との間で数値の PGID を安全に使用できないため、プロセスグループ信号を使わず直接の子だけを保証します。
-子孫は CLI の終了後も残る可能性があり、回収も保証しません。
+Unix 系では、停止状態を確認したあと CLI の process group へベストエフォートの `SIGKILL` を送り、続けて直接の子にも kill を送ります。
+同じグループに残った helper は終了することがありますが、回収は保証しません。
+停止状態を確認できない場合は直接の子（Linux では pidfd）だけを対象にし、古い PGID には signal を送りません。
+直接の子を回収した後は、古い数値の process-group ID は使いません。
 Windows では Close と context cancel は保持した process handle で直接の CLI 子だけを終了し、descendant は終了しません。
 その他の対応 OS でも直接の子だけを対象とします。
 CLI がヘルパーをデタッチする設計の場合は、子孫の終了を保証できません。

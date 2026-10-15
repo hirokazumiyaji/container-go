@@ -52,7 +52,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 
 設計上の制約は次の三つである。
 
-- **最小依存**：標準ライブラリと、Windows の process handle に使う `golang.org/x/sys` のみを依存する。コンテナクライアントのサードパーティ Go モジュールは使わない。
+- **最小依存**：標準ライブラリと、プラットフォームの process と file 操作に使う `golang.org/x/sys` のみを依存する。コンテナクライアントのサードパーティ Go モジュールは使わない。
 - **セキュリティ**：subprocess argv でインジェクションは防ぐが、異常終了時の reaper staging には環境データ 노출の余地があるため、現行の no-leak 保証ではない（#111）。
 - **パフォーマンス**：テストスイートを左右するのはコンテナ（VM）の起動時間である。ライブラリ側のオーバーヘッドをそれに対して無視できる水準に保ち、並列起動を妨げない。
 
@@ -93,7 +93,7 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 
 第一に、最小依存要件との整合である。
 XPC 直結方式は cgo と自前の C ブリッジを必要とし、ビルドに macOS SDK が絡む。
-CLI ラッパー方式は、Windows 専用の `golang.org/x/sys` を除いて純 Go・標準ライブラリで完結し、`CGO_ENABLED=0` でもビルドできる。
+CLI ラッパー方式は、プラットフォームの process 操作に使う `golang.org/x/sys` を除いて純 Go・標準ライブラリで完結し、`CGO_ENABLED=0` でもビルドできる。
 
 第二に、安定性である。
 XPC のルート名やメッセージ構造は Apple Container の内部実装であり、互換性の保証がない。
@@ -595,8 +595,10 @@ local に addressable な tag または alias を使うか、`WithAllowMutableIm
 **ストリームを有限に保つ**。
 `FollowLogs` は `container logs --follow` の子プロセスを起動して `io.ReadCloser` として返す。
 `Close` またはコンテキスト取消では、直接の CLI 子プロセスを終了して回収します。
-Unix では同時回収と数値 PGID の安全性を両立できないため、プロセスグループ信号を使わず直接の子だけを保証します。
-子孫は CLI の終了後も残る可能性があり、回収も保証しません。
+Unix では停止状態を確認したあと CLI の process group へベストエフォートの `SIGKILL` を送り、続けて直接の子にも kill を送ります。
+同じグループに残った helper は終了することがありますが、回収は保証しません。
+停止状態を確認できない場合は直接の子（Linux では pidfd）だけを対象にし、古い PGID には signal を送りません。
+直接の子を回収した後は、古い数値の process-group ID は使いません。
 Windows では保持した process handle で直接の CLI 子だけを終了し、descendant は終了しません。
 その他の対応 OS でも直接の子だけを対象とします。
 ForLog が診断用に保持するログは 1MiB を上限とする。
@@ -606,7 +608,7 @@ ForLog が診断用に保持するログは 1MiB を上限とする。
 ストリームを返した後の CLI 終了エラーは `Read` から返るため、呼び出し側は必ず EOF まで読む必要がある。
 `Close` とコンテキスト取消は意図的な終了経路なので、EOF またはコンテキストエラーになることがある。
 
-**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。Unix はプロセスグループを操作しない。Windows は保持した process handle で直接の子だけを終了する。子孫の回収は保証しない。
+**操作ごとに期限を決める**。inspect、copy、スナップショットログ、delete、prune などの照会的な操作、および public `Exec` は、呼び出し元に deadline がなければ通常 30 秒を既定にする。`Run` と明示的な image fetch は pull と create に 10 分の予算を使う。共有 pull のリーダーだけは、個別の呼び出し元のキャンセルから意図的に切り離す。一人の呼び出し元が他の待機者の pull を中止できないようにするためで、各待機者は自分の context がキャンセルされた時点で待機を終了する。`FollowLogs` はライブラリ側の deadline を追加せず、呼び出し元の context をそのまま渡す。`Exec` は呼び出し元に deadline がない場合 30 秒の既定 deadline を適用し、`WithExecTimeout(0)` は意図的な長時間実行 command のための明示的な escape hatch とする。`Exec` のインフラ確認には、期限付きの後続 context を使うことがある。共有 pull のリーダー以外の操作でライブラリ側の既定を適用するときには、既存の呼び出し元 deadline を保持する。timeout の分類は structured context、`Timeout() bool`、signal の証拠だけを使い、arbitrary な workload stderr を timeout として解釈しない。コンテキスト取消時は直接の CLI 子プロセスを kill して回収する。Unix は所有中の CLI process group に残った descendant へベストエフォートの `SIGKILL` を送ることがあるが、回収はせず、停止状態を確認できない場合や回収後は古い数値 PGID に signal を送らない。Windows は保持した process handle で直接の子だけを終了する。子孫の回収は保証しない。
 
 ## エラー処理
 

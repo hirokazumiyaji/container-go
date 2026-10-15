@@ -529,11 +529,8 @@ func (e *contextStrippedCause) Error() string {
 			}
 		}
 		if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-			if idx := strings.Index(orig, innerText); idx >= 0 {
-				cleaned := strings.TrimSpace(strings.Trim(orig[:idx]+orig[idx+len(innerText):], ":;"))
-				if cleaned != "" {
-					return cleaned
-				}
+			if cleaned := rewriteInnerErrorText(orig, innerText, ""); cleaned != "" {
+				return cleaned
 			}
 		}
 		return orig
@@ -543,11 +540,8 @@ func (e *contextStrippedCause) Error() string {
 	// while replacing the unfiltered inner rendering so stripped context
 	// sentinels do not remain in user-facing diagnostics.
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-		if strings.HasSuffix(orig, innerText) {
-			return strings.TrimSuffix(orig, innerText) + causeText
-		}
-		if idx := strings.Index(orig, innerText); idx >= 0 {
-			return orig[:idx] + causeText + orig[idx+len(innerText):]
+		if cleaned := rewriteInnerErrorText(orig, innerText, causeText); cleaned != "" {
+			return cleaned
 		}
 	}
 	if inners := multiUnwrap(e.original); len(inners) > 0 {
@@ -556,6 +550,25 @@ func (e *contextStrippedCause) Error() string {
 		}
 	}
 	return causeText
+}
+
+// rewriteInnerErrorText replaces every rendering of the unfiltered inner text.
+// A single-%w wrapper may also interpolate the same inner via %s/%v, so only
+// rewriting the suffix/%w occurrence would leave context sentinel text behind.
+func rewriteInnerErrorText(orig, innerText, repl string) string {
+	if innerText == "" || !strings.Contains(orig, innerText) {
+		return ""
+	}
+	cleaned := strings.ReplaceAll(orig, innerText, repl)
+	if repl == "" {
+		cleaned = strings.TrimSpace(cleaned)
+		cleaned = strings.Trim(cleaned, ":;")
+		cleaned = strings.TrimSpace(cleaned)
+	}
+	if cleaned == "" || cleaned == orig {
+		return ""
+	}
+	return cleaned
 }
 
 func multiUnwrap(err error) []error {
@@ -691,14 +704,41 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 	masked := orig
 	for _, e := range edits {
 		masked = masked[:e.start] + e.repl + masked[e.end:]
+		if e.repl == "" {
+			// Tidy delimiters only at the removal junction so retained causes
+			// such as "parser saw: ; token" are not rewritten.
+			masked = tidyDelimiterJunction(masked, e.start)
+		}
 	}
-	// Only tidy delimiters left by removals; do not collapse intentional
-	// whitespace inside retained backend diagnostics.
-	masked = strings.ReplaceAll(masked, ": ;", ":")
-	masked = strings.ReplaceAll(masked, "; ;", ";")
 	masked = strings.TrimSpace(masked)
 	masked = strings.Trim(masked, ":;")
 	return strings.TrimSpace(masked)
+}
+
+// tidyDelimiterJunction collapses delimiter pairs created by removing a child
+// span. The scan is limited to a small window around the junction.
+func tidyDelimiterJunction(s string, at int) string {
+	if at < 0 {
+		at = 0
+	}
+	if at > len(s) {
+		at = len(s)
+	}
+	lo := at - 2
+	if lo < 0 {
+		lo = 0
+	}
+	hi := at + 2
+	if hi > len(s) {
+		hi = len(s)
+	}
+	window := s[lo:hi]
+	cleaned := strings.ReplaceAll(window, ": ;", ":")
+	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")
+	if cleaned == window {
+		return s
+	}
+	return s[:lo] + cleaned + s[hi:]
 }
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 

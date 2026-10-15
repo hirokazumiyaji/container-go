@@ -963,6 +963,34 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("mid %%w framing = %q, must not render stripped context", got.Error())
 	}
 
+	// Single-%w wrappers that also interpolate the inner via %s must rewrite
+	// every copy, not only the suffix/%w occurrence.
+	innerJoin := errors.Join(context.Canceled, cause)
+	dupSingle := fmt.Errorf("note=%s; wrapped=%w", innerJoin, innerJoin)
+	got = nonContextCause(dupSingle)
+	if !errors.Is(got, cause) {
+		t.Fatalf("duplicated single-wrap inner = %v, want cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("duplicated single-wrap inner = %v, must drop canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("duplicated single-wrap inner = %q, must rewrite every inner copy", got.Error())
+	}
+	if !strings.Contains(got.Error(), "backend failure") {
+		t.Fatalf("duplicated single-wrap inner = %q, want cause text", got.Error())
+	}
+
+	delimCause := errors.New("parser saw: ; token")
+	delimWrap := fmt.Errorf("stream: %w; backend: %w", context.Canceled, delimCause)
+	got = nonContextCause(delimWrap)
+	if !strings.Contains(got.Error(), "parser saw: ; token") {
+		t.Fatalf("delimiter in backend diagnostic = %q, want intact retained cause", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("delimiter in backend diagnostic = %q, must not render stripped context", got.Error())
+	}
+
 	a := errors.New("alpha failure")
 	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
 	got = nonContextCause(reordered)

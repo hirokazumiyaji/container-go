@@ -344,19 +344,27 @@ func nonContextCause(err error) error {
 	return filtered
 }
 
-// retainedNonContextCause is like nonContextCause but treats a fully stripped
-// diagnostic facade (contextStrippedCause with a nil cause) as absent for
-// permanent-failure control flow. Custom wrappers around context-only
-// *exec.Error trees must retry, not stop on the first check.
+// retainedNonContextCause is like nonContextCause but treats fully stripped
+// diagnostic facades as absent for permanent-failure control flow. Nested
+// contextStrippedCause layers whose only remaining cause is another empty
+// facade (for example fmt wrapping a custom wrapper around context-only
+// *exec.Error) must also retry, not stop on the first check.
 func retainedNonContextCause(err error) error {
 	filtered := nonContextCause(err)
 	if filtered == nil {
 		return nil
 	}
-	if stripped, ok := filtered.(*contextStrippedCause); ok && stripped.cause == nil {
-		return nil
+	cur := filtered
+	for {
+		stripped, ok := cur.(*contextStrippedCause)
+		if !ok {
+			return filtered
+		}
+		if stripped.cause == nil {
+			return nil
+		}
+		cur = stripped.cause
 	}
-	return filtered
 }
 
 // filterNonContext is the implementation of nonContextCause. The changed

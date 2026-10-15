@@ -115,7 +115,9 @@ type stdoutRunner struct {
 
 func (s *stdoutRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "logs" {
+		s.mu.Lock()
 		s.calls = append(s.calls, args)
+		s.mu.Unlock()
 		return []byte(s.stdout), nil, nil
 	}
 	return s.fakeRunner.Run(ctx, args...)

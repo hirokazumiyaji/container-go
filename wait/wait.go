@@ -1457,6 +1457,39 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 			start = prevEnd
 		}
 	}
+	start, end = expandPairedDelimiters(orig, start, end, occupied)
+	// Absorb any separators left beside a removed pair (for example the space
+	// after "[canceled] backend").
+	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
+		end++
+	}
+	if prevEnd >= 0 {
+		onlySeparators := true
+		for i := prevEnd; i < start; i++ {
+			if !isErrorSeparator(orig[i]) {
+				onlySeparators = false
+				break
+			}
+		}
+		if onlySeparators {
+			start = prevEnd
+		}
+	}
+	return start, end
+}
+
+// expandPairedDelimiters absorbs a balanced (), [], or {} pair that wraps only
+// the discarded span (after separator expansion). Pairs around retained children
+// stay intact because those spans remain occupied.
+func expandPairedDelimiters(orig string, start, end int, occupied []bool) (int, int) {
+	if start <= 0 || end >= len(orig) || occupied[start-1] || occupied[end] {
+		return start, end
+	}
+	for _, pair := range [][2]byte{{'(', ')'}, {'[', ']'}, {'{', '}'}} {
+		if orig[start-1] == pair[0] && orig[end] == pair[1] {
+			return start - 1, end + 1
+		}
+	}
 	return start, end
 }
 
@@ -1521,13 +1554,14 @@ func (e *contextStrippedCause) As(target any) bool {
 			return true
 		}
 	}
-	// Do not expose unfiltered standard-library carriers via As; their Err
-	// fields may still match context even after the top-level error strips it.
-	if isStdlibPackagePath(errorPkgPath(e.original)) {
+	// Do not expose unfiltered wrappers that still Unwrap to discarded context
+	// children. Opaque facades without Unwrap may keep their concrete As type.
+	if _, ok := e.original.(interface{ Unwrap() error }); ok {
 		return false
 	}
-	// Match the original wrapper's concrete type without recursively searching
-	// discarded children that may still carry context sentinels.
+	if _, ok := e.original.(interface{ Unwrap() []error }); ok {
+		return false
+	}
 	return asExactType(e.original, target)
 }
 

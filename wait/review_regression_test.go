@@ -682,8 +682,8 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("mixed multi wrapper = %v", got)
 	}
 	var gotMulti *reviewMultiWrapper
-	if !errors.As(got, &gotMulti) {
-		t.Fatalf("mixed multi wrapper = %v, want original type via As", got)
+	if errors.As(got, &gotMulti) {
+		t.Fatalf("mixed multi wrapper exposed unfiltered *reviewMultiWrapper via As")
 	}
 
 	onlyContext := &reviewMultiWrapper{errs: []error{context.Canceled, context.DeadlineExceeded}}
@@ -694,8 +694,8 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if errors.Is(got, context.Canceled) || errors.Is(got, context.DeadlineExceeded) {
 		t.Fatalf("context-only multi wrapper = %v, must suppress context", got)
 	}
-	if !errors.As(got, &gotMulti) {
-		t.Fatalf("context-only multi wrapper = %v, want original type via As", got)
+	if errors.As(got, &gotMulti) {
+		t.Fatalf("context-only multi wrapper exposed unfiltered *reviewMultiWrapper via As")
 	}
 	if join := errors.Join(context.Canceled, context.DeadlineExceeded); nonContextCause(join) != nil {
 		t.Fatalf("stdlib join of only context = %v, want nil", nonContextCause(join))
@@ -808,8 +808,8 @@ func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
 		t.Fatalf("virtual As wrapper = %v, want virtual classification via As", got)
 	}
 	var gotWrapper *reviewVirtualAsWrapper
-	if !errors.As(got, &gotWrapper) {
-		t.Fatalf("virtual As wrapper = %v, want original type via As", got)
+	if errors.As(got, &gotWrapper) {
+		t.Fatalf("virtual As wrapper exposed unfiltered *reviewVirtualAsWrapper via As")
 	}
 
 	// A custom As that walks unfiltered children must still not expose a
@@ -1287,7 +1287,25 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("paren wrap = %v, want cause", got)
 	}
 	if got.Error() != "(backend)" {
-		t.Fatalf("paren wrap = %q, want intact paired parentheses", got.Error())
+		t.Fatalf("paren wrap = %q, want intact paired parentheses around retained child", got.Error())
+	}
+
+	bracketDiscarded := fmt.Errorf("[%w] %w", context.Canceled, commaCause)
+	got = nonContextCause(bracketDiscarded)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("bracket-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("bracket-discarded wrap = %q, want balanced brackets removed with discarded child", got.Error())
+	}
+
+	bracketTrailing := fmt.Errorf("%w [%w]", commaCause, context.Canceled)
+	got = nonContextCause(bracketTrailing)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("trailing bracket-discarded wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("trailing bracket-discarded wrap = %q, want balanced brackets removed", got.Error())
 	}
 
 	spacedCause := errors.New(" backend ")
@@ -1436,8 +1454,8 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 		t.Fatalf("custom wrapper = %v, must not retain canceled branch", got)
 	}
 	var gotWrapper *reviewStreamWrapper
-	if !errors.As(got, &gotWrapper) {
-		t.Fatalf("custom wrapper = %v, want *reviewStreamWrapper via As", got)
+	if errors.As(got, &gotWrapper) {
+		t.Fatalf("custom wrapper exposed unfiltered *reviewStreamWrapper via As")
 	}
 }
 

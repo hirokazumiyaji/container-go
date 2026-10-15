@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -596,6 +597,23 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 	}
 	if !strings.Contains(got.Error(), "follow logs:") {
 		t.Fatalf("nonContextCause = %v, want wrapper diagnostic text", got)
+	}
+
+	op := &net.OpError{Op: "read", Net: "tcp", Err: errors.Join(context.Canceled, cause)}
+	nested := fmt.Errorf("follow logs: %w", op)
+	got = nonContextCause(nested)
+	if !errors.Is(got, cause) {
+		t.Fatalf("nested wrapper = %v, want typed cause", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("nested wrapper = %v, must not retain canceled branch", got)
+	}
+	if !strings.Contains(got.Error(), "follow logs:") {
+		t.Fatalf("nested wrapper = %v, want outer diagnostic text", got)
+	}
+	var gotOp *net.OpError
+	if !errors.As(got, &gotOp) {
+		t.Fatalf("nested wrapper = %v, want *net.OpError via As", got)
 	}
 }
 

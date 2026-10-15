@@ -355,8 +355,9 @@ func nonContextCause(err error) error {
 // branch was stripped. Typed net.OpError values are cloned; other wrappers
 // keep their Error() text while exposing the filtered cause to errors.Is.
 func replaceUnwrappedCause(err, filtered error) error {
-	var op *net.OpError
-	if errors.As(err, &op) {
+	// Match only the current node. Nested *net.OpError values are rebuilt by
+	// recursion so outer wrappers keep their diagnostics.
+	if op, ok := err.(*net.OpError); ok {
 		clone := *op
 		clone.Err = filtered
 		return &clone

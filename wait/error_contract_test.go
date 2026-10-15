@@ -455,7 +455,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			make: func() Strategy {
 				return ForExec([]string{"pg_isready"}).WithStartupTimeout(time.Hour).WithPollInterval(5 * time.Millisecond)
 			},
-			trigger: "deadline",
+			trigger: "exec-deadline",
 			want:    context.DeadlineExceeded,
 		},
 		{
@@ -471,7 +471,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			make: func() Strategy {
 				return ForLog("never").WithStartupTimeout(time.Hour)
 			},
-			trigger: "deadline",
+			trigger: "running-deadline",
 			want:    context.DeadlineExceeded,
 		},
 	}
@@ -482,9 +482,14 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			target := newWaitDiagnosticTarget()
 			var ctx context.Context
 			var cancel context.CancelFunc
-			if tc.trigger == "deadline" {
-				ctx, cancel = context.WithTimeout(context.Background(), 150*time.Millisecond)
-			} else {
+			var expire func()
+			switch tc.trigger {
+			case "exec-deadline", "running-deadline":
+				caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+				ctx = caller
+				cancel = func() {}
+				expire = caller.expire
+			default:
 				ctx, cancel = context.WithCancel(context.Background())
 			}
 			defer cancel()
@@ -503,6 +508,15 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("exec probe did not start")
 				}
+			case "exec-deadline":
+				select {
+				case <-target.execStarted:
+					expire()
+				case err := <-done:
+					t.Fatalf("wait returned before exec probe started: %v", err)
+				case <-time.After(time.Second):
+					t.Fatal("exec probe did not start")
+				}
 			case "running":
 				select {
 				case <-target.runningStarted:
@@ -512,12 +526,14 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 				case <-time.After(time.Second):
 					t.Fatal("diagnostic probe did not start")
 				}
-			}
-			if tc.trigger == "deadline" && tc.name == "log-deadline" {
+			case "running-deadline":
 				select {
 				case <-target.runningStarted:
-				case <-time.After(100 * time.Millisecond):
-					t.Fatal("log diagnostic probe did not start")
+					expire()
+				case err := <-done:
+					t.Fatalf("wait returned before diagnostic probe started: %v", err)
+				case <-time.After(time.Second):
+					t.Fatal("diagnostic probe did not start")
 				}
 			}
 

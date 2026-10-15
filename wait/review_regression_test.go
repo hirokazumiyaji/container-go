@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 type reviewTypedCause struct {
@@ -807,6 +809,36 @@ func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 	}
 	if got := nonContextCause(&reviewOpaqueFacade{err: errors.Join(context.Canceled, context.DeadlineExceeded)}); got != nil {
 		t.Fatalf("context-only opaque join = %v, want nil", got)
+	}
+}
+
+func TestNonContextCauseRetainsRedactorOnFilteredCause(t *testing.T) {
+	secret := "super-secret-token"
+	cliErr := &cli.CLIError{
+		Args:     []string{"logs", "--follow", "ctr"},
+		ExitCode: 1,
+		Stderr:   "follow failed: " + secret,
+	}
+	opaque := cli.WithRedactor(errors.Join(context.Canceled, cliErr), cli.NewRedactor(secret))
+	got := nonContextCause(opaque)
+	if got == nil {
+		t.Fatal("redacted mixed facade dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("redacted facade = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, cliErr) {
+		t.Fatalf("redacted facade = %v, want CLIError via Is", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("redacted facade Error leaked secret: %q", got.Error())
+	}
+	var gotCLI *cli.CLIError
+	if !errors.As(got, &gotCLI) {
+		t.Fatalf("redacted facade = %v, want *cli.CLIError via As", got)
+	}
+	if strings.Contains(gotCLI.Error(), secret) {
+		t.Fatalf("errors.As CLIError leaked secret: %q", gotCLI.Error())
 	}
 }
 

@@ -381,11 +381,27 @@ func nonContextCause(err error) error {
 			if filtered == nil {
 				return nil
 			}
+			filtered = retainDiagnosticFacade(err, filtered)
 			return &contextStrippedCause{original: err, cause: filtered}
 		}
 		return nil
 	}
 	return err
+}
+
+// retainDiagnosticFacade reapplies an opaque facade's redactor onto the
+// filtered cause so Error/As cannot expose secrets that only that redactor
+// knew how to protect.
+func retainDiagnosticFacade(facade, filtered error) error {
+	type redactorProvider interface {
+		DiagnosticRedactor() *cli.Redactor
+	}
+	if provider, ok := facade.(redactorProvider); ok {
+		if r := provider.DiagnosticRedactor(); r != nil {
+			return cli.WithRedactor(filtered, r)
+		}
+	}
+	return filtered
 }
 
 // preserveEmptyContextWrapper keeps a custom wrapper's type and Is surface

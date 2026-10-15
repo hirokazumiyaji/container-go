@@ -1413,7 +1413,7 @@ func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int,
 }
 
 func isErrorSeparator(b byte) bool {
-	return b == ';' || b == ':' || b == ',' || b == ' ' || b == '\n' || b == '\r'
+	return b == ';' || b == ':' || b == ',' || b == ' ' || b == '\t' || b == '\n' || b == '\r'
 }
 
 // stripContextSentinelPhrases removes canceled/deadline wording from a

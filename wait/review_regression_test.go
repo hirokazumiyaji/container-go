@@ -1211,6 +1211,15 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("newline-delimited wrap = %q, want absorbed newline framing", got.Error())
 	}
 
+	tabWrap := fmt.Errorf("%w\t%w", context.Canceled, commaCause)
+	got = nonContextCause(tabWrap)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("tab-delimited wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("tab-delimited wrap = %q, want absorbed tab framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)
@@ -2038,4 +2047,45 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
+	terminal := &cli.CLIError{
+		Args:     []string{"logs", "--follow", "ctr"},
+		ExitCode: 1,
+		Stderr:   "container exited",
+	}
+	target := &reviewTerminalJoinedContextTarget{err: errors.Join(context.Canceled, terminal)}
+	err := ForLog("never").
+		WithStartupTimeout(300 * time.Millisecond).
+		WithPollInterval(time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected terminal log stream error")
+	}
+	if !errors.Is(err, terminal) {
+		t.Fatalf("error = %v, want terminal CLIError", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	var gotCLI *cli.CLIError
+	if !errors.As(err, &gotCLI) {
+		t.Fatalf("error = %v, want *cli.CLIError via As", err)
+	}
+}
+
+type reviewTerminalJoinedContextTarget struct {
+	err error
+}
+
+func (*reviewTerminalJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*reviewTerminalJoinedContextTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *reviewTerminalJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return nil, t.err
+}
+func (*reviewTerminalJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
 }

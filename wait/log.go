@@ -657,7 +657,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				return terminalErr
 			}
 			if isPermanentCheckError(err) || isTerminalStreamError(err) {
-				return wrapWaitCause(what, err, lastProbeErr)
+				cause := err
+				if filtered := nonContextCause(err); filtered != nil {
+					cause = filtered
+				}
+				return wrapWaitCause(what, cause, lastProbeErr)
 			}
 		} else {
 			result := scanLogStreamTarget(waitCtx, target, stream, match, s.occurrences, replay)
@@ -700,7 +704,11 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 					return terminalErr
 				}
 				if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
-					return wrapWaitCause(what, result.err, lastProbeErr)
+					cause := result.err
+					if filtered := nonContextCause(result.err); filtered != nil {
+						cause = filtered
+					}
+					return wrapWaitCause(what, cause, lastProbeErr)
 				}
 			}
 		}

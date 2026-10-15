@@ -215,11 +215,13 @@ func TestBuiltInWaitContextErrorMatrix(t *testing.T) {
 						t.Fatalf("error = %v, unexpected context.Canceled match", err)
 					}
 					// Composite strategies run a lifecycle monitor that may
-					// observe Running once while noticing cancellation. The
-					// budget contract is that the wait still returns promptly
-					// with the caller's context error.
+					// observe Running once while noticing cancellation. ForLog
+					// can likewise select its lifecycle ticker in the same
+					// turn as a ready deadline and probe with an already-
+					// canceled context. The budget contract is that the wait
+					// still returns promptly with the caller's context error.
 					if tc.callerMode != "background" &&
-						factory.name != "all" && factory.name != "any" &&
+						factory.name != "all" && factory.name != "any" && factory.name != "log" &&
 						target.runningAfterCallerDone.Load() != 0 {
 						t.Fatalf("Running was called %d time(s) after caller termination", target.runningAfterCallerDone.Load())
 					}

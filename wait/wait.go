@@ -535,7 +535,7 @@ func (e *contextStrippedCause) Error() string {
 			}
 		}
 		if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-			if cleaned := rewriteInnerErrorText(orig, innerText, ""); cleaned != "" {
+			if cleaned, ok := rewriteInnerErrorText(orig, innerText, ""); ok {
 				return cleaned
 			}
 		}
@@ -546,7 +546,7 @@ func (e *contextStrippedCause) Error() string {
 	// while replacing the unfiltered inner rendering so stripped context
 	// sentinels do not remain in user-facing diagnostics.
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" {
-		if cleaned := rewriteInnerErrorText(orig, innerText, causeText); cleaned != "" {
+		if cleaned, ok := rewriteInnerErrorText(orig, innerText, causeText); ok {
 			return cleaned
 		}
 	}
@@ -575,20 +575,22 @@ func (e *contextStrippedCause) Error() string {
 // rewriteInnerErrorText replaces every rendering of the unfiltered inner text.
 // A single-%w wrapper may also interpolate the same inner via %s/%v, so only
 // rewriting the suffix/%w occurrence would leave context sentinel text behind.
-func rewriteInnerErrorText(orig, innerText, repl string) string {
+// ok is true when at least one occurrence was rewritten, even if the result is
+// empty (fully stripped context-only wrappers must not restore orig).
+func rewriteInnerErrorText(orig, innerText, repl string) (string, bool) {
 	if innerText == "" || !strings.Contains(orig, innerText) {
-		return ""
+		return "", false
 	}
 	cleaned := strings.ReplaceAll(orig, innerText, repl)
+	if cleaned == orig {
+		return "", false
+	}
 	if repl == "" {
 		cleaned = strings.TrimSpace(cleaned)
 		cleaned = strings.Trim(cleaned, ":;")
 		cleaned = strings.TrimSpace(cleaned)
 	}
-	if cleaned == "" || cleaned == orig {
-		return ""
-	}
-	return cleaned
+	return cleaned, true
 }
 
 func multiUnwrap(err error) []error {

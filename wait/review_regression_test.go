@@ -703,6 +703,18 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("context-only custom wrapper = %q, must not render stripped context", got.Error())
 	}
 
+	passthrough := &reviewPassthroughWrapper{err: context.Canceled}
+	got = nonContextCause(passthrough)
+	if got == nil {
+		t.Fatal("context-only passthrough wrapper dropped")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("context-only passthrough wrapper = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("context-only passthrough wrapper = %q, must not restore stripped text", got.Error())
+	}
+
 	if got := nonContextCause(&net.OpError{Op: "read", Net: "tcp", Err: context.Canceled}); got != nil {
 		t.Fatalf("context-only *net.OpError = %v, want nil", got)
 	}
@@ -1030,6 +1042,14 @@ func (e *reviewContextMatchingWrapper) Unwrap() error  { return e.err }
 func (e *reviewContextMatchingWrapper) Is(target error) bool {
 	return target == context.Canceled || errors.Is(e.err, target)
 }
+
+// reviewPassthroughWrapper renders exactly its child text with no framing.
+type reviewPassthroughWrapper struct {
+	err error
+}
+
+func (e *reviewPassthroughWrapper) Error() string { return e.err.Error() }
+func (e *reviewPassthroughWrapper) Unwrap() error  { return e.err }
 
 func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failure"}

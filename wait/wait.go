@@ -548,6 +548,14 @@ func (e *contextStrippedCause) Error() string {
 		if cleaned := replaceDiscardedErrorText(orig, inners, e.cause); cleaned != "" {
 			return cleaned
 		}
+		// Ambiguous multi-child framing: prefer filtered cause text.
+		return causeText
+	}
+	// Single-error wrapper whose Error() omits the inner text (redactors /
+	// secret-scrubbing wrappers): keep that safe rendering rather than
+	// exposing cause.Error().
+	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && !strings.Contains(orig, innerText) {
+		return orig
 	}
 	return causeText
 }

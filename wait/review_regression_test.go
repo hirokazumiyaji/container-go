@@ -1177,6 +1177,37 @@ func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 	}
 }
 
+// reviewSanitizingWrapper unwraps a raw cause tree but never renders it.
+type reviewSanitizingWrapper struct {
+	err error
+}
+
+func (e *reviewSanitizingWrapper) Error() string { return "operation failed" }
+func (e *reviewSanitizingWrapper) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.err
+}
+
+func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
+	secret := "super-secret-token"
+	wrapped := &reviewSanitizingWrapper{err: errors.Join(context.Canceled, errors.New(secret))}
+	got := nonContextCause(wrapped)
+	if got == nil {
+		t.Fatal("sanitizing wrapper dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("sanitizing wrapper = %v, must suppress canceled", got)
+	}
+	if strings.Contains(got.Error(), secret) {
+		t.Fatalf("sanitizing wrapper Error leaked secret: %q", got.Error())
+	}
+	if got.Error() != "operation failed" {
+		t.Fatalf("sanitizing wrapper = %q, want original safe rendering", got.Error())
+	}
+}
+
 func TestNonContextCauseRetainsRedactorOnFilteredCause(t *testing.T) {
 	secret := "super-secret-token"
 	cliErr := &cli.CLIError{

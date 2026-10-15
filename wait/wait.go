@@ -553,7 +553,7 @@ func (e *contextStrippedCause) Error() string {
 				return cleaned
 			}
 		}
-		return orig
+		return stripContextSentinelPhrases(orig)
 	}
 	causeText := e.cause.Error()
 	// Preserve wrapper framing (for example "follow logs: " or "follow %w failed")
@@ -784,76 +784,53 @@ func replaceDiscardedErrorText(orig string, inners []error, _ error) string {
 			return ""
 		}
 		masked = masked[:e.start] + e.repl + masked[e.end:]
-		if e.repl == "" {
-			// Tidy delimiters only at the removal junction so retained causes
-			// such as "parser saw: ; token" are not rewritten.
-			masked = tidyDelimiterJunction(masked, e.start)
-		}
 	}
 	// Trim only whitespace. Do not strip leading/trailing :/; which may be
-	// part of a retained diagnostic such as ":backend:".
+	// part of a retained diagnostic such as ":backend:". Separator cleanup for
+	// discarded children happens in expandRemovalSeparators before edits apply,
+	// so we never mutate offsets of remaining edits.
 	return strings.TrimSpace(masked)
 }
 
-// expandRemovalSeparators absorbs separators adjacent to a discarded child when
-// that child sits at the start or end of the message, so a retained cause like
-// ":backend:" is not left with a leading "; " that later cleanup would have to
-// strip by trimming meaningful punctuation from the cause itself.
-// Expansion never enters spans already claimed by another child, which would
-// otherwise produce overlapping edits and panic while rebuilding the message.
+// expandRemovalSeparators absorbs unoccupied separators adjacent to a discarded
+// child on either side. Expansion never enters spans already claimed by another
+// child, which would otherwise produce overlapping edits or drop retained text.
 func expandRemovalSeparators(orig string, start, end int, occupied []bool) (int, int) {
-	if start == 0 {
-		for end < len(orig) && !occupied[end] && (orig[end] == ';' || orig[end] == ':' || orig[end] == ' ') {
-			// Stop before consuming punctuation that belongs to the next child
-			// (for example the leading ':' of ":backend:").
-			if orig[end] == ':' || orig[end] == ';' {
-				if end+1 < len(orig) && orig[end+1] != ' ' && orig[end+1] != ';' && orig[end+1] != ':' {
-					// Lone delimiter glued to the next token — leave it.
-					break
-				}
-			}
-			end++
+	for end < len(orig) && !occupied[end] && isErrorSeparator(orig[end]) {
+		// Stop before consuming punctuation that belongs to the next child
+		// (for example the leading ':' of ":backend:").
+		if (orig[end] == ':' || orig[end] == ';') &&
+			end+1 < len(orig) && !isErrorSeparator(orig[end+1]) {
+			break
 		}
-		return start, end
+		end++
 	}
-	if end == len(orig) {
-		for start > 0 && !occupied[start-1] && (orig[start-1] == ';' || orig[start-1] == ':' || orig[start-1] == ' ') {
-			if orig[start-1] == ':' || orig[start-1] == ';' {
-				if start >= 2 && orig[start-2] != ' ' && orig[start-2] != ';' && orig[start-2] != ':' {
-					break
-				}
-			}
-			start--
+	for start > 0 && !occupied[start-1] && isErrorSeparator(orig[start-1]) {
+		if (orig[start-1] == ':' || orig[start-1] == ';') &&
+			start >= 2 && !isErrorSeparator(orig[start-2]) {
+			break
 		}
-		return start, end
+		start--
 	}
 	return start, end
 }
 
-// tidyDelimiterJunction collapses delimiter pairs created by removing a child
-// span. The scan is limited to a small window around the junction.
-func tidyDelimiterJunction(s string, at int) string {
-	if at < 0 {
-		at = 0
+func isErrorSeparator(b byte) bool {
+	return b == ';' || b == ':' || b == ' '
+}
+
+// stripContextSentinelPhrases removes canceled/deadline wording from a
+// context-only wrapper's Error text when framed reconstruction is unavailable.
+func stripContextSentinelPhrases(orig string) string {
+	cleaned := orig
+	for _, phrase := range []string{"context canceled", "context deadline exceeded"} {
+		cleaned = strings.ReplaceAll(cleaned, phrase, "")
 	}
-	if at > len(s) {
-		at = len(s)
-	}
-	lo := at - 2
-	if lo < 0 {
-		lo = 0
-	}
-	hi := at + 2
-	if hi > len(s) {
-		hi = len(s)
-	}
-	window := s[lo:hi]
-	cleaned := strings.ReplaceAll(window, ": ;", ":")
+	cleaned = strings.ReplaceAll(cleaned, ": ;", ":")
 	cleaned = strings.ReplaceAll(cleaned, "; ;", ";")
-	if cleaned == window {
-		return s
-	}
-	return s[:lo] + cleaned + s[hi:]
+	cleaned = strings.TrimSpace(cleaned)
+	cleaned = strings.Trim(cleaned, ":;")
+	return strings.TrimSpace(cleaned)
 }
 func (e *contextStrippedCause) Unwrap() error { return e.cause }
 

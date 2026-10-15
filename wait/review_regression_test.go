@@ -1066,6 +1066,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("adjacent spaced cause = %q, must not render stripped context", got.Error())
 	}
 
+	// Middle discarded child must not let junction cleanup drop a later cause.
+	left := errors.New("x: ")
+	right := errors.New("y")
+	middle := fmt.Errorf("%w%w;%w", left, context.Canceled, right)
+	got = nonContextCause(middle)
+	if !errors.Is(got, left) || !errors.Is(got, right) {
+		t.Fatalf("middle discarded child = %v, want both retained causes", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("middle discarded child = %v, must drop canceled", got)
+	}
+	if !strings.Contains(got.Error(), "y") {
+		t.Fatalf("middle discarded child = %q, want retained trailing cause", got.Error())
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("middle discarded child = %q, must not render stripped context", got.Error())
+	}
+
 	a := errors.New("alpha failure")
 	reordered := fmt.Errorf("ctx=%[2]w; a=%[1]w; b=%[3]w", a, context.Canceled, nestedChild)
 	got = nonContextCause(reordered)
@@ -1266,6 +1284,47 @@ func TestNonContextCauseRetainsOpaqueIsAsWithoutUnwrap(t *testing.T) {
 	var gotFacade *reviewOpaqueIsAsFacade
 	if !errors.As(got, &gotFacade) {
 		t.Fatalf("opaque Is/As facade = %v, want original type via As", got)
+	}
+}
+
+type reviewOpaqueContextTextFacade struct {
+	backend error
+}
+
+func (e *reviewOpaqueContextTextFacade) Error() string {
+	return "context canceled: backend failed"
+}
+func (e *reviewOpaqueContextTextFacade) Is(target error) bool {
+	if e == nil {
+		return false
+	}
+	return target == context.Canceled || errors.Is(e.backend, target)
+}
+func (e *reviewOpaqueContextTextFacade) As(target any) bool {
+	if e == nil || e.backend == nil {
+		return false
+	}
+	return errors.As(e.backend, target)
+}
+
+func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
+	backend := &reviewTypedCause{message: "backend failed"}
+	facade := &reviewOpaqueContextTextFacade{backend: backend}
+	got := nonContextCause(facade)
+	if got == nil {
+		t.Fatal("opaque context-text facade dropped entirely")
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("opaque context-text facade = %v, must suppress canceled", got)
+	}
+	if !errors.Is(got, backend) {
+		t.Fatalf("opaque context-text facade = %v, want backend via Is", got)
+	}
+	if strings.Contains(got.Error(), "context canceled") {
+		t.Fatalf("opaque context-text facade = %q, must strip canceled wording", got.Error())
+	}
+	if !strings.Contains(got.Error(), "backend failed") {
+		t.Fatalf("opaque context-text facade = %q, want backend diagnostic text", got.Error())
 	}
 }
 

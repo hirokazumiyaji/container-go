@@ -598,6 +598,31 @@ func (e *reviewMultiWrapper) Unwrap() []error {
 	return out
 }
 
+type reviewSliceError []string
+
+func (e reviewSliceError) Error() string { return strings.Join(e, ",") }
+
+func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
+	nc := reviewSliceError{"backend", "failure"}
+	joined := errors.Join(nc, errors.New("other"))
+	got := nonContextCause(joined)
+	if got != joined {
+		t.Fatalf("non-comparable join = %v (%T), want original", got, got)
+	}
+	mixed := errors.Join(context.Canceled, nc)
+	got = nonContextCause(mixed)
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("mixed non-comparable = %v, must drop canceled", got)
+	}
+	if !errors.Is(got, nc) && got.Error() != nc.Error() {
+		// reviewSliceError is not comparable for errors.Is equality by value;
+		// at least retain its diagnostic text through the filtered tree.
+		if !strings.Contains(got.Error(), "backend") {
+			t.Fatalf("mixed non-comparable = %v, want retained diagnostic", got)
+		}
+	}
+}
+
 func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	a := errors.New("backend a")
 	b := errors.New("backend b")

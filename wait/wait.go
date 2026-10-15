@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -328,7 +329,7 @@ func nonContextCause(err error) error {
 				changed = true
 				continue
 			}
-			if cause != inner {
+			if !sameError(cause, inner) {
 				changed = true
 			}
 			kept = append(kept, cause)
@@ -354,7 +355,7 @@ func nonContextCause(err error) error {
 		if filtered == nil {
 			return nil
 		}
-		if filtered == inner {
+		if sameError(filtered, inner) {
 			return err
 		}
 		return replaceUnwrappedCause(err, filtered)
@@ -363,6 +364,27 @@ func nonContextCause(err error) error {
 		return nil
 	}
 	return err
+}
+
+// sameError reports whether a and b are the same error value without
+// panicking on non-comparable dynamic types.
+func sameError(a, b error) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
+	if !va.IsValid() || !vb.IsValid() || va.Type() != vb.Type() {
+		return false
+	}
+	if va.Comparable() {
+		return va.Interface() == vb.Interface()
+	}
+	switch va.Kind() {
+	case reflect.Pointer, reflect.Map, reflect.Chan, reflect.Func, reflect.UnsafePointer, reflect.Slice:
+		return va.Pointer() == vb.Pointer()
+	default:
+		return false
+	}
 }
 
 // replaceUnwrappedCause keeps wrapper diagnostics after a nested context

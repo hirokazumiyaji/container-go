@@ -2999,6 +2999,47 @@ func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestRetainedNonContextCauseOpaqueTerminalFacade(t *testing.T) {
+	// Opaque Is(Canceled) facade that only exposes *cli.CLIError via As filters
+	// to an empty contextStrippedCause. Terminal classification must still be
+	// retained so ForLog fails fast instead of reconnecting until timeout.
+	err := &reviewOpaqueTerminalFacade{}
+	got := retainedNonContextCause(err)
+	if got == nil {
+		t.Fatal("retainedNonContextCause = nil, want opaque terminal facade")
+	}
+	if !isTerminalStreamError(got) {
+		t.Fatalf("retained = %v, want terminal stream classification", got)
+	}
+	if errors.Is(got, context.Canceled) {
+		t.Fatalf("retained = %v, must not match canceled", got)
+	}
+	var gotCLI *cli.CLIError
+	if !errors.As(got, &gotCLI) {
+		t.Fatalf("retained = %v, want *cli.CLIError via As", got)
+	}
+}
+
+func TestForLogOpaqueTerminalFacadeFailsFast(t *testing.T) {
+	target := &reviewOpaqueTerminalFacadeTarget{}
+	err := ForLog("never").
+		WithStartupTimeout(500 * time.Millisecond).
+		WithPollInterval(50 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err == nil {
+		t.Fatal("expected terminal opaque facade failure")
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want immediate terminal failure, not startup timeout", err)
+	}
+	if errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, must not match canceled while caller is active", err)
+	}
+	if target.followCalls.Load() != 1 {
+		t.Fatalf("FollowLogs calls = %d, want immediate terminal failure without reconnects", target.followCalls.Load())
+	}
+}
+
 func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 	target := &reviewPermanentProbeJoinedContextTarget{}
 	err := ForLog("never").
@@ -3103,6 +3144,42 @@ func (t *reviewTerminalJoinedContextTarget) FollowLogs(context.Context) (io.Read
 	return nil, t.err
 }
 func (*reviewTerminalJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, nil
+}
+
+type reviewOpaqueTerminalFacade struct{}
+
+func (*reviewOpaqueTerminalFacade) Error() string { return "opaque terminal canceled" }
+func (*reviewOpaqueTerminalFacade) Is(target error) bool {
+	return target == context.Canceled
+}
+func (*reviewOpaqueTerminalFacade) As(target any) bool {
+	if dest, ok := target.(**cli.CLIError); ok {
+		*dest = &cli.CLIError{
+			Args:     []string{"logs", "--follow", "ctr"},
+			ExitCode: 1,
+			Stderr:   "container exited",
+		}
+		return true
+	}
+	return false
+}
+
+type reviewOpaqueTerminalFacadeTarget struct {
+	followCalls atomic.Int32
+}
+
+func (*reviewOpaqueTerminalFacadeTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (*reviewOpaqueTerminalFacadeTarget) Running(context.Context) (bool, error) {
+	return true, nil
+}
+func (t *reviewOpaqueTerminalFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	t.followCalls.Add(1)
+	return nil, &reviewOpaqueTerminalFacade{}
+}
+func (*reviewOpaqueTerminalFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 

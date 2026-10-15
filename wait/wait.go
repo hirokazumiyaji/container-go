@@ -362,14 +362,23 @@ func retainedNonContextCause(err error) error {
 	for {
 		stripped, ok := cur.(*contextStrippedCause)
 		if !ok {
-			// cli.WithRedactor hides the filtered child behind UnwrapRaw, so a
-			// contextStrippedCause → safeError → empty stripped chain must not
-			// stop at the redactor and treat the whole tree as retained.
+			// cli.WithRedactor hides the filtered child behind UnwrapRaw, and
+			// cloned transport wrappers such as *os.PathError hide it behind
+			// ordinary Unwrap. Peeling both is required so an empty stripped
+			// leaf under those carriers is not treated as a retained cause.
 			if permanentProbeError(cur) || isPermanentCheckError(cur) || isTerminalStreamError(cur) {
 				return filtered
 			}
 			if raw, ok := cur.(interface{ UnwrapRaw() error }); ok {
 				next := raw.UnwrapRaw()
+				if next == nil {
+					return nil
+				}
+				cur = next
+				continue
+			}
+			if u, ok := cur.(interface{ Unwrap() error }); ok {
+				next := u.Unwrap()
 				if next == nil {
 					return nil
 				}

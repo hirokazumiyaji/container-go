@@ -634,10 +634,13 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	// and one source never contributes twice to a single error.
 	var lastStreamErr, lastProbeErr error
 	record := func(streamErr, probeErr error) error {
-		if streamErr != nil {
+		// A later context-only observation must not erase a typed transient
+		// cause already retained from the stream or state probe. Caller
+		// cancel/deadline classification still wraps those retained causes.
+		if streamErr != nil && (nonContextCause(streamErr) != nil || nonContextCause(lastStreamErr) == nil) {
 			lastStreamErr = streamErr
 		}
-		if probeErr != nil {
+		if probeErr != nil && (nonContextCause(probeErr) != nil || nonContextCause(lastProbeErr) == nil) {
 			lastProbeErr = probeErr
 		}
 		return joinNonNil(lastStreamErr, lastProbeErr)

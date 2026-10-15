@@ -89,12 +89,29 @@ func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
 
 func TestPollRetainsCheckErrorAtCallerDeadline(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failed at deadline"}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	err := poll(ctx, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(checkCtx context.Context) error {
-		<-checkCtx.Done()
-		return cause
-	})
+	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+	started := make(chan struct{})
+	var startOnce sync.Once
+	done := make(chan error, 1)
+	go func() {
+		done <- poll(caller, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(checkCtx context.Context) error {
+			startOnce.Do(func() { close(started) })
+			<-checkCtx.Done()
+			return cause
+		})
+	}()
+	select {
+	case <-started:
+		caller.expire()
+	case <-time.After(time.Second):
+		t.Fatal("poll check did not start")
+	}
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("poll did not return after deadline")
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
@@ -221,12 +238,57 @@ func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
 	}
 }
 
+type reviewLogDeadlineCauseTarget struct {
+	cause   error
+	started chan struct{}
+	calls   atomic.Int32
+	once    sync.Once
+}
+
+func (t *reviewLogDeadlineCauseTarget) Endpoint(context.Context, string) (string, error) {
+	return "", t.cause
+}
+func (t *reviewLogDeadlineCauseTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *reviewLogDeadlineCauseTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	// First open publishes the typed stream cause. Later opens signal that
+	// retention has happened so the test can expire the caller deterministically.
+	if t.calls.Add(1) == 1 {
+		return &waitContractErrorReadCloser{err: t.cause}, nil
+	}
+	t.once.Do(func() {
+		if t.started != nil {
+			close(t.started)
+		}
+	})
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+func (t *reviewLogDeadlineCauseTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 0, t.cause
+}
+
 func TestForLogDeadlineRetainsStreamCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "scanner backend failure"}
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
-	defer cancel()
+	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+	started := make(chan struct{})
+	done := make(chan error, 1)
 	start := time.Now()
-	err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &waitCauseTarget{cause: cause})
+	go func() {
+		done <- ForLog("never").WithStartupTimeout(time.Hour).
+			WaitUntilReady(caller, &reviewLogDeadlineCauseTarget{cause: cause, started: started})
+	}()
+	select {
+	case <-started:
+		caller.expire()
+	case <-time.After(time.Second):
+		t.Fatal("log stream cause was not retained before deadline")
+	}
+	var err error
+	select {
+	case err = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("ForLog did not return after deadline")
+	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
 	}
@@ -334,56 +396,67 @@ func (s *reviewAnyStrategy) WaitUntilReady(ctx context.Context, _ Target) error 
 func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 	cause := &reviewTypedCause{message: "child backend failure"}
 	cases := []struct {
-		name string
-		make func() (context.Context, context.CancelFunc)
-		want error
+		name    string
+		want    error
+		startup time.Duration
+		trigger func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc)
 	}{
 		{
-			name: "caller-cancel",
-			make: func() (context.Context, context.CancelFunc) {
-				return context.WithCancel(context.Background())
+			name:    "caller-cancel",
+			want:    context.Canceled,
+			startup: time.Hour,
+			trigger: func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc) {
+				ctx, cancel := context.WithCancel(context.Background())
+				go func() {
+					select {
+					case <-child.started:
+						cancel()
+					case <-time.After(time.Second):
+						t.Error("child did not start")
+						cancel()
+					}
+				}()
+				return ctx, cancel
 			},
-			want: context.Canceled,
 		},
 		{
-			name: "caller-deadline",
-			make: func() (context.Context, context.CancelFunc) {
-				return context.WithTimeout(context.Background(), 25*time.Millisecond)
+			name:    "caller-deadline",
+			want:    context.DeadlineExceeded,
+			startup: time.Hour,
+			trigger: func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc) {
+				caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+				go func() {
+					select {
+					case <-child.started:
+						caller.expire()
+					case <-time.After(time.Second):
+						t.Error("child did not start")
+						caller.expire()
+					}
+				}()
+				return caller, func() {}
 			},
-			want: context.DeadlineExceeded,
 		},
 		{
-			name: "startup-timeout",
-			make: func() (context.Context, context.CancelFunc) {
+			name:    "startup-timeout",
+			want:    context.DeadlineExceeded,
+			startup: 25 * time.Millisecond,
+			trigger: func(*testing.T, *reviewAnyStrategy) (context.Context, context.CancelFunc) {
 				return context.WithCancel(context.Background())
 			},
-			want: context.DeadlineExceeded,
 		},
 	}
 
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			ctx, cancel := tc.make()
-			defer cancel()
 			child := &reviewAnyStrategy{cause: cause, delay: 5 * time.Millisecond, started: make(chan struct{})}
-			strategy := ForAny(child)
-			if tc.name == "startup-timeout" {
-				strategy = strategy.WithStartupTimeout(25 * time.Millisecond)
-			} else {
-				strategy = strategy.WithStartupTimeout(time.Hour)
-			}
+			ctx, cancel := tc.trigger(t, child)
+			defer cancel()
+			strategy := ForAny(child).WithStartupTimeout(tc.startup)
 			done := make(chan error, 1)
 			start := time.Now()
 			go func() { done <- strategy.WaitUntilReady(ctx, &reviewNoopTarget{}) }()
-			if tc.name == "caller-cancel" {
-				select {
-				case <-child.started:
-					cancel()
-				case <-time.After(time.Second):
-					t.Fatal("child did not start")
-				}
-			}
 			var err error
 			select {
 			case err = <-done:

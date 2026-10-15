@@ -2305,6 +2305,20 @@ func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	}
 }
 
+func TestFinalLifecycleRetriesContextOnlyAfterTransientProbe(t *testing.T) {
+	target := &reviewFinalProbeStaleTransientTarget{}
+	err := ForExec([]string{"probe"}).
+		WithStartupTimeout(time.Second).
+		WithPollInterval(5 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady = %v, want success after retrying context-only permanent probe", err)
+	}
+	if target.probes.Load() < 3 {
+		t.Fatalf("lifecycle probes = %d, want transient then context-only then success", target.probes.Load())
+	}
+}
+
 func TestCompositeFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	for name, strategy := range map[string]Strategy{
 		"all": ForAll(&reviewCompositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
@@ -2423,6 +2437,35 @@ func (*reviewFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.Read
 	return io.NopCloser(strings.NewReader("")), nil
 }
 func (t *reviewFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+	t.execDone.Store(true)
+	return 0, nil
+}
+
+type reviewFinalProbeStaleTransientTarget struct {
+	execDone atomic.Bool
+	probes   atomic.Int32
+}
+
+func (*reviewFinalProbeStaleTransientTarget) Endpoint(context.Context, string) (string, error) {
+	return "127.0.0.1:1", nil
+}
+func (t *reviewFinalProbeStaleTransientTarget) Running(context.Context) (bool, error) {
+	if !t.execDone.Load() {
+		return true, nil
+	}
+	switch t.probes.Add(1) {
+	case 1:
+		return false, errors.New("transient inspect glitch")
+	case 2:
+		return false, &exec.Error{Name: "container", Err: context.Canceled}
+	default:
+		return true, nil
+	}
+}
+func (*reviewFinalProbeStaleTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+func (t *reviewFinalProbeStaleTransientTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
 }

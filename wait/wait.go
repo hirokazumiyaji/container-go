@@ -289,11 +289,10 @@ func finalLifecycleError(
 				if filtered := nonContextCause(cause); filtered != nil {
 					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
 				}
-				if lastProbeErr != nil {
-					return wrapWaitCause(what, lastProbeErr, joinNonNil(lastErr, lastProbeErr))
-				}
 				// Context-only permanent wrapper while the wait is still
-				// active: retry like a transient probe failure.
+				// active: always retry. A prior transient lastProbeErr is
+				// retained only for a later timeout diagnostic, not as an
+				// immediate failure of an otherwise ready target.
 			}
 			if err := waitForReconnect(waitCtx, interval); err != nil {
 				return waitContextTerminationError(

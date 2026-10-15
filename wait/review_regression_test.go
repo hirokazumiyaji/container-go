@@ -1193,6 +1193,24 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("comma-delimited wrap = %q, want absorbed comma framing", got.Error())
 	}
 
+	compactComma := fmt.Errorf("%w,%w", context.Canceled, commaCause)
+	got = nonContextCause(compactComma)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("compact comma wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("compact comma wrap = %q, want absorbed comma without spaces", got.Error())
+	}
+
+	newlineWrap := fmt.Errorf("%w\n%w", context.Canceled, commaCause)
+	got = nonContextCause(newlineWrap)
+	if !errors.Is(got, commaCause) {
+		t.Fatalf("newline-delimited wrap = %v, want cause", got)
+	}
+	if got.Error() != "backend" {
+		t.Fatalf("newline-delimited wrap = %q, want absorbed newline framing", got.Error())
+	}
+
 	spacedCause := errors.New(" backend ")
 	spacedWrap = fmt.Errorf("%w;%w", context.Canceled, spacedCause)
 	got = nonContextCause(spacedWrap)

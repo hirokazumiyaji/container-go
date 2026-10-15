@@ -1,0 +1,82 @@
+[
+  {
+    "name": "apple_apiserver_unregistered",
+    "backend": "apple",
+    "operation": "system",
+    "stream": "stdout",
+    "output": "apiserver is not running and not registered with launchd",
+    "unavailable": true
+  },
+  {
+    "name": "apple_apiserver_running",
+    "backend": "apple",
+    "operation": "system",
+    "stream": "stdout",
+    "output": "apiserver is running and registered with launchd",
+    "unavailable": false
+  },
+  {
+    "name": "docker_desktop_unavailable",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "Docker Desktop is unable to start",
+    "unavailable": true
+  },
+  {
+    "name": "docker_desktop_near_miss",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "Docker Desktop is still starting",
+    "unavailable": false
+  },
+  {
+    "name": "docker_desktop_configuration_veto",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "Docker Desktop is unable to start: proxy configuration is invalid",
+    "unavailable": false
+  },
+  {
+    "name": "docker_windows_npipe_missing",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "error during connect: open //./pipe/docker_engine: The system cannot find the file specified.",
+    "unavailable": true
+  },
+  {
+    "name": "docker_windows_npipe_missing_desktop_spelling",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "error during connect: open \\\\.\\pipe\\dockerDesktopLinuxEngine: The system cannot find the file specified.",
+    "unavailable": true
+  },
+  {
+    "name": "docker_windows_missing_file_outside_pipe",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "error during connect: open C:/ProgramData/docker/hosts: The system cannot find the file specified.",
+    "unavailable": false
+  },
+  {
+    "name": "docker_windows_other_pipe_missing",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "error during connect: open //./pipe/otherdaemon: The system cannot find the file specified.",
+    "unavailable": false
+  },
+  {
+    "name": "docker_windows_connect_certificate_veto",
+    "backend": "docker",
+    "operation": "version",
+    "stream": "stderr",
+    "output": "error during connect: tls: failed to verify certificate: x509: certificate signed by unknown authority",
+    "unavailable": false
+  }
+]

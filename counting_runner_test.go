@@ -36,6 +36,16 @@ func (r *countingRunner) Run(ctx context.Context, args ...string) ([]byte, []byt
 	return r.inner.Run(ctx, args...)
 }
 
+// RunTo preserves the streaming capability of the wrapped runner so
+// instrumentation does not silently reintroduce full-output buffering.
+func (r *countingRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (cli.OutputStats, error) {
+	r.calls.Add(1)
+	r.mu.Lock()
+	r.args = append(r.args, args)
+	r.mu.Unlock()
+	return cli.RunTo(r.inner, ctx, stdout, stderr, args...)
+}
+
 // Stream forwards to the inner runner when it supports streaming and
 // counts the spawned child process.
 func (r *countingRunner) Stream(ctx context.Context, args ...string) (io.ReadCloser, error) {

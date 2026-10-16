@@ -103,7 +103,10 @@ func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 }
 
 func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) {
-	code, _, err := t.c.Exec(ctx, cmd)
+	// Readiness probes discard application output. ExecTo drains the CLI
+	// streams into io.Discard instead of materializing a buffer for every
+	// polling attempt.
+	code, _, err := t.c.ExecTo(ctx, cmd, io.Discard)
 	return code, waitTargetError(err)
 }
 

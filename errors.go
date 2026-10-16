@@ -30,6 +30,11 @@ type SystemNotRunningError = cli.SystemNotRunningError
 // and keeps the original CLI and probe errors in the error chain.
 var ErrSystemNotRunning = cli.ErrSystemNotRunning
 
+// ErrOutputDelivery reports that CLI output could not be delivered to a
+// caller-provided sink. The original writer error remains in the chain
+// for errors.Is/errors.As checks.
+var ErrOutputDelivery = cli.ErrOutputDelivery
+
 // ErrLogStreamSetup reports that a log stream cannot be started with the
 // configured runner or backend executable and will not be retried.
 var ErrLogStreamSetup = wait.ErrLogStreamSetup
@@ -803,6 +808,22 @@ func wrapNotFoundFor(eng engine, err error) error {
 		return err
 	}
 	return fmt.Errorf("%w: %w", ErrContainerNotFound, err)
+}
+
+// preserveError keeps the original failure in a classified chain. A
+// classifier may add context or a sentinel, but it must not erase a CLI
+// exit, cancellation, or caller-sink error that led to the classification.
+func preserveError(classified, original error) error {
+	if original == nil {
+		return classified
+	}
+	if classified == nil {
+		return original
+	}
+	if errors.Is(classified, original) {
+		return classified
+	}
+	return errors.Join(classified, original)
 }
 
 func wrapNotFoundForOperation(eng engine, err error, operation string, targets ...string) error {

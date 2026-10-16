@@ -557,6 +557,25 @@ func TestClassifyPreservesOriginalAndProbeErrorChains(t *testing.T) {
 	}
 }
 
+func TestClassifyPreservesCLIAndDeliveryErrors(t *testing.T) {
+	original := &CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "XPC connection error"}
+	writerErr := errors.New("sink failed")
+	joined := errors.Join(original, &OutputError{Stream: "stdout", Err: writerErr})
+	probeErr := &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}
+	r := &fakeRunner{results: map[string]fakeResult{
+		"system status": {err: probeErr},
+	}}
+
+	err := Classify(context.Background(), r, joined, appleProbe)
+	if !errors.Is(err, ErrSystemNotRunning) || !errors.Is(err, ErrOutputDelivery) || !errors.Is(err, writerErr) {
+		t.Fatalf("error = %v, want system, delivery, and writer errors", err)
+	}
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
+		t.Fatalf("error = %v, want original CLI exit 7", err)
+	}
+}
+
 func TestClassifyUsesProbeSpecificHint(t *testing.T) {
 	orig := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "cannot connect"}
 	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}

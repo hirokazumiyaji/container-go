@@ -314,8 +314,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error)
 func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
@@ -376,8 +378,63 @@ Windows-specific lifecycle tests are build-constrained. This development
 environment cross-compiles and vets Windows packages but cannot execute the
 Windows process-handle runtime tests, including the exit-259 active-child case.
 `LogsWithOptions{Tail, Since}` bounds snapshots for long-lived reuse
-containers. `Terminate` is generation-guarded: it refuses to delete a
+containers; `MaxBytes` can additionally cap the response. `Terminate` is generation-guarded: it refuses to delete a
 name recycled by another process (see Reuse below).
+
+### Output policy
+
+CLI-backed output has two explicit modes. The historical snapshot and
+reader APIs (`Exec` without `WithExecMaxBytes`, `Logs`, and a zero
+`LogsOptions.MaxBytes`) keep their complete-output behavior during the
+compatibility period. They are retained for existing callers but are
+deprecated for output that is not trusted; a future minor release may
+change their default. New code should use a positive
+`WithExecMaxBytes` or `LogsOptions.MaxBytes`, or stream directly with
+`ExecTo` / `LogsTo`.
+
+`LogsOptions.Tail` is a backend line-based tail (`--tail`) and
+`Since` is a backend timestamp filter. `MaxBytes` is applied after
+that selection and is a **prefix** cap: it retains the first bytes of
+the combined stdout/stderr arrival stream, not a byte tail. The same
+prefix policy applies to `WithExecMaxBytes` and to `LogsTo`. The wait
+failure log path is intentionally different: it keeps a trailing
+1 MiB of the backend's bounded `--tail` so the latest diagnostic
+survives. Legacy unbounded readers
+retain stdout-then-stderr concatenation; bounded and streaming captures
+use observed arrival order when the runner implements `RunTo`, while the
+compatibility adapter for a legacy-only runner writes stdout then stderr.
+
+A positive byte limit applies to combined stdout and stderr. The child
+process is drained after the retained prefix is full, so truncation
+cannot leave it blocked on a pipe. Bounded readers expose
+`Truncated() bool` and return `ErrOutputTruncated` as their terminal
+read error after yielding the retained prefix. `OutputStats` reports
+both total observed bytes and whether a limit discarded data.
+`FollowLogs` is deliberately an uncapped long-lived stream; its caller
+controls the reader and backpressure. A sink failure is never converted
+into a successful result: `RunTo`, `ExecTo`, and `LogsTo` preserve a
+writer error alongside any CLI terminal error, and bounded snapshot
+APIs return a partial reader on infrastructure, cancellation, launch,
+and missing-container failures.
+
+The wait adapter never materializes `ForExec` output: it sends both
+streams to `io.Discard` through `ExecTo`. Failure diagnostics keep the
+trailing 1 MiB of the backend's bounded log tail and redact it before it
+is attached. The CLI runner exposes direct streaming through `RunTo`; runners implementing only the historical `Run` interface are
+adapted for compatibility, but such adapters cannot provide a hard
+peak-memory bound before their own `Run` returns. The large-output
+integration check verifies bounded forwarding and draining, not peak
+host memory; RSS measurement would require an external sampler.
+
+`LogsOptions` now contains `MaxBytes` in addition to `Tail` and
+`Since`. Go cannot extend a struct without breaking old unkeyed
+literals, so this pre-1.0 release makes the source break explicit:
+callers must use keyed `LogsOptions` literals. This is preferable to
+maintaining a second, subtly different options representation. The
+internal ExecRunner diagnostic is separate again: each failed
+invocation keeps at most the trailing 64 KiB of stderr for `CLIError`,
+while `Run` and caller-owned `RunTo` sinks retain their own documented
+behavior.
 
 `Exec` returns the exit code and combined stdout+stderr. A command
 that runs in a running container and exits non-zero is a result rather
@@ -980,7 +1037,10 @@ Docker accepts both options, while the checked Apple Container CLI
 versions use `-n` for Tail and have no Since option. The current checkout
 still sends Docker
 flag spellings to Apple, so the option contract is pending #82. Neither
-path adds a byte cap. `FollowLogs` is intentionally an unbounded stream;
+option adds a byte cap; `LogsOptions.MaxBytes`, `WithExecMaxBytes`,
+`ExecTo`, and `LogsTo` provide a prefix cap or a caller-owned sink, and
+bounded captures report truncation through `Truncated` and
+`ErrOutputTruncated`. `ForExec` discards its output. `FollowLogs` is intentionally an unbounded stream;
 closing its `io.ReadCloser` or cancelling its context terminates the CLI
 process. The wait-failure diagnostic tail is capped at 1MiB.
 
@@ -1066,6 +1126,8 @@ these follow-up issues are applied.
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
 - `ErrContainerNotFound`: not-found from inspect and friends
+- `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
+  the original writer error remains in the chain
 - `ErrImageIdentityUnavailable`: a successful image inspect returned no
   repository-bearing digest or verified local image ID, and the caller
   did not opt into the mutable-tag fallback
@@ -1124,8 +1186,9 @@ container-go/
 ├── reuse.go          // WithReuse and PruneReuseGroup
 ├── cleanup.go        // Cleanup, TerminateContainer, Prune
 ├── reaper.go         // watchdog reaper
-├── exec.go           // Exec and ExecOption
-├── logs.go           // Logs, LogsWithOptions, FollowLogs
+├── exec.go           // Exec, ExecTo, and ExecOption
+├── logs.go           // Logs, LogsWithOptions, LogsTo, FollowLogs
+├── output.go         // bounded readers, sinks, and truncation errors
 ├── copy.go           // WithFiles and copy methods
 ├── errors.go         // public error values
 ├── backend.go        // backend selection
@@ -1148,6 +1211,11 @@ The internal runner contract is:
 ```text
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+type WriterRunner interface {
+    Runner
+    RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error)
 }
 ```
 

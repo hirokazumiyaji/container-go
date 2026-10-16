@@ -14,28 +14,51 @@ import (
 
 // LogsOptions bounds a Logs snapshot. Tail keeps the last N lines
 // (it must be non-negative; 0 means all); Since drops entries older than
-// the timestamp. Each backend maps the options to its supported CLI arguments.
+// the timestamp. Each backend maps those options to its supported CLI
+// arguments. A positive MaxBytes caps the combined stdout+stderr response;
+// zero preserves the historical unbounded snapshot behavior.
+//
+// Tail is a backend line-based tail. MaxBytes is applied while the CLI
+// runs: it retains the prefix of the combined output, not the trailing
+// bytes. The added field intentionally makes keyed literals the required
+// form; old two-field unkeyed literals no longer compile, which is the
+// explicit pre-1.0 compatibility tradeoff.
 type LogsOptions struct {
-	Tail  int
-	Since time.Time
+	Tail     int
+	Since    time.Time
+	MaxBytes int64
 }
 
 func (o LogsOptions) validate() error {
 	if o.Tail < 0 {
 		return validationErrorf("LogsOptions.Tail", o.Tail, "log tail must be >= 0, got %d", o.Tail)
 	}
+	if o.MaxBytes < 0 {
+		return validationErrorf("LogsOptions.MaxBytes", o.MaxBytes, "log MaxBytes must be >= 0, got %d", o.MaxBytes)
+	}
 	return nil
 }
 
-// Logs returns a snapshot of the container's log output so far.
+// Logs returns a snapshot of the container's log output so far. If the
+// CLI fails, any bytes it supplied are still returned with the error.
+//
+// Deprecated: use LogsWithOptions with a positive MaxBytes or LogsTo for
+// output that may be large or untrusted. This compatibility form keeps
+// the historical unbounded capture.
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error) {
 	return c.LogsWithOptions(ctx, LogsOptions{})
 }
 
-// LogsWithOptions returns a bounded snapshot of the container's log
-// output. Long-lived reuse containers can grow unbounded logs, so
-// prefer Tail for diagnostics. It returns ErrUnsupportedCapability
+// LogsWithOptions returns a snapshot of the container's log output.
+// Long-lived reuse containers can grow unbounded logs, so prefer Tail or
+// MaxBytes for diagnostics. A positive MaxBytes enables a fixed-size
+// prefix capture of the merged stdout and stderr; zero retains the
+// historical full-snapshot behavior. It returns ErrUnsupportedCapability
 // without invoking the backend when the backend cannot honor opts.
+//
+// When the CLI fails after producing output, the returned reader is still
+// non-nil and contains that output together with the error; a bounded
+// reader retains its truncation state.
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error) {
 	if err := opts.validate(); err != nil {
 		return nil, err
@@ -50,16 +73,64 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	if err != nil {
 		return nil, err
 	}
-	stdout, stderr, err := c.runner.Run(qCtx, args...)
-	if contextErr := commandContextError(qCtx, err); contextErr != nil {
-		return nil, contextErr
+
+	var (
+		output io.ReadCloser
+		runErr error
+	)
+	if opts.MaxBytes > 0 {
+		capture := newBoundedBuffer(opts.MaxBytes)
+		_, runErr = cli.RunTo(c.runner, qCtx, capture, capture, args...)
+		output = &boundedReadCloser{boundedReader: capture.reader()}
+	} else {
+		var stdout, stderr []byte
+		stdout, stderr, runErr = c.runner.Run(qCtx, args...)
+		// docker logs splits the container's streams across the CLI's
+		// stdout and stderr; a snapshot carries both.
+		output = io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)))
 	}
+	if runErr != nil {
+		return output, c.logsError(ctx, qCtx, runErr)
+	}
+	return output, nil
+}
+
+// LogsTo streams a log snapshot directly to output. When MaxBytes is
+// positive, the first MaxBytes bytes of the combined stream are forwarded;
+// later bytes are drained and discarded rather than buffered. The
+// returned stats count all bytes observed by the CLI. A sink failure is
+// returned together with the CLI's terminal error, if any.
+func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error) {
+	if err := opts.validate(); err != nil {
+		return OutputStats{}, err
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
-		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		return OutputStats{}, err
 	}
-	// docker logs splits the container's streams across the CLI's
-	// stdout and stderr; a snapshot carries both.
-	return io.NopCloser(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))), nil
+	args, err := c.eng.logsArgsWithOptions(target, opts)
+	if err != nil {
+		return OutputStats{}, err
+	}
+
+	tracked := newOutputTrackingWriter(output)
+	sink, limited := outputSink(tracked, opts.MaxBytes)
+	stats, runErr := cli.RunTo(c.runner, qCtx, sink, sink, args...)
+	runErr = preserveOutputDeliveryError(runErr, tracked)
+	result := newOutputStats(stats, limited)
+	if runErr != nil {
+		return result, c.logsError(ctx, qCtx, runErr)
+	}
+	return result, nil
+}
+
+func (c *Container) logsError(ctx, qCtx context.Context, err error) error {
+	if contextErr := commandContextError(qCtx, err); contextErr != nil {
+		return contextErr
+	}
+	return preserveError(wrapNotFoundFor(c.eng, c.classify(ctx, err)), err)
 }
 
 // FollowLogs streams the container's log output until Close is called

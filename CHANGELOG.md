@@ -15,6 +15,15 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add bounded and streaming CLI output paths: `LogsOptions.MaxBytes`,
+  `WithExecMaxBytes`, `ExecTo`, `LogsTo`, `OutputStats`, and the
+  `ErrOutputTruncated` / `Truncated` observability contract. The CLI
+  runner now exposes direct `RunTo` writers, and wait exec probes discard
+  output instead of buffering it.
+- Document the compatibility policy: legacy full-output calls remain
+  available, while callers handling untrusted output should opt into a
+  positive limit or streaming sink. The new `LogsOptions.MaxBytes` field
+  intentionally requires keyed struct literals.
 - Add bounded `Exec` timeouts, partial-output retention, and typed
   unsupported-termination errors for canceled or timed-out calls (#116).
 - Resolve inspected image digests or Docker image IDs before create, retain
@@ -46,6 +55,12 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   compatibility integration tests; add an Apple inspect fixture for 1.3.0.
 - Add `ErrEnvFileUnsupported` for Windows operations that would need a
   per-user secret env file.
+
+- Preserve output-delivery errors alongside CLI terminal errors, retain
+  bounded partial readers on backend failures, and make the large-output
+  integration check deadline-bounded with explicit stderr/wait coverage.
+  `CLIError` diagnostics now retain the trailing 64 KiB of stderr; full
+  `Run` output remains unchanged.
 
 ### Changed
 

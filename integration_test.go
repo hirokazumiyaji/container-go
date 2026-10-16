@@ -147,6 +147,24 @@ func TestIntegrationExecPreservesPartialOutputOnTimeout(t *testing.T) {
 	}
 }
 
+// TestIntegrationAppleForExecDrainsLargeStderr verifies the wait
+// adapter's discard sink on the Apple backend as well as Docker.
+func TestIntegrationAppleForExecDrainsLargeStderr(t *testing.T) {
+	requireSystem(t)
+	runCtx, cancelRun := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancelRun()
+	ctr, err := container.Run(runCtx, integrationAlpine,
+		container.WithCmd("sleep", "60"),
+		container.WithWaitStrategy(wait.ForExec([]string{
+			"sh", "-c", "head -c 4194304 /dev/zero >&2",
+		}).WithStartupTimeout(30*time.Second)),
+	)
+	container.Cleanup(t, ctr)
+	if err != nil {
+		t.Fatalf("Run with ForExec: %v", err)
+	}
+}
+
 func TestIntegrationStopTimeoutRoundsUp(t *testing.T) {
 	requireSystem(t)
 	runStopTimingIntegration(t, "apple", 1500*time.Millisecond, 1400*time.Millisecond, 10*time.Second)

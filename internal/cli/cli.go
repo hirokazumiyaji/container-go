@@ -284,6 +284,55 @@ func (r *ExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, e
 }
 
 func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([]byte, []byte, error) {
+	var stdout, stderr bytes.Buffer
+	// Output buffers are returned whole: success output and non-zero
+	// exec/log results must not be silently truncated. Only the
+	// diagnostic copy inside CLIError is bounded.
+	err := r.execute(ctx, hooks, &stdout, &stderr, func() ([]byte, []byte) {
+		return stdout.Bytes(), stderr.Bytes()
+	}, args)
+	return stdout.Bytes(), stderr.Bytes(), err
+}
+
+// RunTo runs the CLI while sending stdout and stderr directly to the
+// supplied writers. The process is still fully drained after a sink
+// fails or reaches its own limit, so a sink cannot block the child.
+// A sink error is remembered rather than returned from the write itself;
+// the final error contains it together with the process's terminal
+// status. A CLIError diagnostic is taken from a bounded stderr tail, and
+// its stdout side channel is empty because stdout is not retained.
+func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error) {
+	if stdout == nil {
+		stdout = io.Discard
+	}
+	if stderr == nil {
+		stderr = io.Discard
+	}
+	stdoutCount := &countingWriter{dst: stdout}
+	stderrCount := &countingWriter{dst: stderr}
+	diagnostic := &tailBuffer{}
+	runErr := r.execute(ctx, runHooks{}, stdoutCount, &diagnosticWriter{output: stderrCount, diagnostic: diagnostic}, func() ([]byte, []byte) {
+		return nil, []byte(diagnostic.String())
+	}, args)
+	stdoutBytes, stdoutErr := stdoutCount.snapshot()
+	stderrBytes, stderrErr := stderrCount.snapshot()
+	stats := OutputStats{
+		StdoutBytes:     stdoutBytes,
+		StderrBytes:     stderrBytes,
+		StdoutTruncated: writerTruncated(stdout),
+		StderrTruncated: writerTruncated(stderr),
+	}
+	return stats, joinErrors(
+		runErr,
+		outputDeliveryError("stdout", stdoutErr),
+		outputDeliveryError("stderr", stderrErr),
+	)
+}
+
+// execute owns one command lifecycle. stdoutW and stderrW receive the
+// child's streams; captured returns the stdout and stderr bytes available
+// for the CLIError diagnostic once the child has been reaped.
+func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
@@ -295,10 +344,9 @@ func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([
 		}
 		return lifecycle.cancel()
 	}
-	var stdout, stderr bytes.Buffer
 	safeStderr := NewRedactor().NewStream(maxStderr)
-	cmd.Stdout = &stdout
-	cmd.Stderr = io.MultiWriter(&stderr, safeStderr)
+	cmd.Stdout = stdoutW
+	cmd.Stderr = io.MultiWriter(stderrW, safeStderr)
 	// If the process ignores the kill long enough to hold pipes open,
 	// give up waiting shortly after.
 	cmd.WaitDelay = 3 * time.Second
@@ -311,9 +359,9 @@ func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([
 		lifecycle.failStart()
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			contextErr := fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
-			return stdout.Bytes(), stderr.Bytes(), markRunStatus(errors.Join(contextErr, err), lifecycle.status())
+			return markRunStatus(errors.Join(contextErr, err), lifecycle.status())
 		}
-		return stdout.Bytes(), stderr.Bytes(), markRunStatus(err, lifecycle.status())
+		return markRunStatus(err, lifecycle.status())
 	}
 	if hooks.beforePublish != nil {
 		hooks.beforePublish()
@@ -340,14 +388,12 @@ func (r *ExecRunner) run(ctx context.Context, hooks runHooks, args ...string) ([
 	// stale process-handle or numeric process-group signal.
 	err := lifecycle.result()
 	status := lifecycle.status()
-	// Output buffers are returned whole: success output and non-zero
-	// exec/log results must not be silently truncated. Only the
-	// diagnostic copy inside CLIError is bounded.
-	commandErr := commandError(ctx, bin, args, stdout.Bytes(), stderr.Bytes(), err)
+	stdout, stderr := captured()
+	commandErr := commandError(ctx, bin, args, stdout, stderr, err)
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
 		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 	}
-	return stdout.Bytes(), stderr.Bytes(), markRunStatus(commandErr, status)
+	return markRunStatus(commandErr, status)
 }
 
 func commandError(ctx context.Context, bin string, args []string, stdout, stderr []byte, err error) error {

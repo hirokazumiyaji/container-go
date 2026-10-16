@@ -218,8 +218,10 @@ func (c *Container) Endpoint(ctx context.Context, port string) (string, error)
 func (c *Container) ContainerIP(ctx context.Context) (string, error)
 func (c *Container) State(ctx context.Context) (State, error)
 func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error)
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error)
 func (c *Container) Logs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.ReadCloser, error)
+func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
@@ -253,6 +255,18 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
+
+### 出力の契約
+
+CLI の出力には、全量を保持する互換モードと、caller の sink へ直接流す bounded/streaming モードがある。`Exec` で `WithExecMaxBytes` を指定しない場合、`Logs`、`LogsOptions.MaxBytes` が 0 の場合は、既存呼び出しとの互換性のため全量を保持する。この経路は信頼できない出力に対しては deprecated とし、新コードでは正の `WithExecMaxBytes` / `LogsOptions.MaxBytes` または `ExecTo` / `LogsTo` を使う。
+
+`LogsOptions.Tail` は backend の行単位の末尾(`--tail`)で、`Since` は backend の timestamp filter である。`MaxBytes` はその後に適用される**先頭 byte の prefix 上限**であり、byte 単位の tail ではない。stdout/stderr の結合到着ストリームの先頭を保持する。同じ prefix ポリシーを `WithExecMaxBytes` と `LogsTo` にも適用する。wait 失敗時のログ診断だけは、直近の診断を残すため意図的に異なり、backend の bounded `--tail` の末尾 1MiB を保持する。旧 unbounded reader は stdout の後に stderr を連結する。bounded/streaming capture は観測した到着順を使う。
+
+正の制限値は stdout と stderr の合計に適用する。保持上限に達した後も CLI 子プロセスは排水され続けるため、pipe が詰まって停止しない。bounded reader は `Truncated() bool` を提供し、保持したデータを返した後の terminal read error として `ErrOutputTruncated` を返す。`OutputStats` は破棄されたデータを含む観測バイト数と truncation を表す。`FollowLogs` は長期ストリームであり、byte 上限を意図的に設けない。sink の書き込みエラーは成功結果に変換せず、`RunTo`、`ExecTo`、`LogsTo` は CLI の終端エラーを保持する。bounded snapshot API は infrastructure、cancellation、launch、missing-container エラー時も partial reader と truncation state を返す。
+
+wait adapter は `ForExec` の出力を `ExecTo` で `io.Discard` へ送り、失敗診断のログだけを backend の bounded tail の末尾 1MiB として redact して保持する。CLI runner は `RunTo` で直接 streaming を提供する。旧 `Run` しか実装しない runner は互換 adapter を使うが、`Run` が戻る前に大きな slice を作るため peak memory の上限は保証できない。大きな出力の integration test は bounded forwarding と draining を確認するだけで、peak host memory を測定するものではない。RSS の測定には外部 sampler が必要である。
+
+`LogsOptions` に `Tail` と `Since` に加えて `MaxBytes` を追加した。Go の構造体にはフィールドを追加しても旧 unkeyed literal を維持する仕組みがないため、この pre-1.0 リリースでは source break を明示的に受け入れる。呼び出しは keyed `LogsOptions` literal へ移行する。微妙に異なる二重の options 表現を維持するより、この選択の方が明確である。internal CLI diagnostic はさらに別で、各失敗 invocation の `CLIError` には stderr の末尾最大 64KiB だけを保持し、`Run` の全量出力と caller-owned `RunTo` sink の動作は変えない。
 
 ## 接続エンドポイントの設計
 
@@ -602,6 +616,7 @@ Unix では停止状態を確認したあと CLI の process group へベスト�
 Windows では保持した process handle で直接の CLI 子だけを終了し、descendant は終了しません。
 その他の対応 OS でも直接の子だけを対象とします。
 ForLog が診断用に保持するログは 1MiB を上限とする。
+`LogsOptions.MaxBytes`、`WithExecMaxBytes`、`ExecTo`、`LogsTo` は byte 上限（先頭 prefix のみ保持）または呼び出し元所有の sink を提供し、bounded capture は `Truncated` と `ErrOutputTruncated` で truncation を通知する。`ForExec` は `ExecTo` で出力を `io.Discard` へ送り、buffer しない。
 
 ストリームのエラーは 2 つの段階に分かれる。
 `Stream` と公開 API の `FollowLogs` は起動エラーを返す。
@@ -620,6 +635,7 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 - `ErrImageIdentityUnavailable`：成功した image inspect が repository-bearing digest または検証済み local image ID を返さず、mutable tag fallback も指定されていない
 - `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
 - `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
+- `ErrOutputDelivery`：caller-owned output sink が CLI output を拒否した場合。元の writer error は chain に残る
 - `ErrPortNotExposed`：ポートが宣言も公開もされておらず、または宣言済みポートに利用できる host binding がなかった場合。
 - `ErrGenerationReplaced`：delete 時の generation check が同じ名前の置き換えを検出した場合。現在の reuse 経路には readiness 後の最終 check（#83、#84）がない。
 - `*CLIError`：バックエンド CLI が 0 以外で終了した場合。バイナリ、引数、終了コード、stderr（診断用の stderr は 64KiB 上限）を保持する。root の `CLIError` alias は `v0.2.0` にはない現在の開発版追加である。
@@ -651,8 +667,9 @@ container-go/
 ├── reuse.go          // WithReuse と PruneReuseGroup
 ├── cleanup.go        // Cleanup、TerminateContainer、Prune
 ├── reaper.go         // watchdog reaper
-├── exec.go           // Exec と ExecOption
-├── logs.go           // Logs、LogsWithOptions、FollowLogs
+├── exec.go           // Exec、ExecTo、ExecOption
+├── logs.go           // Logs、LogsWithOptions、LogsTo、FollowLogs
+├── output.go         // bounded reader、sink、truncation error
 ├── copy.go           // WithFiles と copy メソッド
 ├── errors.go         // 公開エラー値
 ├── backend.go        // バックエンド選択
@@ -674,6 +691,11 @@ container-go/
 ```text
 type Runner interface {
     Run(ctx context.Context, args ...string) (stdout []byte, stderr []byte, err error)
+}
+
+type WriterRunner interface {
+    Runner
+    RunTo(ctx context.Context, stdout, stderr io.Writer, args ...string) (OutputStats, error)
 }
 ```
 

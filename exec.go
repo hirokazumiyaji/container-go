@@ -26,6 +26,7 @@ type execConfig struct {
 	workdir    string
 	timeout    time.Duration
 	timeoutSet bool
+	maxBytes   int64
 }
 
 // WithExecTimeout sets an upper bound for one Exec invocation. A
@@ -40,6 +41,21 @@ func WithExecTimeout(d time.Duration) ExecOption {
 		}
 		c.timeout = d
 		c.timeoutSet = true
+		return nil
+	}
+}
+
+// WithExecMaxBytes caps the combined stdout+stderr retained by Exec or
+// forwarded by ExecTo. It keeps the prefix observed from the CLI, not a
+// byte tail. The limit must be positive; leaving the option unset keeps
+// the historical full-output behavior. The two streams are merged in
+// arrival order.
+func WithExecMaxBytes(maxBytes int64) ExecOption {
+	return func(c *execConfig) error {
+		if maxBytes <= 0 {
+			return validationErrorf("WithExecMaxBytes", maxBytes, "exec MaxBytes must be greater than zero, got %d", maxBytes)
+		}
+		c.maxBytes = maxBytes
 		return nil
 	}
 }
@@ -110,19 +126,43 @@ func withExecTimeout(ctx context.Context, cfg *execConfig) (context.Context, con
 // ExecTerminationError even if the operating system represents the killed
 // process with a normal exit status. The backend-side process may still be
 // running because neither supported CLI exposes a common exec-instance kill.
-func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (exitCode int, output io.Reader, retErr error) {
+//
+// Output is fully retained unless WithExecMaxBytes is supplied. A bounded
+// reader holds the prefix of the combined output and reports truncation
+// through ErrOutputTruncated and TruncationReporter.
+func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) (int, io.Reader, error) {
+	code, output, _, err := c.execute(ctx, cmd, opts, nil, false)
+	return code, output, err
+}
+
+// ExecTo runs a command and streams its combined stdout+stderr to output
+// while the command is running. WithExecMaxBytes applies a hard prefix
+// limit to that stream; bytes beyond it are drained and discarded. The
+// returned stats count all bytes observed, not just bytes forwarded. A
+// sink failure is returned together with the CLI's terminal error, if
+// any, and is never reported as a successful exit. Timeout, cancellation,
+// and classification behave as they do for Exec.
+func (c *Container) ExecTo(ctx context.Context, cmd []string, output io.Writer, opts ...ExecOption) (int, OutputStats, error) {
+	code, _, stats, err := c.execute(ctx, cmd, opts, output, true)
+	return code, stats, err
+}
+
+// execute implements Exec and ExecTo. When streaming is true, output
+// receives the CLI's streams and the returned reader is empty; otherwise
+// the output is captured and returned as a reader.
+func (c *Container) execute(ctx context.Context, cmd []string, opts []ExecOption, out io.Writer, streaming bool) (exitCode int, output io.Reader, stats OutputStats, retErr error) {
 	for i, opt := range opts {
 		if opt == nil {
-			return 0, nil, validationErrorf("Exec", i, "option %d is nil", i)
+			return 0, nil, OutputStats{}, validationErrorf("Exec", i, "option %d is nil", i)
 		}
 	}
 	if len(cmd) == 0 {
-		return 0, nil, validationErrorf("Exec", cmd, "exec: command must not be empty")
+		return 0, nil, OutputStats{}, validationErrorf("Exec", cmd, "exec: command must not be empty")
 	}
 	cfg := &execConfig{env: map[string]string{}, timeout: defaultExecTimeout}
 	for _, opt := range opts {
 		if err := opt(cfg); err != nil {
-			return 0, nil, c.redactError(optionBoundaryError(err), execDiagnosticValues(cfg, cmd)...)
+			return 0, nil, OutputStats{}, c.redactError(optionBoundaryError(err), execDiagnosticValues(cfg, cmd)...)
 		}
 	}
 
@@ -137,12 +177,12 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// Start, which must not be reported as an unsupported remote-process
 	// termination. Keep the output contract even for this early return.
 	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
-		return 0, emptyExecOutput(), ctxErr
+		return 0, emptyExecOutput(), OutputStats{}, ctxErr
 	}
 
 	target, err := c.verifiedOperationTarget(execCtx)
 	if err != nil {
-		return 0, emptyExecOutput(), err
+		return 0, emptyExecOutput(), OutputStats{}, err
 	}
 
 	var envFile, envDir string
@@ -157,9 +197,9 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 						retErr = joinEnvFileCleanupError(retErr, retryErr)
 					}
 				}()
-				return 0, emptyExecOutput(), joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
+				return 0, emptyExecOutput(), OutputStats{}, joinEnvFileCleanupError(err, cleanupEnvFileWithRetry(dir))
 			}
-			return 0, emptyExecOutput(), err
+			return 0, emptyExecOutput(), OutputStats{}, err
 		}
 		envFile, envDir = path, dir
 		defer func() {
@@ -172,10 +212,30 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	// cancellation. Recheck immediately before handing control to the
 	// runner so that path remains a no-launch result.
 	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
-		return 0, emptyExecOutput(), ctxErr
+		return 0, emptyExecOutput(), OutputStats{}, ctxErr
 	}
 
-	stdout, stderr, err := c.runner.Run(execCtx, c.eng.execArgs(target, cfg, envFile, cmd)...)
+	args := c.eng.execArgs(target, cfg, envFile, cmd)
+	switch {
+	case streaming:
+		var limited *limitedWriter
+		var sink io.Writer
+		tracked := newOutputTrackingWriter(out)
+		sink, limited = outputSink(tracked, cfg.maxBytes)
+		var runStats cli.OutputStats
+		runStats, err = cli.RunTo(c.runner, execCtx, sink, sink, args...)
+		err = preserveOutputDeliveryError(err, tracked)
+		stats = newOutputStats(runStats, limited)
+		output = emptyExecOutput()
+	case cfg.maxBytes > 0:
+		capture := newBoundedBuffer(cfg.maxBytes)
+		_, err = cli.RunTo(c.runner, execCtx, capture, capture, args...)
+		output = capture.reader()
+	default:
+		var stdout, stderr []byte
+		stdout, stderr, err = c.runner.Run(execCtx, args...)
+		output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
+	}
 	// The CLI has finished reading the env file. Remove it before any
 	// result classification or caller-visible output processing. Retain
 	// envDir for a deferred retry if removal fails, and preserve the error.
@@ -192,12 +252,11 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if statusReported {
 		launched = commandStatus.Started
 	}
-	output = io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr))
 	if err == nil {
 		if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil {
-			return 0, output, joinEnvFileCleanupError(ctxErr, envCleanupErr)
+			return 0, output, stats, joinEnvFileCleanupError(ctxErr, envCleanupErr)
 		}
-		return 0, output, envCleanupErr
+		return 0, output, stats, envCleanupErr
 	}
 
 	// Capture whether cancellation was already present when the command
@@ -215,11 +274,23 @@ func (c *Container) Exec(ctx context.Context, cmd []string, opts ...ExecOption) 
 	if ctxErr := effectiveExecContextErr(ctx, execCtx); ctxErr != nil && !errors.Is(err, ctxErr) {
 		err = errors.Join(err, ctxErr)
 	}
-	finish := func(code int, classified error) (int, io.Reader, error) {
-		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
-			return code, output, joinEnvFileCleanupError(contextErr, envCleanupErr)
+	// An application exit status is a result, but a sink failure joined to
+	// it is not: keep delivery errors on every path, including the ones
+	// that otherwise discard the CLIError.
+	deliveryErr := outputDeliveryErrors(err)
+	finish := func(code int, classified error) (int, io.Reader, OutputStats, error) {
+		if deliveryErr != nil {
+			if classified == nil {
+				// Keep the terminal status next to the sink failure.
+				classified = err
+			} else if !errors.Is(classified, cli.ErrOutputDelivery) {
+				classified = errors.Join(classified, deliveryErr)
+			}
 		}
-		return code, output, joinEnvFileCleanupError(classified, envCleanupErr)
+		if contextErr, ok := execContextualError(ctx, execCtx, classified, terminationUnknown); ok {
+			return code, output, stats, joinEnvFileCleanupError(contextErr, envCleanupErr)
+		}
+		return code, output, stats, joinEnvFileCleanupError(classified, envCleanupErr)
 	}
 
 	var cliErr *cli.CLIError

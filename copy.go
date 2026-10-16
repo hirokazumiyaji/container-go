@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -48,10 +49,19 @@ type File struct {
 func WithFiles(files ...File) Option {
 	return func(c *config) error {
 		validated := make([]File, len(files))
+		seen := make(map[string]struct{}, len(c.files)+len(files))
+		for _, existing := range c.files {
+			seen[path.Clean(existing.ContainerPath)] = struct{}{}
+		}
 		for i, f := range files {
 			if err := validateContainerPath(f.ContainerPath); err != nil {
 				return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, err)
 			}
+			clean := path.Clean(f.ContainerPath)
+			if _, exists := seen[clean]; exists {
+				return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, fmt.Errorf("duplicate container path %q", f.ContainerPath))
+			}
+			seen[clean] = struct{}{}
 			abs, err := validateHostPath(f.HostPath)
 			if err != nil {
 				return newValidationErrorWithField("WithFiles", "hostPath", f.HostPath, err)
@@ -98,7 +108,93 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	return c.copyToContainer(ctx, hostPath, containerPath, true)
 }
 
-func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath string, allowDirectory bool) (retErr error) {
+const defaultCopyFilesParallelism = 4
+
+type fileCopyError struct {
+	File File
+	Err  error
+}
+
+func (e *fileCopyError) Error() string {
+	return fmt.Sprintf("copy %q to %q: %v", e.File.HostPath, e.File.ContainerPath, e.Err)
+}
+
+func (e *fileCopyError) Unwrap() error {
+	return e.Err
+}
+
+func (c *Container) copyFiles(ctx context.Context, files []File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	cliCtx, cliCancel := withDefaultTimeout(ctx, queryTimeout)
+	target, err := c.verifiedOperationTarget(cliCtx)
+	cliCancel()
+	if err != nil {
+		return err
+	}
+
+	if len(files) == 1 {
+		if err := c.copyFileWithTarget(ctx, target, files[0].HostPath, files[0].ContainerPath, false); err != nil {
+			return &fileCopyError{File: files[0], Err: err}
+		}
+		return nil
+	}
+
+	concurrency := defaultCopyFilesParallelism
+	if len(files) < concurrency {
+		concurrency = len(files)
+	}
+
+	copyCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	var (
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		firstErr error
+	)
+
+	jobs := make(chan File, len(files))
+	for _, f := range files {
+		jobs <- f
+	}
+	close(jobs)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for f := range jobs {
+				if copyCtx.Err() != nil {
+					return
+				}
+				if err := c.copyFileWithTarget(copyCtx, target, f.HostPath, f.ContainerPath, false); err != nil {
+					errOnce.Do(func() {
+						firstErr = &fileCopyError{File: f, Err: err}
+						cancel()
+					})
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	return firstErr
+}
+
+func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath string, allowDirectory bool) error {
+	cliCtx, cliCancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cliCancel()
+	target, err := c.verifiedOperationTarget(cliCtx)
+	if err != nil {
+		return err
+	}
+	return c.copyFileWithTarget(ctx, target, hostPath, containerPath, allowDirectory)
+}
+
+func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, containerPath string, allowDirectory bool) (retErr error) {
 	if err := validateContainerPath(containerPath); err != nil {
 		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, err)
 	}
@@ -121,10 +217,6 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 
 	cliCtx, cliCancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cliCancel()
-	target, err := c.verifiedOperationTarget(cliCtx)
-	if err != nil {
-		return err
-	}
 	_, _, err = c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
 	return wrapNotFoundFor(c.eng, c.classify(ctx, err))
 }

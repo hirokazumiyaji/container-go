@@ -3,6 +3,7 @@ package container
 import (
 	"fmt"
 	"net/netip"
+	"path"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -87,6 +88,14 @@ func (c *config) validate() error {
 	}
 	if c.reuseGroup != "" && !c.reuse {
 		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
+	}
+	seenFiles := make(map[string]struct{}, len(c.files))
+	for _, f := range c.files {
+		clean := path.Clean(f.ContainerPath)
+		if _, exists := seenFiles[clean]; exists {
+			return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, fmt.Errorf("duplicate container path %q", f.ContainerPath))
+		}
+		seenFiles[clean] = struct{}{}
 	}
 	return nil
 }

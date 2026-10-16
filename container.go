@@ -454,10 +454,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		return c, envCleanupErr
 	}
 
-	for _, f := range cfg.files {
-		if err := c.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
-			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
-		}
+	if err := c.copyFiles(ctx, cfg.files); err != nil {
+		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
 	}
 	if cfg.waitStrategy != nil {
 		if err := cfg.waitStrategy.WaitUntilReady(ctx, waitTarget{c: c}); err != nil {

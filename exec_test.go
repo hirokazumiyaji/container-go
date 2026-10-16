@@ -718,7 +718,6 @@ func TestExecCancellationDuringInspectOverridesConfirmedNotFound(t *testing.T) {
 	}
 }
 
-
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)
@@ -1399,5 +1398,22 @@ func TestExecDoesNotClassifyTimeoutTextFromArgs(t *testing.T) {
 	}
 	if f.callWith("inspect") != nil {
 		t.Fatalf("application argv triggered a verification probe: %v", f.calls)
+	}
+}
+
+func TestExecNonCLIErrorReturnsError(t *testing.T) {
+	nonCLIErr := errors.New("spawn failed: binary not found")
+	f := &execRunner{fakeRunner: newTestRunner(), execErr: nonCLIErr}
+	ctr := runTestContainer(t, f)
+
+	code, _, err := ctr.Exec(context.Background(), []string{"echo", "hello"})
+	if err == nil {
+		t.Fatal("Exec succeeded, want non-CLI error")
+	}
+	if !errors.Is(err, nonCLIErr) {
+		t.Fatalf("err = %v, want %v", err, nonCLIErr)
+	}
+	if code != 0 {
+		t.Errorf("exit code = %d, want 0", code)
 	}
 }

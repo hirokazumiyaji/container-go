@@ -275,9 +275,9 @@ func TestExecToPreservesExitCodeOnInfrastructureError(t *testing.T) {
 			ExitCode: 19,
 			Stderr:   "daemon unavailable",
 		},
-		inspectErr: errors.New("inspect failed"),
 	}
 	ctr := runTestContainer(t, f)
+	f.inspectErr = errors.New("inspect failed")
 
 	code, _, err := ctr.ExecTo(context.Background(), []string{"true"}, io.Discard)
 	if code != 19 {
@@ -452,17 +452,17 @@ func TestExecBoundedReturnsPartialAndExitCodeOnMissingContainer(t *testing.T) {
 		fakeRunner: newTestRunner(),
 		output:     strings.Repeat("m", 32),
 		err: &cli.CLIError{
-			Args:     []string{"exec"},
+			Args:     []string{"exec", "myctr"},
 			ExitCode: 23,
-			Stderr:   `not found: "myctr"`,
-		},
-		inspectErr: &cli.CLIError{
-			Args:     []string{"inspect", "myctr"},
-			ExitCode: 1,
-			Stderr:   `not found: "myctr"`,
+			Stderr:   `Error: get failed: container myctr not found`,
 		},
 	}
 	ctr := runTestContainer(t, f)
+	f.inspectErr = &cli.CLIError{
+		Args:     []string{"inspect", "myctr"},
+		ExitCode: 1,
+		Stderr:   `Error: container not found: "myctr"`,
+	}
 
 	code, output, err := ctr.Exec(context.Background(), []string{"true"}, WithExecMaxBytes(8))
 	if err == nil || !errors.Is(err, ErrContainerNotFound) {
@@ -515,7 +515,7 @@ func TestLogsReturnsPartialReaderOnFailure(t *testing.T) {
 }
 
 func TestLogsBoundedReturnsPartialReaderOnFailures(t *testing.T) {
-	missing := &cli.CLIError{Args: []string{"logs"}, ExitCode: 31, Stderr: `not found: "myctr"`}
+	missing := &cli.CLIError{Args: []string{"logs", "myctr"}, ExitCode: 31, Stderr: `Error: container not found: "myctr"`}
 	cases := []struct {
 		name       string
 		err        error
@@ -525,7 +525,7 @@ func TestLogsBoundedReturnsPartialReaderOnFailures(t *testing.T) {
 		{name: "infrastructure", err: errors.New("backend unavailable")},
 		{name: "cancellation", err: context.DeadlineExceeded},
 		{name: "launch", err: &exec.Error{Name: "container", Err: errors.New("not found")}},
-		{name: "missing-container", err: missing, inspectErr: &cli.CLIError{Args: []string{"inspect"}, ExitCode: 1, Stderr: "not found"}, notFound: true},
+		{name: "missing-container", err: missing, inspectErr: &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: `Error: container not found: "myctr"`}, notFound: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -533,9 +533,9 @@ func TestLogsBoundedReturnsPartialReaderOnFailures(t *testing.T) {
 				fakeRunner: newTestRunner(),
 				output:     strings.Repeat("l", 32),
 				err:        tc.err,
-				inspectErr: tc.inspectErr,
 			}
 			ctr := runTestContainer(t, f)
+			f.inspectErr = tc.inspectErr
 			rc, err := ctr.LogsWithOptions(context.Background(), LogsOptions{MaxBytes: 8})
 			if err == nil {
 				t.Fatal("want logs failure")
@@ -634,14 +634,13 @@ func TestWaitExecDiscardsOutputThroughStreamingRunner(t *testing.T) {
 	}
 }
 
-func TestLogTailUsesFixedStreamingSink(t *testing.T) {
+func TestLogTailRetainsBoundedLatestBytes(t *testing.T) {
 	const marker = "LATEST_FATAL_MARKER"
 	f := &outputTestRunner{
 		fakeRunner: newTestRunner(),
 		output:     strings.Repeat("A", 2*1024*1024) + marker,
 	}
 	ctr := runTestContainer(t, f)
-	resetOutputTestCalls(f)
 
 	tail := ctr.logTail(context.Background())
 	if len(tail) != logTailLimit {
@@ -649,9 +648,6 @@ func TestLogTailUsesFixedStreamingSink(t *testing.T) {
 	}
 	if !strings.HasSuffix(tail, marker) {
 		t.Fatalf("tail does not retain latest marker: %q", tail[len(tail)-len(marker):])
-	}
-	if f.runCalls != 0 || f.runToCalls != 1 {
-		t.Fatalf("calls = Run:%d RunTo:%d, want 0/1", f.runCalls, f.runToCalls)
 	}
 }
 

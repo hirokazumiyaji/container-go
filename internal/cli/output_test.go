@@ -209,3 +209,34 @@ func TestExecRunnerRunToKeepsFailureDiagnosticBounded(t *testing.T) {
 		t.Errorf("CLIError.Stderr retained the discarded prefix")
 	}
 }
+
+type countingTestWriter struct {
+	calls int
+}
+
+func (w *countingTestWriter) Write([]byte) (int, error) {
+	w.calls++
+	return 0, errors.New("sink failed")
+}
+
+func TestCountingWriterStopsWritingAfterSinkError(t *testing.T) {
+	dst := &countingTestWriter{}
+	writer := &countingWriter{dst: dst}
+	for range 3 {
+		n, err := writer.Write([]byte("output"))
+		if n != len("output") || err != nil {
+			t.Fatalf("Write = %d/%v, want %d/nil", n, err, len("output"))
+		}
+	}
+
+	if dst.calls != 1 {
+		t.Fatalf("sink Write calls = %d, want 1 after the first failure", dst.calls)
+	}
+	count, err := writer.snapshot()
+	if count != int64(3*len("output")) {
+		t.Fatalf("counted bytes = %d, want %d", count, 3*len("output"))
+	}
+	if err == nil {
+		t.Fatal("snapshot error = nil, want first sink error")
+	}
+}

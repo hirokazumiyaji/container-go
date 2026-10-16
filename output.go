@@ -308,3 +308,49 @@ func limitedStreamWriter(dst io.Writer, limit int64) *limitedWriter {
 	}
 	return newLimitedWriter(dst, limit)
 }
+
+// outputSink wraps a tracked caller writer for a streaming API: a positive
+// maxBytes forwards only that prefix. Either sink serializes the CLI's two
+// streams onto one destination. The limited writer is nil when no limit
+// applies.
+func outputSink(tracked *outputTrackingWriter, maxBytes int64) (io.Writer, *limitedWriter) {
+	if maxBytes > 0 {
+		limited := limitedStreamWriter(tracked, maxBytes)
+		return limited, limited
+	}
+	return streamWriter(tracked), nil
+}
+
+func newOutputStats(stats cli.OutputStats, limited *limitedWriter) OutputStats {
+	result := OutputStats{
+		Bytes:     stats.StdoutBytes + stats.StderrBytes,
+		Truncated: stats.Truncated(),
+	}
+	if limited != nil {
+		result.Truncated = result.Truncated || limited.Truncated()
+	}
+	return result
+}
+
+// outputDeliveryErrors returns the sink failures contained in err, or nil.
+// Only the delivery branches are returned, so a caller can keep them while
+// treating the remaining CLI exit as an application result.
+func outputDeliveryErrors(err error) error {
+	var found []error
+	var walk func(error)
+	walk = func(cur error) {
+		switch e := cur.(type) {
+		case nil:
+		case *cli.OutputError:
+			found = append(found, e)
+		case interface{ Unwrap() []error }:
+			for _, child := range e.Unwrap() {
+				walk(child)
+			}
+		case interface{ Unwrap() error }:
+			walk(e.Unwrap())
+		}
+	}
+	walk(err)
+	return errors.Join(found...)
+}

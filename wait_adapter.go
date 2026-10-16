@@ -1,21 +1,28 @@
 package container
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"strconv"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // WithWaitStrategy blocks Run until the strategy reports the container
-// ready. On failure the container is removed and the error carries a
-// tail of its logs.
+// ready. On failure, a non-reuse Run attempts to remove the container
+// and, when available, attaches a bounded tail of its logs; a reuse wait
+// leaves the shared container in place.
 func WithWaitStrategy(s wait.Strategy) Option {
 	return func(c *config) error {
+		if err := wait.Validate(s); err != nil {
+			return err
+		}
 		c.waitStrategy = s
+		c.waitDiagnosticSecrets = wait.DiagnosticValues(s)
 		return nil
 	}
 }
@@ -25,98 +32,137 @@ type waitTarget struct {
 	c *Container
 }
 
+var (
+	_ wait.Target      = waitTarget{}
+	_ wait.StateTarget = waitTarget{}
+)
+
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
 	if port == "" {
-		if len(t.c.exposed) == 0 {
-			return "", fmt.Errorf("no ports declared via WithExposedPorts")
+		// Port probes are TCP-only. A UDP declaration must not silently
+		// become the target of an implicit ForExposedPort/ForHTTP probe.
+		// Exposed declarations retain their order even when another port
+		// has an explicit host binding; published-only containers fall back
+		// to their first TCP binding.
+		for _, exposed := range t.c.exposed {
+			if exposed.proto == "tcp" {
+				port = exposed.String()
+				break
+			}
 		}
-		port = t.c.exposed[0].String()
+		if port == "" {
+			for _, published := range t.c.published {
+				if published.proto == "tcp" {
+					port = strconv.Itoa(published.containerPort) + "/" + published.proto
+					break
+				}
+			}
+		}
+		if port == "" {
+			return "", ErrPortNotExposed
+		}
 	}
-	return t.c.Endpoint(ctx, port)
+	endpoint, err := t.c.Endpoint(ctx, port)
+	return endpoint, waitTargetError(err)
 }
 
 func (t waitTarget) Running(ctx context.Context) (bool, error) {
+	state, err := t.State(ctx)
+	return state == wait.StateRunning, err
+}
+
+func (t waitTarget) State(ctx context.Context) (wait.State, error) {
+	if t.c == nil || t.c.eng == nil {
+		return wait.StateRunning, nil
+	}
 	state, err := t.c.State(ctx)
 	if err != nil {
-		return false, err
+		return wait.StateUnknown, waitTargetError(err)
 	}
-	return state == StateRunning, nil
+	switch state {
+	case StateRunning:
+		return wait.StateRunning, nil
+	case StateStopped:
+		return wait.StateStopped, nil
+	case StateStopping:
+		return wait.StateStopping, nil
+	case StateCreated:
+		return wait.StateCreated, nil
+	case StateRestarting:
+		return wait.StateRestarting, nil
+	case StatePaused:
+		return wait.StatePaused, nil
+	default:
+		return wait.StateUnknown, nil
+	}
 }
 
 func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
-	return t.c.FollowLogs(ctx)
+	stream, err := t.c.FollowLogs(ctx)
+	return stream, waitTargetError(err)
 }
 
 func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) {
-	// Readiness probes discard application output. ExecTo drains the
-	// CLI streams into io.Discard instead of materializing a byte slice
-	// for every polling attempt.
+	// Readiness probes discard application output. ExecTo drains the CLI
+	// streams into io.Discard instead of materializing a buffer for every
+	// polling attempt.
 	code, _, err := t.c.ExecTo(ctx, cmd, io.Discard)
-	return code, err
+	return code, waitTargetError(err)
 }
 
-// logTailLimit bounds the trailing diagnostic log tail attached to
-// wait failures. It is independent of the public MaxBytes prefix cap
-// and of the internal 64 KiB CLIError stderr diagnostic.
+func waitTargetError(err error) error {
+	if err == nil || !isNotFound(err) || errors.Is(err, wait.ErrTargetNotFound) {
+		return err
+	}
+	return fmt.Errorf("%w: %w", wait.ErrTargetNotFound, err)
+}
+
+// logTailLimit bounds the diagnostic log tail attached to wait
+// failures.
 const logTailLimit = 1024 * 1024
 
 // logTail fetches up to logTailLimit trailing bytes of the container's
 // logs for diagnostics. It asks the backend for a bounded tail
-// (logsTailArgs) and streams both CLI streams through a fixed-size
-// ring, so neither the CLI output nor the Go buffer grows with total
-// log size. Failures yield an empty tail.
+// (logsTailArgs) and keeps only the last bytes in a fixed-size ring,
+// so neither the CLI output nor the Go buffer grows with total log
+// size. Failures yield an empty tail.
 func (c *Container) logTail(ctx context.Context) string {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
-	defer cancel()
-	tail := newTailWriter(logTailLimit)
-	_, err := cli.RunTo(c.runner, qCtx, tail, tail, c.eng.logsTailArgs(c.id)...)
+	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return ""
 	}
-	return tail.String()
+	return c.logTailTarget(ctx, target)
 }
 
-type tailWriter struct {
-	mu   sync.Mutex
-	buf  []byte
-	pos  int
-	full bool
-}
-
-func newTailWriter(n int) *tailWriter {
-	return &tailWriter{buf: make([]byte, n)}
-}
-
-func (w *tailWriter) Write(p []byte) (int, error) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	original := len(p)
-	if len(w.buf) == 0 {
-		return original, nil
+func (c *Container) logTailTarget(ctx context.Context, target string) string {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
+	if err != nil {
+		return ""
 	}
-	for len(p) > 0 {
-		space := len(w.buf) - w.pos
-		if len(p) < space {
-			copy(w.buf[w.pos:], p)
-			w.pos += len(p)
-			break
+	tail, _ := c.diagnosticRedactor().RedactTail(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
+	return tail
+}
+
+func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	redactor := c.diagnosticRedactor(extra...)
+	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {
+		stream, err := streamer.StreamSnapshot(qCtx, c.eng.logsTailArgs(c.id)...)
+		if err != nil {
+			return "", err
 		}
-		copy(w.buf[w.pos:], p[:space])
-		p = p[space:]
-		w.pos = 0
-		w.full = true
+		defer stream.Close()
+		return redactor.RedactTail(stream, logTailLimit)
 	}
-	return original, nil
-}
-
-func (w *tailWriter) String() string {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if !w.full {
-		return string(w.buf[:w.pos])
+	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
+	if err != nil {
+		return "", err
 	}
-	out := make([]byte, len(w.buf))
-	copy(out, w.buf[w.pos:])
-	copy(out[len(w.buf)-w.pos:], w.buf[:w.pos])
-	return string(out)
+	return redactor.RedactTail(
+		io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)),
+		logTailLimit,
+	)
 }

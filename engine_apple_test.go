@@ -85,7 +85,7 @@ func TestAppleCheckConfigPlatform(t *testing.T) {
 					t.Fatalf("WithPlatform(%q): %v", tc.platform, err)
 				}
 			}
-			err := (appleEngine{}).checkConfig(cfg)
+			err := (appleEngine{}).checkConfig(context.Background(), cfg)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("checkConfig(%q) = %v, want error containing %q", tc.platform, err, tc.wantErr)
@@ -102,13 +102,13 @@ func TestAppleCheckConfigPlatform(t *testing.T) {
 func TestAppleCheckConfigUsesDefaultPlatformEnvironment(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "windows/amd64")
 	cfg := appleCapabilityConfig(t)
-	if err := (appleEngine{}).checkConfig(cfg); err == nil || !strings.Contains(err.Error(), "linux") {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "linux") {
 		t.Fatalf("checkConfig with non-Linux default = %v, want Linux capability error", err)
 	}
 
 	t.Setenv(defaultPlatformEnv, "linux/arm64")
 	cfg = appleCapabilityConfig(t)
-	if err := (appleEngine{}).checkConfig(cfg); err != nil {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 		t.Fatalf("checkConfig with Linux default = %v", err)
 	}
 	if cfg.platform != "linux/arm64" {
@@ -116,7 +116,7 @@ func TestAppleCheckConfigUsesDefaultPlatformEnvironment(t *testing.T) {
 	}
 
 	t.Setenv(defaultPlatformEnv, "linux/arm64/v7")
-	if err := (appleEngine{}).checkConfig(appleCapabilityConfig(t)); err == nil || !strings.Contains(err.Error(), "not valid") {
+	if err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t)); err == nil || !strings.Contains(err.Error(), "not valid") {
 		t.Fatalf("checkConfig with invalid variant default = %v", err)
 	}
 }
@@ -130,14 +130,14 @@ func TestAppleCheckConfigContainerNames(t *testing.T) {
 	}
 	for _, name := range valid {
 		cfg := appleCapabilityConfig(t, WithName(name))
-		if err := (appleEngine{}).checkConfig(cfg); err != nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 			t.Errorf("name %q: %v", name, err)
 		}
 	}
 
 	for _, name := range []string{"a"} {
 		cfg := appleCapabilityConfig(t, WithName(name))
-		if err := (appleEngine{}).checkConfig(cfg); err == nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 			t.Errorf("name %q: want Apple name validation error", name)
 		}
 	}
@@ -149,14 +149,14 @@ func TestAppleCheckConfigContainerNames(t *testing.T) {
 	}
 	for _, name := range []string{"a-", "a."} {
 		cfg := appleCapabilityConfig(t, WithName(name))
-		if err := (appleEngine{}).checkConfig(cfg); err != nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 			t.Errorf("trailing-separator name %q: %v", name, err)
 		}
 	}
 
 	cfg := appleCapabilityConfig(t)
 	cfg.name = strings.Repeat("a", 64)
-	if err := (appleEngine{}).checkConfig(cfg); err == nil {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 		t.Error("64-character name: want Apple name validation error")
 	}
 }
@@ -164,14 +164,14 @@ func TestAppleCheckConfigContainerNames(t *testing.T) {
 func TestAppleCheckConfigNetworkNames(t *testing.T) {
 	for _, name := range []string{"a", "default", "my-network_1.example"} {
 		cfg := appleCapabilityConfig(t, WithNetwork(name))
-		if err := (appleEngine{}).checkConfig(cfg); err != nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 			t.Errorf("network %q: %v", name, err)
 		}
 	}
 
 	for _, name := range []string{"A", "a-", "a."} {
 		cfg := appleCapabilityConfig(t, WithNetwork(name))
-		if err := (appleEngine{}).checkConfig(cfg); err == nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 			t.Errorf("network %q: want Apple network validation error", name)
 		}
 	}
@@ -183,7 +183,7 @@ func TestAppleCheckConfigNetworkNames(t *testing.T) {
 	// name[,mac=...][,mtu=...] property syntax.
 	cfg := appleCapabilityConfig(t)
 	cfg.network = "default,mac=02:42:ac:11:00:02"
-	if err := (appleEngine{}).checkConfig(cfg); err == nil || !strings.Contains(err.Error(), "comma") {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "comma") {
 		t.Fatalf("network properties = %v, want separator rejection", err)
 	}
 	if err := WithNetwork("default,mac=02:42:ac:11:00:02")(cfg); err == nil {
@@ -201,7 +201,7 @@ func TestAppleCheckConfigPorts(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := appleCapabilityConfig(t, tc.opt)
-			if err := (appleEngine{}).checkConfig(cfg); err == nil {
+			if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 				t.Fatal("want Apple port validation error")
 			}
 		})
@@ -214,7 +214,7 @@ func TestAppleCheckConfigPorts(t *testing.T) {
 		WithExposedPorts("1/tcp", "2/tcp", "65535/udp"),
 		WithPublishedPort("2:80/tcp"),
 	)
-	if err := (appleEngine{}).checkConfig(cfg); err != nil {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 		t.Fatalf("valid ports: %v", err)
 	}
 
@@ -222,7 +222,7 @@ func TestAppleCheckConfigPorts(t *testing.T) {
 		WithPublishedPort("2:80/tcp"),
 		WithPublishedPort("2:81/tcp"),
 	)
-	if err := (appleEngine{}).checkConfig(cfg); err == nil || !strings.Contains(err.Error(), "overlap") {
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "overlap") {
 		t.Fatalf("overlapping publishes = %v, want overlap error", err)
 	}
 }
@@ -236,10 +236,10 @@ func TestAppleCheckConfigPublishedPortCount(t *testing.T) {
 		return opts
 	}
 
-	if err := (appleEngine{}).checkConfig(appleCapabilityConfig(t, publish(applePublishedPortLimit)...)); err != nil {
+	if err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t, publish(applePublishedPortLimit)...)); err != nil {
 		t.Fatalf("%d descriptors: %v", applePublishedPortLimit, err)
 	}
-	if err := (appleEngine{}).checkConfig(appleCapabilityConfig(t, publish(applePublishedPortLimit+1)...)); err == nil || !strings.Contains(err.Error(), "64") {
+	if err := (appleEngine{}).checkConfig(context.Background(), appleCapabilityConfig(t, publish(applePublishedPortLimit+1)...)); err == nil || !strings.Contains(err.Error(), "64") {
 		t.Fatalf("%d descriptors: want publish-count error", applePublishedPortLimit+1)
 	}
 	_ = assertAppleRejectsBeforeCLI(t, publish(applePublishedPortLimit+1)...)
@@ -248,14 +248,17 @@ func TestAppleCheckConfigPublishedPortCount(t *testing.T) {
 func TestAppleCheckConfigMemory(t *testing.T) {
 	for _, size := range []string{"200M", "1G", "1T", "1P", "209715200"} {
 		cfg := appleCapabilityConfig(t, WithMemory(size))
-		if err := (appleEngine{}).checkConfig(cfg); err != nil {
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err != nil {
 			t.Errorf("memory %q: %v", size, err)
 		}
 	}
 
+	// WithMemory already rejects zero and overflow, so set the field
+	// directly to prove the Apple check does not depend on option order.
 	for _, size := range []string{"1K", "199M", "0M", "0", "9223372036854775807P", "999999999999999999999P"} {
-		cfg := appleCapabilityConfig(t, WithMemory(size))
-		if err := (appleEngine{}).checkConfig(cfg); err == nil {
+		cfg := appleCapabilityConfig(t)
+		cfg.memory = size
+		if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil {
 			t.Errorf("memory %q: want Apple memory validation error", size)
 		}
 	}

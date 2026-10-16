@@ -3,6 +3,7 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -10,6 +11,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -38,7 +40,9 @@ func (c *cpRunner) isContainerSpec(arg string) bool {
 
 func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "version" {
+		c.mu.Lock()
 		c.calls = append(c.calls, args)
+		c.mu.Unlock()
 		if c.versionErr != nil {
 			return nil, nil, c.versionErr
 		}
@@ -49,7 +53,9 @@ func (c *cpRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, err
 		return []byte(output), nil, nil
 	}
 	if args[0] == "cp" {
+		c.mu.Lock()
 		c.calls = append(c.calls, args)
+		c.mu.Unlock()
 		if c.failPrefix == "cp" {
 			return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "injected failure"}
 		}
@@ -1258,3 +1264,190 @@ func TestCopyToContainerPreservesCallerDeadlineForCLI(t *testing.T) {
 		t.Fatalf("CLI deadline = %v, want caller deadline %v", runner.deadline, wantDeadline)
 	}
 }
+
+func TestWithFilesRejectsDuplicateContainerPath(t *testing.T) {
+	tmp := t.TempDir()
+	f1 := filepath.Join(tmp, "f1.txt")
+	f2 := filepath.Join(tmp, "f2.txt")
+	if err := os.WriteFile(f1, []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(f2, []byte("2"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// Within single WithFiles
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(
+			File{HostPath: f1, ContainerPath: "/etc/app.conf"},
+			File{HostPath: f2, ContainerPath: "/etc/app.conf"},
+		),
+	)
+	if err == nil {
+		t.Fatal("Run succeeded with duplicate container paths in single WithFiles, want error")
+	}
+	var valErr *ValidationError
+	if !errors.As(err, &valErr) || valErr.Option != "WithFiles" || valErr.Field != "containerPath" {
+		t.Fatalf("err = %v, want ValidationError for WithFiles/containerPath", err)
+	}
+
+	// Across multiple WithFiles
+	_, err = Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: f1, ContainerPath: "/etc/app.conf"}),
+		WithFiles(File{HostPath: f2, ContainerPath: "/etc/app.conf"}),
+	)
+	if err == nil {
+		t.Fatal("Run succeeded with duplicate container paths across multiple WithFiles, want error")
+	}
+	if !errors.As(err, &valErr) || valErr.Option != "WithFiles" || valErr.Field != "containerPath" {
+		t.Fatalf("err = %v, want ValidationError for WithFiles/containerPath", err)
+	}
+}
+
+func TestWithFilesParallelCopiesMultipleFiles(t *testing.T) {
+	tmp := t.TempDir()
+	var files []File
+	for i := 0; i < 6; i++ {
+		p := filepath.Join(tmp, fmt.Sprintf("file%d.txt", i))
+		if err := os.WriteFile(p, []byte(fmt.Sprintf("content%d", i)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, File{HostPath: p, ContainerPath: fmt.Sprintf("/data/file%d.txt", i)})
+	}
+
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(files...),
+	)
+	if err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	cpCalls := 0
+	for _, call := range runner.calls {
+		if len(call) > 0 && call[0] == "cp" {
+			cpCalls++
+		}
+	}
+	if cpCalls != len(files) {
+		t.Fatalf("cp calls = %d, want %d", cpCalls, len(files))
+	}
+}
+
+type concurrentCPRunner struct {
+	*fakeRunner
+	active    atomic.Int32
+	maxActive atomic.Int32
+	barrier   chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+}
+
+func (c *concurrentCPRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "cp" {
+		cur := c.active.Add(1)
+		for {
+			oldMax := c.maxActive.Load()
+			if cur <= oldMax || c.maxActive.CompareAndSwap(oldMax, cur) {
+				break
+			}
+		}
+		c.enterOnce.Do(func() {
+			close(c.entered)
+		})
+		select {
+		case <-c.barrier:
+		case <-ctx.Done():
+			c.active.Add(-1)
+			return nil, nil, ctx.Err()
+		}
+		c.active.Add(-1)
+		c.mu.Lock()
+		c.calls = append(c.calls, args)
+		c.mu.Unlock()
+		return nil, nil, nil
+	}
+	return c.fakeRunner.Run(ctx, args...)
+}
+
+func TestWithFilesExecutesConcurrently(t *testing.T) {
+	tmp := t.TempDir()
+	var files []File
+	for i := 0; i < 4; i++ {
+		p := filepath.Join(tmp, fmt.Sprintf("file%d.txt", i))
+		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, File{HostPath: p, ContainerPath: fmt.Sprintf("/data/file%d.txt", i)})
+	}
+
+	runner := &concurrentCPRunner{
+		fakeRunner: newTestRunner(),
+		barrier:    make(chan struct{}),
+		entered:    make(chan struct{}),
+	}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+			WithFiles(files...),
+		)
+		errCh <- err
+	}()
+
+	// Wait until at least one copy enters
+	<-runner.entered
+
+	// Give goroutines time to reach the barrier concurrently
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runner.maxActive.Load() > 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Release all workers
+	close(runner.barrier)
+
+	if err := <-errCh; err != nil {
+		t.Fatalf("Run failed: %v", err)
+	}
+
+	if max := runner.maxActive.Load(); max < 2 {
+		t.Fatalf("max concurrent cp operations = %d, want >= 2", max)
+	}
+}
+
+func TestWithFilesParallelFailureRollsBack(t *testing.T) {
+	tmp := t.TempDir()
+	var files []File
+	for i := 0; i < 4; i++ {
+		p := filepath.Join(tmp, fmt.Sprintf("file%d.txt", i))
+		if err := os.WriteFile(p, []byte("data"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		files = append(files, File{HostPath: p, ContainerPath: fmt.Sprintf("/data/file%d.txt", i)})
+	}
+
+	runner := &cpRunner{fakeRunner: newTestRunner()}
+	runner.failPrefix = "cp"
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(files...),
+	)
+	if err == nil {
+		t.Fatal("Run succeeded despite copy failure, want error")
+	}
+
+	if runner.callWith("delete") == nil {
+		t.Error("container was not rolled back after copy failure")
+	}
+}
+

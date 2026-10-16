@@ -91,6 +91,9 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	ctx := context.Background()
 
 	if err := pullWith(ctx, &cli.ExecRunner{Binary: "docker"}, dockerEngine{}, integrationAlpine); err != nil {
+		if dockerPullRateLimited(err) {
+			t.Skipf("docker pull rate-limited: %v", err)
+		}
 		t.Fatalf("Pull: %v", err)
 	}
 

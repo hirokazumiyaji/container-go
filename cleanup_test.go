@@ -8,7 +8,10 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -78,11 +81,15 @@ type lsRunner struct {
 
 func (l *lsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "ls" {
+		l.mu.Lock()
 		l.calls = append(l.calls, args)
+		l.mu.Unlock()
 		return []byte(l.lsJSON), nil, nil
 	}
 	if args[0] == "inspect" && l.lsJSON != "" {
+		l.mu.Lock()
 		l.calls = append(l.calls, args)
+		l.mu.Unlock()
 		return []byte(l.lsJSON), nil, nil
 	}
 	return l.fakeRunner.Run(ctx, args...)
@@ -128,16 +135,22 @@ type dockerListRunner struct {
 
 func (d *dockerListRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "ps" {
+		d.mu.Lock()
 		d.calls = append(d.calls, args)
+		d.mu.Unlock()
 		return []byte(d.output), nil, nil
 	}
 	if args[0] == "inspect" {
+		d.mu.Lock()
 		d.calls = append(d.calls, args)
+		d.mu.Unlock()
 		id := args[len(args)-1]
 		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:"integration"}},"NetworkSettings":{}}]`, id, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
 	}
 	if args[0] == "rm" && d.deleteErr != nil {
+		d.mu.Lock()
 		d.calls = append(d.calls, args)
+		d.mu.Unlock()
 		return nil, nil, d.deleteErr
 	}
 	return d.fakeRunner.Run(ctx, args...)
@@ -407,3 +420,200 @@ func TestExplicitTerminateIgnoresKeepEnv(t *testing.T) {
 		t.Fatal("explicit Terminate did not issue delete when CONTAINERGO_KEEP=1")
 	}
 }
+
+func TestPruneOptionsValidation(t *testing.T) {
+	tests := []struct {
+		name    string
+		opt     PruneOption
+		wantErr string
+	}{
+		{
+			name:    "negative timeout",
+			opt:     WithPruneTimeout(-time.Second),
+			wantErr: "timeout must be positive",
+		},
+		{
+			name:    "zero timeout",
+			opt:     WithPruneTimeout(0),
+			wantErr: "timeout must be positive",
+		},
+		{
+			name:    "negative parallelism",
+			opt:     WithPruneParallelism(-1),
+			wantErr: "parallelism must be positive",
+		},
+		{
+			name:    "zero parallelism",
+			opt:     WithPruneParallelism(0),
+			wantErr: "parallelism must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestRunner()
+			_, err := pruneWith(context.Background(), f, appleEngine{}, tt.opt)
+			if err == nil {
+				t.Fatalf("pruneWith succeeded, want error containing %q", tt.wantErr)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("err = %v, want error containing %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+type blockingPruneRunner struct {
+	*fakeRunner
+	active    atomic.Int32
+	maxActive atomic.Int32
+	barrier   chan struct{}
+	entered   chan struct{}
+	enterOnce sync.Once
+	ids       []string
+}
+
+func (b *blockingPruneRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "ps" {
+		b.mu.Lock()
+		b.calls = append(b.calls, args)
+		b.mu.Unlock()
+		return []byte(strings.Join(b.ids, "\n") + "\n"), nil, nil
+	}
+	if args[0] == "inspect" {
+		b.mu.Lock()
+		b.calls = append(b.calls, args)
+		b.mu.Unlock()
+		id := args[len(args)-1]
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef",%q:"integration"}},"NetworkSettings":{}}]`, id, managedLabel, reuseLabel, creationLabel, reuseGroupLabel)), nil, nil
+	}
+	if args[0] == "rm" {
+		cur := b.active.Add(1)
+		for {
+			old := b.maxActive.Load()
+			if cur <= old || b.maxActive.CompareAndSwap(old, cur) {
+				break
+			}
+		}
+		b.enterOnce.Do(func() { close(b.entered) })
+		select {
+		case <-b.barrier:
+		case <-ctx.Done():
+			b.active.Add(-1)
+			return nil, nil, ctx.Err()
+		}
+		b.active.Add(-1)
+		b.mu.Lock()
+		b.calls = append(b.calls, args)
+		b.mu.Unlock()
+		return nil, nil, nil
+	}
+	return b.fakeRunner.Run(ctx, args...)
+}
+
+func TestPruneConcurrentDeletion(t *testing.T) {
+	ids := []string{
+		cleanupDockerIDOne,
+		cleanupDockerIDTwo,
+		strings.Repeat("3", 64),
+		strings.Repeat("4", 64),
+	}
+
+	runner := &blockingPruneRunner{
+		fakeRunner: newTestRunner(),
+		barrier:    make(chan struct{}),
+		entered:    make(chan struct{}),
+		ids:        ids,
+	}
+
+	resCh := make(chan []string, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		removed, err := pruneWith(context.Background(), runner, dockerEngine{}, WithPruneParallelism(4))
+		resCh <- removed
+		errCh <- err
+	}()
+
+	<-runner.entered
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if runner.maxActive.Load() > 1 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	close(runner.barrier)
+
+	err := <-errCh
+	removed := <-resCh
+	if err != nil {
+		t.Fatalf("pruneWith failed: %v", err)
+	}
+	if len(removed) != len(ids) {
+		t.Fatalf("removed = %v, want all %d ids", removed, len(ids))
+	}
+	if max := runner.maxActive.Load(); max < 2 {
+		t.Fatalf("max concurrent rm operations = %d, want >= 2", max)
+	}
+}
+
+func TestPruneOverallTimeoutReportsRemaining(t *testing.T) {
+	ids := []string{
+		cleanupDockerIDOne,
+		cleanupDockerIDTwo,
+		strings.Repeat("3", 64),
+		strings.Repeat("4", 64),
+	}
+
+	runner := &blockingPruneRunner{
+		fakeRunner: newTestRunner(),
+		barrier:    make(chan struct{}), // never closed
+		entered:    make(chan struct{}),
+		ids:        ids,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+
+	removed, err := pruneWith(ctx, runner, dockerEngine{}, WithPruneParallelism(2))
+	if err == nil {
+		t.Fatal("pruneWith succeeded, want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded cause", err)
+	}
+	if !strings.Contains(err.Error(), "remaining") {
+		t.Fatalf("err = %v, want remaining count mentioned", err)
+	}
+	if len(removed) > 0 {
+		t.Fatalf("removed = %v, want empty on timeout before any complete", removed)
+	}
+}
+
+func TestPruneTimeoutCapsCallerWithLaterDeadline(t *testing.T) {
+	ids := []string{cleanupDockerIDOne}
+	runner := &blockingPruneRunner{
+		fakeRunner: newTestRunner(),
+		barrier:    make(chan struct{}), // never closed
+		entered:    make(chan struct{}),
+		ids:        ids,
+	}
+
+	// Caller supplies a 1-hour deadline, but WithPruneTimeout is 50ms.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+
+	start := time.Now()
+	_, err := pruneWith(ctx, runner, dockerEngine{}, WithPruneTimeout(50*time.Millisecond))
+	if err == nil {
+		t.Fatal("pruneWith succeeded, want timeout error")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("err = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("prune took %v, want bounded by WithPruneTimeout (50ms)", elapsed)
+	}
+}
+

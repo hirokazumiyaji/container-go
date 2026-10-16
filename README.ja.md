@@ -60,8 +60,6 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
   担当します。
 - `Stop` の非 nil timeout は whole second へ truncation し、negative や極端な値を
   reject しません。#89 が timeout validation を担当します。
-- Apple の `PullNever` は現在 best-effort な backend precheck であり、no-fetch
-  保証ではない。#112 が strict な Apple capability handling を担当する。
 - wait の timeout/cancellation error は error chain に一様に保持されません。#92 が
   built-in strategy の error contract を担当します。
 - liveness probe failure は元の `*CLIError` を `ErrSystemNotRunning` の message に
@@ -116,11 +114,8 @@ func TestRedis(t *testing.T) {
 | OS | 既定バックエンド | 要件 |
 |---|---|---|
 | macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) CLI 1.2.2 または 1.3.0、`container system start` 実行済み |
-| Linux | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン |
-| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン（watchdog リーパーなし。後述） |
-| macOS | Apple Container | macOS 26+、Apple Silicon、[Apple Container](https://github.com/apple/container) 1.2.x(`container system start` 実行済み) |
-| Linux | Docker | docker CLI + 稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要 |
-| Windows | Docker | docker CLI + 稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要(watchdog リーパーなし。後述) |
+| Linux | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要 |
+| Windows | Docker | docker CLI 29.x（29.7.2 を確認）と稼働中のデーモン。copy-out には client/server 29.7.0 以上が必要（watchdog リーパーなし。後述） |
 
 macOS で Docker（Docker Desktop など）を使う場合は
 `CONTAINERGO_BACKEND=docker` を、Apple Container を明示する場合は
@@ -137,18 +132,20 @@ macOS で Docker（Docker Desktop など）を使う場合は
 (root module と testcontainers-go の依存関係の要件)。詳細は
 [bench/README.md](bench/README.md) を参照してください。
 
-現在のチェックアウトで確認した backend の動作（ライブラリが照合する CLI
-stderr 文言と inspect JSON 形状）:
+動作確認済みのバックエンド(本ライブラリがマッチする CLI stderr 文言と
+inspect JSON 形状):
 
-| バックエンド | このチェックアウトで使用した根拠 |
+| バックエンド | このリポジトリで確認した根拠 |
 |---|---|
-| Apple Container CLI | 1.2.2 と 1.3.0 の source、help、inspect fixture |
-| Docker Engine / CLI | 29.x 形式の inspect fixture と、ローカル開発時の 29.7.2 |
-| Apple Container | 1.2.x–1.3.x |
-| Docker Engine / CLI | 29.x。安全な copy-out には client/server 29.7.0 以上が必要 |
+| Apple Container CLI | 1.2.2 / 1.3.0 の source・help・inspect fixture |
+| Docker Engine / CLI | 29.x。29.x 形式の inspect fixture とローカルの 29.7.2。安全な copy-out には client/server 29.7.0 以上が必要 |
 
-この表はリポジトリの根拠を示すもので、範囲内のすべての release を確認済みだと
-いう互換性宣言ではありません。新しい CLI ではエラー文言や JSON フィールドが
+Apple の API サーババージョンは `container system version` または
+`container system status` から実行時に取得し、CLI バージョンから推測しません。
+オプトインした live matrix は、サーババージョンを取得できない場合や CLI と
+異なる場合に skip するため、未確認の API サーバ互換範囲を主張しません。
+この表はリポジトリの根拠を示すもので、すべての release を確認済みだという
+互換性宣言ではありません。新しい CLI ではエラー文言や JSON フィールドが
 変わる可能性があります。`engine_apple.go` / `engine_docker.go` 先頭の stderr
 マッチャと、`internal/inspect/testdata/`・`testdata/` のフィクスチャを参照して
 ください。
@@ -157,9 +154,8 @@ stderr 文言と inspect JSON 形状）:
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`（1～63 文字）を使う。これは保守的な安全
 規則であり、Docker または Apple の完全な name grammar を述べるものではない。
 Apple Container の CLI はより厳密な 2～63 文字の規則
-`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` を持つ。この checkout は Apple 固有の
-preflight check をまだ適用しないため（#112）、1 文字の name は library
-validation を通過しても Apple で拒否されることがある。
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` を持ち、Apple バックエンドは image 解決の
+前にこれを適用するため、1 文字の name は pull 後ではなく事前に拒否される。
 
 ## ファイル取り出しのバックエンド制限
 
@@ -602,11 +598,10 @@ parser は valid だが mismatched な Docker object を no-match として拒�
   明示的に pull します。
 - `PullAlways` は Run の実行ごとに明示的な pull を要求します。
   `WithReuse` の attach 前にも共有コンテナを返す前に実行されます。
-- `PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck
-  を行い、image がない場合は `ErrImageNotFound` を返します。Docker は
-  `--pull=never` も渡すため strict な no-fetch 経路がありますが、Apple Container
-  には同等の run-time switch がないため precheck は no-fetch 保証ではありません
-  （#112）。
+- `PullNever` は Docker では strict な no-fetch policy で、`--pull=never` を
+  渡し、image がない場合は `ErrImageNotFound` を返します。Apple Container には
+  同等の run-time switch がないため、`Run` は `ErrPullNeverUnsupported` で
+  この policy を拒否します。
 
 同じプロセスの並行処理は、バックエンド、イメージ、プラットフォーム、操作の
 種類が同じ pull を共有します。待機中の呼び出し元がキャンセルされても、共有
@@ -636,7 +631,10 @@ func PullPolicy(ctx context.Context, t testing.TB) {
     never, err := container.Run(ctx, "redis:7-alpine",
         container.WithPullPolicy(container.PullNever))
     container.Cleanup(t, never)
-    if errors.Is(err, container.ErrImageNotFound) {
+    // Docker は image 不在を ErrImageNotFound で、Apple Container は
+    // PullNever を ErrPullNeverUnsupported で報告します。
+    if errors.Is(err, container.ErrImageNotFound) ||
+        errors.Is(err, container.ErrPullNeverUnsupported) {
         return
     }
     if err != nil {
@@ -647,9 +645,12 @@ func PullPolicy(ctx context.Context, t testing.TB) {
 }
 ```
 
-例は `Run` の error を確認する前に cleanup を登録する。現在のチェックアウトでは
-`PullNever` の `ErrImageNotFound` は backend 固有であり、Apple では best-effort
-である。Apple の no-fetch 保証ではない（#112）。
+`PullNever` の厳密な no-fetch 保証は Docker バックエンドだけです。Apple
+Container の `container run` には CLI 自身のイメージ解決を止めるスイッチが
+ないため、ライブラリはレジストリへの暗黙の fetch を許さず、CLI 呼び出し前に
+拒否します。Apple では `PullMissing`(既定)または `PullAlways` を fallback と
+して使います。ただし `PullMissing` は image がなければ pull するため、
+no-network 保証ではありません。
 
 この存在確認は `Run` ごとの daemon round trip である。テスト実行中に
 backend のストアが安定していると分かっている場合、
@@ -677,8 +678,35 @@ func ImagePresenceCache(ctx context.Context) {
 既定では無効で、キャッシュするのは "present" の答えだけである。不在を
 キャッシュすると、それが引き起こした pull で無効化する必要が出る。帯域外で
 image が消えた場合はエントリ期限まで再 pull されないので、毎回確実に知りたい
-呼び出し側はオフのままにする。`PullNever` は契約上 image 不在で失敗するため、
+呼び出し側はオフのままにする。Docker の `PullNever` は契約上 image 不在で失敗するため、
 キャッシュの有無に関わらず常に inspect する。
+
+### Apple の capability validation
+
+Apple backend は image の解決や container create の前に静的 capability を検証します。
+Apple が受理する platform grammar は `os/arch[/variant]` で、bare `linux` や
+選択した architecture に定義されていない variant を拒否します。bare な
+`armel` は `linux/armel/v6` と同じ `v6`、bare な `arm`/`armhf` は `v7` を意味します。platform
+未指定時の `CONTAINER_DEFAULT_PLATFORM` は実効 platform として解決し、image
+inspect、pull flight、pull、run で同じ値を使います。明示した `WithPlatform`
+が優先されます。これは Apple CLI の設定なので Docker では消費しません。
+Apple 固有の grammar も Docker には適用しません。
+
+live matrix は `CONTAINERGO_BACKEND=apple` と `CONTAINERGO_APPLE_LIVE=1` の
+両方を明示した場合だけ実行します。一意な name と ownership label を使い、
+label が一致しない container は削除しません。
+
+```sh
+CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
+  go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
+```
+
+`container name` は 2〜63 文字で
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` に一致する必要があります。network name は小文字の 1〜63 文字です。
+公開 API の `WithNetwork` は MAC/MTU の comma 付き property を意図的に受け付けません。
+memory は 200 MiB 以上で、`WithMemory` と同じ整数(任意の `K`/`M`/`G`/`T`/`P` suffix)表記を使い、unit 誤りや overflow を拒否します。
+publish port は 2〜65535、publish descriptor は最大 64 個です。
+`WithExposedPorts` は library 側の宣言であり、Apple の `--publish` flag には変換されません。
 
 ## イメージの解決と固定
 
@@ -692,7 +720,7 @@ Apple が未指定の入力を custom default registry へ解決した場合、`
 Reuse は元の mutable tag ではなく、解決済み digest / image ID で互換性を判定します。
 作成後の検証に失敗した新規 reuse container は削除します。
 
-Apple Container には実行時の `--pull=never` がないため、`Run` は `PullMissing`、`PullAlways`、`PullNever` のいずれでも、pinned された Apple reference を `container run` に渡す前に local store にあるかを確認します。
+Apple Container には実行時の `--pull=never` がないため、`Run` は `PullMissing` と `PullAlways` で、pinned された Apple reference を `container run` に渡す前に local store にあるかを確認します。
 存在せず選択した policy が fetch を許可する場合は exact digest を明示的に pull してから再確認します。
 `container run` に暗黙の fetch をさせません。
 identity を取得できない inspect の成功は `ErrImageIdentityUnavailable`、local に存在しないことが確認された場合は `ErrImageIdentityNotLocal` です。
@@ -959,8 +987,10 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
 ## セキュリティ上の注意
 
 - すべての CLI 呼び出しは argv 配列で行い、シェルを経由しません。唯一の
-  shell script（reaper）は固定文字列で、検証済みの container name と、
-  #73 適用後の Docker ID だけを stdin data として受け取ります。
+  シェルスクリプト(リーパー)は固定文字列で、コンテナ ID は検証済みの
+  stdin データとしてのみ渡します。name-addressed entry には共有の `nameRE`
+  トークン規則を、Docker の full 64-hex immutable ID は別に受け付けます。
+  Apple のより厳密な 2〜63 文字の名前チェックはコンテナ作成前に適用します。
 - Unix では環境変数を、正規化済みの `os.UserCacheDir()` 配下の、所有者と
   モードを検証した 0700 ディレクトリ内の 0600 ファイル経由で渡します。
   既存の symlink 祖先は一度だけ解決し、`..` と書き込み可能な信頼できない

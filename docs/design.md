@@ -26,8 +26,7 @@ spawn a backend CLI process on every retry, while network and port data
 are still not retained indefinitely.
 Docker dead-state pruning depends on #113; missing-inspect
 classification depends on #103; error-chain preservation depends on
-#104; and Apple PullNever capability handling depends on #112. Windows and remote bind-source handling depend
-on #76, TCP-only readiness validation on #77, Stop timeout validation on
+#104. Windows and remote bind-source handling depend on #76, TCP-only readiness validation on #77, Stop timeout validation on
 #89, wait error-chain normalization on #92, public option validation on
 #102, and reaper staging cleanup on #111. Aside from #85, the current
 sections describe the behavior before those changes; they do not
@@ -45,7 +44,6 @@ and the root `CLIError`, `ErrContainerNotFound`, and
 `v0.2.0`. The core `Run`, options, lifecycle, endpoints, `Exec`, `Logs`,
 `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and
 original wait strategies were present in `v0.2.0`.
-Targets: Apple Container v1.2.x (macOS 26+, Apple Silicon), Docker (Linux, Windows, macOS; copy-out requires client/server 29.7.0+), Go 1.26+
 
 ## Purpose
 
@@ -73,8 +71,11 @@ Three constraints shape the design.
 ## Apple Container facts the design relies on
 
 The design decisions below rest on properties of Apple Container's CLI and
-source. The repository's inspect fixtures cover 1.2.2 and 1.3.0; this is
-not an exhaustive compatibility claim for every 1.2.x or 1.3.x release.
+source (fixtures cover 1.2.2 and 1.3.0). The API-server version is queried at
+runtime when a live check needs it; it is not inferred from the CLI version,
+and an unavailable server version is reported as unavailable rather than
+treated as verified. This is not an exhaustive compatibility claim for every
+1.2.x or 1.3.x release.
 
 - Host requirement: macOS 26 or later on Apple Silicon.
 - By default, each container boots as a lightweight VM with a real IP on
@@ -86,11 +87,19 @@ not an exhaustive compatibility claim for every 1.2.x or 1.3.x release.
 - The CLI talks XPC to `container-apiserver` under launchd. Commands
   fail while the service is down; `container system status` reports
   its state.
-- The container name is the container ID. The shared library guard is
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters). Apple
-  Container's CLI has a stricter 2–63-character rule,
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`; this checkout does not apply that
-  backend-specific preflight check (#112).
+- The container name is the container ID. Names must match
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` and stay within 63 characters;
+  the leading character plus at least one following character is required.
+- The run/create path runs Linux images only. Its platform grammar requires
+  `os/arch[/variant]`; bare `linux` and variants not defined for the chosen
+  architecture are rejected. On Apple, `CONTAINER_DEFAULT_PLATFORM` is
+  resolved into the effective config platform when no explicit option is
+  supplied, so the same platform reaches image inspection, pull flights,
+  pulls, and run. The
+  resource and forwarding checks require at least 200 MiB of memory,
+  published ports 2–65535, and no more than 64 publish descriptors. Network
+  names are lowercase, 1–63 characters, and may use dots, hyphens, or
+  underscores only between alphanumerics.
 - Several Docker features do not exist: healthchecks, a `wait`
   command, an event stream, label filters on `ls`, and re-attaching to
   a running container. Their behavior must be reproduced client-side.
@@ -110,7 +119,16 @@ not an exhaustive compatibility claim for every 1.2.x or 1.3.x release.
   anchored CLI stderr forms owned by `engine_apple.go` and
   `engine_docker.go` (name conflict, image/container missing). Those
   matchers are regression-tested against recorded 1.2/1.3 and Docker 29
-  fixtures and a live CLI in `cli_compat_integration_test.go`.
+  fixtures and a live CLI in `cli_compat_integration_test.go`. The Apple
+  capability matrix additionally requires `CONTAINERGO_BACKEND=apple` and
+  `CONTAINERGO_APPLE_LIVE=1`, and skips when the API-server version cannot be
+  established.
+- Apple Container's `run` and `create` commands resolve the image as part of
+  their normal path and expose no `--pull=never` equivalent. A strict
+  `PullNever` guarantee is therefore unavailable on Apple; the backend
+  rejects it with `ErrPullNeverUnsupported` before any CLI call and documents
+  `PullMissing`/`PullAlways` as fallbacks. Docker remains the strict no-fetch
+  backend.
 
 ## Choosing the implementation strategy
 
@@ -201,11 +219,9 @@ the selected pull policy before starting it and then completes the wait
 strategy. The default `PullMissing` policy inspects the local image store and
 issues an explicit pull only when the image is absent. `PullAlways` issues an
 explicit pull for every new-container attempt. `PullNever` is
-backend-specific: on the current checkout it performs a best-effort
-precheck and returns `ErrImageNotFound` when that precheck finds no
-image. Docker also passes `--pull=never`, so Docker has the strict
-no-fetch path; Apple Container has no equivalent run-time switch, so
-its precheck is not a no-fetch guarantee (#112). If a post-start
+strict on Docker, which passes `--pull=never` and returns `ErrImageNotFound`
+when the image is absent; Apple Container has no equivalent run-time switch,
+so `Run` rejects `PullNever` there with `ErrPullNeverUnsupported`. If a post-start
 operation or wait fails on the non-reuse path, `Run` rolls back the
 container it created before returning the error. Reuse has the separate
 shared-lifetime contract described below.
@@ -231,8 +247,8 @@ described below are not.
 - `WithWaitStrategy(s wait.Strategy)`: readiness detection.
 - `WithName(name string)`: container name (default
   `containergo-<random hex>`). It uses the shared 1–63-character guard;
-  Apple's stricter 2–63-character rule is not enforced by the current
-  checkout's backend preflight (#112).
+  Apple's stricter 2–63-character rule is enforced by the Apple backend's
+  preflight before image resolution.
 - `WithLabels(labels map[string]string)`: extra labels. The library's
   managed labels are reserved.
 - `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
@@ -248,7 +264,8 @@ described below are not.
   daemon-assigned host ports. Use an explicit binding when a caller
   needs a specific host port.
 - `WithPullPolicy(policy PullPolicy)`: choose `PullMissing` (default),
-  `PullAlways`, or `PullNever`. `PullAlways` fetches before attach on
+  `PullAlways`, or `PullNever` (Docker only; Apple returns
+  `ErrPullNeverUnsupported`). `PullAlways` fetches before attach on
   `WithReuse` as well as on create.
 - `WithReuse()`: make a named `Run` a get-or-create operation. Attach
   callers apply `WithFiles` and `PullAlways`. Other creation-only
@@ -886,7 +903,7 @@ empty cache. The cache holds only "present" answers - a cached absence
 would have to be invalidated by the pull it triggered - and is keyed by
 backend, image store (Docker client-config env for Docker), image, and
 platform, since those stores are independent.
-`PullNever` always inspects: its contract is to fail when the image is
+On Docker, `PullNever` always inspects: its contract is to fail when the image is
 absent, so a cached answer must not stand in for the check.
 
 ## Security design
@@ -900,10 +917,14 @@ security boundary. The reaper staging exception in #111 means that
 exception is the watchdog reaper's shell script. Its body is a fixed
 string; container IDs enter only as stdin data. The script defeats word
 splitting and globbing (`set -f`, `IFS=`, `read -r`, quoted expansions), and
-the library validates each target before writing it to the pipe. Apple
-Container names must match `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs
-must be lowercase 64-character hexadecimal strings matching `^[0-9a-f]{64}$`.
-The two layers together leave no command injection through IDs.
+the library validates each target before writing it to the pipe. Name-addressed
+entries must match the shared generic `nameRE` form
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`; full Docker IDs must be lowercase
+64-character hexadecimal strings matching `^[0-9a-f]{64}$`. The shared guard is
+intentionally not the complete Apple contract: `appleEngine.checkConfig`
+applies Apple's stricter 2–63-character `appleContainerNameRE` before a
+container is created. The two layers together leave no command injection
+through IDs.
 
 **No environment variables on argv**. `--env key=value` exposes values
 to every user via `ps`. Because environment variables are the main
@@ -932,7 +953,11 @@ valid. Rejecting controls (including tab) and invalid UTF-8 is intentional
 even if a particular backend accepts such a value, because the library will
 not place it in a line-delimited env file. The CLI validates too, but
 first-party validation gives clearer errors and independence from future CLI
-changes.
+changes. `appleEngine.checkConfig` applies backend-specific platform, name,
+network, memory, and publish limits before image resolution;
+`WithExposedPorts` remains a library-side declaration and is not converted
+into an Apple `--publish` flag. The same check runs for the public `Pull`
+path. Docker keeps its own backend-specific checks.
 
 **Handle no credentials**. Registry authentication is delegated to
 the backend CLI: use `container registry login` for Apple Container or
@@ -1111,9 +1136,11 @@ these follow-up issues are applied.
   (#103). For Docker, empty or malformed inspect data can take that
   generic path, while a valid but mismatched object is not rejected as a
   no-match by the current parser.
-- `ErrImageNotFound`: the current `PullNever` precheck found no local
-  image. On Apple this is a best-effort backend-specific precheck, not a
-  no-fetch guarantee (#112).
+- `ErrImageNotFound`: the Docker `PullNever` precheck found no local
+  image.
+- `ErrPullNeverUnsupported`: the backend (Apple Container) cannot honor
+  `PullNever` without an implicit fetch; `Run` and `Pull` reject it before any
+  CLI call. Use `PullMissing` or `PullAlways`.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.
 - `ErrGenerationReplaced`: a delete-time generation check found a
@@ -1294,6 +1321,15 @@ explicit image inspection and pull commands. The Docker run argv adds
 `--pull=never`; Apple Container uses the same explicit policy path.
 Concurrent pulls are aggregated only within the current process and
 for the same backend, image, platform, and operation.
+
+**Apple capability differences**: `appleEngine.checkConfig` rejects
+non-Linux or malformed Apple platforms (including bare `linux` and invalid
+variants), Apple-invalid container/network names, memory below 200 MiB
+(including overflow), published port 1, overlapping publishes, and more than
+64 publish descriptors before invoking the CLI. `PullNever` is also rejected
+with `ErrPullNeverUnsupported`, because Apple has no run-time no-fetch flag;
+`PullMissing` and `PullAlways` are the explicit documented fallbacks. The
+public `Pull` helper applies the same platform and capability validation.
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults

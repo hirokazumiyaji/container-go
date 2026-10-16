@@ -224,8 +224,14 @@ func validationErrorf(option string, value any, format string, args ...any) erro
 
 // ErrImageNotFound reports that an image is not in the backend's local
 // store. Run returns it when the pull policy is PullNever and the image
-// is absent.
+// is absent on a backend that supports that policy.
 var ErrImageNotFound = errors.New("image not found in local store")
+
+// ErrPullNeverUnsupported reports that the selected backend cannot honor
+// PullNever without allowing its run command to fetch an image implicitly.
+// Apple Container returns this before inspecting or starting a container;
+// callers can use PullMissing or PullAlways as the documented fallback.
+var ErrPullNeverUnsupported = errors.New("PullNever is unsupported by this backend")
 
 // ErrImageIdentityUnavailable reports that an image inspect completed
 // successfully but did not provide a usable immutable identity (a
@@ -234,9 +240,7 @@ var ErrImageNotFound = errors.New("image not found in local store")
 // closed by default; WithAllowMutableImageTag opts into passing the
 // original mutable tag to the backend. Apple name@digest references,
 // including name:tag@digest, remain immutable and are never downgraded by
-// that option. PullNever also rejects an identity-less Apple inspect even
-// when the caller supplied a digest, because the backend has not confirmed
-// the local identity.
+// that option.
 var ErrImageIdentityUnavailable = errors.New("backend did not report an immutable image identity")
 
 // ErrImageIdentityMismatch reports that image inspect returned an

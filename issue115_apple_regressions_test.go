@@ -244,7 +244,7 @@ func TestIssue115AppleAddressInspectErrorsRemainOperationalErrors(t *testing.T) 
 			}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(PullNever), WithAllowMutableImageTag(),
-				withRunner(r), withEngine(appleEngine{}))
+				withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 			if err == nil {
 				t.Fatal("want local-address inspection error")
 			}
@@ -315,7 +315,7 @@ func TestIssue115AppleIdentitylessAddressInspectIsUnavailableNotNotLocal(t *test
 		localIdentityless: true,
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
 		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
 	}

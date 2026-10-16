@@ -15,6 +15,18 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Validate Apple Container's platform, name, network, port, and memory
+  capabilities before image resolution; reject unsupported `PullNever` with
+  `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.
+- Document Apple Container CLI source/help and inspect fixtures for 1.2.2
+  and 1.3.0, plus Docker 29.x CLI behavior. The live Apple matrix is
+  explicitly opt-in, reports an unavailable or mismatched API-server version
+  as a skip, and uses ownership-checked cleanup.
+- Resolve Apple Container's `CONTAINER_DEFAULT_PLATFORM` into the effective
+  platform across image inspection, pull flights, pulls, and runs; apply the
+  same capability checks to public `Pull`.
+- Bare Apple `linux/armel` selectors default to `v6`, matching
+  `linux/armel/v6`; bare `arm`/`armhf` remain `v7`.
 - Add bounded and streaming CLI output paths: `LogsOptions.MaxBytes`,
   `WithExecMaxBytes`, `ExecTo`, `LogsTo`, `OutputStats`, and the
   `ErrOutputTruncated` / `Truncated` observability contract. The CLI
@@ -221,8 +233,7 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   normalization is pending #92; reaper staging exposure and mitigation are
   tracked by #111.
 - Successful missing inspect classification is pending #103; liveness
-  error-chain flattening is tracked by #104; Apple PullNever capability
-  handling is pending #112.
+  error-chain flattening is tracked by #104.
 
 ## [0.2.0] - 2026-09-02
 

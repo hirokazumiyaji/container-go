@@ -3,8 +3,10 @@ package container
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
+	"regexp"
 	"runtime"
 	"strconv"
 	"strings"
@@ -41,13 +43,43 @@ const (
 	appleLogsOpenPrefix = "failed to open container logs: "
 )
 
+// These limits mirror the checks in Apple Container 1.2.2 and 1.3.0
+// (Parser.resources, PublishPort, Utility, and ContainersService). Keeping
+// them here makes a bad request fail before any image fetch or container
+// create is attempted.
+const (
+	appleMinMemoryBytes uint64 = 200 * 1024 * 1024
+	// Apple parses the input as a Double, converts to MiB, narrows to Int64,
+	// then multiplies by 1 MiB into UInt64. MaxInt64 bytes is a conservative
+	// bound that leaves room for floating-point rounding in that path.
+	appleMaxMemoryBytes     uint64 = 1<<63 - 1
+	applePublishedPortLimit        = 64
+)
+
+var (
+	// Apple Container requires at least two characters for a container
+	// name; a one-character name is valid for the other backend.
+	appleContainerNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`)
+	// NetworkResource.nameValid is deliberately different from the
+	// container-name rule: it is lowercase, allows one character, and
+	// disallows a trailing separator.
+	appleNetworkNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$`)
+)
+
 func (appleEngine) name() string   { return "apple" }
 func (appleEngine) binary() string { return "container" }
 func (appleEngine) directIP() bool { return true }
 
+// checkConfig applies the parts of Apple Container's CLI contract that are
+// independent of the current service state. The Apple CLI performs these
+// checks only after it has already resolved the image, so doing them here
+// avoids surprising pulls and makes the backend limits visible to callers.
 func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	if err := resolveEffectivePlatform(cfg); err != nil {
 		return err
+	}
+	if cfg.pullPolicy == PullNever {
+		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
 	}
 	if cfg.platform != "" {
 		if err := validateApplePlatform(cfg.platform); err != nil {
@@ -55,7 +87,95 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 		}
 		cfg.platform = canonicalizeApplePlatformSelector(cfg.platform)
 	}
+
+	if cfg.name != "" && !appleContainerNameRE.MatchString(cfg.name) {
+		return fmt.Errorf("invalid Apple container name %q: must be 2-63 characters and match %s", cfg.name, appleContainerNameRE)
+	}
+	if cfg.network != "" {
+		// Apple accepts comma-separated network properties, but this
+		// public option intentionally represents a name only. Rejecting
+		// the separator here avoids passing an option string as a name.
+		if strings.Contains(cfg.network, ",") {
+			return fmt.Errorf("invalid Apple network name %q: comma-separated network properties are not supported", cfg.network)
+		}
+		if !appleNetworkNameRE.MatchString(cfg.network) {
+			return fmt.Errorf("invalid Apple network name %q: must match %s", cfg.network, appleNetworkNameRE)
+		}
+	}
+
+	if len(cfg.published) > applePublishedPortLimit {
+		return fmt.Errorf("apple backend supports at most %d published-port descriptors, got %d", applePublishedPortLimit, len(cfg.published))
+	}
+	seenPublished := make(map[string]struct{}, len(cfg.published))
+	for _, p := range cfg.published {
+		if p.hostPort <= 1 || p.containerPort <= 1 {
+			return fmt.Errorf("apple backend requires published ports to be 2-65535, got %q", p.raw)
+		}
+		// Match Apple Container's PublishPort.hasOverlaps key:
+		// "\(hostPort)/\(proto)" without hostAddress. Distinct bind
+		// addresses on the same host port and protocol still overlap
+		// upstream, so include them here before the CLI is called.
+		key := fmt.Sprintf("%d/%s", p.hostPort, p.proto)
+		if _, exists := seenPublished[key]; exists {
+			return fmt.Errorf("apple backend published-port descriptors overlap at %q", p.raw)
+		}
+		seenPublished[key] = struct{}{}
+	}
+
+	if cfg.memory != "" {
+		if _, err := appleMemoryBytes(cfg.memory); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// appleMemoryBytes parses the integer/unit form accepted by WithMemory and
+// applies the limits used by Apple Container's run/create path. Apple parses
+// the numeric value as a Swift Double, converts it to MiB, narrows it to
+// Int64, and multiplies by 1 MiB into UInt64. The API server requires at least
+// 200 MiB. Use MaxInt64 bytes as a conservative upper bound so values that
+// could round across the final UInt64 conversion are rejected before reaching
+// the CLI.
+func appleMemoryBytes(size string) (uint64, error) {
+	if !memoryRE.MatchString(size) {
+		return 0, fmt.Errorf("invalid Apple memory size %q: use an integer with an optional K, M, G, T, or P suffix", size)
+	}
+
+	digits := size
+	multiplier := uint64(1)
+	// memoryRE has already restricted the optional suffix to K/M/G/T/P.
+	if last := size[len(size)-1]; last < '0' || last > '9' {
+		digits = size[:len(size)-1]
+		switch last {
+		case 'K':
+			multiplier = 1 << 10
+		case 'M':
+			multiplier = 1 << 20
+		case 'G':
+			multiplier = 1 << 30
+		case 'T':
+			multiplier = 1 << 40
+		case 'P':
+			multiplier = 1 << 50
+		}
+	}
+
+	n, err := strconv.ParseUint(digits, 10, 64)
+	if err != nil {
+		if errors.Is(err, strconv.ErrRange) {
+			return 0, fmt.Errorf("apple memory size %q overflows the supported 64-bit range", size)
+		}
+		return 0, fmt.Errorf("invalid Apple memory size %q: %w", size, err)
+	}
+	if n > appleMaxMemoryBytes/multiplier {
+		return 0, fmt.Errorf("apple memory size %q overflows the supported 64-bit range", size)
+	}
+	bytes := n * multiplier
+	if bytes < appleMinMemoryBytes {
+		return 0, fmt.Errorf("apple backend requires at least 200 MiB of memory, got %q", size)
+	}
+	return bytes, nil
 }
 
 // canonicalizeApplePlatformSelector makes the default variant explicit
@@ -165,6 +285,10 @@ type applePlatform struct {
 	variant      string
 }
 
+// parseApplePlatformSelector parses a platform selector using the same
+// defaults as ContainerizationOCI.Platform(from:): bare arm/armhf selectors
+// mean v7, bare armel means v6 (matching explicit linux/armel/v6), bare
+// aarch64/arm64 means v8, and x86 aliases default to no variant.
 func parseApplePlatformSelector(platform string) (applePlatform, bool) {
 	parts := strings.Split(platform, "/")
 	if len(parts) < 1 || len(parts) > 3 || parts[0] == "" {

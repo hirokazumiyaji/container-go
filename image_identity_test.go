@@ -236,7 +236,7 @@ func (r *issue115AppleNoDigestAliasRunner) Run(_ context.Context, args ...string
 func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
 	r := &issue115AppleNoDigestAliasRunner{}
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}
@@ -247,7 +247,7 @@ func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
 	fallback := &issue115AppleNoDigestAliasRunner{}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithAllowMutableImageTag(),
-		withRunner(fallback), withEngine(appleEngine{}))
+		withRunner(fallback), withEngine(applePullNeverBelowPreflight{}))
 	if err != nil {
 		t.Fatalf("explicit fallback Run: %v", err)
 	}
@@ -263,7 +263,7 @@ func TestIssue115PullNeverRejectsIdentitylessAppleInspect(t *testing.T) {
 	r := &issue115IdentityLessRunner{}
 	image := "redis:7-alpine@" + issue115ImageIdentityOld
 	_, err := Run(context.Background(), image,
-		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
 		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
 	}

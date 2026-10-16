@@ -20,9 +20,8 @@ endpoint の更新（#85）はこのチェックアウトに含まれ、`Host`�
 inspect スナップショットを再利用し、readiness の毎回の retry で
 backend CLI を起動しないようにしつつ、ネットワークとポートデータを
 無期限には保持しません。
-missing inspect の分類は #103、error chain の保持は #104、Apple PullNever の
-capability handling は #112 に依存します。Windows / remote の bind source は
-#76、TCP 専用 readiness の validation は #77、Stop timeout の validation は
+missing inspect の分類は #103、error chain の保持は #104 に依存します。
+Windows / remote の bind source は #76、TCP 専用 readiness の validation は #77、Stop timeout の validation は
 #89、wait error chain の統一は #92、public option の validation は #102、reaper
 staging の cleanup は #111 に依存します。
 #85 を除き、以下の現在の節はその変更前の動作を説明します。
@@ -40,7 +39,7 @@ Go 1.26 以降が必要で、nested `bench/` モジュールには Go 1.26 以�
 `Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、backend 選択、
 元の wait strategy は `v0.2.0` に存在しています。
 作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)
-対象: Apple Container v1.2.x(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS。copy-out には client/server 29.7.0 以上)、Go 1.26 以降
+対象: Apple Container CLI 1.2.2 または 1.3.0(macOS 26 以降、Apple Silicon)、Docker(Linux、Windows、macOS。copy-out には client/server 29.7.0 以上)、Go 1.26 以降
 
 ## 目的
 
@@ -58,28 +57,32 @@ Go のテストコードから使い捨てコンテナを起動し、接続情�
 
 ## 前提とする Apple Container の仕様
 
-設計の根拠となる Apple Container の CLI・source の仕様を先に整理する。
-リポジトリの inspect fixture は 1.2.2 と 1.3.0 を対象とする。
-これは 1.2.x や 1.3.x のすべての release を確認済みとする互換性宣言ではない。
+設計の根拠となる Apple Container の CLI・ソース仕様(フィクスチャは 1.2.2 と
+1.3.0)を先に整理する。API サーババージョンは live check が必要になった時点で
+実行時に取得し、CLI バージョンから推測しない。取得できない場合は確認済みとは
+扱わず、利用不可として報告する。これは 1.2.x や 1.3.x のすべての release を
+確認済みとする互換性宣言ではない。
 
 - ホスト要件は macOS 26 以降かつ Apple Silicon である。
 - 既定では、各コンテナは軽量 VM として起動し、vmnet ブリッジ（network は `default`、`192.168.64.0/24`）上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開（`--publish`）は必須ではない。
 - すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返し、追加フィールドは `internal/inspect` が無視する。
 - CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗し、`container system status` で状態を確認する。
 - コンテナ名がそのまま ID になる。共有 library guard は
-  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で、1 文字から 63 文字までを受け付ける。Apple Container の CLI はより厳密な 2～63 文字の規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` を持ち、現在の checkout はその backend 固有の preflight check を適用しない（#112）。
+  `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で、1 文字から 63 文字までを受け付ける。Apple Container の CLI はより厳密な 2～63 文字の規則 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$` を持ち、Apple バックエンドは image 解決の前にこれを適用する。
 - ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチは存在しない。必要な動作はクライアント側で実装する。
 - `--label` は存在するが、ラベルの絞り込みは JSON 出力をクライアント側で行う必要がある。ラベルキーは小文字の Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナにだけ使える。
 - 各コンテナは軽量 VM として起動し、vmnet ブリッジ(既定は `default`、`192.168.64.0/24`)上の実 IP を持つ。ホストはこの IP に直接到達できるため、ポート公開(`--publish`)は必須ではない。
 - すべての操作は `container` CLI から行える。`ls --format json` と `inspect` は機械可読な JSON を返す(追加フィールドは `internal/inspect` が無視する)。
 - CLI は launchd 配下の `container-apiserver` と XPC で通信する。サービスが未起動だとコマンドは失敗する。起動状態は `container system status` で確認できる。
-- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない。
+- コンテナ名がそのまま ID になる。名前は `^[a-zA-Z0-9][a-zA-Z0-9_.-]+$` かつ 63 文字以内でなければならない(先頭文字の後に少なくとも 1 文字必要)。
+- `run`/`create` は Linux image のみを実行する。platform grammar は `os/arch[/variant]` で、bare `linux` や architecture に定義されていない variant を拒否する。Apple では platform 未指定時の `CONTAINER_DEFAULT_PLATFORM` を実効 cfg platform に解決し、image inspect、pull flight、pull、run で同じ値を使う。resource / forwarding の制約として memory は 200 MiB 以上、publish port は 2〜65535、publish descriptor は最大 64 個。network name は英小文字の 1〜63 文字で、 英数字の途中にだけ dot/hyphen/underscore を使える。
 - Docker にある次の機能が存在しない：ヘルスチェック、`wait` コマンド、イベントストリーム、`ls` のラベルフィルタ、実行中コンテナへの再アタッチ。これらに相当する挙動はクライアント側で実装する必要がある。
 - `--label` はあるがフィルタは JSON 出力をクライアント側で絞り込むしかない。ラベルキーは小文字英数字とハイフン、ドット区切りの Docker/OCI 形式に限られる。
 - `container cp` は実行中のコンテナに対してのみ使える。copy-out には型を保持し symlink を追跡しないモードがなく、確認したバージョンでは host 側の検証前に symlink、FIFO、device node を dereference/consume することがある。そのため `CopyFileFromContainer` は Apple Container では `ErrCopyFileFromContainerUnsupported` を返し fail closed する。Docker では型を保持する extractor を利用するため client/server の両方が 29.7.0 以上を必要とし、必要な flag を host が扱える場合に host 側の Lstat/open 検査を維持する。どちらの条件も満たさない場合は fail closed する。
 - `--rm` で削除しても匿名ボリュームは残る。
-- エラー分類は `engine_apple.go` と `engine_docker.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。
+- エラー分類は `engine_apple.go` と `engine_docker.go` の、backend binary・command・行頭固定の CLI stderr 形式に依存する(名前衝突、image/container missing)。1.2/1.3 と Docker 29 の記録フィクスチャ、および `cli_compat_integration_test.go` のライブ CLI で回帰を確認する。capability matrix はさらに `CONTAINERGO_BACKEND=apple` と `CONTAINERGO_APPLE_LIVE=1` を要求し、API サーババージョンを確認できない場合は skip する。
+- Apple の `run`/`create` には image 解決を止める `--pull=never` 相当がないため、厳密な `PullNever` は保証できない。backend は CLI 呼び出し前に `ErrPullNeverUnsupported` で拒否し、`PullMissing`/`PullAlways` を明示的な fallback とする。厳密な no-fetch は Docker だけが保証する。
 
 ## 実現方式の選定
 
@@ -159,7 +162,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 
 コンテナを新規作成する必要がある場合、`Run` は選択した pull policy に従ってイメージを解決・適用してから待機戦略を完了する。
 既定の `PullMissing` はローカルイメージストアを検査し、イメージがないときだけ明示的に pull する。
-`PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求する。`PullNever` は backend 固有で、現在のチェックアウトでは best-effort precheck を行い、image がなければ `ErrImageNotFound` を返す。Docker は `--pull=never` も渡すため strict な no-fetch 経路を持つが、Apple Container には同等の run-time switch がないため、precheck は no-fetch 保証ではない（#112）。起動後の操作や待機が再利用でない経路で失敗した場合は、作成したコンテナをロールバックしてからエラーを返す。Reuse の共有ライフタイムは後述の別契約で扱う。
+`PullAlways` は新規コンテナ作成の試行ごとに明示的な pull を要求する。`PullNever` は Docker では strict で、`--pull=never` を渡し、image がなければ `ErrImageNotFound` を返す。Apple Container には同等の run-time switch がないため、`Run` は `ErrPullNeverUnsupported` でこの policy を拒否する。起動後の操作や待機が再利用でない経路で失敗した場合は、作成したコンテナをロールバックしてからエラーを返す。Reuse の共有ライフタイムは後述の別契約で扱う。
 
 オプションは functional options で提供する。
 以下は現在の開発チェックアウトの API 一覧である。
@@ -171,12 +174,12 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithEnv(env map[string]string)`：環境変数を設定する。値はコマンドライン引数ではなく一時ファイル経由で渡す。
 - `WithCmd(cmd ...string)` / `WithEntrypoint(entrypoint string)`：コマンドとエントリポイントの上書き。エントリポイントは `docker run --entrypoint` の仕様どおり 1 トークンとする。複数トークンは `WithCmd` を使う。
 - `WithWaitStrategy(s wait.Strategy)`：起動完了の判定方法を指定する。
-- `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は現在の checkout の backend preflight では強制されない（#112）。
+- `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は Apple バックエンドの preflight が image 解決前に強制する。
 - `WithLabels(labels map[string]string)`：追加ラベルを指定する。ライブラリが管理するラベルは予約済みである。
 - `WithMounts(mounts ...Mount)`：bind、名前付きボリューム、tmpfs のマウントを指定する。現在の bind source validation は Unix-style で、Windows host path と remote Docker の bind source semantics は #76 に残る。
 - `WithFiles(files ...File)`：起動後のコンテナへファイルをコピーする。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
-- `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever` を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
+- `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。作成専用 option は attach 時に無視される。
 - `WithReuseGroup(group string)`：再利用するコンテナにラベルを付け、`PruneReuseGroup` の対象にする。`WithReuse` が必要で、再利用キーには含まれない。`PruneReuseGroup` の validation grammar は現在より弱い（#102）。
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限を指定する。`WithMemory` は現在 zero を受け付け、backend capability limit を強制しない（#102）。
@@ -523,7 +526,7 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 作る。キャッシュするのは "present" の答えだけである。不在をキャッシュすると、
 それが引き起こした pull で無効化する必要が出る。キーは backend、image store
 （Docker では client-config env）、image、platform であり、これらのストアは
-独立している。`PullNever` は常に inspect する。契約は image 不在で失敗する
+独立している。Docker の `PullNever` は常に inspect する。契約は image 不在で失敗する
 ことなので、キャッシュされた答えをその確認の代わりにしてはならない。
 
 ## セキュリティ設計
@@ -533,9 +536,11 @@ Option を `Run` 間で再利用する必要がある。新しい呼び出しは
 **シェルを経由しない**。
 すべての CLI 呼び出しは `exec.Command` に引数配列を渡す形で行い、シェル文字列を組み立てない。
 唯一の例外は watchdog リーパーのシェルスクリプトである。
-スクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
-スクリプト側は `set -f`（グロブ無効）、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
-ライブラリは、パイプへ書く前の ID を検証し、Apple Container の名前 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` または Docker の完全な小文字 64 桁の 16 進数 ID `^[0-9a-f]{64}$` だけを受け入れる。
+ここはスクリプト本文を固定文字列とし、コンテナ ID は標準入力からデータとして渡す。
+スクリプト側は `set -f`(グロブ無効)、`IFS=` と `read -r`、変数のクォートで語分割とグロブ展開を封じる。
+リーパーは name-addressed entry を共有の generic `nameRE`
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` で検証し、Docker の 64 桁 16 進数 ID も受け付ける。
+この shared guard は Apple の契約全体ではない。`appleEngine.checkConfig` がコンテナ作成前に Apple 固有の 2〜63 文字の `appleContainerNameRE` を適用する。
 二重の防御により、ID 経由のコマンド注入を成立させない。
 
 **環境変数を argv に載せない**。
@@ -550,7 +555,7 @@ cleanup 失敗は返し、deferred retry する。
 Windows の Go `chmod` は同等の秘密性を保証しないため、env ファイルが要る操作は backend を呼ぶ前に `ErrEnvFileUnsupported` で失敗する。
 
 **入力を検証する**。
-コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。環境変数キーは空でない有効な UTF-8 で、`=`、Unicode 空白、制御文字、先頭 `#`、先頭 BOM を含まない。値は有効な UTF-8 で、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029 を含まない。制御文字でない Unicode、空白、`=` は値として許可する。制御文字(タブを含む)や不正な UTF-8 を、バックエンドが受け付ける場合でも行区切り env ファイルへ書かないという意図的な互換性変更である。CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。
+コンテナ名は前述の名前規則、ラベルキーは CLI と同じ Docker/OCI 形式、ポートは数値範囲とプロトコル(`tcp`/`udp`)、コピー対象のパスは `/` 区切りの POSIX 絶対パスでバックスラッシュを含まず、有効な UTF-8 であることを、CLI へ渡す前に検証する。環境変数キーは空でない有効な UTF-8 で、`=`、Unicode 空白、制御文字、先頭 `#`、先頭 BOM を含まない。値は有効な UTF-8 で、Unicode 制御文字、NUL、CR/LF、U+2028、U+2029 を含まない。制御文字でない Unicode、空白、`=` は値として許可する。制御文字(タブを含む)や不正な UTF-8 を、バックエンドが受け付ける場合でも行区切り env ファイルへ書かないという意図的な互換性変更である。CLI 側にも検証はあるが、ライブラリ側で先に落とすことでエラーメッセージを明確にし、将来の CLI 側検証の変化にも依存しない。 `appleEngine.checkConfig` は image 解決前に platform、name、network、memory、publish の backend 固有制約も適用し、公開 `Pull` も同じ検証を通る。
 
 **認証情報を扱わない**。レジストリ認証はバックエンド CLI に委ねる。Apple Container では `container registry login`、Docker では `docker login` を使う。ライブラリに認証情報を入力する経路はない。
 
@@ -631,7 +636,8 @@ root と backend の error は `errors.Is` と `errors.As` で判別できる状
 
 - `ErrSystemNotRunning`：CLI 呼び出しが失敗した後、バックエンド固有の liveness probe が Apple Container のシステムサービスまたは Docker daemon の停止を判定した場合に返す。元の CLI エラーと probe エラーは error chain に保持し、permission、configuration、caller cancellation はこの sentinel に分類しない。
 - `ErrContainerNotFound`：backend が missing container を示す CLI failure を分類した場合。target に一致する entry がない successful inspect response はこの sentinel を保証せず、generic error になる場合がある（#103）。Docker では empty または malformed な inspect data がその generic path に入る。valid だが mismatched な object は現在の parser では no-match として拒否されない。
-- `ErrImageNotFound`：現在の `PullNever` precheck がローカルイメージを見つけなかった場合。Apple では best-effort な backend-specific precheck であり、no-fetch 保証ではない（#112）。
+- `ErrImageNotFound`：Docker の `PullNever` precheck がローカルイメージを見つけなかった場合。
+- `ErrPullNeverUnsupported`：backend（Apple Container）が暗黙の fetch なしに `PullNever` を守れない場合。`Run` と `Pull` は CLI 呼び出し前に拒否する。`PullMissing` または `PullAlways` を使う。
 - `ErrImageIdentityUnavailable`：成功した image inspect が repository-bearing digest または検証済み local image ID を返さず、mutable tag fallback も指定されていない
 - `ErrImageIdentityNotLocal`：選択した policy で pinned reference が local image store に存在しないことが確認された。Apple の `container run` に暗黙の fetch を許さない
 - `ErrImageIdentityMismatch`：inspect が別 image の identity を返した。mutable tag fallback は使わない
@@ -723,6 +729,8 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 
 **Image 処理**：両バックエンドとも、明示的な image inspect と pull コマンドで pull policy を実装する。Docker の run argv は `--pull=never` を追加し、Apple Container も同じ明示的な policy 経路を使う。並行 pull は同一プロセス内で、backend、image、platform、操作が同じ場合だけ集約する。
 
+**Apple capability の違い**：`appleEngine.checkConfig` は、CLI 呼び出し前に non-Linux または不正な Apple platform(bare `linux` と invalid variant を含む)、Apple 規格外の container/network name、200 MiB 未満の memory と overflow、publish port 1、publish の overlap、64 個を超える publish descriptor を拒否する。`WithExposedPorts` は library 側の宣言で、Apple の `--publish` flag には変換しない。Apple には run 時の no-fetch スイッチがないため `PullNever` も拒否し、`ErrPullNeverUnsupported` と明示的な fallback(`PullMissing`/`PullAlways`)を契約とする。公開 `Pull` にも同じ platform/capability 検証を適用する。
+
 **接続エンドポイントの違い**：Docker Desktop(macOS / Windows)ではコンテナ IP にホストから到達できないため、Docker バックエンドは testcontainers と同じ公開ポートモデルを既定とする。
 `WithExposedPorts` で宣言したポートは自動的にランダムポートへ公開する(ローカルは `-p 127.0.0.1::<port>`、リモートデーモンでは `-p 0.0.0.0::<port>`)。
 リモートとは、このマシンを指さないあらゆる `DOCKER_HOST` のことであり、`tcp://host`、`ssh://user@host`、スキームなしの `host:port` / ホスト名が該当する。
@@ -810,6 +818,6 @@ v0.2（Docker backend）は次の順で進めた。
 
 ## 参考資料
 
-- [apple/container](https://github.com/apple/container) v1.2.2 と v1.3.0 の command・source リファレンスおよび `ContainerResource` ソース。
-- [shiguredo/container-rs](https://github.com/shiguredo/container-rs)：XPC 直結方式の先行実装。watchdog reaper、cleanup contract、macOS 固有の制約（ポート競合、転送切断）の整理を参考にした。
-- [testcontainers-go](https://github.com/testcontainers/testcontainers-go) v0.44.0：API 形状（functional options、wait 戦略、nil 安全な cleanup）の参照元。
+- [apple/container](https://github.com/apple/container) v1.2.2 / v1.3.0 の command・source リファレンスおよび `ContainerResource` ソース
+- [shiguredo/container-rs](https://github.com/shiguredo/container-rs)：XPC 直結方式の先行実装。watchdog リーパー、クリーンアップ契約、macOS 固有の制約(ポート競合、転送切断)の整理を参考にした
+- [testcontainers-go](https://github.com/testcontainers/testcontainers-go) v0.44.0：API 形状(functional options、wait 戦略、nil 安全なクリーンアップ)の参照元

@@ -314,7 +314,7 @@ func TestIssue115PullNeverRejectsIdentitylessAppleInspectForPinnedInput(t *testi
 	r := &issue115IdentityLessRunner{}
 	image := "redis:7-alpine@" + issue115ReuseImageDigest
 	_, err := Run(context.Background(), image,
-		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
 		t.Fatalf("error = %v, want ErrImageIdentityUnavailable", err)
 	}

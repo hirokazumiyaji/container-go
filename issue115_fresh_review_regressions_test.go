@@ -145,7 +145,7 @@ func TestIssue115AppleRunMaterializesHostPlatformForPullNever(t *testing.T) {
 	runner := &issue115ReviewRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever),
-		withRunner(runner), withEngine(appleEngine{}))
+		withRunner(runner), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal for implicit %s", err, other)
 	}

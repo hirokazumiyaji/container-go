@@ -193,7 +193,7 @@ func TestIssue115AppleOrdinaryOneVariantIndexWorksForPullNever(t *testing.T) {
 	}
 	ctr, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), WithPlatform(host), WithPullPolicy(PullNever),
-		withRunner(runner), withEngine(appleEngine{}))
+		withRunner(runner), withEngine(applePullNeverBelowPreflight{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -219,7 +219,7 @@ func TestIssue115AppleOrdinaryOneVariantPullNeverRejectsMissingRootWithoutLabeli
 	runner := &issue115ScopedIndexRunner{imageJSON: issue115OrdinaryScopedIndexJSON(host)}
 	_, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), WithPlatform(host), WithPullPolicy(PullNever),
-		withRunner(runner), withEngine(appleEngine{}))
+		withRunner(runner), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}

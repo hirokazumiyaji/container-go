@@ -10,11 +10,10 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-// PullPolicy decides when Run fetches the image. PullNever is a
-// backend-specific best-effort precheck on this checkout: Docker passes
-// --pull=never, while Apple Container has no equivalent run-time switch
-// and may resolve the image during its own run path. #112 tracks strict
-// Apple capability handling.
+// PullPolicy decides when Run fetches the image. PullNever is honored
+// strictly by Docker (--pull=never); Apple Container has no equivalent
+// run-time switch, so Run rejects PullNever there with
+// ErrPullNeverUnsupported.
 type PullPolicy int
 
 const (
@@ -25,12 +24,13 @@ const (
 	// PullAlways fetches the image on every Run, including a
 	// WithReuse attach before the shared container is returned.
 	PullAlways
-	// PullNever performs the current backend precheck and returns
-	// ErrImageNotFound when the image is absent. Docker also passes
-	// --pull=never, but Apple Container has no equivalent flag; its
-	// best-effort precheck is not a no-fetch guarantee (#112). Run fails
-	// before starting when the image is absent or when a pinned identity
-	// is not locally addressable by the backend.
+	// PullNever never fetches; Run fails before starting when the
+	// image is absent. The Docker backend honors this strictly. Apple
+	// Container has no run-time switch that can prevent its implicit image
+	// resolution, so Run rejects this policy with ErrPullNeverUnsupported;
+	// use PullMissing or PullAlways as the documented Apple fallback.
+	// Run also fails before starting when a pinned identity is not locally
+	// addressable by the backend.
 	PullNever
 )
 
@@ -125,8 +125,9 @@ func Pull(ctx context.Context, image string) error {
 	return safePublicError(pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image))
 }
 
-// pullWith is the fake-runner-driven core of Pull: the flight shares one
-// backend pull of the image, and failures go through Classify.
+// pullWith is the fake-runner-driven core of Pull. It resolves and validates
+// the effective backend configuration before entering the pull flight, so the
+// public helper and Run apply the same platform and capability rules.
 func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error {
 	cfg := &config{runner: r, eng: eng}
 	if err := eng.checkConfig(ctx, cfg); err != nil {
@@ -193,6 +194,9 @@ func imageIdentityNeedsLocalAddressCheck(eng engine, identity imageIdentity, pol
 // existing internal callers; Run uses ensureImageRef so the immutable
 // identity is carried into the run command.
 func (c *config) ensureImage(ctx context.Context, image string) error {
+	if err := c.eng.checkConfig(ctx, c); err != nil {
+		return err
+	}
 	_, err := c.ensureImageRef(ctx, image)
 	return err
 }

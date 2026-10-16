@@ -341,7 +341,7 @@ func TestIssue115AppleExplicitPlatformRejectsEmptyVariants(t *testing.T) {
 	r := &issue115ReviewRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/arm64"),
-		withRunner(r), withEngine(appleEngine{}))
+		withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}
@@ -362,7 +362,7 @@ func TestIssue115AppleExplicitPlatformRejectsIncompleteVariant(t *testing.T) {
 	r := &issue115ReviewRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/arm64"),
-		withRunner(r), withEngine(appleEngine{}))
+		withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}
@@ -376,7 +376,7 @@ func TestIssue115AppleEffectiveDefaultPlatformValidatesVariants(t *testing.T) {
 	image := issue115ReviewAppleImageJSON(nil)
 	r := &issue115ReviewRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
-		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(appleEngine{}))
+		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
 		t.Fatalf("error = %v, want ErrImageIdentityNotLocal", err)
 	}

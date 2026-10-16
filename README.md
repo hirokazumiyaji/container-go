@@ -62,8 +62,6 @@ backend-specific behavior. In particular:
   currently passed to a TCP dial; #77 tracks protocol validation.
 - `Stop` converts non-nil durations to whole seconds by truncation and does
   not reject negative or extreme values; #89 tracks timeout validation.
-- Apple `PullNever` is currently a best-effort backend precheck, not a
-  no-fetch guarantee; #112 tracks strict Apple capability handling.
 - Wait timeout/cancellation errors are not uniformly preserved in the
   error chain; #92 tracks the built-in strategy error contract.
 - A failed liveness probe currently flattens the original `*CLIError` into
@@ -119,11 +117,8 @@ func TestRedis(t *testing.T) {
 | OS | Default backend | Requirement |
 |---|---|---|
 | macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) CLI 1.2.2 or 1.3.0 with `container system start` done |
-| Linux | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon |
-| Windows | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon (no watchdog reaper; see below) |
-| macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) 1.2.x with `container system start` done |
-| Linux | Docker | docker CLI + running daemon; copy-out requires client/server 29.7.0+ |
-| Windows | Docker | docker CLI + running daemon; copy-out requires client/server 29.7.0+ (no watchdog reaper; see below) |
+| Linux | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon; copy-out requires client/server 29.7.0+ |
+| Windows | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon; copy-out requires client/server 29.7.0+ (no watchdog reaper; see below) |
 
 Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
 Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
@@ -142,16 +137,18 @@ root module and pins a newer testcontainers-go toolchain; see
 Verified backend behavior (the CLI stderr wording and inspect JSON shapes
 this library matches against):
 
-| Backend | Evidence used by this checkout |
+| Backend | Evidence used by this repository |
 |---|---|
 | Apple Container CLI | Source/help and inspect fixtures for 1.2.2 and 1.3.0 |
-| Docker Engine / CLI | A 29.x-shaped inspect fixture; local development run 29.7.2 |
-| Apple Container | 1.2.x–1.3.x |
-| Docker Engine / CLI | 29.x; secure copy-out requires client/server 29.7.0+ |
+| Docker Engine / CLI | 29.x; a 29.x-shaped inspect fixture and a local 29.7.2 run; secure copy-out requires client/server 29.7.0+ |
 
-These entries describe repository evidence, not an exhaustive
-compatibility claim for every release in a range. Newer CLI releases may
-change error text or JSON fields; see the stderr matchers at the top of
+The Apple API-server version is read at runtime from `container system
+version` or `container system status`; it is not inferred from the CLI
+version. The opt-in live matrix skips when that server version is unavailable
+or differs from the CLI version, so this repository does not claim an
+unobserved API-server compatibility range. These entries describe repository
+evidence, not an exhaustive compatibility claim. Newer CLI releases may change
+error text or JSON fields; see the stderr matchers at the top of
 `engine_apple.go` / `engine_docker.go` and the fixtures under
 `internal/inspect/testdata/` and `testdata/`.
 
@@ -159,9 +156,9 @@ change error text or JSON fields; see the stderr matchers at the top of
 `^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$` (one to 63 characters). This is a
 conservative safety rule, not a claim about the complete Docker or Apple
 name grammar. Apple Container's CLI has the stricter 2–63-character rule
-`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`; this checkout does not yet apply
-that backend-specific preflight check (#112), so a one-character name can
-pass library validation and still be rejected by Apple.
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`, which the Apple backend applies before
+resolving an image, so a one-character name is rejected up front rather than
+after a pull.
 
 ## Installation
 
@@ -719,11 +716,10 @@ before starting it:
   explicit pull only when the image is absent.
 - `PullAlways` requests an explicit pull for every Run attempt,
   including a `WithReuse` attach before the shared container is returned.
-- `PullNever` is backend-specific: the current checkout performs a
-  best-effort precheck and returns `ErrImageNotFound` when it finds no
-  image. Docker also passes `--pull=never` and therefore has the strict
-  no-fetch path; Apple Container has no equivalent run-time switch, so
-  its precheck is not a no-fetch guarantee (#112).
+- `PullNever` is a strict no-fetch policy on Docker: it passes
+  `--pull=never` and returns `ErrImageNotFound` when the image is absent.
+  Apple Container has no equivalent run-time switch, so `Run` rejects the
+  policy there with `ErrPullNeverUnsupported`.
 
 Concurrent operations in one process share a pull for the same backend,
 image, platform, and operation. A cancelled waiter stops waiting, but the
@@ -753,7 +749,10 @@ func PullPolicy(ctx context.Context, t testing.TB) {
     never, err := container.Run(ctx, "redis:7-alpine",
         container.WithPullPolicy(container.PullNever))
     container.Cleanup(t, never)
-    if errors.Is(err, container.ErrImageNotFound) {
+    // Docker reports an absent image as ErrImageNotFound; Apple Container
+    // rejects PullNever with ErrPullNeverUnsupported.
+    if errors.Is(err, container.ErrImageNotFound) ||
+        errors.Is(err, container.ErrPullNeverUnsupported) {
         return
     }
     if err != nil {
@@ -764,11 +763,14 @@ func PullPolicy(ctx context.Context, t testing.TB) {
 }
 ```
 
-The example registers cleanup before checking either `Run` error. On the
-current checkout, `PullNever`'s `ErrImageNotFound` is backend-specific and
-best-effort on Apple; it is not an unconditional no-fetch guarantee (#112).
+`PullNever` is a strict no-fetch contract only on the Docker backend. Apple
+Container's `container run` has no switch that prevents its own image
+resolution, so this library rejects the policy before any CLI call rather than
+silently allowing a registry fetch. Use `PullMissing` (the default) or
+`PullAlways` as the documented Apple fallback; `PullMissing` may still pull an
+absent image and is not a no-network guarantee.
 
-That existence check is a daemon round trip on every `Run`. When the
+The image-existence check is a daemon round trip on every `Run`. When the
 backend's store is known to be stable for the length of the test run,
 `WithImagePresenceCache` reuses a "present" answer for a TTL so later
 `Run`s of the same image skip it. Create the option once and reuse it —
@@ -794,9 +796,40 @@ func ImagePresenceCache(ctx context.Context) {
 It is off by default, and only "present" answers are cached: caching an
 absence would have to be invalidated by the pull it triggered. An image
 removed out of band is not re-pulled until the entry expires, so callers
-who need certainty on every `Run` should leave it off. `PullNever` always
-inspects regardless, since its contract is to fail when the image is
-absent.
+who need certainty on every `Run` should leave it off. On Docker,
+`PullNever` always inspects regardless, since its contract is to fail when
+the image is absent.
+
+### Apple capability validation
+
+The Apple backend checks the CLI's static limits before it resolves an image or
+creates a container. Apple runs Linux images only. `WithPlatform` must use
+Apple's `os/arch[/variant]` grammar: bare `linux` and variants not defined for
+the selected architecture are rejected. A bare `armel` selector means
+`v6`, matching `linux/armel/v6`; bare `arm`/`armhf` mean `v7`. When no platform option is supplied,
+`CONTAINER_DEFAULT_PLATFORM` is resolved into the effective platform and used
+consistently for image inspection, pull flights, pulls, and `run`; an explicit
+`WithPlatform` value takes precedence. This is Apple CLI configuration, so
+Docker does not consume it; the Apple-only grammar is not applied there either.
+
+The opt-in live matrix requires both `CONTAINERGO_BACKEND=apple` and
+`CONTAINERGO_APPLE_LIVE=1`; it uses unique names and ownership labels and
+never deletes a container whose label does not match. Run it with:
+
+```sh
+CONTAINERGO_BACKEND=apple CONTAINERGO_APPLE_LIVE=1 \
+  go test -tags integration -run TestIntegrationAppleCapabilityMatrix ./...
+```
+
+Apple container names must be 2–63 characters and match
+`^[a-zA-Z0-9][a-zA-Z0-9_.-]{1,62}$`. Network names are lowercase
+1–63-character names (the public `WithNetwork` option
+intentionally does not accept comma-separated MAC/MTU properties). Memory is at
+least 200 MiB and uses the same integer with an optional `K`/`M`/`G`/`T`/`P`
+suffix as `WithMemory`; invalid units and overflow are rejected. Published
+ports must be 2–65535, and Apple accepts at most 64 published-port descriptors.
+`WithExposedPorts` remains a library-side declaration and is not turned into an
+Apple `--publish` flag.
 
 ## Image resolution and pinning
 
@@ -819,9 +852,9 @@ or port validation fails.
 
 Apple has no runtime `--pull=never` switch. Before `Run` passes any
 pinned Apple reference to `container run`, it verifies that exact
-reference in the local store for `PullMissing`, `PullAlways`, and
-`PullNever`. If it is missing and the selected policy permits a fetch,
-the library performs an explicit exact-digest pull and verifies it again;
+reference in the local store for `PullMissing` and `PullAlways`
+(`PullNever` is rejected earlier with `ErrPullNeverUnsupported`). If it is
+missing, the library performs an explicit exact-digest pull and verifies it again;
 `container run` is never allowed to perform that implicit fetch. A
 successful inspect that cannot provide a repository-bearing digest or a
 verified local image ID returns `ErrImageIdentityUnavailable`; a
@@ -1048,8 +1081,11 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
   extended attributes, alternate data streams, sparse layout, and hardlink
   identity are not preserved.
-  script (the reaper) is a fixed string that receives validated container
-  names or, after #73, Docker IDs only as stdin data.
+  script (the reaper) is a fixed string that receives container IDs
+  only as validated stdin data. Name-addressed entries use the shared
+  `nameRE` token rule, while Docker's full 64-hex immutable IDs are accepted
+  separately; Apple's stricter 2–63-character name check runs before
+  container creation.
 - On Unix, environment variables are passed through a `0600` file in a
   validated, current-user-owned `0700` directory under the canonical
   `os.UserCacheDir()` path. The library resolves existing symlinked ancestors

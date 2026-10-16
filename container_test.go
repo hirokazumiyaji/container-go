@@ -187,7 +187,7 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			platformParts := strings.Split(platform, "/")
 			platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
 			variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-			if strings.Contains(platformParts[1], "arm") {
+			if strings.Contains(platformParts[1], "arm") || platformParts[1] == "aarch64" {
 				variantDigest = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 			}
 			if len(platformParts) == 3 {

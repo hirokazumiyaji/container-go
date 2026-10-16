@@ -194,9 +194,13 @@ func WithReuseGroup(group string) Option {
 	}
 }
 
-// nameRE is Apple Container's container name rule; the name doubles as
-// the container ID.
+// nameRE is the shared safe container-name form; Apple applies an
+// additional minimum-length rule in its backend validator.
 var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
+// networkNameRE is the common syntactic guard. Apple applies its stricter
+// lowercase/no-separator rule in appleEngine.checkConfig.
+var networkNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 
 // labelKeyRE is the Docker-style label key rule the CLI enforces,
 // extended with slash-separated OCI segments.
@@ -493,7 +497,7 @@ func WithWorkingDir(dir string) Option {
 // container.
 func WithNetwork(name string) Option {
 	return func(c *config) error {
-		if !nameRE.MatchString(name) {
+		if !networkNameRE.MatchString(name) {
 			return validationErrorf("WithNetwork", name, "invalid network name %q", name)
 		}
 		c.network = name
@@ -502,11 +506,14 @@ func WithNetwork(name string) Option {
 	}
 }
 
-// platformRE matches "os", "os/arch", or "os/arch/variant".
+// platformRE matches the shared Docker-style "os", "os/arch", or
+// "os/arch/variant" forms. Apple applies its stricter os/arch[/variant]
+// grammar in checkConfig.
 var platformRE = regexp.MustCompile(`^[a-z0-9]+(/[a-z0-9_-]+){0,2}$`)
 
 // WithPlatform selects the image platform, e.g. "linux/amd64" (runs via
-// Rosetta).
+// Rosetta). Apple Container applies its own os/arch[/variant] and variant
+// validation after this shared syntax check.
 func WithPlatform(p string) Option {
 	return func(c *config) error {
 		if !platformRE.MatchString(p) {

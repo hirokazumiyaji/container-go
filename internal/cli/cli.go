@@ -272,6 +272,11 @@ func (r *ExecRunner) binary() string {
 	return r.Binary
 }
 
+// SetBinary overrides the CLI executable to run.
+func (r *ExecRunner) SetBinary(binary string) {
+	r.Binary = binary
+}
+
 type runHooks struct {
 	start          func(*exec.Cmd) error
 	beforePublish  func()

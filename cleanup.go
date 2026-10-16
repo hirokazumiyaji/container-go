@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -72,14 +73,74 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 	registerCleanup(tb, ctr, true)
 }
 
+// PruneOption configures Prune and PruneReuseGroup operations.
+type PruneOption func(*pruneConfig) error
+
+type pruneConfig struct {
+	runner Runner
+	binary string
+}
+
+func newPruneConfig() *pruneConfig {
+	return &pruneConfig{}
+}
+
+// WithPruneRunner sets the runner used for Prune or PruneReuseGroup.
+func WithPruneRunner(r Runner) PruneOption {
+	return func(c *pruneConfig) error {
+		if r == nil {
+			return validationErrorf("WithPruneRunner", nil, "runner must not be nil")
+		}
+		c.runner = r
+		if c.binary != "" {
+			applyBinaryToRunner(c.runner, c.binary)
+		}
+		return nil
+	}
+}
+
+// WithPruneBinary sets the executable name or path for the container CLI during Prune or PruneReuseGroup.
+func WithPruneBinary(path string) PruneOption {
+	return func(c *pruneConfig) error {
+		if path == "" {
+			return validationErrorf("WithPruneBinary", path, "binary path must not be empty")
+		}
+		if strings.ContainsRune(path, 0) || strings.ContainsAny(path, "\r\n") {
+			return validationErrorf("WithPruneBinary", path, "invalid binary path %q", path)
+		}
+		c.binary = path
+		applyBinaryToRunner(c.runner, path)
+		return nil
+	}
+}
+
 // Prune removes stopped containers created by this library, from any
 // session. It returns the IDs it removed.
-func Prune(ctx context.Context) ([]string, error) {
+func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
+	cfg := newPruneConfig()
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, validationErrorf("Prune", i, "option %d is nil", i)
+		}
+		if err := opt(cfg); err != nil {
+			return nil, err
+		}
+	}
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
+	runner := cfg.runner
+	if runner == nil {
+		bin := cfg.binary
+		if bin == "" {
+			bin = eng.binary()
+		}
+		runner = &cli.ExecRunner{Binary: bin}
+	} else if cfg.binary != "" {
+		applyBinaryToRunner(runner, cfg.binary)
+	}
+	return pruneWith(ctx, runner, eng)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {

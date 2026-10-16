@@ -1349,15 +1349,34 @@ func stripImageDigest(ref string) string {
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
 // step; ordinary Prune still only removes stopped managed containers.
-func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
+func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err
+	}
+	cfg := newPruneConfig()
+	for i, opt := range opts {
+		if opt == nil {
+			return nil, validationErrorf("PruneReuseGroup", i, "option %d is nil", i)
+		}
+		if err := opt(cfg); err != nil {
+			return nil, err
+		}
 	}
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, group)
+	runner := cfg.runner
+	if runner == nil {
+		bin := cfg.binary
+		if bin == "" {
+			bin = eng.binary()
+		}
+		runner = &cli.ExecRunner{Binary: bin}
+	} else if cfg.binary != "" {
+		applyBinaryToRunner(runner, cfg.binary)
+	}
+	return pruneReuseGroupWith(ctx, runner, eng, group)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {

@@ -110,19 +110,79 @@ func WithImagePresenceCache(ttl time.Duration) Option {
 	}
 }
 
+// PullOption configures Pull.
+type PullOption func(*pullConfig) error
+
+type pullConfig struct {
+	runner Runner
+	binary string
+}
+
+func newPullConfig() *pullConfig {
+	return &pullConfig{}
+}
+
+// WithPullRunner sets the runner used for Pull.
+func WithPullRunner(r Runner) PullOption {
+	return func(c *pullConfig) error {
+		if r == nil {
+			return validationErrorf("WithPullRunner", nil, "runner must not be nil")
+		}
+		c.runner = r
+		if c.binary != "" {
+			applyBinaryToRunner(c.runner, c.binary)
+		}
+		return nil
+	}
+}
+
+// WithPullBinary sets the executable name or path for the container CLI during Pull.
+func WithPullBinary(path string) PullOption {
+	return func(c *pullConfig) error {
+		if path == "" {
+			return validationErrorf("WithPullBinary", path, "binary path must not be empty")
+		}
+		if strings.ContainsRune(path, 0) || strings.ContainsAny(path, "\r\n") {
+			return validationErrorf("WithPullBinary", path, "invalid binary path %q", path)
+		}
+		c.binary = path
+		applyBinaryToRunner(c.runner, path)
+		return nil
+	}
+}
+
 // Pull fetches the image into the backend's local store. Concurrent
 // callers in the same process share one pull of the same image; a
 // caller whose context is cancelled stops waiting without affecting
 // the others.
-func Pull(ctx context.Context, image string) error {
+func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	if err := validateImageReference(image); err != nil {
 		return err
+	}
+	cfg := newPullConfig()
+	for i, opt := range opts {
+		if opt == nil {
+			return validationErrorf("Pull", i, "option %d is nil", i)
+		}
+		if err := opt(cfg); err != nil {
+			return err
+		}
 	}
 	eng, err := detectEngine()
 	if err != nil {
 		return safePublicError(err)
 	}
-	return safePublicError(pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image))
+	runner := cfg.runner
+	if runner == nil {
+		bin := cfg.binary
+		if bin == "" {
+			bin = eng.binary()
+		}
+		runner = &cli.ExecRunner{Binary: bin}
+	} else if cfg.binary != "" {
+		applyBinaryToRunner(runner, cfg.binary)
+	}
+	return safePublicError(pullWith(ctx, runner, eng, image))
 }
 
 // pullWith is the fake-runner-driven core of Pull. It resolves and validates

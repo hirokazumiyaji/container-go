@@ -490,7 +490,10 @@ func TestIntegrationDockerLiveCleanupUsesImmutableID(t *testing.T) {
 	logPath := dir + "/calls.log"
 	uid := strings.Repeat("ab", 32)
 	token := "cleanup-token"
-	data := fmt.Sprintf(`[{"Id":%q,"Name":"/race-name","Config":{"Labels":{%q:%q}}}]`, uid, appleCapabilityLabel, token)
+	data := fmt.Sprintf(
+		`[{"Id":%q,"Name":"/race-name","State":{"Status":"running"},"Config":{"Labels":{%q:%q}}}]`,
+		uid, appleCapabilityLabel, token,
+	)
 	script := "#!/bin/sh\n" +
 		"echo \"$@\" >> " + logPath + "\n" +
 		"if [ \"$1\" = inspect ]; then\n" +

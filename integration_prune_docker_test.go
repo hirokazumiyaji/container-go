@@ -99,6 +99,8 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	fixtureLabel := labelKey + "=" + suffix
 	otherFixtureLabel := labelKey + "=other-" + suffix
 	managedLabelArg := managedLabel + "=true"
+	// pruneCandidateEligible requires a valid creation generation.
+	creationLabelArg := creationLabel + "=0123456789abcdef"
 
 	createdName := "containergo-prune-created-" + suffix
 	exitedName := "containergo-prune-exited-" + suffix
@@ -112,14 +114,14 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 		}
 	})
 
-	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", fixtureLabel, "--name", createdName, integrationAlpine)
-	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", fixtureLabel, "--name", exitedName, integrationAlpine, "true")
+	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", creationLabelArg, "--label", fixtureLabel, "--name", createdName, integrationAlpine)
+	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", creationLabelArg, "--label", fixtureLabel, "--name", exitedName, integrationAlpine, "true")
 	runDockerPruneCommand(t, "create", "--label", fixtureLabel, "--name", unmanagedName, integrationAlpine, "true")
-	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", otherFixtureLabel, "--name", otherManagedName, integrationAlpine, "true")
+	runDockerPruneCommand(t, "create", "--label", managedLabelArg, "--label", creationLabelArg, "--label", otherFixtureLabel, "--name", otherManagedName, integrationAlpine, "true")
 	runDockerPruneCommand(t, "start", exitedName, unmanagedName, otherManagedName)
 	// Keep this fixture alive for the whole test; a finite sleep can expire
 	// while Docker is busy and turn the preservation assertion into a race.
-	runDockerPruneCommand(t, "run", "--detach", "--label", managedLabelArg, "--label", fixtureLabel, "--name", runningName, integrationAlpine, "sh", "-c", "while :; do sleep 3600; done")
+	runDockerPruneCommand(t, "run", "--detach", "--label", managedLabelArg, "--label", creationLabelArg, "--label", fixtureLabel, "--name", runningName, integrationAlpine, "sh", "-c", "while :; do sleep 3600; done")
 
 	waitDockerContainerState(t, createdName, "created")
 	waitDockerContainerState(t, exitedName, "exited")

@@ -1377,13 +1377,13 @@ The Apple backend's direct-IP default is unchanged.
 
 **Cleanup differences**: the watchdog reaper switches its delete
 subcommand per backend (`delete --force` for Apple, `rm --force` for
-Docker). It depends on `/bin/sh` and does not run on Windows; Windows
-relies on `Cleanup` and the normal rollback paths. On this checkout the
-Docker-ID registration prerequisite (#73) is not yet present, so the
-Docker reaper path is not active even though normal Docker handles use
-the immutable ID. `Prune` uses daemon-side filters on Docker, but the
-current filter selects only `status=exited`; Docker's `dead` state is
-not selected until #113 is applied.
+Docker). The reaper depends on `/bin/sh` and thus does not run on
+Windows; v0.2 documents that Windows relies on the normal cleanup
+paths (`Cleanup`, rollback) only. `Prune` uses daemon-side filters on
+Docker (`--filter label=... --filter status=exited --filter
+status=dead`; `dead` is a stopped container the daemon can no longer
+reap, so listing only `exited` would miss it). Output is full container
+IDs via `--no-trunc --format {{.ID}}`.
 
 **Liveness detection**: the probe command switches per backend
 (`system status` for Apple, `version --format {{.Server.Version}}` for

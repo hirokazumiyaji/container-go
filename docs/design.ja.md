@@ -745,18 +745,10 @@ unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミ�
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 
-**接続エンドポイントの違い**：Docker Desktop（macOS / Windows）ではホストからコンテナ IP に到達できないため、Docker バックエンドは testcontainers と同じ公開ポート方式を既定にする。
-`WithExposedPorts` で宣言したポートは自動公開される。
-ローカルでは `-p 127.0.0.1::<port>`、検出した non-loopback `DOCKER_HOST=tcp://...` デーモンではクライアントが到達できるように `-p 0.0.0.0::<port>` を使う。
-`Host` は `127.0.0.1`（`tcp://` の `DOCKER_HOST` ならそのホスト）、`MappedPort` は割り当てられたホストポートを返す。
-loopback と unspecified の binding は `defaultHost()` に読み替えるため、その remote デーモンで観測した `127.0.0.1` binding もリモートホストとして解決する。
-検出した remote デーモンで loopback を明示した `WithPublishedPort` は `Run` が拒否する。
-Docker はリモートマシンの loopback でしか listen せず、クライアント側の書き換えでは到達できないためである。
-ライブラリがリモートデーモンを検出するのは `DOCKER_HOST` だけで、リモートデーモンを指す `docker context` は検出しない。
-デーモンが起動時にポートを原子的に割り当てるため、Apple Container で避けた空きポートの競合は再び起こらない。
-Apple バックエンドの直接 IP の既定は変えない。
-
-**Cleanup の違い**：watchdog reaper は backend ごとに delete subcommand を切り替える（Apple は `delete --force`、Docker は `rm --force`）。`/bin/sh` に依存するため Windows では動かず、Windows は `Cleanup` と通常の rollback 経路に依存する。現在の checkout には Docker-ID 登録の前提条件（#73）がないため、通常の Docker handle が不変 ID を使う場合でも、reaper の entry には登録されません。`Prune` は Docker で daemon 側 filter を使うが、現在の filter は `status=exited` だけを選び、dead 状態は #113 を適用するまで選ばない。
+**クリーンアップの違い**: watchdog リーパーは削除サブコマンドをバックエンドごとに切り替える(Apple は `delete --force`、Docker は `rm --force`)。
+リーパーは `/bin/sh` に依存するため Windows では動かない。
+v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、リーパーなしをドキュメントに明記する。
+`Prune` は Docker ではデーモンのフィルタ(`--filter label=... --filter status=exited --filter status=dead`)を使える。`dead` はデーモンが回収できない停止済みコンテナで、`exited` だけだと取りこぼす。出力は `--no-trunc --format {{.ID}}` の full container ID である。
 
 **liveness detection**：probe command は backend ごとに切り替える（Apple は `system status`、Docker は `version --format {{.Server.Version}}`）。
 

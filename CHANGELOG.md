@@ -122,6 +122,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Fixed
 
+- Include Docker `status=dead` in `Prune` daemon-side listing so stopped
+  containers the daemon can no longer reap are deleted alongside
+  `exited` ones (#113).
 - Classify `Exec` cancellation and timeout independently of local exit
   status, including exit code `1` used by Windows `Process.Kill` (#116).
 - Remove anonymous Docker volumes from every managed deletion path while
@@ -226,7 +229,6 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   post-wait, and prune fail-open paths.
 - Docker deletion uses an immutable ID on this base, but other operations
   still address the logical name; #74 tracks the stale-handle fix.
-- Docker `Prune` does not select dead containers until issue #113.
 - Windows and remote bind-source handling is qualified by issue #76;
   `ForListeningPort`/`ForExposedPort` remain TCP-only until #77.
 - `Stop` timeout validation/rounding is pending #89; wait error-chain

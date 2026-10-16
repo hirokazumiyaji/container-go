@@ -1099,7 +1099,10 @@ func (dockerEngine) logsTailArgs(id string) []string {
 }
 
 // listArgs filters daemon-side; the Docker CLI supports label and
-// status filters directly.
+// status filters directly. Docker treats repeated status filters as
+// alternatives, so both exited and dead are selected without admitting
+// created or running containers. Output is full container IDs so prune
+// deletes by immutable ID rather than a mutable name.
 func (dockerEngine) listArgs() []string {
 	return []string{
 		"ps", "--all", "--no-trunc", "--format", "{{.ID}}",

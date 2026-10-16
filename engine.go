@@ -153,9 +153,9 @@ type engine interface {
 	listArgs() []string
 	// parseStoppedManaged extracts, from listArgs output, the
 	// identifiers of stopped containers this library created. The
-	// value is whatever the backend's own deleteArgs accepts, which is
-	// not uniformly an immutable ID: Apple returns container IDs,
-	// Docker's list format is {{.Names}} so it returns names.
+	// value is whatever the backend's own deleteArgs accepts: Apple
+	// returns container IDs, and Docker returns full IDs from
+	// --no-trunc --format {{.ID}}.
 	parseStoppedManaged(data []byte) ([]string, error)
 	// listReuseGroupArgs lists every container tagged with the reuse
 	// group label, including running ones.

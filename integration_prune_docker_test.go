@@ -134,11 +134,9 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	waitDockerContainerState(t, unmanagedName, "exited")
 	waitDockerContainerState(t, otherManagedName, "exited")
 
+	// listArgs returns full IDs (--no-trunc --format {{.ID}}), so compare
+	// against inspect's {{.Id}} rather than short IDs from --quiet.
 	exitedID := runDockerPruneCommand(t, "inspect", "--format", "{{.Id}}", exitedName)
-	exitedListID := runDockerPruneCommand(t, "ps", "--all", "--quiet", "--filter", "name=^/"+exitedName+"$")
-	if exitedListID == "" || strings.Contains(exitedListID, "\n") {
-		t.Fatalf("could not determine exact Docker list ID for %s: %q", exitedName, exitedListID)
-	}
 	otherManagedID := runDockerPruneCommand(t, "inspect", "--format", "{{.Id}}", otherManagedName)
 	unmanagedID := runDockerPruneCommand(t, "inspect", "--format", "{{.Id}}", unmanagedName)
 	createdID := runDockerPruneCommand(t, "inspect", "--format", "{{.Id}}", createdName)
@@ -168,8 +166,8 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 			t.Fatalf("Prune list call unexpectedly includes %q: %v", unwanted, runner.calls[0])
 		}
 	}
-	if len(removed) != 1 || removed[0] != exitedListID || !strings.HasPrefix(exitedID, removed[0]) {
-		t.Fatalf("removed = %v, want exact Docker list ID %s (full ID %s)", removed, exitedListID, exitedID)
+	if len(removed) != 1 || removed[0] != exitedID {
+		t.Fatalf("removed = %v, want full Docker ID %s", removed, exitedID)
 	}
 	unrelated := []struct{ role, id string }{
 		{"created", createdID},

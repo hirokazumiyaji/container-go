@@ -1,0 +1,10 @@
+{
+  "status": "running",
+  "appRoot": "/Applications/container.app",
+  "installRoot": "/usr/local",
+  "logRoot": "/var/log/com.apple.container",
+  "apiServerVersion": "1.3.0",
+  "apiServerCommit": "d6de569",
+  "apiServerBuild": "release",
+  "apiServerAppName": "container-apiserver"
+}

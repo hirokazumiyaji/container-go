@@ -7,6 +7,7 @@ package examples
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"os/exec"
@@ -18,8 +19,21 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
+func TestMain(m *testing.M) {
+	switch backend := os.Getenv("CONTAINERGO_BACKEND"); backend {
+	case "", "apple", "docker":
+	default:
+		fmt.Fprintf(os.Stderr, "invalid CONTAINERGO_BACKEND=%q: valid values are \"apple\" and \"docker\"\n", backend)
+		os.Exit(2)
+	}
+	os.Exit(m.Run())
+}
+
 func requireSystem(t *testing.T) {
 	t.Helper()
+	// Examples own their teardown; do not inherit a diagnostic KEEP
+	// setting from the developer's shell.
+	t.Setenv("CONTAINERGO_KEEP", "0")
 	backend := os.Getenv("CONTAINERGO_BACKEND")
 	if backend == "" {
 		// Match detectEngineFor: darwin → Apple Container, else Docker.
@@ -45,11 +59,14 @@ func requireSystem(t *testing.T) {
 			t.Skip("docker daemon not running")
 		}
 	default:
-		t.Skipf("unknown CONTAINERGO_BACKEND=%q", backend)
+		t.Fatalf("invalid CONTAINERGO_BACKEND=%q: valid values are \"apple\" and \"docker\"", backend)
 	}
 }
 
 func TestExampleRedis(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("this example uses WithEnv, which is unsupported on Windows")
+	}
 	requireSystem(t)
 	ctx := context.Background()
 

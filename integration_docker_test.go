@@ -83,7 +83,7 @@ func waitForDockerVolume(t *testing.T, name string, wantExists bool) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), dockerVolumeWaitTimeout)
 	defer cancel()
-	lastExists := !wantExists
+	var lastExists bool
 	for {
 		probeCtx, probeCancel := context.WithTimeout(ctx, dockerVolumeProbeTimeout)
 		exists, err := dockerVolumeExists(probeCtx, name)
@@ -244,6 +244,7 @@ func TestIntegrationDockerRedisLifecycle(t *testing.T) {
 		if string(round) != "hello docker" {
 			t.Errorf("round-tripped content = %q", round)
 		}
+		assertIntegrationCopyOutRejectsSpecialFiles(t, ctx, ctr)
 	}
 
 	logs, err := ctr.Logs(ctx)

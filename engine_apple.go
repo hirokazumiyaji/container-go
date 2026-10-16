@@ -111,8 +111,10 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 		if p.hostPort <= 1 || p.containerPort <= 1 {
 			return fmt.Errorf("apple backend requires published ports to be 2-65535, got %q", p.raw)
 		}
-		// PublishPort.hasOverlaps in Apple Container keys on host port
-		// and protocol, regardless of the host address.
+		// Match Apple Container's PublishPort.hasOverlaps key:
+		// "\(hostPort)/\(proto)" without hostAddress. Distinct bind
+		// addresses on the same host port and protocol still overlap
+		// upstream, so include them here before the CLI is called.
 		key := fmt.Sprintf("%d/%s", p.hostPort, p.proto)
 		if _, exists := seenPublished[key]; exists {
 			return fmt.Errorf("apple backend published-port descriptors overlap at %q", p.raw)

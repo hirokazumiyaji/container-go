@@ -225,6 +225,16 @@ func TestAppleCheckConfigPorts(t *testing.T) {
 	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "overlap") {
 		t.Fatalf("overlapping publishes = %v, want overlap error", err)
 	}
+
+	// Apple's hasOverlaps ignores hostAddress, so distinct bind addresses
+	// on the same host port and protocol are still an overlap.
+	cfg = appleCapabilityConfig(t,
+		WithPublishedPort("127.0.0.1:8080:80/tcp"),
+		WithPublishedPort("127.0.0.2:8080:80/tcp"),
+	)
+	if err := (appleEngine{}).checkConfig(context.Background(), cfg); err == nil || !strings.Contains(err.Error(), "overlap") {
+		t.Fatalf("same host port on different addresses = %v, want overlap error", err)
+	}
 }
 
 func TestAppleCheckConfigPublishedPortCount(t *testing.T) {

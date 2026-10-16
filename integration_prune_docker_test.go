@@ -14,20 +14,13 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/integrationtest"
 )
 
 func requireDockerPruneIntegration(t *testing.T) {
 	t.Helper()
-	if backend := os.Getenv("CONTAINERGO_BACKEND"); backend != "" && backend != "docker" {
-		t.Skipf("CONTAINERGO_BACKEND=%s; skipping Docker integration", backend)
-	}
-	if _, err := exec.LookPath("docker"); err != nil {
-		t.Skip("docker CLI not installed")
-	}
-	if err := exec.Command("docker", "info").Run(); err != nil {
-		t.Skip("docker daemon not running")
-	}
-	t.Setenv("CONTAINERGO_BACKEND", "docker")
+	// TestMain unsets CONTAINERGO_BACKEND; honor the recorded selection.
+	integrationtest.Preflight(t, "docker", integrationtest.DockerUnavailable)
 }
 
 func runDockerPruneCommand(t *testing.T, args ...string) string {

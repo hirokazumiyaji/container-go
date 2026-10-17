@@ -79,7 +79,7 @@ func Prune(ctx context.Context) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
+	return pruneWith(ctx, defaultRunnerFor(eng), eng)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {

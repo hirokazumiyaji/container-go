@@ -117,7 +117,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := cfg.eng.name() + "\x00" + cfg.name
+	key := cfg.eng.targetID() + "\x00" + cfg.name
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.
@@ -467,7 +467,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 	if runErr != nil {
 		if !attempted {
 			if target, ok := runReaperTarget(cfg); ok {
-				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+				_ = unregisterWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
@@ -524,7 +524,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			}
 			return nil, joinEnvFileCleanupError(err, envCleanupErr)
 		}
-		_ = markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+		_ = markSharedWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 		unregisterReuseFromGlobalReaper(cfg)
 	}
 	if envCleanupErr != nil && len(cfg.files) > 0 {
@@ -958,7 +958,7 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 	// validation, including on direct-IP engines.
 	if !cfg.eng.directIP() {
 		for _, spec := range cfg.exposed {
-			b, ok := matchingExposedBinding(info.bound, spec)
+			b, ok := matchingExposedBinding(info.bound, spec, cfg.eng)
 			if !ok {
 				return fmt.Errorf("reuse %s: exposed port %s missing on existing container", cfg.name, spec)
 			}
@@ -968,7 +968,7 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 		}
 	}
 	for _, p := range cfg.published {
-		b, ok := matchingPublishedBinding(info.bound, p)
+		b, ok := matchingPublishedBinding(info.bound, p, cfg.eng)
 		if !ok {
 			return fmt.Errorf("reuse %s: published port %s missing on existing container", cfg.name, p.raw)
 		}
@@ -1068,14 +1068,15 @@ func checkReuseBindingReachable(eng engine, b boundPort) error {
 	return err
 }
 
-func matchingExposedBinding(bound []boundPort, spec portSpec) (boundPort, bool) {
+func matchingExposedBinding(bound []boundPort, spec portSpec, eng engine) (boundPort, bool) {
 	var loopback boundPort
 	foundLoopback := false
+	remote := eng != nil && eng.isRemote()
 	for _, b := range bound {
 		if b.containerPort != spec.port || b.proto != spec.proto || b.hostPort <= 0 {
 			continue
 		}
-		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+		if remote && ipIsLoopback(b.hostAddr) {
 			loopback, foundLoopback = b, true
 			continue
 		}
@@ -1084,9 +1085,10 @@ func matchingExposedBinding(bound []boundPort, spec portSpec) (boundPort, bool) 
 	return loopback, foundLoopback
 }
 
-func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool) {
+func matchingPublishedBinding(bound []boundPort, p publishSpec, eng engine) (boundPort, bool) {
 	var loopback boundPort
 	foundLoopback := false
+	remote := eng != nil && eng.isRemote()
 	for _, b := range bound {
 		if b.containerPort != p.containerPort || b.proto != p.proto || b.hostPort <= 0 {
 			continue
@@ -1097,7 +1099,7 @@ func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool
 		if p.hostAddr != "" && canonicalIP(b.hostAddr) != p.hostAddr {
 			continue
 		}
-		if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+		if remote && ipIsLoopback(b.hostAddr) {
 			loopback, foundLoopback = b, true
 			continue
 		}
@@ -1357,7 +1359,7 @@ func PruneReuseGroup(ctx context.Context, group string) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, group)
+	return pruneReuseGroupWith(ctx, defaultRunnerFor(eng), eng, group)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
@@ -1450,7 +1452,7 @@ func reuseInfoComplete(cfg *config, info *engineInfo) bool {
 		}
 	}
 	for _, p := range cfg.published {
-		if _, ok := matchingPublishedBinding(info.bound, p); !ok {
+		if _, ok := matchingPublishedBinding(info.bound, p, cfg.eng); !ok {
 			return false
 		}
 	}

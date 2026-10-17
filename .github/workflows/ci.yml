@@ -87,6 +87,8 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test ./...
+      - run: go mod verify
+      - run: go mod tidy -diff
 
   race:
     runs-on: ubuntu-latest
@@ -137,17 +139,14 @@ jobs:
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
-      # bench/ is a separate module, so the root ./... does not reach it.
       # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.8.0
       # is the current scanner that works with this toolchain.
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-        working-directory: bench
 
-  # bench/ is a separate module, so no job above reaches it: they all run
-  # ./... from the root. Without this a Dependabot bump of bench/go.mod would
-  # merge with no signal that the module still builds.
-  bench-build:
+  # bench/ is a separate module, so no root job reaches it.
+  # The bench jobs below run unit tests, race detection, vet, lint,
+  # module verification, and govulncheck for the bench module.
+  bench-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -156,14 +155,46 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # The module this job builds, not the root one. The root go.mod
-          # declares an older toolchain than bench/go.mod, so deriving from
-          # the root fails the build with "go.mod requires go >=" instead
-          # of building anything.
           go-version-file: bench/go.mod
       - run: go build ./...
         working-directory: bench
       - run: go test ./...
+        working-directory: bench
+      - run: go test -race ./...
+        working-directory: bench
+      - run: go vet ./...
+        working-directory: bench
+      - run: go mod verify
+        working-directory: bench
+      - run: go mod tidy -diff
+        working-directory: bench
+
+  bench-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.2'
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.14.0
+          working-directory: bench
+
+  bench-govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.2'
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
         working-directory: bench
 
   # actionlint validates workflow syntax, expressions, and runner labels. It

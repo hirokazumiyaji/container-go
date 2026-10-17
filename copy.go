@@ -215,7 +215,7 @@ func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, co
 		}
 	}()
 
-	cliCtx, cliCancel := withDefaultTimeout(ctx, queryTimeout)
+	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	_, _, err = c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
 	return wrapNotFoundFor(c.eng, c.classify(ctx, err))
@@ -718,13 +718,13 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner); err != nil {
+	if err := c.eng.checkCopyFileFromContainerVersion(qCtx, c.runner, c.effectiveQueryTimeout()); err != nil {
 		return nil, err
 	}
 

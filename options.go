@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -44,6 +45,11 @@ type config struct {
 	runner               cli.Runner
 	binary               string
 	eng                  engine
+	runTimeout           time.Duration
+	queryTimeout         time.Duration
+	reuseAttachTimeout   time.Duration
+	reusePollInterval    time.Duration
+	probeTimeout         time.Duration
 	name                 string
 	env                  map[string]string
 	cmd                  []string
@@ -128,7 +134,48 @@ func (c *config) validate() error {
 	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.name() != "docker" {
 		return validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
 	}
+	if c.reuseAttachTimeout > 0 && !c.reuse {
+		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
+	}
+	if c.reusePollInterval > 0 && !c.reuse {
+		return validationErrorf("WithReusePollInterval", c.reusePollInterval, "WithReusePollInterval requires WithReuse")
+	}
 	return nil
+}
+
+func (c *config) effectiveRunTimeout() time.Duration {
+	if c != nil && c.runTimeout > 0 {
+		return c.runTimeout
+	}
+	return runTimeout
+}
+
+func (c *config) effectiveQueryTimeout() time.Duration {
+	if c != nil && c.queryTimeout > 0 {
+		return c.queryTimeout
+	}
+	return queryTimeout
+}
+
+func (c *config) effectiveReuseAttachTimeout() time.Duration {
+	if c != nil && c.reuseAttachTimeout > 0 {
+		return c.reuseAttachTimeout
+	}
+	return reuseAttachTimeout
+}
+
+func (c *config) effectiveReusePollInterval() time.Duration {
+	if c != nil && c.reusePollInterval > 0 {
+		return c.reusePollInterval
+	}
+	return reusePollInterval
+}
+
+func (c *config) effectiveProbeTimeout() time.Duration {
+	if c != nil && c.probeTimeout > 0 {
+		return c.probeTimeout
+	}
+	return 0
 }
 
 // allLabels merges the session labels the library always applies with
@@ -223,6 +270,73 @@ func WithReuseGroup(group string) Option {
 			return err
 		}
 		c.reuseGroup = group
+		return nil
+	}
+}
+
+// WithRunTimeout sets the timeout budget for Run, including container creation
+// and any image pull performed during run (whether implicit under PullMissing
+// or explicit under PullAlways). A positive d overrides the default 10-minute
+// timeout. Non-positive durations are rejected.
+func WithRunTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithRunTimeout", d, "timeout must be positive")
+		}
+		c.runTimeout = d
+		return nil
+	}
+}
+
+// WithQueryTimeout sets the timeout for backend queries and control operations
+// (such as inspect, stop, state, and copy). A positive d overrides the default
+// 30-second timeout. Non-positive durations are rejected.
+func WithQueryTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithQueryTimeout", d, "timeout must be positive")
+		}
+		c.queryTimeout = d
+		return nil
+	}
+}
+
+// WithProbeTimeout sets the upper bound for backend diagnostic liveness checks
+// during error classification. A positive d overrides the default 5-second
+// timeout. Non-positive durations are rejected.
+func WithProbeTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithProbeTimeout", d, "timeout must be positive")
+		}
+		c.probeTimeout = d
+		return nil
+	}
+}
+
+// WithReuseAttachTimeout sets the maximum duration to wait for another process's
+// container creation to complete before attaching. Requires WithReuse. A positive d
+// overrides the default 60-second timeout. Non-positive durations are rejected.
+func WithReuseAttachTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithReuseAttachTimeout", d, "timeout must be positive")
+		}
+		c.reuseAttachTimeout = d
+		return nil
+	}
+}
+
+// WithReusePollInterval sets the interval between inspect attempts while
+// waiting for a reused container to become ready. Requires WithReuse. A
+// positive d overrides the default 100-millisecond cadence. Non-positive
+// durations are rejected.
+func WithReusePollInterval(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithReusePollInterval", d, "poll interval must be positive")
+		}
+		c.reusePollInterval = d
 		return nil
 	}
 }

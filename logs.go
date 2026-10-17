@@ -63,7 +63,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
@@ -104,7 +104,7 @@ func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptio
 	if err := opts.validate(); err != nil {
 		return OutputStats{}, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {

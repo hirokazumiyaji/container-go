@@ -486,7 +486,7 @@ func (e *execInspectionStateError) Error() string {
 // such. Parse, empty-output, cancellation, permission, configuration, and
 // transport failures remain visible to the caller.
 func (c *Container) verifyExecContainer(ctx context.Context) execInspection {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.operationTarget()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

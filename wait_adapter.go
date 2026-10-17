@@ -135,7 +135,7 @@ func (c *Container) logTail(ctx context.Context) string {
 }
 
 func (c *Container) logTailTarget(ctx context.Context, target string) string {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
 	if err != nil {
@@ -146,7 +146,7 @@ func (c *Container) logTailTarget(ctx context.Context, target string) string {
 }
 
 func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	redactor := c.diagnosticRedactor(extra...)
 	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {

@@ -300,6 +300,27 @@ func TestStrictCleanupReportsCleanupFailure(t *testing.T) {
 	}
 }
 
+func TestNonStrictCleanupLogsCleanupFailure(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	f.failPrefix = "delete"
+	tb := &cleanupTBRecorder{}
+	registerCleanup(tb, ctr, false)
+	if len(tb.callbacks) != 1 {
+		t.Fatalf("callbacks = %d, want 1", len(tb.callbacks))
+	}
+	tb.callbacks[0]()
+	if len(tb.errors) != 0 {
+		t.Fatalf("errors = %v, non-strict cleanup should not report through Errorf", tb.errors)
+	}
+	if len(tb.logs) != 1 {
+		t.Fatalf("logs = %v, want exactly 1 log from non-strict cleanup failure", tb.logs)
+	}
+	if !strings.Contains(tb.logs[0], "cleanup") || !strings.Contains(tb.logs[0], ctr.ID()) {
+		t.Fatalf("log = %q, want cleanup message mentioning container ID", tb.logs[0])
+	}
+}
+
 func TestSessionLabelValueIsValid(t *testing.T) {
 	id := sessionID()
 	if len(id) != 16 || strings.ToLower(id) != id {

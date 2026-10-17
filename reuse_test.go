@@ -205,7 +205,7 @@ func reuseInspectJSONForCreation(id, state, image, creation string) string {
 }
 
 func reuseInspectJSONForCreationWithDigest(id, state, image, creation, digest string) string {
-	platformParts := strings.Split(issue115FreshHostPlatform(), "/")
+	platformParts := strings.Split(freshHostPlatform(), "/")
 	platformJSON := fmt.Sprintf(`{"os": %q, "architecture": %q}`, platformParts[0], platformParts[1])
 	variantDigest := "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 	if strings.Contains(platformParts[1], "arm") {

@@ -13,20 +13,20 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type review91CountingSuccessStrategy struct {
+type countingSuccessStrategy struct {
 	calls atomic.Int32
 }
 
-func (s *review91CountingSuccessStrategy) WaitUntilReady(context.Context, Target) error {
+func (s *countingSuccessStrategy) WaitUntilReady(context.Context, Target) error {
 	s.calls.Add(1)
 	return nil
 }
 
-func TestReview91ForAllCancellationPrecedesLifecycleProbe(t *testing.T) {
+func TestForAllCancellationPrecedesLifecycleProbe(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	target := newLifecycleTarget(StateRunning)
-	strategy := &review91CountingSuccessStrategy{}
+	strategy := &countingSuccessStrategy{}
 
 	err := ForAll(strategy).WaitUntilReady(ctx, target)
 	if !errors.Is(err, context.Canceled) {
@@ -40,7 +40,7 @@ func TestReview91ForAllCancellationPrecedesLifecycleProbe(t *testing.T) {
 	}
 }
 
-func TestReview91CompositeCancellationPrecedesEmptyFastPath(t *testing.T) {
+func TestCompositeCancellationPrecedesEmptyFastPath(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cases := map[string]Strategy{
@@ -56,7 +56,7 @@ func TestReview91CompositeCancellationPrecedesEmptyFastPath(t *testing.T) {
 	}
 }
 
-func TestReview91LogReplayKeepsCursorAcrossEmptyAndPartialReconnects(t *testing.T) {
+func TestLogReplayKeepsCursorAcrossEmptyAndPartialReconnects(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{
 		io.NopCloser(strings.NewReader("boot\nready\n")),
@@ -78,24 +78,24 @@ func TestReview91LogReplayKeepsCursorAcrossEmptyAndPartialReconnects(t *testing.
 	}
 }
 
-type review91PermanentStreamSetupTarget struct {
+type permanentStreamSetupTarget struct {
 	calls atomic.Int32
 }
 
-func (*review91PermanentStreamSetupTarget) Endpoint(context.Context, string) (string, error) {
+func (*permanentStreamSetupTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91PermanentStreamSetupTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *review91PermanentStreamSetupTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*permanentStreamSetupTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *permanentStreamSetupTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.calls.Add(1)
 	return nil, fmt.Errorf("logs: %w: invalid runner", cli.ErrStreamSetup)
 }
-func (*review91PermanentStreamSetupTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*permanentStreamSetupTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-func TestReview91ForLogDoesNotRetryPermanentStreamSetup(t *testing.T) {
-	target := &review91PermanentStreamSetupTarget{}
+func TestForLogDoesNotRetryPermanentStreamSetup(t *testing.T) {
+	target := &permanentStreamSetupTarget{}
 	err := ForLog("ready").
 		WithStartupTimeout(300*time.Millisecond).
 		WithPollInterval(time.Millisecond).
@@ -108,18 +108,18 @@ func TestReview91ForLogDoesNotRetryPermanentStreamSetup(t *testing.T) {
 	}
 }
 
-type review91StopThenSuccessStrategy struct {
+type stopThenSuccessStrategy struct {
 	target *lifecycleTarget
 }
 
-func (s review91StopThenSuccessStrategy) WaitUntilReady(context.Context, Target) error {
+func (s stopThenSuccessStrategy) WaitUntilReady(context.Context, Target) error {
 	s.target.mu.Lock()
 	s.target.state = StateStopped
 	s.target.mu.Unlock()
 	return nil
 }
 
-func TestReview91CompositeRejectsSuccessAfterLifecycleStop(t *testing.T) {
+func TestCompositeRejectsSuccessAfterLifecycleStop(t *testing.T) {
 	cases := map[string]func(Strategy) Strategy{
 		"all": func(strategy Strategy) Strategy { return ForAll(strategy) },
 		"any": func(strategy Strategy) Strategy { return ForAny(strategy) },
@@ -127,7 +127,7 @@ func TestReview91CompositeRejectsSuccessAfterLifecycleStop(t *testing.T) {
 	for name, wrap := range cases {
 		t.Run(name, func(t *testing.T) {
 			target := newLifecycleTarget(StateRunning)
-			err := wrap(review91StopThenSuccessStrategy{target: target}).
+			err := wrap(stopThenSuccessStrategy{target: target}).
 				WaitUntilReady(context.Background(), target)
 			if err == nil || !strings.Contains(err.Error(), "stopped") {
 				t.Fatalf("error = %v, want stopped lifecycle failure", err)
@@ -136,22 +136,22 @@ func TestReview91CompositeRejectsSuccessAfterLifecycleStop(t *testing.T) {
 	}
 }
 
-type review91SlowFinalStateTarget struct {
+type slowFinalStateTarget struct {
 	calls          atomic.Int32
 	firstStateDone chan struct{}
 }
 
-func (*review91SlowFinalStateTarget) Endpoint(context.Context, string) (string, error) {
+func (*slowFinalStateTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91SlowFinalStateTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91SlowFinalStateTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*slowFinalStateTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*slowFinalStateTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*review91SlowFinalStateTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*slowFinalStateTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
-func (t *review91SlowFinalStateTarget) State(ctx context.Context) (State, error) {
+func (t *slowFinalStateTarget) State(ctx context.Context) (State, error) {
 	if t.calls.Add(1) == 1 {
 		if t.firstStateDone != nil {
 			close(t.firstStateDone)
@@ -162,19 +162,19 @@ func (t *review91SlowFinalStateTarget) State(ctx context.Context) (State, error)
 	return StateUnknown, ctx.Err()
 }
 
-type review91WaitForFirstStateStrategy struct {
+type waitForFirstStateStrategy struct {
 	done <-chan struct{}
 }
 
-func (s review91WaitForFirstStateStrategy) WaitUntilReady(context.Context, Target) error {
+func (s waitForFirstStateStrategy) WaitUntilReady(context.Context, Target) error {
 	<-s.done
 	return nil
 }
 
-func TestReview91CompositeFinalLifecycleCheckIsBounded(t *testing.T) {
-	target := &review91SlowFinalStateTarget{firstStateDone: make(chan struct{})}
+func TestCompositeFinalLifecycleCheckIsBounded(t *testing.T) {
+	target := &slowFinalStateTarget{firstStateDone: make(chan struct{})}
 	start := time.Now()
-	err := ForAll(review91WaitForFirstStateStrategy{done: target.firstStateDone}).WithStartupTimeout(100*time.Millisecond).WaitUntilReady(context.Background(), target)
+	err := ForAll(waitForFirstStateStrategy{done: target.firstStateDone}).WithStartupTimeout(100*time.Millisecond).WaitUntilReady(context.Background(), target)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want bounded final lifecycle deadline", err)
 	}

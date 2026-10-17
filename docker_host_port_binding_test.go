@@ -11,7 +11,7 @@ import (
 // remote daemon must bind 0.0.0.0 because a 127.0.0.1 bind lands on the remote
 // machine. Detecting only tcp:// reported local, so the loopback-publish guard
 // never fired and the caller got a published port it could not reach.
-func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
+func TestRemoteDockerHostCoversEveryTransport(t *testing.T) {
 	remote := []string{
 		"ssh://user@remote-host",
 		"ssh://user@10.0.0.5",
@@ -77,7 +77,7 @@ func TestReviewRemoteDockerHostCoversEveryTransport(t *testing.T) {
 // The client-facing host must be scheme-aware for every remote transport.
 // Telling the caller to dial 127.0.0.1 for a container published on a remote
 // daemon reaches nothing, which is the symptom this change exists to prevent.
-func TestReviewDefaultHostIsSchemeAware(t *testing.T) {
+func TestDefaultHostIsSchemeAware(t *testing.T) {
 	cases := map[string]string{
 		"ssh://user@remote-host":    "remote-host",
 		"ssh://user@10.0.0.5":       "10.0.0.5",
@@ -100,7 +100,7 @@ func TestReviewDefaultHostIsSchemeAware(t *testing.T) {
 
 // A remote daemon's published address must not be rewritten to the client's own
 // loopback, which is what an incomplete fix leaves behind.
-func TestReviewConnectHostUsesRemoteHostName(t *testing.T) {
+func TestConnectHostUsesRemoteHostName(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
 	eng := dockerEngine{}
 	// A 0.0.0.0 bind on a remote daemon must resolve to the remote host, not
@@ -120,7 +120,7 @@ func TestReviewConnectHostUsesRemoteHostName(t *testing.T) {
 // 0.0.0.0 here would expose the container's port on every interface of the
 // developer's own machine, which is the opposite of what the loopback default
 // is for.
-func TestReviewAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
+func TestAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
 	for _, host := range []string{"127.0.0.1:2375", "localhost:2375", "", "unix:///var/run/d.sock", "tcp://:2375", ":2375"} {
 		t.Run(host, func(t *testing.T) {
 			t.Setenv("DOCKER_HOST", host)
@@ -157,7 +157,7 @@ func TestReviewAutoPublishBindsLoopbackForSchemeLessLocalHost(t *testing.T) {
 
 // Auto-publish must keep binding loopback for a local daemon, including the
 // transports that carry no hostname.
-func TestReviewAutoPublishBindsLoopbackLocally(t *testing.T) {
+func TestAutoPublishBindsLoopbackLocally(t *testing.T) {
 	for _, host := range []string{"", "unix:///var/run/d.sock", "fd://", "npipe:////./pipe/docker_e"} {
 		t.Setenv("DOCKER_HOST", host)
 		if isRemoteDockerHost() {
@@ -172,7 +172,7 @@ func TestReviewAutoPublishBindsLoopbackLocally(t *testing.T) {
 
 // The user-visible effect: a loopback publish on an ssh:// daemon is rejected,
 // because Docker would listen on the remote machine's loopback.
-func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
+func TestLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "ssh://user@remote-host")
 	err := (dockerEngine{}).checkConfig(context.Background(), &config{
 		published: []publishSpec{{hostAddr: "127.0.0.1", raw: "127.0.0.1:18080:80"}},
@@ -194,7 +194,7 @@ func TestReviewLoopbackPublishRejectedOnSSHDaemon(t *testing.T) {
 
 // A local daemon must keep accepting a loopback publish, which is the normal
 // local development case.
-func TestReviewLoopbackPublishStillAllowedLocally(t *testing.T) {
+func TestLoopbackPublishStillAllowedLocally(t *testing.T) {
 	for _, host := range []string{"", "unix:///var/run/docker.sock", "tcp://127.0.0.1:2375"} {
 		t.Setenv("DOCKER_HOST", host)
 		if err := (dockerEngine{}).checkConfig(context.Background(), &config{
@@ -208,7 +208,7 @@ func TestReviewLoopbackPublishStillAllowedLocally(t *testing.T) {
 // uid is promoted from the first inspect, long after the handle is published.
 // Terminate read it without synchronization while cachedInfo wrote it, which is
 // a data race on a published handle.
-func TestReviewImmutableIDAccessIsSynchronized(t *testing.T) {
+func TestImmutableIDAccessIsSynchronized(t *testing.T) {
 	first := strings.Repeat("a", 64)
 	second := strings.Repeat("b", 64)
 

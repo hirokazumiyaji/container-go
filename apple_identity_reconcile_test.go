@@ -11,18 +11,18 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func issue115ReconcileImageJSON(platform, variant string, synthetic bool) []byte {
-	variants := []any{issue115FreshVariant(platform, variant)}
+func reconcileImageJSON(platform, variant string, synthetic bool) []byte {
+	variants := []any{freshVariant(platform, variant)}
 	annotations := map[string]any{}
 	if synthetic {
 		annotations["com.apple.containerization.index.indirect"] = "true"
 	}
 	data := map[string]any{
-		"id": strings.TrimPrefix(issue115FinalRoot, "sha256:"),
+		"id": strings.TrimPrefix(finalRoot, "sha256:"),
 		"configuration": map[string]any{
 			"name": "registry.example/team/demo:stable",
 			"descriptor": map[string]any{
-				"digest":      issue115FinalRoot,
+				"digest":      finalRoot,
 				"mediaType":   "application/vnd.oci.image.index.v1+json",
 				"annotations": annotations,
 			},
@@ -33,7 +33,7 @@ func issue115ReconcileImageJSON(platform, variant string, synthetic bool) []byte
 	return out
 }
 
-type issue115ReconcileRunner struct {
+type reconcileRunner struct {
 	mu sync.Mutex
 
 	completeJSON  []byte
@@ -45,7 +45,7 @@ type issue115ReconcileRunner struct {
 	deleteCalls   int
 }
 
-func (r *issue115ReconcileRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reconcileRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -67,7 +67,7 @@ func (r *issue115ReconcileRunner) Run(_ context.Context, args ...string) ([]byte
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
-		return issue115FinalContainerJSON(r.runImage, issue115FinalRoot, issue115FinalVariant, r.postPlatform, r.creation), nil, nil
+		return finalContainerJSON(r.runImage, finalRoot, finalVariant, r.postPlatform, r.creation), nil, nil
 	case args[0] == "delete":
 		r.deleteCalls++
 		return nil, nil, nil
@@ -76,13 +76,13 @@ func (r *issue115ReconcileRunner) Run(_ context.Context, args ...string) ([]byte
 	}
 }
 
-func TestIssue115AppleExactInspectReconcilesCompleteIdentity(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	runner := &issue115ReconcileRunner{
-		completeJSON: issue115ReconcileImageJSON(host, issue115FinalVariant, true),
+func TestAppleExactInspectReconcilesCompleteIdentity(t *testing.T) {
+	host := freshHostPlatform()
+	runner := &reconcileRunner{
+		completeJSON: reconcileImageJSON(host, finalVariant, true),
 		postPlatform: host,
 	}
-	input := "registry.example/team/demo:stable@" + issue115FinalRoot
+	input := "registry.example/team/demo:stable@" + finalRoot
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), WithPlatform(host), withRunner(runner), withEngine(appleEngine{}))
 	if err != nil {
@@ -94,21 +94,21 @@ func TestIssue115AppleExactInspectReconcilesCompleteIdentity(t *testing.T) {
 	if runner.runImage != input {
 		t.Fatalf("run image = %q, want caller reference %q", runner.runImage, input)
 	}
-	if ctr.image.reference != input || ctr.image.digest != issue115FinalRoot || ctr.image.rootDigest != issue115FinalRoot {
+	if ctr.image.reference != input || ctr.image.digest != finalRoot || ctr.image.rootDigest != finalRoot {
 		t.Fatalf("root/reference identity = %+v, want caller reference and verified root", ctr.image)
 	}
-	if ctr.image.repository != "registry.example/team/demo" || ctr.image.platform != host || ctr.image.variantDigest != issue115FinalVariant || !ctr.image.appleSynthetic {
+	if ctr.image.repository != "registry.example/team/demo" || ctr.image.platform != host || ctr.image.variantDigest != finalVariant || !ctr.image.appleSynthetic {
 		t.Fatalf("reconciled identity = %+v, want complete platform/variant/synthetic metadata", ctr.image)
 	}
 }
 
-func TestIssue115AppleExactInspectStillChecksPostCreatePlatform(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	runner := &issue115ReconcileRunner{
-		completeJSON: issue115ReconcileImageJSON(host, issue115FinalVariant, true),
-		postPlatform: issue115FreshOtherPlatform(host),
+func TestAppleExactInspectStillChecksPostCreatePlatform(t *testing.T) {
+	host := freshHostPlatform()
+	runner := &reconcileRunner{
+		completeJSON: reconcileImageJSON(host, finalVariant, true),
+		postPlatform: freshOtherPlatform(host),
 	}
-	input := "registry.example/team/demo:stable@" + issue115FinalRoot
+	input := "registry.example/team/demo:stable@" + finalRoot
 	_, err := Run(context.Background(), input,
 		WithName("myctr"), WithPlatform(host), withRunner(runner), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrImageIdentityMismatch) {
@@ -119,7 +119,7 @@ func TestIssue115AppleExactInspectStillChecksPostCreatePlatform(t *testing.T) {
 	}
 }
 
-type issue115ScopedIndexRunner struct {
+type scopedIndexRunner struct {
 	mu sync.Mutex
 
 	imageJSON        []byte
@@ -130,7 +130,7 @@ type issue115ScopedIndexRunner struct {
 	creation         string
 }
 
-func (r *issue115ScopedIndexRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *scopedIndexRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -155,40 +155,40 @@ func (r *issue115ScopedIndexRunner) Run(_ context.Context, args ...string) ([]by
 		}
 		return []byte("myctr\n"), nil, nil
 	case args[0] == "inspect":
-		return issue115FinalContainerJSON(r.runImage, issue115FinalRoot, issue115FinalVariant, r.runPlatform, r.creation), nil, nil
+		return finalContainerJSON(r.runImage, finalRoot, finalVariant, r.runPlatform, r.creation), nil, nil
 	default:
 		return nil, nil, nil
 	}
 }
 
-func issue115OrdinaryScopedIndexJSON(platform string) []byte {
-	return issue115ReconcileImageJSON(platform, issue115FinalVariant, false)
+func ordinaryScopedIndexJSON(platform string) []byte {
+	return reconcileImageJSON(platform, finalVariant, false)
 }
 
-func TestIssue115AppleOrdinaryOneVariantIndexUsesControlledExactRootProbe(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	runner := &issue115ScopedIndexRunner{imageJSON: issue115OrdinaryScopedIndexJSON(host)}
+func TestAppleOrdinaryOneVariantIndexUsesControlledExactRootProbe(t *testing.T) {
+	host := freshHostPlatform()
+	runner := &scopedIndexRunner{imageJSON: ordinaryScopedIndexJSON(host)}
 	ctr, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), WithPlatform(host), WithPullPolicy(PullMissing),
 		withRunner(runner), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if ctr.image.digest != issue115FinalRoot || ctr.image.platform != host || ctr.image.variantDigest != issue115FinalVariant {
+	if ctr.image.digest != finalRoot || ctr.image.platform != host || ctr.image.variantDigest != finalVariant {
 		t.Fatalf("identity = %+v, want ordinary scoped index identity", ctr.image)
 	}
-	if len(runner.pullTargets) != 1 || !strings.Contains(runner.pullTargets[0], "@"+issue115FinalRoot) {
+	if len(runner.pullTargets) != 1 || !strings.Contains(runner.pullTargets[0], "@"+finalRoot) {
 		t.Fatalf("pull targets = %v, want one controlled exact-root probe", runner.pullTargets)
 	}
-	if runner.runImage != "registry.example/team/demo:stable@"+issue115FinalRoot || runner.runPlatform != host {
+	if runner.runImage != "registry.example/team/demo:stable@"+finalRoot || runner.runPlatform != host {
 		t.Fatalf("run = %q platform=%q, want pinned scoped variant", runner.runImage, runner.runPlatform)
 	}
 }
 
-func TestIssue115AppleOrdinaryOneVariantIndexWorksForPullNever(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	runner := &issue115ScopedIndexRunner{
-		imageJSON:        issue115OrdinaryScopedIndexJSON(host),
+func TestAppleOrdinaryOneVariantIndexWorksForPullNever(t *testing.T) {
+	host := freshHostPlatform()
+	runner := &scopedIndexRunner{
+		imageJSON:        ordinaryScopedIndexJSON(host),
 		exactAddressable: true,
 	}
 	ctr, err := Run(context.Background(), "registry.example/team/demo:stable",
@@ -197,26 +197,26 @@ func TestIssue115AppleOrdinaryOneVariantIndexWorksForPullNever(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if ctr.image.digest != issue115FinalRoot || ctr.image.platform != host || len(runner.pullTargets) != 0 {
+	if ctr.image.digest != finalRoot || ctr.image.platform != host || len(runner.pullTargets) != 0 {
 		t.Fatalf("identity = %+v pulls=%v, want local ordinary scoped index", ctr.image, runner.pullTargets)
 	}
 }
 
-func TestIssue115AppleSyntheticRequiresReliableSignal(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	ordinary, exists := (appleEngine{}).parseImageIdentity(issue115OrdinaryScopedIndexJSON(host), "registry.example/team/demo:stable", host)
+func TestAppleSyntheticRequiresReliableSignal(t *testing.T) {
+	host := freshHostPlatform()
+	ordinary, exists := (appleEngine{}).parseImageIdentity(ordinaryScopedIndexJSON(host), "registry.example/team/demo:stable", host)
 	if !exists || ordinary.appleSynthetic {
 		t.Fatalf("ordinary one-variant identity = %+v, exists=%v, want non-synthetic", ordinary, exists)
 	}
-	synthetic, exists := (appleEngine{}).parseImageIdentity(issue115ReconcileImageJSON(host, issue115FinalVariant, true), "registry.example/team/demo:stable", host)
+	synthetic, exists := (appleEngine{}).parseImageIdentity(reconcileImageJSON(host, finalVariant, true), "registry.example/team/demo:stable", host)
 	if !exists || !synthetic.appleSynthetic {
 		t.Fatalf("annotated synthetic identity = %+v, exists=%v, want synthetic", synthetic, exists)
 	}
 }
 
-func TestIssue115AppleOrdinaryOneVariantPullNeverRejectsMissingRootWithoutLabelingSynthetic(t *testing.T) {
-	host := issue115FreshHostPlatform()
-	runner := &issue115ScopedIndexRunner{imageJSON: issue115OrdinaryScopedIndexJSON(host)}
+func TestAppleOrdinaryOneVariantPullNeverRejectsMissingRootWithoutLabelingSynthetic(t *testing.T) {
+	host := freshHostPlatform()
+	runner := &scopedIndexRunner{imageJSON: ordinaryScopedIndexJSON(host)}
 	_, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), WithPlatform(host), WithPullPolicy(PullNever),
 		withRunner(runner), withEngine(applePullNeverBelowPreflight{}))
@@ -231,8 +231,8 @@ func TestIssue115AppleOrdinaryOneVariantPullNeverRejectsMissingRootWithoutLabeli
 	}
 }
 
-func TestIssue115ReconcileFixtureHasSyntheticAnnotation(t *testing.T) {
-	identity, exists := (appleEngine{}).parseImageIdentity(issue115FinalFixture(t), "team/demo:stable", "")
+func TestReconcileFixtureHasSyntheticAnnotation(t *testing.T) {
+	identity, exists := (appleEngine{}).parseImageIdentity(finalFixture(t), "team/demo:stable", "")
 	if !exists || !identity.appleSynthetic {
 		t.Fatalf("single-manifest fixture identity = %+v, exists=%v, want annotated synthetic index", identity, exists)
 	}

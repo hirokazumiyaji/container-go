@@ -14,7 +14,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type issue104FreshDockerRunner struct {
+type branchInspectDockerRunner struct {
 	calls       [][]string
 	inspectJSON []byte
 	execErr     error
@@ -22,7 +22,7 @@ type issue104FreshDockerRunner struct {
 	execStderr  string
 }
 
-func (r *issue104FreshDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *branchInspectDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.calls = append(r.calls, append([]string(nil), args...))
 	switch args[0] {
 	case "inspect":
@@ -50,7 +50,7 @@ func TestNotFoundForOperationMatchesExecVerificationBranch(t *testing.T) {
 
 func TestDockerOperationsUseImmutableOperationTarget(t *testing.T) {
 	uid := strings.Repeat("a", 64)
-	r := &issue104FreshDockerRunner{inspectJSON: dockerInspectJSON(uid, "/myctr", "running")}
+	r := &branchInspectDockerRunner{inspectJSON: dockerInspectJSON(uid, "/myctr", "running")}
 	ctr := &Container{id: "myctr", sync: &lockPack{uid: uid}, runner: r, eng: dockerEngine{}}
 
 	if _, err := ctr.State(context.Background()); err != nil {
@@ -94,7 +94,7 @@ func TestDockerOperationsUseImmutableOperationTarget(t *testing.T) {
 func TestDockerRejectsSameNameReplacementByUID(t *testing.T) {
 	uid := strings.Repeat("a", 64)
 	replacementID := strings.Repeat("b", 64)
-	r := &issue104FreshDockerRunner{inspectJSON: dockerInspectJSON(replacementID, "/myctr", "running")}
+	r := &branchInspectDockerRunner{inspectJSON: dockerInspectJSON(replacementID, "/myctr", "running")}
 	ctr := &Container{id: "myctr", sync: &lockPack{uid: uid}, runner: r, eng: dockerEngine{}}
 
 	if _, err := ctr.State(context.Background()); err == nil {
@@ -146,14 +146,14 @@ func TestDockerParseInspectRejectsNullAndNonContainerState(t *testing.T) {
 	}
 }
 
-type issue104JoinedExecRunner struct {
+type branchJoinedExecRunner struct {
 	*fakeRunner
 	err    error
 	stdout string
 	stderr string
 }
 
-func (r *issue104JoinedExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *branchJoinedExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		return []byte(r.stdout), []byte(r.stderr), r.err
 	}
@@ -169,7 +169,7 @@ func TestExecJoinedErrorSelectsCurrentBranch(t *testing.T) {
 		Binary: "container", Args: []string{"exec", "myctr", "app"}, ExitCode: 23,
 		Stderr: "permission denied: workload path",
 	}
-	f := &issue104JoinedExecRunner{
+	f := &branchJoinedExecRunner{
 		fakeRunner: newTestRunner(),
 		err:        errors.Join(wrong, selected),
 		stdout:     "workload output\n",
@@ -200,7 +200,7 @@ func TestExecIgnoresUnrelatedJoinedAbsenceBranch(t *testing.T) {
 		Binary: "container", Args: []string{"exec", "myctr", "app"}, ExitCode: 23,
 		Stderr: "permission denied: workload path",
 	}
-	f := &issue104JoinedExecRunner{
+	f := &branchJoinedExecRunner{
 		fakeRunner: newTestRunner(),
 		err:        errors.Join(unrelated, selected),
 		stderr:     selected.Stderr,
@@ -288,11 +288,11 @@ func TestProbeClassificationSelectsMatchingJoinedBranch(t *testing.T) {
 	}
 }
 
-type issue104ClassifyProbeRunner struct {
+type branchClassifyProbeRunner struct {
 	err error
 }
 
-func (r *issue104ClassifyProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *branchClassifyProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "system" {
 		return nil, nil, r.err
 	}
@@ -364,7 +364,7 @@ func TestClassifyErrorSelectsCurrentOperationBranch(t *testing.T) {
 		Binary: "container", Args: []string{"system", "status"}, ExitCode: 1,
 		Stderr: "XPC connection error",
 	}
-	got := classifyErrorFor(context.Background(), &issue104ClassifyProbeRunner{err: probeErr}, original, appleEngine{}, "run", "myctr")
+	got := classifyErrorFor(context.Background(), &branchClassifyProbeRunner{err: probeErr}, original, appleEngine{}, "run", "myctr")
 	if !errors.Is(got, cli.ErrSystemNotRunning) {
 		t.Fatalf("Classify error = %v, want current run branch liveness classification", got)
 	}

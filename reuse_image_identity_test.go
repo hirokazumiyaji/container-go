@@ -12,12 +12,12 @@ import (
 )
 
 const (
-	issue115ReuseImageDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	issue115ReuseOtherDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	issue115ReuseImageID     = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	reuseImageDigest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	reuseOtherDigest = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	reuseImageID     = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 )
 
-type issue115ReuseRunner struct {
+type reuseRunner struct {
 	mu sync.Mutex
 
 	created         bool
@@ -31,22 +31,22 @@ type issue115ReuseRunner struct {
 	creation        string
 }
 
-func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reuseRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
 	switch {
 	case len(args) >= 2 && args[0] == "image" && args[1] == "inspect":
 		if r.imageID != "" {
-			return issue115JSONBytes([]map[string]any{{"Id": r.imageID}}), nil, nil
+			return fixtureJSONBytes([]map[string]any{{"Id": r.imageID}}), nil, nil
 		}
-		return issue115JSONBytes([]map[string]any{{
+		return fixtureJSONBytes([]map[string]any{{
 			"id": r.imageDigest[7:],
 			"configuration": map[string]any{
 				"name":       r.containerImage,
 				"descriptor": map[string]string{"digest": r.imageDigest},
 			},
-			"variants": []any{issue115FreshVariant(issue115FreshHostPlatform(), r.imageDigest)},
+			"variants": []any{freshVariant(freshHostPlatform(), r.imageDigest)},
 		}}), nil, nil
 	case args[0] == "run":
 		r.created = true
@@ -75,7 +75,7 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 			creation = "0123456789abcdef"
 		}
 		if r.docker {
-			return issue115JSONBytes([]map[string]any{{
+			return fixtureJSONBytes([]map[string]any{{
 				"Id":         "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
 				"Image":      r.imageID,
 				"HostConfig": map[string]any{"NetworkMode": "bridge"},
@@ -94,7 +94,7 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 				},
 			}}), nil, nil
 		}
-		return issue115JSONBytes([]map[string]any{{
+		return fixtureJSONBytes([]map[string]any{{
 			"id": "myctr",
 			"configuration": map[string]any{
 				"id": "myctr",
@@ -103,7 +103,7 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 					"descriptor":    map[string]string{"digest": r.containerDigest},
 					"variantDigest": r.containerDigest,
 				},
-				"platform": issue115FreshPlatformMap(),
+				"platform": freshPlatformMap(),
 				"labels": map[string]string{
 					managedLabel:  "true",
 					reuseLabel:    "true",
@@ -125,22 +125,22 @@ func (r *issue115ReuseRunner) Run(_ context.Context, args ...string) ([]byte, []
 	}
 }
 
-func (r *issue115ReuseRunner) state() (created, deleted bool) {
+func (r *reuseRunner) state() (created, deleted bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.created, r.deleted
 }
 
-func issue115JSONBytes(v any) []byte {
+func fixtureJSONBytes(v any) []byte {
 	data, _ := json.Marshal(v)
 	return data
 }
 
-func TestIssue115ReuseRejectsResolvedDigestMismatch(t *testing.T) {
-	r := &issue115ReuseRunner{
+func TestReuseRejectsResolvedDigestMismatch(t *testing.T) {
+	r := &reuseRunner{
 		created:         true,
-		imageDigest:     issue115ReuseOtherDigest,
-		containerDigest: issue115ReuseImageDigest,
+		imageDigest:     reuseOtherDigest,
+		containerDigest: reuseImageDigest,
 		containerImage:  "redis:7-alpine",
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -150,11 +150,11 @@ func TestIssue115ReuseRejectsResolvedDigestMismatch(t *testing.T) {
 	}
 }
 
-func TestIssue115ReuseResolvesEachCallersIdentity(t *testing.T) {
-	r := &issue115ReuseRunner{
+func TestReuseResolvesEachCallersIdentity(t *testing.T) {
+	r := &reuseRunner{
 		created:         true,
-		imageDigest:     issue115ReuseImageDigest,
-		containerDigest: issue115ReuseImageDigest,
+		imageDigest:     reuseImageDigest,
+		containerDigest: reuseImageDigest,
 		containerImage:  "redis:7-alpine",
 	}
 	if _, err := Run(context.Background(), "redis:7-alpine",
@@ -164,7 +164,7 @@ func TestIssue115ReuseResolvesEachCallersIdentity(t *testing.T) {
 	// The mutable tag now resolves to another image. A later caller must
 	// not reuse the first caller's identity from the shared flight.
 	r.mu.Lock()
-	r.imageDigest = issue115ReuseOtherDigest
+	r.imageDigest = reuseOtherDigest
 	r.mu.Unlock()
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), withRunner(r), withEngine(appleEngine{}))
@@ -173,10 +173,10 @@ func TestIssue115ReuseResolvesEachCallersIdentity(t *testing.T) {
 	}
 }
 
-func TestIssue115ReuseUsesIDWhenContainerOnlyReportsAnAlias(t *testing.T) {
-	r := &issue115ReuseRunner{
+func TestReuseUsesIDWhenContainerOnlyReportsAnAlias(t *testing.T) {
+	r := &reuseRunner{
 		created:         true,
-		imageID:         issue115ReuseImageID,
+		imageID:         reuseImageID,
 		docker:          true,
 		containerImage:  "other:tag",
 		containerDigest: "",
@@ -190,10 +190,10 @@ func TestIssue115ReuseUsesIDWhenContainerOnlyReportsAnAlias(t *testing.T) {
 	}
 }
 
-func TestIssue115ReuseCleansUpWhenPostCreateValidationFails(t *testing.T) {
-	r := &issue115ReuseRunner{
-		imageDigest:     issue115ReuseImageDigest,
-		containerDigest: issue115ReuseImageDigest,
+func TestReuseCleansUpWhenPostCreateValidationFails(t *testing.T) {
+	r := &reuseRunner{
+		imageDigest:     reuseImageDigest,
+		containerDigest: reuseImageDigest,
 		containerImage:  "redis:7-alpine",
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -208,10 +208,10 @@ func TestIssue115ReuseCleansUpWhenPostCreateValidationFails(t *testing.T) {
 	}
 }
 
-func TestIssue115ReuseCleansUpAfterIdentityValidationFailure(t *testing.T) {
-	r := &issue115ReuseRunner{
-		imageDigest:     issue115ReuseOtherDigest,
-		containerDigest: issue115ReuseImageDigest,
+func TestReuseCleansUpAfterIdentityValidationFailure(t *testing.T) {
+	r := &reuseRunner{
+		imageDigest:     reuseOtherDigest,
+		containerDigest: reuseImageDigest,
 		containerImage:  "redis:7-alpine",
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -225,34 +225,34 @@ func TestIssue115ReuseCleansUpAfterIdentityValidationFailure(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerForeignRepoDigestFallsBackToID(t *testing.T) {
-	data := []byte(`[{"Id":"` + issue115ReuseImageID + `","RepoDigests":["evil.example/library/redis@` + issue115ReuseOtherDigest + `"]}]`)
+func TestDockerForeignRepoDigestFallsBackToID(t *testing.T) {
+	data := []byte(`[{"Id":"` + reuseImageID + `","RepoDigests":["evil.example/library/redis@` + reuseOtherDigest + `"]}]`)
 	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists || identity.mismatch {
 		t.Fatalf("identity = %+v, exists = %v, want ID fallback", identity, exists)
 	}
-	if identity.reference != issue115ReuseImageID || identity.id != issue115ReuseImageID || !identity.pinned {
-		t.Fatalf("identity = %+v, want pinned Docker image ID %q", identity, issue115ReuseImageID)
+	if identity.reference != reuseImageID || identity.id != reuseImageID || !identity.pinned {
+		t.Fatalf("identity = %+v, want pinned Docker image ID %q", identity, reuseImageID)
 	}
 }
 
-func TestIssue115DockerExplicitPinnedRepoConflictIsMismatch(t *testing.T) {
-	data := []byte(`[{"Id":"` + issue115ReuseImageID + `","RepoDigests":["evil.example/library/redis@` + issue115ReuseOtherDigest + `"]}]`)
-	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+issue115ReuseOtherDigest, "")
+func TestDockerExplicitPinnedRepoConflictIsMismatch(t *testing.T) {
+	data := []byte(`[{"Id":"` + reuseImageID + `","RepoDigests":["evil.example/library/redis@` + reuseOtherDigest + `"]}]`)
+	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseOtherDigest, "")
 	if !exists || !identity.mismatch {
 		t.Fatalf("identity = %+v, exists = %v, want explicit pinned conflict", identity, exists)
 	}
 
 	// A differing digest is also a conflict when the repository is
 	// foreign; the ID fallback is reserved for unpinned local aliases.
-	identity, exists = (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+issue115ReuseImageDigest, "")
+	identity, exists = (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine@"+reuseImageDigest, "")
 	if !exists || !identity.mismatch {
 		t.Fatalf("identity = %+v, exists = %v, want digest conflict", identity, exists)
 	}
 }
 
-func TestIssue115AppleLocalIDDigestUsesMutableFallbackWhenAllowed(t *testing.T) {
-	r := &issue115AppleIDRunner{}
+func TestAppleLocalIDDigestUsesMutableFallbackWhenAllowed(t *testing.T) {
+	r := &appleIDRunner{}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullMissing), WithAllowMutableImageTag(),
 		withRunner(r), withEngine(appleEngine{}))
@@ -267,8 +267,8 @@ func TestIssue115AppleLocalIDDigestUsesMutableFallbackWhenAllowed(t *testing.T) 
 	}
 }
 
-func TestIssue115AppleLocalIDDigestFailsClosedWithoutFallback(t *testing.T) {
-	r := &issue115AppleIDRunner{}
+func TestAppleLocalIDDigestFailsClosedWithoutFallback(t *testing.T) {
+	r := &appleIDRunner{}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullMissing),
 		withRunner(r), withEngine(appleEngine{}))
@@ -283,23 +283,23 @@ func TestIssue115AppleLocalIDDigestFailsClosedWithoutFallback(t *testing.T) {
 	}
 }
 
-type issue115AppleIDRunner struct {
+type appleIDRunner struct {
 	mu       sync.Mutex
 	runImage string
 }
 
-func (r *issue115AppleIDRunner) image() string {
+func (r *appleIDRunner) image() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runImage
 }
 
-func (r *issue115AppleIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *appleIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
 		if args[len(args)-1] == "redis:7-alpine" {
-			return []byte(`[{"id":"` + issue115ReuseImageID[7:] + `","configuration":{"name":"redis:7-alpine"},"variants":[]}]`), nil, nil
+			return []byte(`[{"id":"` + reuseImageID[7:] + `","configuration":{"name":"redis:7-alpine"},"variants":[]}]`), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: " + args[len(args)-1]}
 	}
@@ -310,9 +310,9 @@ func (r *issue115AppleIDRunner) Run(_ context.Context, args ...string) ([]byte, 
 	return nil, nil, nil
 }
 
-func TestIssue115PullNeverRejectsIdentitylessAppleInspectForPinnedInput(t *testing.T) {
-	r := &issue115IdentityLessRunner{}
-	image := "redis:7-alpine@" + issue115ReuseImageDigest
+func TestPullNeverRejectsIdentitylessAppleInspectForPinnedInput(t *testing.T) {
+	r := &identityLessRunner{}
+	image := "redis:7-alpine@" + reuseImageDigest
 	_, err := Run(context.Background(), image,
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
@@ -323,14 +323,14 @@ func TestIssue115PullNeverRejectsIdentitylessAppleInspectForPinnedInput(t *testi
 	}
 }
 
-func TestIssue115AppleDigestReferenceIsNormalizedForRun(t *testing.T) {
-	r := &issue115AppleTagSwapRunner{pullDigest: issue115ReuseImageDigest}
+func TestAppleDigestReferenceIsNormalizedForRun(t *testing.T) {
+	r := &appleTagSwapRunner{pullDigest: reuseImageDigest}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullAlways), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if ctr.image.reference != "redis:7-alpine@"+issue115ReuseImageDigest {
+	if ctr.image.reference != "redis:7-alpine@"+reuseImageDigest {
 		t.Fatalf("reference = %q, want normalized Apple digest reference", ctr.image.reference)
 	}
 }

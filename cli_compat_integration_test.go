@@ -35,11 +35,7 @@ func requireDockerCLI(t *testing.T) {
 }
 
 func dockerPullRateLimited(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	return strings.Contains(msg, "toomanyrequests") || strings.Contains(msg, "Rate exceeded")
+	return integrationtest.DockerPullRateLimited(err)
 }
 
 func runDockerSeedWithPullRetry(t *testing.T, r *cli.ExecRunner, ctx context.Context, args ...string) error {

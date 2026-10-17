@@ -13,7 +13,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-func TestReview91FollowLogsClassifiesUnsupportedStreamSetup(t *testing.T) {
+func TestFollowLogsClassifiesUnsupportedStreamSetup(t *testing.T) {
 	ctr := runTestContainer(t, newTestRunner())
 	_, err := ctr.FollowLogs(context.Background())
 	if !errors.Is(err, ErrLogStreamSetup) {
@@ -24,25 +24,25 @@ func TestReview91FollowLogsClassifiesUnsupportedStreamSetup(t *testing.T) {
 	}
 }
 
-type review91StreamSetupTarget struct {
+type streamSetupTarget struct {
 	ctr *Container
 }
 
-func (*review91StreamSetupTarget) Endpoint(context.Context, string) (string, error) {
+func (*streamSetupTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91StreamSetupTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *review91StreamSetupTarget) State(context.Context) (wait.State, error) {
+func (*streamSetupTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *streamSetupTarget) State(context.Context) (wait.State, error) {
 	return wait.StateRunning, nil
 }
-func (t *review91StreamSetupTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+func (t *streamSetupTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	return t.ctr.FollowLogs(ctx)
 }
-func (*review91StreamSetupTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*streamSetupTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
+func TestForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	backend := filepath.Join(t.TempDir(), "docker")
 	if err := os.WriteFile(backend, []byte("not executable"), 0o600); err != nil {
 		t.Fatal(err)
@@ -58,7 +58,7 @@ func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	err := wait.ForLog("ready").
 		WithStartupTimeout(2*time.Second).
 		WithPollInterval(time.Millisecond).
-		WaitUntilReady(context.Background(), &review91StreamSetupTarget{ctr: ctr})
+		WaitUntilReady(context.Background(), &streamSetupTarget{ctr: ctr})
 	if !errors.Is(err, wait.ErrLogStreamSetup) {
 		t.Fatalf("error = %v, want ErrLogStreamSetup", err)
 	}
@@ -67,7 +67,7 @@ func TestReview91ForLogFailsFastForNonExecutableAbsoluteBackend(t *testing.T) {
 	}
 }
 
-func TestReview91ReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
+func TestReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	cfg := &config{}
@@ -82,7 +82,7 @@ func TestReview91ReuseInfoRejectsCanceledCachedReadyInfo(t *testing.T) {
 	}
 }
 
-func TestReview91ReuseWaitRejectsCancellationWithoutStrategy(t *testing.T) {
+func TestReuseWaitRejectsCancellationWithoutStrategy(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	if err := reuseWait(ctx, &config{}, &Container{}); !errors.Is(err, context.Canceled) {
@@ -90,18 +90,18 @@ func TestReview91ReuseWaitRejectsCancellationWithoutStrategy(t *testing.T) {
 	}
 }
 
-type review91CancelOnSuccessStrategy struct {
+type cancelOnSuccessStrategy struct {
 	cancel context.CancelFunc
 }
 
-func (s review91CancelOnSuccessStrategy) WaitUntilReady(context.Context, wait.Target) error {
+func (s cancelOnSuccessStrategy) WaitUntilReady(context.Context, wait.Target) error {
 	s.cancel()
 	return nil
 }
 
-func TestReview91ReuseWaitRejectsCancellationAfterStrategySuccess(t *testing.T) {
+func TestReuseWaitRejectsCancellationAfterStrategySuccess(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cfg := &config{waitStrategy: review91CancelOnSuccessStrategy{cancel: cancel}}
+	cfg := &config{waitStrategy: cancelOnSuccessStrategy{cancel: cancel}}
 	if err := reuseWait(ctx, cfg, &Container{}); !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}

@@ -240,6 +240,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         go-version: ['1.26.0', 'stable']
     steps:
@@ -249,6 +250,69 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
+      # Pre-load and cache the Docker images used across integration tests.
+      # Anonymous pulls against public.ecr.aws from shared GitHub Actions runner
+      # IPs frequently hit rate/data transfer limits ("toomanyrequests: Data
+      # limit exceeded"). Caching the image tarball eliminates repeated registry
+      # calls across workflow runs, and a Docker Hub fallback ensures the images
+      # can be fetched and tagged if the primary mirror is throttled on cache miss.
+      - name: Cache integration test Docker images
+        id: cache-images
+        uses: actions/cache@5a3ec84eff668545956fd18022155c47e93e2684 # v4.2.3
+        with:
+          path: /tmp/docker-images.tar
+          key: integration-docker-images-${{ runner.os }}-${{ hashFiles('integration_image_test.go') }}
+          restore-keys: |
+            integration-docker-images-${{ runner.os }}-
+      - name: Load or pre-pull integration test Docker images
+        run: |
+          target_images=(
+            "public.ecr.aws/docker/library/alpine:latest"
+            "public.ecr.aws/docker/library/redis:7-alpine"
+            "public.ecr.aws/docker/library/nginx:alpine"
+          )
+          fallback_images=(
+            "alpine:latest"
+            "redis:7-alpine"
+            "nginx:alpine"
+          )
+
+          if [ -f /tmp/docker-images.tar ]; then
+            echo "Loading cached images from /tmp/docker-images.tar..."
+            docker load -i /tmp/docker-images.tar || rm -f /tmp/docker-images.tar
+          fi
+
+          for i in "${!target_images[@]}"; do
+            target="${target_images[$i]}"
+            fallback="${fallback_images[$i]}"
+
+            if docker image inspect "$target" >/dev/null 2>&1; then
+              echo "Image $target is already present locally."
+              continue
+            fi
+
+            echo "Pulling $target..."
+            pulled=0
+            for attempt in 1 2 3; do
+              if docker pull "$target"; then
+                pulled=1
+                break
+              fi
+              echo "Pull failed (attempt $attempt/3), retrying in 3s..."
+              sleep 3
+            done
+
+            if [ "$pulled" -eq 0 ]; then
+              echo "Primary pull failed for $target; falling back to Docker Hub ($fallback)..."
+              docker pull "$fallback"
+              docker tag "$fallback" "$target"
+            fi
+          done
+
+          if [ ! -f /tmp/docker-images.tar ]; then
+            echo "Saving images to /tmp/docker-images.tar for cache..."
+            docker save -o /tmp/docker-images.tar "${target_images[@]}"
+          fi
       - run: make integration-docker
         env:
           # A missing or broken Docker backend must fail this required job

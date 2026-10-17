@@ -13,7 +13,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type issue90Target struct {
+type stubWaitTarget struct {
 	endpoint      string
 	endpointErr   error
 	endpointCalls atomic.Int32
@@ -26,12 +26,12 @@ type issue90Target struct {
 	logs          []io.ReadCloser
 }
 
-func (t *issue90Target) Endpoint(context.Context, string) (string, error) {
+func (t *stubWaitTarget) Endpoint(context.Context, string) (string, error) {
 	t.endpointCalls.Add(1)
 	return t.endpoint, t.endpointErr
 }
 
-func (t *issue90Target) Running(context.Context) (bool, error) {
+func (t *stubWaitTarget) Running(context.Context) (bool, error) {
 	call := int(t.runningCalls.Add(1)) - 1
 	if call < len(t.runningErrs) && t.runningErrs[call] != nil {
 		return false, t.runningErrs[call]
@@ -42,7 +42,7 @@ func (t *issue90Target) Running(context.Context) (bool, error) {
 	return true, nil
 }
 
-func (t *issue90Target) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *stubWaitTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.followCalls.Add(1)
 	if len(t.logs) == 0 {
 		return io.NopCloser(strings.NewReader("")), nil
@@ -54,29 +54,29 @@ func (t *issue90Target) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return t.logs[i], nil
 }
 
-func (t *issue90Target) ExecCommand(context.Context, []string) (int, error) {
+func (t *stubWaitTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execCalls.Add(1)
 	return 1, t.execErr
 }
 
-type issue90SuccessfulExecTarget struct {
-	*issue90Target
+type successfulExecTarget struct {
+	*stubWaitTarget
 }
 
-func (*issue90SuccessfulExecTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*successfulExecTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
 func TestEndpointLaunchErrorIsPermanentForPortAndHTTP(t *testing.T) {
 	launchErr := &exec.Error{Name: "container", Err: errors.New("backend binary not found")}
-	strategies := map[string]func(*issue90Target) error{
-		"port": func(target *issue90Target) error {
+	strategies := map[string]func(*stubWaitTarget) error{
+		"port": func(target *stubWaitTarget) error {
 			return ForListeningPort("6379/tcp").
 				WithStartupTimeout(100*time.Millisecond).
 				WithPollInterval(time.Millisecond).
 				WaitUntilReady(context.Background(), target)
 		},
-		"http": func(target *issue90Target) error {
+		"http": func(target *stubWaitTarget) error {
 			return ForHTTP("/ready").
 				WithStartupTimeout(100*time.Millisecond).
 				WithPollInterval(time.Millisecond).
@@ -85,7 +85,7 @@ func TestEndpointLaunchErrorIsPermanentForPortAndHTTP(t *testing.T) {
 	}
 	for name, wait := range strategies {
 		t.Run(name, func(t *testing.T) {
-			target := &issue90Target{endpointErr: launchErr}
+			target := &stubWaitTarget{endpointErr: launchErr}
 			err := wait(target)
 			var got *exec.Error
 			if !errors.As(err, &got) || got.Name != launchErr.Name {
@@ -100,7 +100,7 @@ func TestEndpointLaunchErrorIsPermanentForPortAndHTTP(t *testing.T) {
 
 func TestStateLaunchErrorIsPermanentAfterSuccessfulCheck(t *testing.T) {
 	launchErr := &exec.Error{Name: "container", Err: errors.New("backend binary not found")}
-	target := &issue90SuccessfulExecTarget{issue90Target: &issue90Target{
+	target := &successfulExecTarget{stubWaitTarget: &stubWaitTarget{
 		runningErrs: []error{launchErr},
 	}}
 	err := ForExec([]string{"true"}).
@@ -120,113 +120,113 @@ func TestWaitRejectsInvalidConfigurationBeforeTargetCalls(t *testing.T) {
 	tests := []struct {
 		name     string
 		strategy Strategy
-		calls    func(*issue90Target) int32
+		calls    func(*stubWaitTarget) int32
 	}{
 		{
 			name:     "port syntax",
 			strategy: ForListeningPort("not-a-port"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "UDP port is not a TCP wait target",
 			strategy: ForListeningPort("6379/udp"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "HTTP UDP port is not a TCP wait target",
 			strategy: ForHTTP("/").WithPort("6379/udp"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "empty explicit port",
 			strategy: ForListeningPort(""),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "http method",
 			strategy: ForHTTP("/").WithMethod("GET\n"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "empty HTTP method",
 			strategy: ForHTTP("/").WithMethod(""),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "http path",
 			strategy: ForHTTP("health"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "http path with space",
 			strategy: ForHTTP("/health check"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "http header",
 			strategy: ForHTTP("/").WithHeader("X-Test\n", "value"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "http port",
 			strategy: ForHTTP("/").WithPort("not-a-port"),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "empty explicit HTTP port",
 			strategy: ForHTTP("/").WithPort(""),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "empty exec executable",
 			strategy: ForExec([]string{""}),
-			calls:    func(target *issue90Target) int32 { return target.execCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.execCalls.Load() },
 		},
 		{
 			name:     "empty log pattern",
 			strategy: ForLog(""),
-			calls:    func(target *issue90Target) int32 { return target.followCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.followCalls.Load() },
 		},
 		{
 			name:     "zero log occurrence",
 			strategy: ForLog("ready").WithOccurrence(0),
-			calls:    func(target *issue90Target) int32 { return target.followCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.followCalls.Load() },
 		},
 		{
 			name:     "invalid regexp",
 			strategy: ForLog("[").AsRegexp(),
-			calls:    func(target *issue90Target) int32 { return target.followCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.followCalls.Load() },
 		},
 		{
 			name:     "negative startup timeout",
 			strategy: ForListeningPort("6379/tcp").WithStartupTimeout(-time.Second),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "negative port poll interval",
 			strategy: ForListeningPort("6379/tcp").WithPollInterval(-time.Second),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "negative HTTP poll interval",
 			strategy: ForHTTP("/").WithPollInterval(-time.Second),
-			calls:    func(target *issue90Target) int32 { return target.endpointCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.endpointCalls.Load() },
 		},
 		{
 			name:     "negative exec poll interval",
 			strategy: ForExec([]string{"false"}).WithPollInterval(-time.Second),
-			calls:    func(target *issue90Target) int32 { return target.execCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.execCalls.Load() },
 		},
 		{
 			name:     "negative log poll interval",
 			strategy: ForLog("ready").WithPollInterval(-time.Second),
-			calls:    func(target *issue90Target) int32 { return target.followCalls.Load() },
+			calls:    func(target *stubWaitTarget) int32 { return target.followCalls.Load() },
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			target := &issue90Target{}
+			target := &stubWaitTarget{}
 			started := time.Now()
 			err := tc.strategy.WaitUntilReady(context.Background(), target)
 			if err == nil {
@@ -250,7 +250,7 @@ func TestUndeclaredPortFailsFastAndRemainsMatchable(t *testing.T) {
 		ForListeningPort("6379/tcp"),
 		ForExposedPort(),
 	} {
-		target := &issue90Target{endpointErr: ErrPortNotExposed}
+		target := &stubWaitTarget{endpointErr: ErrPortNotExposed}
 		started := time.Now()
 		err := strategy.WaitUntilReady(context.Background(), target)
 		if err == nil {
@@ -269,7 +269,7 @@ func TestUndeclaredPortFailsFastAndRemainsMatchable(t *testing.T) {
 }
 
 func TestInvalidHTTPRequestFailsFast(t *testing.T) {
-	target := &issue90Target{endpoint: "%"}
+	target := &stubWaitTarget{endpoint: "%"}
 	started := time.Now()
 	err := ForHTTP("/").WithStartupTimeout(time.Second).WithPollInterval(time.Millisecond).WaitUntilReady(context.Background(), target)
 	if err == nil || !errors.Is(err, ErrInvalidConfiguration) {
@@ -285,7 +285,7 @@ func TestInvalidHTTPRequestFailsFast(t *testing.T) {
 
 func TestTimeoutRetainsLastErrorChain(t *testing.T) {
 	cause := errors.New("temporary endpoint failure")
-	target := &issue90Target{}
+	target := &stubWaitTarget{}
 	err := poll(
 		context.Background(),
 		options{startupTimeout: 5 * time.Millisecond, pollInterval: time.Millisecond},
@@ -302,7 +302,7 @@ func TestTimeoutRetainsLastErrorChain(t *testing.T) {
 }
 
 func TestContainerNotFoundFromExecFailsFast(t *testing.T) {
-	target := &issue90Target{execErr: ErrContainerNotFound}
+	target := &stubWaitTarget{execErr: ErrContainerNotFound}
 	started := time.Now()
 	err := ForExec([]string{"false"}).WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
 	if err == nil || !errors.Is(err, ErrContainerNotFound) {
@@ -317,7 +317,7 @@ func TestContainerNotFoundFromExecFailsFast(t *testing.T) {
 }
 
 func TestContainerNotFoundFailsFastDuringWait(t *testing.T) {
-	target := &issue90Target{endpointErr: ErrContainerNotFound}
+	target := &stubWaitTarget{endpointErr: ErrContainerNotFound}
 	started := time.Now()
 	err := ForListeningPort("6379/tcp").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
 	if err == nil || !errors.Is(err, ErrContainerNotFound) {
@@ -351,7 +351,7 @@ func TestLogSettlePrefersReadyEvidenceBeforeTerminal(t *testing.T) {
 }
 
 func TestForLogTreatsOversizedLineAsPermanent(t *testing.T) {
-	target := &issue90Target{logs: []io.ReadCloser{
+	target := &stubWaitTarget{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader(strings.Repeat("x", maxLogLineSize+1))),
 	}}
 	err := ForLog("never").
@@ -370,7 +370,7 @@ func TestForLogTreatsOversizedLineAsPermanent(t *testing.T) {
 }
 
 func TestForLogPollIntervalReconnects(t *testing.T) {
-	target := &issue90Target{logs: []io.ReadCloser{
+	target := &stubWaitTarget{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader("starting\n")),
 		io.NopCloser(strings.NewReader("ready\n")),
 	}}
@@ -393,7 +393,7 @@ func TestForLogReconnectsAfterTransientStateProbeError(t *testing.T) {
 		ExitCode: 1,
 		Stderr:   "temporary daemon failure",
 	}
-	target := &issue90Target{
+	target := &stubWaitTarget{
 		runningErrs: []error{stateErr},
 		logs: []io.ReadCloser{
 			io.NopCloser(strings.NewReader("starting\n")),
@@ -477,13 +477,13 @@ func TestScanLogStreamDeduplicatesReplayBeyondFingerprintWindow(t *testing.T) {
 	}
 }
 
-type issue90FragmentErrorReader struct {
+type fragmentErrorReader struct {
 	fragment string
 	err      error
 	sent     bool
 }
 
-func (r *issue90FragmentErrorReader) Read(p []byte) (int, error) {
+func (r *fragmentErrorReader) Read(p []byte) (int, error) {
 	if r.sent {
 		return 0, r.err
 	}
@@ -491,7 +491,7 @@ func (r *issue90FragmentErrorReader) Read(p []byte) (int, error) {
 	return copy(p, r.fragment), nil
 }
 
-func (*issue90FragmentErrorReader) Close() error { return nil }
+func (*fragmentErrorReader) Close() error { return nil }
 
 func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 	baseline := scanLogStream(
@@ -514,7 +514,7 @@ func TestScanLogStreamRollsBackTransientState(t *testing.T) {
 	transient := errors.New("transport interrupted")
 	result := scanLogStream(
 		context.Background(),
-		&issue90FragmentErrorReader{fragment: "ready", err: transient},
+		&fragmentErrorReader{fragment: "ready", err: transient},
 		func(line string) int { return strings.Count(line, "ready") },
 		1,
 		replay,
@@ -568,7 +568,7 @@ func TestScanLogStreamUsesScannerLineSemantics(t *testing.T) {
 }
 
 func TestForLogRegexpEndAnchorMatchesCRLF(t *testing.T) {
-	target := &issue90Target{logs: []io.ReadCloser{io.NopCloser(strings.NewReader("ready\r\n"))}}
+	target := &stubWaitTarget{logs: []io.ReadCloser{io.NopCloser(strings.NewReader("ready\r\n"))}}
 	err := ForLog("ready$").AsRegexp().WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), target)
 	if err != nil {
 		t.Fatalf("WaitUntilReady: %v", err)
@@ -613,7 +613,7 @@ func TestScanLogStreamTreatsFinalAndTerminatedReadyAsSameFingerprint(t *testing.
 }
 
 func TestForAllValidatesChildrenBeforeRunning(t *testing.T) {
-	target := &issue90Target{}
+	target := &stubWaitTarget{}
 	err := ForAll(
 		ForListeningPort("6379/tcp"),
 		ForHTTP("invalid-path"),
@@ -648,7 +648,7 @@ func TestForLogDoesNotAcceptTerminalCLIError(t *testing.T) {
 		ExitCode: 17,
 		Stderr:   "logs stream failed",
 	}
-	target := &issue90Target{logs: []io.ReadCloser{&terminalLogReader{err: terminal}}}
+	target := &stubWaitTarget{logs: []io.ReadCloser{&terminalLogReader{err: terminal}}}
 	err := ForLog("ready").
 		WithStartupTimeout(time.Second).
 		WithPollInterval(time.Millisecond).
@@ -672,7 +672,7 @@ func TestForLogDoesNotAcceptTerminalCLIError(t *testing.T) {
 }
 
 func TestForLogDeduplicatesReplayedHistoryAcrossReconnect(t *testing.T) {
-	target := &issue90Target{logs: []io.ReadCloser{
+	target := &stubWaitTarget{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader("ready\n")),
 		io.NopCloser(strings.NewReader("ready\n")),
 		io.NopCloser(strings.NewReader("ready\nstill starting\nready\n")),
@@ -692,8 +692,8 @@ func TestForLogDeduplicatesReplayedHistoryAcrossReconnect(t *testing.T) {
 
 func TestForLogDoesNotCommitTransientOccurrence(t *testing.T) {
 	transient := errors.New("transport interrupted")
-	target := &issue90Target{logs: []io.ReadCloser{
-		&issue90FragmentErrorReader{fragment: "ready", err: transient},
+	target := &stubWaitTarget{logs: []io.ReadCloser{
+		&fragmentErrorReader{fragment: "ready", err: transient},
 		io.NopCloser(strings.NewReader("")),
 	}}
 	err := ForLog("ready").
@@ -706,7 +706,7 @@ func TestForLogDoesNotCommitTransientOccurrence(t *testing.T) {
 }
 
 func TestForLogDeduplicatesFinalReadyWithReplayedTerminatedLine(t *testing.T) {
-	target := &issue90Target{logs: []io.ReadCloser{
+	target := &stubWaitTarget{logs: []io.ReadCloser{
 		io.NopCloser(strings.NewReader("ready")),
 		io.NopCloser(strings.NewReader("ready\n")),
 		io.NopCloser(strings.NewReader("ready\nready\n")),
@@ -736,7 +736,7 @@ func TestCompositeNegativeTimeoutRemainsUnbounded(t *testing.T) {
 			if err := Validate(strategy); err != nil {
 				t.Fatalf("Validate: %v", err)
 			}
-			if err := strategy.WaitUntilReady(context.Background(), &issue90Target{}); err != nil {
+			if err := strategy.WaitUntilReady(context.Background(), &stubWaitTarget{}); err != nil {
 				t.Fatalf("WaitUntilReady: %v", err)
 			}
 		})

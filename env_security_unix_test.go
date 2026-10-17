@@ -34,21 +34,21 @@ func TestEnvFileOwnershipValidation(t *testing.T) {
 	}
 }
 
-type issue97EnvPathInfo struct {
+type envSecurityPathInfo struct {
 	os.FileInfo
 	uid  uint32
 	mode os.FileMode
 }
 
-func (i issue97EnvPathInfo) Sys() any {
+func (i envSecurityPathInfo) Sys() any {
 	stat := *(i.FileInfo.Sys().(*syscall.Stat_t))
 	stat.Uid = i.uid
 	return &stat
 }
 
-func (i issue97EnvPathInfo) Mode() os.FileMode { return i.mode }
+func (i envSecurityPathInfo) Mode() os.FileMode { return i.mode }
 
-func TestIssue97TrustedEnvPathAncestorsRequireRootOrCurrentOwner(t *testing.T) {
+func TestTrustedEnvPathAncestorsRequireRootOrCurrentOwner(t *testing.T) {
 	info, err := os.Stat(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -59,19 +59,19 @@ func TestIssue97TrustedEnvPathAncestorsRequireRootOrCurrentOwner(t *testing.T) {
 		foreign = uid + 2
 	}
 	for _, mode := range []os.FileMode{0o755, 0o777 | os.ModeSticky} {
-		if !trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: 0, mode: mode}) {
+		if !trustedEnvPathComponent(envSecurityPathInfo{FileInfo: info, uid: 0, mode: mode}) {
 			t.Errorf("root-owned mode %04o was rejected", mode)
 		}
-		if !trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: uid, mode: mode}) {
+		if !trustedEnvPathComponent(envSecurityPathInfo{FileInfo: info, uid: uid, mode: mode}) {
 			t.Errorf("current-user-owned mode %04o was rejected", mode)
 		}
-		if trustedEnvPathComponent(issue97EnvPathInfo{FileInfo: info, uid: foreign, mode: mode}) {
+		if trustedEnvPathComponent(envSecurityPathInfo{FileInfo: info, uid: foreign, mode: mode}) {
 			t.Errorf("foreign-owned mode %04o was trusted", mode)
 		}
 	}
 }
 
-func TestIssue97RunEnvPreflightHonorsContextWhileRootLocked(t *testing.T) {
+func TestRunEnvPreflightHonorsContextWhileRootLocked(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -101,7 +101,7 @@ func TestIssue97RunEnvPreflightHonorsContextWhileRootLocked(t *testing.T) {
 	}
 }
 
-func TestIssue97RootMarkerWaiterAcceptsCompletedCreatorChild(t *testing.T) {
+func TestRootMarkerWaiterAcceptsCompletedCreatorChild(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -161,12 +161,12 @@ func TestIssue97RootMarkerWaiterAcceptsCompletedCreatorChild(t *testing.T) {
 	}
 }
 
-type issue97EnvCleanupGateRunner struct {
+type envCleanupGateRunner struct {
 	*fakeRunner
 	envPath string
 }
 
-func (r *issue97EnvCleanupGateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *envCleanupGateRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "run" {
 		for i, arg := range args {
 			if arg == "--env-file" && i+1 < len(args) {
@@ -178,16 +178,16 @@ func (r *issue97EnvCleanupGateRunner) Run(ctx context.Context, args ...string) (
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-type issue97EnvCleanupGateWait struct {
+type envCleanupGateWait struct {
 	called *bool
 }
 
-func (w issue97EnvCleanupGateWait) WaitUntilReady(context.Context, wait.Target) error {
+func (w envCleanupGateWait) WaitUntilReady(context.Context, wait.Target) error {
 	*w.called = true
 	return nil
 }
 
-func TestIssue97RunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
+func TestRunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -196,12 +196,12 @@ func TestIssue97RunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
 	if err := os.WriteFile(hostFile, []byte("host"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &issue97EnvCleanupGateRunner{fakeRunner: newTestRunner()}
+	runner := &envCleanupGateRunner{fakeRunner: newTestRunner()}
 	waitCalled := false
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("cleanup-gate"), WithEnv(map[string]string{"TOKEN": "secret"}),
 		WithFiles(File{HostPath: hostFile, ContainerPath: "/tmp/host"}),
-		WithWaitStrategy(issue97EnvCleanupGateWait{called: &waitCalled}),
+		WithWaitStrategy(envCleanupGateWait{called: &waitCalled}),
 		withRunner(runner), withEngine(appleEngine{}))
 	if ctr == nil || ctr.ID() != "cleanup-gate" {
 		t.Fatalf("Run handle = %v, error = %v; want usable handle", ctr, err)
@@ -231,7 +231,7 @@ func TestIssue97RunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-func TestIssue97LateWriteErrorRetainsPublishedEnvOwnership(t *testing.T) {
+func TestLateWriteErrorRetainsPublishedEnvOwnership(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -274,14 +274,14 @@ func TestIssue97LateWriteErrorRetainsPublishedEnvOwnership(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-type issue97RootReplacementRunner struct {
+type rootReplacementRunner struct {
 	*fakeRunner
 	envPath string
 	root    string
 	oldRoot string
 }
 
-func (r *issue97RootReplacementRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *rootReplacementRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	stdout, stderr, err := r.fakeRunner.Run(ctx, args...)
 	if err != nil || len(args) == 0 || args[0] != "run" {
 		return stdout, stderr, err
@@ -304,12 +304,12 @@ func (r *issue97RootReplacementRunner) Run(ctx context.Context, args ...string) 
 	return stdout, stderr, nil
 }
 
-func TestIssue97RunRetainsEnvOwnershipWhenCacheRootReplaced(t *testing.T) {
+func TestRunRetainsEnvOwnershipWhenCacheRootReplaced(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
 	isolateEnvFileRoot(t)
-	runner := &issue97RootReplacementRunner{fakeRunner: newTestRunner()}
+	runner := &rootReplacementRunner{fakeRunner: newTestRunner()}
 	defer func() {
 		if runner.envPath != "" {
 			dir := filepath.Dir(runner.envPath)
@@ -373,7 +373,7 @@ func TestIssue97RunRetainsEnvOwnershipWhenCacheRootReplaced(t *testing.T) {
 	}
 }
 
-func TestIssue97PublishesOwnershipBeforeRootReplacement(t *testing.T) {
+func TestPublishesOwnershipBeforeRootReplacement(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -423,7 +423,7 @@ func TestIssue97PublishesOwnershipBeforeRootReplacement(t *testing.T) {
 	_ = os.RemoveAll(root)
 }
 
-func TestIssue97PublishesStagingOwnershipBeforeValidationFailure(t *testing.T) {
+func TestPublishesStagingOwnershipBeforeValidationFailure(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -469,7 +469,7 @@ func TestIssue97PublishesStagingOwnershipBeforeValidationFailure(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-func TestIssue97RejectsStagingSamePathReplacementBeforePublication(t *testing.T) {
+func TestRejectsStagingSamePathReplacementBeforePublication(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -517,7 +517,7 @@ func TestIssue97RejectsStagingSamePathReplacementBeforePublication(t *testing.T)
 	_ = os.RemoveAll(replacement)
 }
 
-func TestIssue97RejectsRootReplacementAfterCallback(t *testing.T) {
+func TestRejectsRootReplacementAfterCallback(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -537,7 +537,7 @@ func TestIssue97RejectsRootReplacementAfterCallback(t *testing.T) {
 	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
 }
 
-func TestIssue97LateRootCleanupUsesDetachedContext(t *testing.T) {
+func TestLateRootCleanupUsesDetachedContext(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -580,7 +580,7 @@ func TestIssue97LateRootCleanupUsesDetachedContext(t *testing.T) {
 	}
 }
 
-func TestIssue97RejectsRootMarkerReplacementAfterCallback(t *testing.T) {
+func TestRejectsRootMarkerReplacementAfterCallback(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -604,7 +604,7 @@ func TestIssue97RejectsRootMarkerReplacementAfterCallback(t *testing.T) {
 	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
 }
 
-func TestIssue97RejectsRootAncestorModeChangeAfterCallback(t *testing.T) {
+func TestRejectsRootAncestorModeChangeAfterCallback(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -626,7 +626,7 @@ func TestIssue97RejectsRootAncestorModeChangeAfterCallback(t *testing.T) {
 	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
 }
 
-func TestIssue97RejectsRootAncestorSymlinkAfterCallback(t *testing.T) {
+func TestRejectsRootAncestorSymlinkAfterCallback(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -646,7 +646,7 @@ func TestIssue97RejectsRootAncestorSymlinkAfterCallback(t *testing.T) {
 	_ = os.RemoveAll(filepath.Join(base, envFileRootName))
 }
 
-func TestIssue97RootCallbackUsesBoundedContext(t *testing.T) {
+func TestRootCallbackUsesBoundedContext(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -678,7 +678,7 @@ func TestIssue97RootCallbackUsesBoundedContext(t *testing.T) {
 	}
 }
 
-func TestIssue97CleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
+func TestCleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -716,7 +716,7 @@ func TestIssue97CleanupMissingOwnedPathRemainsUnsafe(t *testing.T) {
 	_ = os.RemoveAll(root)
 }
 
-func TestIssue97ChildReplacementSurvivesRemoval(t *testing.T) {
+func TestChildReplacementSurvivesRemoval(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -772,7 +772,7 @@ func TestIssue97ChildReplacementSurvivesRemoval(t *testing.T) {
 	}
 }
 
-func TestIssue97RejectsChildReplacementBeforePublication(t *testing.T) {
+func TestRejectsChildReplacementBeforePublication(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -813,7 +813,7 @@ func TestIssue97RejectsChildReplacementBeforePublication(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-func TestIssue97RejectsChildReplacementAfterPublication(t *testing.T) {
+func TestRejectsChildReplacementAfterPublication(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -869,7 +869,7 @@ func TestIssue97RejectsChildReplacementAfterPublication(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-func TestIssue97CleanupDoesNotAdoptReplacedDirectory(t *testing.T) {
+func TestCleanupDoesNotAdoptReplacedDirectory(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -934,7 +934,7 @@ func TestIssue97CleanupDoesNotAdoptReplacedDirectory(t *testing.T) {
 	_ = os.RemoveAll(replacementPath)
 }
 
-func TestIssue97CleanupAcquiresOpenLockBeforeRemoval(t *testing.T) {
+func TestCleanupAcquiresOpenLockBeforeRemoval(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -995,7 +995,7 @@ func TestIssue97CleanupAcquiresOpenLockBeforeRemoval(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-func TestIssue97PendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
+func TestPendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -1189,7 +1189,7 @@ func (r *reuseEnvCleanupFailureRunner) Run(ctx context.Context, args ...string) 
 	return r.reuseCreateRunner.Run(ctx, args...)
 }
 
-func TestIssue97ReuseCleanupFailureReturnsIncompleteBeforeFiles(t *testing.T) {
+func TestReuseCleanupFailureReturnsIncompleteBeforeFiles(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -1198,7 +1198,7 @@ func TestIssue97ReuseCleanupFailureReturnsIncompleteBeforeFiles(t *testing.T) {
 	if err := os.WriteFile(hostFile, []byte("host"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &issue97BlockingReuseCleanupRunner{
+	runner := &blockingReuseCleanupRunner{
 		reuseCreateRunner: newReuseCreateRunner(),
 		started:           make(chan struct{}),
 		release:           make(chan struct{}),
@@ -1281,14 +1281,14 @@ func TestIssue97ReuseCleanupFailureReturnsIncompleteBeforeFiles(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-type issue97ReuseRetryRunner struct {
+type reuseRetryRunner struct {
 	*reuseCreateRunner
 	root       string
 	envPath    string
 	copySawEnv atomic.Bool
 }
 
-func (r *issue97ReuseRetryRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reuseRetryRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "run" {
 		for i, arg := range args {
 			if arg == "--env-file" && i+1 < len(args) {
@@ -1305,7 +1305,7 @@ func (r *issue97ReuseRetryRunner) Run(ctx context.Context, args ...string) ([]by
 	return r.reuseCreateRunner.Run(ctx, args...)
 }
 
-func TestIssue97ReuseRetriesCleanupBeforeFileSetup(t *testing.T) {
+func TestReuseRetriesCleanupBeforeFileSetup(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
@@ -1314,7 +1314,7 @@ func TestIssue97ReuseRetriesCleanupBeforeFileSetup(t *testing.T) {
 	if err := os.WriteFile(hostFile, []byte("host"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	runner := &issue97ReuseRetryRunner{reuseCreateRunner: newReuseCreateRunner()}
+	runner := &reuseRetryRunner{reuseCreateRunner: newReuseCreateRunner()}
 	oldHook := envCleanupBeforeAttemptHook
 	var attempts atomic.Int32
 	transient := errors.New("injected transient cleanup failure")
@@ -1341,14 +1341,14 @@ func TestIssue97ReuseRetriesCleanupBeforeFileSetup(t *testing.T) {
 	}
 }
 
-type issue97ConflictCleanupRunner struct {
+type conflictCleanupRunner struct {
 	*reuseCreateRunner
 	envPath       string
 	conflict      atomic.Bool
 	attachInspect atomic.Int32
 }
 
-func (r *issue97ConflictCleanupRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *conflictCleanupRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		if r.conflict.Load() {
 			r.attachInspect.Add(1)
@@ -1373,12 +1373,12 @@ func (r *issue97ConflictCleanupRunner) Run(ctx context.Context, args ...string) 
 	return r.reuseCreateRunner.Run(ctx, args...)
 }
 
-func TestIssue97ReuseConflictPreservesCleanupAndDoesNotAttach(t *testing.T) {
+func TestReuseConflictPreservesCleanupAndDoesNotAttach(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
 	isolateEnvFileRoot(t)
-	runner := &issue97ConflictCleanupRunner{reuseCreateRunner: newReuseCreateRunner()}
+	runner := &conflictCleanupRunner{reuseCreateRunner: newReuseCreateRunner()}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithEnv(map[string]string{"TOKEN": "secret"}),
 		withRunner(runner), withEngine(appleEngine{}))
@@ -1442,7 +1442,7 @@ func TestPublicReuseReturnsHandleWhenEnvCleanupFails(t *testing.T) {
 	_ = os.RemoveAll(dir)
 }
 
-type issue97BlockingReuseCleanupRunner struct {
+type blockingReuseCleanupRunner struct {
 	*reuseCreateRunner
 	started   chan struct{}
 	release   chan struct{}
@@ -1451,7 +1451,7 @@ type issue97BlockingReuseCleanupRunner struct {
 	envPath   string
 }
 
-func (r *issue97BlockingReuseCleanupRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *blockingReuseCleanupRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "cp" {
 		r.copyCalls.Add(1)
 	}
@@ -1468,12 +1468,12 @@ func (r *issue97BlockingReuseCleanupRunner) Run(ctx context.Context, args ...str
 	return r.reuseCreateRunner.Run(ctx, args...)
 }
 
-func TestIssue97ReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testing.T) {
+func TestReuseCleanupWarningWaitersStillCheckCompatibilityAndReadiness(t *testing.T) {
 	if !envFileLocksSupported {
 		t.Skip("advisory env-file locks are unavailable on this platform")
 	}
 	isolateEnvFileRoot(t)
-	runner := &issue97BlockingReuseCleanupRunner{
+	runner := &blockingReuseCleanupRunner{
 		reuseCreateRunner: newReuseCreateRunner(),
 		started:           make(chan struct{}),
 		release:           make(chan struct{}),

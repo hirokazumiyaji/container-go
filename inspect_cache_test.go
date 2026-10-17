@@ -461,7 +461,7 @@ func TestCanceledContextSkipsDynamicCache(t *testing.T) {
 	}
 }
 
-func reviewExplicitAppleContainer(r *fakeRunner) *Container {
+func explicitAppleContainer(r *fakeRunner) *Container {
 	return &Container{
 		id:       "myctr",
 		runner:   r,
@@ -479,7 +479,7 @@ func reviewExplicitAppleContainer(r *fakeRunner) *Container {
 func TestExplicitPublishedHostVerifiesLiveIdentity(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{appleInspectWithIdentity("192.0.2.1/24", testAppleCreationA)}
-	ctr := reviewExplicitAppleContainer(runner)
+	ctr := explicitAppleContainer(runner)
 
 	host, err := ctr.Host(context.Background())
 	if err != nil {
@@ -496,7 +496,7 @@ func TestExplicitPublishedHostVerifiesLiveIdentity(t *testing.T) {
 func TestExplicitPublishedEndpointVerifiesLiveIdentity(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{appleInspectWithIdentity("192.0.2.1/24", testAppleCreationA)}
-	ctr := reviewExplicitAppleContainer(runner)
+	ctr := explicitAppleContainer(runner)
 
 	endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
 	if err != nil {
@@ -513,7 +513,7 @@ func TestExplicitPublishedEndpointVerifiesLiveIdentity(t *testing.T) {
 func TestExplicitPublishedMappedPortVerifiesLiveIdentity(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{appleInspectWithIdentity("192.0.2.1/24", testAppleCreationA)}
-	ctr := reviewExplicitAppleContainer(runner)
+	ctr := explicitAppleContainer(runner)
 
 	port, err := ctr.MappedPort(context.Background(), "6379/tcp")
 	if err != nil {
@@ -569,7 +569,7 @@ func TestExplicitPublishedResolutionRejectsUIDMismatch(t *testing.T) {
 func TestExplicitPublishedResolutionRejectsCreationMismatch(t *testing.T) {
 	runner := newTestRunner()
 	runner.inspectResponses = []string{appleInspectWithIdentity("192.0.2.1/24", testAppleCreationB)}
-	ctr := reviewExplicitAppleContainer(runner)
+	ctr := explicitAppleContainer(runner)
 
 	if _, err := ctr.Endpoint(context.Background(), "6379/tcp"); !errors.Is(err, ErrGenerationReplaced) {
 		t.Fatalf("creation mismatch error = %v, want ErrGenerationReplaced", err)

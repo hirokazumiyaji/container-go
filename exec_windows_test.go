@@ -16,39 +16,39 @@ import (
 )
 
 const (
-	issue116WindowsHelperEnv = "CONTAINERGO_ISSUE116_WINDOWS_HELPER"
-	issue116WindowsReadyEnv  = "CONTAINERGO_ISSUE116_WINDOWS_READY"
+	windowsExecHelperEnv = "CONTAINERGO_ISSUE116_WINDOWS_HELPER"
+	windowsExecReadyEnv  = "CONTAINERGO_ISSUE116_WINDOWS_READY"
 )
 
-type issue116WindowsHelperRunner struct {
+type windowsExecHelperRunner struct {
 	runner cli.Runner
 }
 
-func (r *issue116WindowsHelperRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *windowsExecHelperRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	helperArgs := []string{"-test.run=^TestExecWindowsKillHelper$", "--"}
 	return r.runner.Run(ctx, append(helperArgs, args...)...)
 }
 
 func TestExecWindowsProcessKillReturnsTerminationError(t *testing.T) {
 	ready := filepath.Join(t.TempDir(), "ready")
-	t.Setenv(issue116WindowsHelperEnv, "1")
-	t.Setenv(issue116WindowsReadyEnv, ready)
+	t.Setenv(windowsExecHelperEnv, "1")
+	t.Setenv(windowsExecReadyEnv, ready)
 
-	runner := &issue116WindowsHelperRunner{runner: &cli.ExecRunner{Binary: os.Args[0]}}
+	runner := &windowsExecHelperRunner{runner: &cli.ExecRunner{Binary: os.Args[0]}}
 	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
 	ctr.setImmutableID(dockerFixtureID)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	result := make(chan issue116ExecResult, 1)
+	result := make(chan execResult, 1)
 	go func() {
 		code, out, err := ctr.Exec(ctx, []string{"true"})
-		result <- issue116ExecResult{code: code, out: out, err: err}
+		result <- execResult{code: code, out: out, err: err}
 	}()
 
-	waitForIssue116WindowsHelper(t, ready, result)
+	waitForWindowsExecHelper(t, ready, result)
 	cancel()
-	got := waitForIssue116ExecResult(t, result)
+	got := waitForExecResult(t, result)
 
 	if got.code != 1 {
 		t.Fatalf("exit code = %d, want Windows Process.Kill status 1", got.code)
@@ -73,7 +73,7 @@ func TestExecWindowsProcessKillReturnsTerminationError(t *testing.T) {
 	}
 }
 
-func waitForIssue116WindowsHelper(t *testing.T, ready string, result <-chan issue116ExecResult) {
+func waitForWindowsExecHelper(t *testing.T, ready string, result <-chan execResult) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -92,7 +92,7 @@ func waitForIssue116WindowsHelper(t *testing.T, ready string, result <-chan issu
 }
 
 func TestExecWindowsKillHelper(t *testing.T) {
-	if os.Getenv(issue116WindowsHelperEnv) == "" {
+	if os.Getenv(windowsExecHelperEnv) == "" {
 		return
 	}
 	if _, err := os.Stdout.WriteString("windows stdout"); err != nil {
@@ -101,7 +101,7 @@ func TestExecWindowsKillHelper(t *testing.T) {
 	if _, err := os.Stderr.WriteString("windows stderr"); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(os.Getenv(issue116WindowsReadyEnv), []byte("ready"), 0o600); err != nil {
+	if err := os.WriteFile(os.Getenv(windowsExecReadyEnv), []byte("ready"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	for {

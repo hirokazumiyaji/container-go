@@ -910,29 +910,29 @@ func (h *hangingProbeRunner) Run(ctx context.Context, _ ...string) ([]byte, []by
 	return nil, nil, ctx.Err()
 }
 
-type issue104RecordingProbeRunner struct {
+type recordingProbeRunner struct {
 	calls int
 	err   error
 }
 
-func (r *issue104RecordingProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+func (r *recordingProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
 	r.calls++
 	return nil, nil, r.err
 }
 
-type issue104JoinedProbeRunner struct {
+type joinedProbeRunner struct {
 	err    error
 	stdout string
 }
 
-func (r *issue104JoinedProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+func (r *joinedProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
 	return []byte(r.stdout), nil, r.err
 }
 
 func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
 	original := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command timed out"}
 	operationErr := errors.Join(original, context.DeadlineExceeded)
-	runner := &issue104RecordingProbeRunner{err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}}
+	runner := &recordingProbeRunner{err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}}
 
 	got := Classify(context.Background(), runner, operationErr, appleProbe)
 	if runner.calls != 0 {
@@ -990,7 +990,7 @@ func TestClassifyJoinedProbeConfigurationVetoesLiveness(t *testing.T) {
 		Stderr: "cannot connect to the Docker daemon",
 	}
 	probeErr := errors.Join(liveness, errors.New("x509: certificate signed by unknown authority"))
-	runner := &issue104JoinedProbeRunner{err: probeErr, stdout: "probe stdout"}
+	runner := &joinedProbeRunner{err: probeErr, stdout: "probe stdout"}
 	probe := Probe{
 		Args: []string{"version"}, Hint: "start the daemon",
 		IsUnavailable: func(error) bool { return true },

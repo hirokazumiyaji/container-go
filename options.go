@@ -2,6 +2,7 @@ package container
 
 import (
 	"fmt"
+	"io"
 	"path"
 	"path/filepath"
 	"regexp"
@@ -85,6 +86,7 @@ type config struct {
 	dockerContext         *string
 	dockerConfigDir       *string
 	clientPinned          bool
+	attachOutput          io.Writer
 }
 
 func newConfig() *config {
@@ -113,6 +115,12 @@ func (c *config) validate() error {
 	}
 	if c.reuseGroup != "" && !c.reuse {
 		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
+	}
+	if c.reuse && c.attachOutput != nil {
+		// The reuse path attaches to a container this call may not have
+		// created, so the single creation-time stream WithAttachOutput
+		// promises cannot be established.
+		return validationErrorf("WithAttachOutput", nil, "WithAttachOutput cannot be combined with WithReuse")
 	}
 	seenFiles := make(map[string]struct{}, len(c.files))
 	for _, f := range c.files {
@@ -593,6 +601,21 @@ func WithPlatform(p string) Option {
 			return validationErrorf("WithPlatform", p, "invalid platform %q", p)
 		}
 		c.platform = p
+		return nil
+	}
+}
+
+// WithAttachOutput streams the container's log output to the provided writer
+// starting immediately after container creation. It requires a container this
+// call creates, so Run rejects it together with WithReuse; a reuse caller may
+// attach to a container another process created and would otherwise receive no
+// stream at all.
+func WithAttachOutput(w io.Writer) Option {
+	return func(c *config) error {
+		if w == nil {
+			return validationErrorf("WithAttachOutput", nil, "output writer cannot be nil")
+		}
+		c.attachOutput = w
 		return nil
 	}
 }

@@ -25,7 +25,8 @@ type Configuration struct {
 	// Platform is the platform selected when the container was created.
 	// Older CLI versions may omit it; callers must treat a zero value as
 	// unknown rather than silently treating it as the host platform.
-	Platform Platform `json:"platform"`
+	Platform     Platform `json:"platform"`
+	CreationDate string   `json:"creationDate"`
 }
 
 type Image struct {
@@ -80,8 +81,11 @@ type PublishedPort struct {
 }
 
 type Status struct {
-	State    string    `json:"state"`
-	Networks []Network `json:"networks"`
+	State       string    `json:"state"`
+	Networks    []Network `json:"networks"`
+	StartedDate *string   `json:"startedDate"`
+	ExitedAt    *string   `json:"exitedAt"`
+	ExitCode    *int      `json:"exitCode"`
 }
 
 type Network struct {

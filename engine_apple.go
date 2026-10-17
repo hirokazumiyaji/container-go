@@ -365,6 +365,8 @@ func formatApplePlatform(platform applePlatform) string {
 
 // imageStoreID is empty: Apple Container talks to one local store.
 func (appleEngine) imageStoreID() string { return "" }
+func (appleEngine) targetID() string     { return "" }
+func (appleEngine) isRemote() bool       { return false }
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 

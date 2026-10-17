@@ -122,7 +122,7 @@ func Pull(ctx context.Context, image string) error {
 	if err != nil {
 		return safePublicError(err)
 	}
-	return safePublicError(pullWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, image))
+	return safePublicError(pullWith(ctx, defaultRunnerFor(eng), eng, image))
 }
 
 // pullWith is the fake-runner-driven core of Pull. It resolves and validates
@@ -140,11 +140,15 @@ func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error
 	})
 }
 
-// flightKey identifies the pull being aggregated: one backend, one
+// flightKey identifies the pull being aggregated: one backend target, one
 // image, one operation kind, one platform. Same image with different
-// platforms must not share a flight.
+// targets or platforms must not share a flight.
 func flightKey(eng engine, image, op, platform string) string {
-	return eng.name() + "\x00" + image + "\x00" + op + "\x00" + platform
+	target := ""
+	if eng != nil {
+		target = eng.targetID()
+	}
+	return target + "\x00" + image + "\x00" + op + "\x00" + platform
 }
 
 // imageFlights aggregates concurrent image fetches across the process.

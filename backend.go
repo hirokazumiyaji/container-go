@@ -25,6 +25,31 @@ func applyEngineBinary(cfg *config) {
 	}
 }
 
+// applyEngineRunnerEnv points the default runner at the selected engine's
+// target environment.
+func applyEngineRunnerEnv(cfg *config) {
+	if de, ok := cfg.eng.(dockerEngine); ok {
+		if er, ok := cfg.runner.(*cli.ExecRunner); ok {
+			targetEnv := de.targetEnv()
+			if len(targetEnv) > 0 {
+				cloned := &cli.ExecRunner{
+					Binary: er.Binary,
+					Env:    cli.MergeEnv(er.Env, targetEnv),
+				}
+				cfg.runner = cloned
+			}
+		}
+	}
+}
+
+func defaultRunnerFor(eng engine) cli.Runner {
+	var env []string
+	if de, ok := eng.(dockerEngine); ok {
+		env = de.targetEnv()
+	}
+	return &cli.ExecRunner{Binary: eng.binary(), Env: env}
+}
+
 func detectEngineFor(goos, value string) (engine, error) {
 	if err := validateBackendEnv(value); err != nil {
 		return nil, err

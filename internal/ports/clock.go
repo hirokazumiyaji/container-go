@@ -5,29 +5,10 @@ import (
 	"time"
 )
 
-// Clock provides time operations that can be replaced with a fake in unit tests.
-type Clock interface {
-	Now() time.Time
-	Sleep(d time.Duration)
-	After(d time.Duration) <-chan time.Time
-	SleepWithContext(ctx context.Context, d time.Duration) error
-}
-
-// RealClock implements Clock using the standard time package.
+// RealClock provides context-aware time operations using the standard library.
 type RealClock struct{}
 
-func (RealClock) Now() time.Time {
-	return time.Now()
-}
-
-func (RealClock) Sleep(d time.Duration) {
-	time.Sleep(d)
-}
-
-func (RealClock) After(d time.Duration) <-chan time.Time {
-	return time.After(d)
-}
-
+// SleepWithContext sleeps for d or until ctx is done, whichever comes first.
 func (RealClock) SleepWithContext(ctx context.Context, d time.Duration) error {
 	if err := ctx.Err(); err != nil {
 		return err

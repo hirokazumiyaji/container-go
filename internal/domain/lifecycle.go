@@ -45,28 +45,3 @@ func ReuseAction(state State, recreated bool) (Action, error) {
 		return ActionWait, nil
 	}
 }
-
-// CanTransition reports whether a transition from state 'from' to state 'to' is valid.
-func CanTransition(from, to State) bool {
-	if from == to {
-		return true
-	}
-	switch from {
-	case StateCreated:
-		return to == StateRunning || to == StateStopped || to == StateStopping || to == StateUnknown
-	case StateRunning:
-		return to == StateStopping || to == StateStopped || to == StateRestarting || to == StatePaused || to == StateUnknown
-	case StateRestarting:
-		return to == StateRunning || to == StateStopped || to == StateStopping || to == StateUnknown
-	case StatePaused:
-		return to == StateRunning || to == StateStopping || to == StateStopped || to == StateUnknown
-	case StateStopping:
-		return to == StateStopped || to == StateUnknown
-	case StateStopped:
-		return to == StateRunning || to == StateCreated || to == StateUnknown
-	case StateUnknown:
-		return true
-	default:
-		return false
-	}
-}

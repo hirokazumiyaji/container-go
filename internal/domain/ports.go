@@ -1,6 +1,7 @@
 package domain
 
 import (
+	"errors"
 	"fmt"
 	"net/netip"
 	"strconv"
@@ -51,6 +52,29 @@ func (p PublishSpec) ConnectAddr() string {
 	return CanonicalIP(p.HostAddr)
 }
 
+// fieldError associates a parse failure with the public option field it came
+// from, so the root package can rebuild its ValidationError contract.
+type fieldError struct {
+	field   string
+	message string
+}
+
+func (e *fieldError) Error() string { return e.message }
+
+func newFieldError(field, message string) error {
+	return &fieldError{field: field, message: message}
+}
+
+// FieldOf returns the public option field for a parse error that belongs to
+// one, when the parser knows it.
+func FieldOf(err error) (string, bool) {
+	var fieldErr *fieldError
+	if errors.As(err, &fieldErr) {
+		return fieldErr.field, true
+	}
+	return "", false
+}
+
 // ParsePublishSpec parses a publish specification string
 // "[hostAddr:]hostPort:containerPort[/proto]".
 func ParsePublishSpec(s string) (PublishSpec, error) {
@@ -58,7 +82,7 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 	rest := s
 	if portsPart, proto, ok := strings.Cut(s, "/"); ok {
 		if proto != "tcp" && proto != "udp" {
-			return PublishSpec{}, fmt.Errorf("invalid published port %q: protocol must be tcp or udp", s)
+			return PublishSpec{}, newFieldError("published port", "protocol must be tcp or udp")
 		}
 		spec.Proto = proto
 		rest = portsPart
@@ -67,7 +91,7 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 	if strings.HasPrefix(rest, "[") {
 		end := strings.Index(rest, "]:")
 		if end < 0 {
-			return PublishSpec{}, fmt.Errorf("invalid published port %q: bracketed IPv6 form is malformed", s)
+			return PublishSpec{}, newFieldError("published port", "bracketed IPv6 form is malformed")
 		}
 		spec.HostAddr = rest[1:end]
 		rest = rest[end+2:]
@@ -85,14 +109,14 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 
 	hostPart, ctrPart, ok := strings.Cut(rest, ":")
 	if !ok || strings.Contains(ctrPart, ":") {
-		return PublishSpec{}, fmt.Errorf("invalid published port %q: want [host-ip:]host-port:container-port[/proto]", s)
+		return PublishSpec{}, newFieldError("published port", "want [host-ip:]host-port:container-port[/proto]")
 	}
 	var err error
 	if spec.HostPort, err = ParsePortNumber(hostPart); err != nil {
-		return PublishSpec{}, err
+		return PublishSpec{}, newFieldError("port", "must be 1-65535")
 	}
 	if spec.ContainerPort, err = ParsePortNumber(ctrPart); err != nil {
-		return PublishSpec{}, err
+		return PublishSpec{}, newFieldError("port", "must be 1-65535")
 	}
 	return spec, nil
 }
@@ -119,12 +143,6 @@ func CanonicalIP(addr string) string {
 func IPIs4(addr string) bool {
 	ip, err := netip.ParseAddr(addr)
 	return err == nil && ip.Unmap().Is4()
-}
-
-// IPIs6 reports whether addr is an IPv6 address.
-func IPIs6(addr string) bool {
-	ip, err := netip.ParseAddr(addr)
-	return err == nil && ip.Unmap().Is6()
 }
 
 // IPIsLoopback reports whether addr is a loopback address.

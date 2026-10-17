@@ -702,6 +702,9 @@ type publishSpec struct {
 func parsePublishSpec(s string) (publishSpec, error) {
 	spec, err := domain.ParsePublishSpec(s)
 	if err != nil {
+		if field, ok := domain.FieldOf(err); ok {
+			return publishSpec{}, invalidOption(field, err.Error())
+		}
 		return publishSpec{}, err
 	}
 	return publishSpec{

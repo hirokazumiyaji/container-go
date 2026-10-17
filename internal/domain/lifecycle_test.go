@@ -32,21 +32,3 @@ func TestReuseAction(t *testing.T) {
 		}
 	}
 }
-
-func TestCanTransition(t *testing.T) {
-	if !CanTransition(StateCreated, StateRunning) {
-		t.Error("expected Created -> Running to be valid")
-	}
-	if !CanTransition(StateRunning, StateStopped) {
-		t.Error("expected Running -> Stopped to be valid")
-	}
-	if !CanTransition(StateStopped, StateRunning) {
-		t.Error("expected Stopped -> Running to be valid")
-	}
-	if CanTransition(StateStopping, StateRunning) {
-		t.Error("expected Stopping -> Running to be invalid")
-	}
-	if !CanTransition(StateRunning, StateRunning) {
-		t.Error("expected same-state transition to be valid")
-	}
-}

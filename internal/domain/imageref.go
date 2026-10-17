@@ -58,14 +58,6 @@ func CanonicalDockerHubRegistry(registry string) string {
 	}
 }
 
-// SplitImageDigest splits an image reference into its base reference and digest.
-func SplitImageDigest(ref string) (base, digest string) {
-	if at := strings.LastIndex(ref, "@"); at >= 0 {
-		return ref[:at], ref[at+1:]
-	}
-	return ref, ""
-}
-
 // ImageDigest returns the digest portion of an image reference, or empty string if absent.
 func ImageDigest(ref string) string {
 	i := strings.Index(ref, "@")
@@ -81,21 +73,6 @@ func StripImageDigest(ref string) string {
 		return ref[:i]
 	}
 	return ref
-}
-
-// SplitImageTag splits an image reference into base and tag. Any digest is
-// removed first so the result matches the other repository helpers.
-func SplitImageTag(ref string) (base, tag string) {
-	ref = StripImageDigest(ref)
-	lastSlash := strings.LastIndex(ref, "/")
-	afterSlash := ref
-	if lastSlash >= 0 {
-		afterSlash = ref[lastSlash+1:]
-	}
-	if colon := strings.LastIndex(afterSlash, ":"); colon >= 0 {
-		return ref[:lastSlash+1+colon], afterSlash[colon+1:]
-	}
-	return ref, ""
 }
 
 // isHex checks if s contains only hexadecimal characters.

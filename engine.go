@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 )
 
 // imageIdentity is the backend's verified image content identity when one
@@ -391,43 +392,17 @@ func isImageID(ref string) bool {
 // reference. A bare Docker-style ID or digest is deliberately rejected:
 // without a repository it cannot be compared with another named image.
 func imageReferenceBase(ref string) string {
-	base := strings.TrimSpace(stripImageDigest(ref))
-	if base == "" || isBareImageReference(base) {
-		return ""
-	}
-	return base
+	return domain.ImageReferenceBase(ref)
 }
 
 func isRepositoryDigestReference(ref string) bool {
 	return imageReferenceBase(ref) != "" && validImageDigest(imageDigest(ref))
 }
 
-// isBareImageDigest recognizes a digest used without a repository, such
-// as sha256:<64hex>. It is kept separate from isImageID because the
-// latter is the Docker local-ID syntax used only after inspect verifies
-// an Id field.
-func isBareImageDigest(ref string) bool {
-	ref = strings.TrimSpace(ref)
-	if strings.Contains(ref, "@") || strings.Contains(ref, "/") {
-		return false
-	}
-	i := strings.IndexByte(ref, ':')
-	if i <= 0 || i == len(ref)-1 {
-		return false
-	}
-	switch strings.ToLower(ref[:i]) {
-	case "sha256", "sha384", "sha512":
-		return true
-	default:
-		return false
-	}
-}
-
 // isBareImageID recognizes the unprefixed 64-hex image-ID spelling. It
 // is a local identifier, not a repository name.
 func isBareImageID(ref string) bool {
-	ref = strings.TrimSpace(ref)
-	return len(ref) == 64 && isHex(ref)
+	return domain.IsBareImageID(ref)
 }
 
 // canonicalDockerImageID normalizes Docker's accepted 64-hex and
@@ -447,7 +422,7 @@ func canonicalDockerImageID(ref string) (string, bool) {
 // isBareImageReference identifies either spelling of an ID-shaped or
 // digest-shaped value that has no repository provenance.
 func isBareImageReference(ref string) bool {
-	return isBareImageDigest(ref) || isBareImageID(ref)
+	return domain.IsBareImageReference(ref)
 }
 
 func isHex(s string) bool {

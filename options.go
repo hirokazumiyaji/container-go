@@ -82,6 +82,10 @@ type config struct {
 	reusedCreated         bool
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
+	dockerHost            *string
+	dockerContext         *string
+	dockerConfigDir       *string
+	clientPinned          bool
 }
 
 func newConfig() *config {
@@ -89,6 +93,13 @@ func newConfig() *config {
 		runner: &cli.ExecRunner{},
 		env:    map[string]string{},
 		labels: map[string]string{},
+	}
+}
+
+func withClientPinned() Option {
+	return func(c *config) error {
+		c.clientPinned = true
+		return nil
 	}
 }
 
@@ -111,6 +122,12 @@ func (c *config) validate() error {
 			return newValidationErrorWithField("WithFiles", "containerPath", f.ContainerPath, fmt.Errorf("duplicate container path %q", f.ContainerPath))
 		}
 		seenFiles[clean] = struct{}{}
+	}
+	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
+		return validationErrorf("WithDockerHost", nil, "cannot override Docker target options on Client.Run")
+	}
+	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.name() != "docker" {
+		return validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
 	}
 	return nil
 }
@@ -799,4 +816,31 @@ func ipIsLoopback(addr string) bool {
 func ipIsUnspecified(addr string) bool {
 	ip, err := netip.ParseAddr(addr)
 	return err == nil && ip.Unmap().IsUnspecified()
+}
+
+// WithDockerHost overrides the target Docker daemon host (DOCKER_HOST)
+// for this container.
+func WithDockerHost(host string) Option {
+	return func(c *config) error {
+		c.dockerHost = &host
+		return nil
+	}
+}
+
+// WithDockerContext overrides the target Docker context (DOCKER_CONTEXT)
+// for this container.
+func WithDockerContext(context string) Option {
+	return func(c *config) error {
+		c.dockerContext = &context
+		return nil
+	}
+}
+
+// WithDockerConfig overrides the target Docker config directory (DOCKER_CONFIG)
+// for this container.
+func WithDockerConfig(dir string) Option {
+	return func(c *config) error {
+		c.dockerConfigDir = &dir
+		return nil
+	}
 }

@@ -144,16 +144,14 @@ func WithPruneBinary(path string) PruneOption {
 }
 
 // runnerFor returns the runner these options select, falling back to a new
-// ExecRunner for the engine's default CLI.
+// ExecRunner for the engine's default CLI and target environment.
 func (c pruneConfig) runnerFor(eng engine) Runner {
 	if c.runner != nil {
 		return c.runner
 	}
-	binary := c.binary
-	if binary == "" {
-		binary = eng.binary()
-	}
-	return &cli.ExecRunner{Binary: binary}
+	r := defaultRunnerFor(eng)
+	applyBinaryToRunner(r, c.binary)
+	return r
 }
 
 // parsePruneOptions applies opts over the prune defaults. name labels the

@@ -22,7 +22,68 @@ import (
 // container IP is generally not reachable from the host (Docker
 // Desktop), so on publishable network modes exposed ports are published
 // to daemon-assigned loopback ports and endpoints resolve to those.
-type dockerEngine struct{}
+type dockerEngine struct {
+	explicitTarget  bool
+	host            string
+	context         string
+	configDir       string
+	defaultPlatform string
+}
+
+func newDockerEngine(host, context, configDir, defaultPlatform string) dockerEngine {
+	return dockerEngine{
+		explicitTarget:  true,
+		host:            host,
+		context:         context,
+		configDir:       configDir,
+		defaultPlatform: defaultPlatform,
+	}
+}
+
+func (e dockerEngine) effectiveHost() string {
+	if e.explicitTarget {
+		return e.host
+	}
+	return os.Getenv("DOCKER_HOST")
+}
+
+func (e dockerEngine) effectiveContext() string {
+	if e.explicitTarget {
+		return e.context
+	}
+	return os.Getenv("DOCKER_CONTEXT")
+}
+
+func (e dockerEngine) effectiveConfigDir() string {
+	if e.explicitTarget {
+		return e.configDir
+	}
+	return os.Getenv("DOCKER_CONFIG")
+}
+
+func (e dockerEngine) effectiveDefaultPlatform() string {
+	if e.explicitTarget {
+		return e.defaultPlatform
+	}
+	return os.Getenv("DOCKER_DEFAULT_PLATFORM")
+}
+
+func (e dockerEngine) targetEnv() []string {
+	var env []string
+	if host := e.effectiveHost(); host != "" {
+		env = append(env, "DOCKER_HOST="+host)
+	}
+	if ctx := e.effectiveContext(); ctx != "" {
+		env = append(env, "DOCKER_CONTEXT="+ctx)
+	}
+	if cfg := e.effectiveConfigDir(); cfg != "" {
+		env = append(env, "DOCKER_CONFIG="+cfg)
+	}
+	if plat := e.effectiveDefaultPlatform(); plat != "" {
+		env = append(env, "DOCKER_DEFAULT_PLATFORM="+plat)
+	}
+	return env
+}
 
 // Docker parses stop --time through a signed integer. Cap the value at
 // MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
@@ -71,11 +132,23 @@ func (dockerEngine) requiresImmutableID() bool { return true }
 // context chosen only via `docker context use` with no env remains
 // invisible here, matching the library's existing DOCKER_HOST-only
 // remote detection.
-func (dockerEngine) imageStoreID() string {
-	return normalizeDockerHost(os.Getenv("DOCKER_HOST")) + "\x00" +
-		os.Getenv("DOCKER_CONTEXT") + "\x00" +
-		os.Getenv("DOCKER_CONFIG") + "\x00" +
-		os.Getenv("DOCKER_DEFAULT_PLATFORM")
+func (e dockerEngine) imageStoreID() string {
+	return normalizeDockerHost(e.effectiveHost()) + "\x00" +
+		e.effectiveContext() + "\x00" +
+		e.effectiveConfigDir() + "\x00" +
+		e.effectiveDefaultPlatform()
+}
+
+func (e dockerEngine) targetID() string {
+	storeID := e.imageStoreID()
+	if storeID == "\x00\x00\x00" {
+		return ""
+	}
+	return "docker\x00" + storeID
+}
+
+func (e dockerEngine) isRemote() bool {
+	return isRemoteDockerHostValue(e.effectiveHost())
 }
 
 // dockerDefaultNetwork asks the daemon which platform default it exposes.
@@ -108,7 +181,7 @@ var dockerVolumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 // checkConfig rejects options Docker cannot honor before any image or
 // container command is issued, including volume names and publish
 // options that cannot be honored on the selected network.
-func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
+func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	// Docker's local volume driver adds a minimum length to the shared name
 	// grammar. Apple Container accepts names (for example, one-character
 	// names) that Docker rejects, so this check stays backend-specific.
@@ -141,7 +214,7 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 			return dockerPublishOptionError(network, "WithExposedPorts")
 		}
 	}
-	if isRemoteDockerHost() {
+	if e.isRemote() {
 		// The CLI does not expose the daemon OS or shared filesystem, so reject
 		// every remote bind mount conservatively: Docker resolves the source
 		// on the daemon host, and this library cannot verify that a client
@@ -529,8 +602,8 @@ func dockerWindowsNpipeUnavailable(text string) bool {
 // on a remote daemon reaches nothing, which is the exact symptom the remote
 // detection exists to prevent. Note: a `docker context` pointing at a remote
 // daemon is not detected; only DOCKER_HOST is honored.
-func (dockerEngine) defaultHost() string {
-	host := dockerHostName()
+func (e dockerEngine) defaultHost() string {
+	host := dockerHostNameFrom(e.effectiveHost())
 	if host == "" {
 		return "127.0.0.1"
 	}
@@ -541,7 +614,7 @@ func (dockerEngine) defaultHost() string {
 		}
 		return "::1"
 	}
-	if isRemoteDockerHost() {
+	if e.isRemote() {
 		if canonical != "" {
 			return canonical
 		}
@@ -569,40 +642,20 @@ func normalizeDockerHost(raw string) string {
 	return "tcp://" + raw
 }
 
-// dockerHostName returns the hostname DOCKER_HOST names, or "" when it names
-// no host (a local socket, or an unparsable value).
-func dockerHostName() string {
-	u, err := url.Parse(normalizeDockerHost(os.Getenv("DOCKER_HOST")))
+// dockerHostNameFrom returns the hostname the supplied DOCKER_HOST names, or
+// "" when it names no host.
+func dockerHostNameFrom(raw string) string {
+	u, err := url.Parse(normalizeDockerHost(raw))
 	if err != nil {
 		return ""
 	}
 	return u.Hostname()
 }
 
-// isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
-// live on another machine. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1
-// bind on the remote host is unreachable from the client.
-//
-// The scheme is checked directly rather than through defaultHost, which
-// recognizes only tcp://. ssh:// is a first-class Docker remote transport, and
-// the daemon there resolves bind-mount sources on its own host, so a
-// configuration derived from defaultHost would report local and let the bind
-// through unchanged. A loopback host is still this machine. An empty hostname
-// after parse (tcp://:2375, or scheme-less :2375 after normalizeDockerHost)
-// matches the Docker CLI's TCP parser, which substitutes its default hostname
-// — a local daemon — so those forms are local too. An unparsable value is
-// treated as remote so a malformed setting fails closed rather than
-// permitting a bind the daemon would resolve in the wrong place.
-//
-// ssh:// is remote in the same sense as tcp://, not a special case. The CLI's
-// SSH session tunnels only the Docker API (`docker system dial-stdio` over
-// stdio); it does not forward published container ports, which the daemon
-// allocates on the remote host. So the connect address is the remote hostname,
-// and that hostname must be directly dialable: an ssh-config alias reachable
-// only through a ProxyJump or bastion needs a manual `ssh -L` forward, which
-// is outside what DOCKER_HOST can express.
-func isRemoteDockerHost() bool {
-	raw := normalizeDockerHost(os.Getenv("DOCKER_HOST"))
+// isRemoteDockerHostValue reports whether the supplied DOCKER_HOST points at a
+// daemon that may live on another machine.
+func isRemoteDockerHostValue(rawHost string) bool {
+	raw := normalizeDockerHost(rawHost)
 	if raw == "" {
 		return false
 	}
@@ -628,6 +681,32 @@ func isRemoteDockerHost() bool {
 	return !isLoopbackOrUnspecified(host)
 }
 
+// isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
+// live on another machine. Auto-publish must bind 0.0.0.0 there; a 127.0.0.1
+// bind on the remote host is unreachable from the client.
+//
+// The scheme is checked directly rather than through defaultHost, which
+// recognizes only tcp://. ssh:// is a first-class Docker remote transport, and
+// the daemon there resolves bind-mount sources on its own host, so a
+// configuration derived from defaultHost would report local and let the bind
+// through unchanged. A loopback host is still this machine. An empty hostname
+// after parse (tcp://:2375, or scheme-less :2375 after normalizeDockerHost)
+// matches the Docker CLI's TCP parser, which substitutes its default hostname
+// — a local daemon — so those forms are local too. An unparsable value is
+// treated as remote so a malformed setting fails closed rather than
+// permitting a bind the daemon would resolve in the wrong place.
+//
+// ssh:// is remote in the same sense as tcp://, not a special case. The CLI's
+// SSH session tunnels only the Docker API (`docker system dial-stdio` over
+// stdio); it does not forward published container ports, which the daemon
+// allocates on the remote host. So the connect address is the remote hostname,
+// and that hostname must be directly dialable: an ssh-config alias reachable
+// only through a ProxyJump or bastion needs a manual `ssh -L` forward, which
+// is outside what DOCKER_HOST can express.
+func isRemoteDockerHost() bool {
+	return isRemoteDockerHostValue(os.Getenv("DOCKER_HOST"))
+}
+
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
 // must be rewritten to defaultHost() on a remote daemon.
 func isLoopbackOrUnspecified(addr string) bool {
@@ -644,9 +723,12 @@ func isLoopbackOrUnspecified(addr string) bool {
 func dockerConnectHost(addr string, eng engine) string {
 	canonical := canonicalIP(addr)
 	if canonical == "" {
-		return eng.defaultHost()
+		if eng != nil {
+			return eng.defaultHost()
+		}
+		return "127.0.0.1"
 	}
-	if isRemoteDockerHost() && isLoopbackOrUnspecified(canonical) {
+	if eng != nil && eng.isRemote() && isLoopbackOrUnspecified(canonical) {
 		return eng.defaultHost()
 	}
 	if ipIsUnspecified(canonical) {
@@ -659,7 +741,7 @@ func dockerConnectHost(addr string, eng engine) string {
 }
 
 func dockerBindingConnectHost(b boundPort, eng engine) (string, error) {
-	if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+	if eng != nil && eng.isRemote() && ipIsLoopback(b.hostAddr) {
 		return "", fmt.Errorf("%w: Docker port %d is bound to remote-daemon loopback %q", ErrEndpointUnreachable, b.hostPort, canonicalIP(b.hostAddr))
 	}
 	return dockerConnectHost(b.hostAddr, eng), nil
@@ -674,7 +756,7 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// remote daemon it binds all interfaces so the client can reach it
 	// via defaultHost().
 	bindAddr := "127.0.0.1"
-	if isRemoteDockerHost() {
+	if e.isRemote() {
 		bindAddr = "0.0.0.0"
 	}
 	// checkConfig rejects these combinations before Run reaches this

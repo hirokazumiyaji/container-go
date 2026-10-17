@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"regexp"
 	"runtime"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 // The reaper is an external /bin/sh child holding the write end of a
@@ -388,6 +391,7 @@ type reaper struct {
 	retryLevel   int
 
 	// These are test seams. Production values are bounded defaults.
+	env             []string
 	timeoutSeconds  int
 	pendingAttempts int
 	spawnCommand    func() (*exec.Cmd, error)
@@ -395,14 +399,19 @@ type reaper struct {
 	retryBackoff    func(int) time.Duration
 }
 
-func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
+func newReaperWithEnv(binary, subcommand string, deleteFlags []string, env []string) *reaper {
 	return &reaper{
 		binary:          binary,
 		subcommand:      subcommand,
 		deleteFlags:     append([]string(nil), deleteFlags...),
+		env:             append([]string(nil), env...),
 		timeoutSeconds:  defaultReaperTimeoutSeconds,
 		pendingAttempts: defaultReaperPendingAttempts,
 	}
+}
+
+func newReaper(binary, subcommand string, deleteFlags ...string) *reaper {
+	return newReaperWithEnv(binary, subcommand, deleteFlags, nil)
 }
 
 func validateReaperEntry(entry reaperEntry) error {
@@ -956,6 +965,9 @@ func (r *reaper) spawnLocked() error {
 		args := []string{"-c", reaperScript, "containergo-reaper", r.binary, r.subcommand, breQuote(creationLabel), strconv.Itoa(timeout), strconv.Itoa(attempts)}
 		args = append(args, r.deleteFlags...)
 		cmd = exec.Command("/bin/sh", args...)
+		if len(r.env) > 0 {
+			cmd.Env = cli.MergeEnv(os.Environ(), r.env)
+		}
 	}
 	if cmd == nil {
 		return errors.New("reaper: nil spawn command")
@@ -1057,90 +1069,97 @@ var (
 	globalReapers   = map[string]*reaper{}
 )
 
+func getGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string) *reaper {
+	if key == "" {
+		key = binary
+	}
+	globalReapersMu.Lock()
+	defer globalReapersMu.Unlock()
+	r, ok := globalReapers[key]
+	if !ok {
+		r = newReaperWithEnv(binary, subcommand, deleteFlags, env)
+		globalReapers[key] = r
+	}
+	return r
+}
+
+func registerWithGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string, id, creation string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
+	if err := r.register(id, creation); err != nil {
+		log.Printf("container-go: reaper registration failed (key=%q, binary=%q): %v", key, binary, err)
+		return err
+	}
+	return nil
+}
+
 // registerWithGlobalReaper best-effort registers a completed container
 // with the process-wide reaper. Reaper trouble never fails startup.
 func registerWithGlobalReaper(binary, subcommand string, deleteFlags []string, id, creation string) error {
-	if runtime.GOOS == "windows" {
-		return nil
-	}
-	r := getGlobalReaper(binary, subcommand, deleteFlags)
-	if err := r.register(id, creation); err != nil {
-		log.Printf("container-go: reaper registration failed (binary=%q): %v", binary, err)
-		return err
-	}
-	return nil
+	return registerWithGlobalReaperTarget(binary, binary, subcommand, deleteFlags, nil, id, creation)
 }
 
-func preRegisterWithGlobalReaper(binary, subcommand string, deleteFlags []string, id, creation string) error {
+func preRegisterWithGlobalReaperTarget(key, binary, subcommand string, deleteFlags []string, env []string, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
-	r := getGlobalReaper(binary, subcommand, deleteFlags)
+	r := getGlobalReaperTarget(key, binary, subcommand, deleteFlags, env)
 	if err := r.registerPending(id, creation); err != nil {
-		log.Printf("container-go: reaper pre-registration failed (binary=%q): %v", binary, err)
+		log.Printf("container-go: reaper pre-registration failed (key=%q, binary=%q): %v", key, binary, err)
 		return err
 	}
 	return nil
 }
 
-func completePreRegistrationWithGlobalReaper(binary, id, creation string) error {
+func completePreRegistrationWithGlobalReaperKey(key, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
 	globalReapersMu.Lock()
-	r, ok := globalReapers[binary]
+	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()
 	if !ok {
 		return nil
 	}
 	if err := r.completePending(id, creation); err != nil {
-		log.Printf("container-go: reaper create-completion update failed (binary=%q): %v", binary, err)
+		log.Printf("container-go: reaper create-completion update failed (key=%q): %v", key, err)
 		return err
 	}
 	return nil
 }
 
-func markSharedWithGlobalReaper(binary, id, creation string) error {
+func markSharedWithGlobalReaperKey(key, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
 	globalReapersMu.Lock()
-	r, ok := globalReapers[binary]
+	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()
 	if !ok {
 		return nil
 	}
 	if err := r.markShared(id, creation); err != nil {
-		log.Printf("container-go: reaper shared-state update failed (binary=%q): %v", binary, err)
+		log.Printf("container-go: reaper shared-state update failed (key=%q): %v", key, err)
 		return err
 	}
 	return nil
 }
 
-func unregisterWithGlobalReaper(binary, id, creation string) error {
+func unregisterWithGlobalReaperKey(key, id, creation string) error {
 	if runtime.GOOS == "windows" {
 		return nil
 	}
 	globalReapersMu.Lock()
-	r, ok := globalReapers[binary]
+	r, ok := globalReapers[key]
 	globalReapersMu.Unlock()
 	if !ok {
 		return nil
 	}
 	if err := r.unregister(id, creation); err != nil {
-		log.Printf("container-go: reaper unregister failed (binary=%q): %v", binary, err)
+		log.Printf("container-go: reaper unregister failed (key=%q): %v", key, err)
 		return err
 	}
 	return nil
-}
-
-func getGlobalReaper(binary, subcommand string, deleteFlags []string) *reaper {
-	globalReapersMu.Lock()
-	defer globalReapersMu.Unlock()
-	r, ok := globalReapers[binary]
-	if !ok {
-		r = newReaper(binary, subcommand, deleteFlags...)
-		globalReapers[binary] = r
-	}
-	return r
 }

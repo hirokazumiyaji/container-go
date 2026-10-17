@@ -543,7 +543,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 		runner:  runner,
 		eng:     dockerEngine{},
 		exposed: []portSpec{{port: 6379, proto: "tcp"}},
-		sync: &lockPack{uid: dockerFixtureID},
+		sync:    &lockPack{uid: dockerFixtureID},
 	}
 
 	start := make(chan struct{})

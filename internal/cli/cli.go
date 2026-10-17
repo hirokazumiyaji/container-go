@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -263,6 +264,11 @@ type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
 	Binary string
+
+	// Env is the optional slice of environment variables for child
+	// processes. When non-empty, variables override or are added to the
+	// process's environment.
+	Env []string
 }
 
 func (r *ExecRunner) binary() string {
@@ -275,6 +281,14 @@ func (r *ExecRunner) binary() string {
 // SetBinary overrides the CLI executable to run.
 func (r *ExecRunner) SetBinary(binary string) {
 	r.Binary = binary
+}
+
+// ExternalEnv returns the runner's custom environment variables.
+func (r *ExecRunner) ExternalEnv() []string {
+	if len(r.Env) == 0 {
+		return nil
+	}
+	return append([]string(nil), r.Env...)
 }
 
 type runHooks struct {
@@ -340,6 +354,9 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(r.Env) > 0 {
+		cmd.Env = MergeEnv(os.Environ(), r.Env)
+	}
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
 	var cancelObservedOnce sync.Once
@@ -1245,4 +1262,39 @@ func containsNonLivenessText(s string) bool {
 		}
 	}
 	return false
+}
+
+// MergeEnv merges base environment variables with overrides, ensuring that
+// variables in overrides replace any matching key in base.
+func MergeEnv(base, overrides []string) []string {
+	if len(overrides) == 0 {
+		return append([]string(nil), base...)
+	}
+	res := make([]string, 0, len(base)+len(overrides))
+	overrideKeys := make(map[string]struct{}, len(overrides))
+	for _, env := range overrides {
+		key, _, ok := strings.Cut(env, "=")
+		if ok {
+			if runtime.GOOS == "windows" {
+				overrideKeys[strings.ToUpper(key)] = struct{}{}
+			} else {
+				overrideKeys[key] = struct{}{}
+			}
+		}
+	}
+	for _, env := range base {
+		key, _, ok := strings.Cut(env, "=")
+		if ok {
+			lookupKey := key
+			if runtime.GOOS == "windows" {
+				lookupKey = strings.ToUpper(key)
+			}
+			if _, replaced := overrideKeys[lookupKey]; replaced {
+				continue
+			}
+		}
+		res = append(res, env)
+	}
+	res = append(res, overrides...)
+	return res
 }

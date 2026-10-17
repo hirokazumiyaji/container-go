@@ -268,3 +268,25 @@ func (s *classifyingStream) wrap(err error) error {
 	// still recover CLIError and ErrContainerNotFound with errors.Is/As.
 	return wrapNotFoundFor(s.container.eng, errors.Join(classified, err))
 }
+
+// FollowLogsTo streams the container's log output directly into output until
+// the context is cancelled, the container terminates, or stream is closed.
+func (c *Container) FollowLogsTo(ctx context.Context, output io.Writer) error {
+	if output == nil {
+		return errors.New("logs: output writer cannot be nil")
+	}
+	stream, err := c.FollowLogs(ctx)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	_, copyErr := io.Copy(output, stream)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+	if copyErr != nil && !errors.Is(copyErr, io.EOF) && !errors.Is(copyErr, context.Canceled) {
+		return copyErr
+	}
+	return nil
+}

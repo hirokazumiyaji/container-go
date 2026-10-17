@@ -2,6 +2,7 @@ package container
 
 import (
 	"fmt"
+	"io"
 	"net/netip"
 	"path/filepath"
 	"regexp"
@@ -66,6 +67,7 @@ type config struct {
 	reusedCreated         bool
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
+	attachOutput          io.Writer
 }
 
 func newConfig() *config {
@@ -520,6 +522,18 @@ func WithPlatform(p string) Option {
 			return validationErrorf("WithPlatform", p, "invalid platform %q", p)
 		}
 		c.platform = p
+		return nil
+	}
+}
+
+// WithAttachOutput streams the container's log output to the provided writer
+// starting immediately after container creation.
+func WithAttachOutput(w io.Writer) Option {
+	return func(c *config) error {
+		if w == nil {
+			return validationErrorf("WithAttachOutput", nil, "output writer cannot be nil")
+		}
+		c.attachOutput = w
 		return nil
 	}
 }

@@ -718,7 +718,6 @@ func TestExecCancellationDuringInspectOverridesConfirmedNotFound(t *testing.T) {
 	}
 }
 
-
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)

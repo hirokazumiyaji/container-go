@@ -518,6 +518,16 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 		if ip, err := c.IPv4(); err == nil {
 			info.ip = ip
 		}
+		info.createdAt = parseInspectTime(c.Configuration.CreationDate)
+		if c.Status.StartedDate != nil {
+			info.startedAt = parseInspectTime(*c.Status.StartedDate)
+		}
+		if c.Status.ExitedAt != nil {
+			info.finishedAt = parseInspectTime(*c.Status.ExitedAt)
+		}
+		if c.Status.ExitCode != nil {
+			info.exitCode = *c.Status.ExitCode
+		}
 		for _, p := range c.Configuration.PublishedPorts {
 			info.bound = append(info.bound, boundPort{
 				containerPort: p.ContainerPort,
@@ -555,6 +565,29 @@ func appleState(state string) State {
 	default:
 		return StateUnknown
 	}
+}
+
+func (appleEngine) startArgs(id string) []string {
+	return []string{"start", id}
+}
+
+func (appleEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
+	return nil, fmt.Errorf("%w: apple backend does not support restart CLI subcommand", ErrUnsupportedCapability)
+}
+
+func (appleEngine) killArgs(id string, signal string) []string {
+	if signal != "" {
+		return []string{"kill", "--signal", signal, id}
+	}
+	return []string{"kill", id}
+}
+
+func (appleEngine) pauseArgs(id string) ([]string, error) {
+	return nil, fmt.Errorf("%w: apple backend does not support pause", ErrUnsupportedCapability)
+}
+
+func (appleEngine) unpauseArgs(id string) ([]string, error) {
+	return nil, fmt.Errorf("%w: apple backend does not support unpause", ErrUnsupportedCapability)
 }
 
 func (appleEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {

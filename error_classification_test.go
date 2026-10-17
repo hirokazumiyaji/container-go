@@ -1108,10 +1108,10 @@ func TestAmbiguousRunPreservesOriginalAndCleansPartialCreate(t *testing.T) {
 }
 
 type pruneDeleteRunner struct {
-	list         string
-	inspectJSON  string
-	deleteErr    error
-	deleteCalls  int
+	list        string
+	inspectJSON string
+	deleteErr   error
+	deleteCalls int
 }
 
 func (r *pruneDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {

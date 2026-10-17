@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
@@ -631,10 +632,7 @@ func isRemoteDockerHost() bool {
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
 // must be rewritten to defaultHost() on a remote daemon.
 func isLoopbackOrUnspecified(addr string) bool {
-	if addr == "" || strings.EqualFold(addr, "localhost") {
-		return true
-	}
-	return ipIsLoopback(addr) || ipIsUnspecified(addr)
+	return domain.IsLoopbackOrUnspecified(addr)
 }
 
 // dockerConnectHost rewrites unspecified binds to the client-facing

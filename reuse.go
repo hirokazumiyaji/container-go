@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -354,20 +355,20 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		if err := checkReuseOwnedIdentity(info, resolvedImage, image, cfg); err != nil {
 			return nil, err
 		}
-		switch info.state {
-		case StateCreated, StateRestarting, StateUnknown:
+		action, actionErr := domain.ReuseAction(info.state, recreated)
+		if actionErr != nil {
+			if info.state == StateStopped && recreated {
+				return nil, fmt.Errorf("reuse: %w", actionErr)
+			}
+			return nil, fmt.Errorf("reuse %s: %w", cfg.name, actionErr)
+		}
+		switch action {
+		case domain.ActionWait:
 			if err := waitForReusePoll(ctx); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
-		case StateStopping:
-			return nil, fmt.Errorf("reuse %s: container is stopping and cannot become ready", cfg.name)
-		case StatePaused:
-			return nil, fmt.Errorf("reuse %s: container is paused and cannot become ready", cfg.name)
-		case StateStopped:
-			if recreated {
-				return nil, fmt.Errorf("reuse: container stayed stopped after recreate")
-			}
+		case domain.ActionRecreate:
 			// Only recycle containers this library created for reuse
 			// with a compatible resolved image; never delete foreign leftovers.
 			if err := resolveImage(); err != nil {
@@ -381,7 +382,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			}
 			recreated = true
 			continue
-		case StateRunning:
+		case domain.ActionAttach:
 			if err := resolveImage(); err != nil {
 				return nil, err
 			}
@@ -1107,36 +1108,9 @@ func matchingPublishedBinding(bound []boundPort, p publishSpec) (boundPort, bool
 }
 
 // imagesCompatible reports whether a requested image reference matches
-// what inspect reported. Short Docker Hub names are normalized
-// (docker.io/library/..., latest) before comparison; arbitrary
-// registry/namespace suffix matches are rejected. When the request pins
-// a digest, both the normalized base and the digest must match.
+// what inspect reported.
 func imagesCompatible(requested, actual string) bool {
-	if requested == "" || actual == "" {
-		return requested == actual
-	}
-	// A bare digest/ID has no repository namespace. Comparing it by its
-	// digest alone would make unrelated registries interchangeable.
-	if isBareImageReference(requested) || isBareImageReference(actual) {
-		return false
-	}
-	if requested == actual {
-		return true
-	}
-	reqDigest := imageDigest(requested)
-	actDigest := imageDigest(actual)
-	if reqDigest != "" {
-		if !strings.EqualFold(reqDigest, actDigest) {
-			return false
-		}
-		reqBase := imageReferenceBase(requested)
-		actBase := imageReferenceBase(actual)
-		return reqBase != "" && actBase != "" &&
-			normalizeImageRef(reqBase) == normalizeImageRef(actBase)
-	}
-	req := imageReferenceBase(requested)
-	act := imageReferenceBase(actual)
-	return req != "" && act != "" && normalizeImageRef(req) == normalizeImageRef(act)
+	return domain.ImagesCompatible(requested, actual)
 }
 
 // imageRepository returns the canonical repository portion of an image
@@ -1145,66 +1119,7 @@ func imagesCompatible(requested, actual string) bool {
 // namespace boundary. A bare ID/digest has no repository and returns
 // the empty string.
 func imageRepository(ref string) string {
-	base := imageReferenceBase(ref)
-	if base == "" {
-		return ""
-	}
-	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
-		base = base[:i]
-	}
-	return strings.TrimSuffix(normalizeImageRef(base), ":latest")
-}
-
-// normalizeImageRef expands Docker Hub short names to a canonical
-// registry/repo:tag form. The default registry is docker.io, the
-// default namespace for single-component repos is library, and the
-// default tag is latest.
-func normalizeImageRef(ref string) string {
-	tag := "latest"
-	name := ref
-	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
-		tag = name[i+1:]
-		name = name[:i]
-		if tag == "" {
-			tag = "latest"
-		}
-	}
-	var registry, repo string
-	parts := strings.Split(name, "/")
-	switch {
-	case len(parts) == 1:
-		registry = "docker.io"
-		repo = "library/" + parts[0]
-	case len(parts) == 2 && !isRegistry(parts[0]):
-		registry = "docker.io"
-		repo = name
-	case isRegistry(parts[0]):
-		registry = canonicalDockerHubRegistry(parts[0])
-		repo = strings.Join(parts[1:], "/")
-		if registry == "docker.io" && !strings.Contains(repo, "/") {
-			repo = "library/" + repo
-		}
-	default:
-		registry = "docker.io"
-		repo = name
-	}
-	if repo == "" {
-		repo = name
-	}
-	return registry + "/" + repo + ":" + tag
-}
-
-func isRegistry(s string) bool {
-	return strings.Contains(s, ".") || strings.Contains(s, ":") || s == "localhost"
-}
-
-func canonicalDockerHubRegistry(registry string) string {
-	switch strings.ToLower(registry) {
-	case "docker.io", "registry-1.docker.io", "index.docker.io":
-		return "docker.io"
-	default:
-		return registry
-	}
+	return domain.ImageRepository(ref)
 }
 
 func isUnqualifiedImageReference(ref string) bool {
@@ -1214,7 +1129,7 @@ func isUnqualifiedImageReference(ref string) bool {
 	}
 	base = imageRepositoryBaseWithoutTag(base)
 	first, _, _ := strings.Cut(base, "/")
-	return !isRegistry(first)
+	return !domain.IsRegistry(first)
 }
 
 func isDockerRegistryReference(ref string) bool {
@@ -1224,14 +1139,11 @@ func isDockerRegistryReference(ref string) bool {
 	}
 	base = imageRepositoryBaseWithoutTag(base)
 	first, _, _ := strings.Cut(base, "/")
-	return canonicalDockerHubRegistry(first) == "docker.io"
+	return domain.CanonicalDockerHubRegistry(first) == "docker.io"
 }
 
 func imageRepositoryBaseWithoutTag(base string) string {
-	if i := strings.LastIndex(base, ":"); i >= 0 && !strings.Contains(base[i+1:], "/") {
-		return base[:i]
-	}
-	return base
+	return domain.ImageRepositoryBaseWithoutTag(base)
 }
 
 // imageRepositoryPathsCompatible compares the repository path and tag
@@ -1241,85 +1153,7 @@ func imageRepositoryBaseWithoutTag(base string) string {
 // Apple inspect responses may legitimately contain a custom default
 // registry.
 func imageRepositoryPathsCompatible(a, b string) bool {
-	aName, aTag, aExplicit := imageRepositoryParts(a)
-	bName, bTag, bExplicit := imageRepositoryParts(b)
-	if aName == "" || bName == "" {
-		return false
-	}
-	if aExplicit && bExplicit {
-		ra, rb := imageRegistryOf(a), imageRegistryOf(b)
-		if ra == "" || rb == "" || !strings.EqualFold(ra, rb) {
-			return false
-		}
-	}
-	if !tagsCompatible(aTag, bTag) {
-		return false
-	}
-	if aExplicit && bExplicit {
-		return aName == bName
-	}
-	if aExplicit {
-		return repositoryNameMatches(bName, aName)
-	}
-	if bExplicit {
-		return repositoryNameMatches(aName, bName)
-	}
-	return normalizeImageRef(stripImageDigest(a)) == normalizeImageRef(stripImageDigest(b))
-}
-
-func imageRegistryOf(ref string) string {
-	base := imageRepositoryBaseWithoutTag(imageReferenceBase(ref))
-	if base == "" {
-		return ""
-	}
-	first, _, _ := strings.Cut(base, "/")
-	if !isRegistry(first) {
-		return ""
-	}
-	return canonicalDockerHubRegistry(first)
-}
-
-func imageRepositoryParts(ref string) (name, tag string, explicit bool) {
-	base := imageReferenceBase(ref)
-	if base == "" {
-		return "", "", false
-	}
-	name = base
-	if i := strings.LastIndex(name, ":"); i >= 0 && !strings.Contains(name[i+1:], "/") {
-		tag = name[i+1:]
-		name = name[:i]
-	}
-	parts := strings.Split(name, "/")
-	if len(parts) > 0 && isRegistry(parts[0]) {
-		explicit = true
-		registry := canonicalDockerHubRegistry(parts[0])
-		name = strings.Join(parts[1:], "/")
-		if registry == "docker.io" && !strings.Contains(name, "/") {
-			name = "library/" + name
-		}
-	}
-	return name, tag, explicit
-}
-
-func tagsCompatible(a, b string) bool {
-	if a == "" {
-		a = "latest"
-	}
-	if b == "" {
-		b = "latest"
-	}
-	return a == b
-}
-
-func repositoryNameMatches(unqualified, qualified string) bool {
-	if unqualified == qualified {
-		return true
-	}
-	parts := strings.Split(unqualified, "/")
-	if len(parts) == 1 {
-		return qualified == unqualified || qualified == "library/"+unqualified
-	}
-	return false
+	return domain.ImageRepositoryPathsCompatible(a, b)
 }
 
 // imageRepositoriesCompatible compares canonical repository keys captured
@@ -1332,18 +1166,11 @@ func imageRepositoriesCompatible(a, b string) bool {
 }
 
 func imageDigest(ref string) string {
-	i := strings.Index(ref, "@")
-	if i < 0 {
-		return ""
-	}
-	return ref[i+1:]
+	return domain.ImageDigest(ref)
 }
 
 func stripImageDigest(ref string) string {
-	if i := strings.Index(ref, "@"); i >= 0 {
-		return ref[:i]
-	}
-	return ref
+	return domain.StripImageDigest(ref)
 }
 
 // PruneReuseGroup force-removes every container tagged with the given

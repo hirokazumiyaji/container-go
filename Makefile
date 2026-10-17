@@ -86,6 +86,7 @@ release-check:
 	go mod tidy -diff
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 	$(MAKE) release-check-bench
+	cd tools && go mod verify && go mod tidy -diff
 	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
 
 # bench/ is a separate module, so a root-level ./... reaches none of it: not

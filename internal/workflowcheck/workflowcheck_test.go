@@ -519,3 +519,94 @@ func checkoutWithHas(lines []string, usesIdx int, want string) bool {
 	}
 	return false
 }
+
+var (
+	makeGovulncheckVersion = regexp.MustCompile(`(?m)^GOVULNCHECK_VERSION\s*:=\s*(\S+)`)
+	makeActionlintVersion  = regexp.MustCompile(`(?m)^ACTIONLINT_VERSION\s*:=\s*(\S+)`)
+	workflowGovulncheckPin = regexp.MustCompile(`golang\.org/x/vuln/cmd/govulncheck@(v\S+)`)
+	workflowActionlintPin  = regexp.MustCompile(`github\.com/rhysd/actionlint/cmd/actionlint@(v\S+)`)
+)
+
+func parseModRequires(t *testing.T, path string) map[string]string {
+	t.Helper()
+	lines := readLines(t, path)
+	requires := make(map[string]string)
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && strings.HasPrefix(fields[1], "v") {
+			requires[fields[0]] = fields[1]
+		}
+	}
+	return requires
+}
+
+// Dependabot tracks developer tool dependencies declared in tools/go.mod.
+// Tool version pins across Makefile and CI workflows must match tools/go.mod
+// so that Dependabot updates produce an immediate CI failure if the pins drift.
+func TestToolPinsMatchToolsGoMod(t *testing.T) {
+	toolsModPath := filepath.Join("..", "..", "tools", "go.mod")
+	requires := parseModRequires(t, toolsModPath)
+
+	vulnVersion, ok := requires["golang.org/x/vuln"]
+	if !ok || vulnVersion == "" {
+		t.Fatalf("%s: missing require for golang.org/x/vuln", toolsModPath)
+	}
+
+	actionlintVersion, ok := requires["github.com/rhysd/actionlint"]
+	if !ok || actionlintVersion == "" {
+		t.Fatalf("%s: missing require for github.com/rhysd/actionlint", toolsModPath)
+	}
+
+	// 1. Check Makefile
+	makefilePath := filepath.Join("..", "..", "Makefile")
+	makeContent, err := os.ReadFile(makefilePath)
+	if err != nil {
+		t.Fatalf("read Makefile: %v", err)
+	}
+
+	if m := makeGovulncheckVersion.FindSubmatch(makeContent); m == nil || string(m[1]) != vulnVersion {
+		got := ""
+		if m != nil {
+			got = string(m[1])
+		}
+		t.Errorf("Makefile GOVULNCHECK_VERSION = %q, want %q from %s", got, vulnVersion, toolsModPath)
+	}
+
+	if m := makeActionlintVersion.FindSubmatch(makeContent); m == nil || string(m[1]) != actionlintVersion {
+		got := ""
+		if m != nil {
+			got = string(m[1])
+		}
+		t.Errorf("Makefile ACTIONLINT_VERSION = %q, want %q from %s", got, actionlintVersion, toolsModPath)
+	}
+
+	// 2. Check workflow files
+	for _, wf := range workflowFiles(t) {
+		lines := readLines(t, wf)
+		for i, line := range lines {
+			if m := workflowGovulncheckPin.FindStringSubmatch(line); m != nil {
+				if m[1] != vulnVersion {
+					t.Errorf("%s:%d: govulncheck pin = %q, want %q from %s", wf, i+1, m[1], vulnVersion, toolsModPath)
+				}
+			}
+			if m := workflowActionlintPin.FindStringSubmatch(line); m != nil {
+				if m[1] != actionlintVersion {
+					t.Errorf("%s:%d: actionlint pin = %q, want %q from %s", wf, i+1, m[1], actionlintVersion, toolsModPath)
+				}
+			}
+		}
+	}
+}
+
+// Dependabot configuration must track the /tools directory.
+func TestDependabotTracksToolsModule(t *testing.T) {
+	dependabotPath := filepath.Join("..", "..", ".github", "dependabot.yml")
+	content, err := os.ReadFile(dependabotPath)
+	if err != nil {
+		t.Fatalf("read dependabot.yml: %v", err)
+	}
+	if !strings.Contains(string(content), `directory: "/tools"`) {
+		t.Fatalf("%s must track directory: \"/tools\"", dependabotPath)
+	}
+}
+

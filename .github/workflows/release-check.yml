@@ -31,6 +31,7 @@ on:
       # this a PR touching only bench sources would run no bench check at all:
       # the tag push would be the first time release-check-bench saw the code.
       - 'bench/**'
+      - 'tools/**'
       # The Makefile defines the gate this workflow runs, so a PR that weakens
       # it must trigger this workflow. Without it a dropped `go vet` or a
       # weakened `go mod verify` would never be checked.

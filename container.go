@@ -17,6 +17,8 @@ import (
 	"unsafe"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
+	"github.com/hirokazumiyaji/container-go/internal/ports"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -119,16 +121,16 @@ func newCreationID() string {
 }
 
 // State is a container lifecycle state.
-type State string
+type State = domain.State
 
 const (
-	StateRunning    State = "running"
-	StateStopped    State = "stopped"
-	StateStopping   State = "stopping"
-	StateCreated    State = "created"
-	StateRestarting State = "restarting"
-	StatePaused     State = "paused"
-	StateUnknown    State = "unknown"
+	StateRunning    State = domain.StateRunning
+	StateStopped    State = domain.StateStopped
+	StateStopping   State = domain.StateStopping
+	StateCreated    State = domain.StateCreated
+	StateRestarting State = domain.StateRestarting
+	StatePaused     State = domain.StatePaused
+	StateUnknown    State = domain.StateUnknown
 )
 
 // lockPack holds the mutable, synchronized fields of a Container. Shared
@@ -138,14 +140,14 @@ type lockPack struct {
 	uidMu          sync.RWMutex
 	uid            string
 	mu             sync.Mutex
-	info           *engineInfo // immutable identity snapshot; excludes network/port/state
-	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
-	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
-	dynamicGen     uint64      // bumped by clearDynamic so in-flight refreshes cannot repopulate
+	info           *engineInfo      // immutable identity snapshot; excludes network/port/state
+	dynamic        *engineInfo      // short-TTL network/port/state snapshot for endpoint reads
+	dynamicAt      time.Time        // wall time when dynamic was stored; zero if unset
+	dynamicGen     uint64           // bumped by clearDynamic so in-flight refreshes cannot repopulate
 	now            func() time.Time // optional test clock; nil means time.Now
-	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
-	inspectMu      contextLock // serializes inspect target selection and UID publication
-	defaultNetwork string      // Docker daemon default identity, learned lazily
+	dynamicMu      contextLock      // serializes dynamic refresh so older inspects cannot overwrite newer ones
+	inspectMu      contextLock      // serializes inspect target selection and UID publication
+	defaultNetwork string           // Docker daemon default identity, learned lazily
 }
 
 func (p *lockPack) currentTime() time.Time {
@@ -575,14 +577,7 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 }
 
 func waitForReusePoll(ctx context.Context) error {
-	timer := time.NewTimer(reusePollInterval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return ports.RealClock{}.SleepWithContext(ctx, reusePollInterval)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before

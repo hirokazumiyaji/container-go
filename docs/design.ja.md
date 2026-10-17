@@ -723,7 +723,7 @@ v0.2 で Docker バックエンドを追加し、Linux と Windows でも同じ 
 
 **選択**：`CONTAINERGO_BACKEND` 環境変数を最優先し、`apple` または `docker` を受け付ける。未指定なら OS で決め、macOS は Apple Container、Linux と Windows は Docker になる。macOS で Docker Desktop を使う場合は `CONTAINERGO_BACKEND=docker` を設定する。
 
-**方式**：Docker も `os/exec` の CLI ラッパーにする。container-rs は Docker Engine API を直接呼ぶが、本ライブラリは直接 API を使わない。直接 API クライアントは tar の生成、ログストリームの逆多重化、レジストリ認証、Windows の名前付きパイプを自前実装することになるため、CLI ラッパーを使う方が既存の runner 層（argv 実行、timeout、streaming）を共有できる。`DOCKER_HOST`、Docker context、認証の解決は docker CLI に委ねる。ただし、このライブラリが remote endpoint として検出するのは `DOCKER_HOST` だけで、Docker context の remote daemon は検出しない。
+**方式**：Docker も `os/exec` の CLI ラッパーにする。container-rs は Docker Engine API を直接呼ぶが、本ライブラリは直接 API を使わない。直接 API クライアントは tar の生成、ログストリームの逆多重化、レジストリ認証、Windows の名前付きパイプを自前実装することになるため、CLI ラッパーを使う方が既存の runner 層（argv 実行、timeout、streaming）を共有できる。`DOCKER_HOST`、Docker context、認証の解決は docker CLI に委ねる。`DOCKER_HOST` および Docker context の remote daemon を検出し、remote endpoint として解決する。
 
 **内部構造**：バックエンドは「引数の組み立て」と「inspect 出力の正規化」だけを担う内部インターフェースにする。プロセス実行(ランナー)、待機戦略、クリーンアップ、検証は両バックエンドで共有する。正規化した情報には、ライフサイクル状態(created、running、restarting、stopping、stopped、paused、unknown)、ラベル、image 参照、利用できる場合の backend ID、コンテナ IP、Docker network mode、公開ポートの束縛（コンテナポート → ホストアドレスとポート）を含める。backend ID が stable identity で、IP と binding は動的であり、endpoint 読み取りでは短い dynamic-inspect TTL の間だけ再利用する。
 
@@ -741,7 +741,7 @@ unspecified 束縛は loopback へ解決しながら IPv4 と IPv6 のファミ�
 リモートデーモンで明示または再利用された loopback 束縛は拒否する。
 その待ち受け先はリモートマシンの loopback であり、client 側の書き換えでは到達できないためである。
 `ssh://` のホスト名は直接 dial 可能でなければならず、ProxyJump や踏み台越しのエイリアスは手動の `ssh -L` 転送が必要である(CLI の SSH セッションが運ぶのは Docker API だけであるため)。
-`docker context` 経由のリモート指定は検知できない。
+`DOCKER_HOST` と Docker context（アクティブまたは明示設定）の双方が remote daemon として解決される。
 ランダム割り当てはデーモンが起動時に原子的に行うため、Apple Container で避けた「空きポート確保の競合」は発生しない。
 Apple Container バックエンドの既定(直接 IP)は変えない。
 
@@ -770,7 +770,7 @@ v0.2 の Windows は通常経路(`Cleanup`、ロールバック)のみとし、�
 現在の API が暗黙に意味を与えない事项を、ここに明記する。
 
 - **Apple の名前ベース削除**：non-empty で一致する作成世代チェックと per-name `flock` は、同じ host で本ライブラリの generation-checked `Terminate` / failed-create cleanup、および `Prune` / `PruneReuseGroup` を保護する。外部 reaper はこの lock を取らず、同じ窓で外部の CLI が delete して再作成した場合には区別できない。#83 と #84 が ownership と最終確認の gap を扱い、外部競合を閉じるには backend の不変 ID または原子的な条件付き削除が必要である。
-- **remote Docker の検出**：endpoint 選択に使うのは `DOCKER_HOST=tcp://...` だけである。remote Docker context は検出しない。
+- **remote Docker の検出**：remote endpoint は `DOCKER_HOST` および Docker context（`tcp://` および `ssh://` トランスポートをサポート）の両方から解決される。
 - **Reuse の互換性**：両 backend で image を検査する。Docker は published port binding も検査するが、Apple は inspect data に `WithExposedPorts` の宣言を残さないため比較できない。`env`、`cmd`、`mounts` の差は意図的に attach する。今後の release で設定を比較すべきかは未解決の製品上の決定であり、分離が必要なら別の名前を使う。
 - **logger injection**：公開 logger hook は存在しない。追加するには新しい API と、公開できるコマンドデータの範囲を決める決定が必要である。
 - **Windows / remote bind mount**：現在の validation は Unix-style で、remote Docker daemon が client host path を解決できる保証はない。#76 が capability boundary を追加する。

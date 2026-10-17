@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
@@ -122,23 +123,33 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 	}
 
 	if _, ok := eng.(dockerEngine); ok {
-		host := os.Getenv("DOCKER_HOST")
+		var de dockerEngine
+		de.explicitTarget = true
 		if cfg.dockerHost != nil {
-			host = *cfg.dockerHost
+			de.host = *cfg.dockerHost
+			de.explicitHost = true
+		} else {
+			de.host = os.Getenv("DOCKER_HOST")
 		}
-		dockerCtx := os.Getenv("DOCKER_CONTEXT")
 		if cfg.dockerContext != nil {
-			dockerCtx = *cfg.dockerContext
+			de.context = *cfg.dockerContext
+			de.explicitContext = true
+		} else {
+			de.context = os.Getenv("DOCKER_CONTEXT")
 		}
-		cfgDir := os.Getenv("DOCKER_CONFIG")
 		if cfg.dockerConfigDir != nil {
-			cfgDir = *cfg.dockerConfigDir
+			de.configDir = *cfg.dockerConfigDir
+			de.explicitConfigDir = true
+		} else {
+			de.configDir = os.Getenv("DOCKER_CONFIG")
 		}
-		platform := os.Getenv("DOCKER_DEFAULT_PLATFORM")
 		if cfg.platform != nil {
-			platform = *cfg.platform
+			de.defaultPlatform = *cfg.platform
+			de.explicitDefaultPlatform = true
+		} else {
+			de.defaultPlatform = os.Getenv("DOCKER_DEFAULT_PLATFORM")
 		}
-		eng = newDockerEngine(host, dockerCtx, cfgDir, platform)
+		eng = de
 	} else if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil || cfg.platform != nil {
 		return nil, fmt.Errorf("docker target options cannot be used with %s backend", eng.name())
 	}
@@ -169,6 +180,30 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 			}
 		}
 		runner = cloned
+	}
+
+	if de, ok := eng.(dockerEngine); ok {
+		resolved, err := de.resolveTarget(context.Background(), runner)
+		if err != nil {
+			if de.effectiveContext() != "" || de.effectiveHost() != "" {
+				return nil, err
+			}
+			var configErr *ConfigError
+			if errors.As(err, &configErr) {
+				return nil, err
+			}
+		} else {
+			eng = resolved
+			if er, ok := runner.(*cli.ExecRunner); ok {
+				if targetEnv := resolved.targetEnv(); len(targetEnv) > 0 {
+					cloned := &cli.ExecRunner{
+						Binary: er.Binary,
+						Env:    cli.MergeEnv(er.Env, targetEnv),
+					}
+					runner = cloned
+				}
+			}
+		}
 	}
 
 	return &Client{

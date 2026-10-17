@@ -971,10 +971,10 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	// Context-only UnwrapErr with an independent DNS reason must still keep
 	// *net.DNSError for As, not disappear as a fully stripped carrier.
 	contextOnlyUnwrapDNS := &net.DNSError{
-		Err:       "no such host",
-		Name:      "example.com",
+		Err:        "no such host",
+		Name:       "example.com",
 		IsNotFound: true,
-		UnwrapErr: context.Canceled,
+		UnwrapErr:  context.Canceled,
 	}
 	got = nonContextCause(contextOnlyUnwrapDNS)
 	var gotContextOnlyDNS *net.DNSError
@@ -1633,7 +1633,7 @@ type reviewContextMatchingWrapper struct {
 }
 
 func (e *reviewContextMatchingWrapper) Error() string { return "context matching: " + e.err.Error() }
-func (e *reviewContextMatchingWrapper) Unwrap() error  { return e.err }
+func (e *reviewContextMatchingWrapper) Unwrap() error { return e.err }
 func (e *reviewContextMatchingWrapper) Is(target error) bool {
 	return target == context.Canceled || errors.Is(e.err, target)
 }
@@ -1644,7 +1644,7 @@ type reviewPassthroughWrapper struct {
 }
 
 func (e *reviewPassthroughWrapper) Error() string { return e.err.Error() }
-func (e *reviewPassthroughWrapper) Unwrap() error  { return e.err }
+func (e *reviewPassthroughWrapper) Unwrap() error { return e.err }
 
 func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
 	cause := &reviewTypedCause{message: "backend failure"}
@@ -2456,7 +2456,7 @@ func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	target := &reviewFinalProbeJoinedContextTarget{}
 	err := ForExec([]string{"probe"}).
 		WithStartupTimeout(time.Second).
-		WithPollInterval(10 * time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected final lifecycle probe error")
@@ -2473,7 +2473,7 @@ func TestFinalLifecycleRetriesContextOnlyAfterTransientProbe(t *testing.T) {
 	target := &reviewFinalProbeStaleTransientTarget{}
 	err := ForExec([]string{"probe"}).
 		WithStartupTimeout(time.Second).
-		WithPollInterval(5 * time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err != nil {
 		t.Fatalf("WaitUntilReady = %v, want success after retrying context-only permanent probe", err)
@@ -2579,8 +2579,8 @@ func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 	backend := &reviewTypedCause{message: "backend inspect failed"}
 	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(80 * time.Millisecond).
-		WithPollInterval(5 * time.Millisecond).
+		WithStartupTimeout(80*time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected timeout or probe error")
@@ -2596,8 +2596,8 @@ func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 func TestFinalLifecycleProbeTimeoutRetriesInsteadOfUnknownState(t *testing.T) {
 	target := &reviewFinalProbeTimeoutOnlyTarget{}
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(250 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(250*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after probe retries")
@@ -2832,8 +2832,8 @@ func TestForExecTimeoutStripsJoinedContext(t *testing.T) {
 	target.execErr = errors.Join(context.Canceled, backend)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(200 * time.Millisecond).
-		WithPollInterval(20 * time.Millisecond).
+		WithStartupTimeout(200*time.Millisecond).
+		WithPollInterval(20*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout")
@@ -2854,8 +2854,8 @@ func TestForExecContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target.execErr = &exec.Error{Name: "container", Err: context.Canceled}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after context-only permanent retries")
@@ -2876,8 +2876,8 @@ func TestForExecWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target.execErr = &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after wrapped context-only permanent retries")
@@ -2898,8 +2898,8 @@ func TestForExecNestedWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target.execErr = fmt.Errorf("outer: %w", &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}})
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after nested wrapped context-only permanent retries")
@@ -2936,8 +2936,8 @@ func TestForExecRedactedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after redacted context-only permanent retries")
@@ -2975,8 +2975,8 @@ func TestForExecPathErrorContextOnlyPermanentLaunchRetries(t *testing.T) {
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after PathError context-only permanent retries")
@@ -3024,8 +3024,8 @@ func TestForExecIndependentDNSAfterContextLaunchFailsFast(t *testing.T) {
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected independent DNS failure")
@@ -3059,8 +3059,8 @@ func TestForExecJoinedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after joined context-only permanent retries")
@@ -3081,8 +3081,8 @@ func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
 	target.execErr = &reviewOpaquePermanentFacade{}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent opaque failure")
@@ -3124,8 +3124,8 @@ func TestForExecNestedPermanentFacadeFailsFast(t *testing.T) {
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent nested facade failure")
@@ -3165,7 +3165,7 @@ type reviewLaunchWrapper struct {
 }
 
 func (e *reviewLaunchWrapper) Error() string { return "launch: " + e.err.Error() }
-func (e *reviewLaunchWrapper) Unwrap() error  { return e.err }
+func (e *reviewLaunchWrapper) Unwrap() error { return e.err }
 
 func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	terminal := &cli.CLIError{
@@ -3175,7 +3175,7 @@ func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	}
 	target := &reviewTerminalJoinedContextTarget{err: errors.Join(context.Canceled, terminal)}
 	err := ForLog("never").
-		WithStartupTimeout(300 * time.Millisecond).
+		WithStartupTimeout(300*time.Millisecond).
 		WithPollInterval(time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
@@ -3217,8 +3217,8 @@ func TestRetainedNonContextCauseOpaqueTerminalFacade(t *testing.T) {
 func TestForLogOpaqueTerminalFacadeFailsFast(t *testing.T) {
 	target := &reviewOpaqueTerminalFacadeTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected terminal opaque facade failure")
@@ -3237,7 +3237,7 @@ func TestForLogOpaqueTerminalFacadeFailsFast(t *testing.T) {
 func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 	target := &reviewPermanentProbeJoinedContextTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
 		WithPollInterval(time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
@@ -3254,8 +3254,8 @@ func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 func TestForLogNestedPermanentFacadeFailsFast(t *testing.T) {
 	target := &reviewLogNestedPermanentFacadeTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent nested facade failure")
@@ -3274,8 +3274,8 @@ func TestForLogNestedPermanentFacadeFailsFast(t *testing.T) {
 func TestForLogContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := &reviewLogContextOnlyPermanentTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after context-only permanent retries")

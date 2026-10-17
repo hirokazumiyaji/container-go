@@ -582,7 +582,7 @@ func (appleEngine) checkCopyFileFromContainer() error {
 	)
 }
 
-func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner) error {
+func (appleEngine) checkCopyFileFromContainerVersion(context.Context, cli.Runner, ...time.Duration) error {
 	return appleEngine{}.checkCopyFileFromContainer()
 }
 

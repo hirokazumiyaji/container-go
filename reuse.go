@@ -110,9 +110,9 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// flight so every caller performs its own fetch instead of being
 	// absorbed by an in-flight image pull.
 	if cfg.pullPolicy == PullAlways {
-		pullCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+		pullCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveRunTimeout())
 		defer cancel()
-		if err := pullImage(pullCtx, cfg.runner, cfg.eng, image, cfg.platform); err != nil {
+		if err := cfg.pullImage(pullCtx, image, cfg.platform); err != nil {
 			return nil, err
 		}
 		cfg.imagePrepared = true
@@ -126,7 +126,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		// Shared ensure must not die with the first caller's cancel;
 		// waiters keep waiting on their own contexts.
-		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), reuseAttachTimeout)
+		flightCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveReuseAttachTimeout())
 		defer cancel()
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -172,7 +172,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	// network or port state. Once Docker has supplied an immutable ID,
 	// every compatibility inspect must target that ID rather than the
 	// reusable name.
-	infoCtx, infoCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	infoCtx, infoCancel := context.WithTimeout(ctx, cfg.effectiveReuseAttachTimeout())
 	defer infoCancel()
 	info, err := reuseInfoForCaller(infoCtx, cfg, base)
 	if err != nil {
@@ -215,6 +215,8 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		id:              base.id,
 		runner:          cfg.runner,
 		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
 		exposed:         cfg.exposed,
 		published:       cfg.published,
 		network:         cfg.network,
@@ -304,7 +306,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 					return nil, err
 				}
 				lastInspectErr = err
-				if err := waitForReusePoll(ctx); err != nil {
+				if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
 				continue
@@ -339,7 +341,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			// "Starting container" then reports the ID as not found.
 			// Re-inspect and attach (or recreate) until the deadline.
 			if cfg.eng.nameConflict(operationErr) || createRaceMissing(operationErr) {
-				if err := waitForReusePoll(ctx); err != nil {
+				if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 					return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 				}
 				continue
@@ -356,7 +358,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 		}
 		switch info.state {
 		case StateCreated, StateRestarting, StateUnknown:
-			if err := waitForReusePoll(ctx); err != nil {
+			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 			continue
@@ -389,6 +391,8 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				id:              cfg.name,
 				runner:          cfg.runner,
 				eng:             cfg.eng,
+				queryTimeout:    cfg.queryTimeout,
+				probeTimeout:    cfg.probeTimeout,
 				exposed:         cfg.exposed,
 				published:       cfg.published,
 				network:         cfg.network,
@@ -399,7 +403,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
 			}, nil
 		default:
-			if err := waitForReusePoll(ctx); err != nil {
+			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
 			}
 		}
@@ -407,7 +411,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 }
 
 func reuseCreate(ctx context.Context, image string, cfg *config) (*Container, error) {
-	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
 	defer cancel()
 	resolvedImage, err := cfg.ensureImageRef(runCtx, image)
 	if err != nil {
@@ -423,7 +427,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 
 	// The leader's pull and create get an independent runTimeout budget
 	// even when the caller's context carries a tighter attach deadline.
-	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
+	runCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
 	defer cancel()
 	materializeAppleRunPlatform(cfg)
 	// Keep the secret file out of the image-pull and attach/retry windows;
@@ -471,7 +475,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := classifyErrorFor(ctx, cfg.runner, runErr, cfg.eng, "run", cfg.name)
+		classified := classifyErrorForWithProbe(ctx, cfg.runner, runErr, cfg.eng, cfg.probeTimeout, "run", cfg.name)
 		if cfg.eng.nameConflict(runErr) || cfg.eng.nameConflict(classified) ||
 			createRaceMissing(runErr) || createRaceMissing(classified) {
 			// Keep the backend conflict and cleanup failure as separate
@@ -506,6 +510,8 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		id:              cfg.name,
 		runner:          cfg.runner,
 		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
 		exposed:         cfg.exposed,
 		published:       cfg.published,
 		network:         cfg.network,
@@ -547,7 +553,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		// ownership and the flight layer carries this as a warning.
 		return ctr, &reuseCleanupWarning{err: envCleanupErr}
 	}
-	inspectCtx, inspectCancel := context.WithTimeout(ctx, reuseAttachTimeout)
+	inspectCtx, inspectCancel := context.WithTimeout(ctx, cfg.effectiveReuseAttachTimeout())
 	defer inspectCancel()
 	var createdInfo *engineInfo
 	for {
@@ -559,7 +565,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		if !transientReuseInspectError(err) {
 			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
-		if err := waitForReusePoll(inspectCtx); err != nil {
+		if err := waitForReusePoll(inspectCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return nil, joinEnvFileCleanupError(ctr.rollback(ctx, err), envCleanupErr)
 		}
 	}
@@ -644,7 +650,7 @@ func deleteStoppedReuseResult(ctx context.Context, cfg *config, info *engineInfo
 	}
 
 	target := cfg.name
-	guardCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	guardCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	unlock := func() {}
 	if !requiresImmutableID(cfg.eng) {
@@ -819,6 +825,8 @@ func namedContainer(cfg *config, id string) *Container {
 		id:              id,
 		runner:          cfg.runner,
 		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
 		exposed:         cfg.exposed,
 		published:       cfg.published,
 		network:         cfg.network,
@@ -1417,7 +1425,7 @@ func reuseInfoForCaller(ctx context.Context, cfg *config, base *Container) (*eng
 				return nil, err
 			}
 		}
-		if err := waitForReusePoll(ctx); err != nil {
+		if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 			return nil, err
 		}
 	}

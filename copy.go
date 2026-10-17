@@ -119,7 +119,7 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 		}
 	}()
 
-	cliCtx, cliCancel := withDefaultTimeout(ctx, queryTimeout)
+	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	target, err := c.verifiedOperationTarget(cliCtx)
 	if err != nil {
@@ -626,13 +626,13 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		return nil, err
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
 		return nil, err
 	}
-	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner); err != nil {
+	if err := c.eng.checkCopyFileFromContainerVersion(qCtx, c.runner, c.effectiveQueryTimeout()); err != nil {
 		return nil, err
 	}
 

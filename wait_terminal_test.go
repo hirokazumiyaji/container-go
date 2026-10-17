@@ -35,7 +35,7 @@ exit 17
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -79,7 +79,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -125,7 +125,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -163,7 +163,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {

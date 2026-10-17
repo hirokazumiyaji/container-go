@@ -138,14 +138,17 @@ type lockPack struct {
 	uidMu          sync.RWMutex
 	uid            string
 	mu             sync.Mutex
-	info           *engineInfo // immutable identity snapshot; excludes network/port/state
-	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
-	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
-	dynamicGen     uint64      // bumped by clearDynamic so in-flight refreshes cannot repopulate
+	info           *engineInfo      // immutable identity snapshot; excludes network/port/state
+	dynamic        *engineInfo      // short-TTL network/port/state snapshot for endpoint reads
+	dynamicAt      time.Time        // wall time when dynamic was stored; zero if unset
+	dynamicGen     uint64           // bumped by clearDynamic so in-flight refreshes cannot repopulate
 	now            func() time.Time // optional test clock; nil means time.Now
-	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
-	inspectMu      contextLock // serializes inspect target selection and UID publication
-	defaultNetwork string      // Docker daemon default identity, learned lazily
+	dynamicMu      contextLock      // serializes dynamic refresh so older inspects cannot overwrite newer ones
+	inspectMu      contextLock      // serializes inspect target selection and UID publication
+	defaultNetwork string           // Docker daemon default identity, learned lazily
+	attachMu       sync.Mutex
+	attachCancel   context.CancelFunc
+	attachDone     chan struct{}
 }
 
 func (p *lockPack) currentTime() time.Time {
@@ -454,6 +457,19 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		return c, envCleanupErr
 	}
 
+	if cfg.attachOutput != nil {
+		attachCtx, cancel := context.WithCancel(context.Background())
+		p := c.pack()
+		p.attachMu.Lock()
+		p.attachCancel = cancel
+		p.attachDone = make(chan struct{})
+		p.attachMu.Unlock()
+		go func() {
+			defer close(p.attachDone)
+			_ = c.FollowLogsTo(attachCtx, cfg.attachOutput)
+		}()
+	}
+
 	for _, f := range cfg.files {
 		if err := c.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
 			return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
@@ -666,6 +682,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 // cannot verify the generation, and the caller must know the container was left
 // behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	c.stopAttached()
 	if keepContainers() {
 		return cause
 	}
@@ -882,7 +899,270 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
 	_, _, err = c.runner.Run(stopCtx, args...)
-	return c.classifyOperation(ctx, err, "stop")
+	if err != nil {
+		return c.classifyOperation(ctx, err, "stop")
+	}
+	c.stopAttached()
+	c.clearDynamic()
+	return nil
+}
+
+// Image returns the image reference the container was created with.
+func (c *Container) Image() string {
+	return c.image.reference
+}
+
+// InspectInfo represents a point-in-time snapshot of container state and metadata.
+type InspectInfo struct {
+	id         string
+	name       string
+	image      string
+	imageID    string
+	state      State
+	exitCode   int
+	createdAt  time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+	labels     map[string]string
+	ip         string
+	platform   string
+	ports      []PortBinding
+}
+
+func (i *InspectInfo) ID() string            { return i.id }
+func (i *InspectInfo) Name() string          { return i.name }
+func (i *InspectInfo) Image() string         { return i.image }
+func (i *InspectInfo) ImageID() string       { return i.imageID }
+func (i *InspectInfo) State() State          { return i.state }
+func (i *InspectInfo) ExitCode() int         { return i.exitCode }
+func (i *InspectInfo) CreatedAt() time.Time  { return i.createdAt }
+func (i *InspectInfo) StartedAt() time.Time  { return i.startedAt }
+func (i *InspectInfo) FinishedAt() time.Time { return i.finishedAt }
+func (i *InspectInfo) IP() string            { return i.ip }
+func (i *InspectInfo) Platform() string      { return i.platform }
+
+func (i *InspectInfo) Labels() map[string]string {
+	if i.labels == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(i.labels))
+	for k, v := range i.labels {
+		clone[k] = v
+	}
+	return clone
+}
+
+func (i *InspectInfo) Ports() []PortBinding {
+	if i.ports == nil {
+		return nil
+	}
+	clone := make([]PortBinding, len(i.ports))
+	copy(clone, i.ports)
+	return clone
+}
+
+// Inspect returns a fresh snapshot of the container's metadata and runtime state.
+func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ports := make([]PortBinding, len(info.bound))
+	for idx, b := range info.bound {
+		ports[idx] = PortBinding{
+			ContainerPort: b.containerPort,
+			Proto:         b.proto,
+			HostAddr:      b.hostAddr,
+			HostPort:      b.hostPort,
+		}
+	}
+	return &InspectInfo{
+		id:         c.id,
+		name:       info.name,
+		image:      info.image,
+		imageID:    info.imageID,
+		state:      info.state,
+		exitCode:   info.exitCode,
+		createdAt:  info.createdAt,
+		startedAt:  info.startedAt,
+		finishedAt: info.finishedAt,
+		labels:     info.labels,
+		ip:         info.ip,
+		platform:   info.platform,
+		ports:      ports,
+	}, nil
+}
+
+// ExitCode returns the exit code from a fresh container inspect.
+func (c *Container) ExitCode(ctx context.Context) (int, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return info.exitCode, nil
+}
+
+const waitExitPollInterval = 100 * time.Millisecond
+
+// Wait blocks until the container reaches StateStopped and returns its exit code.
+// If the container is already stopped, it returns its exit code immediately.
+func (c *Container) Wait(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+		info, err := c.inspectDynamicFresh(ctx)
+		if err != nil {
+			return 0, err
+		}
+		if info.state == StateStopped {
+			return info.exitCode, nil
+		}
+		timer.Reset(waitExitPollInterval)
+	}
+}
+
+// Start starts a stopped container.
+func (c *Container) Start(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("start %s: %w", c.id, ErrSharedContainer)
+	}
+	startCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(startCtx)
+	if err != nil {
+		return err
+	}
+	args := c.eng.startArgs(target)
+	_, _, err = c.runner.Run(startCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "start"), "start", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// Restart restarts the container. On backends without a native restart command
+// (such as Apple Container), it gracefully stops then starts the container.
+func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Restart", "timeout", *timeout,
+			fmt.Errorf("restart timeout must be >= 0, got %s", *timeout))
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("restart %s: %w", c.id, ErrSharedContainer)
+	}
+	restartCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	defer cancel()
+	target, err := c.verifiedOperationTarget(restartCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.restartArgs(target, timeout)
+	if errors.Is(err, ErrUnsupportedCapability) {
+		if stopErr := c.Stop(ctx, timeout); stopErr != nil {
+			return stopErr
+		}
+		return c.Start(ctx)
+	}
+	if err != nil {
+		return fmt.Errorf("restart %s: %w", c.id, err)
+	}
+	_, _, err = c.runner.Run(restartCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "restart"), "restart", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// Kill terminates or sends a signal to the container's main process.
+// If no signal is provided, it defaults to SIGKILL.
+func (c *Container) Kill(ctx context.Context, signal ...string) error {
+	if len(signal) > 1 {
+		return newValidationErrorWithField("Kill", "signal", signal,
+			fmt.Errorf("at most one signal may be provided"))
+	}
+	var sig string
+	if len(signal) == 1 {
+		if signal[0] == "" {
+			return newValidationErrorWithField("Kill", "signal", signal[0],
+				fmt.Errorf("signal cannot be empty"))
+		}
+		sig = signal[0]
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
+	}
+	killCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(killCtx)
+	if err != nil {
+		return err
+	}
+	args := c.eng.killArgs(target, sig)
+	_, _, err = c.runner.Run(killCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "kill"), "kill", target, c.id)
+	}
+	c.stopAttached()
+	c.clearDynamic()
+	return nil
+}
+
+// Pause pauses the processes in the container. Returns ErrUnsupportedCapability
+// on backends without pause capability (Apple Container).
+func (c *Container) Pause(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("pause %s: %w", c.id, ErrSharedContainer)
+	}
+	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(pCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.pauseArgs(target)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(pCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "pause"), "pause", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// Unpause unpauses the processes in the container. Returns ErrUnsupportedCapability
+// on backends without pause capability (Apple Container).
+func (c *Container) Unpause(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("unpause %s: %w", c.id, ErrSharedContainer)
+	}
+	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(pCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.unpauseArgs(target)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(pCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "unpause"), "unpause", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
 }
 
 // Shared returns a handle to the same container with Stop/Copy refusals
@@ -908,11 +1188,44 @@ func (c *Container) Shared() *Container {
 	}
 }
 
+// StopAttached terminates any active background log streaming started by WithAttachOutput.
+func (c *Container) StopAttached() {
+	c.stopAttached()
+}
+
+func (c *Container) stopAttached() {
+	p := c.pack()
+	p.attachMu.Lock()
+	cancel := p.attachCancel
+	done := p.attachDone
+	p.attachCancel = nil
+	p.attachMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(500 * time.Millisecond):
+		}
+	}
+}
+
+// AttachedDone returns a channel that is closed when the background attached
+// log stream finishes. If WithAttachOutput was not used, it returns nil.
+func (c *Container) AttachedDone() <-chan struct{} {
+	p := c.pack()
+	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
+	return p.attachDone
+}
+
 // Terminate force-removes the container. A Docker handle must carry a
 // validated immutable UID; a name-only handle is never an acceptable
 // fallback. Apple Container has no immutable UID, so its name path is
 // allowed only with a valid generation and a fresh locked inspect.
 func (c *Container) Terminate(ctx context.Context) error {
+	c.stopAttached()
 	if requiresImmutableID(c.eng) {
 		target, err := c.verifiedOperationTarget(ctx)
 		if err != nil {
@@ -966,6 +1279,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
+	c.stopAttached()
 	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)

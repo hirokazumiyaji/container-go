@@ -105,7 +105,19 @@ type engineInfo struct {
 	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
-	bound []boundPort
+	bound      []boundPort
+	exitCode   int
+	createdAt  time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+}
+
+// PortBinding describes a host-to-container port mapping.
+type PortBinding struct {
+	ContainerPort int
+	Proto         string
+	HostAddr      string
+	HostPort      int
 }
 
 type boundPort struct {
@@ -131,6 +143,11 @@ type engine interface {
 	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
+	startArgs(id string) []string
+	restartArgs(id string, timeout *time.Duration) ([]string, error)
+	killArgs(id string, signal string) []string
+	pauseArgs(id string) ([]string, error)
+	unpauseArgs(id string) ([]string, error)
 	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
@@ -481,4 +498,17 @@ func validImageDigest(digest string) bool {
 		return false
 	}
 	return len(encoded) == wantLength && isHex(encoded)
+}
+
+func parseInspectTime(s string) time.Time {
+	if s == "" || s == "0001-01-01T00:00:00Z" {
+		return time.Time{}
+	}
+	if t, err := time.Parse(time.RFC3339Nano, s); err == nil {
+		return t
+	}
+	if t, err := time.Parse(time.RFC3339, s); err == nil {
+		return t
+	}
+	return time.Time{}
 }

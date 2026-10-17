@@ -36,7 +36,7 @@ func runParallelRuns(t *testing.T, n int, opts ...Option) []error {
 }
 
 func TestRunPullMissingPullsOnceAcrossTenParallelRuns(t *testing.T) {
-f := newDockerTestRunner()
+	f := newDockerTestRunner()
 	errs := runParallelRuns(t, 10, WithName("myctr"), withRunner(f), withEngine(dockerEngine{}))
 	for i, err := range errs {
 		if err != nil {
@@ -77,7 +77,7 @@ func TestRunPullAlwaysPullsEveryRun(t *testing.T) {
 }
 
 func TestRunPullNeverFailsBeforeRunWhenImageMissing(t *testing.T) {
-f := newDockerTestRunner()
+	f := newDockerTestRunner()
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(f), withEngine(dockerEngine{}))
 	if !errors.Is(err, ErrImageNotFound) {
@@ -92,7 +92,7 @@ f := newDockerTestRunner()
 }
 
 func TestRunPullNeverRunsWhenImagePresent(t *testing.T) {
-f := newDockerTestRunner()
+	f := newDockerTestRunner()
 	f.imagePresent = true
 	ctr := runTestContainer(t, f, WithPullPolicy(PullNever), withEngine(dockerEngine{}))
 	_ = ctr

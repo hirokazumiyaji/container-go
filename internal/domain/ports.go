@@ -112,17 +112,17 @@ func ParsePublishSpec(s string) (PublishSpec, error) {
 		return PublishSpec{}, newFieldError("published port", "want [host-ip:]host-port:container-port[/proto]")
 	}
 	var err error
-	if spec.HostPort, err = ParsePortNumber(hostPart); err != nil {
+	if spec.HostPort, err = parsePortNumber(hostPart); err != nil {
 		return PublishSpec{}, newFieldError("port", "must be 1-65535")
 	}
-	if spec.ContainerPort, err = ParsePortNumber(ctrPart); err != nil {
+	if spec.ContainerPort, err = parsePortNumber(ctrPart); err != nil {
 		return PublishSpec{}, newFieldError("port", "must be 1-65535")
 	}
 	return spec, nil
 }
 
-// ParsePortNumber parses a port number and ensures it is in 1-65535.
-func ParsePortNumber(s string) (int, error) {
+// parsePortNumber parses a port number and ensures it is in 1-65535.
+func parsePortNumber(s string) (int, error) {
 	n, err := strconv.Atoi(s)
 	if err != nil || n < 1 || n > 65535 {
 		return 0, fmt.Errorf("invalid port %q: must be 1-65535", s)

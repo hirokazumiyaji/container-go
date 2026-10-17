@@ -1368,9 +1368,8 @@ session carries only the Docker API, so an alias behind a ProxyJump or
 bastion needs a manual `ssh -L` forward.
 An explicit or reused loopback binding on a remote daemon is rejected:
 it listens on the remote machine's loopback, which no client-side
-rewrite can reach.
-Only `DOCKER_HOST` is honored; a `docker context` pointing at a remote
-daemon is not detected.
+Both `DOCKER_HOST` and Docker contexts (active or explicitly configured)
+are resolved for remote daemons.
 The daemon assigns ports atomically at start, so the free-port race
 avoided on Apple Container does not reappear.
 The Apple backend's direct-IP default is unchanged.
@@ -1420,8 +1419,8 @@ These are deliberately recorded rather than implied by the current API:
   Issues #83 and #84 track the ownership and final-verification gaps;
   closing the external race requires an immutable identity or an atomic
   conditional delete from the backend.
-- **Remote Docker detection**: only `DOCKER_HOST=tcp://...` is used
-  for endpoint selection. A remote Docker context is not detected.
+- **Remote Docker detection**: remote endpoints are resolved from
+  both `DOCKER_HOST` and Docker contexts (supporting `tcp://` and `ssh://` transports).
 - **Reuse compatibility**: image is checked on both backends. Docker
   also checks published port bindings; Apple cannot compare
   `WithExposedPorts` declarations because they are not retained in its

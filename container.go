@@ -311,44 +311,25 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		cfg.eng = eng
 	}
 	if de, ok := cfg.eng.(dockerEngine); ok {
-		if !de.explicitTarget {
-			if cfg.dockerHost != nil {
-				de.host = *cfg.dockerHost
-				de.explicitTarget = true
-			} else {
-				de.host = os.Getenv("DOCKER_HOST")
-			}
-			if cfg.dockerContext != nil {
-				de.context = *cfg.dockerContext
-				de.explicitTarget = true
-			} else {
-				de.context = os.Getenv("DOCKER_CONTEXT")
-			}
-			if cfg.dockerConfigDir != nil {
-				de.configDir = *cfg.dockerConfigDir
-				de.explicitTarget = true
-			} else {
-				de.configDir = os.Getenv("DOCKER_CONFIG")
-			}
-			if cfg.platform != "" {
-				de.defaultPlatform = cfg.platform
-				de.explicitTarget = true
-			} else {
-				de.defaultPlatform = os.Getenv("DOCKER_DEFAULT_PLATFORM")
-			}
-		} else {
-			if cfg.dockerHost != nil {
-				de.host = *cfg.dockerHost
-			}
-			if cfg.dockerContext != nil {
-				de.context = *cfg.dockerContext
-			}
-			if cfg.dockerConfigDir != nil {
-				de.configDir = *cfg.dockerConfigDir
-			}
-			if cfg.platform != "" {
-				de.defaultPlatform = cfg.platform
-			}
+		if cfg.dockerHost != nil {
+			de.host = *cfg.dockerHost
+			de.explicitHost = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerContext != nil {
+			de.context = *cfg.dockerContext
+			de.explicitContext = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerConfigDir != nil {
+			de.configDir = *cfg.dockerConfigDir
+			de.explicitConfigDir = true
+			de.explicitTarget = true
+		}
+		if cfg.platform != "" {
+			de.defaultPlatform = cfg.platform
+			de.explicitDefaultPlatform = true
+			de.explicitTarget = true
 		}
 		cfg.eng = de
 	}
@@ -357,6 +338,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
+	applyEngineRunnerEnv(cfg)
 	// Establish the run budget before env-file security preflight. The
 	// preflight takes the root advisory lock and may otherwise outlive a
 	// canceled caller while another process is holding that lock.

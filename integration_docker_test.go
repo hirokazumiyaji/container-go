@@ -482,7 +482,13 @@ func TestIntegrationDockerPruneKeepsCreatedAndRunning(t *testing.T) {
 	requireDocker(t)
 	ctx := context.Background()
 	if err := container.Pull(ctx, integrationAlpine); err != nil {
-		t.Fatalf("Pull: %v", err)
+		if integrationtest.DockerPullRateLimited(err) {
+			if _, inspectErr := exec.Command("docker", "image", "inspect", integrationAlpine).Output(); inspectErr != nil {
+				t.Skipf("docker pull rate-limited and image not locally available: %v", err)
+			}
+		} else {
+			t.Fatalf("Pull: %v", err)
+		}
 	}
 	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())
 	createdName := "containergo-prune-created-" + suffix

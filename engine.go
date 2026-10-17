@@ -385,7 +385,7 @@ func applePlatformMetadataCompatible(a, b string) bool {
 func isImageID(ref string) bool {
 	const prefix = "sha256:"
 	return strings.HasPrefix(ref, prefix) && len(ref) == len(prefix)+64 &&
-		isHex(strings.TrimPrefix(ref, prefix)) && imageRE.MatchString(ref)
+		domain.IsHex(strings.TrimPrefix(ref, prefix)) && imageRE.MatchString(ref)
 }
 
 // imageReferenceBase returns a repository-bearing base for an image
@@ -425,18 +425,6 @@ func isBareImageReference(ref string) bool {
 	return domain.IsBareImageReference(ref)
 }
 
-func isHex(s string) bool {
-	if s == "" {
-		return false
-	}
-	for _, r := range s {
-		if (r < '0' || r > '9') && (r < 'a' || r > 'f') && (r < 'A' || r > 'F') {
-			return false
-		}
-	}
-	return true
-}
-
 func validImageDigest(digest string) bool {
 	i := strings.IndexByte(digest, ':')
 	if i <= 0 || i == len(digest)-1 {
@@ -455,5 +443,5 @@ func validImageDigest(digest string) bool {
 	default:
 		return false
 	}
-	return len(encoded) == wantLength && isHex(encoded)
+	return len(encoded) == wantLength && domain.IsHex(encoded)
 }

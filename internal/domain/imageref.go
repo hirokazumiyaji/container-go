@@ -75,8 +75,8 @@ func StripImageDigest(ref string) string {
 	return ref
 }
 
-// isHex checks if s contains only hexadecimal characters.
-func isHex(s string) bool {
+// IsHex checks if s contains only hexadecimal characters.
+func IsHex(s string) bool {
 	if s == "" {
 		return false
 	}
@@ -109,7 +109,7 @@ func IsBareImageDigest(ref string) bool {
 // IsBareImageID recognizes the unprefixed 64-hex image-ID spelling.
 func IsBareImageID(ref string) bool {
 	ref = strings.TrimSpace(ref)
-	return len(ref) == 64 && isHex(ref)
+	return len(ref) == 64 && IsHex(ref)
 }
 
 // IsBareImageReference identifies either spelling of an ID-shaped or digest-shaped value without repo.

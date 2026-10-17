@@ -63,3 +63,16 @@ func TestImageRepository(t *testing.T) {
 		}
 	}
 }
+
+func TestIsHex(t *testing.T) {
+	for _, s := range []string{"0", "abcdef", "ABCDEF0123456789"} {
+		if !IsHex(s) {
+			t.Errorf("IsHex(%q) = false, want true", s)
+		}
+	}
+	for _, s := range []string{"", "xyz", "0x12", "123g"} {
+		if IsHex(s) {
+			t.Errorf("IsHex(%q) = true, want false", s)
+		}
+	}
+}

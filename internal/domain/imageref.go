@@ -83,8 +83,10 @@ func StripImageDigest(ref string) string {
 	return ref
 }
 
-// SplitImageTag splits an image reference into base and tag.
+// SplitImageTag splits an image reference into base and tag. Any digest is
+// removed first so the result matches the other repository helpers.
 func SplitImageTag(ref string) (base, tag string) {
+	ref = StripImageDigest(ref)
 	lastSlash := strings.LastIndex(ref, "/")
 	afterSlash := ref
 	if lastSlash >= 0 {

@@ -63,3 +63,23 @@ func TestImageRepository(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitImageTagStripsDigest(t *testing.T) {
+	tests := []struct {
+		input    string
+		wantBase string
+		wantTag  string
+	}{
+		{"redis:7", "redis", "7"},
+		{"alpine@sha256:abc", "alpine", ""},
+		{"alpine:3@sha256:abc", "alpine", "3"},
+		{"registry:5000/team/app:v1", "registry:5000/team/app", "v1"},
+	}
+
+	for _, tt := range tests {
+		base, tag := SplitImageTag(tt.input)
+		if base != tt.wantBase || tag != tt.wantTag {
+			t.Errorf("SplitImageTag(%q) = (%q, %q), want (%q, %q)", tt.input, base, tag, tt.wantBase, tt.wantTag)
+		}
+	}
+}

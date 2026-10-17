@@ -51,7 +51,8 @@ func (p PublishSpec) ConnectAddr() string {
 	return CanonicalIP(p.HostAddr)
 }
 
-// ParsePublishSpec parses a publish specification string "[hostAddr:][hostPort:]containerPort[/proto]".
+// ParsePublishSpec parses a publish specification string
+// "[hostAddr:]hostPort:containerPort[/proto]".
 func ParsePublishSpec(s string) (PublishSpec, error) {
 	spec := PublishSpec{Raw: s, Proto: "tcp"}
 	rest := s

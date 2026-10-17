@@ -1,19 +1,13 @@
 package container
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"maps"
 	"testing"
 )
 
-// allLabels must set each internal label exactly once. A duplicated
-// branch here is invisible to a map-equality assertion, because the
-// second assignment writes the value the first one already wrote - so
-// the runtime tests below pin the resulting label set (they catch a
-// dropped or extra label) and the static check at the bottom is what
-// actually catches a recurrence of the duplication.
+// allLabels must carry every internal label exactly once and keep
+// caller-supplied labels from overriding them. The assignment count is
+// tested in internal/domain, where BuildLabels owns it.
 func TestAllLabelsSetsEachInternalLabelOnce(t *testing.T) {
 	cfg := newConfig()
 	cfg.creation = "abc123"
@@ -81,58 +75,25 @@ func TestAllLabelsInternalLabelsWinOverReserved(t *testing.T) {
 	}
 }
 
-// TestAllLabelsWritesEachLabelOnce parses allLabels and counts the
-// assignments to each reserved label key. Observing the returned map
-// cannot do this: assigning the same key twice in the same block is
-// the same observable result as assigning it once, so the duplicate
-// that prompted this file survived every map-level assertion.
-func TestAllLabelsWritesEachLabelOnce(t *testing.T) {
-	fset := token.NewFileSet()
-	file, err := parser.ParseFile(fset, "options.go", nil, 0)
-	if err != nil {
-		t.Fatalf("parse options.go: %v", err)
+// A forged optional reuse label must not survive when the config did not
+// request reuse: otherwise an ownership check could accept a container
+// that was never created through the reuse path.
+func TestAllLabelsDropsForgedOptionalReservedLabels(t *testing.T) {
+	cfg := newConfig()
+	cfg.labels = map[string]string{
+		managedLabel:    "false",
+		sessionLabel:    "forged",
+		creationLabel:   "forged",
+		reuseLabel:      "true",
+		reuseGroupLabel: "forged",
 	}
 
-	var fn *ast.FuncDecl
-	for _, decl := range file.Decls {
-		f, ok := decl.(*ast.FuncDecl)
-		if ok && f.Name.Name == "allLabels" {
-			fn = f
-			break
-		}
+	got := cfg.allLabels()
+	want := map[string]string{
+		managedLabel: "true",
+		sessionLabel: sessionID(),
 	}
-	if fn == nil {
-		t.Fatal("allLabels not found in options.go")
-	}
-
-	writes := map[string]int{}
-	ast.Inspect(fn.Body, func(n ast.Node) bool {
-		as, ok := n.(*ast.AssignStmt)
-		if !ok {
-			return true
-		}
-		for _, lhs := range as.Lhs {
-			idx, ok := lhs.(*ast.IndexExpr)
-			if !ok {
-				continue
-			}
-			key, ok := idx.Index.(*ast.Ident)
-			if !ok {
-				continue
-			}
-			// The source identifier is the constant's Go name, not
-			// the label string it holds.
-			switch key.Name {
-			case "managedLabel", "sessionLabel", "creationLabel", "reuseLabel", "reuseGroupLabel":
-				writes[key.Name]++
-			}
-		}
-		return true
-	})
-
-	for _, name := range []string{"managedLabel", "sessionLabel", "creationLabel", "reuseLabel", "reuseGroupLabel"} {
-		if writes[name] != 1 {
-			t.Errorf("allLabels assigns %s %d times, want exactly 1", name, writes[name])
-		}
+	if !maps.Equal(got, want) {
+		t.Errorf("allLabels() = %v, want %v", got, want)
 	}
 }

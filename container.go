@@ -23,11 +23,11 @@ import (
 )
 
 const (
-	managedLabel    = "com.github.hirokazumiyaji.container-go"
-	sessionLabel    = "com.github.hirokazumiyaji.container-go.session"
-	reuseLabel      = "com.github.hirokazumiyaji.container-go.reuse"
-	reuseGroupLabel = "com.github.hirokazumiyaji.container-go.reuse-group"
-	creationLabel   = "com.github.hirokazumiyaji.container-go.creation"
+	managedLabel    = domain.LabelManaged
+	sessionLabel    = domain.LabelSession
+	reuseLabel      = domain.LabelReuse
+	reuseGroupLabel = domain.LabelReuseGroup
+	creationLabel   = domain.LabelCreation
 
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.

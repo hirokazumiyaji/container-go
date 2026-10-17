@@ -118,22 +118,13 @@ func (c *config) validate() error {
 // user-supplied ones. Internal labels always win so callers cannot
 // override the generation used for safe cleanup.
 func (c *config) allLabels() map[string]string {
-	labels := map[string]string{}
-	for k, v := range c.labels {
-		labels[k] = v
-	}
-	labels[managedLabel] = "true"
-	labels[sessionLabel] = sessionID()
-	if c.creation != "" {
-		labels[creationLabel] = c.creation
-	}
-	if c.reuse {
-		labels[reuseLabel] = "true"
-	}
-	if c.reuseGroup != "" {
-		labels[reuseGroupLabel] = c.reuseGroup
-	}
-	return labels
+	return domain.BuildLabels(domain.LabelConfig{
+		Session:    sessionID(),
+		Creation:   c.creation,
+		Reuse:      c.reuse,
+		ReuseGroup: c.reuseGroup,
+		Custom:     c.labels,
+	})
 }
 
 // commonRunArgs builds the shared run flags after --name: labels,

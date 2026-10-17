@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestFreshReviewAppleReaperHoldsNameLockAcrossReplacement(t *testing.T) {
+func TestAppleReaperHoldsNameLockAcrossReplacement(t *testing.T) {
 	dir := t.TempDir()
 	tmpDir := filepath.Join(dir, "tmp with spaces")
 	if err := os.Mkdir(tmpDir, 0o700); err != nil {

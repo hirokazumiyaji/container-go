@@ -165,11 +165,11 @@ func TestExecReturnsStructuredPermissionAndConfigFailures(t *testing.T) {
 	}
 }
 
-type issue104CanceledExecRunner struct {
+type canceledExecRunner struct {
 	*execRunner
 }
 
-func (r *issue104CanceledExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *canceledExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		return []byte("partial output"), []byte("process killed"), errors.Join(
 			&cli.CLIError{Args: args, ExitCode: -1, Stderr: "process killed"},
@@ -180,7 +180,7 @@ func (r *issue104CanceledExecRunner) Run(ctx context.Context, args ...string) ([
 }
 
 func TestExecReturnsCancellationWhenCLIExitIsSignal(t *testing.T) {
-	f := &issue104CanceledExecRunner{execRunner: &execRunner{fakeRunner: newTestRunner()}}
+	f := &canceledExecRunner{execRunner: &execRunner{fakeRunner: newTestRunner()}}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"sleep"})
@@ -718,7 +718,6 @@ func TestExecCancellationDuringInspectOverridesConfirmedNotFound(t *testing.T) {
 	}
 }
 
-
 func TestExecSuccessAddsNoProbe(t *testing.T) {
 	inner := &execRunner{fakeRunner: newTestRunner(), execStdout: "ok\n"}
 	r := newCountingRunner(inner)
@@ -777,13 +776,13 @@ func TestExecRejectsEmptyCommand(t *testing.T) {
 	}
 }
 
-type issue116BlockingExecRunner struct {
+type blockingExecRunner struct {
 	*fakeRunner
 	started chan struct{}
 	release chan struct{}
 }
 
-func (r *issue116BlockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *blockingExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) == 0 || args[0] != "exec" {
 		return r.fakeRunner.Run(ctx, args...)
 	}
@@ -796,13 +795,13 @@ func (r *issue116BlockingExecRunner) Run(ctx context.Context, args ...string) ([
 	}
 }
 
-type issue116DeadlineExecRunner struct {
+type deadlineExecRunner struct {
 	*fakeRunner
 	deadline time.Time
 	has      bool
 }
 
-func (r *issue116DeadlineExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *deadlineExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		r.deadline, r.has = ctx.Deadline()
 		return []byte("ok"), nil, nil
@@ -810,13 +809,13 @@ func (r *issue116DeadlineExecRunner) Run(ctx context.Context, args ...string) ([
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-type issue116ExecResult struct {
+type execResult struct {
 	code int
 	out  io.Reader
 	err  error
 }
 
-func waitForIssue116ExecStart(t *testing.T, started <-chan struct{}) {
+func waitForExecStart(t *testing.T, started <-chan struct{}) {
 	t.Helper()
 	select {
 	case <-started:
@@ -825,14 +824,14 @@ func waitForIssue116ExecStart(t *testing.T, started <-chan struct{}) {
 	}
 }
 
-func waitForIssue116ExecResult(t *testing.T, result <-chan issue116ExecResult) issue116ExecResult {
+func waitForExecResult(t *testing.T, result <-chan execResult) execResult {
 	t.Helper()
 	select {
 	case got := <-result:
 		return got
 	case <-time.After(time.Second):
 		t.Fatal("Exec did not return")
-		return issue116ExecResult{}
+		return execResult{}
 	}
 }
 
@@ -848,7 +847,7 @@ func assertExecTerminationError(t *testing.T, err error) {
 }
 
 func TestExecAddsDefaultDeadline(t *testing.T) {
-	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	f := &deadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}); err != nil {
@@ -864,7 +863,7 @@ func TestExecAddsDefaultDeadline(t *testing.T) {
 }
 
 func TestExecCustomTimeoutUsesEarlierCallerDeadline(t *testing.T) {
-	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	f := &deadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 	callerDeadline := time.Now().Add(2 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
@@ -879,7 +878,7 @@ func TestExecCustomTimeoutUsesEarlierCallerDeadline(t *testing.T) {
 }
 
 func TestExecCustomTimeoutBoundsLaterCallerDeadline(t *testing.T) {
-	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	f := &deadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 	callerDeadline := time.Now().Add(2 * time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
@@ -899,19 +898,19 @@ func TestExecDefaultTimeoutStopsBlockingBackend(t *testing.T) {
 	defaultExecTimeout = 20 * time.Millisecond
 	defer func() { defaultExecTimeout = original }()
 
-	f := &issue116BlockingExecRunner{
+	f := &blockingExecRunner{
 		fakeRunner: newTestRunner(),
 		started:    make(chan struct{}),
 		release:    make(chan struct{}),
 	}
 	ctr := runTestContainer(t, f)
-	result := make(chan issue116ExecResult, 1)
+	result := make(chan execResult, 1)
 	go func() {
 		code, out, err := ctr.Exec(context.Background(), []string{"true"})
-		result <- issue116ExecResult{code: code, out: out, err: err}
+		result <- execResult{code: code, out: out, err: err}
 	}()
-	waitForIssue116ExecStart(t, f.started)
-	got := waitForIssue116ExecResult(t, result)
+	waitForExecStart(t, f.started)
+	got := waitForExecResult(t, result)
 	if !errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
 	}
@@ -926,7 +925,7 @@ func TestExecDefaultTimeoutStopsBlockingBackend(t *testing.T) {
 }
 
 func TestExecCancellationPreservesPartialOutput(t *testing.T) {
-	f := &issue116BlockingExecRunner{
+	f := &blockingExecRunner{
 		fakeRunner: newTestRunner(),
 		started:    make(chan struct{}),
 		release:    make(chan struct{}),
@@ -936,15 +935,15 @@ func TestExecCancellationPreservesPartialOutput(t *testing.T) {
 	defer cancel()
 	defer close(f.release)
 
-	result := make(chan issue116ExecResult, 1)
+	result := make(chan execResult, 1)
 	go func() {
 		code, out, err := ctr.Exec(ctx, []string{"true"})
-		result <- issue116ExecResult{code: code, out: out, err: err}
+		result <- execResult{code: code, out: out, err: err}
 	}()
-	waitForIssue116ExecStart(t, f.started)
+	waitForExecStart(t, f.started)
 	cancel()
 
-	got := waitForIssue116ExecResult(t, result)
+	got := waitForExecResult(t, result)
 	if !errors.Is(got.err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", got.err)
 	}
@@ -962,20 +961,20 @@ func TestExecCancellationPreservesPartialOutput(t *testing.T) {
 }
 
 func TestExecTimeoutPreservesPartialOutput(t *testing.T) {
-	f := &issue116BlockingExecRunner{
+	f := &blockingExecRunner{
 		fakeRunner: newTestRunner(),
 		started:    make(chan struct{}),
 		release:    make(chan struct{}),
 	}
 	ctr := runTestContainer(t, f)
 
-	result := make(chan issue116ExecResult, 1)
+	result := make(chan execResult, 1)
 	go func() {
 		code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
-		result <- issue116ExecResult{code: code, out: out, err: err}
+		result <- execResult{code: code, out: out, err: err}
 	}()
-	waitForIssue116ExecStart(t, f.started)
-	got := waitForIssue116ExecResult(t, result)
+	waitForExecStart(t, f.started)
+	got := waitForExecResult(t, result)
 	if !errors.Is(got.err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want context.DeadlineExceeded", got.err)
 	}
@@ -1010,12 +1009,12 @@ func TestExecInfrastructureErrorPreservesOutput(t *testing.T) {
 	}
 }
 
-type issue116InfraRunner struct {
+type infraRunner struct {
 	*fakeRunner
 	execCalled bool
 }
 
-func (r *issue116InfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *infraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		r.execCalled = true
 		return []byte("partial stdout"), []byte("partial stderr"), &cli.CLIError{
@@ -1031,7 +1030,7 @@ func (r *issue116InfraRunner) Run(ctx context.Context, args ...string) ([]byte, 
 }
 
 func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
-	f := &issue116InfraRunner{fakeRunner: newTestRunner()}
+	f := &infraRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"true"})
@@ -1051,12 +1050,12 @@ func TestExecClassifiedInfrastructureErrorPreservesCodeAndOutput(t *testing.T) {
 	}
 }
 
-type issue116InspectDeadlineRunner struct {
+type inspectDeadlineRunner struct {
 	*fakeRunner
 	execCalled bool
 }
 
-func (r *issue116InspectDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *inspectDeadlineRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		r.execCalled = true
 		return []byte("command output"), []byte("daemon unavailable"), &cli.CLIError{Args: args, ExitCode: 125, Stderr: "daemon unavailable"}
@@ -1069,7 +1068,7 @@ func (r *issue116InspectDeadlineRunner) Run(ctx context.Context, args ...string)
 }
 
 func TestExecInspectDeadlineDoesNotClaimRemoteTermination(t *testing.T) {
-	f := &issue116InspectDeadlineRunner{fakeRunner: newTestRunner()}
+	f := &inspectDeadlineRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
@@ -1088,11 +1087,11 @@ func TestExecInspectDeadlineDoesNotClaimRemoteTermination(t *testing.T) {
 	}
 }
 
-type issue116ConcurrentExitRunner struct {
+type concurrentExitRunner struct {
 	*fakeRunner
 }
 
-func (r *issue116ConcurrentExitRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *concurrentExitRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		<-ctx.Done()
 		return []byte("exit stdout"), []byte("exit stderr"), errors.Join(
@@ -1104,7 +1103,7 @@ func (r *issue116ConcurrentExitRunner) Run(ctx context.Context, args ...string) 
 }
 
 func TestExecContextTerminationPreservesExitStatus(t *testing.T) {
-	f := &issue116ConcurrentExitRunner{fakeRunner: newTestRunner()}
+	f := &concurrentExitRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"false"}, WithExecTimeout(20*time.Millisecond))
@@ -1123,13 +1122,13 @@ func TestExecContextTerminationPreservesExitStatus(t *testing.T) {
 
 // Windows Process.Kill terminates the local CLI with exit code 1 rather
 // than the negative status used for a Unix signal.
-type issue116WindowsKillExecRunner struct {
+type windowsKillExecRunner struct {
 	*fakeRunner
 	stderr     string
 	execCalled bool
 }
 
-func (r *issue116WindowsKillExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *windowsKillExecRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		r.execCalled = true
 		<-ctx.Done()
@@ -1141,37 +1140,37 @@ func (r *issue116WindowsKillExecRunner) Run(ctx context.Context, args ...string)
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-type issue116WindowsKillInfraRunner struct {
-	*issue116WindowsKillExecRunner
+type windowsKillInfraRunner struct {
+	*windowsKillExecRunner
 }
 
-func (r *issue116WindowsKillInfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *windowsKillInfraRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if r.execCalled && len(args) > 0 && args[0] == "inspect" {
 		return nil, nil, errors.New("inspect failed")
 	}
-	return r.issue116WindowsKillExecRunner.Run(ctx, args...)
+	return r.windowsKillExecRunner.Run(ctx, args...)
 }
 
 func TestExecWindowsKillExitCodeStillReturnsTerminationError(t *testing.T) {
-	f := &issue116WindowsKillExecRunner{fakeRunner: newTestRunner()}
+	f := &windowsKillExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
-	assertIssue116WindowsKillResult(t, issue116ExecResult{code: code, out: out, err: err})
+	assertWindowsKillResult(t, execResult{code: code, out: out, err: err})
 }
 
 func TestExecWindowsKillInfrastructureStatusStillReturnsTerminationError(t *testing.T) {
-	f := &issue116WindowsKillInfraRunner{issue116WindowsKillExecRunner: &issue116WindowsKillExecRunner{
+	f := &windowsKillInfraRunner{windowsKillExecRunner: &windowsKillExecRunner{
 		fakeRunner: newTestRunner(),
 		stderr:     "daemon unavailable",
 	}}
 	ctr := runTestContainer(t, f)
 
 	code, out, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(20*time.Millisecond))
-	assertIssue116WindowsKillResult(t, issue116ExecResult{code: code, out: out, err: err})
+	assertWindowsKillResult(t, execResult{code: code, out: out, err: err})
 }
 
-func assertIssue116WindowsKillResult(t *testing.T, got issue116ExecResult) {
+func assertWindowsKillResult(t *testing.T, got execResult) {
 	t.Helper()
 	if got.code != 1 || got.out == nil {
 		t.Fatalf("code/output = %d/%v, want code 1 and output", got.code, got.out)
@@ -1194,7 +1193,7 @@ func assertIssue116WindowsKillResult(t *testing.T, got issue116ExecResult) {
 }
 
 func TestExecZeroTimeoutDisablesDefaultDeadline(t *testing.T) {
-	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	f := &deadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 
 	if _, _, err := ctr.Exec(context.Background(), []string{"true"}, WithExecTimeout(0)); err != nil {
@@ -1206,7 +1205,7 @@ func TestExecZeroTimeoutDisablesDefaultDeadline(t *testing.T) {
 }
 
 func TestExecZeroTimeoutKeepsCallerDeadline(t *testing.T) {
-	f := &issue116DeadlineExecRunner{fakeRunner: newTestRunner()}
+	f := &deadlineExecRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 	callerDeadline := time.Now().Add(time.Second)
 	ctx, cancel := context.WithDeadline(context.Background(), callerDeadline)
@@ -1220,12 +1219,12 @@ func TestExecZeroTimeoutKeepsCallerDeadline(t *testing.T) {
 	}
 }
 
-type issue116PreCanceledRunner struct {
+type preCanceledRunner struct {
 	*fakeRunner
 	execCalls int
 }
 
-func (r *issue116PreCanceledRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *preCanceledRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		r.execCalls++
 		return []byte("unexpected"), nil, &cli.CLIError{Args: args, ExitCode: 7, Stderr: "unexpected"}
@@ -1234,7 +1233,7 @@ func (r *issue116PreCanceledRunner) Run(ctx context.Context, args ...string) ([]
 }
 
 func TestExecPreCanceledContextDoesNotLaunchCLI(t *testing.T) {
-	f := &issue116PreCanceledRunner{fakeRunner: newTestRunner()}
+	f := &preCanceledRunner{fakeRunner: newTestRunner()}
 	ctr := runTestContainer(t, f)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -1254,12 +1253,12 @@ func TestExecPreCanceledContextDoesNotLaunchCLI(t *testing.T) {
 	}
 }
 
-type issue116PlainCLIErrorRaceRunner struct {
+type plainCLIErrorRaceRunner struct {
 	*fakeRunner
 	started chan struct{}
 }
 
-func (r *issue116PlainCLIErrorRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *plainCLIErrorRaceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		close(r.started)
 		<-ctx.Done()
@@ -1271,17 +1270,17 @@ func (r *issue116PlainCLIErrorRaceRunner) Run(ctx context.Context, args ...strin
 }
 
 func TestExecNormalizesPlainCLIErrorCancellationRace(t *testing.T) {
-	f := &issue116PlainCLIErrorRaceRunner{fakeRunner: newTestRunner(), started: make(chan struct{})}
+	f := &plainCLIErrorRaceRunner{fakeRunner: newTestRunner(), started: make(chan struct{})}
 	ctr := runTestContainer(t, f)
 	ctx, cancel := context.WithCancel(context.Background())
-	result := make(chan issue116ExecResult, 1)
+	result := make(chan execResult, 1)
 	go func() {
 		code, out, err := ctr.Exec(ctx, []string{"true"})
-		result <- issue116ExecResult{code: code, out: out, err: err}
+		result <- execResult{code: code, out: out, err: err}
 	}()
-	waitForIssue116ExecStart(t, f.started)
+	waitForExecStart(t, f.started)
 	cancel()
-	got := waitForIssue116ExecResult(t, result)
+	got := waitForExecResult(t, result)
 
 	if got.code != 7 || got.out == nil {
 		t.Fatalf("code/output = %d/%v, want status 7 and output", got.code, got.out)
@@ -1296,11 +1295,11 @@ func TestExecNormalizesPlainCLIErrorCancellationRace(t *testing.T) {
 	assertExecTerminationError(t, got.err)
 }
 
-type issue116TimeoutError struct{}
+type testTimeoutError struct{}
 
-func (issue116TimeoutError) Error() string   { return "structured operation timeout" }
-func (issue116TimeoutError) Timeout() bool   { return true }
-func (issue116TimeoutError) Temporary() bool { return true }
+func (testTimeoutError) Error() string   { return "structured operation timeout" }
+func (testTimeoutError) Timeout() bool   { return true }
+func (testTimeoutError) Temporary() bool { return true }
 
 func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 	cases := []struct {
@@ -1310,7 +1309,7 @@ func TestExecRecognizesTimeoutAndSignalBeforeApplicationResult(t *testing.T) {
 	}{
 		{
 			name: "structured timeout",
-			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout"}, issue116TimeoutError{}),
+			err:  errors.Join(&cli.CLIError{Args: []string{"exec"}, ExitCode: 7, Stderr: "client: i/o timeout"}, testTimeoutError{}),
 			code: 7,
 		},
 		{

@@ -30,7 +30,7 @@ func (r *freshMetadataRunner) Run(_ context.Context, args ...string) ([]byte, []
 	return []byte(`[{"id":"meta","configuration":{"id":"meta","image":{"reference":"redis:7-alpine"},"labels":{"` + creationLabel + `":"0123456789abcdef"}},"status":{"state":"running","networks":[{"ipv4Address":"192.0.2.10/24","network":"default"}]}}]`), nil, nil
 }
 
-func TestFreshReviewRefreshesIncompleteEndpointMetadata(t *testing.T) {
+func TestRefreshesIncompleteEndpointMetadata(t *testing.T) {
 	runner := &freshMetadataRunner{}
 	ctr := &Container{id: "meta", creation: "0123456789abcdef", runner: runner, eng: appleEngine{}, exposed: []portSpec{{port: 6379, proto: "tcp"}}}
 	if _, err := ctr.ContainerIP(context.Background()); err == nil {
@@ -69,7 +69,7 @@ func (r *freshDockerPortRunner) Run(_ context.Context, args ...string) ([]byte, 
 	return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"running"},"HostConfig":{"NetworkMode":"bridge"},"Config":{"Labels":{}},"NetworkSettings":{"Networks":{"bridge":{}},"Ports":{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}}}]`, id)), nil, nil
 }
 
-func TestFreshReviewRefreshesIncompletePublishedPortMetadata(t *testing.T) {
+func TestRefreshesIncompletePublishedPortMetadata(t *testing.T) {
 	runner := &freshDockerPortRunner{}
 	ctr := &Container{
 		id:      strings.Repeat("b", 64),
@@ -109,7 +109,7 @@ func (r *freshDockerPruneRunner) Run(_ context.Context, args ...string) ([]byte,
 	}
 }
 
-func TestFreshReviewDockerPruneDoesNotForceDeleteRunningCandidate(t *testing.T) {
+func TestDockerPruneDoesNotForceDeleteRunningCandidate(t *testing.T) {
 	runner := &freshDockerPruneRunner{}
 	removed, err := pruneWith(context.Background(), runner, dockerEngine{})
 	if err != nil {
@@ -142,7 +142,7 @@ func (r *freshDockerGroupRunner) Run(_ context.Context, args ...string) ([]byte,
 	}
 }
 
-func TestFreshReviewDockerPruneReuseGroupAllowsRunningMember(t *testing.T) {
+func TestDockerPruneReuseGroupAllowsRunningMember(t *testing.T) {
 	uid := strings.Repeat("c", 64)
 	runner := &freshDockerGroupRunner{uid: uid}
 	removed, err := pruneReuseGroupWith(context.Background(), runner, dockerEngine{}, "integration")
@@ -186,7 +186,7 @@ func (r *freshReuseAttachRunner) Run(_ context.Context, args ...string) ([]byte,
 	}
 }
 
-func TestFreshReviewReuseAttachRetriesTransientInspectError(t *testing.T) {
+func TestReuseAttachRetriesTransientInspectError(t *testing.T) {
 	oldTimeout, oldPoll := reuseAttachTimeout, reusePollInterval
 	reuseAttachTimeout = 300 * time.Millisecond
 	reusePollInterval = time.Millisecond

@@ -10,7 +10,7 @@ import (
 	"time"
 )
 
-type review91IdentitySwitchRunner struct {
+type identitySwitchRunner struct {
 	*fakeRunner
 	mu          sync.Mutex
 	inspects    int
@@ -19,13 +19,13 @@ type review91IdentitySwitchRunner struct {
 }
 
 const (
-	review91UIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	review91UIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	review91GenA = "0123456789abcdef"
-	review91GenB = "fedcba9876543210"
+	reuseTestUIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	reuseTestUIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	reuseTestGenA = "0123456789abcdef"
+	reuseTestGenB = "fedcba9876543210"
 )
 
-func (r *review91IdentitySwitchRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *identitySwitchRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] != "inspect" {
 		return r.fakeRunner.Run(ctx, args...)
 	}
@@ -38,17 +38,17 @@ func (r *review91IdentitySwitchRunner) Run(ctx context.Context, args ...string) 
 	switch inspect {
 	case 1:
 		close(r.first)
-		created := strings.Replace(review91ReuseInspectJSON(review91UIDA, review91GenA, false), `"Status":"running"`, `"Status":"created"`, 1)
+		created := strings.Replace(reuseTestInspectJSON(reuseTestUIDA, reuseTestGenA, false), `"Status":"running"`, `"Status":"created"`, 1)
 		return []byte(created), nil, nil
 	case 2:
 		<-r.releaseBase
-		return []byte(review91ReuseInspectJSON(review91UIDA, review91GenA, false)), nil, nil
+		return []byte(reuseTestInspectJSON(reuseTestUIDA, reuseTestGenA, false)), nil, nil
 	default:
-		return []byte(review91ReuseInspectJSON(review91UIDB, review91GenB, true)), nil, nil
+		return []byte(reuseTestInspectJSON(reuseTestUIDB, reuseTestGenB, true)), nil, nil
 	}
 }
 
-func review91ReuseInspectJSON(uid, generation string, bound bool) string {
+func reuseTestInspectJSON(uid, generation string, bound bool) string {
 	ports := `{}`
 	if bound {
 		ports = `{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}`
@@ -67,7 +67,7 @@ func review91ReuseInspectJSON(uid, generation string, bound bool) string {
 	}]`, uid, generation, ports)
 }
 
-func TestReview91ReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
+func TestReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 	oldPoll, oldTimeout := reusePollInterval, reuseAttachTimeout
 	reusePollInterval = time.Millisecond
 	reuseAttachTimeout = time.Second
@@ -75,7 +75,7 @@ func TestReview91ReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 		reusePollInterval, reuseAttachTimeout = oldPoll, oldTimeout
 	})
 
-	runner := &review91IdentitySwitchRunner{
+	runner := &identitySwitchRunner{
 		fakeRunner:  newTestRunner(),
 		first:       make(chan struct{}),
 		releaseBase: make(chan struct{}),
@@ -121,39 +121,39 @@ func TestReview91ReuseCallerRefreshRejectsReplacedIdentity(t *testing.T) {
 	}
 }
 
-type review91SingleInspectRunner struct {
+type singleInspectRunner struct {
 	data string
 	err  error
 }
 
-func (r review91SingleInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r singleInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		return []byte(r.data), nil, r.err
 	}
 	return nil, nil, nil
 }
 
-func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
+func TestReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 	cases := map[string]struct {
 		creation string
 		uid      string
 	}{
-		"generation": {creation: review91GenB, uid: review91UIDA},
-		"uid":        {creation: review91GenA, uid: review91UIDB},
+		"generation": {creation: reuseTestGenB, uid: reuseTestUIDA},
+		"uid":        {creation: reuseTestGenA, uid: reuseTestUIDB},
 	}
 	for name, replacement := range cases {
 		t.Run(name, func(t *testing.T) {
 			initial := &engineInfo{
 				state:  StateCreated,
-				labels: map[string]string{creationLabel: review91GenA},
-				uid:    review91UIDA,
+				labels: map[string]string{creationLabel: reuseTestGenA},
+				uid:    reuseTestUIDA,
 			}
 			base := &Container{
-				creation: review91GenA,
-				sync: &lockPack{uid: review91UIDA, info: initial},
+				creation: reuseTestGenA,
+				sync:     &lockPack{uid: reuseTestUIDA, info: initial},
 			}
 			cfg := &config{
-				runner: review91SingleInspectRunner{data: review91ReuseInspectJSON(replacement.uid, replacement.creation, false)},
+				runner: singleInspectRunner{data: reuseTestInspectJSON(replacement.uid, replacement.creation, false)},
 				eng:    dockerEngine{},
 				name:   "shared",
 			}
@@ -168,9 +168,9 @@ func TestReview91ReuseRefreshVerifiesGenerationAndUID(t *testing.T) {
 	}
 }
 
-type review91CreatedRunner struct{}
+type createdRunner struct{}
 
-func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (createdRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
 		return []byte(`[{"Id":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","RepoDigests":["docker.io/library/redis@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"]}]`), nil, nil
 	}
@@ -186,12 +186,12 @@ func (review91CreatedRunner) Run(_ context.Context, args ...string) ([]byte, []b
 			}},
 			"State":{"Status":"created"},
 			"NetworkSettings":{}
-		}]`, review91UIDA, review91GenA)), nil, nil
+		}]`, reuseTestUIDA, reuseTestGenA)), nil, nil
 	}
 	return nil, nil, nil
 }
 
-func TestReview91ReuseEnsureTimeoutPreservesDeadlineExceeded(t *testing.T) {
+func TestReuseEnsureTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	oldPoll, oldTimeout := reusePollInterval, reuseAttachTimeout
 	reusePollInterval = time.Millisecond
 	reuseAttachTimeout = 100 * time.Millisecond
@@ -202,7 +202,7 @@ func TestReview91ReuseEnsureTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	_, err := reuseEnsureContainer(ctx, "redis:7-alpine", &config{
-		runner: review91CreatedRunner{},
+		runner: createdRunner{},
 		eng:    dockerEngine{},
 		name:   "shared",
 	})
@@ -211,7 +211,7 @@ func TestReview91ReuseEnsureTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	}
 }
 
-type review91RefreshTimeoutRunner struct {
+type refreshTimeoutRunner struct {
 	*fakeRunner
 	mu          sync.Mutex
 	inspects    int
@@ -219,7 +219,7 @@ type review91RefreshTimeoutRunner struct {
 	releaseBase chan struct{}
 }
 
-func (r *review91RefreshTimeoutRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *refreshTimeoutRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] != "inspect" {
 		return r.fakeRunner.Run(ctx, args...)
 	}
@@ -230,17 +230,17 @@ func (r *review91RefreshTimeoutRunner) Run(ctx context.Context, args ...string) 
 	switch inspect {
 	case 1:
 		close(r.first)
-		created := strings.Replace(review91ReuseInspectJSON(review91UIDA, review91GenA, false), `"Status":"running"`, `"Status":"created"`, 1)
+		created := strings.Replace(reuseTestInspectJSON(reuseTestUIDA, reuseTestGenA, false), `"Status":"running"`, `"Status":"created"`, 1)
 		return []byte(created), nil, nil
 	case 2:
 		<-r.releaseBase
-		return []byte(review91ReuseInspectJSON(review91UIDA, review91GenA, false)), nil, nil
+		return []byte(reuseTestInspectJSON(reuseTestUIDA, reuseTestGenA, false)), nil, nil
 	default:
 		return nil, nil, errors.New("temporary refreshed inspect failure")
 	}
 }
 
-func TestReview91ReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T) {
+func TestReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T) {
 	oldPoll, oldTimeout := reusePollInterval, reuseAttachTimeout
 	reusePollInterval = time.Millisecond
 	reuseAttachTimeout = 100 * time.Millisecond
@@ -248,7 +248,7 @@ func TestReview91ReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T
 		reusePollInterval, reuseAttachTimeout = oldPoll, oldTimeout
 	})
 
-	runner := &review91RefreshTimeoutRunner{
+	runner := &refreshTimeoutRunner{
 		fakeRunner:  newTestRunner(),
 		first:       make(chan struct{}),
 		releaseBase: make(chan struct{}),
@@ -293,19 +293,19 @@ func TestReview91ReuseCallerRefreshTimeoutPreservesDeadlineExceeded(t *testing.T
 	}
 }
 
-type review91LazyUIDRunner struct {
+type lazyUIDRunner struct {
 	inspectDelay time.Duration
 	mu           sync.Mutex
 	deleted      []string
 }
 
-func (r *review91LazyUIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *lazyUIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
 		// Keep inspect in flight while concurrent Terminate calls read the
 		// lazy immutable-ID field.
 		time.Sleep(r.inspectDelay)
-		return []byte(review91OwnedDockerInspect(review91UIDA, review91GenA, false, false)), nil, nil
+		return []byte(ownedDockerInspect(reuseTestUIDA, reuseTestGenA, false, false)), nil, nil
 	case "rm":
 		r.mu.Lock()
 		r.deleted = append(r.deleted, args[len(args)-1])
@@ -316,14 +316,14 @@ func (r *review91LazyUIDRunner) Run(_ context.Context, args ...string) ([]byte, 
 	}
 }
 
-func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
-	runner := &review91LazyUIDRunner{inspectDelay: 50 * time.Millisecond}
+func TestLazyUIDCacheConcurrentWithTerminate(t *testing.T) {
+	runner := &lazyUIDRunner{inspectDelay: 50 * time.Millisecond}
 	ctr := &Container{
 		id:       "shared",
 		runner:   runner,
 		eng:      dockerEngine{},
-		creation: review91GenA,
-		sync: &lockPack{uid: review91UIDA},
+		creation: reuseTestGenA,
+		sync:     &lockPack{uid: reuseTestUIDA},
 	}
 
 	start := make(chan struct{})
@@ -359,13 +359,13 @@ func TestReview91LazyUIDCacheConcurrentWithTerminate(t *testing.T) {
 		t.Fatalf("delete calls = %d, want %d", len(deleted), terminators)
 	}
 	for _, target := range deleted {
-		if target != review91UIDA {
+		if target != reuseTestUIDA {
 			t.Fatalf("deleted target = %q, want immutable UID", target)
 		}
 	}
 }
 
-func TestReview91ReuseContextErrorWrapsDeadline(t *testing.T) {
+func TestReuseContextErrorWrapsDeadline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 	err := reuseContextError(ctx, "shared")

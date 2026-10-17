@@ -8,7 +8,7 @@ import (
 	"testing"
 )
 
-func issue115FreshVariant(platform, digest string) map[string]any {
+func freshVariant(platform, digest string) map[string]any {
 	parts := strings.Split(platform, "/")
 	metadata := map[string]any{
 		"os":           parts[0],
@@ -23,7 +23,7 @@ func issue115FreshVariant(platform, digest string) map[string]any {
 	}
 }
 
-func issue115FreshHostPlatform() string {
+func freshHostPlatform() string {
 	arch := runtime.GOARCH
 	switch arch {
 	case "aarch64":
@@ -34,8 +34,8 @@ func issue115FreshHostPlatform() string {
 	return "linux/" + arch
 }
 
-func issue115FreshPlatformMap() map[string]string {
-	parts := strings.Split(issue115FreshHostPlatform(), "/")
+func freshPlatformMap() map[string]string {
+	parts := strings.Split(freshHostPlatform(), "/")
 	platform := map[string]string{"os": parts[0], "architecture": parts[1]}
 	if len(parts) == 3 {
 		platform["variant"] = parts[2]
@@ -43,13 +43,13 @@ func issue115FreshPlatformMap() map[string]string {
 	return platform
 }
 
-func issue115FreshAppleImageJSON(root, variant string) []byte {
-	return issue115ReviewAppleImageJSONForRoot(root, []map[string]any{
-		issue115FreshVariant(issue115FreshHostPlatform(), variant),
+func freshAppleImageJSON(root, variant string) []byte {
+	return platformPinningAppleImageJSONForRoot(root, []map[string]any{
+		freshVariant(freshHostPlatform(), variant),
 	})
 }
 
-func issue115FreshOtherPlatform(host string) string {
+func freshOtherPlatform(host string) string {
 	platform, ok := parseApplePlatformSelector(host)
 	if ok && platform.architecture == "arm64" {
 		return "linux/amd64"
@@ -57,12 +57,12 @@ func issue115FreshOtherPlatform(host string) string {
 	return "linux/arm64/v8"
 }
 
-func TestIssue115AppleBareArmelPlatformIsCanonicalizedForRun(t *testing.T) {
+func TestAppleBareArmelPlatformIsCanonicalizedForRun(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "")
-	image := issue115ReviewAppleImageJSON([]map[string]any{
-		issue115FreshVariant("linux/armel/v6", issue115ReviewVariant),
+	image := platformPinningAppleImageJSON([]map[string]any{
+		freshVariant("linux/armel/v6", platformPinningVariant),
 	})
-	runner := &issue115ReviewRunner{inspectJSON: image}
+	runner := &platformPinningRunner{inspectJSON: image}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullAlways), WithPlatform("linux/armel"),
 		withRunner(runner), withEngine(appleEngine{}))
@@ -74,18 +74,18 @@ func TestIssue115AppleBareArmelPlatformIsCanonicalizedForRun(t *testing.T) {
 	}
 	for _, call := range runner.calls {
 		if len(call) > 0 && (call[0] == "run" || (len(call) > 1 && call[0] == "image" && call[1] == "pull")) &&
-			!issue115ReviewCallHasPlatform(call, "linux/armel/v6") {
+			!callHasPlatform(call, "linux/armel/v6") {
 			t.Errorf("bare armel selector was not canonicalized: %v", call)
 		}
 	}
 }
 
-func TestIssue115AppleDefaultArmelPlatformIsCanonicalizedForPull(t *testing.T) {
+func TestAppleDefaultArmelPlatformIsCanonicalizedForPull(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/armel")
-	image := issue115ReviewAppleImageJSON([]map[string]any{
-		issue115FreshVariant("linux/armel/v6", issue115ReviewVariant),
+	image := platformPinningAppleImageJSON([]map[string]any{
+		freshVariant("linux/armel/v6", platformPinningVariant),
 	})
-	runner := &issue115ReviewRunner{inspectJSON: image}
+	runner := &platformPinningRunner{inspectJSON: image}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullAlways),
 		withRunner(runner), withEngine(appleEngine{}))
@@ -97,35 +97,35 @@ func TestIssue115AppleDefaultArmelPlatformIsCanonicalizedForPull(t *testing.T) {
 	}
 	for _, call := range runner.calls {
 		if len(call) > 0 && (call[0] == "run" || (len(call) > 1 && call[0] == "image" && call[1] == "pull")) &&
-			!issue115ReviewCallHasPlatform(call, "linux/armel/v6") {
+			!callHasPlatform(call, "linux/armel/v6") {
 			t.Errorf("default armel selector was not canonicalized: %v", call)
 		}
 	}
 }
 
-func TestIssue115PullCanonicalizesDefaultArmelPlatform(t *testing.T) {
+func TestPullCanonicalizesDefaultArmelPlatform(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/armel")
-	runner := &issue115ReviewRunner{}
+	runner := &platformPinningRunner{}
 	if err := pullWith(context.Background(), runner, appleEngine{}, "redis:7-alpine"); err != nil {
 		t.Fatalf("pullWith: %v", err)
 	}
-	if len(runner.calls) != 1 || !issue115ReviewCallHasPlatform(runner.calls[0], "linux/armel/v6") {
+	if len(runner.calls) != 1 || !callHasPlatform(runner.calls[0], "linux/armel/v6") {
 		t.Fatalf("pull calls = %v, want canonical default armel", runner.calls)
 	}
 }
 
-func TestIssue115PullWithoutSelectorRemainsPlatformAgnostic(t *testing.T) {
+func TestPullWithoutSelectorRemainsPlatformAgnostic(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "")
-	runner := &issue115ReviewRunner{}
+	runner := &platformPinningRunner{}
 	if err := pullWith(context.Background(), runner, appleEngine{}, "redis:7-alpine"); err != nil {
 		t.Fatalf("pullWith: %v", err)
 	}
 	if len(runner.calls) != 1 {
 		t.Fatalf("pull calls = %v, want one pull", runner.calls)
 	}
-	if issue115ReviewCallHasPlatform(runner.calls[0], "linux/arm64") ||
-		issue115ReviewCallHasPlatform(runner.calls[0], "linux/amd64") ||
-		issue115ReviewCallHasPlatform(runner.calls[0], "linux/armel/v6") {
+	if callHasPlatform(runner.calls[0], "linux/arm64") ||
+		callHasPlatform(runner.calls[0], "linux/amd64") ||
+		callHasPlatform(runner.calls[0], "linux/armel/v6") {
 		t.Fatalf("standalone Pull unexpectedly selected a host platform: %v", runner.calls[0])
 	}
 	for _, arg := range runner.calls[0] {
@@ -135,14 +135,14 @@ func TestIssue115PullWithoutSelectorRemainsPlatformAgnostic(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleRunMaterializesHostPlatformForPullNever(t *testing.T) {
+func TestAppleRunMaterializesHostPlatformForPullNever(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "")
-	host := issue115FreshHostPlatform()
-	other := issue115FreshOtherPlatform(host)
-	image := issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, []map[string]any{
-		issue115FreshVariant(other, "sha256:"+issue115ReviewID),
+	host := freshHostPlatform()
+	other := freshOtherPlatform(host)
+	image := platformPinningAppleImageJSONForRoot(platformPinningRoot, []map[string]any{
+		freshVariant(other, "sha256:"+platformPinningID),
 	})
-	runner := &issue115ReviewRunner{inspectJSON: image}
+	runner := &platformPinningRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever),
 		withRunner(runner), withEngine(applePullNeverBelowPreflight{}))
@@ -155,18 +155,18 @@ func TestIssue115AppleRunMaterializesHostPlatformForPullNever(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleRunUsesHostPlatformBeforeFetchingMissingVariant(t *testing.T) {
+func TestAppleRunUsesHostPlatformBeforeFetchingMissingVariant(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "")
-	host := issue115FreshHostPlatform()
-	other := issue115FreshOtherPlatform(host)
-	initial := issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, []map[string]any{
-		issue115FreshVariant(other, "sha256:"+issue115ReviewID),
+	host := freshHostPlatform()
+	other := freshOtherPlatform(host)
+	initial := platformPinningAppleImageJSONForRoot(platformPinningRoot, []map[string]any{
+		freshVariant(other, "sha256:"+platformPinningID),
 	})
-	afterPull := issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, []map[string]any{
-		issue115FreshVariant(host, issue115ReviewVariant),
-		issue115FreshVariant(other, "sha256:"+issue115ReviewID),
+	afterPull := platformPinningAppleImageJSONForRoot(platformPinningRoot, []map[string]any{
+		freshVariant(host, platformPinningVariant),
+		freshVariant(other, "sha256:"+platformPinningID),
 	})
-	runner := &issue115ReviewRunner{inspectJSON: initial, afterPullJSON: afterPull}
+	runner := &platformPinningRunner{inspectJSON: initial, afterPullJSON: afterPull}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}))
 	if err != nil {
@@ -176,18 +176,18 @@ func TestIssue115AppleRunUsesHostPlatformBeforeFetchingMissingVariant(t *testing
 		t.Fatalf("identity platform = %q, want materialized host %q", ctr.image.platform, host)
 	}
 	runImage, _, pulls := runner.state()
-	if runImage != "redis:7-alpine@"+issue115ReviewRoot || pulls != 1 {
+	if runImage != "redis:7-alpine@"+platformPinningRoot || pulls != 1 {
 		t.Fatalf("run=%q pulls=%d, want host-specific fetch", runImage, pulls)
 	}
 	var sawPull bool
 	for _, call := range runner.calls {
 		if len(call) > 1 && call[0] == "image" && call[1] == "pull" {
 			sawPull = true
-			if !issue115ReviewCallHasPlatform(call, host) {
+			if !callHasPlatform(call, host) {
 				t.Errorf("pull missing materialized host platform: %v", call)
 			}
 		}
-		if len(call) > 0 && call[0] == "run" && !issue115ReviewCallHasPlatform(call, host) {
+		if len(call) > 0 && call[0] == "run" && !callHasPlatform(call, host) {
 			t.Errorf("run missing materialized host platform: %v", call)
 		}
 	}
@@ -196,14 +196,14 @@ func TestIssue115AppleRunUsesHostPlatformBeforeFetchingMissingVariant(t *testing
 	}
 }
 
-func TestIssue115AppleRunRejectsImplicitPostCreatePlatformMismatch(t *testing.T) {
+func TestAppleRunRejectsImplicitPostCreatePlatformMismatch(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "")
-	host := issue115FreshHostPlatform()
-	runner := &issue115FinalRunner{
-		imageJSON:        issue115FinalMultiFixture(),
+	host := freshHostPlatform()
+	runner := &finalRunner{
+		imageJSON:        finalMultiFixture(),
 		exactAddressable: true,
-		postRoot:         issue115FinalRoot,
-		postPlatform:     issue115FreshOtherPlatform(host),
+		postRoot:         finalRoot,
+		postPlatform:     freshOtherPlatform(host),
 	}
 	_, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}))
@@ -215,8 +215,8 @@ func TestIssue115AppleRunRejectsImplicitPostCreatePlatformMismatch(t *testing.T)
 	}
 }
 
-func TestIssue115ApplePinnedComparisonIgnoresTagOnlyWithDigest(t *testing.T) {
-	root := issue115ReviewRoot
+func TestApplePinnedComparisonIgnoresTagOnlyWithDigest(t *testing.T) {
+	root := platformPinningRoot
 	cases := []struct {
 		name      string
 		requested string
@@ -244,7 +244,7 @@ func TestIssue115ApplePinnedComparisonIgnoresTagOnlyWithDigest(t *testing.T) {
 		{
 			name:      "different digest",
 			requested: "team/demo:stable@" + root,
-			actual:    "team/demo:stable@sha256:" + issue115ReviewID,
+			actual:    "team/demo:stable@sha256:" + platformPinningID,
 			want:      false,
 		},
 		{

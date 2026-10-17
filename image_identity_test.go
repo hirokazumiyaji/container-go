@@ -12,11 +12,11 @@ import (
 )
 
 const (
-	issue115ImageIdentityOld = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	issue115ImageIdentityNew = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	testImageIdentityOld = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	testImageIdentityNew = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 )
 
-type issue115TagSwapRunner struct {
+type tagSwapRunner struct {
 	mu            sync.Mutex
 	pullDigest    string
 	inspectDigest string
@@ -26,7 +26,7 @@ type issue115TagSwapRunner struct {
 	inspectCalls  int
 }
 
-func (r *issue115TagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *tagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -34,17 +34,17 @@ func (r *issue115TagSwapRunner) Run(_ context.Context, args ...string) ([]byte, 
 		r.inspectCalls++
 		digest := r.inspectDigest
 		if digest == "" {
-			digest = issue115ImageIdentityOld
+			digest = testImageIdentityOld
 		}
 		if r.swapOnInspect {
-			r.inspectDigest = issue115ImageIdentityNew
+			r.inspectDigest = testImageIdentityNew
 		}
 		return []byte(fmt.Sprintf(`[{"Id":%q,"RepoDigests":["docker.io/library/redis@%s"]}]`, digest, digest)), nil, nil
 	case args[0] == "pull" || (args[0] == "image" && len(args) > 1 && args[1] == "pull"):
 		r.pullCalls++
 		digest := r.pullDigest
 		if digest == "" {
-			digest = issue115ImageIdentityOld
+			digest = testImageIdentityOld
 		}
 		r.inspectDigest = digest
 		return nil, nil, nil
@@ -56,43 +56,43 @@ func (r *issue115TagSwapRunner) Run(_ context.Context, args ...string) ([]byte, 
 	}
 }
 
-func (r *issue115TagSwapRunner) image() string {
+func (r *tagSwapRunner) image() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runImage
 }
 
-func TestIssue115RunPinsDockerIdentityAfterPullMissingInspect(t *testing.T) {
-	r := &issue115TagSwapRunner{inspectDigest: issue115ImageIdentityOld, swapOnInspect: true}
+func TestRunPinsDockerIdentityAfterPullMissingInspect(t *testing.T) {
+	r := &tagSwapRunner{inspectDigest: testImageIdentityOld, swapOnInspect: true}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(dockerEngine{}), WithPullPolicy(PullMissing))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := r.image(); !strings.Contains(got, issue115ImageIdentityOld) {
-		t.Fatalf("run image = %q, want inspected identity %q", got, issue115ImageIdentityOld)
+	if got := r.image(); !strings.Contains(got, testImageIdentityOld) {
+		t.Fatalf("run image = %q, want inspected identity %q", got, testImageIdentityOld)
 	}
-	if !ctr.image.pinned || ctr.image.digest != issue115ImageIdentityOld {
-		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, issue115ImageIdentityOld)
+	if !ctr.image.pinned || ctr.image.digest != testImageIdentityOld {
+		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, testImageIdentityOld)
 	}
 }
 
-func TestIssue115RunPinsDockerIdentityAfterPullAlways(t *testing.T) {
-	r := &issue115TagSwapRunner{pullDigest: issue115ImageIdentityOld, swapOnInspect: true}
+func TestRunPinsDockerIdentityAfterPullAlways(t *testing.T) {
+	r := &tagSwapRunner{pullDigest: testImageIdentityOld, swapOnInspect: true}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(dockerEngine{}), WithPullPolicy(PullAlways))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := r.image(); !strings.Contains(got, issue115ImageIdentityOld) {
-		t.Fatalf("run image = %q, want pulled identity %q", got, issue115ImageIdentityOld)
+	if got := r.image(); !strings.Contains(got, testImageIdentityOld) {
+		t.Fatalf("run image = %q, want pulled identity %q", got, testImageIdentityOld)
 	}
-	if !ctr.image.pinned || ctr.image.digest != issue115ImageIdentityOld {
-		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, issue115ImageIdentityOld)
+	if !ctr.image.pinned || ctr.image.digest != testImageIdentityOld {
+		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, testImageIdentityOld)
 	}
 }
 
-type issue115AppleTagSwapRunner struct {
+type appleTagSwapRunner struct {
 	mu             sync.Mutex
 	pullDigest     string
 	inspectDigest  string
@@ -102,14 +102,14 @@ type issue115AppleTagSwapRunner struct {
 	creation       string
 }
 
-func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *appleTagSwapRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
 	case args[0] == "image" && len(args) > 1 && args[1] == "inspect":
 		digest := r.inspectDigest
 		if digest == "" {
-			digest = issue115ImageIdentityOld
+			digest = testImageIdentityOld
 		}
 		if args[len(args)-1] == "redis:7-alpine" {
 			// The mutable tag may be replaced after the initial resolution,
@@ -117,16 +117,16 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 			// must continue to observe that exact old digest.
 			r.resolvedDigest = digest
 			if r.swapOnInspect {
-				r.inspectDigest = issue115ImageIdentityNew
+				r.inspectDigest = testImageIdentityNew
 			}
 		} else if r.resolvedDigest != "" {
 			digest = r.resolvedDigest
 		}
-		return issue115FreshAppleImageJSON(digest, digest), nil, nil
+		return freshAppleImageJSON(digest, digest), nil, nil
 	case args[0] == "image" && len(args) > 1 && args[1] == "pull":
 		digest := r.pullDigest
 		if digest == "" {
-			digest = issue115ImageIdentityOld
+			digest = testImageIdentityOld
 		}
 		r.inspectDigest = digest
 		return nil, nil, nil
@@ -145,53 +145,53 @@ func (r *issue115AppleTagSwapRunner) Run(_ context.Context, args ...string) ([]b
 		}
 		digest := r.resolvedDigest
 		if digest == "" {
-			digest = issue115ImageIdentityOld
+			digest = testImageIdentityOld
 		}
-		return issue115ReviewContainerJSON(image, digest, issue115FreshHostPlatform(), r.creation), nil, nil
+		return platformPinningContainerJSON(image, digest, freshHostPlatform(), r.creation), nil, nil
 	default:
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "unexpected command"}
 	}
 }
 
-func (r *issue115AppleTagSwapRunner) image() string {
+func (r *appleTagSwapRunner) image() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runImage
 }
 
-func TestIssue115RunPinsAppleIdentityAfterTagReplacement(t *testing.T) {
-	r := &issue115AppleTagSwapRunner{inspectDigest: issue115ImageIdentityOld, swapOnInspect: true}
+func TestRunPinsAppleIdentityAfterTagReplacement(t *testing.T) {
+	r := &appleTagSwapRunner{inspectDigest: testImageIdentityOld, swapOnInspect: true}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}), WithPullPolicy(PullMissing))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := r.image(); !strings.Contains(got, issue115ImageIdentityOld) {
-		t.Fatalf("run image = %q, want inspected Apple identity %q", got, issue115ImageIdentityOld)
+	if got := r.image(); !strings.Contains(got, testImageIdentityOld) {
+		t.Fatalf("run image = %q, want inspected Apple identity %q", got, testImageIdentityOld)
 	}
-	if !ctr.image.pinned || ctr.image.digest != issue115ImageIdentityOld {
-		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, issue115ImageIdentityOld)
+	if !ctr.image.pinned || ctr.image.digest != testImageIdentityOld {
+		t.Fatalf("handle identity = %+v, want pinned digest %q", ctr.image, testImageIdentityOld)
 	}
 }
 
-func TestIssue115RunPinsAppleIdentityAfterPullAlways(t *testing.T) {
-	r := &issue115AppleTagSwapRunner{pullDigest: issue115ImageIdentityOld, swapOnInspect: true}
+func TestRunPinsAppleIdentityAfterPullAlways(t *testing.T) {
+	r := &appleTagSwapRunner{pullDigest: testImageIdentityOld, swapOnInspect: true}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}), WithPullPolicy(PullAlways))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := r.image(); !strings.Contains(got, issue115ImageIdentityOld) {
-		t.Fatalf("run image = %q, want pulled Apple identity %q", got, issue115ImageIdentityOld)
+	if got := r.image(); !strings.Contains(got, testImageIdentityOld) {
+		t.Fatalf("run image = %q, want pulled Apple identity %q", got, testImageIdentityOld)
 	}
 }
 
-type issue115IdentityLessRunner struct {
+type identityLessRunner struct {
 	runImage string
 	runCalls int
 }
 
-func (r *issue115IdentityLessRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *identityLessRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch {
 	case args[0] == "image" && len(args) > 1 && args[1] == "inspect":
 		return []byte(`[{"reference":"redis:7-alpine"}]`), nil, nil
@@ -204,8 +204,8 @@ func (r *issue115IdentityLessRunner) Run(_ context.Context, args ...string) ([]b
 	}
 }
 
-func TestIssue115RunFailsClosedWhenIdentityIsUnavailable(t *testing.T) {
-	r := &issue115IdentityLessRunner{}
+func TestRunFailsClosedWhenIdentityIsUnavailable(t *testing.T) {
+	r := &identityLessRunner{}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
@@ -216,14 +216,14 @@ func TestIssue115RunFailsClosedWhenIdentityIsUnavailable(t *testing.T) {
 	}
 }
 
-type issue115AppleNoDigestAliasRunner struct {
+type appleNoDigestAliasRunner struct {
 	runCalls int
 }
 
-func (r *issue115AppleNoDigestAliasRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *appleNoDigestAliasRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "image" && len(args) > 1 && args[1] == "inspect" {
 		if args[len(args)-1] == "redis:7-alpine" {
-			return issue115FreshAppleImageJSON(issue115ImageIdentityNew, issue115ImageIdentityNew), nil, nil
+			return freshAppleImageJSON(testImageIdentityNew, testImageIdentityNew), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Args: args, ExitCode: 1, Stderr: "image not found: " + args[len(args)-1]}
 	}
@@ -233,8 +233,8 @@ func (r *issue115AppleNoDigestAliasRunner) Run(_ context.Context, args ...string
 	return nil, nil, nil
 }
 
-func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
-	r := &issue115AppleNoDigestAliasRunner{}
+func TestPullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
+	r := &appleNoDigestAliasRunner{}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
@@ -244,7 +244,7 @@ func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
 		t.Fatal("PullNever issued run after pinned digest was not local")
 	}
 
-	fallback := &issue115AppleNoDigestAliasRunner{}
+	fallback := &appleNoDigestAliasRunner{}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithAllowMutableImageTag(),
 		withRunner(fallback), withEngine(applePullNeverBelowPreflight{}))
@@ -259,9 +259,9 @@ func TestIssue115PullNeverDoesNotSilentlyFetchApplePinnedDigest(t *testing.T) {
 	}
 }
 
-func TestIssue115PullNeverRejectsIdentitylessAppleInspect(t *testing.T) {
-	r := &issue115IdentityLessRunner{}
-	image := "redis:7-alpine@" + issue115ImageIdentityOld
+func TestPullNeverRejectsIdentitylessAppleInspect(t *testing.T) {
+	r := &identityLessRunner{}
+	image := "redis:7-alpine@" + testImageIdentityOld
 	_, err := Run(context.Background(), image,
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
@@ -272,8 +272,8 @@ func TestIssue115PullNeverRejectsIdentitylessAppleInspect(t *testing.T) {
 	}
 }
 
-func TestIssue115AllowMutableImageTagIsExplicitFallback(t *testing.T) {
-	r := &issue115IdentityLessRunner{}
+func TestAllowMutableImageTagIsExplicitFallback(t *testing.T) {
+	r := &identityLessRunner{}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithAllowMutableImageTag(), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -287,25 +287,25 @@ func TestIssue115AllowMutableImageTagIsExplicitFallback(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerFallsBackToImmutableImageIDWithoutRepoDigest(t *testing.T) {
+func TestDockerFallsBackToImmutableImageIDWithoutRepoDigest(t *testing.T) {
 	// Replace the normal RepoDigests response with an ID-only response.
-	r2 := &issue115IDOnlyRunner{id: issue115ImageIdentityOld}
+	r2 := &idOnlyRunner{id: testImageIdentityOld}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(r2), withEngine(dockerEngine{}), WithPullPolicy(PullNever))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if r2.runImage != issue115ImageIdentityOld {
-		t.Fatalf("run image = %q, want Docker image ID %q", r2.runImage, issue115ImageIdentityOld)
+	if r2.runImage != testImageIdentityOld {
+		t.Fatalf("run image = %q, want Docker image ID %q", r2.runImage, testImageIdentityOld)
 	}
 }
 
-type issue115IDOnlyRunner struct {
+type idOnlyRunner struct {
 	id       string
 	runImage string
 }
 
-func (r *issue115IDOnlyRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *idOnlyRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "image":
 		return []byte(fmt.Sprintf(`[{"Id":%q}]`, r.id)), nil, nil
@@ -317,39 +317,39 @@ func (r *issue115IDOnlyRunner) Run(_ context.Context, args ...string) ([]byte, [
 	}
 }
 
-func TestIssue115DockerImageIdentityUsesRepoDigestWithoutTag(t *testing.T) {
-	data := []byte(`[{"Id":"` + issue115ImageIdentityOld + `","RepoDigests":["docker.io/library/redis@` + issue115ImageIdentityNew + `"]}]`)
+func TestDockerImageIdentityUsesRepoDigestWithoutTag(t *testing.T) {
+	data := []byte(`[{"Id":"` + testImageIdentityOld + `","RepoDigests":["docker.io/library/redis@` + testImageIdentityNew + `"]}]`)
 	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists {
 		t.Fatal("image was reported absent")
 	}
-	want := "redis:7-alpine@" + issue115ImageIdentityNew
-	if identity.reference != want || identity.digest != issue115ImageIdentityNew || !identity.pinned {
+	want := "redis:7-alpine@" + testImageIdentityNew
+	if identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
 		t.Fatalf("identity = %+v, want reference %q", identity, want)
 	}
 }
 
-func TestIssue115DockerImageIdentityFallsBackToIDForForeignRepoDigest(t *testing.T) {
-	data := []byte(`[{"Id":"` + issue115ImageIdentityOld + `","RepoDigests":["evil.example/library/redis@` + issue115ImageIdentityNew + `"]}]`)
+func TestDockerImageIdentityFallsBackToIDForForeignRepoDigest(t *testing.T) {
+	data := []byte(`[{"Id":"` + testImageIdentityOld + `","RepoDigests":["evil.example/library/redis@` + testImageIdentityNew + `"]}]`)
 	identity, exists := (dockerEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
-	if !exists || identity.mismatch || !identity.pinned || identity.id != issue115ImageIdentityOld {
+	if !exists || identity.mismatch || !identity.pinned || identity.id != testImageIdentityOld {
 		t.Fatalf("identity = %+v, exists = %v, want immutable local ID fallback", identity, exists)
 	}
 }
 
-func TestIssue115AppleImageIdentityUsesDescriptorDigest(t *testing.T) {
-	data := []byte(`[{"id":"` + issue115ImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue115ImageIdentityNew + `"}},"variants":[]}]`)
+func TestAppleImageIdentityUsesDescriptorDigest(t *testing.T) {
+	data := []byte(`[{"id":"` + testImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + testImageIdentityNew + `"}},"variants":[]}]`)
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists {
 		t.Fatal("image was reported absent")
 	}
-	want := "redis:7-alpine@" + issue115ImageIdentityNew
-	if identity.reference != want || identity.digest != issue115ImageIdentityNew || !identity.pinned {
+	want := "redis:7-alpine@" + testImageIdentityNew
+	if identity.reference != want || identity.digest != testImageIdentityNew || !identity.pinned {
 		t.Fatalf("identity = %+v, want reference %q", identity, want)
 	}
 }
 
-func TestIssue115AppleImageIdentityUsesIDAsDigestReference(t *testing.T) {
+func TestAppleImageIdentityUsesIDAsDigestReference(t *testing.T) {
 	data := []byte(`[{"id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","configuration":{"name":"redis:7-alpine"},"variants":[]}]`)
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists {
@@ -361,23 +361,23 @@ func TestIssue115AppleImageIdentityUsesIDAsDigestReference(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleImageIdentityUsesRootForSelectedPlatformVariant(t *testing.T) {
-	data := []byte(`[{"id":"` + issue115ImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + issue115ImageIdentityOld + `"}},"variants":[{"digest":"` + issue115ImageIdentityNew + `","platform":{"os":"linux","architecture":"arm64"}}]}]`)
+func TestAppleImageIdentityUsesRootForSelectedPlatformVariant(t *testing.T) {
+	data := []byte(`[{"id":"` + testImageIdentityOld + `","configuration":{"name":"redis:7-alpine","descriptor":{"digest":"` + testImageIdentityOld + `"}},"variants":[{"digest":"` + testImageIdentityNew + `","platform":{"os":"linux","architecture":"arm64"}}]}]`)
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "linux/arm64")
 	if !exists {
 		t.Fatal("selected platform was reported absent")
 	}
-	if identity.digest != issue115ImageIdentityOld || identity.reference != "redis:7-alpine@"+issue115ImageIdentityOld {
+	if identity.digest != testImageIdentityOld || identity.reference != "redis:7-alpine@"+testImageIdentityOld {
 		t.Fatalf("identity = %+v, want root descriptor identity", identity)
 	}
-	if identity.variantDigest != issue115ImageIdentityNew || identity.platform != "linux/arm64" {
+	if identity.variantDigest != testImageIdentityNew || identity.platform != "linux/arm64" {
 		t.Fatalf("identity = %+v, want separately tracked platform variant", identity)
 	}
 }
 
-func TestIssue115ImageIdentityMismatchCannotUseMutableFallback(t *testing.T) {
+func TestImageIdentityMismatchCannotUseMutableFallback(t *testing.T) {
 	identity, exists := (appleEngine{}).parseImageIdentity(
-		[]byte(`[{"id":"`+issue115ImageIdentityOld+`","configuration":{"name":"nginx:alpine","descriptor":{"digest":"`+issue115ImageIdentityNew+`"}}}]`),
+		[]byte(`[{"id":"`+testImageIdentityOld+`","configuration":{"name":"nginx:alpine","descriptor":{"digest":"`+testImageIdentityNew+`"}}}]`),
 		"redis:7-alpine", "")
 	if !exists || !identity.mismatch {
 		t.Fatalf("identity = %+v, exists = %v, want mismatch", identity, exists)

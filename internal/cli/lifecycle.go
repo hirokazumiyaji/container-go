@@ -12,17 +12,18 @@ import (
 // Reaped is the fact that cmd.Wait returned; it is deliberately separate from
 // whether cancellation won the race with that wait. TerminatedByCancellation
 // is set only after a platform implementation proved the direct child was
-// active and successfully accepted a termination action.
+// active and successfully accepted a termination action, so it is never set
+// for a run that reports TerminationProvable false.
 type RunStatus struct {
 	Started                  bool
 	Reaped                   bool
 	CancelRequested          bool
 	TerminatedByCancellation bool
-	// TerminationProvable reports whether this run attached the platform
-	// process identity that termination evidence rests on. It is false when
-	// attachment failed and the run fell back to a retained best-effort
-	// handle, which cannot prove the direct child was active; such a run
-	// reports the conservative result instead of TerminatedByCancellation.
+	// TerminationProvable reports whether this run's termination path could
+	// prove the direct child was active. It is false for the best-effort
+	// fallbacks, whose retained Start-time handle cannot tell a live child
+	// from one that already exited; those runs still kill the child but
+	// withhold TerminatedByCancellation.
 	TerminationProvable bool
 }
 
@@ -225,7 +226,7 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 		}
 		l.lastResult = result
 		l.terminateErr = result.err
-		if contextTermination && result.err == nil && result.active {
+		if contextTermination && result.err == nil && result.active && l.terminationProvable {
 			l.terminatedByCancellation = true
 		}
 	})

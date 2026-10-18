@@ -52,10 +52,13 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 		return nil, os.ErrProcessDone
 	}
 	identity, err := openProcessIdentity(cmd.Process)
-	// Attachment alone is not proof: the identity must also be able to
-	// observe the stopped barrier. On Linux that requires the pidfd, so a
-	// failed attach leaves this run on the conservative path.
-	provable := err == nil && identity != nil && processGroupTerminationSupported()
+	// An identity attached for this run is its own proof. Only the retained
+	// handle has to ask the platform whether the stopped barrier is
+	// observable at all, and that probe is a constant off Linux.
+	provable := err == nil && identity != nil
+	if _, retained := identity.(retainedProcessIdentity); retained {
+		provable = provable && processGroupTerminationSupported()
+	}
 	if err != nil || identity == nil {
 		// A pidfd (or equivalent) is an enhancement. The retained
 		// os.Process is still safer than reacquiring a process by a

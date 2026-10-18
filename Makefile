@@ -6,9 +6,14 @@ test:
 vet:
 	go vet ./...
 
+# Every gate that can compile the `integration`-tagged files type-checks them
+# with this command. Go ignores an unknown build tag silently, so a rename that
+# misses one copy would quietly stop checking instead of failing.
+VET_INTEGRATION := go vet -tags integration ./...
+
 vet-integration:
-	go vet -tags integration ./...
-	cd bench && go vet -tags integration ./...
+	$(VET_INTEGRATION)
+	cd bench && $(VET_INTEGRATION)
 
 lint:
 	golangci-lint run ./...
@@ -83,7 +88,7 @@ release-check:
 	# Also type-checks the `integration`-tagged files, which no untagged build
 	# compiles. ci.yml's integration-docker job covers this on a PR, but that
 	# job does not run on a tag push, so the tag gate would not.
-	go vet -tags integration ./...
+	$(VET_INTEGRATION)
 	$(MAKE) lint
 	go test -count=1 -race ./...
 	go mod verify
@@ -104,7 +109,7 @@ release-check:
 release-check-bench:
 	cd bench && go build ./... \
 		&& go vet ./... \
-		&& go vet -tags integration ./... \
+		&& $(VET_INTEGRATION) \
 		&& golangci-lint run ./... \
 		&& go test -count=1 -race ./... \
 		&& go mod verify \

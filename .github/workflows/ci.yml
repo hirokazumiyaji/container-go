@@ -62,9 +62,12 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
-      # The integration suites are excluded: they need a real backend,
-      # which neither of these runners provides for both backends.
+      # The integration suites are not executed: they need a real backend,
+      # which neither of these runners provides for both backends. The tagged
+      # vet still compiles them, including the Windows-only files that no
+      # other job type-checks.
       - run: go build ./...
+      - run: go vet -tags integration ./...
       - run: go test ./...
 
   # Unit tests run against a fake CLI runner, so the cheaper Linux

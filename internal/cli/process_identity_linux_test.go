@@ -5,6 +5,7 @@ package cli
 import (
 	"errors"
 	"os/exec"
+	"syscall"
 	"testing"
 )
 
@@ -103,5 +104,41 @@ func TestLinuxTerminationInterleavingWithWaitReapUsesPidfd(t *testing.T) {
 	}
 	if identity.killCalls != 1 {
 		t.Fatalf("pidfd kill calls = %d, want 1", identity.killCalls)
+	}
+}
+
+// reapedKillIdentity reports a real child's state but fails its direct kill
+// with ESRCH, which is what the pidfd path returns once the numeric group
+// signal has killed the child and the sole waiter has already reaped it.
+type reapedKillIdentity struct {
+	stableProcessIdentity
+}
+
+func (reapedKillIdentity) kill() error { return syscall.ESRCH }
+
+// TestLinuxTerminationAcceptsReapedChildAfterGroupKill pins the race that made
+// TestExecRunnerStatusTracksContextTermination flake. The group signal kills
+// the child, cmd.Wait reaps it, and the then-redundant pidfd SIGKILL reports
+// ESRCH. That is a proven termination, so it must not be reported as a failure
+// to prove one.
+func TestLinuxTerminationAcceptsReapedChildAfterGroupKill(t *testing.T) {
+	cmd := exec.Command(writeStub(t, `sleep 5`))
+	configureProcessTree(cmd)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	identity, err := openProcessIdentity(cmd.Process)
+	if err != nil {
+		t.Skipf("pidfd is unavailable on this host: %v", err)
+	}
+	defer identity.close()
+
+	result := terminateProcessIdentity(reapedKillIdentity{identity}, cmd.Process.Pid)
+	if !result.active || result.err != nil {
+		t.Fatalf("termination result = %+v, want proven active termination", result)
 	}
 }

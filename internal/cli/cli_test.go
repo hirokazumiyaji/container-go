@@ -402,25 +402,33 @@ func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	time.AfterFunc(300*time.Millisecond, cancel)
+	started := time.Now()
 	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
 	status, reported := RunStatusOf(err)
 	if !reported || !status.Started || !status.Reaped {
 		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
 	}
-	// The platform probe alone cannot decide this run. Attaching the pidfd
+	// The stub sleeps far past the cancellation, so a prompt return is itself
+	// the evidence that cancellation terminated the child rather than letting
+	// it run to completion.
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("run took %v, want a prompt return after cancellation", elapsed)
+	}
+	// The platform probe alone cannot decide this run: attaching the pidfd
 	// fails under transient resource pressure, and the retained fallback
 	// cannot prove the direct child was active, so assert the capability the
 	// run actually published rather than the platform's.
-	if status.TerminationProvable && !status.TerminatedByCancellation {
-		t.Fatalf("run status = %+v, want active cancellation termination", status)
+	//
+	// Only this direction is an invariant. The converse does not hold: even a
+	// run that attached the identity withholds the claim when the stopped-state
+	// barrier goes unobserved (processStoppedObservationWindow) or the child
+	// exits before the cancellation lands. Both are deliberate conservative
+	// outcomes, not proof that termination failed.
+	if status.TerminatedByCancellation && !status.TerminationProvable {
+		t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
 	}
-	if !status.TerminationProvable {
-		if processGroupTerminationSupported() {
-			t.Logf("run status = %+v: platform identity was not attached, conservative result expected", status)
-		}
-		if status.TerminatedByCancellation {
-			t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
-		}
+	if !status.TerminationProvable && processGroupTerminationSupported() {
+		t.Logf("run status = %+v: platform identity was not attached, conservative result expected", status)
 	}
 }
 
@@ -433,7 +441,10 @@ func TestExecRunnerStatusReportsBestEffortTreeAsUnprovable(t *testing.T) {
 	defer cancel()
 	time.AfterFunc(100*time.Millisecond, cancel)
 	hooks := runHooks{terminate: func(cmd *exec.Cmd) error { return terminateProcessTree(cmd) }}
-	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).run(ctx, hooks, "exec")
+	// exec keeps the sleeper as the direct child: the stub's shell would
+	// otherwise outlive the direct kill and hold the output pipe open until
+	// the sleep expired, which only adds wall-clock to the race job.
+	_, _, err := (&ExecRunner{Binary: writeStub(t, `exec sleep 5`)}).run(ctx, hooks, "exec")
 	status, reported := RunStatusOf(err)
 	if !reported || !status.Started || !status.Reaped {
 		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)

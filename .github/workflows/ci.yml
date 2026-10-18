@@ -66,6 +66,10 @@ jobs:
       # which neither of these runners provides for both backends. The tagged
       # vet still compiles them, including the Windows-only files that no
       # other job type-checks.
+      #
+      # Keep `integration` in step with VET_INTEGRATION in the Makefile. This
+      # leg cannot call `make vet-integration`: the Windows runner image ships
+      # no GNU Make, so the tag is repeated here rather than centralized.
       - run: go build ./...
       - run: go vet -tags integration ./...
       - run: go test ./...

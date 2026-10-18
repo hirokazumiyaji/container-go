@@ -18,6 +18,12 @@ type RunStatus struct {
 	Reaped                   bool
 	CancelRequested          bool
 	TerminatedByCancellation bool
+	// TerminationProvable reports whether this run attached the platform
+	// process identity that termination evidence rests on. It is false when
+	// attachment failed and the run fell back to a retained best-effort
+	// handle, which cannot prove the direct child was active; such a run
+	// reports the conservative result instead of TerminatedByCancellation.
+	TerminationProvable bool
 }
 
 type runStatusError struct {
@@ -77,6 +83,7 @@ type commandLifecycle struct {
 	terminateErr error
 	lastResult   terminationResult
 
+	terminationProvable      bool
 	cancelRequested          bool
 	terminatedByCancellation bool
 	terminateOnce            sync.Once
@@ -95,9 +102,14 @@ func newCommandLifecycle(ctx context.Context, cmd *exec.Cmd) *commandLifecycle {
 // lifecycle owner. The context watcher may call Cancel as soon as Start
 // returns, so publication and the start barrier are one operation.
 func (l *commandLifecycle) publishStart(tree processTree) {
+	provable := false
+	if prover, ok := tree.(provableTerminationTree); ok {
+		provable = prover.provesActiveTermination()
+	}
 	l.mu.Lock()
 	l.started = true
 	l.tree = tree
+	l.terminationProvable = provable
 	l.mu.Unlock()
 	close(l.startDone)
 }
@@ -172,6 +184,7 @@ func (l *commandLifecycle) status() RunStatus {
 		Reaped:                   l.reaped,
 		CancelRequested:          l.cancelRequested,
 		TerminatedByCancellation: l.terminatedByCancellation,
+		TerminationProvable:      l.terminationProvable,
 	}
 }
 

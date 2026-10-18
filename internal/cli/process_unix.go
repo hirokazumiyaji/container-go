@@ -41,6 +41,10 @@ type stableProcessIdentity interface {
 type unixProcessTree struct {
 	identity stableProcessIdentity
 	pid      int
+	// provable records whether this run attached the platform identity that
+	// termination evidence rests on. Without it the tree still kills the
+	// direct child, but it cannot prove the child was active.
+	provable bool
 }
 
 func newProcessTree(cmd *exec.Cmd) (processTree, error) {
@@ -48,13 +52,17 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 		return nil, os.ErrProcessDone
 	}
 	identity, err := openProcessIdentity(cmd.Process)
+	// Attachment alone is not proof: the identity must also be able to
+	// observe the stopped barrier. On Linux that requires the pidfd, so a
+	// failed attach leaves this run on the conservative path.
+	provable := err == nil && identity != nil && processGroupTerminationSupported()
 	if err != nil || identity == nil {
 		// A pidfd (or equivalent) is an enhancement. The retained
 		// os.Process is still safer than reacquiring a process by a
 		// numeric PID, so use it as the conservative direct-child path.
 		identity = retainedProcessIdentity{process: cmd.Process}
 	}
-	return &unixProcessTree{identity: identity, pid: cmd.Process.Pid}, nil
+	return &unixProcessTree{identity: identity, pid: cmd.Process.Pid, provable: provable}, nil
 }
 
 func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
@@ -62,6 +70,10 @@ func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		return terminateDirectProcessResult(cmd)
 	}
 	return terminateProcessIdentity(t.identity, t.pid)
+}
+
+func (t *unixProcessTree) provesActiveTermination() bool {
+	return t != nil && t.provable
 }
 
 func (t *unixProcessTree) close() {

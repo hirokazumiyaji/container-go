@@ -332,8 +332,12 @@ func TestLifecycleDoesNotMarkEmptyTerminationAsActive(t *testing.T) {
 		t.Fatalf("terminate: %v", err)
 	}
 	lifecycle.wait()
-	if status := lifecycle.status(); status.TerminatedByCancellation {
+	status := lifecycle.status()
+	if status.TerminatedByCancellation {
 		t.Fatalf("status = %+v, empty/inactive termination must not claim active child", status)
+	}
+	if status.TerminationProvable {
+		t.Fatalf("status = %+v, a best-effort tree must not report a provable termination", status)
 	}
 }
 
@@ -349,6 +353,8 @@ func (t *blockingTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
 	return terminationResult{active: true}
 }
 func (t *blockingTerminationTree) close() {}
+
+func (*blockingTerminationTree) provesActiveTermination() bool { return true }
 
 func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 	ctx := context.Background()
@@ -386,8 +392,9 @@ func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 	close(tree.release)
 	<-terminateDone
 	<-waitDone
-	if status := lifecycle.status(); !status.TerminatedByCancellation {
-		t.Fatalf("status = %+v, want active cancellation termination", status)
+	status := lifecycle.status()
+	if !status.TerminationProvable || !status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, want a provable active cancellation termination", status)
 	}
 }
 
@@ -400,11 +407,39 @@ func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
 	if !reported || !status.Started || !status.Reaped {
 		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
 	}
-	if processGroupTerminationSupported() && !status.TerminatedByCancellation {
+	// The platform probe alone cannot decide this run. Attaching the pidfd
+	// fails under transient resource pressure, and the retained fallback
+	// cannot prove the direct child was active, so assert the capability the
+	// run actually published rather than the platform's.
+	if status.TerminationProvable && !status.TerminatedByCancellation {
 		t.Fatalf("run status = %+v, want active cancellation termination", status)
 	}
-	if !processGroupTerminationSupported() && status.TerminatedByCancellation {
-		t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
+	if !status.TerminationProvable {
+		if processGroupTerminationSupported() {
+			t.Logf("run status = %+v: platform identity was not attached, conservative result expected", status)
+		}
+		if status.TerminatedByCancellation {
+			t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
+		}
+	}
+}
+
+// TestExecRunnerStatusReportsBestEffortTreeAsUnprovable pins the path a
+// failed platform-identity attach takes: the run keeps the best-effort tree,
+// so its status must not report a provable termination even though the tree
+// terminated the child.
+func TestExecRunnerStatusReportsBestEffortTreeAsUnprovable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(100*time.Millisecond, cancel)
+	hooks := runHooks{terminate: func(cmd *exec.Cmd) error { return terminateProcessTree(cmd) }}
+	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).run(ctx, hooks, "exec")
+	status, reported := RunStatusOf(err)
+	if !reported || !status.Started || !status.Reaped {
+		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
+	}
+	if status.TerminationProvable {
+		t.Fatalf("run status = %+v, a best-effort process tree must not be provable", status)
 	}
 }
 

@@ -356,7 +356,12 @@ func readLines(t *testing.T, path string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Split(string(data), "\n")
+	// A Windows checkout has CRLF endings. These helpers compare whole lines
+	// (`line == "jobs:"`) as well as anchoring patterns with $, so a trailing
+	// CR would make them match nothing: every jobs()-based rule would pass
+	// vacuously on the one platform some of them exist to guard.
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	return strings.Split(text, "\n")
 }
 
 func makefileVetIntegration(t *testing.T) string {

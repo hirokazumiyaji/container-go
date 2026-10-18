@@ -129,13 +129,19 @@ jobs:
           version: v2.14.0
 
   # The tagged vet runs in three places, and TestTaggedVetMatchesMakefileCommand
-  # keeps the two copies of the tag equal. The cross-platform legs run it
-  # natively, which is the only way the Windows-only integration files get
-  # type-checked, but they cannot call `make vet-integration` because the
-  # Windows runner image ships no GNU Make. The `lint` job also vets the root
-  # module's tagged files through run.build-tags, so this job's distinct
-  # coverage is the Make target the release gate uses plus the bench module,
-  # which no root-level command reaches.
+  # plus TestGolangciBuildTagsMatchMakefileCommand keep the copies of the tag
+  # equal. The cross-platform legs run it natively, which is the only way the
+  # Windows-only integration files get type-checked, but they cannot call
+  # `make vet-integration` because the Windows runner image ships no GNU Make.
+  #
+  # release-check.yml's `verify` job runs this same target for any PR touching
+  # Go sources, the Makefile, .golangci.yml, a workflow or bench/, so this job
+  # buys runner time rather than coverage. It exists for the same reason ci.yml
+  # keeps lint, race, govulncheck and bench-build as separate jobs instead of
+  # deferring to that gate: `verify` allows an hour and compiles govulncheck and
+  # actionlint from source, so a tagged vet failure would surface late and
+  # buried, while this job reports it in about a minute. It also covers pushes
+  # to main and workflow_dispatch, where the pull_request path filter never runs.
   vet-integration:
     runs-on: ubuntu-latest
     timeout-minutes: 15

@@ -38,6 +38,9 @@ var (
 	jobTimeoutKey = regexp.MustCompile(`^    timeout-minutes:\s*`)
 	// stepWithKey matches a step-level with: mapping key.
 	stepWithKey = regexp.MustCompile(`^(\s*)with:\s*(?:#.*)?$`)
+	// vetIntegrationVar captures the command the Makefile centralizes as
+	// VET_INTEGRATION, which every tagged vet gate is expected to share.
+	vetIntegrationVar = regexp.MustCompile(`^VET_INTEGRATION\s*:?=\s*(.+)$`)
 )
 
 // Every third-party action must be pinned to a full commit SHA. A mutable tag
@@ -288,6 +291,41 @@ func TestJobDrivesDockerIgnoresCommentOnly(t *testing.T) {
 	}
 }
 
+// The cross-platform legs run the tagged vet natively, which is the only way
+// the Windows-only integration files get type-checked, but they cannot call
+// `make vet-integration`: the Windows runner image ships no GNU Make. That
+// leaves a second copy of the integration tag in the workflow, and Go ignores
+// an unknown build tag and exits 0, so a rename that missed the copy would
+// silently stop compiling the very files the step exists for. Compare the
+// commands rather than trusting the cross-reference comment to stay honest.
+func TestTaggedVetMatchesMakefileCommand(t *testing.T) {
+	want := makefileVetIntegration(t)
+	found := 0
+	for _, path := range workflowFiles(t) {
+		lines := readLines(t, path)
+		for _, job := range jobs(lines) {
+			for _, line := range jobBodyLines(lines, job) {
+				m := runStepKey.FindStringSubmatch(line)
+				if m == nil {
+					continue
+				}
+				cmd := strings.TrimSpace(m[2])
+				if !strings.HasPrefix(cmd, "go vet -tags ") {
+					continue
+				}
+				found++
+				if cmd != want {
+					t.Errorf("%s: job %q runs %q, want the Makefile VET_INTEGRATION command %q",
+						path, job, cmd, want)
+				}
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatalf("no tagged vet step found under %s; the Windows-only integration files would go unchecked", workflowDir)
+	}
+}
+
 func workflowFiles(t *testing.T) []string {
 	t.Helper()
 	// Both extensions: GitHub accepts .yml and .yaml, and a workflow added
@@ -319,6 +357,18 @@ func readLines(t *testing.T, path string) []string {
 		t.Fatal(err)
 	}
 	return strings.Split(string(data), "\n")
+}
+
+func makefileVetIntegration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(workflowDir, "..", "..", "Makefile")
+	for _, line := range readLines(t, path) {
+		if m := vetIntegrationVar.FindStringSubmatch(line); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	t.Fatalf("%s: no VET_INTEGRATION assignment found", path)
+	return ""
 }
 
 // jobs returns the job keys of a workflow. The top-level keys before the

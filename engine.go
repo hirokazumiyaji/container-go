@@ -208,6 +208,11 @@ type engine interface {
 	// reused against another (for Docker: DOCKER_HOST, DOCKER_CONTEXT,
 	// DOCKER_CONFIG, DOCKER_DEFAULT_PLATFORM).
 	imageStoreID() string
+	// targetID returns a string distinguishing this backend target
+	// (backend name and daemon endpoint/context) from others.
+	targetID() string
+	// isRemote reports whether the target daemon lives on another machine.
+	isRemote() bool
 }
 
 func stopArgsFor(id string, timeout *time.Duration, maxSeconds int64) ([]string, error) {

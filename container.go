@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -196,6 +198,19 @@ type Container struct {
 	sync                    *lockPack
 	diagnosticRedactorValue *cli.Redactor
 	secretsMu               sync.RWMutex
+	targetHost              string
+}
+
+// TargetHost returns the client-facing default host configured when this
+// container was created.
+func (c *Container) TargetHost() string {
+	if c.targetHost != "" {
+		return c.targetHost
+	}
+	if c.eng != nil {
+		return c.eng.defaultHost()
+	}
+	return "127.0.0.1"
 }
 
 func (c *Container) pack() *lockPack {
@@ -287,13 +302,56 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		return nil, err
 	}
 	if cfg.eng == nil {
-		eng, err := detectEngine()
+		backend := os.Getenv(backendEnv)
+		if backend == "" && (cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil) {
+			backend = "docker"
+		}
+		eng, err := detectEngineFor(runtime.GOOS, backend)
 		if err != nil {
 			return nil, cfg.publicError(err)
 		}
 		cfg.eng = eng
 	}
+	// cfg.validate cannot see this combination before the engine is selected:
+	// with no explicit engine it runs while cfg.eng is still nil.
+	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
+		if _, isDocker := cfg.eng.(dockerEngine); !isDocker {
+			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
+		}
+	}
+	if de, ok := cfg.eng.(dockerEngine); ok {
+		if cfg.dockerHost != nil {
+			de.host = *cfg.dockerHost
+			de.explicitHost = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerContext != nil {
+			de.context = *cfg.dockerContext
+			de.explicitContext = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerConfigDir != nil {
+			de.configDir = *cfg.dockerConfigDir
+			de.explicitConfigDir = true
+			de.explicitTarget = true
+		}
+		if cfg.platform != "" {
+			de.defaultPlatform = cfg.platform
+			de.explicitDefaultPlatform = true
+			de.explicitTarget = true
+		}
+		cfg.eng = de
+	}
 	applyEngineBinary(cfg)
+	applyEngineRunnerEnv(cfg)
+	// Reject Windows before the backend is asked anything: Docker context
+	// resolution runs the CLI, and chmod's 0600/0700 bits do not provide
+	// per-user secrecy there.
+	if len(cfg.env) > 0 {
+		if err := ensureEnvFileSecurity(); err != nil {
+			return nil, err
+		}
+	}
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -303,12 +361,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
 
-	// Reject Windows before an image pull or any env-file storage setup.
-	// chmod's 0600/0700 bits do not provide per-user secrecy there.
 	if len(cfg.env) > 0 {
-		if err := ensureEnvFileSecurity(); err != nil {
-			return nil, err
-		}
 		// Validate the private root and reclaim provably stale directories
 		// before spending time on an image pull or backend create. The
 		// security cleanup has its own finite budget in addition to the
@@ -387,7 +440,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if runErr != nil {
 		if !attempted {
 			if target, ok := runReaperTarget(cfg); ok {
-				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+				_ = unregisterWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
@@ -419,6 +472,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		image:                   resolvedImage,
 		sync:                    &lockPack{uid: uid},
 		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
+		targetHost:              cfg.eng.defaultHost(),
 	}
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
@@ -441,9 +495,9 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		// write. Never register a second active record as a fallback:
 		// that could turn a failed state transition into a duplicate
 		// destructive target.
-		_ = completePreRegistrationWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+		_ = completePreRegistrationWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 		if uid := c.immutableID(); uid != "" {
-			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, uid, "")
+			_ = registerWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, uid, "")
 		}
 	}
 	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
@@ -491,6 +545,8 @@ type runReaperTargetInfo struct {
 	binary      string
 	subcommand  string
 	deleteFlags []string
+	reaperKey   string
+	env         []string
 }
 
 func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
@@ -509,10 +565,25 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 			binary = cfg.eng.binary()
 		}
 	}
+	var env []string
+	if eenv, ok := cfg.runner.(interface{ ExternalEnv() []string }); ok {
+		env = eenv.ExternalEnv()
+	}
+	if len(env) == 0 {
+		if de, ok := cfg.eng.(dockerEngine); ok {
+			env = de.targetEnv()
+		}
+	}
+	reaperKey := binary
+	if cfg.eng != nil && cfg.eng.targetID() != "" {
+		reaperKey = binary + "\x00" + cfg.eng.targetID()
+	}
 	return runReaperTargetInfo{
 		binary:      binary,
 		subcommand:  cfg.eng.reaperSubcommand(),
 		deleteFlags: append([]string(nil), cfg.eng.reaperDeleteFlags()...),
+		reaperKey:   reaperKey,
+		env:         env,
 	}, true
 }
 
@@ -521,7 +592,7 @@ func preRegisterRunWithGlobalReaper(cfg *config) {
 	if !ok {
 		return
 	}
-	_ = preRegisterWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, cfg.name, cfg.creation)
+	_ = preRegisterWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, cfg.name, cfg.creation)
 }
 
 func unregisterReuseFromGlobalReaper(cfg *config) {
@@ -529,7 +600,7 @@ func unregisterReuseFromGlobalReaper(cfg *config) {
 	if !ok {
 		return
 	}
-	_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+	_ = unregisterWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 }
 
 // unregisterContainerReaper removes only the records proven to belong to
@@ -542,10 +613,10 @@ func unregisterContainerReaper(cfg *config, name, creation, uid string) {
 		return
 	}
 	if uid != "" && cfg.eng.name() == "docker" {
-		_ = unregisterWithGlobalReaper(target.binary, uid, "")
+		_ = unregisterWithGlobalReaperKey(target.reaperKey, uid, "")
 	}
 	if name != "" {
-		_ = unregisterWithGlobalReaper(target.binary, name, creation)
+		_ = unregisterWithGlobalReaperKey(target.reaperKey, name, creation)
 	}
 }
 
@@ -557,7 +628,7 @@ func protectReuseReaper(cfg *config) {
 	// markShared updates the in-memory state before attempting the pipe
 	// write. Thus even a failed transition fails closed: the record is
 	// non-destructive and is replayed as shared on the next child.
-	_ = markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+	_ = markSharedWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 }
 
 // runCreateLocked serializes an Apple name-addressed create with the
@@ -1030,11 +1101,11 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		if len(c.published) > 0 {
 			return "", dockerNetworkEndpointError(info.networkMode)
 		}
-		return c.eng.defaultHost(), nil
+		return c.TargetHost(), nil
 	}
 	if len(c.published) > 0 {
 		p := c.published[0]
-		b, ok := matchingPublishedBinding(info.bound, p)
+		b, ok := matchingPublishedBinding(info.bound, p, c.eng)
 		if !ok {
 			c.clearDynamic()
 			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
@@ -1045,7 +1116,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		}
 		return host, nil
 	}
-	return c.eng.defaultHost(), nil
+	return c.TargetHost(), nil
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
@@ -1114,7 +1185,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		return "", 0, err
 	}
 	if published != nil {
-		b, ok := matchingPublishedBinding(info.bound, *published)
+		b, ok := matchingPublishedBinding(info.bound, *published, c.eng)
 		if !ok {
 			c.clearDynamic()
 			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
@@ -1125,7 +1196,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		}
 		return host, b.hostPort, nil
 	}
-	if b, ok := matchingExposedBinding(info.bound, spec); ok {
+	if b, ok := matchingExposedBinding(info.bound, spec, c.eng); ok {
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
 			return "", 0, err

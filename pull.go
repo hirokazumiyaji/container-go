@@ -174,14 +174,9 @@ func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	}
 	runner := cfg.runner
 	if runner == nil {
-		bin := cfg.binary
-		if bin == "" {
-			bin = eng.binary()
-		}
-		runner = &cli.ExecRunner{Binary: bin}
-	} else if cfg.binary != "" {
-		applyBinaryToRunner(runner, cfg.binary)
+		runner = defaultRunnerFor(eng)
 	}
+	applyBinaryToRunner(runner, cfg.binary)
 	return safePublicError(pullWith(ctx, runner, eng, image))
 }
 
@@ -193,18 +188,23 @@ func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error
 	if err := eng.checkConfig(ctx, cfg); err != nil {
 		return err
 	}
-	return doErr(ctx, &imageFlights, flightKey(eng, image, flightPull, cfg.platform), func() error {
+	resolvedEng := cfg.eng
+	return doErr(ctx, &imageFlights, flightKey(resolvedEng, image, flightPull, cfg.platform), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), runTimeout)
 		defer cancel()
-		return pullImage(execCtx, r, eng, image, cfg.platform)
+		return pullImage(execCtx, r, resolvedEng, image, cfg.platform)
 	})
 }
 
-// flightKey identifies the pull being aggregated: one backend, one
+// flightKey identifies the pull being aggregated: one backend target, one
 // image, one operation kind, one platform. Same image with different
-// platforms must not share a flight.
+// backends, targets, or platforms must not share a flight.
 func flightKey(eng engine, image, op, platform string) string {
-	return eng.name() + "\x00" + image + "\x00" + op + "\x00" + platform
+	target := ""
+	if eng != nil {
+		target = eng.name() + "\x00" + eng.targetID()
+	}
+	return target + "\x00" + image + "\x00" + op + "\x00" + platform
 }
 
 // imageFlights aggregates concurrent image fetches across the process.

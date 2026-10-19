@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -19,11 +20,99 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/strictjson"
 )
 
+type dockerTargetEndpoint struct {
+	rawHost    string
+	scheme     string
+	host       string
+	isRemote   bool
+	clientHost string
+	context    string
+}
+
 // dockerEngine drives the `docker` CLI. Unlike Apple Container, the
 // container IP is generally not reachable from the host (Docker
 // Desktop), so on publishable network modes exposed ports are published
 // to daemon-assigned loopback ports and endpoints resolve to those.
-type dockerEngine struct{}
+type dockerEngine struct {
+	explicitTarget          bool
+	explicitHost            bool
+	explicitContext         bool
+	explicitConfigDir       bool
+	explicitDefaultPlatform bool
+	host                    string
+	context                 string
+	configDir               string
+	defaultPlatform         string
+	resolvedTarget          *dockerTargetEndpoint
+}
+
+func newDockerEngine(host, context, configDir, defaultPlatform string) dockerEngine {
+	return dockerEngine{
+		explicitTarget:          true,
+		explicitHost:            host != "",
+		explicitContext:         context != "",
+		explicitConfigDir:       configDir != "",
+		explicitDefaultPlatform: defaultPlatform != "",
+		host:                    host,
+		context:                 context,
+		configDir:               configDir,
+		defaultPlatform:         defaultPlatform,
+	}
+}
+
+func (e dockerEngine) effectiveHost() string {
+	if e.explicitHost || e.host != "" {
+		return e.host
+	}
+	return os.Getenv("DOCKER_HOST")
+}
+
+func (e dockerEngine) effectiveContext() string {
+	if e.explicitContext || e.context != "" {
+		return e.context
+	}
+	if env := os.Getenv("DOCKER_CONTEXT"); env != "" {
+		return env
+	}
+	if e.resolvedTarget != nil && e.resolvedTarget.context != "" {
+		return e.resolvedTarget.context
+	}
+	return ""
+}
+
+func (e dockerEngine) effectiveConfigDir() string {
+	if e.explicitConfigDir || e.configDir != "" {
+		return e.configDir
+	}
+	return os.Getenv("DOCKER_CONFIG")
+}
+
+func (e dockerEngine) effectiveDefaultPlatform() string {
+	if e.explicitDefaultPlatform || e.defaultPlatform != "" {
+		return e.defaultPlatform
+	}
+	return os.Getenv("DOCKER_DEFAULT_PLATFORM")
+}
+
+func (e dockerEngine) targetEnv() []string {
+	var env []string
+	if e.explicitHost && !e.explicitContext {
+		if host := e.effectiveHost(); host != "" {
+			env = append(env, "DOCKER_HOST="+host)
+		}
+	} else if ctx := e.effectiveContext(); ctx != "" {
+		env = append(env, "DOCKER_CONTEXT="+ctx)
+	} else if host := e.effectiveHost(); host != "" {
+		env = append(env, "DOCKER_HOST="+host)
+	}
+	if cfg := e.effectiveConfigDir(); cfg != "" {
+		env = append(env, "DOCKER_CONFIG="+cfg)
+	}
+	if plat := e.effectiveDefaultPlatform(); plat != "" {
+		env = append(env, "DOCKER_DEFAULT_PLATFORM="+plat)
+	}
+	return env
+}
 
 // Docker parses stop --time through a signed integer. Cap the value at
 // MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
@@ -72,11 +161,30 @@ func (dockerEngine) requiresImmutableID() bool { return true }
 // context chosen only via `docker context use` with no env remains
 // invisible here, matching the library's existing DOCKER_HOST-only
 // remote detection.
-func (dockerEngine) imageStoreID() string {
-	return normalizeDockerHost(os.Getenv("DOCKER_HOST")) + "\x00" +
-		os.Getenv("DOCKER_CONTEXT") + "\x00" +
-		os.Getenv("DOCKER_CONFIG") + "\x00" +
-		os.Getenv("DOCKER_DEFAULT_PLATFORM")
+func (e dockerEngine) imageStoreID() string {
+	rawHost := e.effectiveHost()
+	if rawHost == "" && e.resolvedTarget != nil {
+		rawHost = e.resolvedTarget.rawHost
+	}
+	return normalizeDockerHost(rawHost) + "\x00" +
+		e.effectiveContext() + "\x00" +
+		e.effectiveConfigDir() + "\x00" +
+		e.effectiveDefaultPlatform()
+}
+
+func (e dockerEngine) targetID() string {
+	storeID := e.imageStoreID()
+	if storeID == "\x00\x00\x00" {
+		return ""
+	}
+	return "docker\x00" + storeID
+}
+
+func (e dockerEngine) isRemote() bool {
+	if e.resolvedTarget != nil {
+		return e.resolvedTarget.isRemote
+	}
+	return isRemoteDockerHostValue(e.effectiveHost())
 }
 
 // dockerDefaultNetwork asks the daemon which platform default it exposes.
@@ -109,7 +217,7 @@ var dockerVolumeNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]+$`)
 // checkConfig rejects options Docker cannot honor before any image or
 // container command is issued, including volume names and publish
 // options that cannot be honored on the selected network.
-func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
+func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	// Docker's local volume driver adds a minimum length to the shared name
 	// grammar. Apple Container accepts names (for example, one-character
 	// names) that Docker rejects, so this check stays backend-specific.
@@ -142,7 +250,16 @@ func (dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 			return dockerPublishOptionError(network, "WithExposedPorts")
 		}
 	}
-	if isRemoteDockerHost() {
+
+	resolvedEng, err := e.resolveTarget(ctx, cfg.runner)
+	if err != nil {
+		return err
+	}
+	e = resolvedEng
+	cfg.eng = resolvedEng
+	applyEngineRunnerEnv(cfg)
+
+	if e.isRemote() {
 		// The CLI does not expose the daemon OS or shared filesystem, so reject
 		// every remote bind mount conservatively: Docker resolves the source
 		// on the daemon host, and this library cannot verify that a client
@@ -522,31 +639,24 @@ func dockerWindowsNpipeUnavailable(text string) bool {
 }
 
 // defaultHost returns the address the client should dial to reach the
-// container. For a remote daemon that is the DOCKER_HOST host; otherwise it is
+// container. For a remote daemon that is the remote endpoint host; otherwise it is
 // this machine's loopback.
 //
 // Unlike the auto-publish bind decision, this must be scheme-aware for every
 // remote transport. A client told to dial 127.0.0.1 for a container published
 // on a remote daemon reaches nothing, which is the exact symptom the remote
-// detection exists to prevent. Note: a `docker context` pointing at a remote
-// daemon is not detected; only DOCKER_HOST is honored.
-func (dockerEngine) defaultHost() string {
-	host := dockerHostName()
-	if host == "" {
-		return "127.0.0.1"
+// detection exists to prevent. Both DOCKER_HOST and Docker contexts (active
+// or explicitly configured) are resolved.
+func (e dockerEngine) defaultHost() string {
+	if e.resolvedTarget != nil {
+		return e.resolvedTarget.clientHost
 	}
-	canonical := canonicalIP(host)
-	if ipIsUnspecified(canonical) {
-		if ipIs4(canonical) {
-			return "127.0.0.1"
+	host := e.effectiveHost()
+	if host != "" {
+		ep, err := parseDockerEndpoint(host)
+		if err == nil {
+			return ep.clientHost
 		}
-		return "::1"
-	}
-	if isRemoteDockerHost() {
-		if canonical != "" {
-			return canonical
-		}
-		return host
 	}
 	return "127.0.0.1"
 }
@@ -570,14 +680,338 @@ func normalizeDockerHost(raw string) string {
 	return "tcp://" + raw
 }
 
-// dockerHostName returns the hostname DOCKER_HOST names, or "" when it names
-// no host (a local socket, or an unparsable value).
-func dockerHostName() string {
-	u, err := url.Parse(normalizeDockerHost(os.Getenv("DOCKER_HOST")))
-	if err != nil {
-		return ""
+func parseDockerEndpoint(raw string) (dockerTargetEndpoint, error) {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return dockerTargetEndpoint{
+			rawHost:    "",
+			scheme:     "unix",
+			host:       "",
+			isRemote:   false,
+			clientHost: "127.0.0.1",
+		}, nil
 	}
-	return u.Hostname()
+	normalized := normalizeDockerHost(trimmed)
+	u, err := url.Parse(normalized)
+	if err != nil {
+		return dockerTargetEndpoint{}, fmt.Errorf("malformed Docker endpoint %q: %w", raw, err)
+	}
+	scheme := strings.ToLower(u.Scheme)
+	switch scheme {
+	case "unix", "npipe", "fd":
+		return dockerTargetEndpoint{
+			rawHost:    trimmed,
+			scheme:     scheme,
+			host:       "",
+			isRemote:   false,
+			clientHost: "127.0.0.1",
+		}, nil
+	case "tcp", "http", "https":
+		host := u.Hostname()
+		if host == "" {
+			return dockerTargetEndpoint{
+				rawHost:    trimmed,
+				scheme:     scheme,
+				host:       "",
+				isRemote:   false,
+				clientHost: "127.0.0.1",
+			}, nil
+		}
+		canonical := canonicalIP(host)
+		if isLoopbackOrUnspecified(host) {
+			clientHost := "127.0.0.1"
+			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
+				clientHost = "::1"
+			}
+			return dockerTargetEndpoint{
+				rawHost:    trimmed,
+				scheme:     scheme,
+				host:       host,
+				isRemote:   false,
+				clientHost: clientHost,
+			}, nil
+		}
+		clientHost := host
+		if canonical != "" {
+			clientHost = canonical
+		}
+		return dockerTargetEndpoint{
+			rawHost:    trimmed,
+			scheme:     scheme,
+			host:       host,
+			isRemote:   true,
+			clientHost: clientHost,
+		}, nil
+	case "ssh":
+		host := u.Hostname()
+		if host == "" {
+			return dockerTargetEndpoint{}, fmt.Errorf("docker ssh endpoint %q missing host", raw)
+		}
+		canonical := canonicalIP(host)
+		if isLoopbackOrUnspecified(host) {
+			clientHost := "127.0.0.1"
+			if ipIsUnspecified(canonical) && !ipIs4(canonical) {
+				clientHost = "::1"
+			}
+			return dockerTargetEndpoint{
+				rawHost:    trimmed,
+				scheme:     scheme,
+				host:       host,
+				isRemote:   false,
+				clientHost: clientHost,
+			}, nil
+		}
+		clientHost := host
+		if canonical != "" {
+			clientHost = canonical
+		}
+		return dockerTargetEndpoint{
+			rawHost:    trimmed,
+			scheme:     scheme,
+			host:       host,
+			isRemote:   true,
+			clientHost: clientHost,
+		}, nil
+	default:
+		return dockerTargetEndpoint{}, fmt.Errorf("%w: unsupported Docker endpoint scheme %q", ErrInvalidConfig, scheme)
+	}
+}
+
+// isRemoteDockerHostValue reports whether the supplied DOCKER_HOST points at a
+// daemon that may live on another machine.
+func isRemoteDockerHostValue(rawHost string) bool {
+	ep, err := parseDockerEndpoint(rawHost)
+	if err != nil {
+		return true
+	}
+	return ep.isRemote
+}
+
+type dockerContextInspect struct {
+	Name      string `json:"Name"`
+	Endpoints map[string]struct {
+		Host string `json:"Host"`
+	} `json:"Endpoints"`
+}
+
+func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
+	eenv, ok := runner.(interface{ ExternalEnv() []string })
+	if !ok {
+		return "", false
+	}
+	env := eenv.ExternalEnv()
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return env[i][len(prefix):], true
+		}
+	}
+	return "", false
+}
+
+type dockerContextUnavailableError struct {
+	detail string
+}
+
+func (e *dockerContextUnavailableError) Error() string {
+	return "docker context command unavailable: " + e.detail
+}
+
+func isDockerContextUnavailable(err error, stderr string) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(stderr + " " + err.Error())
+	return strings.Contains(msg, "unknown command") ||
+		strings.Contains(msg, "is not a docker command") ||
+		strings.Contains(msg, "unexpected command") ||
+		strings.Contains(msg, "not supported") ||
+		strings.Contains(msg, "command not found") ||
+		strings.Contains(msg, "executable file not found")
+}
+
+func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contextName string) (string, string, error) {
+	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+
+	var args []string
+	if contextName != "" {
+		args = []string{"context", "inspect", contextName}
+	} else {
+		args = []string{"context", "inspect"}
+	}
+
+	stdout, stderr, err := runner.Run(qCtx, args...)
+	if err != nil {
+		if ctx.Err() != nil {
+			return "", "", ctx.Err()
+		}
+		if qCtx.Err() != nil {
+			return "", "", fmt.Errorf("inspect Docker context timed out: %w", qCtx.Err())
+		}
+		errMsg := strings.TrimSpace(string(stderr))
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		if isDockerContextUnavailable(err, errMsg) {
+			return "", "", &dockerContextUnavailableError{detail: errMsg}
+		}
+		if contextName != "" {
+			return "", "", &ConfigError{
+				Backend: "docker",
+				Option:  "WithContext",
+				Detail:  fmt.Sprintf("unknown Docker context %q: %s", contextName, errMsg),
+			}
+		}
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "context",
+			Detail:  fmt.Sprintf("failed to inspect active Docker context: %s", errMsg),
+		}
+	}
+
+	if len(strings.TrimSpace(string(stdout))) == 0 {
+		if contextName == "" {
+			return "", "", &dockerContextUnavailableError{detail: "empty context inspect output"}
+		}
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  fmt.Sprintf("Docker context %q not found", contextName),
+		}
+	}
+
+	var contexts []dockerContextInspect
+	if err := json.Unmarshal(stdout, &contexts); err != nil {
+		return "", "", fmt.Errorf("decode Docker context inspect output: %w", err)
+	}
+	if len(contexts) == 0 {
+		detail := "no context returned from Docker inspect"
+		if contextName != "" {
+			detail = fmt.Sprintf("Docker context %q not found", contextName)
+		}
+		return "", "", &ConfigError{
+			Backend: "docker",
+			Option:  "WithContext",
+			Detail:  detail,
+		}
+	}
+	endpointHost := contexts[0].Endpoints["docker"].Host
+	if endpointHost == "" {
+		if runtime.GOOS == "windows" {
+			endpointHost = "npipe:////./pipe/docker_engine"
+		} else {
+			endpointHost = "unix:///var/run/docker.sock"
+		}
+	}
+	resolvedName := contextName
+	if resolvedName == "" && len(contexts) > 0 {
+		resolvedName = contexts[0].Name
+	}
+	return resolvedName, endpointHost, nil
+}
+
+func (e dockerEngine) resolveTarget(ctx context.Context, runner cli.Runner) (dockerEngine, error) {
+	if e.resolvedTarget != nil && e.explicitTarget {
+		return e, nil
+	}
+
+	effectiveHost := e.effectiveHost()
+	runnerHasHost := false
+	if !e.explicitHost {
+		if val, ok := runnerEnvLookup(runner, "DOCKER_HOST"); ok {
+			effectiveHost = val
+			runnerHasHost = true
+		}
+	}
+
+	effectiveCtx := e.effectiveContext()
+	runnerHasContext := false
+	if !e.explicitContext {
+		if val, ok := runnerEnvLookup(runner, "DOCKER_CONTEXT"); ok {
+			effectiveCtx = val
+			runnerHasContext = true
+		}
+	}
+
+	resolvedCtx := effectiveCtx
+	var targetHost string
+
+	if e.explicitHost && !e.explicitContext {
+		// Explicit host requested by caller takes precedence over ambient context.
+		targetHost = effectiveHost
+	} else if effectiveCtx != "" {
+		if runner == nil {
+			return e, &ConfigError{
+				Backend: "docker",
+				Option:  "WithContext",
+				Detail:  fmt.Sprintf("cannot inspect Docker context %q without runner", effectiveCtx),
+			}
+		}
+		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, effectiveCtx)
+		if err != nil {
+			return e, err
+		}
+		// Docker context takes precedence over DOCKER_HOST.
+		targetHost = ctxEndpoint
+		if ctxName != "" {
+			resolvedCtx = ctxName
+		}
+	} else if effectiveHost != "" {
+		// No context set, explicit or ambient host is target.
+		targetHost = effectiveHost
+	} else if runner != nil {
+		// Neither context nor host is set: inspect active context.
+		ctxName, ctxEndpoint, err := resolveDockerContextEndpoint(ctx, runner, "")
+		if err != nil {
+			var unavail *dockerContextUnavailableError
+			if errors.As(err, &unavail) {
+				// The CLI or runner does not support `docker context`; fall back to default local socket.
+				targetHost = ""
+			} else {
+				return e, err
+			}
+		} else {
+			targetHost = ctxEndpoint
+			if ctxName != "" {
+				resolvedCtx = ctxName
+			}
+		}
+	}
+
+	ep, err := parseDockerEndpoint(targetHost)
+	if err != nil {
+		option := "WithDockerHost"
+		if effectiveCtx != "" {
+			option = "WithContext"
+		}
+		return e, &ConfigError{
+			Backend: "docker",
+			Option:  option,
+			Detail:  err.Error(),
+		}
+	}
+
+	clone := e
+	if resolvedCtx != "" {
+		ep.context = resolvedCtx
+	}
+	clone.resolvedTarget = &ep
+	if e.explicitHost && !e.explicitContext {
+		clone.host = effectiveHost
+		clone.explicitHost = true
+		clone.explicitTarget = true
+	} else if e.explicitContext || runnerHasContext {
+		clone.context = resolvedCtx
+		clone.host = ""
+		clone.explicitContext = true
+		clone.explicitTarget = true
+	} else if runnerHasHost && targetHost == effectiveHost {
+		clone.host = effectiveHost
+		clone.explicitHost = true
+		clone.explicitTarget = true
+	}
+	return clone, nil
 }
 
 // isRemoteDockerHost reports whether DOCKER_HOST points at a daemon that may
@@ -603,30 +1037,7 @@ func dockerHostName() string {
 // only through a ProxyJump or bastion needs a manual `ssh -L` forward, which
 // is outside what DOCKER_HOST can express.
 func isRemoteDockerHost() bool {
-	raw := normalizeDockerHost(os.Getenv("DOCKER_HOST"))
-	if raw == "" {
-		return false
-	}
-	// These transports name a socket on this machine. fd:// (systemd
-	// socket activation) yields an empty hostname from url.Parse; list it
-	// with the other local sockets so the classification does not depend
-	// on the empty-host TCP fallback below.
-	for _, local := range []string{"unix://", "npipe://", "fd://"} {
-		if strings.HasPrefix(strings.ToLower(raw), local) {
-			return false
-		}
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return true
-	}
-	host := u.Hostname()
-	if host == "" {
-		// Docker's ParseTCPAddr does `if host == "" { host = defaultAddr.Hostname() }`.
-		// That default is this machine, so tcp://:2375 / :2375 are local.
-		return false
-	}
-	return !isLoopbackOrUnspecified(host)
+	return isRemoteDockerHostValue(os.Getenv("DOCKER_HOST"))
 }
 
 // isLoopbackOrUnspecified reports addresses that mean "this host" and
@@ -642,9 +1053,12 @@ func isLoopbackOrUnspecified(addr string) bool {
 func dockerConnectHost(addr string, eng engine) string {
 	canonical := canonicalIP(addr)
 	if canonical == "" {
-		return eng.defaultHost()
+		if eng != nil {
+			return eng.defaultHost()
+		}
+		return "127.0.0.1"
 	}
-	if isRemoteDockerHost() && isLoopbackOrUnspecified(canonical) {
+	if eng != nil && eng.isRemote() && isLoopbackOrUnspecified(canonical) {
 		return eng.defaultHost()
 	}
 	if ipIsUnspecified(canonical) {
@@ -657,7 +1071,7 @@ func dockerConnectHost(addr string, eng engine) string {
 }
 
 func dockerBindingConnectHost(b boundPort, eng engine) (string, error) {
-	if isRemoteDockerHost() && ipIsLoopback(b.hostAddr) {
+	if eng != nil && eng.isRemote() && ipIsLoopback(b.hostAddr) {
 		return "", fmt.Errorf("%w: Docker port %d is bound to remote-daemon loopback %q", ErrEndpointUnreachable, b.hostPort, canonicalIP(b.hostAddr))
 	}
 	return dockerConnectHost(b.hostAddr, eng), nil
@@ -672,7 +1086,7 @@ func (e dockerEngine) runArgs(cfg *config, image, envFile string) []string {
 	// remote daemon it binds all interfaces so the client can reach it
 	// via defaultHost().
 	bindAddr := "127.0.0.1"
-	if isRemoteDockerHost() {
+	if e.isRemote() {
 		bindAddr = "0.0.0.0"
 	}
 	// checkConfig rejects these combinations before Run reaches this

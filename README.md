@@ -125,9 +125,8 @@ Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
 
 The library shells out to the backend CLI (`container` or `docker`) — no
 cgo and no daemon API client. `DOCKER_HOST`, contexts, and registry auth
-are handled by the docker CLI itself. The library uses only
-`DOCKER_HOST=tcp://...` to select a remote Docker endpoint; a remote
-Docker context is not detected.
+are handled by the docker CLI itself. The library resolves remote endpoints from
+`DOCKER_HOST` or the active/configured Docker context (supporting `tcp://` and `ssh://` transports).
 
 Go 1.26+ is required for the root module. The optional nested
 `bench/` benchmark module requires Go 1.26+ because it depends on the
@@ -295,9 +294,9 @@ Assignment happens atomically in the daemon, so parallel tests do not race
 over ports here either. With a detected non-loopback
 `DOCKER_HOST=tcp://...` daemon, an explicit `WithPublishedPort` bound to
 loopback (`127.0.0.1:...`, `[::1]:...`) is rejected, since it would only
-listen on the remote machine. Only
-`DOCKER_HOST` is honored; a `docker context` pointing at a remote daemon
-is not detected.
+listen on the remote machine. Both `DOCKER_HOST` and Docker contexts
+(active or explicitly configured via `WithDockerContext` / `WithClientDockerContext`)
+are detected and resolved for remote daemons.
 testcontainers model. Locally this binds loopback
 (`-p 127.0.0.1::<port>`); with a remote `DOCKER_HOST` it binds all
 interfaces (`-p 0.0.0.0::<port>`) so the client can reach it. Remote
@@ -356,8 +355,8 @@ and reuse operations inspect that ID; dynamic network, IP, and binding
 data are refreshed on every operation rather than served from a stale
 snapshot.
 
-Only `DOCKER_HOST` is honored for host reachability; a `docker context`
-pointing at a remote daemon is not used to rewrite endpoint hosts.
+Both `DOCKER_HOST` and Docker contexts are honored for host reachability;
+endpoint hosts resolve to the detected remote endpoint.
 
 For a local Docker daemon, when a client insists on `localhost` (or the
 container IP is not reachable in your setup), publish the port

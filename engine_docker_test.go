@@ -543,7 +543,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 		runner:  runner,
 		eng:     dockerEngine{},
 		exposed: []portSpec{{port: 6379, proto: "tcp"}},
-		sync: &lockPack{uid: dockerFixtureID},
+		sync:    &lockPack{uid: dockerFixtureID},
 	}
 
 	start := make(chan struct{})
@@ -1198,7 +1198,7 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 			return d.inspectResponses[index], nil, nil
 		}
 		return d.inspectJSON, nil, nil
-	case "image", "pull":
+	case "image", "pull", "context":
 		return d.fakeRunner.Run(ctx, args...)
 	default:
 		return nil, nil, nil

@@ -47,6 +47,7 @@ type fakeRunner struct {
 	binary                string
 	envFiles              []string // contents of --env-file captured at call time
 	inspectJSON           string
+	contextJSON           string
 	inspectResponses      []string // sequential inspect bodies for refresh tests
 	inspectCalls          int
 	failPrefix            string // fail calls whose first arg matches
@@ -59,6 +60,11 @@ type fakeRunner struct {
 	pullCalls    int
 	runPlatform  string
 	creations    map[string]string // container name -> creation generation from run args
+	env          []string
+}
+
+func (f *fakeRunner) ExternalEnv() []string {
+	return f.env
 }
 
 func (f *fakeRunner) binaryName() string {
@@ -95,6 +101,22 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return []byte("ok"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
+	}
+	if args[0] == "context" {
+		if f.failPrefix == "context" {
+			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: f.failStderr}
+		}
+		if f.contextJSON != "" {
+			return []byte(f.contextJSON), nil, nil
+		}
+		name := "default"
+		if len(args) > 2 && args[2] != "" {
+			name = args[2]
+			if name == "nonexistent" {
+				return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: fmt.Sprintf("context %q: context not found", name)}
+			}
+		}
+		return []byte(fmt.Sprintf(`[{"Name":%q,"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`, name)), nil, nil
 	}
 	// Image handling for both backends: docker inspects via
 	// `image inspect` and pulls via `pull`; apple uses

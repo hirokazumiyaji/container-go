@@ -128,11 +128,19 @@ func (c *config) validate() error {
 		}
 		seenFiles[clean] = struct{}{}
 	}
+	return c.validateDockerTarget()
+}
+
+// validateDockerTarget checks the Docker target invariants that depend on the
+// resolved engine. validate() runs before engine detection, when c.eng is
+// still nil for a plain Run, and Run checks the backend again once the engine
+// is known. Values are never echoed: a DOCKER_HOST may carry credentials.
+func (c *config) validateDockerTarget() error {
 	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
-		return validationErrorf("WithDockerHost", nil, "cannot override Docker target options on Client.Run")
+		return validationErrorf(c.dockerTargetOption(), nil, "cannot override Docker target options on Client.Run")
 	}
 	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.name() != "docker" {
-		return validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
+		return validationErrorf(c.dockerTargetOption(), nil, "Docker target options require Docker backend")
 	}
 	if c.reuseAttachTimeout > 0 && !c.reuse {
 		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
@@ -176,6 +184,19 @@ func (c *config) effectiveProbeTimeout() time.Duration {
 		return c.probeTimeout
 	}
 	return 0
+}
+
+// dockerTargetOption names the option that set a target override so a
+// validation error points at the option the caller must change.
+func (c *config) dockerTargetOption() string {
+	switch {
+	case c.dockerContext != nil:
+		return "WithDockerContext"
+	case c.dockerConfigDir != nil:
+		return "WithDockerConfig"
+	default:
+		return "WithDockerHost"
+	}
 }
 
 // allLabels merges the session labels the library always applies with
@@ -883,15 +904,24 @@ func ipIsUnspecified(addr string) bool {
 // for this container.
 func WithDockerHost(host string) Option {
 	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerHost", host); err != nil {
+			return err
+		}
 		c.dockerHost = &host
 		return nil
 	}
 }
 
 // WithDockerContext overrides the target Docker context (DOCKER_CONTEXT)
-// for this container.
+// for this container. A configured context takes precedence over an ambient
+// DOCKER_HOST and over an explicit WithDockerHost when both are set; an
+// explicit host still wins over an ambient context, matching the library's
+// Docker target resolution.
 func WithDockerContext(context string) Option {
 	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerContext", context); err != nil {
+			return err
+		}
 		c.dockerContext = &context
 		return nil
 	}
@@ -901,7 +931,25 @@ func WithDockerContext(context string) Option {
 // for this container.
 func WithDockerConfig(dir string) Option {
 	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerConfig", dir); err != nil {
+			return err
+		}
 		c.dockerConfigDir = &dir
 		return nil
 	}
+}
+
+// validateDockerTargetValue rejects Docker target values that cannot be passed
+// to a child process safely or that are too large to redact from streamed
+// diagnostics. The rejected value is never echoed. An empty value is accepted
+// on purpose: it pins the target as explicitly unset, so a DOCKER_HOST that
+// appears later cannot repoint the child.
+func validateDockerTargetValue(option, value string) error {
+	if err := validateEnvValue(value); err != nil {
+		return newValidationErrorWithField(option, "value", nil, fmt.Errorf("has an invalid value: %w", err))
+	}
+	if len(value) > cli.MaxStreamOverlap || !cli.StreamValueFits(value) {
+		return invalidOption(option, "value is too large to redact safely from streamed diagnostics")
+	}
+	return nil
 }

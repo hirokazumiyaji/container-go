@@ -2,6 +2,7 @@ package container
 
 import (
 	"context"
+	"errors"
 	"os"
 	"runtime"
 	"strings"
@@ -391,6 +392,153 @@ func (r *recordingRunner) Run(_ context.Context, args ...string) ([]byte, []byte
 		return []byte(""), nil, nil
 	}
 	return []byte(""), nil, nil
+}
+
+func TestClientPinsAbsentDockerEnvComponents(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+
+	client, err := NewClient(WithClientBackend("docker"))
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	er, ok := client.runner.(*cli.ExecRunner)
+	if !ok {
+		t.Fatalf("client.runner is %T, want *cli.ExecRunner", client.runner)
+	}
+
+	// The client froze the default local target, so a DOCKER_HOST exported
+	// after construction must not reach the child CLI.
+	t.Setenv("DOCKER_HOST", "tcp://late-daemon:2375")
+	for _, entry := range cli.MergeEnv(os.Environ(), er.Env) {
+		if strings.HasPrefix(entry, "DOCKER_HOST=") {
+			t.Fatalf("client runner inherited a later DOCKER_HOST: %q", entry)
+		}
+	}
+}
+
+func TestRunPinsAbsentDockerEnvComponents(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+
+	cfg := &config{eng: dockerEngine{}, runner: &cli.ExecRunner{Binary: "docker"}}
+	applyEngineRunnerEnv(cfg)
+	er, ok := cfg.runner.(*cli.ExecRunner)
+	if !ok {
+		t.Fatalf("cfg.runner is %T, want *cli.ExecRunner", cfg.runner)
+	}
+
+	t.Setenv("DOCKER_HOST", "tcp://late-daemon:2375")
+	for _, entry := range cli.MergeEnv(os.Environ(), er.Env) {
+		if strings.HasPrefix(entry, "DOCKER_HOST=") {
+			t.Fatalf("run runner inherited a later DOCKER_HOST: %q", entry)
+		}
+	}
+}
+
+func TestClientBinaryIsTrimmed(t *testing.T) {
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientBinary("  /opt/bin/docker  "),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	er, ok := client.runner.(*cli.ExecRunner)
+	if !ok {
+		t.Fatalf("client.runner is %T, want *cli.ExecRunner", client.runner)
+	}
+	if er.Binary != "/opt/bin/docker" {
+		t.Errorf("client binary = %q, want /opt/bin/docker", er.Binary)
+	}
+}
+
+func TestDockerTargetValuesRejectUnsafeInput(t *testing.T) {
+	cfg := newConfig()
+	long := strings.Repeat("a", cli.MaxStreamOverlap+1)
+
+	for _, tt := range []struct {
+		name string
+		opt  Option
+	}{
+		{"host line break", WithDockerHost("tcp://daemon\ninjected")},
+		{"host NUL", WithDockerHost("tcp://daemon\x00")},
+		{"oversized context", WithDockerContext(long)},
+		{"oversized config", WithDockerConfig(long)},
+	} {
+		if err := tt.opt(cfg); err == nil {
+			t.Errorf("%s: option accepted an unsafe value", tt.name)
+		}
+	}
+}
+
+func TestDockerTargetValuesAreRedacted(t *testing.T) {
+	const host = "tcp://user:secret-token@daemon-a:2375"
+
+	cfg := &config{}
+	if err := WithDockerHost(host)(cfg); err != nil {
+		t.Fatalf("WithDockerHost: %v", err)
+	}
+	err := cfg.publicError(errors.New("cannot connect to " + host))
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Errorf("docker host credentials leaked into public error: %v", err)
+	}
+}
+
+func TestClientTargetValuesAreRedacted(t *testing.T) {
+	const host = "tcp://user:secret-token@daemon-a:2375"
+
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost(host),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	// Client.Run freezes the target on the engine, so the engine-resolved
+	// value must be redacted from public errors too.
+	cfg := &config{eng: client.eng}
+	err = cfg.publicError(errors.New("cannot connect to " + host))
+	if strings.Contains(err.Error(), "secret-token") {
+		t.Errorf("client target credentials leaked into public error: %v", err)
+	}
+}
+
+func TestOversizedDockerTargetValueIsNotRegisteredForRedaction(t *testing.T) {
+	huge := "tcp://" + strings.Repeat("a", cli.MaxStreamOverlap)
+	cfg := &config{eng: newDockerEngine(huge, "", "", "")}
+	for _, value := range cfg.diagnosticValues() {
+		if len(value) > cli.MaxStreamOverlap {
+			t.Fatalf("oversized docker target value reached the stream redactor: %d bytes", len(value))
+		}
+	}
+
+	cfg = &config{eng: newDockerEngine("tcp://daemon-a:2375", "", "", "")}
+	found := false
+	for _, value := range cfg.diagnosticValues() {
+		if value == "tcp://daemon-a:2375" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("engine-resolved docker target value is missing from the redaction registry")
+	}
+}
+
+func TestDockerTargetValidationNamesTheOption(t *testing.T) {
+	dockerCtx, dir := "remote-ctx", "/custom/cfg"
+
+	contextOnly := &config{eng: appleEngine{}, dockerContext: &dockerCtx}
+	var valErr *ValidationError
+	if err := contextOnly.validate(); !errors.As(err, &valErr) || valErr.Option != "WithDockerContext" {
+		t.Errorf("validate() = %v, want a ValidationError for WithDockerContext", err)
+	}
+
+	nonDocker := &config{eng: appleEngine{}, dockerConfigDir: &dir}
+	valErr = nil
+	if err := nonDocker.validate(); !errors.As(err, &valErr) || valErr.Option != "WithDockerConfig" {
+		t.Errorf("validate() = %v, want a ValidationError for WithDockerConfig", err)
+	}
 }
 
 func TestClientPullAndPrune(t *testing.T) {

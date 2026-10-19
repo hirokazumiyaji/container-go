@@ -30,6 +30,28 @@ func (c *config) diagnosticValues() []string {
 	for _, published := range c.published {
 		values = append(values, published.raw)
 	}
+	if c.dockerHost != nil {
+		values = append(values, *c.dockerHost)
+	}
+	if c.dockerContext != nil {
+		values = append(values, *c.dockerContext)
+	}
+	if c.dockerConfigDir != nil {
+		values = append(values, *c.dockerConfigDir)
+	}
+	// Client.Run freezes the target on the engine and leaves the config
+	// fields above nil, so cover an engine-resolved target as well. The
+	// platform is left visible: it is diagnostic context, not a secret.
+	// Environment-sourced values did not pass option validation, so skip
+	// any value the bounded streaming window cannot redact instead of
+	// making every stream on this handle fail.
+	if de, ok := c.eng.(dockerEngine); ok {
+		for _, value := range []string{de.effectiveHost(), de.effectiveContext(), de.effectiveConfigDir()} {
+			if value != "" && len(value) <= cli.MaxStreamOverlap && cli.StreamValueFits(value) {
+				values = append(values, value)
+			}
+		}
+	}
 	values = append(values, c.waitDiagnosticValues()...)
 	return uniqueStrings(values)
 }

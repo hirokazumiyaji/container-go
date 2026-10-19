@@ -527,6 +527,82 @@ func (r *blockingDockerInspectRunner) targets() []string {
 	return slices.Clone(r.inspectTarget)
 }
 
+func TestDockerPinnedTargetEnvCoversEveryComponent(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://daemon-a:2375")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", "")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "")
+
+	env := dockerEngine{}.pinnedTargetEnv()
+	want := []string{
+		"DOCKER_HOST=tcp://daemon-a:2375",
+		"DOCKER_CONTEXT",
+		"DOCKER_CONFIG",
+		"DOCKER_DEFAULT_PLATFORM",
+	}
+	if !slices.Equal(env, want) {
+		t.Fatalf("pinnedTargetEnv() = %v, want %v", env, want)
+	}
+
+	// The bare keys remove the inherited entries, so a variable exported
+	// after the target was frozen cannot repoint the child.
+	merged := cli.MergeEnv([]string{
+		"DOCKER_HOST=tcp://late:2375",
+		"DOCKER_CONTEXT=late",
+		"DOCKER_CONFIG=/late",
+		"DOCKER_DEFAULT_PLATFORM=linux/arm64",
+		"KEEP=1",
+	}, env)
+	got := map[string]string{}
+	for _, entry := range merged {
+		key, value, _ := strings.Cut(entry, "=")
+		got[key] = value
+	}
+	if len(got) != 2 || got["DOCKER_HOST"] != "tcp://daemon-a:2375" || got["KEEP"] != "1" {
+		t.Fatalf("merged env = %v, want the frozen host and KEEP=1 only", merged)
+	}
+}
+
+func TestPinRunnerEnvKeepsRunnerValues(t *testing.T) {
+	runnerEnv := []string{"DOCKER_HOST=tcp://runner-host:2375"}
+	pinned := []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+
+	// A removal marker must not delete a value the runner sets itself, and
+	// the marker has to survive into the runner environment so the
+	// inherited process value is still stripped at exec time.
+	got := pinRunnerEnv(runnerEnv, pinned)
+	want := []string{"DOCKER_HOST=tcp://runner-host:2375", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	got = pinRunnerEnv([]string{"DOCKER_HOST=tcp://old:2375"}, []string{"DOCKER_HOST=tcp://new:2375"})
+	want = []string{"DOCKER_HOST=tcp://new:2375"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	// A duplicate key in the runner environment collapses to the last
+	// occurrence, so first-match lookup cannot prefer a stale value.
+	got = pinRunnerEnv(
+		[]string{"DOCKER_HOST=tcp://stale:2375", "KEEP=1", "DOCKER_HOST=tcp://old:2375"},
+		[]string{"DOCKER_HOST=tcp://new:2375"},
+	)
+	want = []string{"DOCKER_HOST=tcp://new:2375", "KEEP=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	// Re-applying the pinned environment is idempotent: markers are not
+	// duplicated, and a later value replaces a marker in place.
+	pinned = []string{"DOCKER_HOST=tcp://new:2375", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+	once := pinRunnerEnv(nil, pinned)
+	twice := pinRunnerEnv(once, pinned)
+	if !slices.Equal(once, twice) {
+		t.Fatalf("pinRunnerEnv() re-application = %v, want %v", twice, once)
+	}
+}
+
 func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
 	if err != nil {

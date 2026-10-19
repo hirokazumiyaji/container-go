@@ -310,6 +310,13 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		}
 		cfg.eng = eng
 	}
+	// cfg.validate cannot see this combination before the engine is selected:
+	// with no explicit engine it runs while cfg.eng is still nil.
+	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
+		if _, isDocker := cfg.eng.(dockerEngine); !isDocker {
+			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
+		}
+	}
 	if de, ok := cfg.eng.(dockerEngine); ok {
 		if cfg.dockerHost != nil {
 			de.host = *cfg.dockerHost

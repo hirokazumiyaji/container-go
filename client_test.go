@@ -259,6 +259,22 @@ func TestWithDockerHostOptionOnRun(t *testing.T) {
 	}
 }
 
+func TestRunRejectsDockerTargetOptionsOnDetectedAppleBackend(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple Container is available only on macOS")
+	}
+	t.Setenv(backendEnv, "apple")
+	f := newTestRunner()
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithDockerHost("tcp://daemon-a:2375"), withRunner(f))
+	if err == nil {
+		t.Fatal("Run with WithDockerHost on the Apple backend returned no error")
+	}
+	if len(f.calls) != 0 {
+		t.Fatalf("Run invoked the backend before rejecting the option: %v", f.calls)
+	}
+}
+
 func TestDockerOptionsResolveBackendAndPreserveEnv(t *testing.T) {
 	t.Setenv("DOCKER_CONFIG", "/custom/docker/config")
 	t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/amd64")

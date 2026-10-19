@@ -570,6 +570,26 @@ func TestMergeEnvReplacesMatchingKeys(t *testing.T) {
 	}
 }
 
+func TestMergeEnvDeduplicatesAndSkipsMalformedOverrides(t *testing.T) {
+	base := []string{"FOO=1", "BAR=2"}
+	overrides := []string{"BAR=first", "MALFORMED", "=EMPTY", "BAR=second", "NEW=value"}
+
+	got := MergeEnv(base, overrides)
+	want := []string{"FOO=1", "BAR=second", "NEW=value"}
+	if len(got) != len(want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("MergeEnv = %q, want %q", got, want)
+		}
+	}
+
+	if got := MergeEnv(base, []string{"MALFORMED"}); len(got) != len(base) {
+		t.Fatalf("MergeEnv with only malformed overrides = %q, want base %q", got, base)
+	}
+}
+
 type fakeRunner struct {
 	results map[string]fakeResult
 }

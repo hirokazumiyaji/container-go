@@ -1265,23 +1265,34 @@ func containsNonLivenessText(s string) bool {
 }
 
 // MergeEnv merges base environment variables with overrides, ensuring that
-// variables in overrides replace any matching key in base.
+// variables in overrides replace any matching key in base. Malformed
+// overrides without a non-empty key are skipped, and duplicate override keys
+// keep the last value, so the child environment stays deterministic.
 func MergeEnv(base, overrides []string) []string {
 	if len(overrides) == 0 {
 		return append([]string(nil), base...)
 	}
-	res := make([]string, 0, len(base)+len(overrides))
-	overrideKeys := make(map[string]struct{}, len(overrides))
+	deduped := make([]string, 0, len(overrides))
+	position := make(map[string]int, len(overrides))
 	for _, env := range overrides {
 		key, _, ok := strings.Cut(env, "=")
-		if ok {
-			if runtime.GOOS == "windows" {
-				overrideKeys[strings.ToUpper(key)] = struct{}{}
-			} else {
-				overrideKeys[key] = struct{}{}
-			}
+		if !ok || key == "" {
+			continue
 		}
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(key)
+		}
+		if pos, duplicate := position[key]; duplicate {
+			deduped[pos] = env
+			continue
+		}
+		position[key] = len(deduped)
+		deduped = append(deduped, env)
 	}
+	if len(deduped) == 0 {
+		return append([]string(nil), base...)
+	}
+	res := make([]string, 0, len(base)+len(deduped))
 	for _, env := range base {
 		key, _, ok := strings.Cut(env, "=")
 		if ok {
@@ -1289,12 +1300,12 @@ func MergeEnv(base, overrides []string) []string {
 			if runtime.GOOS == "windows" {
 				lookupKey = strings.ToUpper(key)
 			}
-			if _, replaced := overrideKeys[lookupKey]; replaced {
+			if _, replaced := position[lookupKey]; replaced {
 				continue
 			}
 		}
 		res = append(res, env)
 	}
-	res = append(res, overrides...)
+	res = append(res, deduped...)
 	return res
 }

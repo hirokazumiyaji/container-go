@@ -25,8 +25,11 @@ type Configuration struct {
 	// Platform is the platform selected when the container was created.
 	// Older CLI versions may omit it; callers must treat a zero value as
 	// unknown rather than silently treating it as the host platform.
-	Platform     Platform `json:"platform"`
-	CreationDate string   `json:"creationDate"`
+	Platform Platform `json:"platform"`
+	// CreationDate is the timestamp the backend reported for creation.
+	// Omitting the field and reporting an empty value are equivalent: both
+	// mean the time is unknown.
+	CreationDate string `json:"creationDate"`
 }
 
 type Image struct {

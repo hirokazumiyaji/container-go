@@ -116,7 +116,9 @@ func (c *config) validate() error {
 
 // allLabels merges the session labels the library always applies with
 // user-supplied ones. Internal labels always win so callers cannot
-// override the generation used for safe cleanup.
+// override the generation used for safe cleanup. validate rejects
+// WithReuseGroup without WithReuse, which is also what lets BuildLabels
+// decide whether to emit the reuse-group label.
 func (c *config) allLabels() map[string]string {
 	return domain.BuildLabels(domain.LabelConfig{
 		Session:    sessionID(),

@@ -33,6 +33,9 @@ func reservedLabel(key string) bool {
 // BuildLabels merges custom labels with container-go tracking labels.
 // Reserved tracking keys are taken only from cfg so a caller cannot forge
 // ownership or generation metadata through Custom.
+//
+// LabelReuseGroup is emitted only when Reuse is true. A caller that accepts a
+// group without reuse must reject that combination before building labels.
 func BuildLabels(cfg LabelConfig) map[string]string {
 	labels := make(map[string]string, len(cfg.Custom)+5)
 	for k, v := range cfg.Custom {

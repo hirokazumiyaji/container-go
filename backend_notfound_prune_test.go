@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -157,6 +158,7 @@ func TestDeleteStoppedReuseFailsClosedWithoutOwnershipLabels(t *testing.T) {
 }
 
 type applePruneSafetyRunner struct {
+	mu          sync.Mutex
 	listJSON    string
 	inspectJSON string
 	deletes     []string
@@ -169,7 +171,10 @@ func (r *applePruneSafetyRunner) Run(_ context.Context, args ...string) ([]byte,
 	case "inspect":
 		return []byte(r.inspectJSON), nil, nil
 	case "delete":
+		// Prune deletes candidates from several workers at once.
+		r.mu.Lock()
 		r.deletes = append(r.deletes, args[len(args)-1])
+		r.mu.Unlock()
 		return nil, nil, nil
 	default:
 		return nil, nil, nil

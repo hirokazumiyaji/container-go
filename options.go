@@ -18,6 +18,20 @@ import (
 // Option configures Run.
 type Option func(*config) error
 
+// Runner executes one backend CLI invocation.
+type Runner = cli.Runner
+
+// ExecRunner executes backend CLI commands as child processes.
+type ExecRunner = cli.ExecRunner
+
+// ExternalRunner identifies runners that execute the CLI as real child
+// processes for reaper registration.
+type ExternalRunner = cli.ExternalRunner
+
+// Streamer starts a long-lived CLI invocation and exposes its combined
+// stdout and stderr as a stream.
+type Streamer = cli.Streamer
+
 const (
 	// maxMemoryBytes is a portable, backend-neutral ceiling. Individual
 	// backends may enforce a smaller capability limit in checkConfig.
@@ -29,6 +43,7 @@ const (
 
 type config struct {
 	runner               cli.Runner
+	binary               string
 	eng                  engine
 	name                 string
 	env                  map[string]string
@@ -241,11 +256,51 @@ func validateImageReference(image string) error {
 	return nil
 }
 
-func withRunner(r cli.Runner) Option {
+func applyBinaryToRunner(r Runner, binary string) {
+	if r == nil || binary == "" {
+		return
+	}
+	if er, ok := r.(*cli.ExecRunner); ok {
+		er.Binary = binary
+		return
+	}
+	if bs, ok := r.(interface{ SetBinary(string) }); ok {
+		bs.SetBinary(binary)
+	}
+}
+
+// WithRunner sets the runner used for CLI invocations.
+func WithRunner(r Runner) Option {
 	return func(c *config) error {
+		if r == nil {
+			return validationErrorf("WithRunner", nil, "runner must not be nil")
+		}
 		c.runner = r
+		if c.binary != "" {
+			applyBinaryToRunner(c.runner, c.binary)
+		}
 		return nil
 	}
+}
+
+// WithBinary sets the executable name or path for the container CLI.
+// It overrides the backend's default CLI binary name.
+func WithBinary(path string) Option {
+	return func(c *config) error {
+		if path == "" {
+			return validationErrorf("WithBinary", path, "binary path must not be empty")
+		}
+		if strings.ContainsRune(path, 0) || strings.ContainsAny(path, "\r\n") {
+			return validationErrorf("WithBinary", path, "invalid binary path %q", path)
+		}
+		c.binary = path
+		applyBinaryToRunner(c.runner, path)
+		return nil
+	}
+}
+
+func withRunner(r cli.Runner) Option {
+	return WithRunner(r)
 }
 
 func withEngine(e engine) Option {

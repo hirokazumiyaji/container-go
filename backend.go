@@ -20,8 +20,12 @@ func detectEngine() (engine, error) {
 // applyEngineBinary points the default runner at the selected engine's
 // CLI. An explicitly configured binary wins.
 func applyEngineBinary(cfg *config) {
-	if er, ok := cfg.runner.(*cli.ExecRunner); ok && er.Binary == "" {
-		er.Binary = cfg.eng.binary()
+	if er, ok := cfg.runner.(*cli.ExecRunner); ok {
+		if cfg.binary != "" {
+			er.Binary = cfg.binary
+		} else if er.Binary == "" {
+			er.Binary = cfg.eng.binary()
+		}
 	}
 }
 

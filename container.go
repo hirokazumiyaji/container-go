@@ -138,14 +138,14 @@ type lockPack struct {
 	uidMu          sync.RWMutex
 	uid            string
 	mu             sync.Mutex
-	info           *engineInfo // immutable identity snapshot; excludes network/port/state
-	dynamic        *engineInfo // short-TTL network/port/state snapshot for endpoint reads
-	dynamicAt      time.Time   // wall time when dynamic was stored; zero if unset
-	dynamicGen     uint64      // bumped by clearDynamic so in-flight refreshes cannot repopulate
+	info           *engineInfo      // immutable identity snapshot; excludes network/port/state
+	dynamic        *engineInfo      // short-TTL network/port/state snapshot for endpoint reads
+	dynamicAt      time.Time        // wall time when dynamic was stored; zero if unset
+	dynamicGen     uint64           // bumped by clearDynamic so in-flight refreshes cannot repopulate
 	now            func() time.Time // optional test clock; nil means time.Now
-	dynamicMu      contextLock // serializes dynamic refresh so older inspects cannot overwrite newer ones
-	inspectMu      contextLock // serializes inspect target selection and UID publication
-	defaultNetwork string      // Docker daemon default identity, learned lazily
+	dynamicMu      contextLock      // serializes dynamic refresh so older inspects cannot overwrite newer ones
+	inspectMu      contextLock      // serializes inspect target selection and UID publication
+	defaultNetwork string           // Docker daemon default identity, learned lazily
 }
 
 func (p *lockPack) currentTime() time.Time {
@@ -501,7 +501,11 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 	}
 	binary := er.ExternalBinary()
 	if binary == "" {
-		binary = cfg.eng.binary()
+		if cfg.binary != "" {
+			binary = cfg.binary
+		} else {
+			binary = cfg.eng.binary()
+		}
 	}
 	return runReaperTargetInfo{
 		binary:      binary,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -80,6 +81,8 @@ type PruneOption func(*pruneConfig) error
 type pruneConfig struct {
 	timeout     time.Duration
 	parallelism int
+	runner      Runner
+	binary      string
 }
 
 const defaultPruneParallelism = 4
@@ -100,8 +103,8 @@ func WithPruneTimeout(d time.Duration) PruneOption {
 }
 
 // WithPruneParallelism sets the worker pool size for concurrent container
-// deletions during prune. When omitted or <= 0, defaultPruneParallelism (4)
-// is used.
+// deletions during prune. When omitted, defaultPruneParallelism (4) is used;
+// a non-positive value is rejected.
 func WithPruneParallelism(n int) PruneOption {
 	return func(c *pruneConfig) error {
 		if n <= 0 {
@@ -112,14 +115,57 @@ func WithPruneParallelism(n int) PruneOption {
 	}
 }
 
-func parsePruneOptions(opts []PruneOption) (pruneConfig, error) {
+// WithPruneRunner sets the runner used for Prune or PruneReuseGroup.
+func WithPruneRunner(r Runner) PruneOption {
+	return func(c *pruneConfig) error {
+		if r == nil {
+			return validationErrorf("WithPruneRunner", nil, "runner must not be nil")
+		}
+		c.runner = r
+		applyBinaryToRunner(c.runner, c.binary)
+		return nil
+	}
+}
+
+// WithPruneBinary sets the executable name or path for the container CLI
+// during Prune or PruneReuseGroup.
+func WithPruneBinary(path string) PruneOption {
+	return func(c *pruneConfig) error {
+		if path == "" {
+			return validationErrorf("WithPruneBinary", path, "binary path must not be empty")
+		}
+		if strings.ContainsRune(path, 0) || strings.ContainsAny(path, "\r\n") {
+			return validationErrorf("WithPruneBinary", path, "invalid binary path %q", path)
+		}
+		c.binary = path
+		applyBinaryToRunner(c.runner, path)
+		return nil
+	}
+}
+
+// runnerFor returns the runner these options select, falling back to a new
+// ExecRunner for the engine's default CLI.
+func (c pruneConfig) runnerFor(eng engine) Runner {
+	if c.runner != nil {
+		return c.runner
+	}
+	binary := c.binary
+	if binary == "" {
+		binary = eng.binary()
+	}
+	return &cli.ExecRunner{Binary: binary}
+}
+
+// parsePruneOptions applies opts over the prune defaults. name labels the
+// entry point for a nil option, matching Run and Exec.
+func parsePruneOptions(name string, opts []PruneOption) (pruneConfig, error) {
 	cfg := pruneConfig{
 		timeout:     defaultPruneTimeout,
 		parallelism: defaultPruneParallelism,
 	}
-	for _, opt := range opts {
+	for i, opt := range opts {
 		if opt == nil {
-			continue
+			return pruneConfig{}, validationErrorf(name, i, "option %d is nil", i)
 		}
 		if err := opt(&cfg); err != nil {
 			return pruneConfig{}, err
@@ -131,11 +177,15 @@ func parsePruneOptions(opts []PruneOption) (pruneConfig, error) {
 // Prune removes stopped containers created by this library, from any
 // session. It returns the IDs it removed.
 func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
+	cfg, err := parsePruneOptions("Prune", opts)
+	if err != nil {
+		return nil, safePublicError(err)
+	}
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, opts...)
+	return pruneWith(ctx, cfg.runnerFor(eng), eng, opts...)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine, opts ...PruneOption) ([]string, error) {
@@ -160,7 +210,7 @@ func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []strin
 }
 
 func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, opts ...PruneOption) ([]string, error) {
-	cfg, err := parsePruneOptions(opts)
+	cfg, err := parsePruneOptions(errKind, opts)
 	if err != nil {
 		return nil, safePublicError(err)
 	}

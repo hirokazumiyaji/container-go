@@ -1355,11 +1355,15 @@ func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err
 	}
+	cfg, err := parsePruneOptions("PruneReuseGroup", opts)
+	if err != nil {
+		return nil, safePublicError(err)
+	}
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, group, opts...)
+	return pruneReuseGroupWith(ctx, cfg.runnerFor(eng), eng, group, opts...)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string, opts ...PruneOption) ([]string, error) {

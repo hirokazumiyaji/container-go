@@ -4,7 +4,7 @@ go 1.26.0
 
 require (
 	github.com/hirokazumiyaji/container-go v0.0.0
-	github.com/magiconair/properties v1.8.10
+	github.com/magiconair/properties v1.18.12
 	github.com/testcontainers/testcontainers-go v0.44.0
 )
 

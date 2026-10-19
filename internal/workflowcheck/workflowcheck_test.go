@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -38,6 +39,11 @@ var (
 	jobTimeoutKey = regexp.MustCompile(`^    timeout-minutes:\s*`)
 	// stepWithKey matches a step-level with: mapping key.
 	stepWithKey = regexp.MustCompile(`^(\s*)with:\s*(?:#.*)?$`)
+	// vetIntegrationVar captures the command the Makefile centralizes as
+	// VET_INTEGRATION, which every tagged vet gate is expected to share.
+	vetIntegrationVar = regexp.MustCompile(`^VET_INTEGRATION\s*:?=\s*(.+)$`)
+	// buildTagsKey matches golangci-lint's run.build-tags mapping key.
+	buildTagsKey = regexp.MustCompile(`^\s*build-tags:\s*$`)
 )
 
 // Every third-party action must be pinned to a full commit SHA. A mutable tag
@@ -288,6 +294,53 @@ func TestJobDrivesDockerIgnoresCommentOnly(t *testing.T) {
 	}
 }
 
+// The cross-platform legs run the tagged vet natively, which is the only way
+// the Windows-only integration files get type-checked, but they cannot call
+// `make vet-integration`: the Windows runner image ships no GNU Make. That
+// leaves a second copy of the integration tag in the workflow, and Go ignores
+// an unknown build tag and exits 0, so a rename that missed the copy would
+// silently stop compiling the very files the step exists for. Compare the
+// commands rather than trusting the cross-reference comment to stay honest.
+func TestTaggedVetMatchesMakefileCommand(t *testing.T) {
+	want := makefileVetIntegration(t)
+	found := 0
+	for _, path := range workflowFiles(t) {
+		lines := readLines(t, path)
+		for _, job := range jobs(lines) {
+			for _, line := range jobBodyLines(lines, job) {
+				m := runStepKey.FindStringSubmatch(line)
+				if m == nil {
+					continue
+				}
+				cmd := strings.TrimSpace(m[2])
+				if !strings.HasPrefix(cmd, "go vet -tags ") {
+					continue
+				}
+				found++
+				if cmd != want {
+					t.Errorf("%s: job %q runs %q, want the Makefile VET_INTEGRATION command %q",
+						path, job, cmd, want)
+				}
+			}
+		}
+	}
+	if found == 0 {
+		t.Fatalf("no tagged vet step found under %s; the Windows-only integration files would go unchecked", workflowDir)
+	}
+}
+
+// .golangci.yml repeats the integration tag in run.build-tags so the lint job
+// analyzes the tagged files. Nothing else ties that copy to the Makefile's, and
+// Go ignores an unknown build tag, so a rename that missed this file would keep
+// lint green while it quietly stopped analyzing the tagged code.
+func TestGolangciBuildTagsMatchMakefileCommand(t *testing.T) {
+	tag := vetIntegrationTag(t)
+	if tags := golangciBuildTags(t); !slices.Contains(tags, tag) {
+		t.Errorf(".golangci.yml: run.build-tags = %v, want it to contain %q from the Makefile VET_INTEGRATION command",
+			tags, tag)
+	}
+}
+
 func workflowFiles(t *testing.T) []string {
 	t.Helper()
 	// Both extensions: GitHub accepts .yml and .yaml, and a workflow added
@@ -318,7 +371,64 @@ func readLines(t *testing.T, path string) []string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return strings.Split(string(data), "\n")
+	// A Windows checkout has CRLF endings. These helpers compare whole lines
+	// (`line == "jobs:"`) as well as anchoring patterns with $, so a trailing
+	// CR would make them match nothing: every jobs()-based rule would pass
+	// vacuously on the one platform some of them exist to guard.
+	text := strings.ReplaceAll(string(data), "\r\n", "\n")
+	return strings.Split(text, "\n")
+}
+
+func makefileVetIntegration(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(workflowDir, "..", "..", "Makefile")
+	for _, line := range readLines(t, path) {
+		if m := vetIntegrationVar.FindStringSubmatch(line); m != nil {
+			return strings.TrimSpace(m[1])
+		}
+	}
+	t.Fatalf("%s: no VET_INTEGRATION assignment found", path)
+	return ""
+}
+
+// vetIntegrationTag returns the build tag the VET_INTEGRATION command passes.
+func vetIntegrationTag(t *testing.T) string {
+	t.Helper()
+	fields := strings.Fields(makefileVetIntegration(t))
+	for i, field := range fields {
+		if field == "-tags" && i+1 < len(fields) {
+			return fields[i+1]
+		}
+	}
+	t.Fatalf("VET_INTEGRATION does not pass -tags: %q", strings.Join(fields, " "))
+	return ""
+}
+
+// golangciBuildTags returns the entries under run.build-tags in .golangci.yml.
+func golangciBuildTags(t *testing.T) []string {
+	t.Helper()
+	path := filepath.Join(workflowDir, "..", "..", ".golangci.yml")
+	lines := readLines(t, path)
+	for i, line := range lines {
+		if !buildTagsKey.MatchString(line) {
+			continue
+		}
+		keyIndent := leadingSpaces(line)
+		var out []string
+		for _, next := range lines[i+1:] {
+			trim := strings.TrimSpace(next)
+			if trim == "" {
+				continue
+			}
+			if leadingSpaces(next) <= keyIndent || !strings.HasPrefix(trim, "- ") {
+				break
+			}
+			out = append(out, strings.TrimSpace(strings.TrimPrefix(trim, "- ")))
+		}
+		return out
+	}
+	t.Fatalf("%s: no run.build-tags key found", path)
+	return nil
 }
 
 // jobs returns the job keys of a workflow. The top-level keys before the

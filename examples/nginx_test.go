@@ -32,7 +32,11 @@ func TestExampleNginx(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Get("http://" + endpoint + "/")
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+endpoint+"/", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -5,6 +5,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -58,6 +59,29 @@ func TestTerminateProcessTreeAfterWaitUsesHandleDoneState(t *testing.T) {
 	}
 	if err := terminateProcessTree(cmd); !errors.Is(err, os.ErrProcessDone) {
 		t.Fatalf("terminate after Wait = %v, want os.ErrProcessDone", err)
+	}
+}
+
+// TestProcessAlreadyGoneClassifiesKillResults pins the classification both
+// termination paths rest on. A pidfd kill reports a raw ESRCH while the
+// retained os.Process reports os.ErrProcessDone, and only an unrecognised
+// failure means the child may still be running.
+func TestProcessAlreadyGoneClassifiesKillResults(t *testing.T) {
+	gone := []error{
+		os.ErrProcessDone,
+		syscall.ESRCH,
+		fmt.Errorf("pidfd_send_signal: %w", syscall.ESRCH),
+	}
+	for _, err := range gone {
+		if !processAlreadyGone(err) {
+			t.Errorf("processAlreadyGone(%v) = false, want true", err)
+		}
+	}
+	unknown := []error{nil, syscall.EPERM, syscall.EINVAL, errors.New("boom")}
+	for _, err := range unknown {
+		if processAlreadyGone(err) {
+			t.Errorf("processAlreadyGone(%v) = true, want false", err)
+		}
 	}
 }
 

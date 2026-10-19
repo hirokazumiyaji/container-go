@@ -22,6 +22,14 @@ type processTree interface {
 	close()
 }
 
+// provableTerminationTree is implemented by process trees whose termination
+// evidence rests on a retained platform identity that can prove the direct
+// child was active. commandLifecycle publishes the answer as
+// RunStatus.TerminationProvable; a tree without it is best-effort.
+type provableTerminationTree interface {
+	provesActiveTermination() bool
+}
+
 type processTreeFunc func(*exec.Cmd) error
 
 func (f processTreeFunc) terminate(cmd *exec.Cmd) terminationResult {

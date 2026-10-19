@@ -335,6 +335,14 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 	applyEngineBinary(cfg)
 	applyEngineRunnerEnv(cfg)
+	// Reject Windows before the backend is asked anything: Docker context
+	// resolution runs the CLI, and chmod's 0600/0700 bits do not provide
+	// per-user secrecy there.
+	if len(cfg.env) > 0 {
+		if err := ensureEnvFileSecurity(); err != nil {
+			return nil, err
+		}
+	}
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
@@ -344,12 +352,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
 	defer cancel()
 
-	// Reject Windows before an image pull or any env-file storage setup.
-	// chmod's 0600/0700 bits do not provide per-user secrecy there.
 	if len(cfg.env) > 0 {
-		if err := ensureEnvFileSecurity(); err != nil {
-			return nil, err
-		}
 		// Validate the private root and reclaim provably stale directories
 		// before spending time on an image pull or backend create. The
 		// security cleanup has its own finite budget in addition to the

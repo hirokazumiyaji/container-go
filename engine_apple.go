@@ -17,7 +17,12 @@ import (
 )
 
 // appleEngine drives Apple Container's `container` CLI.
-type appleEngine struct{}
+type appleEngine struct {
+	// binaryOverride is the caller-configured CLI. It names both the
+	// executable to run and the backend identity error classification
+	// compares against, so the two cannot disagree.
+	binaryOverride string
+}
 
 // Apple Container parses stop --time as a signed 32-bit integer, even when
 // the library itself runs on a 64-bit host.
@@ -66,8 +71,13 @@ var (
 	appleNetworkNameRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9._-]{0,61}[a-z0-9])?$`)
 )
 
-func (appleEngine) name() string   { return "apple" }
-func (appleEngine) binary() string { return "container" }
+func (appleEngine) name() string { return "apple" }
+func (e appleEngine) binary() string {
+	if e.binaryOverride != "" {
+		return e.binaryOverride
+	}
+	return "container"
+}
 func (appleEngine) directIP() bool { return true }
 
 // checkConfig applies the parts of Apple Container's CLI contract that are
@@ -368,11 +378,11 @@ func (appleEngine) imageStoreID() string { return "" }
 
 func (appleEngine) defaultHost() string { return "127.0.0.1" }
 
-func (appleEngine) probe() cli.Probe {
+func (e appleEngine) probe() cli.Probe {
 	return cli.Probe{
 		Args:          []string{"system", "status"},
 		Hint:          "Ensure container system service has been started with `container system start`.",
-		Binary:        "container",
+		Binary:        e.binary(),
 		Operation:     "system",
 		IsUnavailable: appleProbeUnavailable,
 	}

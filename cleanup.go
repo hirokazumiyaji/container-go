@@ -118,7 +118,7 @@ func WithPruneParallelism(n int) PruneOption {
 // WithPruneRunner sets the runner used for Prune or PruneReuseGroup.
 func WithPruneRunner(r Runner) PruneOption {
 	return func(c *pruneConfig) error {
-		if r == nil {
+		if runnerIsNil(r) {
 			return validationErrorf("WithPruneRunner", nil, "runner must not be nil")
 		}
 		c.runner = r
@@ -146,14 +146,7 @@ func WithPruneBinary(path string) PruneOption {
 // runnerFor returns the runner these options select, falling back to a new
 // ExecRunner for the engine's default CLI.
 func (c pruneConfig) runnerFor(eng engine) Runner {
-	if c.runner != nil {
-		return c.runner
-	}
-	binary := c.binary
-	if binary == "" {
-		binary = eng.binary()
-	}
-	return &cli.ExecRunner{Binary: binary}
+	return effectiveRunner(c.runner, c.binary, eng)
 }
 
 // parsePruneOptions applies opts over the prune defaults. name labels the
@@ -185,6 +178,7 @@ func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
+	eng = withEngineBinary(eng, cfg.binary)
 	return pruneWith(ctx, cfg.runnerFor(eng), eng, opts...)
 }
 

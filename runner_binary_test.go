@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 type mockRunner struct {
@@ -330,6 +332,97 @@ func TestPullAndPruneOrderIndependence(t *testing.T) {
 	_, _ = Prune(context.Background(), WithPruneBinary("/custom/prune2"), WithPruneRunner(r4))
 	if r4.bin != "/custom/prune2" {
 		t.Errorf("r4.bin = %q, want /custom/prune2", r4.bin)
+	}
+}
+
+// A configured binary names both the executable to run and the backend
+// identity error classification compares against. Leaving the engine at its
+// default while running something else would stop the backend's own errors
+// from being attributed to it, which silently degrades not-found, absence and
+// conflict detection.
+func TestConfiguredBinaryKeepsBackendIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		binary string
+	}{
+		{"renamed wrapper", "/opt/docker-wrapper"},
+		{"same name in another directory", "/usr/local/bin/docker"},
+		{"bare name", "docker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			eng := withEngineBinary(dockerEngine{}, tt.binary)
+			if got := eng.binary(); got != tt.binary {
+				t.Fatalf("engine binary = %q, want %q", got, tt.binary)
+			}
+			if got := eng.probe().Binary; got != tt.binary {
+				t.Fatalf("probe binary = %q, want %q", got, tt.binary)
+			}
+			cliErr := &cli.CLIError{Binary: tt.binary, Args: []string{"inspect", "abc"}, ExitCode: 1}
+			if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
+				t.Fatalf("CLIError binary %q did not match engine binary %q", cliErr.Binary, eng.binary())
+			}
+		})
+	}
+}
+
+func TestUnconfiguredEnginesKeepDefaultBinary(t *testing.T) {
+	if got := (dockerEngine{}).binary(); got != "docker" {
+		t.Fatalf("docker binary = %q, want docker", got)
+	}
+	if got := (dockerEngine{}).probe().Binary; got != "docker" {
+		t.Fatalf("docker probe binary = %q, want docker", got)
+	}
+	if got := (appleEngine{}).binary(); got != "container" {
+		t.Fatalf("apple binary = %q, want container", got)
+	}
+	if got := (appleEngine{}).probe().Binary; got != "container" {
+		t.Fatalf("apple probe binary = %q, want container", got)
+	}
+}
+
+// An ExecRunner the caller supplied without naming an executable inherits the
+// backend's CLI, which is what Run does for its default runner. Leaving it
+// empty would make ExecRunner fall back to "container" on every backend.
+func TestEffectiveRunnerAppliesEngineBinary(t *testing.T) {
+	inherited := effectiveRunner(&ExecRunner{}, "", dockerEngine{})
+	er, ok := inherited.(*ExecRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want *ExecRunner", inherited)
+	}
+	if er.Binary != "docker" {
+		t.Fatalf("runner binary = %q, want docker", er.Binary)
+	}
+
+	configured := effectiveRunner(&ExecRunner{}, "/opt/docker-wrapper", dockerEngine{})
+	if er := configured.(*ExecRunner); er.Binary != "/opt/docker-wrapper" {
+		t.Fatalf("runner binary = %q, want the configured path", er.Binary)
+	}
+}
+
+// A typed-nil pointer stored in the runner interface passes an == nil test and
+// then panics when the runner is used, so every runner option has to reject it
+// by value.
+func TestRunnerOptionsRejectTypedNil(t *testing.T) {
+	var typedNil *ExecRunner
+	options := []struct {
+		name string
+		err  error
+	}{
+		{"WithRunner", WithRunner(typedNil)(newConfig())},
+		{"WithPruneRunner", WithPruneRunner(typedNil)(&pruneConfig{})},
+		{"WithPullRunner", WithPullRunner(typedNil)(&pullConfig{})},
+	}
+	for _, tt := range options {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.err == nil {
+				t.Fatal("typed-nil runner was accepted, want a validation error")
+			}
+			var valErr *ValidationError
+			if !errors.As(tt.err, &valErr) {
+				t.Fatalf("error = %v, want ValidationError", tt.err)
+			}
+		})
 	}
 }
 

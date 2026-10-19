@@ -1363,6 +1363,7 @@ func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]
 	if err != nil {
 		return nil, safePublicError(err)
 	}
+	eng = withEngineBinary(eng, cfg.binary)
 	return pruneReuseGroupWith(ctx, cfg.runnerFor(eng), eng, group, opts...)
 }
 

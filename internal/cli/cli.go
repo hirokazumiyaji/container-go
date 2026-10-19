@@ -665,13 +665,19 @@ func probeBinaryMatches(got, want string) bool {
 		return true
 	}
 	got = strings.TrimSpace(strings.ToLower(got))
+	want = strings.TrimSpace(strings.ToLower(want))
+	// want may be a caller-configured path, so compare executable names on
+	// both sides rather than whole paths.
+	if i := strings.LastIndexAny(want, `/\\`); i >= 0 {
+		want = want[i+1:]
+	}
 	if got == "" {
 		got = "container"
 	}
 	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
 		got = got[i+1:]
 	}
-	return got == strings.ToLower(want)
+	return got == want
 }
 
 // Classify augments a failed CLI call. When the backend-specific probe

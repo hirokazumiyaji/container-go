@@ -15,23 +15,23 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type review91RealStreamTarget struct {
+type realStreamTarget struct {
 	binary string
 }
 
-func (*review91RealStreamTarget) Endpoint(context.Context, string) (string, error) {
+func (*realStreamTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91RealStreamTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91RealStreamTarget) State(context.Context) (State, error)  { return StateRunning, nil }
-func (t *review91RealStreamTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+func (*realStreamTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*realStreamTarget) State(context.Context) (State, error)  { return StateRunning, nil }
+func (t *realStreamTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	return (&cli.ExecRunner{Binary: t.binary}).Stream(ctx)
 }
-func (*review91RealStreamTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*realStreamTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-func TestReview91ForLogSucceedsAfterRealStreamSettleClose(t *testing.T) {
+func TestForLogSucceedsAfterRealStreamSettleClose(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell stream fixture is unavailable on Windows")
 	}
@@ -39,12 +39,12 @@ func TestReview91ForLogSucceedsAfterRealStreamSettleClose(t *testing.T) {
 	if err := os.WriteFile(binary, []byte("#!/bin/sh\nprintf 'ready\\n'\nexec sleep 10\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), &review91RealStreamTarget{binary: binary}); err != nil {
+	if err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(context.Background(), &realStreamTarget{binary: binary}); err != nil {
 		t.Fatalf("ForLog with a real stream: %v", err)
 	}
 }
 
-func TestReview91ForLogMatchesCleanUnterminatedFinalLine(t *testing.T) {
+func TestForLogMatchesCleanUnterminatedFinalLine(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{io.NopCloser(strings.NewReader("ready"))}
 
@@ -53,23 +53,23 @@ func TestReview91ForLogMatchesCleanUnterminatedFinalLine(t *testing.T) {
 	}
 }
 
-type review91TrackedReadCloser struct {
+type trackedReadCloser struct {
 	io.ReadCloser
 	closed chan struct{}
 	once   atomic.Bool
 }
 
-func (r *review91TrackedReadCloser) Close() error {
+func (r *trackedReadCloser) Close() error {
 	if r.once.CompareAndSwap(false, true) {
 		close(r.closed)
 	}
 	return r.ReadCloser.Close()
 }
 
-func TestReview91ForLogSettlesBeforeAcceptingBackpressuredMatch(t *testing.T) {
+func TestForLogSettlesBeforeAcceptingBackpressuredMatch(t *testing.T) {
 	pr, pw := io.Pipe()
 	t.Cleanup(func() { _ = pw.Close() })
-	tracked := &review91TrackedReadCloser{ReadCloser: pr, closed: make(chan struct{})}
+	tracked := &trackedReadCloser{ReadCloser: pr, closed: make(chan struct{})}
 	go func() {
 		_, _ = pw.Write([]byte("ready\n"))
 		for {
@@ -91,7 +91,7 @@ func TestReview91ForLogSettlesBeforeAcceptingBackpressuredMatch(t *testing.T) {
 	}
 }
 
-func TestReview91ForLogDiscardsUnterminatedFinalToken(t *testing.T) {
+func TestForLogDiscardsUnterminatedFinalToken(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{
 		io.NopCloser(strings.NewReader("ready\npartial")),
@@ -111,7 +111,7 @@ func TestReview91ForLogDiscardsUnterminatedFinalToken(t *testing.T) {
 	}
 }
 
-func TestReview91PollDoesNotExtendDeadlineForFinalStateProbe(t *testing.T) {
+func TestPollDoesNotExtendDeadlineForFinalStateProbe(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.stateScript = []struct {
 		state State
@@ -136,22 +136,22 @@ func TestReview91PollDoesNotExtendDeadlineForFinalStateProbe(t *testing.T) {
 	}
 }
 
-type review91SlowInitialStateTarget struct {
+type slowInitialStateTarget struct {
 	calls   atomic.Int32
 	started chan struct{}
 }
 
-func (*review91SlowInitialStateTarget) Endpoint(context.Context, string) (string, error) {
+func (*slowInitialStateTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91SlowInitialStateTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91SlowInitialStateTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*slowInitialStateTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*slowInitialStateTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*review91SlowInitialStateTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*slowInitialStateTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
-func (t *review91SlowInitialStateTarget) State(ctx context.Context) (State, error) {
+func (t *slowInitialStateTarget) State(ctx context.Context) (State, error) {
 	if t.calls.Add(1) == 1 {
 		close(t.started)
 		<-ctx.Done()
@@ -160,25 +160,25 @@ func (t *review91SlowInitialStateTarget) State(ctx context.Context) (State, erro
 	return StateRunning, nil
 }
 
-type review91WaitForStateStartStrategy struct {
-	target *review91SlowInitialStateTarget
+type waitForStateStartStrategy struct {
+	target *slowInitialStateTarget
 }
 
-func (s review91WaitForStateStartStrategy) WaitUntilReady(context.Context, Target) error {
+func (s waitForStateStartStrategy) WaitUntilReady(context.Context, Target) error {
 	<-s.target.started
 	return nil
 }
 
-func TestReview91CompositeStartsChildrenWhileInitialStateProbeIsSlow(t *testing.T) {
-	target := &review91SlowInitialStateTarget{started: make(chan struct{})}
-	strategy := review91WaitForStateStartStrategy{target: target}
+func TestCompositeStartsChildrenWhileInitialStateProbeIsSlow(t *testing.T) {
+	target := &slowInitialStateTarget{started: make(chan struct{})}
+	strategy := waitForStateStartStrategy{target: target}
 	err := ForAll(strategy).WithStartupTimeout(200*time.Millisecond).WaitUntilReady(context.Background(), target)
 	if err != nil {
 		t.Fatalf("ForAll: %v", err)
 	}
 }
 
-func TestReview91FinalSuccessRequiresRunning(t *testing.T) {
+func TestFinalSuccessRequiresRunning(t *testing.T) {
 	for _, state := range []State{StateCreated, StateRestarting, StateUnknown} {
 		t.Run(string(state), func(t *testing.T) {
 			target := newLifecycleTarget(StateRunning)

@@ -83,14 +83,14 @@ func TestAppleLogsDashNTargetExtraction(t *testing.T) {
 	}
 }
 
-type reuseRollbackReviewRunner struct {
+type reuseRollbackSafetyRunner struct {
 	creation string
 	inspect  int
 	deletes  int
 	copyErr  error
 }
 
-func (r *reuseRollbackReviewRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reuseRollbackSafetyRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "image":
 		if args[1] == "inspect" {
@@ -133,7 +133,7 @@ func TestReuseRollbackDoesNotDeleteRunningGeneration(t *testing.T) {
 	if err := os.WriteFile(host, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	r := &reuseRollbackReviewRunner{copyErr: errors.New("copy failed")}
+	r := &reuseRollbackSafetyRunner{copyErr: errors.New("copy failed")}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("shared"), WithReuse(), WithFiles(File{HostPath: host, ContainerPath: "/tmp/input"}),
 		withRunner(r), withEngine(appleEngine{}))
@@ -146,7 +146,7 @@ func TestReuseRollbackDoesNotDeleteRunningGeneration(t *testing.T) {
 }
 
 func TestDeleteStoppedReuseFailsClosedWithoutOwnershipLabels(t *testing.T) {
-	r := &reuseRollbackReviewRunner{}
+	r := &reuseRollbackSafetyRunner{}
 	info := &engineInfo{state: StateStopped, labels: map[string]string{reuseLabel: "true"}}
 	if err := deleteStoppedReuse(context.Background(), &config{runner: r, eng: appleEngine{}, name: "shared"}, info); err == nil {
 		t.Fatal("deleteStoppedReuse accepted missing managed/creation labels")
@@ -156,13 +156,13 @@ func TestDeleteStoppedReuseFailsClosedWithoutOwnershipLabels(t *testing.T) {
 	}
 }
 
-type applePruneReviewRunner struct {
+type applePruneSafetyRunner struct {
 	listJSON    string
 	inspectJSON string
 	deletes     []string
 }
 
-func (r *applePruneReviewRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *applePruneSafetyRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "ls":
 		return []byte(r.listJSON), nil, nil
@@ -178,7 +178,7 @@ func (r *applePruneReviewRunner) Run(_ context.Context, args ...string) ([]byte,
 
 func TestApplePruneRetainsRunningReplacement(t *testing.T) {
 	const creation = "0123456789abcdef"
-	r := &applePruneReviewRunner{
+	r := &applePruneSafetyRunner{
 		listJSON:    fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"stopped","networks":[]}}]`, managedLabel, creationLabel, creation),
 		inspectJSON: fmt.Sprintf(`[{"id":"shared","configuration":{"labels":{%q:"true",%q:%q}},"status":{"state":"running","networks":[]}}]`, managedLabel, creationLabel, creation),
 	}
@@ -193,7 +193,7 @@ func TestApplePruneRetainsRunningReplacement(t *testing.T) {
 
 func TestDockerPruneRequestsFullIDsWithoutQuiet(t *testing.T) {
 	args := (dockerEngine{}).listArgs()
-	if !reviewContains(args, "--no-trunc") || reviewContains(args, "--quiet") {
+	if !containsArg(args, "--no-trunc") || containsArg(args, "--quiet") {
 		t.Fatalf("listArgs = %v, want --no-trunc and no --quiet", args)
 	}
 	if _, err := (dockerEngine{}).parseStoppedManaged([]byte("short-name\n")); err == nil {
@@ -201,7 +201,7 @@ func TestDockerPruneRequestsFullIDsWithoutQuiet(t *testing.T) {
 	}
 }
 
-func reviewContains(values []string, want string) bool {
+func containsArg(values []string, want string) bool {
 	for _, value := range values {
 		if value == want {
 			return true

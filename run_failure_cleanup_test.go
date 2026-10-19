@@ -513,3 +513,99 @@ func (w *reuseFailWrapper) Run(ctx context.Context, args ...string) ([]byte, []b
 	}
 	return w.failRunRunner.Run(ctx, args...)
 }
+
+func TestCleanupFailedCreateSkipsDifferentGeneration(t *testing.T) {
+	ctx := context.Background()
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"},
+		inspectJSON: strings.ReplaceAll(ownedInspectJSON("myctr"), "__CONTAINER_CREATION__", "different-gen-123"),
+	}
+
+	cfg := &config{}
+	cfg.runner = r
+	cfg.eng = appleEngine{}
+	cfg.name = "myctr"
+	cfg.creation = "0123456789abcdef"
+	r.creation = cfg.creation
+
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"}
+	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete when container has different generation", r.deleted)
+	}
+}
+
+func TestCleanupFailedCreateSkipsMissingGeneration(t *testing.T) {
+	ctx := context.Background()
+	base := newTestRunner()
+	base.imagePresent = true
+	// Inspect JSON with creation label completely omitted
+	inspectWithoutCreation := fmt.Sprintf(`[
+  {
+    "id": "myctr",
+    "configuration": {
+      "id": "myctr",
+      "image": {"reference": "redis:7-alpine"},
+      "publishedPorts": [],
+      "labels": {
+        "com.github.hirokazumiyaji.container-go": "true",
+        "com.github.hirokazumiyaji.container-go.session": %q
+      }
+    },
+    "status": {"state": "created", "networks": []}
+  }
+]`, sessionID())
+
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"},
+		inspectJSON: inspectWithoutCreation,
+	}
+
+	cfg := &config{}
+	cfg.runner = r
+	cfg.eng = appleEngine{}
+	cfg.name = "myctr"
+	cfg.creation = "0123456789abcdef"
+	r.creation = cfg.creation
+
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"}
+	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete when container is missing generation label", r.deleted)
+	}
+}
+
+func TestCleanupFailedCreateReuseSkipsDifferentGeneration(t *testing.T) {
+	ctx := context.Background()
+	base := newTestRunner()
+	base.imagePresent = true
+	r := &failRunRunner{
+		fakeRunner:  base,
+		runErr:      &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"},
+		inspectJSON: strings.ReplaceAll(ownedReuseInspectJSON("myctr"), "__CONTAINER_CREATION__", "different-gen-456"),
+	}
+
+	cfg := &config{}
+	cfg.runner = r
+	cfg.eng = appleEngine{}
+	cfg.name = "myctr"
+	cfg.reuse = true
+	cfg.creation = "0123456789abcdef"
+	r.creation = cfg.creation
+
+	runErr := &cli.CLIError{Args: []string{"run"}, ExitCode: 125, Stderr: "create failed"}
+	if err := cleanupFailedCreate(ctx, cfg, runErr, runErr); err != nil {
+		t.Fatalf("cleanupFailedCreate: %v", err)
+	}
+	if len(r.deleted) != 0 {
+		t.Fatalf("deleted = %v, want no delete for reuse container with different generation", r.deleted)
+	}
+}

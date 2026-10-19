@@ -596,10 +596,12 @@ func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error 
 }
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
-	for _, f := range files {
-		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
-			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
+	if err := ctr.copyFiles(ctx, files); err != nil {
+		var fErr *fileCopyError
+		if errors.As(err, &fErr) {
+			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, fErr.File.HostPath, fErr.File.ContainerPath, fErr.Err)
 		}
+		return fmt.Errorf("reuse %s: WithFiles copy: %w", ctr.id, err)
 	}
 	return nil
 }

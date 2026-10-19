@@ -12,7 +12,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func TestReview91PollRetriesTransientCLIInspectError(t *testing.T) {
+func TestPollRetriesTransientCLIInspectError(t *testing.T) {
 	target := newLifecycleTarget(StateUnknown)
 	target.stateErr = &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "daemon temporarily unavailable"}
 	start := time.Now()
@@ -31,7 +31,7 @@ func TestReview91PollRetriesTransientCLIInspectError(t *testing.T) {
 	}
 }
 
-func TestReview91ForAllFailsFastForCustomStrategyLifecycle(t *testing.T) {
+func TestForAllFailsFastForCustomStrategyLifecycle(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.stateScript = []struct {
 		state State
@@ -53,17 +53,17 @@ func TestReview91ForAllFailsFastForCustomStrategyLifecycle(t *testing.T) {
 	}
 }
 
-var errReview91CheckCause = errors.New("readiness check failed")
+var errCheckCause = errors.New("readiness check failed")
 
-type review91CallerDeadlineTarget struct {
+type callerDeadlineTarget struct {
 	stateCalls atomic.Int32
 }
 
-func (*review91CallerDeadlineTarget) Endpoint(context.Context, string) (string, error) {
+func (*callerDeadlineTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
 
-func (t *review91CallerDeadlineTarget) Running(ctx context.Context) (bool, error) {
+func (t *callerDeadlineTarget) Running(ctx context.Context) (bool, error) {
 	if t.stateCalls.Add(1) == 1 {
 		return true, nil
 	}
@@ -71,16 +71,16 @@ func (t *review91CallerDeadlineTarget) Running(ctx context.Context) (bool, error
 	return false, ctx.Err()
 }
 
-func (*review91CallerDeadlineTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*callerDeadlineTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (*review91CallerDeadlineTarget) ExecCommand(context.Context, []string) (int, error) {
-	return 1, errReview91CheckCause
+func (*callerDeadlineTarget) ExecCommand(context.Context, []string) (int, error) {
+	return 1, errCheckCause
 }
 
-func TestReview91FinalStateProbeHonorsCallerDeadline(t *testing.T) {
-	target := &review91CallerDeadlineTarget{}
+func TestFinalStateProbeHonorsCallerDeadline(t *testing.T) {
+	target := &callerDeadlineTarget{}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
 	defer cancel()
 
@@ -92,7 +92,7 @@ func TestReview91FinalStateProbeHonorsCallerDeadline(t *testing.T) {
 	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("error = %v, want caller deadline", err)
 	}
-	if !errors.Is(err, errReview91CheckCause) {
+	if !errors.Is(err, errCheckCause) {
 		t.Fatalf("error = %v, want readiness check cause", err)
 	}
 	if elapsed := time.Since(start); elapsed > 300*time.Millisecond {
@@ -103,7 +103,7 @@ func TestReview91FinalStateProbeHonorsCallerDeadline(t *testing.T) {
 	}
 }
 
-func TestReview91ReopenedLogsDeduplicateReplayedPrefix(t *testing.T) {
+func TestReopenedLogsDeduplicateReplayedPrefix(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{
 		io.NopCloser(strings.NewReader("ready\n")),
@@ -124,37 +124,37 @@ func TestReview91ReopenedLogsDeduplicateReplayedPrefix(t *testing.T) {
 	}
 }
 
-type review91TerminalStreamTarget struct {
+type terminalStreamTarget struct {
 	calls atomic.Int32
 }
 
-func (*review91TerminalStreamTarget) Endpoint(context.Context, string) (string, error) {
+func (*terminalStreamTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
 
-func (*review91TerminalStreamTarget) Running(context.Context) (bool, error) {
+func (*terminalStreamTarget) Running(context.Context) (bool, error) {
 	return true, nil
 }
 
-func (t *review91TerminalStreamTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *terminalStreamTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.calls.Add(1)
-	return review91TerminalReader{}, nil
+	return terminalReader{}, nil
 }
 
-func (*review91TerminalStreamTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*terminalStreamTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type review91TerminalReader struct{}
+type terminalReader struct{}
 
-func (review91TerminalReader) Read([]byte) (int, error) {
+func (terminalReader) Read([]byte) (int, error) {
 	return 0, &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 17, Stderr: "log stream failed"}
 }
 
-func (review91TerminalReader) Close() error { return nil }
+func (terminalReader) Close() error { return nil }
 
-func TestReview91PermanentLogStreamErrorFailsFast(t *testing.T) {
-	target := &review91TerminalStreamTarget{}
+func TestPermanentLogStreamErrorFailsFast(t *testing.T) {
+	target := &terminalStreamTarget{}
 	err := ForLog("ready").
 		WithStartupTimeout(300*time.Millisecond).
 		WithPollInterval(time.Millisecond).
@@ -171,24 +171,24 @@ func TestReview91PermanentLogStreamErrorFailsFast(t *testing.T) {
 	}
 }
 
-type review91DataThenErrorTarget struct{}
+type dataThenErrorTarget struct{}
 
-func (*review91DataThenErrorTarget) Endpoint(context.Context, string) (string, error) {
+func (*dataThenErrorTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91DataThenErrorTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91DataThenErrorTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
-	return &review91DataThenErrorReader{}, nil
+func (*dataThenErrorTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*dataThenErrorTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+	return &dataThenErrorReader{}, nil
 }
-func (*review91DataThenErrorTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*dataThenErrorTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type review91DataThenErrorReader struct {
+type dataThenErrorReader struct {
 	sent bool
 }
 
-func (r *review91DataThenErrorReader) Read(p []byte) (int, error) {
+func (r *dataThenErrorReader) Read(p []byte) (int, error) {
 	if !r.sent {
 		r.sent = true
 		return copy(p, "ready\n"), nil
@@ -196,13 +196,13 @@ func (r *review91DataThenErrorReader) Read(p []byte) (int, error) {
 	return 0, &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 19, Stderr: "late stream failure"}
 }
 
-func (*review91DataThenErrorReader) Close() error { return nil }
+func (*dataThenErrorReader) Close() error { return nil }
 
-func TestReview91TerminalErrorAfterMatchingLineWins(t *testing.T) {
+func TestTerminalErrorAfterMatchingLineWins(t *testing.T) {
 	err := ForLog("ready").
 		WithStartupTimeout(300*time.Millisecond).
 		WithPollInterval(time.Millisecond).
-		WaitUntilReady(context.Background(), &review91DataThenErrorTarget{})
+		WaitUntilReady(context.Background(), &dataThenErrorTarget{})
 	if err == nil {
 		t.Fatal("matching line hid a terminal stream error")
 	}

@@ -12,12 +12,19 @@ import (
 // Reaped is the fact that cmd.Wait returned; it is deliberately separate from
 // whether cancellation won the race with that wait. TerminatedByCancellation
 // is set only after a platform implementation proved the direct child was
-// active and successfully accepted a termination action.
+// active and successfully accepted a termination action, so it is never set
+// for a run that reports TerminationProvable false.
 type RunStatus struct {
 	Started                  bool
 	Reaped                   bool
 	CancelRequested          bool
 	TerminatedByCancellation bool
+	// TerminationProvable reports whether this run's termination path could
+	// prove the direct child was active. It is false for the best-effort
+	// fallbacks, whose retained Start-time handle cannot tell a live child
+	// from one that already exited; those runs still kill the child but
+	// withhold TerminatedByCancellation.
+	TerminationProvable bool
 }
 
 type runStatusError struct {
@@ -77,6 +84,7 @@ type commandLifecycle struct {
 	terminateErr error
 	lastResult   terminationResult
 
+	terminationProvable      bool
 	cancelRequested          bool
 	terminatedByCancellation bool
 	terminateOnce            sync.Once
@@ -95,9 +103,14 @@ func newCommandLifecycle(ctx context.Context, cmd *exec.Cmd) *commandLifecycle {
 // lifecycle owner. The context watcher may call Cancel as soon as Start
 // returns, so publication and the start barrier are one operation.
 func (l *commandLifecycle) publishStart(tree processTree) {
+	provable := false
+	if prover, ok := tree.(provableTerminationTree); ok {
+		provable = prover.provesActiveTermination()
+	}
 	l.mu.Lock()
 	l.started = true
 	l.tree = tree
+	l.terminationProvable = provable
 	l.mu.Unlock()
 	close(l.startDone)
 }
@@ -172,6 +185,7 @@ func (l *commandLifecycle) status() RunStatus {
 		Reaped:                   l.reaped,
 		CancelRequested:          l.cancelRequested,
 		TerminatedByCancellation: l.terminatedByCancellation,
+		TerminationProvable:      l.terminationProvable,
 	}
 }
 
@@ -212,7 +226,7 @@ func (l *commandLifecycle) terminate(cancelled ...bool) error {
 		}
 		l.lastResult = result
 		l.terminateErr = result.err
-		if contextTermination && result.err == nil && result.active {
+		if contextTermination && result.err == nil && result.active && l.terminationProvable {
 			l.terminatedByCancellation = true
 		}
 	})

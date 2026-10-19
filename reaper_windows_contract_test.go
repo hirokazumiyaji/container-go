@@ -12,7 +12,7 @@ import (
 // contract, not an accident, so it is asserted rather than only described in
 // a comment: if the guard were dropped, registration would silently do nothing
 // on Windows while appearing to work everywhere else.
-func TestReviewReaperRegistrationIsANoOpOnWindows(t *testing.T) {
+func TestReaperRegistrationIsANoOpOnWindows(t *testing.T) {
 	if runtime.GOOS != "windows" {
 		t.Skip("the no-op contract is specific to Windows")
 	}
@@ -28,7 +28,7 @@ func TestReviewReaperRegistrationIsANoOpOnWindows(t *testing.T) {
 
 // Cleanup and rollback are the only removal paths on Windows, because the
 // reaper is unavailable there. Terminate must therefore work without a reaper.
-func TestReviewTerminateWorksWithoutReaper(t *testing.T) {
+func TestTerminateWorksWithoutReaper(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	if err := ctr.Terminate(context.Background()); err != nil {

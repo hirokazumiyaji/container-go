@@ -186,3 +186,13 @@ func AppleUnavailable() error {
 	}
 	return probe("apple container system service", "container", "system", "status")
 }
+
+// DockerPullRateLimited reports whether err is caused by a registry rate limit
+// or data limit (e.g. Docker Hub or AWS Public ECR).
+func DockerPullRateLimited(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "toomanyrequests") || strings.Contains(msg, "Rate exceeded")
+}

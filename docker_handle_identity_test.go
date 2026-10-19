@@ -22,7 +22,7 @@ func (r *freshDockerIdentityRunner) Run(_ context.Context, args ...string) ([]by
 	return []byte(fmt.Sprintf(`[{"Id":%q,"Name":%q,"State":{"Status":"running"},"Config":{"Labels":{}},"NetworkSettings":{}}]`, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "/logical-name")), nil, nil
 }
 
-func TestFreshReviewNameLookupDoesNotPublishDockerUID(t *testing.T) {
+func TestNameLookupDoesNotPublishDockerUID(t *testing.T) {
 	runner := &freshDockerIdentityRunner{}
 	ctr := &Container{id: "logical-name", runner: runner, eng: dockerEngine{}, nameInspect: true}
 	if _, err := ctr.inspectFresh(context.Background()); err != nil {
@@ -36,7 +36,7 @@ func TestFreshReviewNameLookupDoesNotPublishDockerUID(t *testing.T) {
 	}
 }
 
-func TestFreshReviewDockerHandleNeverFallsBackToName(t *testing.T) {
+func TestDockerHandleNeverFallsBackToName(t *testing.T) {
 	runner := &freshDockerIdentityRunner{}
 	ctr := &Container{id: "logical-name", runner: runner, eng: dockerEngine{}}
 	if _, err := ctr.State(context.Background()); err == nil {

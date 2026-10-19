@@ -91,3 +91,20 @@ func TestDecideRequiredCrossBackendFails(t *testing.T) {
 		t.Errorf("verdict=%v, want Skip without REQUIRE_BACKEND", verdict)
 	}
 }
+
+func TestDockerPullRateLimited(t *testing.T) {
+	cases := []struct {
+		err  error
+		want bool
+	}{
+		{nil, false},
+		{errors.New("connection reset by peer"), false},
+		{errors.New("docker pull public.ecr.aws/docker/library/alpine:latest: toomanyrequests: Data limit exceeded"), true},
+		{errors.New("Error response from daemon: Rate exceeded"), true},
+	}
+	for _, tc := range cases {
+		if got := DockerPullRateLimited(tc.err); got != tc.want {
+			t.Errorf("DockerPullRateLimited(%v) = %t, want %t", tc.err, got, tc.want)
+		}
+	}
+}

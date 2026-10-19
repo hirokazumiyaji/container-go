@@ -9,8 +9,8 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-func TestIssue115AppleManifestUnknownAllowsExplicitMutableFallback(t *testing.T) {
-	exact := "redis:7-alpine@" + issue115ReviewRoot
+func TestAppleManifestUnknownAllowsExplicitMutableFallback(t *testing.T) {
+	exact := "redis:7-alpine@" + platformPinningRoot
 	cases := []struct {
 		name   string
 		stderr string
@@ -35,8 +35,8 @@ func TestIssue115AppleManifestUnknownAllowsExplicitMutableFallback(t *testing.T)
 			if !(appleEngine{}).imageMissing(pullErr) || !imageAddressMissing(appleEngine{}, pullErr) {
 				t.Fatalf("direct Apple pull classifier rejected %q", tc.stderr)
 			}
-			r := &issue115AppleAddressRunner{
-				fixture:      issue115AppleImageFixture(t),
+			r := &appleAddressRunner{
+				fixture:      appleImageFixture(t),
 				localMissing: true,
 				exactPullErr: pullErr,
 			}
@@ -59,7 +59,7 @@ func TestIssue115AppleManifestUnknownAllowsExplicitMutableFallback(t *testing.T)
 	}
 }
 
-func TestIssue115AppleManifestUnknownIsPullOnlyAndNotTransport(t *testing.T) {
+func TestAppleManifestUnknownIsPullOnlyAndNotTransport(t *testing.T) {
 	pullErr := func(stderr string) error {
 		return &cli.CLIError{
 			Binary:   "container",
@@ -96,14 +96,14 @@ func TestIssue115AppleManifestUnknownIsPullOnlyAndNotTransport(t *testing.T) {
 	}
 }
 
-type issue115DockerImageAbsenceRunner struct {
+type dockerImageAbsenceRunner struct {
 	*fakeRunner
 	reason    string
 	available bool
 	pullCalls int
 }
 
-func (r *issue115DockerImageAbsenceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *dockerImageAbsenceRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) >= 2 && args[0] == "image" && args[1] == "inspect" {
 		if r.available {
 			r.imagePresent = true
@@ -125,7 +125,7 @@ func (r *issue115DockerImageAbsenceRunner) Run(ctx context.Context, args ...stri
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestIssue115DockerPlatformAndManifestAbsenceDrivePullPolicy(t *testing.T) {
+func TestDockerPlatformAndManifestAbsenceDrivePullPolicy(t *testing.T) {
 	cases := []struct {
 		name   string
 		reason string
@@ -147,7 +147,7 @@ func TestIssue115DockerPlatformAndManifestAbsenceDrivePullPolicy(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			for _, policy := range []PullPolicy{PullMissing, PullNever} {
 				t.Run(policyName(policy), func(t *testing.T) {
-					r := &issue115DockerImageAbsenceRunner{
+					r := &dockerImageAbsenceRunner{
 						fakeRunner: newTestRunner(),
 						reason:     tc.reason,
 					}
@@ -175,7 +175,7 @@ func TestIssue115DockerPlatformAndManifestAbsenceDrivePullPolicy(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerAbsenceMatcherIsOperationScoped(t *testing.T) {
+func TestDockerAbsenceMatcherIsOperationScoped(t *testing.T) {
 	reason := "no matching manifest for linux/arm64/v8 in the manifest list entries"
 	if (dockerEngine{}).imageMissing(&cli.CLIError{
 		Binary:   "docker",
@@ -195,7 +195,7 @@ func TestIssue115DockerAbsenceMatcherIsOperationScoped(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerHubAliasesAreCanonicalForRepositoryComparisons(t *testing.T) {
+func TestDockerHubAliasesAreCanonicalForRepositoryComparisons(t *testing.T) {
 	cases := []struct {
 		requested string
 		actual    string
@@ -244,7 +244,7 @@ func TestIssue115DockerHubAliasesAreCanonicalForRepositoryComparisons(t *testing
 	}
 }
 
-func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testing.T) {
+func TestLifecycleClassifiersAreOperationBackendAndTargetAware(t *testing.T) {
 	appleConflict := &cli.CLIError{
 		Binary:   "container",
 		Args:     []string{"run", "--name", "wanted", "redis"},
@@ -363,7 +363,7 @@ func TestIssue115LifecycleClassifiersAreOperationBackendAndTargetAware(t *testin
 	}
 }
 
-func TestIssue115RunDoesNotSkipCleanupForImageConfigConflict(t *testing.T) {
+func TestRunDoesNotSkipCleanupForImageConfigConflict(t *testing.T) {
 	r := &failRunRunner{
 		fakeRunner: newTestRunner(),
 		runErr: &cli.CLIError{
@@ -384,12 +384,12 @@ func TestIssue115RunDoesNotSkipCleanupForImageConfigConflict(t *testing.T) {
 	}
 }
 
-type issue115ExecAppRunner struct {
+type execAppRunner struct {
 	*fakeRunner
 	inspectCalls int
 }
 
-func (r *issue115ExecAppRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *execAppRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && args[0] == "exec" {
 		return nil, []byte("missing-command: not found\n"), &cli.CLIError{
 			Binary:   "docker",
@@ -404,10 +404,10 @@ func (r *issue115ExecAppRunner) Run(ctx context.Context, args ...string) ([]byte
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func TestIssue115ExecApplicationNotFoundDoesNotProbeAsMissingContainer(t *testing.T) {
+func TestExecApplicationNotFoundDoesNotProbeAsMissingContainer(t *testing.T) {
 	base := newDockerTestRunner()
 	ctr := runTestContainer(t, base, withEngine(dockerEngine{}))
-	r := &issue115ExecAppRunner{fakeRunner: base}
+	r := &execAppRunner{fakeRunner: base}
 	ctr.runner = r
 	code, _, err := ctr.Exec(context.Background(), []string{"missing-command"})
 	if err != nil {

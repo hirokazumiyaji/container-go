@@ -117,12 +117,12 @@ func TestClassifiersAreBackendCommandAndTargetAware(t *testing.T) {
 	}
 }
 
-type reviewTerminateRunner struct {
+type terminateClassificationRunner struct {
 	err         error
 	deleteCalls int
 }
 
-func (r *reviewTerminateRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *terminateClassificationRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
 		return nil, nil, r.err
@@ -141,7 +141,7 @@ func TestTerminateDoesNotTreatPermissionNotFoundAsVerifiedAbsence(t *testing.T) 
 		Binary: "container", Args: []string{"inspect", "myctr"},
 		ExitCode: 1, Stderr: "permission denied: container not found: myctr",
 	}
-	r := &reviewTerminateRunner{err: original}
+	r := &terminateClassificationRunner{err: original}
 	ctr := &Container{id: "myctr", runner: r, eng: appleEngine{}, creation: "generation"}
 
 	if err := ctr.Terminate(context.Background()); err == nil {
@@ -152,7 +152,7 @@ func TestTerminateDoesNotTreatPermissionNotFoundAsVerifiedAbsence(t *testing.T) 
 	}
 }
 
-func TestCreateRaceMissingIsAnchoredAndCommandAwareReview(t *testing.T) {
+func TestCreateRaceMissingApplicationWording(t *testing.T) {
 	cases := []struct {
 		name string
 		err  *cli.CLIError
@@ -263,11 +263,11 @@ func TestWaitForExecKeepsTimeoutTextAsExitResult(t *testing.T) {
 	}
 }
 
-type reviewProbeRunner struct {
+type probeClassificationRunner struct {
 	calls int
 }
 
-func (r *reviewProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+func (r *probeClassificationRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
 	r.calls++
 	return nil, nil, errors.New("unexpected probe")
 }
@@ -276,7 +276,7 @@ func TestClassifyContextJoinsNonCLILaunchError(t *testing.T) {
 	original := errors.New("backend launch failed")
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	runner := &reviewProbeRunner{}
+	runner := &probeClassificationRunner{}
 	got := cli.Classify(ctx, runner, original, cli.Probe{Args: []string{"version"}, Hint: "start the daemon"})
 	if !errors.Is(got, original) {
 		t.Fatalf("error = %v, want original launch error", got)

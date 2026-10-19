@@ -12,21 +12,21 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type review91ReuseRunner struct {
+type reuseTransientRunner struct {
 	*fakeRunner
 	mu       sync.Mutex
-	steps    []review91InspectStep
+	steps    []reuseTransientInspectStep
 	inspects int
 }
 
-type review91InspectStep struct {
+type reuseTransientInspectStep struct {
 	data string
 	err  error
 }
 
-const review91DockerUID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+const reuseTransientDockerUID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-func (r *review91ReuseRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *reuseTransientRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		r.mu.Lock()
 		i := r.inspects
@@ -40,22 +40,22 @@ func (r *review91ReuseRunner) Run(ctx context.Context, args ...string) ([]byte, 
 		return []byte(step.data), nil, step.err
 	}
 	if args[0] == "run" {
-		return []byte(review91DockerUID + "\n"), nil, nil
+		return []byte(reuseTransientDockerUID + "\n"), nil, nil
 	}
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-func (r *review91ReuseRunner) inspectCount() int {
+func (r *reuseTransientRunner) inspectCount() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.inspects
 }
 
-func review91DockerInspect(bound bool) string {
-	return review91DockerInspectIdentity(bound, review91DockerUID, "aaaaaaaaaaaaaaaa")
+func reuseTransientInspect(bound bool) string {
+	return reuseTransientInspectIdentity(bound, reuseTransientDockerUID, "aaaaaaaaaaaaaaaa")
 }
 
-func review91DockerInspectIdentity(bound bool, uid, creation string) string {
+func reuseTransientInspectIdentity(bound bool, uid, creation string) string {
 	ports := `{}`
 	if bound {
 		ports = `{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}`
@@ -76,7 +76,7 @@ func review91DockerInspectIdentity(bound bool, uid, creation string) string {
 	}]`, uid, sessionLabelJSON, creationLabel, ports)
 }
 
-func TestReview91WithReuseRetriesTransientInspect(t *testing.T) {
+func TestWithReuseRetriesTransientInspect(t *testing.T) {
 	oldPoll := reusePollInterval
 	oldTimeout := reuseAttachTimeout
 	reusePollInterval = time.Millisecond
@@ -86,11 +86,11 @@ func TestReview91WithReuseRetriesTransientInspect(t *testing.T) {
 		reuseAttachTimeout = oldTimeout
 	})
 
-	runner := &review91ReuseRunner{
+	runner := &reuseTransientRunner{
 		fakeRunner: newTestRunner(),
-		steps: []review91InspectStep{
+		steps: []reuseTransientInspectStep{
 			{err: errors.New("temporary inspect failure")},
-			{data: review91DockerInspect(true)},
+			{data: reuseTransientInspect(true)},
 		},
 	}
 	runner.imagePresent = true
@@ -109,7 +109,7 @@ func TestReview91WithReuseRetriesTransientInspect(t *testing.T) {
 	}
 }
 
-func TestReview91WithReuseRetriesIncompleteInspect(t *testing.T) {
+func TestWithReuseRetriesIncompleteInspect(t *testing.T) {
 	oldPoll := reusePollInterval
 	oldTimeout := reuseAttachTimeout
 	reusePollInterval = time.Millisecond
@@ -119,12 +119,12 @@ func TestReview91WithReuseRetriesIncompleteInspect(t *testing.T) {
 		reuseAttachTimeout = oldTimeout
 	})
 
-	runner := &review91ReuseRunner{
+	runner := &reuseTransientRunner{
 		fakeRunner: newTestRunner(),
-		steps: []review91InspectStep{
-			{data: review91DockerInspect(false)},
-			{data: review91DockerInspect(false)},
-			{data: review91DockerInspect(true)},
+		steps: []reuseTransientInspectStep{
+			{data: reuseTransientInspect(false)},
+			{data: reuseTransientInspect(false)},
+			{data: reuseTransientInspect(true)},
 		},
 	}
 	runner.imagePresent = true
@@ -140,14 +140,14 @@ func TestReview91WithReuseRetriesIncompleteInspect(t *testing.T) {
 	}
 }
 
-type review91CreateInspectRunner struct {
+type createInspectRunner struct {
 	*fakeRunner
 	created  bool
 	inspects int
 	creation string
 }
 
-func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *createInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
 		r.mu.Lock()
@@ -159,7 +159,7 @@ func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) (
 		if r.inspects == 1 {
 			return nil, nil, errors.New("temporary post-create inspect failure")
 		}
-		return []byte(review91DockerInspectIdentity(true, review91DockerUID, r.creation)), nil, nil
+		return []byte(reuseTransientInspectIdentity(true, reuseTransientDockerUID, r.creation)), nil, nil
 	case "run":
 		r.created = true
 		for i, arg := range args {
@@ -169,13 +169,13 @@ func (r *review91CreateInspectRunner) Run(ctx context.Context, args ...string) (
 				}
 			}
 		}
-		return []byte(review91DockerUID + "\n"), nil, nil
+		return []byte(reuseTransientDockerUID + "\n"), nil, nil
 	default:
 		return r.fakeRunner.Run(ctx, args...)
 	}
 }
 
-func TestReview91WithReuseRetriesInspectAfterCreate(t *testing.T) {
+func TestWithReuseRetriesInspectAfterCreate(t *testing.T) {
 	oldPoll := reusePollInterval
 	oldTimeout := reuseAttachTimeout
 	reusePollInterval = time.Millisecond
@@ -185,7 +185,7 @@ func TestReview91WithReuseRetriesInspectAfterCreate(t *testing.T) {
 		reuseAttachTimeout = oldTimeout
 	})
 
-	runner := &review91CreateInspectRunner{fakeRunner: newTestRunner()}
+	runner := &createInspectRunner{fakeRunner: newTestRunner()}
 	runner.imagePresent = true
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithReuse(), WithExposedPorts("6379/tcp"),
@@ -204,7 +204,7 @@ func TestReview91WithReuseRetriesInspectAfterCreate(t *testing.T) {
 	}
 }
 
-func TestReview91ReuseTransientErrorIsNotClassifiedAsMissing(t *testing.T) {
+func TestReuseTransientErrorIsNotClassifiedAsMissing(t *testing.T) {
 	// Keep this assertion close to the runner: a plain inspect error must
 	// remain retryable rather than being mistaken for a not-found result.
 	err := &cli.CLIError{Args: []string{"inspect", "myctr"}, ExitCode: 1, Stderr: "daemon temporarily unavailable"}

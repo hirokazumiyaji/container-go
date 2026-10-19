@@ -10,28 +10,28 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type issue104FollowupProbeRunner struct {
+type followupProbeRunner struct {
 	probeErr    error
 	probeStdout string
 }
 
-func (r *issue104FollowupProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *followupProbeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && (args[0] == "version" || args[0] == "system") {
 		return []byte(r.probeStdout), nil, r.probeErr
 	}
 	return nil, nil, nil
 }
 
-type issue104FollowupPruneRunner struct {
+type followupPruneRunner struct {
 	deleteErr error
 }
 
-type issue104ReplacementDockerRunner struct {
+type replacementDockerRunner struct {
 	inspects int
 	deleted  []string
 }
 
-func (r *issue104ReplacementDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *replacementDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	switch args[0] {
 	case "inspect":
 		r.inspects++
@@ -46,7 +46,7 @@ func (r *issue104ReplacementDockerRunner) Run(_ context.Context, args ...string)
 	}
 }
 
-func (r *issue104FollowupPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *followupPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if len(args) > 0 && (args[0] == "ps" || args[0] == "ls") {
 		return nil, nil, nil
 	}
@@ -69,7 +69,7 @@ func TestExec126ShortcutUsesSelectedCurrentBranch(t *testing.T) {
 		Binary: "container", Args: []string{"exec", "myctr", "app"}, ExitCode: 23,
 		Stderr: "permission denied: current workload",
 	}
-	f := &issue104JoinedExecRunner{
+	f := &branchJoinedExecRunner{
 		fakeRunner: newTestRunner(),
 		err:        errors.Join(unrelatedStatus, selected),
 		stderr:     selected.Stderr,
@@ -83,7 +83,7 @@ func TestExec126ShortcutUsesSelectedCurrentBranch(t *testing.T) {
 }
 
 func TestFailedDockerTerminateDoesNotPromoteReplacementUID(t *testing.T) {
-	runner := &issue104ReplacementDockerRunner{}
+	runner := &replacementDockerRunner{}
 	ctr := &Container{
 		id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: dockerEngine{},
 	}
@@ -102,7 +102,7 @@ func TestFailedDockerTerminateDoesNotPromoteReplacementUID(t *testing.T) {
 }
 
 func TestExecVerificationDoesNotPromoteUnprovenDockerUID(t *testing.T) {
-	runner := &issue104ReplacementDockerRunner{}
+	runner := &replacementDockerRunner{}
 	ctr := &Container{
 		id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: dockerEngine{},
 	}
@@ -141,7 +141,7 @@ func TestTerminateTreatsEmptyAndMismatchedInspectAsAbsent(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			runner := &issue104FreshDockerRunner{inspectJSON: []byte(tc.data)}
+			runner := &branchInspectDockerRunner{inspectJSON: []byte(tc.data)}
 			ctr := &Container{id: "myctr", creation: strings.Repeat("a", 16), runner: runner, eng: appleEngine{}}
 			if err := ctr.Terminate(context.Background()); err != nil {
 				t.Fatalf("Terminate with absent inspect result = %v, want nil", err)
@@ -163,7 +163,7 @@ func TestPruneDeleteNotFoundIsOperationAndTargetSpecific(t *testing.T) {
 		Binary: "docker", Args: []string{"inspect", targetID}, ExitCode: 1,
 		Stderr: "Error: no such object: " + targetID,
 	}
-	r := &issue104FollowupPruneRunner{deleteErr: errors.Join(inspectAbsence, permission)}
+	r := &followupPruneRunner{deleteErr: errors.Join(inspectAbsence, permission)}
 	removed, err := pruneListed(
 		context.Background(), r, dockerEngine{}, []string{"ps"},
 		func([]byte) ([]string, error) { return []string{targetID}, nil }, "prune",
@@ -178,7 +178,7 @@ func TestPruneDeleteNotFoundIsOperationAndTargetSpecific(t *testing.T) {
 
 func TestPruneDeleteHonorsSentinelWithoutCLIError(t *testing.T) {
 	targetID := strings.Repeat("a", 64)
-	r := &issue104FollowupPruneRunner{deleteErr: ErrContainerNotFound}
+	r := &followupPruneRunner{deleteErr: ErrContainerNotFound}
 	removed, err := pruneListed(
 		context.Background(), r, dockerEngine{}, []string{"ps"},
 		func([]byte) ([]string, error) { return []string{targetID}, nil }, "prune",
@@ -292,7 +292,7 @@ func TestProbeStdoutAttachesToMatchingBranch(t *testing.T) {
 		}
 		return false
 	}
-	runner := &issue104FollowupProbeRunner{
+	runner := &followupProbeRunner{
 		probeErr:    errors.Join(wrongBranch, matchingBranch),
 		probeStdout: "Cannot connect to the Docker daemon\n",
 	}

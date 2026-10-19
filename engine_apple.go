@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/inspect"
 )
 
@@ -836,7 +837,7 @@ func (appleEngine) parseImageIdentity(data []byte, image, platform string) (imag
 	variantDigest := ""
 	if platform != "" {
 		if len(record.Variants) == 0 && !rootOK {
-			if len(record.ID) == 64 && isHex(record.ID) {
+			if len(record.ID) == 64 && domain.IsHex(record.ID) {
 				// An old ID-only record proves that some local content
 				// exists, but it cannot prove that the host variant is
 				// addressable by a digest reference.
@@ -987,7 +988,7 @@ func finishAppleImageIdentity(requested string, record appleImageInspectRecord, 
 		// run target without a descriptor proving what that ID names.
 		return imageIdentity{}
 	}
-	if len(record.ID) == 64 && isHex(record.ID) {
+	if len(record.ID) == 64 && domain.IsHex(record.ID) {
 		// Older Apple image-inspect responses exposed the local content ID
 		// without a descriptor. Keep the compatibility fallback, but do
 		// not classify it as a Docker image ID.
@@ -1090,7 +1091,7 @@ func appleImageIDMatchesDescriptor(requested, recordID, digest string) bool {
 	if strings.HasPrefix(recordID, "sha256:") {
 		return isImageID(recordID) && strings.EqualFold(recordID, digest)
 	}
-	return len(recordID) == 64 && isHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
+	return len(recordID) == 64 && domain.IsHex(recordID) && strings.EqualFold("sha256:"+recordID, digest)
 }
 
 func (appleEngine) platformCompatible(selector, actual string) bool {

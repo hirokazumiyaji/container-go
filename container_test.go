@@ -670,6 +670,58 @@ func TestPublishedPortParseErrors(t *testing.T) {
 	}
 }
 
+// The domain parser owns the syntax, but the root package owns the public
+// ValidationError contract: option field, legacy message, and empty Value.
+func TestPublishedPortParseErrorContract(t *testing.T) {
+	cases := []struct {
+		spec    string
+		option  string
+		message string
+	}{
+		{"8080:80/sctp", "published port", "protocol must be tcp or udp"},
+		{"[::1:8080:80", "published port", "bracketed IPv6 form is malformed"},
+		{"invalid", "published port", "want [host-ip:]host-port:container-port[/proto]"},
+		{"70000:80", "port", "must be 1-65535"},
+		{"8080:99999", "port", "must be 1-65535"},
+	}
+	for _, tc := range cases {
+		err := WithPublishedPort(tc.spec)(newConfig())
+		if err == nil {
+			t.Errorf("spec %q: want validation error", tc.spec)
+			continue
+		}
+		if !errors.Is(err, ErrInvalidOption) {
+			t.Errorf("spec %q: error = %v, want ErrInvalidOption", tc.spec, err)
+		}
+		var validation *ValidationError
+		if !errors.As(err, &validation) {
+			t.Errorf("spec %q: error = %T %v, want *ValidationError", tc.spec, err, err)
+			continue
+		}
+		if validation.Option != tc.option || validation.Field != tc.option {
+			t.Errorf("spec %q: option/field = %q/%q, want %q", tc.spec, validation.Option, validation.Field, tc.option)
+		}
+		if validation.Message != tc.message || err.Error() != tc.message {
+			t.Errorf("spec %q: message = %q (error %q), want %q", tc.spec, validation.Message, err, tc.message)
+		}
+		if validation.Value != nil {
+			t.Errorf("spec %q: value = %#v, want nil", tc.spec, validation.Value)
+		}
+	}
+
+	// A malformed host address stays a plain parse error; the option
+	// wrapper then records the full spec as the redaction value.
+	const spec = "badhost:8080:80"
+	err := WithPublishedPort(spec)(newConfig())
+	var validation *ValidationError
+	if !errors.As(err, &validation) {
+		t.Fatalf("host address error = %T %v, want *ValidationError", err, err)
+	}
+	if validation.Option != "WithPublishedPort" || validation.Value != spec {
+		t.Errorf("host address option/value = %q/%#v, want WithPublishedPort/%q", validation.Option, validation.Value, spec)
+	}
+}
+
 func TestContainerIP(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

@@ -217,14 +217,14 @@ func (c *Container) TargetHost() string {
 }
 
 func (c *Container) effectiveQueryTimeout() time.Duration {
-	if c != nil && c.queryTimeout > 0 {
+	if c.queryTimeout > 0 {
 		return c.queryTimeout
 	}
 	return queryTimeout
 }
 
 func (c *Container) effectiveProbeTimeout() time.Duration {
-	if c != nil && c.probeTimeout > 0 {
+	if c.probeTimeout > 0 {
 		return c.probeTimeout
 	}
 	return 0
@@ -1616,7 +1616,7 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if name := c.cachedDefaultNetwork(); name != "" {
 		return name, nil
 	}
-	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng, c.effectiveQueryTimeout(), c.effectiveProbeTimeout())
+	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 	if err != nil {
 		return "", err
 	}
@@ -1643,7 +1643,7 @@ func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engin
 	if !configNeedsDefaultNetwork(cfg) {
 		return nil
 	}
-	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng, cfg.effectiveQueryTimeout(), cfg.effectiveProbeTimeout())
+	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
 		return err
 	}

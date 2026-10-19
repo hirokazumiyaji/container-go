@@ -144,35 +144,35 @@ func (c *config) validate() error {
 }
 
 func (c *config) effectiveRunTimeout() time.Duration {
-	if c != nil && c.runTimeout > 0 {
+	if c.runTimeout > 0 {
 		return c.runTimeout
 	}
 	return runTimeout
 }
 
 func (c *config) effectiveQueryTimeout() time.Duration {
-	if c != nil && c.queryTimeout > 0 {
+	if c.queryTimeout > 0 {
 		return c.queryTimeout
 	}
 	return queryTimeout
 }
 
 func (c *config) effectiveReuseAttachTimeout() time.Duration {
-	if c != nil && c.reuseAttachTimeout > 0 {
+	if c.reuseAttachTimeout > 0 {
 		return c.reuseAttachTimeout
 	}
 	return reuseAttachTimeout
 }
 
 func (c *config) effectiveReusePollInterval() time.Duration {
-	if c != nil && c.reusePollInterval > 0 {
+	if c.reusePollInterval > 0 {
 		return c.reusePollInterval
 	}
 	return reusePollInterval
 }
 
 func (c *config) effectiveProbeTimeout() time.Duration {
-	if c != nil && c.probeTimeout > 0 {
+	if c.probeTimeout > 0 {
 		return c.probeTimeout
 	}
 	return 0

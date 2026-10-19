@@ -262,11 +262,11 @@ func (c *config) ensureImage(ctx context.Context, image string) error {
 }
 
 func (c *config) inspectImage(ctx context.Context, image, platform string) (imageIdentity, bool, error) {
-	return inspectImage(ctx, c.runner, c.eng, image, platform, c.effectiveQueryTimeout(), c.effectiveProbeTimeout())
+	return inspectImage(ctx, c.runner, c.eng, image, platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 }
 
 func (c *config) pullImage(ctx context.Context, image, platform string) error {
-	return pullImage(ctx, c.runner, c.eng, image, platform, c.effectiveProbeTimeout())
+	return pullImage(ctx, c.runner, c.eng, image, platform, opTimeouts{probe: c.effectiveProbeTimeout()})
 }
 
 func (c *config) ensureImageRef(ctx context.Context, image string) (imageIdentity, error) {
@@ -503,7 +503,7 @@ func verifyAppleCreatedImage(ctx context.Context, c *Container, expected imageId
 			if imageReference == "" {
 				imageReference = expected.reference
 			}
-			checked, exists, inspectErr := inspectImage(ctx, c.runner, c.eng, imageReference, actual.platform, c.effectiveQueryTimeout(), c.effectiveProbeTimeout())
+			checked, exists, inspectErr := inspectImage(ctx, c.runner, c.eng, imageReference, actual.platform, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 			if inspectErr != nil {
 				return fmt.Errorf("verify Apple image variant after create: %w", inspectErr)
 			}
@@ -660,16 +660,18 @@ func mutableImageReference(image string, identity imageIdentity) imageIdentity {
 	return identity
 }
 
-func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, timeouts ...time.Duration) (imageIdentity, bool, error) {
-	var (
+// opTimeouts carries the optional query and probe budgets for an image
+// operation. A zero query uses the package default; a zero probe leaves
+// error classification without a probe budget.
+type opTimeouts struct {
+	query time.Duration
+	probe time.Duration
+}
+
+func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, timeouts opTimeouts) (imageIdentity, bool, error) {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
 		qTimeout = queryTimeout
-		pTimeout time.Duration
-	)
-	if len(timeouts) > 0 && timeouts[0] > 0 {
-		qTimeout = timeouts[0]
-	}
-	if len(timeouts) > 1 {
-		pTimeout = timeouts[1]
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
@@ -681,7 +683,7 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 		if eng.imageMissingForTarget(err, image) || imageMissingError(eng, err) {
 			return imageIdentity{}, false, nil
 		}
-		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, pTimeout, commandOperation(eng.imageInspectArgs(image, platform)), image)
+		return imageIdentity{}, false, classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(eng.imageInspectArgs(image, platform)), image)
 	}
 	if contextErr := commandContextError(qCtx, nil); contextErr != nil {
 		return imageIdentity{}, false, contextErr
@@ -696,21 +698,17 @@ func inspectImage(ctx context.Context, r cli.Runner, eng engine, image, platform
 // imageExists reports whether the image (and requested platform
 // variant, when set) is in the backend's store.
 func imageExists(ctx context.Context, r cli.Runner, eng engine, image, platform string) (bool, error) {
-	identity, exists, err := inspectImage(ctx, r, eng, image, platform)
+	identity, exists, err := inspectImage(ctx, r, eng, image, platform, opTimeouts{})
 	return exists && !identity.notLocal, err
 }
 
 // pullImage fetches the image (and requested platform variant, when
 // set) through the backend CLI.
-func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, probeTimeout ...time.Duration) error {
-	var pt time.Duration
-	if len(probeTimeout) > 0 {
-		pt = probeTimeout[0]
-	}
+func pullImage(ctx context.Context, r cli.Runner, eng engine, image, platform string, timeouts opTimeouts) error {
 	args := eng.pullImageArgs(image, platform)
 	_, _, err := r.Run(ctx, args...)
 	if err != nil {
-		return classifyErrorForWithProbe(ctx, r, err, eng, pt, commandOperation(args), image)
+		return classifyErrorForWithProbe(ctx, r, err, eng, timeouts.probe, commandOperation(args), image)
 	}
 	return nil
 }

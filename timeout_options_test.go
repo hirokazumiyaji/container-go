@@ -161,23 +161,6 @@ func TestReuseTimeoutCrossOptionValidation(t *testing.T) {
 }
 
 func TestConfigEffectiveTimeouts(t *testing.T) {
-	var nilCfg *config
-	if nilCfg.effectiveRunTimeout() != runTimeout {
-		t.Errorf("nil effectiveRunTimeout = %v, want %v", nilCfg.effectiveRunTimeout(), runTimeout)
-	}
-	if nilCfg.effectiveQueryTimeout() != queryTimeout {
-		t.Errorf("nil effectiveQueryTimeout = %v, want %v", nilCfg.effectiveQueryTimeout(), queryTimeout)
-	}
-	if nilCfg.effectiveReuseAttachTimeout() != reuseAttachTimeout {
-		t.Errorf("nil effectiveReuseAttachTimeout = %v, want %v", nilCfg.effectiveReuseAttachTimeout(), reuseAttachTimeout)
-	}
-	if nilCfg.effectiveReusePollInterval() != reusePollInterval {
-		t.Errorf("nil effectiveReusePollInterval = %v, want %v", nilCfg.effectiveReusePollInterval(), reusePollInterval)
-	}
-	if nilCfg.effectiveProbeTimeout() != 0 {
-		t.Errorf("nil effectiveProbeTimeout = %v, want 0", nilCfg.effectiveProbeTimeout())
-	}
-
 	cfg := newConfig()
 	if err := WithRunTimeout(2 * time.Minute)(cfg); err != nil {
 		t.Fatal(err)
@@ -211,14 +194,6 @@ func TestContainerTimeoutsAndShared(t *testing.T) {
 	}
 	if ctr.effectiveProbeTimeout() != 3*time.Second {
 		t.Errorf("effectiveProbeTimeout = %v, want 3s", ctr.effectiveProbeTimeout())
-	}
-
-	var nilCtr *Container
-	if nilCtr.effectiveQueryTimeout() != queryTimeout {
-		t.Errorf("nil effectiveQueryTimeout = %v, want %v", nilCtr.effectiveQueryTimeout(), queryTimeout)
-	}
-	if nilCtr.effectiveProbeTimeout() != 0 {
-		t.Errorf("nil effectiveProbeTimeout = %v, want 0", nilCtr.effectiveProbeTimeout())
 	}
 
 	shared := ctr.Shared()
@@ -300,7 +275,7 @@ func TestWithQueryTimeoutAppliedToDockerDefaultNetwork(t *testing.T) {
 	}
 
 	start := time.Now()
-	name, err := dockerDefaultNetwork(context.Background(), cfg.runner, cfg.eng, cfg.effectiveQueryTimeout(), cfg.effectiveProbeTimeout())
+	name, err := dockerDefaultNetwork(context.Background(), cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
 		t.Fatalf("dockerDefaultNetwork error: %v", err)
 	}
@@ -327,7 +302,7 @@ func TestWithQueryTimeoutAppliedToCopyFileVersion(t *testing.T) {
 
 	customTimeout := 45 * time.Second
 	start := time.Now()
-	err := dockerEngine{}.checkCopyFileFromContainerVersion(context.Background(), runner, customTimeout)
+	err := dockerEngine{}.checkCopyFileFromContainerVersion(context.Background(), runner, opTimeouts{query: customTimeout})
 	if err != nil {
 		t.Fatalf("checkCopyFileFromContainerVersion error: %v", err)
 	}

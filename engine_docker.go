@@ -191,20 +191,16 @@ func (e dockerEngine) isRemote() bool {
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network
 // is the daemon default.
-func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, timeouts ...time.Duration) (string, error) {
-	qTimeout := queryTimeout
-	var pTimeout time.Duration
-	if len(timeouts) > 0 && timeouts[0] > 0 {
-		qTimeout = timeouts[0]
-	}
-	if len(timeouts) > 1 {
-		pTimeout = timeouts[1]
+func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, timeouts opTimeouts) (string, error) {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
 	if err != nil {
-		classified := classifyErrorWithProbe(ctx, runner, err, eng, pTimeout)
+		classified := classifyErrorWithProbe(ctx, runner, err, eng, timeouts.probe)
 		return "", fmt.Errorf("inspect Docker server platform: %w", classified)
 	}
 	serverOS := strings.ToLower(strings.TrimSpace(string(stdout)))
@@ -1439,10 +1435,10 @@ func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
 	return client, server, nil
 }
 
-func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts ...time.Duration) error {
-	qTimeout := queryTimeout
-	if len(timeouts) > 0 && timeouts[0] > 0 {
-		qTimeout = timeouts[0]
+func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
 	}
 	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()

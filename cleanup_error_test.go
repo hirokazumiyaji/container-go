@@ -72,7 +72,7 @@ func (r *cleanupErrRunner) Run(ctx context.Context, args ...string) ([]byte, []b
 // A cleanup failure must reach the caller. Before, the delete error was
 // discarded and Run returned only the classified run error, so a leftover
 // container was undetectable.
-func TestReviewFailedCreateCleanupErrorReachesCaller(t *testing.T) {
+func TestFailedCreateCleanupErrorReachesCaller(t *testing.T) {
 	deleteErr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "myctr"}, ExitCode: 1, Stderr: "daemon down"}
 	r := &cleanupErrRunner{fakeRunner: newTestRunner(), failDelete: true, deleteErr: deleteErr}
 
@@ -107,7 +107,7 @@ func TestReviewFailedCreateCleanupErrorReachesCaller(t *testing.T) {
 
 // An already-absent container is an idempotent success, not a failure: there
 // is nothing left to clean up.
-func TestReviewFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
+func TestFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
 	r := &cleanupErrRunner{
 		fakeRunner:  newTestRunner(),
 		failInspect: true,
@@ -133,7 +133,7 @@ func TestReviewFailedCreateCleanupNotFoundIsSuccess(t *testing.T) {
 // An inspect that succeeds but reports no container is proof of absence, so
 // it must be an idempotent success. Reporting it as a leak is worse than the
 // original silence: the caller is told about a container that is gone.
-func TestReviewFailedCreateEmptyInspectOutputIsNotAReport(t *testing.T) {
+func TestFailedCreateEmptyInspectOutputIsNotAReport(t *testing.T) {
 	r := &emptyInspectRunner{fakeRunner: newTestRunner()}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -152,7 +152,7 @@ func TestReviewFailedCreateEmptyInspectOutputIsNotAReport(t *testing.T) {
 
 // A container that cannot be inspected may still be running, so that is a
 // failure rather than an assumption that it is gone.
-func TestReviewFailedCreateUninspectableIsReported(t *testing.T) {
+func TestFailedCreateUninspectableIsReported(t *testing.T) {
 	r := &cleanupErrRunner{fakeRunner: newTestRunner(), failInspect: true}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -168,7 +168,7 @@ func TestReviewFailedCreateUninspectableIsReported(t *testing.T) {
 
 // A name conflict means a pre-existing container, not ours, so nothing is
 // removed and nothing is reported.
-func TestReviewFailedCreateNameConflictIsNotACleanupFailure(t *testing.T) {
+func TestFailedCreateNameConflictIsNotACleanupFailure(t *testing.T) {
 	r := &conflictRunner{fakeRunner: newTestRunner()}
 
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -187,7 +187,7 @@ func TestReviewFailedCreateNameConflictIsNotACleanupFailure(t *testing.T) {
 
 // The reuse inspect/copy rollback must keep both errors recoverable, and must
 // no longer discard the Terminate result.
-func TestReviewReuseRollbackPreservesBothErrors(t *testing.T) {
+func TestReuseRollbackPreservesBothErrors(t *testing.T) {
 	copyErr := &cli.CLIError{Binary: "container", Args: []string{"cp"}, ExitCode: 1, Stderr: "reuse copy failed"}
 	cleanupErr := &cli.CLIError{Binary: "container", Args: []string{"delete", "--force", "reuse-rollback"}, ExitCode: 1, Stderr: "daemon down"}
 	r := &reuseRollbackCleanupRunner{
@@ -216,7 +216,7 @@ func TestReviewReuseRollbackPreservesBothErrors(t *testing.T) {
 
 // StrictCleanup must report a teardown failure as a test failure rather than
 // logging it, so a leak cannot hide behind a green run.
-func TestReviewStrictCleanupFailsOnTeardownError(t *testing.T) {
+func TestStrictCleanupFailsOnTeardownError(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &cleanupErrRunner{fakeRunner: f, failDelete: true}
@@ -232,7 +232,7 @@ func TestReviewStrictCleanupFailsOnTeardownError(t *testing.T) {
 
 // Cleanup keeps its existing lenient behavior, so an unrelated backend
 // problem does not turn an unrelated test red.
-func TestReviewCleanupStaysLenient(t *testing.T) {
+func TestCleanupStaysLenient(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 	ctr.runner = &cleanupErrRunner{fakeRunner: f, failDelete: true}

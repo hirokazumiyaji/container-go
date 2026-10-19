@@ -15,7 +15,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-func review91OwnedDockerInspect(uid, generation string, reused, bound bool) string {
+func ownedDockerInspect(uid, generation string, reused, bound bool) string {
 	ports := `{}`
 	if bound {
 		ports = `{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"49153"}]}`
@@ -39,19 +39,19 @@ func review91OwnedDockerInspect(uid, generation string, reused, bound bool) stri
 	}]`, uid, managedLabel, sessionLabel, sessionID(), creationLabel, generation, reuseLabelJSON, ports)
 }
 
-type review91MutableInspectRunner struct {
+type mutableInspectRunner struct {
 	*fakeRunner
 	mu   sync.Mutex
 	data string
 }
 
-func (r *review91MutableInspectRunner) setInspect(data string) {
+func (r *mutableInspectRunner) setInspect(data string) {
 	r.mu.Lock()
 	r.data = data
 	r.mu.Unlock()
 }
 
-func (r *review91MutableInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+func (r *mutableInspectRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		r.mu.Lock()
 		data := r.data
@@ -61,21 +61,21 @@ func (r *review91MutableInspectRunner) Run(ctx context.Context, args ...string) 
 	return r.fakeRunner.Run(ctx, args...)
 }
 
-type review91AfterWaitStrategy func()
+type afterWaitStrategy func()
 
-func (s review91AfterWaitStrategy) WaitUntilReady(context.Context, wait.Target) error {
+func (s afterWaitStrategy) WaitUntilReady(context.Context, wait.Target) error {
 	s()
 	return nil
 }
 
 const (
-	review91Round2UIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	review91Round2UIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	review91Round2GenA = "0123456789abcdef"
-	review91Round2GenB = "fedcba9876543210"
+	revalidateTestUIDA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	revalidateTestUIDB = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	revalidateTestGenA = "0123456789abcdef"
+	revalidateTestGenB = "fedcba9876543210"
 )
 
-func TestReview91ReuseRevalidatesAfterReadiness(t *testing.T) {
+func TestReuseRevalidatesAfterReadiness(t *testing.T) {
 	oldPoll, oldTimeout := reusePollInterval, reuseAttachTimeout
 	reusePollInterval = time.Millisecond
 	reuseAttachTimeout = 100 * time.Millisecond
@@ -83,33 +83,33 @@ func TestReview91ReuseRevalidatesAfterReadiness(t *testing.T) {
 		reusePollInterval, reuseAttachTimeout = oldPoll, oldTimeout
 	})
 
-	initial := review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, true, true)
+	initial := ownedDockerInspect(revalidateTestUIDA, revalidateTestGenA, true, true)
 	cases := map[string]struct {
 		after  string
 		check  func(error) bool
 		reason string
 	}{
 		"identity": {
-			after:  review91OwnedDockerInspect(review91Round2UIDB, review91Round2GenB, true, true),
+			after:  ownedDockerInspect(revalidateTestUIDB, revalidateTestGenB, true, true),
 			check:  func(err error) bool { return errors.Is(err, ErrGenerationReplaced) },
 			reason: "replacement identity",
 		},
 		"ownership": {
-			after:  review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, false, true),
+			after:  ownedDockerInspect(revalidateTestUIDA, revalidateTestGenA, false, true),
 			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "WithReuse") },
 			reason: "missing ownership",
 		},
 		"compatibility": {
-			after:  review91OwnedDockerInspect(review91Round2UIDA, review91Round2GenA, true, false),
+			after:  ownedDockerInspect(revalidateTestUIDA, revalidateTestGenA, true, false),
 			check:  func(err error) bool { return err != nil && strings.Contains(err.Error(), "exposed port") },
 			reason: "missing published endpoint",
 		},
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			runner := &review91MutableInspectRunner{fakeRunner: newTestRunner(), data: initial}
+			runner := &mutableInspectRunner{fakeRunner: newTestRunner(), data: initial}
 			runner.imagePresent = true
-			strategy := review91AfterWaitStrategy(func() { runner.setInspect(tc.after) })
+			strategy := afterWaitStrategy(func() { runner.setInspect(tc.after) })
 			ctr, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithReuse(), WithExposedPorts("6379/tcp"),
 				WithWaitStrategy(strategy), withRunner(runner), withEngine(dockerEngine{}))
@@ -123,37 +123,37 @@ func TestReview91ReuseRevalidatesAfterReadiness(t *testing.T) {
 	}
 }
 
-type review91ReplacementInspectRunner struct {
+type replacementInspectRunner struct {
 	data string
 }
 
-func (r review91ReplacementInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r replacementInspectRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	if args[0] == "inspect" {
 		return []byte(r.data), nil, nil
 	}
 	return nil, nil, nil
 }
 
-type review91TerminalStream struct {
+type terminalStream struct {
 	err    error
 	closed chan struct{}
 	reads  atomic.Int32
 }
 
-func (s *review91TerminalStream) Read([]byte) (int, error) {
+func (s *terminalStream) Read([]byte) (int, error) {
 	if s.reads.Add(1) == 1 {
 		return 0, s.err
 	}
 	return 0, io.EOF
 }
-func (s *review91TerminalStream) Close() error          { return nil }
-func (s *review91TerminalStream) Done() <-chan struct{} { return s.closed }
-func (s *review91TerminalStream) TerminalError() error  { return s.err }
+func (s *terminalStream) Close() error          { return nil }
+func (s *terminalStream) Done() <-chan struct{} { return s.closed }
+func (s *terminalStream) TerminalError() error  { return s.err }
 
-func TestReview91ClassifyingStreamCachesOriginalTerminalCLIError(t *testing.T) {
+func TestClassifyingStreamCachesOriginalTerminalCLIError(t *testing.T) {
 	runner := &fakeRunner{systemUp: false}
 	terminal := &cli.CLIError{Args: []string{"logs", "--follow", "myctr"}, ExitCode: 31, Stderr: "terminal failure"}
-	underlying := &review91TerminalStream{err: terminal, closed: make(chan struct{})}
+	underlying := &terminalStream{err: terminal, closed: make(chan struct{})}
 	stream := &classifyingStream{ReadCloser: underlying, ctx: context.Background(), container: &Container{
 		id: "myctr", runner: runner, eng: appleEngine{},
 	}}
@@ -179,7 +179,7 @@ func TestReview91ClassifyingStreamCachesOriginalTerminalCLIError(t *testing.T) {
 	}
 }
 
-func TestReview91ReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
+func TestReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
 	cases := map[string]map[string]string{
 		"unmanaged":   {reuseLabel: "true", creationLabel: "aaaaaaaaaaaaaaaa"},
 		"ungenerated": {managedLabel: "true", reuseLabel: "true"},
@@ -194,8 +194,8 @@ func TestReview91ReuseRejectsUnmanagedOrUngeneratedAdoption(t *testing.T) {
 	}
 }
 
-func TestReview91DeleteStoppedReuseRefusesEmptyGeneration(t *testing.T) {
-	runner := &review91ReplacementInspectRunner{}
+func TestDeleteStoppedReuseRefusesEmptyGeneration(t *testing.T) {
+	runner := &replacementInspectRunner{}
 	err := deleteStoppedReuse(context.Background(), &config{
 		runner: runner, eng: appleEngine{}, name: "shared",
 	}, &engineInfo{state: StateStopped, labels: map[string]string{managedLabel: "true", reuseLabel: "true"}})
@@ -204,9 +204,9 @@ func TestReview91DeleteStoppedReuseRefusesEmptyGeneration(t *testing.T) {
 	}
 }
 
-func TestReview91LazyCacheRejectsReplacementNameLookup(t *testing.T) {
-	runner := review91ReplacementInspectRunner{
-		data: review91OwnedDockerInspect("replacement-uid", "replacement-generation", false, true),
+func TestLazyCacheRejectsReplacementNameLookup(t *testing.T) {
+	runner := replacementInspectRunner{
+		data: ownedDockerInspect("replacement-uid", "replacement-generation", false, true),
 	}
 	ctr := &Container{
 		id:       "myctr",
@@ -227,24 +227,24 @@ func TestReview91LazyCacheRejectsReplacementNameLookup(t *testing.T) {
 	}
 }
 
-func TestReview91CacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
+func TestCacheKeepsIdentityAndEndpointImmutable(t *testing.T) {
 	original := &engineInfo{
 		state:  StateRunning,
-		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: review91Round2GenA},
-		uid:    review91Round2UIDA,
+		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: revalidateTestGenA},
+		uid:    revalidateTestUIDA,
 		bound:  []boundPort{{containerPort: 6379, proto: "tcp", hostPort: 49153}},
 	}
 	replacement := &engineInfo{
 		state:  StateRunning,
-		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: review91Round2GenA},
-		uid:    review91Round2UIDB,
+		labels: map[string]string{managedLabel: "true", sessionLabel: sessionID(), creationLabel: revalidateTestGenA},
+		uid:    revalidateTestUIDB,
 		bound:  []boundPort{{containerPort: 6379, proto: "tcp", hostPort: 49154}},
 	}
 	ctr := &Container{
 		eng:      dockerEngine{},
-		creation: review91Round2GenA,
+		creation: revalidateTestGenA,
 		exposed:  []portSpec{{port: 6379, proto: "tcp"}},
-		sync:     &lockPack{uid: review91Round2UIDA},
+		sync:     &lockPack{uid: revalidateTestUIDA},
 	}
 	if err := ctr.cacheInfo(original); err != nil {
 		t.Fatalf("cache original: %v", err)

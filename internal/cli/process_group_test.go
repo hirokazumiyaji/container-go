@@ -18,7 +18,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestIssue116EscapingProcessGroupHelper(t *testing.T) {
+func TestEscapingProcessGroupHelper(t *testing.T) {
 	if os.Getenv("CONTAINERGO_GROUP_ESCAPE_HELPER") != "1" {
 		return
 	}
@@ -62,7 +62,7 @@ func TestExecRunnerCancellationKillsChildThatLeavesProcessGroup(t *testing.T) {
 	dir := t.TempDir()
 	pidFile := filepath.Join(dir, "escaped-child.pid")
 	errorFile := filepath.Join(dir, "escaped-child.error")
-	wrapper := writeStub(t, `exec env CONTAINERGO_GROUP_ESCAPE_HELPER=1 CONTAINERGO_GROUP_ESCAPE_PID="$1" CONTAINERGO_GROUP_ESCAPE_ERROR="$2" "$3" -test.run='^TestIssue116EscapingProcessGroupHelper$'`)
+	wrapper := writeStub(t, `exec env CONTAINERGO_GROUP_ESCAPE_HELPER=1 CONTAINERGO_GROUP_ESCAPE_PID="$1" CONTAINERGO_GROUP_ESCAPE_ERROR="$2" "$3" -test.run='^TestEscapingProcessGroupHelper$'`)
 	r := &ExecRunner{Binary: wrapper}
 
 	ctx, cancel := context.WithCancel(context.Background())

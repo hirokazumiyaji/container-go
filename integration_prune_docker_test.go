@@ -91,10 +91,13 @@ func TestIntegrationDockerPruneExactFixtures(t *testing.T) {
 	ctx := context.Background()
 
 	if err := pullWith(ctx, &cli.ExecRunner{Binary: "docker"}, dockerEngine{}, integrationAlpine); err != nil {
-		if dockerPullRateLimited(err) {
-			t.Skipf("docker pull rate-limited: %v", err)
+		if integrationtest.DockerPullRateLimited(err) {
+			if _, inspectErr := exec.Command("docker", "image", "inspect", integrationAlpine).Output(); inspectErr != nil {
+				t.Skipf("docker pull rate-limited and image not locally available: %v", err)
+			}
+		} else {
+			t.Fatalf("Pull: %v", err)
 		}
-		t.Fatalf("Pull: %v", err)
 	}
 
 	suffix := fmt.Sprintf("%d-%d", os.Getpid(), time.Now().UnixNano())

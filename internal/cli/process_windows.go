@@ -75,6 +75,12 @@ func (t *windowsProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 	}
 }
 
+// provesActiveTermination reports the retained process handle, whose liveness
+// answer is tied to the original process rather than to a recycled PID.
+func (t *windowsProcessTree) provesActiveTermination() bool {
+	return t != nil && t.process != 0
+}
+
 func (t *windowsProcessTree) close() {
 	if t == nil {
 		return

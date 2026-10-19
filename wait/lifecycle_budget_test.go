@@ -13,11 +13,11 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type review90Cause struct{ message string }
+type budgetWaitCause struct{ message string }
 
-func (e *review90Cause) Error() string { return e.message }
+func (e *budgetWaitCause) Error() string { return e.message }
 
-type review90LogProbeTarget struct {
+type budgetLogProbeTarget struct {
 	streamErr   error
 	probeErr    error
 	probeCalls  atomic.Int32
@@ -25,11 +25,11 @@ type review90LogProbeTarget struct {
 	probeBudget time.Duration
 }
 
-func (*review90LogProbeTarget) Endpoint(context.Context, string) (string, error) {
+func (*budgetLogProbeTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("unused endpoint")
 }
 
-func (t *review90LogProbeTarget) Running(ctx context.Context) (bool, error) {
+func (t *budgetLogProbeTarget) Running(ctx context.Context) (bool, error) {
 	t.probeCalls.Add(1)
 	if deadline, ok := ctx.Deadline(); ok {
 		t.probeBudget = time.Until(deadline)
@@ -39,26 +39,26 @@ func (t *review90LogProbeTarget) Running(ctx context.Context) (bool, error) {
 	return false, t.probeErr
 }
 
-func (t *review90LogProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *budgetLogProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	if t.streamErr != nil {
-		return review90ErrorReader{err: t.streamErr}, nil
+		return budgetErrorReader{err: t.streamErr}, nil
 	}
 	return io.NopCloser(strings.NewReader("")), nil
 }
 
-func (*review90LogProbeTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*budgetLogProbeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, errors.New("unused exec")
 }
 
-type review90ErrorReader struct{ err error }
+type budgetErrorReader struct{ err error }
 
-func (r review90ErrorReader) Read([]byte) (int, error) { return 0, r.err }
-func (review90ErrorReader) Close() error               { return nil }
+func (r budgetErrorReader) Read([]byte) (int, error) { return 0, r.err }
+func (budgetErrorReader) Close() error               { return nil }
 
 func TestForLogEOFProbeHonorsCallerBudgetAndRetainsCauses(t *testing.T) {
-	streamCause := &review90Cause{message: "stream read failed"}
-	probeCause := &review90Cause{message: "state probe failed"}
-	target := &review90LogProbeTarget{streamErr: streamCause, probeErr: probeCause}
+	streamCause := &budgetWaitCause{message: "stream read failed"}
+	probeCause := &budgetWaitCause{message: "state probe failed"}
+	target := &budgetLogProbeTarget{streamErr: streamCause, probeErr: probeCause}
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Millisecond)
 	defer cancel()
 	started := time.Now()
@@ -80,20 +80,20 @@ func TestForLogEOFProbeHonorsCallerBudgetAndRetainsCauses(t *testing.T) {
 	}
 }
 
-type review90CloseTerminalLogStream struct {
+type budgetCloseTerminalLogStream struct {
 	*strings.Reader
 	done        chan struct{}
 	expire      func()
 	terminalErr error
 }
 
-func newReview90CloseTerminalLogStream(
+func newBudgetCloseTerminalLogStream(
 	expire func(),
 	terminalErr error,
-) *review90CloseTerminalLogStream {
+) *budgetCloseTerminalLogStream {
 	done := make(chan struct{})
 	close(done)
-	return &review90CloseTerminalLogStream{
+	return &budgetCloseTerminalLogStream{
 		Reader:      strings.NewReader("ready\n"),
 		done:        done,
 		expire:      expire,
@@ -101,17 +101,17 @@ func newReview90CloseTerminalLogStream(
 	}
 }
 
-func (s *review90CloseTerminalLogStream) Close() error {
+func (s *budgetCloseTerminalLogStream) Close() error {
 	s.expire()
 	return nil
 }
-func (s *review90CloseTerminalLogStream) Done() <-chan struct{}     { return s.done }
-func (*review90CloseTerminalLogStream) Drain(context.Context) error { return nil }
-func (s *review90CloseTerminalLogStream) TerminalError() error {
+func (s *budgetCloseTerminalLogStream) Done() <-chan struct{}     { return s.done }
+func (*budgetCloseTerminalLogStream) Drain(context.Context) error { return nil }
+func (s *budgetCloseTerminalLogStream) TerminalError() error {
 	return s.terminalErr
 }
 
-type review90DrainTerminalLogStream struct {
+type budgetDrainTerminalLogStream struct {
 	*strings.Reader
 	done        chan struct{}
 	cancel      context.CancelFunc
@@ -129,7 +129,7 @@ func TestSettleLogMatchRetainsTerminalErrorWhenDrainIsCancelled(t *testing.T) {
 	}
 	done := make(chan struct{})
 	close(done)
-	stream := &review90DrainTerminalLogStream{
+	stream := &budgetDrainTerminalLogStream{
 		Reader:      strings.NewReader(""),
 		done:        done,
 		cancel:      cancel,
@@ -145,15 +145,15 @@ func TestSettleLogMatchRetainsTerminalErrorWhenDrainIsCancelled(t *testing.T) {
 	}
 }
 
-func (*review90DrainTerminalLogStream) Close() error { return nil }
-func (s *review90DrainTerminalLogStream) Done() <-chan struct{} {
+func (*budgetDrainTerminalLogStream) Close() error { return nil }
+func (s *budgetDrainTerminalLogStream) Done() <-chan struct{} {
 	return s.done
 }
-func (s *review90DrainTerminalLogStream) Drain(context.Context) error {
+func (s *budgetDrainTerminalLogStream) Drain(context.Context) error {
 	s.cancel()
 	return context.Canceled
 }
-func (s *review90DrainTerminalLogStream) TerminalError() error {
+func (s *budgetDrainTerminalLogStream) TerminalError() error {
 	return s.terminalErr
 }
 
@@ -170,7 +170,7 @@ func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T)
 		},
 		"deadline": {
 			newContext: func() (context.Context, func()) {
-				ctx := newReview90DeadlineContext(time.Now().Add(time.Hour))
+				ctx := newBudgetDeadlineContext(time.Now().Add(time.Hour))
 				return ctx, ctx.expire
 			},
 			want: context.DeadlineExceeded,
@@ -185,8 +185,8 @@ func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T)
 				Stderr:   "logs stream failed",
 			}
 			ctx, expire := tc.newContext()
-			stream := newReview90CloseTerminalLogStream(expire, terminal)
-			target := &issue90Target{logs: []io.ReadCloser{stream}}
+			stream := newBudgetCloseTerminalLogStream(expire, terminal)
+			target := &stubWaitTarget{logs: []io.ReadCloser{stream}}
 
 			err := ForLog("ready").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, target)
 			if !errors.Is(err, tc.want) {
@@ -203,17 +203,17 @@ func TestForLogRetainsSettledTerminalErrorDuringContextTermination(t *testing.T)
 	}
 }
 
-type review90BlockingStatusStream struct {
+type budgetBlockingStatusStream struct {
 	reader        *io.PipeReader
 	done          chan struct{}
 	terminalErr   error
 	terminalCalls atomic.Int32
 }
 
-func newReview90BlockingStatusStream(terminalErr error) *review90BlockingStatusStream {
+func newBudgetBlockingStatusStream(terminalErr error) *budgetBlockingStatusStream {
 	done := make(chan struct{})
 	close(done)
-	return &review90BlockingStatusStream{
+	return &budgetBlockingStatusStream{
 		reader:      newBlockingPipeReader(),
 		done:        done,
 		terminalErr: terminalErr,
@@ -225,14 +225,14 @@ func newBlockingPipeReader() *io.PipeReader {
 	return reader
 }
 
-func (s *review90BlockingStatusStream) Read(p []byte) (int, error) {
+func (s *budgetBlockingStatusStream) Read(p []byte) (int, error) {
 	return s.reader.Read(p)
 }
-func (s *review90BlockingStatusStream) Close() error { return s.reader.Close() }
-func (s *review90BlockingStatusStream) Done() <-chan struct{} {
+func (s *budgetBlockingStatusStream) Close() error { return s.reader.Close() }
+func (s *budgetBlockingStatusStream) Done() <-chan struct{} {
 	return s.done
 }
-func (s *review90BlockingStatusStream) TerminalError() error {
+func (s *budgetBlockingStatusStream) TerminalError() error {
 	s.terminalCalls.Add(1)
 	return s.terminalErr
 }
@@ -244,7 +244,7 @@ func TestScanLogStreamJoinsContextWithSettledTerminalExit(t *testing.T) {
 		ExitCode: 17,
 		Stderr:   "logs stream failed",
 	}
-	stream := newReview90BlockingStatusStream(terminal)
+	stream := newBudgetBlockingStatusStream(terminal)
 	t.Cleanup(func() { _ = stream.Close() })
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -263,7 +263,7 @@ func TestScanLogStreamJoinsContextWithSettledTerminalExit(t *testing.T) {
 }
 
 func TestPollRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
-	target := &issue90Target{runningStates: []bool{false}}
+	target := &stubWaitTarget{runningStates: []bool{false}}
 	err := poll(
 		context.Background(),
 		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
@@ -280,7 +280,7 @@ func TestPollRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
 }
 
 func TestForLogRunsFinalLifecycleCheckBeforeSuccess(t *testing.T) {
-	target := &issue90Target{
+	target := &stubWaitTarget{
 		runningStates: []bool{false},
 		logs:          []io.ReadCloser{io.NopCloser(strings.NewReader("ready\n"))},
 	}
@@ -311,12 +311,12 @@ func TestFinalLifecycleProbeHonorsWaitBudget(t *testing.T) {
 	}
 }
 
-type review90ContextStrategy struct {
+type budgetContextStrategy struct {
 	cause  error
 	starts chan struct{}
 }
 
-func (s *review90ContextStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
+func (s *budgetContextStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
 	select {
 	case <-s.starts:
 	default:
@@ -326,19 +326,19 @@ func (s *review90ContextStrategy) WaitUntilReady(ctx context.Context, _ Target) 
 	return s.cause
 }
 
-type review90NonCooperativeStrategy struct {
+type budgetNonCooperativeStrategy struct {
 	started chan struct{}
 	release chan struct{}
 }
 
-func (s *review90NonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
+func (s *budgetNonCooperativeStrategy) WaitUntilReady(context.Context, Target) error {
 	close(s.started)
 	<-s.release
 	return nil
 }
 
 func TestForAnyCancellationDoesNotWaitForNonCooperativeChild(t *testing.T) {
-	child := &review90NonCooperativeStrategy{
+	child := &budgetNonCooperativeStrategy{
 		started: make(chan struct{}),
 		release: make(chan struct{}),
 	}
@@ -347,7 +347,7 @@ func TestForAnyCancellationDoesNotWaitForNonCooperativeChild(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	go func() {
-		done <- ForAny(child).WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &issue90Target{})
+		done <- ForAny(child).WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &stubWaitTarget{})
 	}()
 
 	select {
@@ -371,24 +371,24 @@ func TestForAnyCancellationDoesNotWaitForNonCooperativeChild(t *testing.T) {
 }
 
 func TestCompositeContextErrorsRetainChildCauses(t *testing.T) {
-	cause := &review90Cause{message: "child failed at deadline"}
+	cause := &budgetWaitCause{message: "child failed at deadline"}
 	tests := []struct {
 		name     string
 		strategy Strategy
 	}{
 		{
 			name:     "all",
-			strategy: ForAll((&review90ContextStrategy{cause: cause, starts: make(chan struct{})})).WithStartupTimeout(20 * time.Millisecond),
+			strategy: ForAll((&budgetContextStrategy{cause: cause, starts: make(chan struct{})})).WithStartupTimeout(20 * time.Millisecond),
 		},
 		{
 			name:     "any",
-			strategy: ForAny((&review90ContextStrategy{cause: cause, starts: make(chan struct{})})).WithStartupTimeout(20 * time.Millisecond),
+			strategy: ForAny((&budgetContextStrategy{cause: cause, starts: make(chan struct{})})).WithStartupTimeout(20 * time.Millisecond),
 		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			started := time.Now()
-			err := tc.strategy.WaitUntilReady(context.Background(), &issue90Target{})
+			err := tc.strategy.WaitUntilReady(context.Background(), &stubWaitTarget{})
 			if err == nil || !errors.Is(err, context.DeadlineExceeded) || !errors.Is(err, cause) {
 				t.Fatalf("error = %v, want deadline and child cause", err)
 			}
@@ -400,30 +400,30 @@ func TestCompositeContextErrorsRetainChildCauses(t *testing.T) {
 }
 
 func TestCompositeCallerCancellationWinsOverChildDeadline(t *testing.T) {
-	cause := &review90Cause{message: "child saw cancellation"}
-	child := &review90ContextStrategy{cause: cause, starts: make(chan struct{})}
+	cause := &budgetWaitCause{message: "child saw cancellation"}
+	child := &budgetContextStrategy{cause: cause, starts: make(chan struct{})}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() {
 		<-child.starts
 		cancel()
 	}()
-	err := ForAll(child).WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &issue90Target{})
+	err := ForAll(child).WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &stubWaitTarget{})
 	if err == nil || !errors.Is(err, context.Canceled) || !errors.Is(err, cause) {
 		t.Fatalf("error = %v, want cancellation and child cause", err)
 	}
 }
 
-type review90DeadlineContext struct {
+type budgetDeadlineContext struct {
 	deadline time.Time
 	done     chan struct{}
 }
 
-func newReview90DeadlineContext(deadline time.Time) *review90DeadlineContext {
-	return &review90DeadlineContext{deadline: deadline, done: make(chan struct{})}
+func newBudgetDeadlineContext(deadline time.Time) *budgetDeadlineContext {
+	return &budgetDeadlineContext{deadline: deadline, done: make(chan struct{})}
 }
-func (c *review90DeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
-func (c *review90DeadlineContext) Done() <-chan struct{}       { return c.done }
-func (c *review90DeadlineContext) Err() error {
+func (c *budgetDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *budgetDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *budgetDeadlineContext) Err() error {
 	select {
 	case <-c.done:
 		return context.DeadlineExceeded
@@ -431,17 +431,17 @@ func (c *review90DeadlineContext) Err() error {
 		return nil
 	}
 }
-func (*review90DeadlineContext) Value(any) any { return nil }
-func (c *review90DeadlineContext) expire()     { close(c.done) }
+func (*budgetDeadlineContext) Value(any) any { return nil }
+func (c *budgetDeadlineContext) expire()     { close(c.done) }
 
-type review90ReleaseStrategy struct {
+type budgetReleaseStrategy struct {
 	started  chan struct{}
 	canceled chan struct{}
 	release  chan struct{}
 	cause    error
 }
 
-func (s *review90ReleaseStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
+func (s *budgetReleaseStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
 	close(s.started)
 	<-ctx.Done()
 	close(s.canceled)
@@ -450,7 +450,7 @@ func (s *review90ReleaseStrategy) WaitUntilReady(ctx context.Context, _ Target) 
 }
 
 func TestForAllDistinguishesCallerAndStartupDeadlines(t *testing.T) {
-	cause := &review90Cause{message: "child released after deadline"}
+	cause := &budgetWaitCause{message: "child released after deadline"}
 	for _, tc := range []struct {
 		name           string
 		startupTimeout time.Duration
@@ -461,8 +461,8 @@ func TestForAllDistinguishesCallerAndStartupDeadlines(t *testing.T) {
 		{name: "caller", startupTimeout: time.Second, callerDeadline: 20 * time.Millisecond, wantStartup: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			caller := newReview90DeadlineContext(time.Now().Add(tc.callerDeadline))
-			child := &review90ReleaseStrategy{
+			caller := newBudgetDeadlineContext(time.Now().Add(tc.callerDeadline))
+			child := &budgetReleaseStrategy{
 				started:  make(chan struct{}),
 				canceled: make(chan struct{}),
 				release:  make(chan struct{}),
@@ -470,7 +470,7 @@ func TestForAllDistinguishesCallerAndStartupDeadlines(t *testing.T) {
 			}
 			done := make(chan error, 1)
 			go func() {
-				done <- ForAll(child).WithStartupTimeout(tc.startupTimeout).WaitUntilReady(caller, &issue90Target{})
+				done <- ForAll(child).WithStartupTimeout(tc.startupTimeout).WaitUntilReady(caller, &stubWaitTarget{})
 			}()
 			select {
 			case <-child.started:

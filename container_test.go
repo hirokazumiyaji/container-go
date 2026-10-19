@@ -610,17 +610,52 @@ func TestPublishedPortSwitchesToHostEndpoint(t *testing.T) {
 }
 
 func TestPublishedPortWithUnspecifiedHostReturnsLoopback(t *testing.T) {
-	f := newTestRunner()
-	ctr := runTestContainer(t, f,
-		WithExposedPorts("6379/tcp"),
-		WithPublishedPort("16379:6379"))
+	for _, tc := range []struct {
+		name     string
+		spec     string
+		wantHost string
+		wantEnd  string
+	}{
+		{
+			name:     "empty host",
+			spec:     "16379:6379",
+			wantHost: "127.0.0.1",
+			wantEnd:  "127.0.0.1:16379",
+		},
+		{
+			name:     "ipv4 0.0.0.0",
+			spec:     "0.0.0.0:16379:6379",
+			wantHost: "127.0.0.1",
+			wantEnd:  "127.0.0.1:16379",
+		},
+		{
+			name:     "ipv6 ::",
+			spec:     "[::]:16379:6379",
+			wantHost: "::1",
+			wantEnd:  "[::1]:16379",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := runTestContainer(t, f,
+				WithExposedPorts("6379/tcp"),
+				WithPublishedPort(tc.spec))
 
-	host, err := ctr.Host(context.Background())
-	if err != nil {
-		t.Fatalf("Host: %v", err)
-	}
-	if host != "127.0.0.1" {
-		t.Errorf("Host = %q, want 127.0.0.1", host)
+			host, err := ctr.Host(context.Background())
+			if err != nil {
+				t.Fatalf("Host: %v", err)
+			}
+			if host != tc.wantHost {
+				t.Errorf("Host = %q, want %q", host, tc.wantHost)
+			}
+			endpoint, err := ctr.Endpoint(context.Background(), "6379/tcp")
+			if err != nil {
+				t.Fatalf("Endpoint: %v", err)
+			}
+			if endpoint != tc.wantEnd {
+				t.Errorf("Endpoint = %q, want %q", endpoint, tc.wantEnd)
+			}
+		})
 	}
 }
 

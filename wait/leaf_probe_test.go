@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-func TestReview91LeafPollRejectsStopDuringSuccessfulCheck(t *testing.T) {
+func TestLeafPollRejectsStopDuringSuccessfulCheck(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.stateScript = []struct {
 		state State
@@ -33,7 +33,7 @@ func TestReview91LeafPollRejectsStopDuringSuccessfulCheck(t *testing.T) {
 	}
 }
 
-func TestReview91ForLogRejectsStopDuringMatch(t *testing.T) {
+func TestForLogRejectsStopDuringMatch(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.stateScript = []struct {
 		state State
@@ -54,11 +54,11 @@ func TestReview91ForLogRejectsStopDuringMatch(t *testing.T) {
 	}
 }
 
-type review91TransientTailReader struct {
+type transientTailReader struct {
 	sent bool
 }
 
-func (r *review91TransientTailReader) Read(p []byte) (int, error) {
+func (r *transientTailReader) Read(p []byte) (int, error) {
 	if !r.sent {
 		r.sent = true
 		return copy(p, "ready\n"), nil
@@ -66,12 +66,12 @@ func (r *review91TransientTailReader) Read(p []byte) (int, error) {
 	return 0, errors.New("temporary log transport failure")
 }
 
-func (*review91TransientTailReader) Close() error { return nil }
+func (*transientTailReader) Close() error { return nil }
 
-func TestReview91TransientScannerErrorDoesNotCommitReplayOrOccurrence(t *testing.T) {
+func TestTransientScannerErrorDoesNotCommitReplayOrOccurrence(t *testing.T) {
 	target := newLifecycleTarget(StateRunning)
 	target.logStreams = []io.ReadCloser{
-		&review91TransientTailReader{},
+		&transientTailReader{},
 		io.NopCloser(strings.NewReader("ready\n")),
 		io.NopCloser(strings.NewReader("ready\nready\n")),
 	}
@@ -89,29 +89,29 @@ func TestReview91TransientScannerErrorDoesNotCommitReplayOrOccurrence(t *testing
 	}
 }
 
-type review91CancelingMissingTarget struct {
+type cancelingMissingTarget struct {
 	cancel context.CancelFunc
 }
 
-func (*review91CancelingMissingTarget) Endpoint(context.Context, string) (string, error) {
+func (*cancelingMissingTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91CancelingMissingTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91CancelingMissingTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*cancelingMissingTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*cancelingMissingTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*review91CancelingMissingTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*cancelingMissingTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
-func (t *review91CancelingMissingTarget) State(context.Context) (State, error) {
+func (t *cancelingMissingTarget) State(context.Context) (State, error) {
 	t.cancel()
 	return StateUnknown, fmt.Errorf("inspect raced cancellation: %w", ErrTargetNotFound)
 }
 
-func TestReview91LeafStateProbePrefersCallerCancellation(t *testing.T) {
+func TestLeafStateProbePrefersCallerCancellation(t *testing.T) {
 	t.Run("poll", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		target := &review91CancelingMissingTarget{cancel: cancel}
+		target := &cancelingMissingTarget{cancel: cancel}
 		err := poll(ctx, options{startupTimeout: time.Second, pollInterval: time.Millisecond}, target, "wait for test", func(context.Context) error { return nil })
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v, want context.Canceled", err)
@@ -123,7 +123,7 @@ func TestReview91LeafStateProbePrefersCallerCancellation(t *testing.T) {
 
 	t.Run("log", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		target := &review91CancelingMissingTarget{cancel: cancel}
+		target := &cancelingMissingTarget{cancel: cancel}
 		err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("error = %v, want context.Canceled", err)
@@ -134,29 +134,29 @@ func TestReview91LeafStateProbePrefersCallerCancellation(t *testing.T) {
 	})
 }
 
-type review91DeadlineMissingTarget struct {
+type deadlineMissingTarget struct {
 	stateCalls atomic.Int32
 }
 
-func (*review91DeadlineMissingTarget) Endpoint(context.Context, string) (string, error) {
+func (*deadlineMissingTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*review91DeadlineMissingTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*review91DeadlineMissingTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*deadlineMissingTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*deadlineMissingTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*review91DeadlineMissingTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*deadlineMissingTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
-func (t *review91DeadlineMissingTarget) State(ctx context.Context) (State, error) {
+func (t *deadlineMissingTarget) State(ctx context.Context) (State, error) {
 	t.stateCalls.Add(1)
 	<-ctx.Done()
 	return StateUnknown, fmt.Errorf("inspect raced deadline: %w", ErrTargetNotFound)
 }
 
-func TestReview91LeafStateProbePrefersDeadline(t *testing.T) {
+func TestLeafStateProbePrefersDeadline(t *testing.T) {
 	t.Run("poll", func(t *testing.T) {
-		target := &review91DeadlineMissingTarget{}
+		target := &deadlineMissingTarget{}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 		defer cancel()
 		err := poll(ctx, options{startupTimeout: time.Second, pollInterval: time.Millisecond}, target, "wait for test", func(context.Context) error { return nil })
@@ -169,7 +169,7 @@ func TestReview91LeafStateProbePrefersDeadline(t *testing.T) {
 	})
 
 	t.Run("log", func(t *testing.T) {
-		target := &review91DeadlineMissingTarget{}
+		target := &deadlineMissingTarget{}
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 		defer cancel()
 		err := ForLog("ready").WithStartupTimeout(time.Second).WaitUntilReady(ctx, target)

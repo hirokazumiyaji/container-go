@@ -194,11 +194,15 @@ func TestIntegrationPublishedPort(t *testing.T) {
 	if host != "127.0.0.1" || port != 18080 {
 		t.Fatalf("endpoint = %s:%d, want 127.0.0.1:18080", host, port)
 	}
-	resp, err := http.Get(fmt.Sprintf("http://%s:%d/", host, port))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, fmt.Sprintf("http://%s:%d/", host, port), nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("GET: %v", err)
 	}
-	resp.Body.Close()
+	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Errorf("status = %d", resp.StatusCode)
 	}

@@ -901,3 +901,11 @@ func TestForExecRejectsEmptyCommand(t *testing.T) {
 		})
 	}
 }
+
+func TestForAnyEmptyStrategiesReturnsImmediately(t *testing.T) {
+	ctx := context.Background()
+	target := newFakeTarget()
+	if err := ForAny().WaitUntilReady(ctx, target); err != nil {
+		t.Fatalf("ForAny() with no strategies returned error: %v, want nil", err)
+	}
+}

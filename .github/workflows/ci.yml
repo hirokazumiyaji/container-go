@@ -174,9 +174,9 @@ jobs:
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
-      # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.8.0
+      # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.9.0
       # is the current scanner that works with this toolchain.
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
 
   # bench/ is a separate module, so no root job reaches it.
   # The bench jobs below run unit tests, race detection, vet, lint,
@@ -229,7 +229,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: '1.27.2'
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
         working-directory: bench
 
   # actionlint validates workflow syntax, expressions, and runner labels. It

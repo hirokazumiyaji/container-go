@@ -1450,4 +1450,3 @@ func TestWithFilesParallelFailureRollsBack(t *testing.T) {
 		t.Error("container was not rolled back after copy failure")
 	}
 }
-

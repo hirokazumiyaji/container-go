@@ -338,7 +338,6 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
-	applyEngineRunnerEnv(cfg)
 	// Establish the run budget before env-file security preflight. The
 	// preflight takes the root advisory lock and may otherwise outlive a
 	// canceled caller while another process is holding that lock.

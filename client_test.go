@@ -95,6 +95,33 @@ func TestTargetReuseFlightIsolation(t *testing.T) {
 	}
 }
 
+func TestFlightKeysSeparateBackendsWithoutExplicitTarget(t *testing.T) {
+	appleKey := flightKey(appleEngine{}, "redis:7-alpine", flightPull, "")
+	dockerKey := flightKey(dockerEngine{}, "redis:7-alpine", flightPull, "")
+	if appleKey == dockerKey {
+		t.Fatalf("pull flight keys collide across backends: %q", appleKey)
+	}
+}
+
+func TestCloneRunnerIsolatesBinaryOverride(t *testing.T) {
+	orig := &cli.ExecRunner{Binary: "docker", Env: []string{"DOCKER_HOST=tcp://daemon-a:2375"}}
+	cloned, ok := cloneRunner(orig).(*cli.ExecRunner)
+	if !ok {
+		t.Fatal("cloneRunner did not return an ExecRunner")
+	}
+	applyBinaryToRunner(cloned, "/usr/local/bin/other-docker")
+
+	if orig.Binary != "docker" {
+		t.Fatalf("original runner binary mutated to %q", orig.Binary)
+	}
+	if len(cloned.Env) != 1 || cloned.Env[0] != orig.Env[0] {
+		t.Fatalf("cloned env = %q, want %q", cloned.Env, orig.Env)
+	}
+	if &cloned.Env[0] == &orig.Env[0] {
+		t.Fatal("cloned runner shares the original env backing array")
+	}
+}
+
 func TestEndpointNotDriftingOnEnvChange(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "tcp://daemon-a:2375")
 

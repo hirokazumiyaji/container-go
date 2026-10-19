@@ -117,7 +117,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := cfg.eng.targetID() + "\x00" + cfg.name
+	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.

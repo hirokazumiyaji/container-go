@@ -198,11 +198,11 @@ func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error
 
 // flightKey identifies the pull being aggregated: one backend target, one
 // image, one operation kind, one platform. Same image with different
-// targets or platforms must not share a flight.
+// backends, targets, or platforms must not share a flight.
 func flightKey(eng engine, image, op, platform string) string {
 	target := ""
 	if eng != nil {
-		target = eng.targetID()
+		target = eng.name() + "\x00" + eng.targetID()
 	}
 	return target + "\x00" + image + "\x00" + op + "\x00" + platform
 }

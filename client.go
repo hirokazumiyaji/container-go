@@ -216,11 +216,23 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 func (c *Client) Run(ctx context.Context, image string, opts ...Option) (*Container, error) {
 	clientOpts := []Option{
 		withEngine(c.eng),
-		withRunner(c.runner),
+		withRunner(cloneRunner(c.runner)),
 		withClientPinned(),
 	}
 	allOpts := append(clientOpts, opts...)
 	return Run(ctx, image, allOpts...)
+}
+
+// cloneRunner copies an *cli.ExecRunner so per-Run options such as WithBinary
+// cannot mutate the runner pinned on the Client.
+func cloneRunner(r cli.Runner) cli.Runner {
+	er, ok := r.(*cli.ExecRunner)
+	if !ok {
+		return r
+	}
+	cloned := *er
+	cloned.Env = append([]string(nil), er.Env...)
+	return &cloned
 }
 
 // Pull fetches an image into this Client's target store.

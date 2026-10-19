@@ -794,13 +794,15 @@ type dockerContextInspect struct {
 }
 
 func runnerEnvLookup(runner cli.Runner, key string) (string, bool) {
-	if eenv, ok := runner.(interface{ ExternalEnv() []string }); ok {
-		prefix := key + "="
-		for i := len(eenv.ExternalEnv()) - 1; i >= 0; i-- {
-			entry := eenv.ExternalEnv()[i]
-			if strings.HasPrefix(entry, prefix) {
-				return entry[len(prefix):], true
-			}
+	eenv, ok := runner.(interface{ ExternalEnv() []string })
+	if !ok {
+		return "", false
+	}
+	env := eenv.ExternalEnv()
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return env[i][len(prefix):], true
 		}
 	}
 	return "", false

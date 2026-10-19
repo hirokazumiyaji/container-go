@@ -17,34 +17,27 @@ func detectEngine() (engine, error) {
 	return detectEngineFor(runtime.GOOS, os.Getenv(backendEnv))
 }
 
-// withEngineBinary returns eng carrying the caller-configured CLI, so every
-// place that names the backend CLI -- runner construction, reaper
-// registration, the probe, and error classification -- agrees on one
-// executable. Classification keys on that name, so leaving it at the engine
-// default while running a different executable would stop the backend's own
-// errors from being attributed to it.
-func withEngineBinary(eng engine, binary string) engine {
-	if binary == "" {
-		return eng
+// applyEngineIdentity records which backend CLI a runner speaks for. Error
+// classification compares the CLI's name against the backend's, so a runner
+// pointed at a wrapper executable would otherwise stop the backend from
+// recognizing errors its own CLI produced.
+func applyEngineIdentity(r Runner, eng engine) {
+	if er, ok := r.(*cli.ExecRunner); ok {
+		er.Identity = eng.binary()
 	}
-	switch e := eng.(type) {
-	case dockerEngine:
-		e.binaryOverride = binary
-		return e
-	case appleEngine:
-		e.binaryOverride = binary
-		return e
-	}
-	return eng
 }
 
 // applyEngineBinary points the default runner at the selected engine's
 // CLI. An explicitly configured binary wins.
 func applyEngineBinary(cfg *config) {
-	cfg.eng = withEngineBinary(cfg.eng, cfg.binary)
-	if er, ok := cfg.runner.(*cli.ExecRunner); ok && er.Binary == "" {
-		er.Binary = cfg.eng.binary()
+	if er, ok := cfg.runner.(*cli.ExecRunner); ok {
+		if cfg.binary != "" {
+			er.Binary = cfg.binary
+		} else if er.Binary == "" {
+			er.Binary = cfg.eng.binary()
+		}
 	}
+	applyEngineIdentity(cfg.runner, cfg.eng)
 }
 
 // effectiveRunner returns the runner to use for one backend. A caller-supplied
@@ -53,12 +46,13 @@ func applyEngineBinary(cfg *config) {
 // back to the historical "container" name on every backend.
 func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 	if configured == nil {
-		return &cli.ExecRunner{Binary: eng.binary()}
+		configured = &cli.ExecRunner{}
 	}
 	applyBinaryToRunner(configured, binary)
 	if er, ok := configured.(*cli.ExecRunner); ok && er.Binary == "" {
 		er.Binary = eng.binary()
 	}
+	applyEngineIdentity(configured, eng)
 	return configured
 }
 

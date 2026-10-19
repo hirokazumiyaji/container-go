@@ -189,20 +189,13 @@ func hasParsedCLITarget(ctx cliErrorContext) bool {
 
 func cliBinaryMatches(got, want string) bool {
 	got = strings.TrimSpace(strings.ToLower(got))
-	want = strings.TrimSpace(strings.ToLower(want))
-	// want may be a caller-configured path, so compare executable names rather
-	// than whole paths: the CLIError records the executable that ran, while the
-	// engine names the backend's CLI, and a configured path carries both.
-	if i := strings.LastIndexAny(want, `/\\`); i >= 0 {
-		want = want[i+1:]
-	}
 	if got == "" {
-		return want == "container"
+		return strings.EqualFold(want, "container")
 	}
 	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
 		got = got[i+1:]
 	}
-	return got == want
+	return got == strings.ToLower(want)
 }
 
 func commandOperation(args []string) string {

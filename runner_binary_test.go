@@ -335,10 +335,10 @@ func TestPullAndPruneOrderIndependence(t *testing.T) {
 	}
 }
 
-// A configured binary names both the executable to run and the backend
-// identity error classification compares against. Leaving the engine at its
-// default while running something else would stop the backend's own errors
-// from being attributed to it, which silently degrades not-found, absence and
+// A configured binary names the executable to run, while the backend identity
+// error classification compares against stays the backend's own CLI. Without
+// that split, a wrapper executable would stop the backend from recognizing
+// errors its own CLI produced, silently degrading not-found, absence and
 // conflict detection.
 func TestConfiguredBinaryKeepsBackendIdentity(t *testing.T) {
 	tests := []struct {
@@ -351,16 +351,21 @@ func TestConfiguredBinaryKeepsBackendIdentity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			eng := withEngineBinary(dockerEngine{}, tt.binary)
-			if got := eng.binary(); got != tt.binary {
-				t.Fatalf("engine binary = %q, want %q", got, tt.binary)
+			runner, ok := effectiveRunner(&ExecRunner{Binary: tt.binary}, "", dockerEngine{}).(*ExecRunner)
+			if !ok {
+				t.Fatalf("runner = %T, want *ExecRunner", runner)
 			}
-			if got := eng.probe().Binary; got != tt.binary {
-				t.Fatalf("probe binary = %q, want %q", got, tt.binary)
+			if runner.Binary != tt.binary {
+				t.Fatalf("runner binary = %q, want the configured %q", runner.Binary, tt.binary)
 			}
-			cliErr := &cli.CLIError{Binary: tt.binary, Args: []string{"inspect", "abc"}, ExitCode: 1}
-			if !cliBinaryMatches(cliErr.Binary, eng.binary()) {
-				t.Fatalf("CLIError binary %q did not match engine binary %q", cliErr.Binary, eng.binary())
+			if runner.Identity != "docker" {
+				t.Fatalf("runner identity = %q, want docker", runner.Identity)
+			}
+			// The identity is what classification compares, so the backend must
+			// keep recognizing errors its CLI produced under the override.
+			cliErr := &cli.CLIError{Binary: runner.Identity, Args: []string{"inspect", "abc"}, ExitCode: 1}
+			if !cliBinaryMatches(cliErr.Binary, (dockerEngine{}).binary()) {
+				t.Fatalf("CLIError binary %q did not match the backend", cliErr.Binary)
 			}
 		})
 	}

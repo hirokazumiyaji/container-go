@@ -172,7 +172,6 @@ func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	if err != nil {
 		return safePublicError(err)
 	}
-	eng = withEngineBinary(eng, cfg.binary)
 	return safePublicError(pullWith(ctx, effectiveRunner(cfg.runner, cfg.binary, eng), eng, image))
 }
 

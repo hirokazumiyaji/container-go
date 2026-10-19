@@ -263,6 +263,12 @@ type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
 	Binary string
+	// Identity names the backend CLI this runner speaks for, which is what
+	// error classification compares against. Empty means the executable names
+	// it, which is right when Binary is the backend's own CLI. A caller that
+	// points Binary at a wrapper sets this so the wrapper's errors are still
+	// attributed to the backend that owns it.
+	Identity string
 }
 
 func (r *ExecRunner) binary() string {
@@ -270,6 +276,14 @@ func (r *ExecRunner) binary() string {
 		return "container"
 	}
 	return r.Binary
+}
+
+// identity names the backend CLI for error classification.
+func (r *ExecRunner) identity() string {
+	if r.Identity != "" {
+		return r.Identity
+	}
+	return r.binary()
 }
 
 // SetBinary overrides the CLI executable to run.
@@ -339,6 +353,7 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 // for the CLIError diagnostic once the child has been reaped.
 func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
 	bin := r.binary()
+	identity := r.identity()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
@@ -394,14 +409,14 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	err := lifecycle.result()
 	status := lifecycle.status()
 	stdout, stderr := captured()
-	commandErr := commandError(ctx, bin, args, stdout, stderr, err)
+	commandErr := commandError(ctx, bin, identity, args, stdout, stderr, err)
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
 		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 	}
 	return markRunStatus(commandErr, status)
 }
 
-func commandError(ctx context.Context, bin string, args []string, stdout, stderr []byte, err error) error {
+func commandError(ctx context.Context, bin, identity string, args []string, stdout, stderr []byte, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -415,7 +430,7 @@ func commandError(ctx context.Context, bin string, args []string, stdout, stderr
 			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
 		cliErr := &CLIError{
-			Binary:   bin,
+			Binary:   identity,
 			Args:     args,
 			ExitCode: exitCode,
 			Stderr:   truncateStderr(string(stderr)),
@@ -438,7 +453,7 @@ func commandError(ctx context.Context, bin string, args []string, stdout, stderr
 // commandRunError is the historical helper name retained for tests that
 // exercise cancellation races without a stdout side channel.
 func commandRunError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
-	return commandError(ctx, bin, args, nil, stderr, err)
+	return commandError(ctx, bin, bin, args, nil, stderr, err)
 }
 
 // withProbeOutput attaches captured probe streams to an error so
@@ -665,19 +680,13 @@ func probeBinaryMatches(got, want string) bool {
 		return true
 	}
 	got = strings.TrimSpace(strings.ToLower(got))
-	want = strings.TrimSpace(strings.ToLower(want))
-	// want may be a caller-configured path, so compare executable names on
-	// both sides rather than whole paths.
-	if i := strings.LastIndexAny(want, `/\\`); i >= 0 {
-		want = want[i+1:]
-	}
 	if got == "" {
 		got = "container"
 	}
 	if i := strings.LastIndexAny(got, `/\\`); i >= 0 {
 		got = got[i+1:]
 	}
-	return got == want
+	return got == strings.ToLower(want)
 }
 
 // Classify augments a failed CLI call. When the backend-specific probe

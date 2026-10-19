@@ -178,7 +178,6 @@ func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	eng = withEngineBinary(eng, cfg.binary)
 	return pruneWith(ctx, cfg.runnerFor(eng), eng, opts...)
 }
 

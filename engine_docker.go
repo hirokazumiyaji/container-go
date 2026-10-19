@@ -22,12 +22,7 @@ import (
 // container IP is generally not reachable from the host (Docker
 // Desktop), so on publishable network modes exposed ports are published
 // to daemon-assigned loopback ports and endpoints resolve to those.
-type dockerEngine struct {
-	// binaryOverride is the caller-configured CLI. It names both the
-	// executable to run and the backend identity error classification
-	// compares against, so the two cannot disagree.
-	binaryOverride string
-}
+type dockerEngine struct{}
 
 // Docker parses stop --time through a signed integer. Cap the value at
 // MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
@@ -63,13 +58,8 @@ const (
 	dockerNetworkNAT     = "nat"
 )
 
-func (dockerEngine) name() string { return "docker" }
-func (e dockerEngine) binary() string {
-	if e.binaryOverride != "" {
-		return e.binaryOverride
-	}
-	return "docker"
-}
+func (dockerEngine) name() string   { return "docker" }
+func (dockerEngine) binary() string { return "docker" }
 func (dockerEngine) directIP() bool { return false }
 
 func (dockerEngine) requiresImmutableID() bool { return true }
@@ -405,13 +395,13 @@ func dockerNetworkEndpointError(mode string) error {
 	}
 }
 
-func (e dockerEngine) probe() cli.Probe {
+func (dockerEngine) probe() cli.Probe {
 	// version --format reaches the daemon without the heavy info
 	// collection; only reachability matters for ErrSystemNotRunning.
 	return cli.Probe{
 		Args:          []string{"version", "--format", "{{.Server.Version}}"},
 		Hint:          "start the Docker daemon",
-		Binary:        e.binary(),
+		Binary:        "docker",
 		Operation:     "version",
 		IsUnavailable: dockerProbeUnavailable,
 	}

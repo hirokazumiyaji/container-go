@@ -114,6 +114,80 @@ func (e dockerEngine) targetEnv() []string {
 	return env
 }
 
+// pinRunnerEnv applies a pinned target environment to a runner's own
+// environment. Configured values override; a bare key is appended as a
+// removal marker only when the runner does not set that key itself. The
+// markers must stay in ExecRunner.Env because the inherited process
+// environment is merged at exec time, not here.
+func pinRunnerEnv(runnerEnv, pinned []string) []string {
+	// Collapse duplicate keys first (last occurrence wins, matching
+	// MergeEnv) so replacing a pinned key in place cannot leave an earlier
+	// stale duplicate that first-match env lookup would prefer.
+	env := make([]string, 0, len(runnerEnv)+len(pinned))
+	index := make(map[string]int, len(runnerEnv))
+	for _, entry := range runnerEnv {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			// Index a bare removal marker too, so re-applying the pinned
+			// environment cannot append the same marker twice.
+			if key != "" {
+				if _, seen := index[key]; seen {
+					continue
+				}
+				index[key] = len(env)
+			}
+			env = append(env, entry)
+			continue
+		}
+		if at, duplicate := index[key]; duplicate {
+			env[at] = entry
+			continue
+		}
+		index[key] = len(env)
+		env = append(env, entry)
+	}
+	for _, entry := range pinned {
+		key, _, hasValue := strings.Cut(entry, "=")
+		if key == "" {
+			continue
+		}
+		if at, exists := index[key]; exists {
+			if hasValue {
+				env[at] = entry
+			}
+			continue
+		}
+		index[key] = len(env)
+		env = append(env, entry)
+	}
+	return env
+}
+
+// pinnedTargetEnv returns the complete child environment for this target:
+// every component is either its configured value or a bare key that removes
+// the inherited entry. targetEnv only lists configured components, so an
+// unset one would let a variable exported after the target was frozen
+// repoint the child CLI at another daemon.
+//
+// Connection modifiers (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH,
+// DOCKER_API_VERSION) are intentionally left inherited: they change how the
+// pinned connection is negotiated, not which daemon it reaches, and
+// stripping them would break a daemon that requires TLS.
+func (e dockerEngine) pinnedTargetEnv() []string {
+	env := e.targetEnv()
+	present := make(map[string]struct{}, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		present[key] = struct{}{}
+	}
+	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"} {
+		if _, ok := present[key]; !ok {
+			env = append(env, key)
+		}
+	}
+	return env
+}
+
 // Docker parses stop --time through a signed integer. Cap the value at
 // MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
 // ones; the daemon's duration conversion is also safe at this limit.

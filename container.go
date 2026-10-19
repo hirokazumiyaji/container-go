@@ -590,7 +590,7 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 	}
 	if len(env) == 0 {
 		if de, ok := cfg.eng.(dockerEngine); ok {
-			env = de.targetEnv()
+			env = de.pinnedTargetEnv()
 		}
 	}
 	reaperKey := binary

@@ -762,7 +762,15 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
 	if c.reused {
-		cfg := &config{runner: c.runner, eng: c.eng, name: c.id, reuse: true, creation: c.creation}
+		cfg := &config{
+			runner:       c.runner,
+			eng:          c.eng,
+			name:         c.id,
+			reuse:        true,
+			creation:     c.creation,
+			queryTimeout: c.queryTimeout,
+			probeTimeout: c.probeTimeout,
+		}
 		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
 		if err != nil {
 			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})

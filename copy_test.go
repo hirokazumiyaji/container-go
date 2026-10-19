@@ -1450,3 +1450,44 @@ func TestWithFilesParallelFailureRollsBack(t *testing.T) {
 		t.Error("container was not rolled back after copy failure")
 	}
 }
+
+// TestCopyFilesConcurrentlyReportsCancellationBetweenCopies pins the contract
+// that a run cancelled while no worker is inside a copy must not report
+// success. Every worker leaves through the pre-copy guard without recording an
+// error, so the helper has to surface the context itself: returning nil there
+// would claim an incomplete copy set was fully applied and skip the rollback
+// the sequential loop used to trigger.
+func TestCopyFilesConcurrentlyReportsCancellationBetweenCopies(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	files := make([]File, 0, defaultCopyFilesParallelism+1)
+	for i := 0; i < defaultCopyFilesParallelism+1; i++ {
+		files = append(files, File{
+			HostPath:      fmt.Sprintf("/host/file%d", i),
+			ContainerPath: fmt.Sprintf("/data/file%d", i),
+		})
+	}
+
+	release := make(chan struct{})
+	var started, copied atomic.Int32
+	err := copyFilesConcurrently(ctx, files, func(context.Context, File) error {
+		// Cancel while the first copy is in flight and hold every worker until
+		// it is released, so the file still queued is dropped by the guard on
+		// the next iteration instead of being copied.
+		if started.Add(1) == 1 {
+			cancel()
+			close(release)
+		}
+		<-release
+		copied.Add(1)
+		return nil
+	})
+
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("copyFilesConcurrently error = %v, want context.Canceled", err)
+	}
+	if got, total := copied.Load(), int32(len(files)); got >= total {
+		t.Fatalf("copied = %d of %d, want fewer: the test no longer models an incomplete copy set", got, total)
+	}
+}

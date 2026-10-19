@@ -194,5 +194,7 @@ func DockerPullRateLimited(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return strings.Contains(msg, "toomanyrequests") || strings.Contains(msg, "Rate exceeded")
+	return strings.Contains(msg, "toomanyrequests") ||
+		strings.Contains(msg, "Rate exceeded") ||
+		strings.Contains(msg, "Data limit exceeded")
 }

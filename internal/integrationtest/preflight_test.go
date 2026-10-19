@@ -101,6 +101,7 @@ func TestDockerPullRateLimited(t *testing.T) {
 		{errors.New("connection reset by peer"), false},
 		{errors.New("docker pull public.ecr.aws/docker/library/alpine:latest: toomanyrequests: Data limit exceeded"), true},
 		{errors.New("Error response from daemon: Rate exceeded"), true},
+		{errors.New("docker pull public.ecr.aws/docker/library/alpine:latest: exit code 1: Error response from daemon: error from registry: Data limit exceeded"), true},
 	}
 	for _, tc := range cases {
 		if got := DockerPullRateLimited(tc.err); got != tc.want {

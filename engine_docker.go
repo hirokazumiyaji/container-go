@@ -191,12 +191,16 @@ func (e dockerEngine) isRemote() bool {
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network
 // is the daemon default.
-func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine) (string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, timeouts opTimeouts) (string, error) {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
 	if err != nil {
-		classified := cli.Classify(ctx, runner, err, eng.probe())
+		classified := classifyErrorWithProbe(ctx, runner, err, eng, timeouts.probe)
 		return "", fmt.Errorf("inspect Docker server platform: %w", classified)
 	}
 	serverOS := strings.ToLower(strings.TrimSpace(string(stdout)))
@@ -309,11 +313,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 }
 
 func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, error) {
-	queryCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	queryCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
 	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		classified := classifyErrorWithProbe(ctx, cfg.runner, err, cfg.eng, cfg.effectiveProbeTimeout())
 		return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, classified)
 	}
 	return parseDockerNetworkInspect(stdout, cfg.network)
@@ -1431,10 +1435,12 @@ func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
 	return client, server, nil
 }
 
-// checkCopyFileFromContainerVersion verifies both ends of the Docker
-// client/daemon connection before any private destination is created.
-func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner) error {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
 	if err != nil {

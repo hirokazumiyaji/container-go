@@ -95,6 +95,9 @@ type Probe struct {
 	Args   []string
 	Hint   string
 	Binary string
+	// Timeout bounds the diagnostic liveness check. When zero, probeTimeout
+	// (5 seconds) is used.
+	Timeout time.Duration
 	// Operation names the backend command represented by Args. It lets
 	// classifiers ignore joined CLIError branches from other operations.
 	Operation string
@@ -715,7 +718,11 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return withContextError(ctx, err)
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	timeout := probe.Timeout
+	if timeout <= 0 {
+		timeout = probeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	probeStdout, probeStderr, probeErr := r.Run(probeCtx, probe.Args...)
 	if probeErr != nil {

@@ -141,7 +141,7 @@ type engine interface {
 	checkCopyFileFromContainer() error
 	// checkCopyFileFromContainerVersion verifies backend-specific
 	// minimum versions before a copy-out creates a private temp directory.
-	checkCopyFileFromContainerVersion(context.Context, cli.Runner) error
+	checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
 	// logsFollowArgs builds the streaming follow argv.
 	logsFollowArgs(id string) []string

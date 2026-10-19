@@ -192,7 +192,7 @@ func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error
 	return doErr(ctx, &imageFlights, flightKey(resolvedEng, image, flightPull, cfg.platform), func() error {
 		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
 		defer cancel()
-		return pullImage(execCtx, r, resolvedEng, image, cfg.platform)
+		return pullImage(execCtx, r, resolvedEng, image, cfg.platform, opTimeouts{probe: cfg.effectiveProbeTimeout()})
 	})
 }
 

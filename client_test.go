@@ -344,6 +344,9 @@ func TestClientRunRejectsPerRunDockerTargetOverrides(t *testing.T) {
 }
 
 func TestClientAppleBackend(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Apple Container is available only on macOS")
+	}
 	client, err := NewClient(
 		WithClientBackend("apple"),
 		WithClientBinary("container"),

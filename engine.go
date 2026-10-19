@@ -471,18 +471,16 @@ func validImageDigest(digest string) bool {
 // parseInspectTime decodes a backend timestamp. The backends express "not
 // set" as an empty string or the Go zero-value form; both map to the zero
 // time, which is the documented unknown marker on InspectInfo. A value that
-// matches neither accepted RFC 3339 layout is reported the same way: a
-// cosmetic field must not fail an otherwise usable Inspect, and the library
-// never fabricates an instant from a value it cannot read.
+// does not match RFC 3339 is reported the same way: a cosmetic field must not
+// fail an otherwise usable Inspect, and the library never fabricates an
+// instant from a value it cannot read. RFC3339Nano also accepts timestamps
+// without fractional seconds, so one layout covers both backend forms.
 func parseInspectTime(s string) time.Time {
 	switch s {
 	case "", "0001-01-01T00:00:00Z":
 		return time.Time{}
 	}
 	t, err := time.Parse(time.RFC3339Nano, s)
-	if err != nil {
-		t, err = time.Parse(time.RFC3339, s)
-	}
 	if err != nil {
 		return time.Time{}
 	}

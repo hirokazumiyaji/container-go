@@ -1046,13 +1046,17 @@ type dockerPruneCandidate struct {
 // dockerPruneRunner models Docker's repeated status filters and the
 // inspect revalidation pruneDockerCandidate performs before delete.
 type dockerPruneRunner struct {
+	mu         sync.Mutex
 	calls      [][]string
 	candidates []dockerPruneCandidate
 	creation   string
 }
 
 func (d *dockerPruneRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	// Prune deletes candidates from several workers at once.
+	d.mu.Lock()
 	d.calls = append(d.calls, args)
+	d.mu.Unlock()
 	switch args[0] {
 	case "ps":
 		var ids []string
@@ -1121,8 +1125,14 @@ func TestDockerPruneRemovesExitedAndDeadOnly(t *testing.T) {
 			deleted = append(deleted, call[len(call)-1])
 		}
 	}
-	if want := []string{exitedID, deadID}; !slices.Equal(deleted, want) {
-		t.Errorf("deleted = %v, want %v", deleted, want)
+	// Deletion runs on several workers, so the order of the rm calls is not
+	// part of the contract. The returned slice asserted above carries the
+	// ordering guarantee.
+	slices.Sort(deleted)
+	wantDeleted := []string{exitedID, deadID}
+	slices.Sort(wantDeleted)
+	if !slices.Equal(deleted, wantDeleted) {
+		t.Errorf("deleted = %v, want %v", deleted, wantDeleted)
 	}
 }
 

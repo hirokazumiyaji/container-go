@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -71,6 +72,7 @@ func waitDockerContainerState(t *testing.T, name, want string) {
 // Prune only touches this test's fixtures; production Prune remains
 // eligible to remove managed containers from any session.
 type isolatedDockerPruneRunner struct {
+	mu          sync.Mutex
 	runner      cli.Runner
 	labelFilter string
 	calls       [][]string
@@ -80,7 +82,11 @@ func (r *isolatedDockerPruneRunner) Run(ctx context.Context, args ...string) ([]
 	if args[0] == "ps" {
 		args = append(append([]string(nil), args...), "--filter", r.labelFilter)
 	}
+	// Prune deletes candidates from several workers at once. The nested runner
+	// stays outside the lock so the live CLI calls still overlap.
+	r.mu.Lock()
 	r.calls = append(r.calls, append([]string(nil), args...))
+	r.mu.Unlock()
 	return r.runner.Run(ctx, args...)
 }
 

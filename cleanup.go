@@ -5,7 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	backendinspect "github.com/hirokazumiyaji/container-go/internal/inspect"
@@ -72,18 +74,72 @@ func StrictCleanup(tb testing.TB, ctr *Container) {
 	registerCleanup(tb, ctr, true)
 }
 
+// PruneOption configures Prune and PruneReuseGroup operations.
+type PruneOption func(*pruneConfig) error
+
+type pruneConfig struct {
+	timeout     time.Duration
+	parallelism int
+}
+
+const defaultPruneParallelism = 4
+
+var defaultPruneTimeout = 5 * time.Minute
+
+// WithPruneTimeout sets an overall timeout for the prune operation.
+// When omitted, the operation uses defaultPruneTimeout (5 minutes)
+// unless the caller's context already has an earlier deadline.
+func WithPruneTimeout(d time.Duration) PruneOption {
+	return func(c *pruneConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithPruneTimeout", d, "timeout must be positive")
+		}
+		c.timeout = d
+		return nil
+	}
+}
+
+// WithPruneParallelism sets the worker pool size for concurrent container
+// deletions during prune. When omitted or <= 0, defaultPruneParallelism (4)
+// is used.
+func WithPruneParallelism(n int) PruneOption {
+	return func(c *pruneConfig) error {
+		if n <= 0 {
+			return validationErrorf("WithPruneParallelism", n, "parallelism must be positive")
+		}
+		c.parallelism = n
+		return nil
+	}
+}
+
+func parsePruneOptions(opts []PruneOption) (pruneConfig, error) {
+	cfg := pruneConfig{
+		timeout:     defaultPruneTimeout,
+		parallelism: defaultPruneParallelism,
+	}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		if err := opt(&cfg); err != nil {
+			return pruneConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
 // Prune removes stopped containers created by this library, from any
 // session. It returns the IDs it removed.
-func Prune(ctx context.Context) ([]string, error) {
+func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng)
+	return pruneWith(ctx, &cli.ExecRunner{Binary: eng.binary()}, eng, opts...)
 }
 
-func pruneWith(ctx context.Context, r cli.Runner, eng engine) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune")
+func pruneWith(ctx context.Context, r cli.Runner, eng engine, opts ...PruneOption) ([]string, error) {
+	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", opts...)
 }
 
 type pruneCandidate struct {
@@ -99,20 +155,28 @@ type pruneCandidate struct {
 // pruneListed lists candidates and removes each still-current candidate.
 // Apple candidates carry list-time ownership/state metadata and are
 // revalidated while the per-name lock is held before a name is deleted.
-func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string) ([]string, error) {
-	return pruneListedWithGroup(ctx, r, eng, listArgs, parse, errKind, "")
+func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, opts ...PruneOption) ([]string, error) {
+	return pruneListedWithGroup(ctx, r, eng, listArgs, parse, errKind, "", opts...)
 }
 
-func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string) ([]string, error) {
+func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, opts ...PruneOption) ([]string, error) {
+	cfg, err := parsePruneOptions(opts)
+	if err != nil {
+		return nil, safePublicError(err)
+	}
+
 	redactor := cli.NewHashedContextRedactor(reuseGroup)
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	overallCtx, overallCancel := context.WithTimeout(ctx, cfg.timeout)
+	defer overallCancel()
+
+	qCtx, cancel := context.WithTimeout(overallCtx, queryTimeout)
 	defer cancel()
 	stdout, _, err := r.Run(qCtx, listArgs...)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
 		return nil, contextErr
 	}
 	if err != nil {
-		return nil, cli.WithRedactor(classifyError(ctx, r, err, eng), redactor)
+		return nil, cli.WithRedactor(classifyError(overallCtx, r, err, eng), redactor)
 	}
 	ids, err := parse(stdout)
 	if contextErr := commandContextError(qCtx, err); contextErr != nil {
@@ -120,6 +184,10 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 	}
 	if err != nil {
 		return nil, cli.WithRedactor(err, redactor)
+	}
+
+	if len(ids) == 0 {
+		return nil, nil
 	}
 
 	var listed map[string]pruneCandidate
@@ -130,28 +198,89 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		}
 	}
 
+	concurrency := cfg.parallelism
+	if concurrency <= 0 {
+		concurrency = defaultPruneParallelism
+	}
+	if len(ids) < concurrency {
+		concurrency = len(ids)
+	}
+
+	type pruneJob struct {
+		index int
+		id    string
+	}
+
+	jobs := make(chan pruneJob, len(ids))
+	for i, id := range ids {
+		jobs <- pruneJob{index: i, id: id}
+	}
+	close(jobs)
+
+	var (
+		wg          sync.WaitGroup
+		mu          sync.Mutex
+		didRemoveAt = make([]bool, len(ids))
+		errAt       = make([]error, len(ids))
+		attemptedAt = make([]bool, len(ids))
+	)
+
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for job := range jobs {
+				if overallCtx.Err() != nil {
+					return
+				}
+				var didRemove bool
+				var opErr error
+				if eng.name() == "apple" {
+					candidate, ok := listed[job.id]
+					if !ok {
+						opErr = fmt.Errorf("%s %s: list candidate metadata missing", errKind, job.id)
+					} else {
+						didRemove, opErr = pruneNamedCandidateWithMetadata(overallCtx, r, eng, candidate, errKind, reuseGroup)
+					}
+				} else {
+					didRemove, opErr = pruneDockerCandidate(overallCtx, r, eng, job.id, errKind, reuseGroup)
+				}
+				mu.Lock()
+				attemptedAt[job.index] = true
+				didRemoveAt[job.index] = didRemove
+				errAt[job.index] = opErr
+				mu.Unlock()
+			}
+		}()
+	}
+
+	wg.Wait()
+
 	var removed []string
 	var errs []error
-	for _, id := range ids {
-		var didRemove bool
-		if eng.name() == "apple" {
-			candidate, ok := listed[id]
-			if !ok {
-				errs = append(errs, fmt.Errorf("%s %s: list candidate metadata missing", errKind, id))
-				continue
-			}
-			didRemove, err = pruneNamedCandidateWithMetadata(ctx, r, eng, candidate, errKind, reuseGroup)
-		} else {
-			didRemove, err = pruneDockerCandidate(ctx, r, eng, id, errKind, reuseGroup)
-		}
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		if didRemove {
+	for i, id := range ids {
+		if didRemoveAt[i] {
 			removed = append(removed, id)
 		}
+		if errAt[i] != nil {
+			errs = append(errs, errAt[i])
+		}
 	}
+
+	if overallCtx.Err() != nil {
+		unattempted := 0
+		for i := range ids {
+			if !attemptedAt[i] {
+				unattempted++
+			}
+		}
+		if unattempted > 0 {
+			errs = append(errs, fmt.Errorf("%s: %d container(s) remaining: %w", errKind, unattempted, overallCtx.Err()))
+		} else if len(errs) == 0 {
+			errs = append(errs, overallCtx.Err())
+		}
+	}
+
 	return removed, cli.WithRedactor(errors.Join(errs...), redactor)
 }
 
@@ -185,7 +314,7 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		// that became running after the daemon-side list.
 		return false, nil
 	}
-	dCtx, dCancel := withDefaultTimeout(ctx, queryTimeout)
+	dCtx, dCancel := context.WithTimeout(ctx, queryTimeout)
 	defer dCancel()
 	deleteArgs := eng.deleteArgs(id)
 	_, _, err = r.Run(dCtx, deleteArgs...)
@@ -269,7 +398,7 @@ func pruneNamedCandidateWithMetadata(ctx context.Context, r cli.Runner, eng engi
 	if eng.name() != "apple" || !pruneCandidateEligible(candidate, reuseGroup) {
 		return false, nil
 	}
-	guardCtx, guardCancel := withDefaultTimeout(ctx, queryTimeout)
+	guardCtx, guardCancel := context.WithTimeout(ctx, queryTimeout)
 	defer guardCancel()
 	unlock, err := lockName(guardCtx, candidate.id)
 	if err != nil {

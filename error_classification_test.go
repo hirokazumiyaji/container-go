@@ -8,6 +8,7 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1108,10 +1109,11 @@ func TestAmbiguousRunPreservesOriginalAndCleansPartialCreate(t *testing.T) {
 }
 
 type pruneDeleteRunner struct {
-	list         string
-	inspectJSON  string
-	deleteErr    error
-	deleteCalls  int
+	mu          sync.Mutex
+	list        string
+	inspectJSON string
+	deleteErr   error
+	deleteCalls int
 }
 
 func (r *pruneDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
@@ -1125,7 +1127,10 @@ func (r *pruneDeleteRunner) Run(_ context.Context, args ...string) ([]byte, []by
 		return []byte(r.list), nil, nil
 	}
 	if args[0] == "delete" || args[0] == "rm" {
+		// Prune deletes candidates from several workers at once.
+		r.mu.Lock()
 		r.deleteCalls++
+		r.mu.Unlock()
 		return nil, nil, r.deleteErr
 	}
 	if args[0] == "system" {

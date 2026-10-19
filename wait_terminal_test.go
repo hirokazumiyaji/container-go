@@ -16,7 +16,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
-func TestIssue90ForLogClassifiesRealTerminalFollowError(t *testing.T) {
+func TestForLogClassifiesRealTerminalFollowError(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then
@@ -35,7 +35,7 @@ exit 17
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -59,7 +59,7 @@ exit 17
 	}
 }
 
-func TestIssue90ForLogRetainsTerminalStderrBeforeNotFoundClassification(t *testing.T) {
+func TestForLogRetainsTerminalStderrBeforeNotFoundClassification(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then
@@ -79,7 +79,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -100,7 +100,7 @@ exit 1
 	}
 }
 
-func TestIssue90ForLogConsumesPendingOutputBeforeAcceptingMatch(t *testing.T) {
+func TestForLogConsumesPendingOutputBeforeAcceptingMatch(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then
@@ -125,7 +125,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	err := wait.ForLog("ready").
 		WithStartupTimeout(5*time.Second).
@@ -146,7 +146,7 @@ exit 1
 	}
 }
 
-func TestIssue90FollowLogsClassifiesTerminalNotFound(t *testing.T) {
+func TestFollowLogsDaemonNotFoundTerminal(t *testing.T) {
 	script := filepath.Join(t.TempDir(), "docker")
 	contents := `#!/bin/sh
 if [ "$1" = "version" ]; then
@@ -163,7 +163,7 @@ exit 1
 		id:     "myctr",
 		runner: &cli.ExecRunner{Binary: script},
 		eng:    dockerEngine{},
-		sync: &lockPack{uid: testDockerUID},
+		sync:   &lockPack{uid: testDockerUID},
 	}
 	stream, err := ctr.FollowLogs(context.Background())
 	if err != nil {

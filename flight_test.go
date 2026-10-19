@@ -134,7 +134,7 @@ func TestFlightGroupCallerCancellationDoesNotCancelOthers(t *testing.T) {
 	}
 }
 
-func TestIssue97FlightGroupReportsLeaderAndWaiters(t *testing.T) {
+func TestFlightGroupReportsLeaderAndWaiters(t *testing.T) {
 	var g flightGroup[int]
 	started := make(chan struct{})
 	release := make(chan struct{})

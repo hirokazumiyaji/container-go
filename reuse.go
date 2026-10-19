@@ -596,10 +596,12 @@ func cleanupReuseCreate(ctx context.Context, ctr *Container, cause error) error 
 }
 
 func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
-	for _, f := range files {
-		if err := ctr.copyToContainer(ctx, f.HostPath, f.ContainerPath, false); err != nil {
-			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, f.HostPath, f.ContainerPath, err)
+	if err := ctr.copyFiles(ctx, files); err != nil {
+		var fErr *fileCopyError
+		if errors.As(err, &fErr) {
+			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, fErr.File.HostPath, fErr.File.ContainerPath, fErr.Err)
 		}
+		return fmt.Errorf("reuse %s: WithFiles copy: %w", ctr.id, err)
 	}
 	return nil
 }
@@ -1353,39 +1355,24 @@ func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err
 	}
-	cfg := newPruneConfig()
-	for i, opt := range opts {
-		if opt == nil {
-			return nil, validationErrorf("PruneReuseGroup", i, "option %d is nil", i)
-		}
-		if err := opt(cfg); err != nil {
-			return nil, err
-		}
+	cfg, err := parsePruneOptions("PruneReuseGroup", opts)
+	if err != nil {
+		return nil, safePublicError(err)
 	}
 	eng, err := detectEngine()
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	runner := cfg.runner
-	if runner == nil {
-		bin := cfg.binary
-		if bin == "" {
-			bin = eng.binary()
-		}
-		runner = &cli.ExecRunner{Binary: bin}
-	} else if cfg.binary != "" {
-		applyBinaryToRunner(runner, cfg.binary)
-	}
-	return pruneReuseGroupWith(ctx, runner, eng, group)
+	return pruneReuseGroupWith(ctx, cfg.runnerFor(eng), eng, group, opts...)
 }
 
-func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string) ([]string, error) {
+func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, safePublicError(err, group)
 	}
 	return pruneListedWithGroup(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group, group)
+	}, "prune reuse group "+group, group, opts...)
 }
 
 func reuseContextError(ctx context.Context, name string) error {

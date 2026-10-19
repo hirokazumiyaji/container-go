@@ -88,7 +88,7 @@ func (r *deleteExternalRunner) Run(_ context.Context, args ...string) ([]byte, [
 func (r *deleteExternalRunner) External() bool         { return true }
 func (r *deleteExternalRunner) ExternalBinary() string { return r.bin }
 
-func TestFreshReviewConfirmedDeleteUnregistersReaperRecords(t *testing.T) {
+func TestConfirmedDeleteUnregistersReaperRecords(t *testing.T) {
 	bin := filepath.Join(t.TempDir(), "docker")
 	runner := &deleteExternalRunner{bin: bin}
 	watchdog := newReaper(bin, "rm", dockerDeleteVolumesFlag)
@@ -121,7 +121,7 @@ func TestFreshReviewConfirmedDeleteUnregistersReaperRecords(t *testing.T) {
 	}
 }
 
-func TestFreshReviewUncertainReuseOwnershipStaysShared(t *testing.T) {
+func TestUncertainReuseOwnershipStaysShared(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "container")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
@@ -158,7 +158,7 @@ func TestFreshReviewUncertainReuseOwnershipStaysShared(t *testing.T) {
 	}
 }
 
-func TestFreshReviewReuseRecordIsSharedBeforeCreatePublication(t *testing.T) {
+func TestReuseRecordIsSharedBeforeCreatePublication(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "container")
 	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {

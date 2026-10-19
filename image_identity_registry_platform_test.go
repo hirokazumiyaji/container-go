@@ -14,13 +14,13 @@ import (
 )
 
 const (
-	issue115FinalRoot        = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-	issue115FinalVariant     = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-	issue115FinalOtherRoot   = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
-	issue115FinalReplacement = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+	finalRoot        = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	finalVariant     = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	finalOtherRoot   = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+	finalReplacement = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
 )
 
-func issue115FinalFixture(t *testing.T) []byte {
+func finalFixture(t *testing.T) []byte {
 	t.Helper()
 	data, err := os.ReadFile("testdata/apple_image_inspect_single_manifest.json")
 	if err != nil {
@@ -29,11 +29,11 @@ func issue115FinalFixture(t *testing.T) []byte {
 	return data
 }
 
-func issue115FinalMultiFixture() []byte {
-	return []byte(fmt.Sprintf(`[{"id":"%s","configuration":{"name":"registry.example/team/demo:stable","descriptor":{"digest":"%s","mediaType":"application/vnd.oci.image.index.v1+json"}},"variants":[{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"%s"},{"platform":{"os":"linux","architecture":"amd64"},"digest":"%s"}]}]`, strings.TrimPrefix(issue115FinalRoot, "sha256:"), issue115FinalRoot, issue115FinalVariant, issue115FinalOtherRoot))
+func finalMultiFixture() []byte {
+	return []byte(fmt.Sprintf(`[{"id":"%s","configuration":{"name":"registry.example/team/demo:stable","descriptor":{"digest":"%s","mediaType":"application/vnd.oci.image.index.v1+json"}},"variants":[{"platform":{"os":"linux","architecture":"arm64","variant":"v8"},"digest":"%s"},{"platform":{"os":"linux","architecture":"amd64"},"digest":"%s"}]}]`, strings.TrimPrefix(finalRoot, "sha256:"), finalRoot, finalVariant, finalOtherRoot))
 }
 
-type issue115FinalRunner struct {
+type finalRunner struct {
 	mu sync.Mutex
 
 	imageJSON         []byte
@@ -49,7 +49,7 @@ type issue115FinalRunner struct {
 	containerInspects int
 }
 
-func (r *issue115FinalRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *finalRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -77,7 +77,7 @@ func (r *issue115FinalRunner) Run(_ context.Context, args ...string) ([]byte, []
 		r.containerInspects++
 		root := r.postRoot
 		if root == "" {
-			root = issue115FinalRoot
+			root = finalRoot
 		}
 		platform := r.postPlatform
 		if platform == "" {
@@ -87,7 +87,7 @@ func (r *issue115FinalRunner) Run(_ context.Context, args ...string) ([]byte, []
 			platform = "linux/arm64/v8"
 		}
 		variant := r.postVariant
-		return issue115FinalContainerJSON(r.runImage, root, variant, platform, r.creation), nil, nil
+		return finalContainerJSON(r.runImage, root, variant, platform, r.creation), nil, nil
 	case args[0] == "delete":
 		r.deleteCalls++
 		return nil, nil, nil
@@ -96,7 +96,7 @@ func (r *issue115FinalRunner) Run(_ context.Context, args ...string) ([]byte, []
 	}
 }
 
-func issue115FinalContainerJSON(image, root, variant, platform, creation string) []byte {
+func finalContainerJSON(image, root, variant, platform, creation string) []byte {
 	if image == "" {
 		image = "registry.example/team/demo:stable"
 	}
@@ -135,9 +135,9 @@ func issue115FinalContainerJSON(image, root, variant, platform, creation string)
 	return data
 }
 
-func TestIssue115AppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) {
-	image := issue115FinalFixture(t)
-	r := &issue115FinalRunner{imageJSON: image}
+func TestAppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) {
+	image := finalFixture(t)
+	r := &finalRunner{imageJSON: image}
 	_, err := Run(context.Background(), "team/demo:stable",
 		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
@@ -147,7 +147,7 @@ func TestIssue115AppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) 
 		t.Fatalf("synthetic root was pulled/run: pulls=%v run=%q", r.pullTargets, r.runImage)
 	}
 
-	fallback := &issue115FinalRunner{imageJSON: image}
+	fallback := &finalRunner{imageJSON: image}
 	ctr, err := Run(context.Background(), "team/demo:stable",
 		WithName("myctr"), WithPlatform("linux/arm64/v8"), WithAllowMutableImageTag(), withRunner(fallback), withEngine(appleEngine{}))
 	if err != nil {
@@ -158,9 +158,9 @@ func TestIssue115AppleSingleManifestSyntheticIndexDoesNotPullRoot(t *testing.T) 
 	}
 }
 
-func TestIssue115AppleNameDigestWithTagIsPinned(t *testing.T) {
-	input := "registry.example/team/demo:stable@" + issue115FinalRoot
-	r := &issue115FinalRunner{imageJSON: issue115FinalFixture(t), exactAddressable: true}
+func TestAppleNameDigestWithTagIsPinned(t *testing.T) {
+	input := "registry.example/team/demo:stable@" + finalRoot
+	r := &finalRunner{imageJSON: finalFixture(t), exactAddressable: true}
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -171,8 +171,8 @@ func TestIssue115AppleNameDigestWithTagIsPinned(t *testing.T) {
 	}
 }
 
-func TestIssue115ApplePreservesCustomDefaultRegistry(t *testing.T) {
-	r := &issue115FinalRunner{imageJSON: issue115FinalFixture(t), exactAddressable: true}
+func TestApplePreservesCustomDefaultRegistry(t *testing.T) {
+	r := &finalRunner{imageJSON: finalFixture(t), exactAddressable: true}
 	ctr, err := Run(context.Background(), "team/demo:stable",
 		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -186,12 +186,12 @@ func TestIssue115ApplePreservesCustomDefaultRegistry(t *testing.T) {
 	}
 }
 
-func TestIssue115ApplePreservesCustomDefaultRegistryForPinnedReference(t *testing.T) {
-	fixture := strings.Replace(string(issue115FinalFixture(t)),
+func TestApplePreservesCustomDefaultRegistryForPinnedReference(t *testing.T) {
+	fixture := strings.Replace(string(finalFixture(t)),
 		`"name": "registry.example/team/demo:stable"`,
-		`"name": "registry.example/team/demo:stable@`+issue115FinalRoot+`"`, 1)
-	r := &issue115FinalRunner{imageJSON: []byte(fixture), exactAddressable: true}
-	input := "team/demo:stable@" + issue115FinalRoot
+		`"name": "registry.example/team/demo:stable@`+finalRoot+`"`, 1)
+	r := &finalRunner{imageJSON: []byte(fixture), exactAddressable: true}
+	input := "team/demo:stable@" + finalRoot
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), WithPlatform("linux/arm64/v8"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -205,8 +205,8 @@ func TestIssue115ApplePreservesCustomDefaultRegistryForPinnedReference(t *testin
 	}
 }
 
-func TestIssue115AppleConfigurationPlatformAndVariantIdentity(t *testing.T) {
-	data := issue115FinalContainerJSON("registry.example/team/demo:stable", issue115FinalRoot, issue115FinalVariant, "linux/arm64/v8", "0123456789abcdef")
+func TestAppleConfigurationPlatformAndVariantIdentity(t *testing.T) {
+	data := finalContainerJSON("registry.example/team/demo:stable", finalRoot, finalVariant, "linux/arm64/v8", "0123456789abcdef")
 	info, err := (appleEngine{}).parseInspect(data, "myctr")
 	if err != nil {
 		t.Fatal(err)
@@ -215,7 +215,7 @@ func TestIssue115AppleConfigurationPlatformAndVariantIdentity(t *testing.T) {
 		t.Fatalf("platform = %q, want configuration.platform", info.platform)
 	}
 	identity := imageFromInfo(info)
-	if !identity.pinned || identity.variantDigest != issue115FinalVariant || identity.digest != issue115FinalRoot {
+	if !identity.pinned || identity.variantDigest != finalVariant || identity.digest != finalRoot {
 		t.Fatalf("identity = %+v, want root and selected variant identities", identity)
 	}
 	other := identity
@@ -225,18 +225,18 @@ func TestIssue115AppleConfigurationPlatformAndVariantIdentity(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleUnselectedPlatformMetadataDoesNotBlockReuse(t *testing.T) {
+func TestAppleUnselectedPlatformMetadataDoesNotBlockReuse(t *testing.T) {
 	requested := imageIdentity{
-		reference:  "registry.example/team/demo:stable@" + issue115FinalRoot,
-		digest:     issue115FinalRoot,
-		rootDigest: issue115FinalRoot,
+		reference:  "registry.example/team/demo:stable@" + finalRoot,
+		digest:     finalRoot,
+		rootDigest: finalRoot,
 		repository: "registry.example/team/demo",
 		pinned:     true,
 	}
 	actual := imageFromInfo(&engineInfo{
 		image:              "registry.example/team/demo:stable",
-		imageDigest:        issue115FinalRoot,
-		imageVariantDigest: issue115FinalVariant,
+		imageDigest:        finalRoot,
+		imageVariantDigest: finalVariant,
 		platform:           "linux/arm64/v8",
 	})
 	if !requestedImageIdentitiesCompatible(requested, actual) {
@@ -251,7 +251,7 @@ func TestIssue115AppleUnselectedPlatformMetadataDoesNotBlockReuse(t *testing.T) 
 	}
 }
 
-func TestIssue115RejectsKnownDifferentDockerImageIDs(t *testing.T) {
+func TestRejectsKnownDifferentDockerImageIDs(t *testing.T) {
 	root := "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	a := imageIdentity{reference: "registry.example/team/demo@" + root, digest: root, rootDigest: root, repository: "registry.example/team/demo", id: "sha256:" + strings.Repeat("1", 64), pinned: true}
 	b := a
@@ -267,7 +267,7 @@ func TestIssue115RejectsKnownDifferentDockerImageIDs(t *testing.T) {
 	}
 }
 
-func TestIssue115ImageMissingReasonIsAnchored(t *testing.T) {
+func TestImageMissingReasonIsAnchored(t *testing.T) {
 	imageName := "not-found-image"
 	args := []string{"image", "inspect", imageName}
 	if (appleEngine{}).imageMissing(&cli.CLIError{Binary: "container", Args: args, Stderr: "failed to inspect " + imageName}) {
@@ -284,11 +284,11 @@ func TestIssue115ImageMissingReasonIsAnchored(t *testing.T) {
 	}
 }
 
-func TestIssue115ApplePostCreateIdentityReplacementRollsBack(t *testing.T) {
-	r := &issue115FinalRunner{
-		imageJSON:        issue115FinalMultiFixture(),
+func TestApplePostCreateIdentityReplacementRollsBack(t *testing.T) {
+	r := &finalRunner{
+		imageJSON:        finalMultiFixture(),
 		exactAddressable: true,
-		postRoot:         issue115FinalReplacement,
+		postRoot:         finalReplacement,
 	}
 	_, err := Run(context.Background(), "registry.example/team/demo:stable",
 		WithName("myctr"), withRunner(r), withEngine(appleEngine{}))

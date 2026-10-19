@@ -330,7 +330,7 @@ func TestWaitErrorRetainsLastTransientCause(t *testing.T) {
 	for _, factory := range factories {
 		factory := factory
 		t.Run(factory.name, func(t *testing.T) {
-			caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+			caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 			started := make(chan struct{})
 			done := make(chan error, 1)
 			go func() {
@@ -367,7 +367,7 @@ func TestWaitErrorRetainsLastTransientCause(t *testing.T) {
 	}
 
 	t.Run("log-stream", func(t *testing.T) {
-		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+		caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 		started := make(chan struct{})
 		done := make(chan error, 1)
 		go func() {
@@ -485,7 +485,7 @@ func TestCallerTerminationDoesNotOutliveDiagnosticProbe(t *testing.T) {
 			var expire func()
 			switch tc.trigger {
 			case "exec-deadline", "running-deadline":
-				caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+				caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 				ctx = caller
 				cancel = func() {}
 				expire = caller.expire

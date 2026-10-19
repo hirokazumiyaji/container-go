@@ -1,10 +1,19 @@
-.PHONY: test vet lint integration integration-docker bench-integration release-check release-check-bench
+.PHONY: test vet vet-integration lint integration integration-docker bench-integration release-check release-check-bench
 
 test:
 	go test ./...
 
 vet:
 	go vet ./...
+
+# Every gate that can compile the `integration`-tagged files type-checks them
+# with this command. Go ignores an unknown build tag silently, so a rename that
+# misses one copy would quietly stop checking instead of failing.
+VET_INTEGRATION := go vet -tags integration ./...
+
+vet-integration:
+	$(VET_INTEGRATION)
+	cd bench && $(VET_INTEGRATION)
 
 lint:
 	golangci-lint run ./...
@@ -79,13 +88,14 @@ release-check:
 	# Also type-checks the `integration`-tagged files, which no untagged build
 	# compiles. ci.yml's integration-docker job covers this on a PR, but that
 	# job does not run on a tag push, so the tag gate would not.
-	go vet -tags integration ./...
+	$(VET_INTEGRATION)
 	$(MAKE) lint
 	go test -count=1 -race ./...
 	go mod verify
 	go mod tidy -diff
 	go run golang.org/x/vuln/cmd/govulncheck@$(GOVULNCHECK_VERSION) ./...
 	$(MAKE) release-check-bench
+	cd tools && go mod verify && go mod tidy -diff
 	go run github.com/rhysd/actionlint/cmd/actionlint@$(ACTIONLINT_VERSION) -shellcheck= -pyflakes=
 
 # bench/ is a separate module, so a root-level ./... reaches none of it: not
@@ -100,7 +110,7 @@ release-check:
 release-check-bench:
 	cd bench && go build ./... \
 		&& go vet ./... \
-		&& go vet -tags integration ./... \
+		&& $(VET_INTEGRATION) \
 		&& golangci-lint run ./... \
 		&& go test -count=1 -race ./... \
 		&& go mod verify \

@@ -24,53 +24,53 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-type reviewTypedCause struct {
+type typedCause struct {
 	message string
 }
 
-func (e *reviewTypedCause) Error() string { return e.message }
+func (e *typedCause) Error() string { return e.message }
 
-type reviewNoopTarget struct{}
+type noopTarget struct{}
 
-func (*reviewNoopTarget) Endpoint(context.Context, string) (string, error) {
+func (*noopTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
-func (*reviewNoopTarget) Running(context.Context) (bool, error) { return true, nil }
-func (*reviewNoopTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*noopTarget) Running(context.Context) (bool, error) { return true, nil }
+func (*noopTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewNoopTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*noopTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, errors.New("exec not used")
 }
 
-type reviewExecTarget struct {
+type execTarget struct {
 	cause       error
 	block       bool
 	started     chan struct{}
 	startedOnce sync.Once
 }
 
-func newReviewExecTarget(cause error, block bool) *reviewExecTarget {
-	return &reviewExecTarget{
+func newExecTarget(cause error, block bool) *execTarget {
+	return &execTarget{
 		cause:   cause,
 		block:   block,
 		started: make(chan struct{}),
 	}
 }
 
-func (*reviewExecTarget) Endpoint(context.Context, string) (string, error) {
+func (*execTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
-func (t *reviewExecTarget) Running(ctx context.Context) (bool, error) {
+func (t *execTarget) Running(ctx context.Context) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return true, err
 	}
 	return true, nil
 }
-func (*reviewExecTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*execTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (t *reviewExecTarget) ExecCommand(ctx context.Context, _ []string) (int, error) {
+func (t *execTarget) ExecCommand(ctx context.Context, _ []string) (int, error) {
 	t.startedOnce.Do(func() { close(t.started) })
 	if t.block {
 		<-ctx.Done()
@@ -79,9 +79,9 @@ func (t *reviewExecTarget) ExecCommand(ctx context.Context, _ []string) (int, er
 }
 
 func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failed at deadline"}
+	cause := &typedCause{message: "backend failed at deadline"}
 	ctx, cancel := context.WithCancel(context.Background())
-	err := poll(ctx, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(context.Context) error {
+	err := poll(ctx, options{startupTimeout: time.Hour}, &noopTarget{}, "wait", func(context.Context) error {
 		cancel()
 		return cause
 	})
@@ -91,7 +91,7 @@ func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
 	if !errors.Is(err, cause) {
 		t.Fatalf("error = %v, want current check cause", err)
 	}
-	var typed *reviewTypedCause
+	var typed *typedCause
 	if !errors.As(err, &typed) {
 		t.Fatalf("error = %v, want typed check cause", err)
 	}
@@ -101,13 +101,13 @@ func TestPollRetainsCheckErrorWhenContextCompletes(t *testing.T) {
 }
 
 func TestPollRetainsCheckErrorAtCallerDeadline(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failed at deadline"}
-	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+	cause := &typedCause{message: "backend failed at deadline"}
+	caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 	started := make(chan struct{})
 	var startOnce sync.Once
 	done := make(chan error, 1)
 	go func() {
-		done <- poll(caller, options{startupTimeout: time.Hour}, &reviewNoopTarget{}, "wait", func(checkCtx context.Context) error {
+		done <- poll(caller, options{startupTimeout: time.Hour}, &noopTarget{}, "wait", func(checkCtx context.Context) error {
 			startOnce.Do(func() { close(started) })
 			<-checkCtx.Done()
 			return cause
@@ -134,10 +134,10 @@ func TestPollRetainsCheckErrorAtCallerDeadline(t *testing.T) {
 }
 
 func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
-	cause := &reviewTypedCause{message: "readiness backend failure"}
+	cause := &typedCause{message: "readiness backend failure"}
 	t.Run("cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		target := newReviewExecTarget(cause, true)
+		target := newExecTarget(cause, true)
 		done := make(chan error, 1)
 		go func() {
 			done <- ForExec([]string{"probe"}).WithStartupTimeout(time.Hour).WithPollInterval(5*time.Millisecond).WaitUntilReady(ctx, target)
@@ -160,8 +160,8 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 	})
 
 	t.Run("deadline", func(t *testing.T) {
-		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
-		target := newReviewExecTarget(cause, false)
+		caller := newManualDeadlineContext(time.Now().Add(time.Hour))
+		target := newExecTarget(cause, false)
 		done := make(chan error, 1)
 		go func() {
 			done <- ForExec([]string{"probe"}).WithStartupTimeout(time.Hour).WithPollInterval(5*time.Millisecond).WaitUntilReady(caller, target)
@@ -190,7 +190,7 @@ func TestPollSkipsDiagnosticProbeAfterCallerTermination(t *testing.T) {
 }
 
 func TestReceiveLogScanResultPrefersQueuedTerminalCause(t *testing.T) {
-	cause := &reviewTypedCause{message: "scanner backend failure"}
+	cause := &typedCause{message: "scanner backend failure"}
 	results := make(chan logScanResult, 1)
 	results <- logScanResult{err: cause}
 	done := make(chan struct{})
@@ -203,30 +203,30 @@ func TestReceiveLogScanResultPrefersQueuedTerminalCause(t *testing.T) {
 	}
 }
 
-type reviewLogReadStartTarget struct {
+type logReadStartTarget struct {
 	started chan struct{}
 }
 
-func (t *reviewLogReadStartTarget) Endpoint(context.Context, string) (string, error) {
+func (t *logReadStartTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
-func (t *reviewLogReadStartTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *reviewLogReadStartTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+func (t *logReadStartTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *logReadStartTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	// Signal from the reader's first Read (not FollowLogs) so cancellation
 	// cannot precede the scan goroutine observing the stream.
-	return &reviewLogReadStartCloser{ctx: ctx, started: t.started}, nil
+	return &logReadStartCloser{ctx: ctx, started: t.started}, nil
 }
-func (*reviewLogReadStartTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*logReadStartTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, errors.New("exec not used")
 }
 
-type reviewLogReadStartCloser struct {
+type logReadStartCloser struct {
 	ctx     context.Context
 	started chan struct{}
 	once    sync.Once
 }
 
-func (r *reviewLogReadStartCloser) Read([]byte) (int, error) {
+func (r *logReadStartCloser) Read([]byte) (int, error) {
 	r.once.Do(func() {
 		if r.started != nil {
 			close(r.started)
@@ -235,7 +235,7 @@ func (r *reviewLogReadStartCloser) Read([]byte) (int, error) {
 	<-r.ctx.Done()
 	return 0, r.ctx.Err()
 }
-func (*reviewLogReadStartCloser) Close() error { return nil }
+func (*logReadStartCloser) Close() error { return nil }
 
 func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
@@ -243,7 +243,7 @@ func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &reviewLogReadStartTarget{started: started})
+		done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, &logReadStartTarget{started: started})
 	}()
 	var start time.Time
 	select {
@@ -267,18 +267,18 @@ func TestForLogCancelSynchronizesOnFirstRead(t *testing.T) {
 	}
 }
 
-type reviewLogDeadlineCauseTarget struct {
+type logDeadlineCauseTarget struct {
 	cause   error
 	started chan struct{}
 	calls   atomic.Int32
 	once    sync.Once
 }
 
-func (t *reviewLogDeadlineCauseTarget) Endpoint(context.Context, string) (string, error) {
+func (t *logDeadlineCauseTarget) Endpoint(context.Context, string) (string, error) {
 	return "", t.cause
 }
-func (t *reviewLogDeadlineCauseTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *reviewLogDeadlineCauseTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+func (t *logDeadlineCauseTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *logDeadlineCauseTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	// First open publishes the typed stream cause. Later opens signal that
 	// retention has happened so the test can expire the caller deterministically.
 	if t.calls.Add(1) == 1 {
@@ -292,18 +292,18 @@ func (t *reviewLogDeadlineCauseTarget) FollowLogs(ctx context.Context) (io.ReadC
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
-func (t *reviewLogDeadlineCauseTarget) ExecCommand(context.Context, []string) (int, error) {
+func (t *logDeadlineCauseTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, t.cause
 }
 
 func TestForLogDeadlineRetainsStreamCause(t *testing.T) {
-	cause := &reviewTypedCause{message: "scanner backend failure"}
-	caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+	cause := &typedCause{message: "scanner backend failure"}
+	caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 	started := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
 		done <- ForLog("never").WithStartupTimeout(time.Hour).
-			WaitUntilReady(caller, &reviewLogDeadlineCauseTarget{cause: cause, started: started})
+			WaitUntilReady(caller, &logDeadlineCauseTarget{cause: cause, started: started})
 	}()
 	var start time.Time
 	select {
@@ -330,18 +330,18 @@ func TestForLogDeadlineRetainsStreamCause(t *testing.T) {
 	}
 }
 
-type reviewManualDeadlineContext struct {
+type manualDeadlineContext struct {
 	deadline time.Time
 	done     chan struct{}
 }
 
-func newReviewManualDeadlineContext(deadline time.Time) *reviewManualDeadlineContext {
-	return &reviewManualDeadlineContext{deadline: deadline, done: make(chan struct{})}
+func newManualDeadlineContext(deadline time.Time) *manualDeadlineContext {
+	return &manualDeadlineContext{deadline: deadline, done: make(chan struct{})}
 }
 
-func (c *reviewManualDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
-func (c *reviewManualDeadlineContext) Done() <-chan struct{}       { return c.done }
-func (c *reviewManualDeadlineContext) Err() error {
+func (c *manualDeadlineContext) Deadline() (time.Time, bool) { return c.deadline, true }
+func (c *manualDeadlineContext) Done() <-chan struct{}       { return c.done }
+func (c *manualDeadlineContext) Err() error {
 	select {
 	case <-c.done:
 		return context.DeadlineExceeded
@@ -349,23 +349,23 @@ func (c *reviewManualDeadlineContext) Err() error {
 		return nil
 	}
 }
-func (*reviewManualDeadlineContext) Value(any) any { return nil }
+func (*manualDeadlineContext) Value(any) any { return nil }
 
-func (c *reviewManualDeadlineContext) expire() { close(c.done) }
+func (c *manualDeadlineContext) expire() { close(c.done) }
 
-type reviewLogTerminationTarget struct {
+type logTerminationTarget struct {
 	terminate func()
 	started   chan struct{}
 	once      sync.Once
 }
 
-func (t *reviewLogTerminationTarget) Endpoint(context.Context, string) (string, error) {
+func (t *logTerminationTarget) Endpoint(context.Context, string) (string, error) {
 	return "", errors.New("endpoint not used")
 }
-func (t *reviewLogTerminationTarget) Running(context.Context) (bool, error) {
+func (t *logTerminationTarget) Running(context.Context) (bool, error) {
 	return true, nil
 }
-func (t *reviewLogTerminationTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *logTerminationTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.once.Do(func() {
 		if t.started != nil {
 			close(t.started)
@@ -374,7 +374,7 @@ func (t *reviewLogTerminationTarget) FollowLogs(context.Context) (io.ReadCloser,
 	})
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewLogTerminationTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*logTerminationTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, errors.New("exec not used")
 }
 
@@ -382,7 +382,7 @@ func TestForLogDoesNotOutliveCallerTermination(t *testing.T) {
 	t.Run("cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
 		started := make(chan struct{})
-		target := &reviewLogTerminationTarget{terminate: cancel, started: started}
+		target := &logTerminationTarget{terminate: cancel, started: started}
 		start := time.Now()
 		err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(ctx, target)
 		if !errors.Is(err, context.Canceled) {
@@ -394,8 +394,8 @@ func TestForLogDoesNotOutliveCallerTermination(t *testing.T) {
 	})
 
 	t.Run("deadline", func(t *testing.T) {
-		caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
-		target := &reviewLogTerminationTarget{terminate: caller.expire, started: make(chan struct{})}
+		caller := newManualDeadlineContext(time.Now().Add(time.Hour))
+		target := &logTerminationTarget{terminate: caller.expire, started: make(chan struct{})}
 		start := time.Now()
 		err := ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(caller, target)
 		if !errors.Is(err, context.DeadlineExceeded) {
@@ -407,14 +407,14 @@ func TestForLogDoesNotOutliveCallerTermination(t *testing.T) {
 	})
 }
 
-type reviewAnyStrategy struct {
+type testAnyStrategy struct {
 	cause   error
 	delay   time.Duration
 	started chan struct{}
 	once    sync.Once
 }
 
-func (s *reviewAnyStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
+func (s *testAnyStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
 	s.once.Do(func() { close(s.started) })
 	<-ctx.Done()
 	if s.delay > 0 {
@@ -424,18 +424,18 @@ func (s *reviewAnyStrategy) WaitUntilReady(ctx context.Context, _ Target) error 
 }
 
 func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
-	cause := &reviewTypedCause{message: "child backend failure"}
+	cause := &typedCause{message: "child backend failure"}
 	cases := []struct {
 		name    string
 		want    error
 		startup time.Duration
-		trigger func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc)
+		trigger func(t *testing.T, child *testAnyStrategy) (context.Context, context.CancelFunc)
 	}{
 		{
 			name:    "caller-cancel",
 			want:    context.Canceled,
 			startup: time.Hour,
-			trigger: func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc) {
+			trigger: func(t *testing.T, child *testAnyStrategy) (context.Context, context.CancelFunc) {
 				ctx, cancel := context.WithCancel(context.Background())
 				go func() {
 					select {
@@ -453,8 +453,8 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 			name:    "caller-deadline",
 			want:    context.DeadlineExceeded,
 			startup: time.Hour,
-			trigger: func(t *testing.T, child *reviewAnyStrategy) (context.Context, context.CancelFunc) {
-				caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+			trigger: func(t *testing.T, child *testAnyStrategy) (context.Context, context.CancelFunc) {
+				caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 				go func() {
 					select {
 					case <-child.started:
@@ -471,7 +471,7 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 			name:    "startup-timeout",
 			want:    context.DeadlineExceeded,
 			startup: 25 * time.Millisecond,
-			trigger: func(*testing.T, *reviewAnyStrategy) (context.Context, context.CancelFunc) {
+			trigger: func(*testing.T, *testAnyStrategy) (context.Context, context.CancelFunc) {
 				return context.WithCancel(context.Background())
 			},
 		},
@@ -480,12 +480,12 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			child := &reviewAnyStrategy{cause: cause, delay: 5 * time.Millisecond, started: make(chan struct{})}
+			child := &testAnyStrategy{cause: cause, delay: 5 * time.Millisecond, started: make(chan struct{})}
 			ctx, cancel := tc.trigger(t, child)
 			defer cancel()
 			strategy := ForAny(child).WithStartupTimeout(tc.startup)
 			done := make(chan error, 1)
-			go func() { done <- strategy.WaitUntilReady(ctx, &reviewNoopTarget{}) }()
+			go func() { done <- strategy.WaitUntilReady(ctx, &noopTarget{}) }()
 			var start time.Time
 			select {
 			case <-child.started:
@@ -511,7 +511,7 @@ func TestForAnyCollectsContextAwareChildCause(t *testing.T) {
 	}
 }
 
-type reviewReleaseStrategy struct {
+type testReleaseStrategy struct {
 	started    chan struct{}
 	release    <-chan struct{}
 	canceled   chan struct{}
@@ -520,7 +520,7 @@ type reviewReleaseStrategy struct {
 	cancelOnce sync.Once
 }
 
-func (s *reviewReleaseStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
+func (s *testReleaseStrategy) WaitUntilReady(ctx context.Context, _ Target) error {
 	s.startOnce.Do(func() { close(s.started) })
 	<-ctx.Done()
 	s.cancelOnce.Do(func() { close(s.canceled) })
@@ -543,15 +543,15 @@ func TestForAllClassifiesDeadlineSourceAtRaceBoundary(t *testing.T) {
 	for _, tc := range cases {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
-			caller := newReviewManualDeadlineContext(time.Now().Add(tc.callerDeadline))
+			caller := newManualDeadlineContext(time.Now().Add(tc.callerDeadline))
 			started := make(chan struct{})
 			release := make(chan struct{})
 			canceled := make(chan struct{})
-			childCause := &reviewTypedCause{message: "child failure"}
-			strategy := ForAll(&reviewReleaseStrategy{started: started, release: release, canceled: canceled, err: childCause}).
+			childCause := &typedCause{message: "child failure"}
+			strategy := ForAll(&testReleaseStrategy{started: started, release: release, canceled: canceled, err: childCause}).
 				WithStartupTimeout(tc.startupTimeout)
 			done := make(chan error, 1)
-			go func() { done <- strategy.WaitUntilReady(caller, &reviewNoopTarget{}) }()
+			go func() { done <- strategy.WaitUntilReady(caller, &noopTarget{}) }()
 			select {
 			case <-started:
 			case <-time.After(time.Second):
@@ -607,66 +607,66 @@ func TestNonContextCausePreservesNonContextWrappers(t *testing.T) {
 	}
 }
 
-type reviewMultiWrapper struct {
+type multiWrapper struct {
 	errs []error
 }
 
-func (e *reviewMultiWrapper) Error() string {
+func (e *multiWrapper) Error() string {
 	return "multi wrapper: " + errors.Join(e.errs...).Error()
 }
-func (e *reviewMultiWrapper) Unwrap() []error {
+func (e *multiWrapper) Unwrap() []error {
 	out := make([]error, len(e.errs))
 	copy(out, e.errs)
 	return out
 }
 
-type reviewSliceError []string
+type sliceError []string
 
-func (e reviewSliceError) Error() string { return strings.Join(e, ",") }
+func (e sliceError) Error() string { return strings.Join(e, ",") }
 
-// reviewStructSliceError is a non-comparable struct error (value receiver)
+// structSliceError is a non-comparable struct error (value receiver)
 // used to ensure untouched multi-wrappers are not replaced.
-type reviewStructSliceError struct {
+type structSliceError struct {
 	Parts []string
 }
 
-func (e reviewStructSliceError) Error() string { return strings.Join(e.Parts, ",") }
+func (e structSliceError) Error() string { return strings.Join(e.Parts, ",") }
 
-// reviewFuncBearingError is non-comparable and fails reflect.DeepEqual between
+// funcBearingError is non-comparable and fails reflect.DeepEqual between
 // boxed copies because of the function field.
-type reviewFuncBearingError struct {
+type funcBearingError struct {
 	Label string
 	Fn    func()
 }
 
-func (e reviewFuncBearingError) Error() string { return e.Label }
+func (e funcBearingError) Error() string { return e.Label }
 
 func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
-	nc := reviewSliceError{"backend", "failure"}
+	nc := sliceError{"backend", "failure"}
 	joined := errors.Join(nc, errors.New("other"))
 	got := nonContextCause(joined)
 	if got != joined {
 		t.Fatalf("non-comparable join = %v (%T), want original", got, got)
 	}
-	structChild := reviewStructSliceError{Parts: []string{"backend", "failure"}}
-	structMulti := &reviewMultiWrapper{errs: []error{structChild}}
+	structChild := structSliceError{Parts: []string{"backend", "failure"}}
+	structMulti := &multiWrapper{errs: []error{structChild}}
 	got = nonContextCause(structMulti)
 	if got != structMulti {
 		t.Fatalf("struct-slice multi wrapper = %v (%T), want original", got, got)
 	}
-	var gotStructMulti *reviewMultiWrapper
+	var gotStructMulti *multiWrapper
 	if !errors.As(got, &gotStructMulti) || gotStructMulti != structMulti {
-		t.Fatalf("struct-slice multi wrapper lost *reviewMultiWrapper via As: %v (%T)", got, got)
+		t.Fatalf("struct-slice multi wrapper lost *multiWrapper via As: %v (%T)", got, got)
 	}
-	funcChild := reviewFuncBearingError{Label: "backend", Fn: func() {}}
-	funcMulti := &reviewMultiWrapper{errs: []error{funcChild}}
+	funcChild := funcBearingError{Label: "backend", Fn: func() {}}
+	funcMulti := &multiWrapper{errs: []error{funcChild}}
 	got = nonContextCause(funcMulti)
 	if got != funcMulti {
 		t.Fatalf("func-bearing multi wrapper = %v (%T), want original", got, got)
 	}
-	var gotFuncMulti *reviewMultiWrapper
+	var gotFuncMulti *multiWrapper
 	if !errors.As(got, &gotFuncMulti) || gotFuncMulti != funcMulti {
-		t.Fatalf("func-bearing multi wrapper lost *reviewMultiWrapper via As: %v (%T)", got, got)
+		t.Fatalf("func-bearing multi wrapper lost *multiWrapper via As: %v (%T)", got, got)
 	}
 	mixed := errors.Join(context.Canceled, nc)
 	got = nonContextCause(mixed)
@@ -677,7 +677,7 @@ func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 		t.Fatalf("mixed non-comparable = %q, must not render stripped context", got.Error())
 	}
 	if !errors.Is(got, nc) && got.Error() != nc.Error() {
-		// reviewSliceError is not comparable for errors.Is equality by value;
+		// sliceError is not comparable for errors.Is equality by value;
 		// at least retain its diagnostic text through the filtered tree.
 		if !strings.Contains(got.Error(), "backend") {
 			t.Fatalf("mixed non-comparable = %v, want retained diagnostic", got)
@@ -686,7 +686,7 @@ func TestNonContextCauseHandlesNonComparableErrors(t *testing.T) {
 }
 
 func TestNonContextCauseRebuildsStdlibJoinWithoutContextText(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
+	cause := &typedCause{message: "backend failure"}
 	got := nonContextCause(errors.Join(context.Canceled, cause))
 	if !errors.Is(got, cause) {
 		t.Fatalf("filtered join = %v, want cause", got)
@@ -706,20 +706,20 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if got := nonContextCause(joined); got != joined {
 		t.Fatalf("untouched join = %v (%T), want original", got, got)
 	}
-	multi := &reviewMultiWrapper{errs: []error{a, b}}
+	multi := &multiWrapper{errs: []error{a, b}}
 	if got := nonContextCause(multi); got != multi {
 		t.Fatalf("untouched multi wrapper = %v (%T), want original", got, got)
 	}
-	emptyMulti := &reviewMultiWrapper{errs: nil}
+	emptyMulti := &multiWrapper{errs: nil}
 	gotEmpty := nonContextCause(emptyMulti)
 	if gotEmpty != emptyMulti {
 		t.Fatalf("empty multi wrapper = %v (%T), want original", gotEmpty, gotEmpty)
 	}
-	var gotEmptyMulti *reviewMultiWrapper
+	var gotEmptyMulti *multiWrapper
 	if !errors.As(gotEmpty, &gotEmptyMulti) || gotEmptyMulti != emptyMulti {
-		t.Fatalf("empty multi wrapper lost *reviewMultiWrapper via As: %v (%T)", gotEmpty, gotEmpty)
+		t.Fatalf("empty multi wrapper lost *multiWrapper via As: %v (%T)", gotEmpty, gotEmpty)
 	}
-	mixed := &reviewMultiWrapper{errs: []error{context.Canceled, a}}
+	mixed := &multiWrapper{errs: []error{context.Canceled, a}}
 	got := nonContextCause(mixed)
 	if got == mixed {
 		t.Fatal("mixed multi wrapper should be rebuilt")
@@ -727,12 +727,12 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 	if !errors.Is(got, a) || errors.Is(got, context.Canceled) {
 		t.Fatalf("mixed multi wrapper = %v", got)
 	}
-	var gotMulti *reviewMultiWrapper
+	var gotMulti *multiWrapper
 	if errors.As(got, &gotMulti) {
-		t.Fatalf("mixed multi wrapper exposed unfiltered *reviewMultiWrapper via As")
+		t.Fatalf("mixed multi wrapper exposed unfiltered *multiWrapper via As")
 	}
 
-	onlyContext := &reviewMultiWrapper{errs: []error{context.Canceled, context.DeadlineExceeded}}
+	onlyContext := &multiWrapper{errs: []error{context.Canceled, context.DeadlineExceeded}}
 	got = nonContextCause(onlyContext)
 	if got == nil {
 		t.Fatal("context-only custom multi wrapper dropped entirely")
@@ -741,13 +741,13 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("context-only multi wrapper = %v, must suppress context", got)
 	}
 	if errors.As(got, &gotMulti) {
-		t.Fatalf("context-only multi wrapper exposed unfiltered *reviewMultiWrapper via As")
+		t.Fatalf("context-only multi wrapper exposed unfiltered *multiWrapper via As")
 	}
 	if join := errors.Join(context.Canceled, context.DeadlineExceeded); nonContextCause(join) != nil {
 		t.Fatalf("stdlib join of only context = %v, want nil", nonContextCause(join))
 	}
 
-	onlyContextCustom := &reviewMultiWrapper{errs: []error{context.Canceled}}
+	onlyContextCustom := &multiWrapper{errs: []error{context.Canceled}}
 	got = nonContextCause(onlyContextCustom)
 	if got == nil {
 		t.Fatal("context-only custom wrapper dropped")
@@ -756,7 +756,7 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("context-only custom wrapper = %q, must not render stripped context", got.Error())
 	}
 
-	passthrough := &reviewPassthroughWrapper{err: context.Canceled}
+	passthrough := &passthroughWrapper{err: context.Canceled}
 	got = nonContextCause(passthrough)
 	if got == nil {
 		t.Fatal("context-only passthrough wrapper dropped")
@@ -768,7 +768,7 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 		t.Fatalf("context-only passthrough wrapper = %q, must not restore stripped text", got.Error())
 	}
 
-	dupContextOnly := &reviewMultiWrapper{errs: []error{context.Canceled, context.Canceled}}
+	dupContextOnly := &multiWrapper{errs: []error{context.Canceled, context.Canceled}}
 	got = nonContextCause(dupContextOnly)
 	if got == nil {
 		t.Fatal("duplicate context-only multi wrapper dropped")
@@ -798,7 +798,7 @@ func TestNonContextCausePreservesUntouchedMultiErrors(t *testing.T) {
 }
 
 func TestNonContextCauseAsDoesNotExposeDiscardedTransportChildren(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend failure"}
+	backend := &typedCause{message: "backend failure"}
 	wrapped := fmt.Errorf("%w; %w", &os.PathError{Op: "open", Path: "/tmp/x", Err: context.Canceled}, backend)
 	got := nonContextCause(wrapped)
 	if !errors.Is(got, backend) {
@@ -810,28 +810,28 @@ func TestNonContextCauseAsDoesNotExposeDiscardedTransportChildren(t *testing.T) 
 	}
 }
 
-// reviewVirtualCode is a classification supplied only via a wrapper As method,
+// virtualCode is a classification supplied only via a wrapper As method,
 // not present on the wrapped cause tree.
-type reviewVirtualCode struct {
+type virtualCode struct {
 	Code string
 }
 
-func (e *reviewVirtualCode) Error() string {
+func (e *virtualCode) Error() string {
 	if e == nil {
 		return "virtual code"
 	}
 	return "virtual code: " + e.Code
 }
 
-type reviewVirtualAsWrapper struct {
+type virtualAsWrapper struct {
 	err  error
-	code *reviewVirtualCode
+	code *virtualCode
 }
 
-func (e *reviewVirtualAsWrapper) Error() string { return "virtual: " + e.err.Error() }
-func (e *reviewVirtualAsWrapper) Unwrap() error { return e.err }
-func (e *reviewVirtualAsWrapper) As(target any) bool {
-	if t, ok := target.(**reviewVirtualCode); ok && e != nil && e.code != nil {
+func (e *virtualAsWrapper) Error() string { return "virtual: " + e.err.Error() }
+func (e *virtualAsWrapper) Unwrap() error { return e.err }
+func (e *virtualAsWrapper) As(target any) bool {
+	if t, ok := target.(**virtualCode); ok && e != nil && e.code != nil {
 		*t = e.code
 		return true
 	}
@@ -839,9 +839,9 @@ func (e *reviewVirtualAsWrapper) As(target any) bool {
 }
 
 func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
-	code := &reviewVirtualCode{Code: "E_BACKEND"}
-	wrapped := &reviewVirtualAsWrapper{err: errors.Join(context.Canceled, cause), code: code}
+	cause := &typedCause{message: "backend failure"}
+	code := &virtualCode{Code: "E_BACKEND"}
+	wrapped := &virtualAsWrapper{err: errors.Join(context.Canceled, cause), code: code}
 	got := nonContextCause(wrapped)
 	if !errors.Is(got, cause) {
 		t.Fatalf("virtual As wrapper = %v, want cause", got)
@@ -849,20 +849,20 @@ func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
 	if errors.Is(got, context.Canceled) {
 		t.Fatalf("virtual As wrapper = %v, must drop canceled", got)
 	}
-	var gotCode *reviewVirtualCode
+	var gotCode *virtualCode
 	if !errors.As(got, &gotCode) || gotCode != code {
 		t.Fatalf("virtual As wrapper = %v, want virtual classification via As", got)
 	}
-	var gotWrapper *reviewVirtualAsWrapper
+	var gotWrapper *virtualAsWrapper
 	if errors.As(got, &gotWrapper) {
-		t.Fatalf("virtual As wrapper exposed unfiltered *reviewVirtualAsWrapper via As")
+		t.Fatalf("virtual As wrapper exposed unfiltered *virtualAsWrapper via As")
 	}
 
-	// Wrapper and retained child both match *reviewVirtualCode: wrapper As
+	// Wrapper and retained child both match *virtualCode: wrapper As
 	// must win, matching errors.As depth-first order on the original tree.
-	childCode := &reviewVirtualCode{Code: "CHILD"}
-	wrapperCode := &reviewVirtualCode{Code: "WRAP"}
-	competing := &reviewVirtualAsWrapper{
+	childCode := &virtualCode{Code: "CHILD"}
+	wrapperCode := &virtualCode{Code: "WRAP"}
+	competing := &virtualAsWrapper{
 		err:  errors.Join(context.Canceled, childCode),
 		code: wrapperCode,
 	}
@@ -870,14 +870,14 @@ func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
 	if !errors.Is(got, childCode) {
 		t.Fatalf("competing As wrapper = %v, want child code via Is", got)
 	}
-	var gotCompeting *reviewVirtualCode
+	var gotCompeting *virtualCode
 	if !errors.As(got, &gotCompeting) || gotCompeting != wrapperCode {
 		t.Fatalf("competing As wrapper = %#v, want wrapper code via As precedence", gotCompeting)
 	}
 
 	// A custom As that walks unfiltered children must still not expose a
 	// discarded context-bearing transport wrapper.
-	leaky := &reviewOpaqueFacade{
+	leaky := &opaqueFacade{
 		err: errors.Join(&os.PathError{Op: "open", Path: "/tmp/x", Err: context.Canceled}, cause),
 	}
 	got = nonContextCause(leaky)
@@ -891,7 +891,7 @@ func TestNonContextCausePreservesVirtualAsClassification(t *testing.T) {
 }
 
 func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
+	cause := &typedCause{message: "backend failure"}
 	pathErr := &os.PathError{Op: "open", Path: "/tmp/x", Err: errors.Join(context.Canceled, cause)}
 	got := nonContextCause(pathErr)
 	if !errors.Is(got, cause) {
@@ -971,10 +971,10 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 	// Context-only UnwrapErr with an independent DNS reason must still keep
 	// *net.DNSError for As, not disappear as a fully stripped carrier.
 	contextOnlyUnwrapDNS := &net.DNSError{
-		Err:       "no such host",
-		Name:      "example.com",
+		Err:        "no such host",
+		Name:       "example.com",
 		IsNotFound: true,
-		UnwrapErr: context.Canceled,
+		UnwrapErr:  context.Canceled,
 	}
 	got = nonContextCause(contextOnlyUnwrapDNS)
 	var gotContextOnlyDNS *net.DNSError
@@ -1066,7 +1066,7 @@ func TestNonContextCauseClonesTransportWrappersWithFilteredCause(t *testing.T) {
 }
 
 func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
+	cause := &typedCause{message: "backend failure"}
 	wrapped := fmt.Errorf("follow logs: %w; backend: %w", context.Canceled, cause)
 	got := nonContextCause(wrapped)
 	if !errors.Is(got, cause) {
@@ -1172,7 +1172,7 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	}
 
 	// Literal framing that copies a child phrase must not steal the claim.
-	framedCause := &reviewTypedCause{message: "backend failure"}
+	framedCause := &typedCause{message: "backend failure"}
 	framed := fmt.Errorf("note=context canceled; ctx=%w; backend=%w", context.Canceled, framedCause)
 	got = nonContextCause(framed)
 	if !errors.Is(got, framedCause) {
@@ -1189,7 +1189,7 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 		t.Fatalf("ambiguous framing copy = %q, want cause-only fallback without framing copies", got.Error())
 	}
 
-	nestedCause := &reviewTypedCause{message: "nested backend failure"}
+	nestedCause := &typedCause{message: "nested backend failure"}
 	nestedChild := fmt.Errorf("attempt: %w", errors.Join(context.Canceled, nestedCause))
 	nested := fmt.Errorf("stream: %w; backend: %w", context.Canceled, nestedChild)
 	got = nonContextCause(nested)
@@ -1612,43 +1612,43 @@ func TestNonContextCausePreservesFmtMultiWrapFraming(t *testing.T) {
 	}
 }
 
-type reviewContextMatchingMulti struct {
+type contextMatchingMulti struct {
 	errs []error
 }
 
-func (e *reviewContextMatchingMulti) Error() string {
+func (e *contextMatchingMulti) Error() string {
 	return "context matching multi: " + errors.Join(e.errs...).Error()
 }
-func (e *reviewContextMatchingMulti) Unwrap() []error {
+func (e *contextMatchingMulti) Unwrap() []error {
 	out := make([]error, len(e.errs))
 	copy(out, e.errs)
 	return out
 }
-func (e *reviewContextMatchingMulti) Is(target error) bool {
+func (e *contextMatchingMulti) Is(target error) bool {
 	return target == context.Canceled || target == context.DeadlineExceeded
 }
 
-type reviewContextMatchingWrapper struct {
+type contextMatchingWrapper struct {
 	err error
 }
 
-func (e *reviewContextMatchingWrapper) Error() string { return "context matching: " + e.err.Error() }
-func (e *reviewContextMatchingWrapper) Unwrap() error  { return e.err }
-func (e *reviewContextMatchingWrapper) Is(target error) bool {
+func (e *contextMatchingWrapper) Error() string { return "context matching: " + e.err.Error() }
+func (e *contextMatchingWrapper) Unwrap() error { return e.err }
+func (e *contextMatchingWrapper) Is(target error) bool {
 	return target == context.Canceled || errors.Is(e.err, target)
 }
 
-// reviewPassthroughWrapper renders exactly its child text with no framing.
-type reviewPassthroughWrapper struct {
+// passthroughWrapper renders exactly its child text with no framing.
+type passthroughWrapper struct {
 	err error
 }
 
-func (e *reviewPassthroughWrapper) Error() string { return e.err.Error() }
-func (e *reviewPassthroughWrapper) Unwrap() error  { return e.err }
+func (e *passthroughWrapper) Error() string { return e.err.Error() }
+func (e *passthroughWrapper) Unwrap() error { return e.err }
 
 func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
-	multi := &reviewContextMatchingMulti{errs: []error{cause}}
+	cause := &typedCause{message: "backend failure"}
+	multi := &contextMatchingMulti{errs: []error{cause}}
 	got := nonContextCause(multi)
 	if got == nil {
 		t.Fatal("wrapper with non-context children dropped")
@@ -1660,7 +1660,7 @@ func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
 		t.Fatalf("multi wrapper = %v, want child cause", got)
 	}
 
-	wrapped := &reviewContextMatchingWrapper{err: cause}
+	wrapped := &contextMatchingWrapper{err: cause}
 	got = nonContextCause(wrapped)
 	if got == nil {
 		t.Fatal("single wrapper with non-context child dropped")
@@ -1673,20 +1673,20 @@ func TestNonContextCauseSuppressesWrapperSuppliedContextMatches(t *testing.T) {
 	}
 }
 
-type reviewStreamWrapper struct {
+type streamWrapper struct {
 	err error
 }
 
-func (e *reviewStreamWrapper) Error() string { return "stream wrapper: " + e.err.Error() }
-func (e *reviewStreamWrapper) Unwrap() error { return e.err }
-func (e *reviewStreamWrapper) Is(target error) bool {
-	return target == errReviewStreamSentinel || errors.Is(e.err, target)
+func (e *streamWrapper) Error() string { return "stream wrapper: " + e.err.Error() }
+func (e *streamWrapper) Unwrap() error { return e.err }
+func (e *streamWrapper) Is(target error) bool {
+	return target == errTestStreamSentinel || errors.Is(e.err, target)
 }
 
-var errReviewStreamSentinel = errors.New("review stream sentinel")
+var errTestStreamSentinel = errors.New("review stream sentinel")
 
 func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T) {
-	cause := &reviewTypedCause{message: "backend failure"}
+	cause := &typedCause{message: "backend failure"}
 	wrapped := fmt.Errorf("follow logs: %w", errors.Join(context.Canceled, cause))
 	got := nonContextCause(wrapped)
 	if !errors.Is(got, cause) {
@@ -1722,66 +1722,66 @@ func TestNonContextCausePreservesWrapperDiagnosticsForMixedContext(t *testing.T)
 		t.Fatalf("nested wrapper = %v, want *net.OpError via As", got)
 	}
 
-	custom := &reviewStreamWrapper{err: errors.Join(context.Canceled, cause)}
+	custom := &streamWrapper{err: errors.Join(context.Canceled, cause)}
 	got = nonContextCause(custom)
 	if !errors.Is(got, cause) {
 		t.Fatalf("custom wrapper = %v, want typed cause", got)
 	}
-	if !errors.Is(got, errReviewStreamSentinel) {
+	if !errors.Is(got, errTestStreamSentinel) {
 		t.Fatalf("custom wrapper = %v, want sentinel via original Is", got)
 	}
 	if errors.Is(got, context.Canceled) {
 		t.Fatalf("custom wrapper = %v, must not retain canceled branch", got)
 	}
-	var gotWrapper *reviewStreamWrapper
+	var gotWrapper *streamWrapper
 	if errors.As(got, &gotWrapper) {
-		t.Fatalf("custom wrapper exposed unfiltered *reviewStreamWrapper via As")
+		t.Fatalf("custom wrapper exposed unfiltered *streamWrapper via As")
 	}
 }
 
-// reviewOpaqueFacade mirrors cli.safeError: Is/As over an inner tree without
+// opaqueFacade mirrors cli.safeError: Is/As over an inner tree without
 // Unwrap, with UnwrapRaw as the explicit opt-in to the source error.
-type reviewOpaqueFacade struct {
+type opaqueFacade struct {
 	err error
 }
 
-func (e *reviewOpaqueFacade) Error() string { return "opaque: " + e.err.Error() }
-func (e *reviewOpaqueFacade) Is(target error) bool {
+func (e *opaqueFacade) Error() string { return "opaque: " + e.err.Error() }
+func (e *opaqueFacade) Is(target error) bool {
 	return e != nil && errors.Is(e.err, target)
 }
-func (e *reviewOpaqueFacade) As(target any) bool {
+func (e *opaqueFacade) As(target any) bool {
 	return e != nil && errors.As(e.err, target)
 }
-func (e *reviewOpaqueFacade) UnwrapRaw() error {
+func (e *opaqueFacade) UnwrapRaw() error {
 	if e == nil {
 		return nil
 	}
 	return e.err
 }
 
-// reviewRepeatedChildTextWrapper unwraps a context sentinel while its Error
+// repeatedChildTextWrapper unwraps a context sentinel while its Error
 // text also embeds that sentinel as independent diagnostic prose.
-type reviewRepeatedChildTextWrapper struct {
+type repeatedChildTextWrapper struct {
 	backend error
 	child   error
 }
 
-func (e *reviewRepeatedChildTextWrapper) Error() string {
+func (e *repeatedChildTextWrapper) Error() string {
 	return "peer reported context canceled; context canceled"
 }
-func (e *reviewRepeatedChildTextWrapper) Unwrap() error {
+func (e *repeatedChildTextWrapper) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.child
 }
-func (e *reviewRepeatedChildTextWrapper) Is(target error) bool {
+func (e *repeatedChildTextWrapper) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return errors.Is(e.child, target) || errors.Is(e.backend, target)
 }
-func (e *reviewRepeatedChildTextWrapper) As(target any) bool {
+func (e *repeatedChildTextWrapper) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
@@ -1789,8 +1789,8 @@ func (e *reviewRepeatedChildTextWrapper) As(target any) bool {
 }
 
 func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend failure"}
-	wrapped := &reviewRepeatedChildTextWrapper{backend: backend, child: context.Canceled}
+	backend := &typedCause{message: "backend failure"}
+	wrapped := &repeatedChildTextWrapper{backend: backend, child: context.Canceled}
 	got := nonContextCause(wrapped)
 	if got == nil {
 		t.Fatal("repeated child-text wrapper dropped entirely")
@@ -1808,7 +1808,7 @@ func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
 		t.Fatalf("repeated child-text wrapper = %q, corrupted retained diagnostic", got.Error())
 	}
 
-	spaced := &reviewSpacedSingleChildWrapper{child: context.Canceled}
+	spaced := &spacedSingleChildWrapper{child: context.Canceled}
 	got = nonContextCause(spaced)
 	if got == nil {
 		t.Fatal("spaced single-child wrapper dropped entirely")
@@ -1826,8 +1826,8 @@ func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
 		t.Fatalf("spaced single-child wrapper = %q, must strip unique child text", got.Error())
 	}
 
-	framedBackend := &reviewTypedCause{message: "backend"}
-	framed := &reviewFramedUnchangedChildWrapper{child: framedBackend}
+	framedBackend := &typedCause{message: "backend"}
+	framed := &framedUnchangedChildWrapper{child: framedBackend}
 	got = nonContextCause(framed)
 	if got == nil {
 		t.Fatal("framed unchanged-child wrapper dropped entirely")
@@ -1843,57 +1843,57 @@ func TestNonContextCauseKeepsAmbiguousRepeatedSingleChildText(t *testing.T) {
 	}
 }
 
-// reviewFramedUnchangedChildWrapper matches context itself while wrapping an
+// framedUnchangedChildWrapper matches context itself while wrapping an
 // unchanged backend child whose Error text already appears in the frame.
-type reviewFramedUnchangedChildWrapper struct {
+type framedUnchangedChildWrapper struct {
 	child error
 }
 
-func (e *reviewFramedUnchangedChildWrapper) Error() string {
+func (e *framedUnchangedChildWrapper) Error() string {
 	return "operation failed: " + e.child.Error()
 }
-func (e *reviewFramedUnchangedChildWrapper) Unwrap() error {
+func (e *framedUnchangedChildWrapper) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.child
 }
-func (e *reviewFramedUnchangedChildWrapper) Is(target error) bool {
+func (e *framedUnchangedChildWrapper) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return target == context.Canceled || errors.Is(e.child, target)
 }
 
-// reviewSpacedSingleChildWrapper keeps intentional boundary whitespace around
+// spacedSingleChildWrapper keeps intentional boundary whitespace around
 // a unique context child rendering.
-type reviewSpacedSingleChildWrapper struct {
+type spacedSingleChildWrapper struct {
 	child error
 }
 
-func (e *reviewSpacedSingleChildWrapper) Error() string {
+func (e *spacedSingleChildWrapper) Error() string {
 	return " backend: context canceled "
 }
-func (e *reviewSpacedSingleChildWrapper) Unwrap() error {
+func (e *spacedSingleChildWrapper) Unwrap() error {
 	if e == nil {
 		return nil
 	}
 	return e.child
 }
 
-// reviewOpaqueIsAsFacade matches context and a backend sentinel via Is/As only.
-type reviewOpaqueIsAsFacade struct {
+// opaqueIsAsFacade matches context and a backend sentinel via Is/As only.
+type opaqueIsAsFacade struct {
 	backend error
 }
 
-func (e *reviewOpaqueIsAsFacade) Error() string { return "opaque is/as facade" }
-func (e *reviewOpaqueIsAsFacade) Is(target error) bool {
+func (e *opaqueIsAsFacade) Error() string { return "opaque is/as facade" }
+func (e *opaqueIsAsFacade) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return errors.Is(target, context.Canceled) || errors.Is(e.backend, target)
 }
-func (e *reviewOpaqueIsAsFacade) As(target any) bool {
+func (e *opaqueIsAsFacade) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
@@ -1901,8 +1901,8 @@ func (e *reviewOpaqueIsAsFacade) As(target any) bool {
 }
 
 func TestNonContextCauseRetainsOpaqueIsAsWithoutUnwrap(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend failure"}
-	facade := &reviewOpaqueIsAsFacade{backend: backend}
+	backend := &typedCause{message: "backend failure"}
+	facade := &opaqueIsAsFacade{backend: backend}
 	got := nonContextCause(facade)
 	if got == nil {
 		t.Fatal("opaque Is/As facade dropped entirely")
@@ -1913,30 +1913,30 @@ func TestNonContextCauseRetainsOpaqueIsAsWithoutUnwrap(t *testing.T) {
 	if !errors.Is(got, backend) {
 		t.Fatalf("opaque Is/As facade = %v, want backend via Is", got)
 	}
-	var gotCause *reviewTypedCause
+	var gotCause *typedCause
 	if !errors.As(got, &gotCause) || gotCause != backend {
 		t.Fatalf("opaque Is/As facade = %v, want backend via As", got)
 	}
-	var gotFacade *reviewOpaqueIsAsFacade
+	var gotFacade *opaqueIsAsFacade
 	if !errors.As(got, &gotFacade) {
 		t.Fatalf("opaque Is/As facade = %v, want original type via As", got)
 	}
 }
 
-type reviewOpaqueContextTextFacade struct {
+type opaqueContextTextFacade struct {
 	backend error
 }
 
-func (e *reviewOpaqueContextTextFacade) Error() string {
+func (e *opaqueContextTextFacade) Error() string {
 	return "context canceled: backend failed"
 }
-func (e *reviewOpaqueContextTextFacade) Is(target error) bool {
+func (e *opaqueContextTextFacade) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return target == context.Canceled || errors.Is(e.backend, target)
 }
-func (e *reviewOpaqueContextTextFacade) As(target any) bool {
+func (e *opaqueContextTextFacade) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
@@ -1944,8 +1944,8 @@ func (e *reviewOpaqueContextTextFacade) As(target any) bool {
 }
 
 func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend failed"}
-	facade := &reviewOpaqueContextTextFacade{backend: backend}
+	backend := &typedCause{message: "backend failed"}
+	facade := &opaqueContextTextFacade{backend: backend}
 	got := nonContextCause(facade)
 	if got == nil {
 		t.Fatal("opaque context-text facade dropped entirely")
@@ -1963,7 +1963,7 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 		t.Fatalf("opaque context-text facade = %q, want backend diagnostic text", got.Error())
 	}
 
-	ambiguous := &reviewOpaqueAmbiguousContextTextFacade{backend: backend}
+	ambiguous := &opaqueAmbiguousContextTextFacade{backend: backend}
 	got = nonContextCause(ambiguous)
 	if got == nil {
 		t.Fatal("ambiguous opaque facade dropped entirely")
@@ -1983,7 +1983,7 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 		t.Fatalf("ambiguous opaque facade = %q, stripped inside retained diagnostic", got.Error())
 	}
 
-	embedded := &reviewOpaqueEmbeddedContextTextFacade{backend: backend}
+	embedded := &opaqueEmbeddedContextTextFacade{backend: backend}
 	got = nonContextCause(embedded)
 	if got == nil {
 		t.Fatal("embedded opaque facade dropped entirely")
@@ -2002,40 +2002,40 @@ func TestNonContextCauseStripsOpaqueFacadeContextText(t *testing.T) {
 	}
 }
 
-type reviewOpaqueAmbiguousContextTextFacade struct {
+type opaqueAmbiguousContextTextFacade struct {
 	backend error
 }
 
-func (e *reviewOpaqueAmbiguousContextTextFacade) Error() string {
+func (e *opaqueAmbiguousContextTextFacade) Error() string {
 	return "context canceled: peer reported context canceled"
 }
-func (e *reviewOpaqueAmbiguousContextTextFacade) Is(target error) bool {
+func (e *opaqueAmbiguousContextTextFacade) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return target == context.Canceled || errors.Is(e.backend, target)
 }
-func (e *reviewOpaqueAmbiguousContextTextFacade) As(target any) bool {
+func (e *opaqueAmbiguousContextTextFacade) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
 	return errors.As(e.backend, target)
 }
 
-type reviewOpaqueEmbeddedContextTextFacade struct {
+type opaqueEmbeddedContextTextFacade struct {
 	backend error
 }
 
-func (e *reviewOpaqueEmbeddedContextTextFacade) Error() string {
+func (e *opaqueEmbeddedContextTextFacade) Error() string {
 	return "peer reported context canceled"
 }
-func (e *reviewOpaqueEmbeddedContextTextFacade) Is(target error) bool {
+func (e *opaqueEmbeddedContextTextFacade) Is(target error) bool {
 	if e == nil {
 		return false
 	}
 	return target == context.Canceled || errors.Is(e.backend, target)
 }
-func (e *reviewOpaqueEmbeddedContextTextFacade) As(target any) bool {
+func (e *opaqueEmbeddedContextTextFacade) As(target any) bool {
 	if e == nil || e.backend == nil {
 		return false
 	}
@@ -2043,8 +2043,8 @@ func (e *reviewOpaqueEmbeddedContextTextFacade) As(target any) bool {
 }
 
 func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
-	cause := &reviewTypedCause{message: "logs follow exited 1"}
-	opaque := &reviewOpaqueFacade{err: errors.Join(context.Canceled, cause)}
+	cause := &typedCause{message: "logs follow exited 1"}
+	opaque := &opaqueFacade{err: errors.Join(context.Canceled, cause)}
 	got := nonContextCause(opaque)
 	if got == nil {
 		t.Fatal("opaque mixed facade dropped entirely")
@@ -2055,11 +2055,11 @@ func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 	if errors.Is(got, context.Canceled) {
 		t.Fatalf("opaque facade = %v, must suppress canceled", got)
 	}
-	var gotCause *reviewTypedCause
+	var gotCause *typedCause
 	if !errors.As(got, &gotCause) || gotCause != cause {
 		t.Fatalf("opaque facade = %v, want typed cause via As", got)
 	}
-	var gotFacade *reviewOpaqueFacade
+	var gotFacade *opaqueFacade
 	if !errors.As(got, &gotFacade) {
 		t.Fatalf("opaque facade = %v, want original facade via As", got)
 	}
@@ -2067,21 +2067,21 @@ func TestNonContextCauseRetainsOpaqueFacadeNonContextSurface(t *testing.T) {
 		t.Fatalf("opaque facade = %v, want original diagnostic text", got)
 	}
 
-	if got := nonContextCause(&reviewOpaqueFacade{err: context.Canceled}); got != nil {
+	if got := nonContextCause(&opaqueFacade{err: context.Canceled}); got != nil {
 		t.Fatalf("context-only opaque facade = %v, want nil", got)
 	}
-	if got := nonContextCause(&reviewOpaqueFacade{err: errors.Join(context.Canceled, context.DeadlineExceeded)}); got != nil {
+	if got := nonContextCause(&opaqueFacade{err: errors.Join(context.Canceled, context.DeadlineExceeded)}); got != nil {
 		t.Fatalf("context-only opaque join = %v, want nil", got)
 	}
 }
 
-// reviewSanitizingWrapper unwraps a raw cause tree but never renders it.
-type reviewSanitizingWrapper struct {
+// sanitizingWrapper unwraps a raw cause tree but never renders it.
+type sanitizingWrapper struct {
 	err error
 }
 
-func (e *reviewSanitizingWrapper) Error() string { return "operation failed" }
-func (e *reviewSanitizingWrapper) Unwrap() error {
+func (e *sanitizingWrapper) Error() string { return "operation failed" }
+func (e *sanitizingWrapper) Unwrap() error {
 	if e == nil {
 		return nil
 	}
@@ -2090,7 +2090,7 @@ func (e *reviewSanitizingWrapper) Unwrap() error {
 
 func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 	secret := "super-secret-token"
-	wrapped := &reviewSanitizingWrapper{err: errors.Join(context.Canceled, errors.New(secret))}
+	wrapped := &sanitizingWrapper{err: errors.Join(context.Canceled, errors.New(secret))}
 	got := nonContextCause(wrapped)
 	if got == nil {
 		t.Fatal("sanitizing wrapper dropped entirely")
@@ -2105,7 +2105,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("sanitizing wrapper = %q, want original safe rendering", got.Error())
 	}
 
-	multi := &reviewSanitizingMultiWrapper{errs: []error{context.Canceled, errors.New(secret)}, msg: "operation failed"}
+	multi := &sanitizingMultiWrapper{errs: []error{context.Canceled, errors.New(secret)}, msg: "operation failed"}
 	got = nonContextCause(multi)
 	if got == nil {
 		t.Fatal("sanitizing multi wrapper dropped entirely")
@@ -2120,7 +2120,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("sanitizing multi wrapper = %q, want original safe rendering", got.Error())
 	}
 
-	partial := &reviewSanitizingMultiWrapper{
+	partial := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
 		msg:  "operation failed: public",
 	}
@@ -2138,7 +2138,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("partial sanitizing multi wrapper = %q, want original safe rendering", got.Error())
 	}
 
-	partialWithContext := &reviewSanitizingMultiWrapper{
+	partialWithContext := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
 		msg:  "context canceled: public",
 	}
@@ -2159,7 +2159,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("partial sanitizing with context text = %q, want retained public text", got.Error())
 	}
 
-	overlapPartial := &reviewSanitizingMultiWrapper{
+	overlapPartial := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("peer reported context canceled"), errors.New(secret)},
 		msg:  "peer reported context canceled",
 	}
@@ -2177,7 +2177,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("overlap partial sanitizing = %q, want intact retained diagnostic", got.Error())
 	}
 
-	delimPartial := &reviewSanitizingMultiWrapper{
+	delimPartial := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("parser saw: ; token"), errors.New(secret)},
 		msg:  "context canceled; parser saw: ; token",
 	}
@@ -2195,7 +2195,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("delimiter partial sanitizing = %q, want intact retained delimiters", got.Error())
 	}
 
-	ambiguousPartial := &reviewSanitizingMultiWrapper{
+	ambiguousPartial := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("public"), errors.New(secret)},
 		msg:  "note=context canceled; ctx=context canceled; public",
 	}
@@ -2212,7 +2212,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("ambiguous partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 
-	spacedPartial := &reviewSanitizingMultiWrapper{
+	spacedPartial := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New(" backend "), errors.New(secret)},
 		msg:  "context canceled;  backend ",
 	}
@@ -2227,7 +2227,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("spaced partial sanitizing = %q, want retained leading whitespace", got.Error())
 	}
 
-	adjacentDiscarded := &reviewSanitizingMultiWrapper{
+	adjacentDiscarded := &sanitizingMultiWrapper{
 		errs: []error{
 			context.Canceled,
 			context.DeadlineExceeded,
@@ -2250,7 +2250,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("adjacent discarded partial sanitizing = %q, want intact retained diagnostic", got.Error())
 	}
 
-	mixedDup := &reviewSanitizingMultiWrapper{
+	mixedDup := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("context canceled"), errors.New(secret)},
 		msg:  "context canceled",
 	}
@@ -2266,7 +2266,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("mixed duplicate partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 
-	overlapDup := &reviewSanitizingMultiWrapper{
+	overlapDup := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("canceled"), errors.New(secret)},
 		msg:  "context canceled",
 	}
@@ -2281,7 +2281,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("overlapping retained phrase partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 
-	coalescedDup := &reviewSanitizingMultiWrapper{
+	coalescedDup := &sanitizingMultiWrapper{
 		errs: []error{context.Canceled, errors.New("public"), errors.New("public")},
 		msg:  "context canceled; public",
 	}
@@ -2299,11 +2299,11 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("coalesced duplicate partial sanitizing = %q, must not expand coalesced duplicates", got.Error())
 	}
 
-	nestedBackend := &reviewTypedCause{message: "backend"}
+	nestedBackend := &typedCause{message: "backend"}
 	nestedMixed := errors.Join(context.Canceled, nestedBackend)
 	// One changed retained child rendered twice (plus an omitted secret): the
 	// extra copy is ambiguous framing and must not leave a stale context span.
-	dupNestedPartial := &reviewSanitizingMultiWrapper{
+	dupNestedPartial := &sanitizingMultiWrapper{
 		errs: []error{nestedMixed, errors.New(secret)},
 		msg:  nestedMixed.Error() + "; " + nestedMixed.Error(),
 	}
@@ -2318,7 +2318,7 @@ func TestNonContextCausePreservesSanitizedWrapperError(t *testing.T) {
 		t.Fatalf("duplicate nested mixed partial sanitizing = %q, want original safe rendering", got.Error())
 	}
 
-	nestedPartial := &reviewSanitizingMultiWrapper{
+	nestedPartial := &sanitizingMultiWrapper{
 		errs: []error{nestedMixed, errors.New(secret)},
 		msg:  nestedMixed.Error(),
 	}
@@ -2359,13 +2359,13 @@ func TestIsStdlibPackagePathAllowlist(t *testing.T) {
 	}
 }
 
-type reviewSanitizingMultiWrapper struct {
+type sanitizingMultiWrapper struct {
 	errs []error
 	msg  string
 }
 
-func (e *reviewSanitizingMultiWrapper) Error() string { return e.msg }
-func (e *reviewSanitizingMultiWrapper) Unwrap() []error {
+func (e *sanitizingMultiWrapper) Error() string { return e.msg }
+func (e *sanitizingMultiWrapper) Unwrap() []error {
 	out := make([]error, len(e.errs))
 	copy(out, e.errs)
 	return out
@@ -2405,7 +2405,7 @@ func TestNonContextCauseRetainsRedactorOnFilteredCause(t *testing.T) {
 }
 
 func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
-	cause := &reviewTypedCause{message: "transient stream failure"}
+	cause := &typedCause{message: "transient stream failure"}
 	cases := []struct {
 		name  string
 		mixed error
@@ -2415,13 +2415,13 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			caller := newReviewManualDeadlineContext(time.Now().Add(time.Hour))
+			caller := newManualDeadlineContext(time.Now().Add(time.Hour))
 			started := make(chan struct{})
 			done := make(chan error, 1)
 			go func() {
 				done <- ForLog("never").WithStartupTimeout(time.Hour).WaitUntilReady(
 					caller,
-					&reviewLogDeadlineCauseTarget{cause: tc.mixed, started: started},
+					&logDeadlineCauseTarget{cause: tc.mixed, started: started},
 				)
 			}()
 			select {
@@ -2453,10 +2453,10 @@ func TestForLogTimeoutDoesNotRetainStaleContextBranch(t *testing.T) {
 }
 
 func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
-	target := &reviewFinalProbeJoinedContextTarget{}
+	target := &finalProbeJoinedContextTarget{}
 	err := ForExec([]string{"probe"}).
 		WithStartupTimeout(time.Second).
-		WithPollInterval(10 * time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected final lifecycle probe error")
@@ -2470,10 +2470,10 @@ func TestFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 }
 
 func TestFinalLifecycleRetriesContextOnlyAfterTransientProbe(t *testing.T) {
-	target := &reviewFinalProbeStaleTransientTarget{}
+	target := &finalProbeStaleTransientTarget{}
 	err := ForExec([]string{"probe"}).
 		WithStartupTimeout(time.Second).
-		WithPollInterval(5 * time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err != nil {
 		t.Fatalf("WaitUntilReady = %v, want success after retrying context-only permanent probe", err)
@@ -2485,11 +2485,11 @@ func TestFinalLifecycleRetriesContextOnlyAfterTransientProbe(t *testing.T) {
 
 func TestCompositeFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 	for name, strategy := range map[string]Strategy{
-		"all": ForAll(&reviewCompositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
-		"any": ForAny(&reviewCompositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
+		"all": ForAll(&compositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&compositeMarkDoneStrategy{}).WithStartupTimeout(time.Second),
 	} {
 		t.Run(name, func(t *testing.T) {
-			target := &reviewCompositeFinalProbeJoinedContextTarget{}
+			target := &compositeFinalProbeJoinedContextTarget{}
 			err := strategy.WaitUntilReady(context.Background(), target)
 			if err == nil {
 				t.Fatal("expected composite final lifecycle probe error")
@@ -2506,11 +2506,11 @@ func TestCompositeFinalLifecycleProbeStripsJoinedContext(t *testing.T) {
 
 func TestCompositeFinalLifecycleRetriesContextOnlyProbe(t *testing.T) {
 	for name, strategy := range map[string]Strategy{
-		"all": ForAll(&reviewCompositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
-		"any": ForAny(&reviewCompositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
+		"all": ForAll(&compositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&compositeContextOnlyProbeStrategy{}).WithStartupTimeout(time.Second),
 	} {
 		t.Run(name, func(t *testing.T) {
-			target := &reviewCompositeContextOnlyProbeTarget{}
+			target := &compositeContextOnlyProbeTarget{}
 			err := strategy.WaitUntilReady(context.Background(), target)
 			if err != nil {
 				t.Fatalf("WaitUntilReady = %v, want success after context-only final probe retries", err)
@@ -2528,11 +2528,11 @@ func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) 
 	defer func() { finalLifecycleProbeTimeout = old }()
 
 	for name, strategy := range map[string]Strategy{
-		"all": ForAll(&reviewCompositeAlwaysTransientStrategy{}),
-		"any": ForAny(&reviewCompositeAlwaysTransientStrategy{}),
+		"all": ForAll(&compositeAlwaysTransientStrategy{}),
+		"any": ForAny(&compositeAlwaysTransientStrategy{}),
 	} {
 		t.Run(name, func(t *testing.T) {
-			target := &reviewCompositeAlwaysTransientTarget{}
+			target := &compositeAlwaysTransientTarget{}
 			start := time.Now()
 			err := strategy.WaitUntilReady(context.Background(), target)
 			elapsed := time.Since(start)
@@ -2551,11 +2551,11 @@ func TestCompositeFinalLifecycleCheckBoundedWithoutStartupTimeout(t *testing.T) 
 
 func TestCompositeFinalLifecyclePermanentCheckErrorFailsFast(t *testing.T) {
 	for name, strategy := range map[string]Strategy{
-		"all": ForAll(&reviewCompositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
-		"any": ForAny(&reviewCompositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
+		"all": ForAll(&compositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
+		"any": ForAny(&compositeContainerNotFoundStrategy{}).WithStartupTimeout(time.Second),
 	} {
 		t.Run(name, func(t *testing.T) {
-			target := &reviewCompositeContainerNotFoundTarget{}
+			target := &compositeContainerNotFoundTarget{}
 			start := time.Now()
 			err := strategy.WaitUntilReady(context.Background(), target)
 			elapsed := time.Since(start)
@@ -2576,11 +2576,11 @@ func TestCompositeFinalLifecyclePermanentCheckErrorFailsFast(t *testing.T) {
 }
 
 func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend inspect failed"}
-	target := &reviewFinalProbeDeadlineRaceTarget{backend: backend}
+	backend := &typedCause{message: "backend inspect failed"}
+	target := &finalProbeDeadlineRaceTarget{backend: backend}
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(80 * time.Millisecond).
-		WithPollInterval(5 * time.Millisecond).
+		WithStartupTimeout(80*time.Millisecond).
+		WithPollInterval(5*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected timeout or probe error")
@@ -2594,10 +2594,10 @@ func TestFinalLifecycleProbeDeadlineRaceStripsCanceled(t *testing.T) {
 }
 
 func TestFinalLifecycleProbeTimeoutRetriesInsteadOfUnknownState(t *testing.T) {
-	target := &reviewFinalProbeTimeoutOnlyTarget{}
+	target := &finalProbeTimeoutOnlyTarget{}
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(250 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(250*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after probe retries")
@@ -2610,81 +2610,81 @@ func TestFinalLifecycleProbeTimeoutRetriesInsteadOfUnknownState(t *testing.T) {
 	}
 }
 
-type reviewFinalProbeTimeoutOnlyTarget struct {
+type finalProbeTimeoutOnlyTarget struct {
 	execDone atomic.Bool
 }
 
-func (*reviewFinalProbeTimeoutOnlyTarget) Endpoint(context.Context, string) (string, error) {
+func (*finalProbeTimeoutOnlyTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewFinalProbeTimeoutOnlyTarget) Running(ctx context.Context) (bool, error) {
+func (t *finalProbeTimeoutOnlyTarget) Running(ctx context.Context) (bool, error) {
 	if !t.execDone.Load() {
 		return true, nil
 	}
 	<-ctx.Done()
 	return false, ctx.Err()
 }
-func (*reviewFinalProbeTimeoutOnlyTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*finalProbeTimeoutOnlyTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (t *reviewFinalProbeTimeoutOnlyTarget) ExecCommand(context.Context, []string) (int, error) {
+func (t *finalProbeTimeoutOnlyTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
 }
 
-type reviewFinalProbeDeadlineRaceTarget struct {
+type finalProbeDeadlineRaceTarget struct {
 	backend  error
 	execDone atomic.Bool
 }
 
-func (*reviewFinalProbeDeadlineRaceTarget) Endpoint(context.Context, string) (string, error) {
+func (*finalProbeDeadlineRaceTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewFinalProbeDeadlineRaceTarget) Running(ctx context.Context) (bool, error) {
+func (t *finalProbeDeadlineRaceTarget) Running(ctx context.Context) (bool, error) {
 	if !t.execDone.Load() {
 		return true, nil
 	}
 	<-ctx.Done()
 	return false, errors.Join(context.Canceled, t.backend, ctx.Err())
 }
-func (*reviewFinalProbeDeadlineRaceTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*finalProbeDeadlineRaceTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (t *reviewFinalProbeDeadlineRaceTarget) ExecCommand(context.Context, []string) (int, error) {
+func (t *finalProbeDeadlineRaceTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
 }
 
-type reviewFinalProbeJoinedContextTarget struct {
+type finalProbeJoinedContextTarget struct {
 	execDone atomic.Bool
 }
 
-func (*reviewFinalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+func (*finalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewFinalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+func (t *finalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
 	if t.execDone.Load() {
 		return false, errors.Join(context.Canceled, ErrTargetNotFound)
 	}
 	return true, nil
 }
-func (*reviewFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*finalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (t *reviewFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+func (t *finalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
 }
 
-type reviewFinalProbeStaleTransientTarget struct {
+type finalProbeStaleTransientTarget struct {
 	execDone atomic.Bool
 	probes   atomic.Int32
 }
 
-func (*reviewFinalProbeStaleTransientTarget) Endpoint(context.Context, string) (string, error) {
+func (*finalProbeStaleTransientTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewFinalProbeStaleTransientTarget) Running(context.Context) (bool, error) {
+func (t *finalProbeStaleTransientTarget) Running(context.Context) (bool, error) {
 	if !t.execDone.Load() {
 		return true, nil
 	}
@@ -2697,52 +2697,52 @@ func (t *reviewFinalProbeStaleTransientTarget) Running(context.Context) (bool, e
 		return true, nil
 	}
 }
-func (*reviewFinalProbeStaleTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*finalProbeStaleTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (t *reviewFinalProbeStaleTransientTarget) ExecCommand(context.Context, []string) (int, error) {
+func (t *finalProbeStaleTransientTarget) ExecCommand(context.Context, []string) (int, error) {
 	t.execDone.Store(true)
 	return 0, nil
 }
 
-type reviewCompositeFinalProbeJoinedContextTarget struct {
+type compositeFinalProbeJoinedContextTarget struct {
 	childDone atomic.Bool
 }
 
-func (*reviewCompositeFinalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+func (*compositeFinalProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewCompositeFinalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+func (t *compositeFinalProbeJoinedContextTarget) Running(context.Context) (bool, error) {
 	if t.childDone.Load() {
 		return false, errors.Join(context.Canceled, ErrTargetNotFound)
 	}
 	return true, nil
 }
-func (*reviewCompositeFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*compositeFinalProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewCompositeFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*compositeFinalProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewCompositeMarkDoneStrategy struct{}
+type compositeMarkDoneStrategy struct{}
 
-func (*reviewCompositeMarkDoneStrategy) WaitUntilReady(_ context.Context, target Target) error {
-	if t, ok := target.(*reviewCompositeFinalProbeJoinedContextTarget); ok {
+func (*compositeMarkDoneStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*compositeFinalProbeJoinedContextTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil
 }
 
-type reviewCompositeContextOnlyProbeTarget struct {
+type compositeContextOnlyProbeTarget struct {
 	childDone atomic.Bool
 	probes    atomic.Int32
 }
 
-func (*reviewCompositeContextOnlyProbeTarget) Endpoint(context.Context, string) (string, error) {
+func (*compositeContextOnlyProbeTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewCompositeContextOnlyProbeTarget) Running(context.Context) (bool, error) {
+func (t *compositeContextOnlyProbeTarget) Running(context.Context) (bool, error) {
 	if !t.childDone.Load() {
 		return true, nil
 	}
@@ -2751,89 +2751,89 @@ func (t *reviewCompositeContextOnlyProbeTarget) Running(context.Context) (bool, 
 	}
 	return true, nil
 }
-func (*reviewCompositeContextOnlyProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*compositeContextOnlyProbeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewCompositeContextOnlyProbeTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*compositeContextOnlyProbeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewCompositeContextOnlyProbeStrategy struct{}
+type compositeContextOnlyProbeStrategy struct{}
 
-func (*reviewCompositeContextOnlyProbeStrategy) WaitUntilReady(_ context.Context, target Target) error {
-	if t, ok := target.(*reviewCompositeContextOnlyProbeTarget); ok {
+func (*compositeContextOnlyProbeStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*compositeContextOnlyProbeTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil
 }
 
-type reviewCompositeAlwaysTransientTarget struct {
+type compositeAlwaysTransientTarget struct {
 	childDone atomic.Bool
 }
 
-func (*reviewCompositeAlwaysTransientTarget) Endpoint(context.Context, string) (string, error) {
+func (*compositeAlwaysTransientTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewCompositeAlwaysTransientTarget) Running(context.Context) (bool, error) {
+func (t *compositeAlwaysTransientTarget) Running(context.Context) (bool, error) {
 	if !t.childDone.Load() {
 		return true, nil
 	}
 	return false, errors.New("transient inspect glitch")
 }
-func (*reviewCompositeAlwaysTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*compositeAlwaysTransientTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewCompositeAlwaysTransientTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*compositeAlwaysTransientTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewCompositeAlwaysTransientStrategy struct{}
+type compositeAlwaysTransientStrategy struct{}
 
-func (*reviewCompositeAlwaysTransientStrategy) WaitUntilReady(_ context.Context, target Target) error {
-	if t, ok := target.(*reviewCompositeAlwaysTransientTarget); ok {
+func (*compositeAlwaysTransientStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*compositeAlwaysTransientTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil
 }
 
-type reviewCompositeContainerNotFoundTarget struct {
+type compositeContainerNotFoundTarget struct {
 	childDone atomic.Bool
 }
 
-func (*reviewCompositeContainerNotFoundTarget) Endpoint(context.Context, string) (string, error) {
+func (*compositeContainerNotFoundTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewCompositeContainerNotFoundTarget) Running(context.Context) (bool, error) {
+func (t *compositeContainerNotFoundTarget) Running(context.Context) (bool, error) {
 	if !t.childDone.Load() {
 		return true, nil
 	}
 	return false, ErrContainerNotFound
 }
-func (*reviewCompositeContainerNotFoundTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*compositeContainerNotFoundTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewCompositeContainerNotFoundTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*compositeContainerNotFoundTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewCompositeContainerNotFoundStrategy struct{}
+type compositeContainerNotFoundStrategy struct{}
 
-func (*reviewCompositeContainerNotFoundStrategy) WaitUntilReady(_ context.Context, target Target) error {
-	if t, ok := target.(*reviewCompositeContainerNotFoundTarget); ok {
+func (*compositeContainerNotFoundStrategy) WaitUntilReady(_ context.Context, target Target) error {
+	if t, ok := target.(*compositeContainerNotFoundTarget); ok {
 		t.childDone.Store(true)
 	}
 	return nil
 }
 
 func TestForExecTimeoutStripsJoinedContext(t *testing.T) {
-	backend := &reviewTypedCause{message: "backend probe failed"}
+	backend := &typedCause{message: "backend probe failed"}
 	target := newFakeTarget()
 	target.execCode = 1
 	target.execErr = errors.Join(context.Canceled, backend)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(200 * time.Millisecond).
-		WithPollInterval(20 * time.Millisecond).
+		WithStartupTimeout(200*time.Millisecond).
+		WithPollInterval(20*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout")
@@ -2854,8 +2854,8 @@ func TestForExecContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target.execErr = &exec.Error{Name: "container", Err: context.Canceled}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after context-only permanent retries")
@@ -2873,11 +2873,11 @@ func TestForExecContextOnlyPermanentLaunchRetries(t *testing.T) {
 
 func TestForExecWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := newFakeTarget()
-	target.execErr = &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}}
+	target.execErr = &launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after wrapped context-only permanent retries")
@@ -2895,11 +2895,11 @@ func TestForExecWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 
 func TestForExecNestedWrappedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := newFakeTarget()
-	target.execErr = fmt.Errorf("outer: %w", &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}})
+	target.execErr = fmt.Errorf("outer: %w", &launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}})
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after nested wrapped context-only permanent retries")
@@ -2920,7 +2920,7 @@ func TestRetainedNonContextCausePeelsRedactorOverEmptyStripped(t *testing.T) {
 	// contextStrippedCause → safeError → empty stripped. Peel UnwrapRaw so
 	// the chain is treated as context-only for permanent control flow.
 	err := cli.WithRedactor(
-		&reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
 		cli.NewRedactor("secret"),
 	)
 	if got := retainedNonContextCause(err); got != nil {
@@ -2931,13 +2931,13 @@ func TestRetainedNonContextCausePeelsRedactorOverEmptyStripped(t *testing.T) {
 func TestForExecRedactedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := newFakeTarget()
 	target.execErr = cli.WithRedactor(
-		&reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
 		cli.NewRedactor("secret"),
 	)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after redacted context-only permanent retries")
@@ -2959,7 +2959,7 @@ func TestRetainedNonContextCausePeelsPathErrorOverEmptyStripped(t *testing.T) {
 	err := &os.PathError{
 		Op:   "open",
 		Path: "/probe",
-		Err:  &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
+		Err:  &launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
 	}
 	if got := retainedNonContextCause(err); got != nil {
 		t.Fatalf("retainedNonContextCause = %v (%T), want nil under PathError", got, got)
@@ -2971,12 +2971,12 @@ func TestForExecPathErrorContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target.execErr = &os.PathError{
 		Op:   "open",
 		Path: "/probe",
-		Err:  &reviewLaunchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
+		Err:  &launchWrapper{err: &exec.Error{Name: "container", Err: context.Canceled}},
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after PathError context-only permanent retries")
@@ -3024,8 +3024,8 @@ func TestForExecIndependentDNSAfterContextLaunchFailsFast(t *testing.T) {
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected independent DNS failure")
@@ -3043,8 +3043,8 @@ func TestForExecIndependentDNSAfterContextLaunchFailsFast(t *testing.T) {
 
 func TestRetainedNonContextCauseJoinedEmptyStrippedFacades(t *testing.T) {
 	err := errors.Join(
-		&reviewLaunchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
-		&reviewLaunchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
 	)
 	if got := retainedNonContextCause(err); got != nil {
 		t.Fatalf("retainedNonContextCause = %v (%T), want nil for joined empty facades", got, got)
@@ -3054,13 +3054,13 @@ func TestRetainedNonContextCauseJoinedEmptyStrippedFacades(t *testing.T) {
 func TestForExecJoinedContextOnlyPermanentLaunchRetries(t *testing.T) {
 	target := newFakeTarget()
 	target.execErr = errors.Join(
-		&reviewLaunchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
-		&reviewLaunchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "a", Err: context.Canceled}},
+		&launchWrapper{err: &exec.Error{Name: "b", Err: context.Canceled}},
 	)
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after joined context-only permanent retries")
@@ -3078,11 +3078,11 @@ func TestForExecJoinedContextOnlyPermanentLaunchRetries(t *testing.T) {
 
 func TestForExecOpaquePermanentClassificationFailsFast(t *testing.T) {
 	target := newFakeTarget()
-	target.execErr = &reviewOpaquePermanentFacade{}
+	target.execErr = &opaquePermanentFacade{}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent opaque failure")
@@ -3102,8 +3102,8 @@ func TestRetainedNonContextCauseNestedPermanentFacade(t *testing.T) {
 	// Outer permanent Is over an inner custom wrapper of only context.Canceled
 	// filters to nested contextStrippedCause values. Permanence must be checked
 	// on every facade, not only the empty leaf.
-	inner := &reviewLaunchWrapper{err: context.Canceled}
-	outer := &reviewNestedPermanentFacade{err: inner}
+	inner := &launchWrapper{err: context.Canceled}
+	outer := &nestedPermanentFacade{err: inner}
 
 	got := retainedNonContextCause(outer)
 	if got == nil {
@@ -3119,13 +3119,13 @@ func TestRetainedNonContextCauseNestedPermanentFacade(t *testing.T) {
 
 func TestForExecNestedPermanentFacadeFailsFast(t *testing.T) {
 	target := newFakeTarget()
-	target.execErr = &reviewNestedPermanentFacade{
-		err: &reviewLaunchWrapper{err: context.Canceled},
+	target.execErr = &nestedPermanentFacade{
+		err: &launchWrapper{err: context.Canceled},
 	}
 
 	err := ForExec([]string{"probe"}).
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent nested facade failure")
@@ -3141,31 +3141,31 @@ func TestForExecNestedPermanentFacadeFailsFast(t *testing.T) {
 	}
 }
 
-type reviewOpaquePermanentFacade struct{}
+type opaquePermanentFacade struct{}
 
-func (*reviewOpaquePermanentFacade) Error() string { return "opaque permanent" }
-func (*reviewOpaquePermanentFacade) Is(target error) bool {
+func (*opaquePermanentFacade) Error() string { return "opaque permanent" }
+func (*opaquePermanentFacade) Is(target error) bool {
 	return target == context.Canceled || target == ErrTargetNotFound
 }
 
-type reviewNestedPermanentFacade struct {
+type nestedPermanentFacade struct {
 	err error
 }
 
-func (e *reviewNestedPermanentFacade) Error() string {
+func (e *nestedPermanentFacade) Error() string {
 	return "nested permanent: " + e.err.Error()
 }
-func (e *reviewNestedPermanentFacade) Unwrap() error { return e.err }
-func (e *reviewNestedPermanentFacade) Is(target error) bool {
+func (e *nestedPermanentFacade) Unwrap() error { return e.err }
+func (e *nestedPermanentFacade) Is(target error) bool {
 	return target == ErrTargetNotFound
 }
 
-type reviewLaunchWrapper struct {
+type launchWrapper struct {
 	err error
 }
 
-func (e *reviewLaunchWrapper) Error() string { return "launch: " + e.err.Error() }
-func (e *reviewLaunchWrapper) Unwrap() error  { return e.err }
+func (e *launchWrapper) Error() string { return "launch: " + e.err.Error() }
+func (e *launchWrapper) Unwrap() error { return e.err }
 
 func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 	terminal := &cli.CLIError{
@@ -3173,9 +3173,9 @@ func TestForLogTerminalStreamStripsJoinedContext(t *testing.T) {
 		ExitCode: 1,
 		Stderr:   "container exited",
 	}
-	target := &reviewTerminalJoinedContextTarget{err: errors.Join(context.Canceled, terminal)}
+	target := &terminalJoinedContextTarget{err: errors.Join(context.Canceled, terminal)}
 	err := ForLog("never").
-		WithStartupTimeout(300 * time.Millisecond).
+		WithStartupTimeout(300*time.Millisecond).
 		WithPollInterval(time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
@@ -3197,7 +3197,7 @@ func TestRetainedNonContextCauseOpaqueTerminalFacade(t *testing.T) {
 	// Opaque Is(Canceled) facade that only exposes *cli.CLIError via As filters
 	// to an empty contextStrippedCause. Terminal classification must still be
 	// retained so ForLog fails fast instead of reconnecting until timeout.
-	err := &reviewOpaqueTerminalFacade{}
+	err := &opaqueTerminalFacade{}
 	got := retainedNonContextCause(err)
 	if got == nil {
 		t.Fatal("retainedNonContextCause = nil, want opaque terminal facade")
@@ -3215,10 +3215,10 @@ func TestRetainedNonContextCauseOpaqueTerminalFacade(t *testing.T) {
 }
 
 func TestForLogOpaqueTerminalFacadeFailsFast(t *testing.T) {
-	target := &reviewOpaqueTerminalFacadeTarget{}
+	target := &opaqueTerminalFacadeTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected terminal opaque facade failure")
@@ -3235,9 +3235,9 @@ func TestForLogOpaqueTerminalFacadeFailsFast(t *testing.T) {
 }
 
 func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
-	target := &reviewPermanentProbeJoinedContextTarget{}
+	target := &permanentProbeJoinedContextTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
 		WithPollInterval(time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
@@ -3252,10 +3252,10 @@ func TestForLogPermanentProbeStripsJoinedContext(t *testing.T) {
 }
 
 func TestForLogNestedPermanentFacadeFailsFast(t *testing.T) {
-	target := &reviewLogNestedPermanentFacadeTarget{}
+	target := &logNestedPermanentFacadeTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(500 * time.Millisecond).
-		WithPollInterval(50 * time.Millisecond).
+		WithStartupTimeout(500*time.Millisecond).
+		WithPollInterval(50*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected permanent nested facade failure")
@@ -3272,10 +3272,10 @@ func TestForLogNestedPermanentFacadeFailsFast(t *testing.T) {
 }
 
 func TestForLogContextOnlyPermanentLaunchRetries(t *testing.T) {
-	target := &reviewLogContextOnlyPermanentTarget{}
+	target := &logContextOnlyPermanentTarget{}
 	err := ForLog("never").
-		WithStartupTimeout(150 * time.Millisecond).
-		WithPollInterval(10 * time.Millisecond).
+		WithStartupTimeout(150*time.Millisecond).
+		WithPollInterval(10*time.Millisecond).
 		WaitUntilReady(context.Background(), target)
 	if err == nil {
 		t.Fatal("expected startup timeout after context-only permanent retries")
@@ -3291,63 +3291,63 @@ func TestForLogContextOnlyPermanentLaunchRetries(t *testing.T) {
 	}
 }
 
-type reviewPermanentProbeJoinedContextTarget struct{}
+type permanentProbeJoinedContextTarget struct{}
 
-func (*reviewPermanentProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+func (*permanentProbeJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*reviewPermanentProbeJoinedContextTarget) Running(context.Context) (bool, error) {
+func (*permanentProbeJoinedContextTarget) Running(context.Context) (bool, error) {
 	return false, errors.Join(context.Canceled, ErrTargetNotFound)
 }
-func (*reviewPermanentProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*permanentProbeJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewPermanentProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*permanentProbeJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewLogNestedPermanentFacadeTarget struct {
+type logNestedPermanentFacadeTarget struct {
 	runningCalls atomic.Int32
 }
 
-func (*reviewLogNestedPermanentFacadeTarget) Endpoint(context.Context, string) (string, error) {
+func (*logNestedPermanentFacadeTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (t *reviewLogNestedPermanentFacadeTarget) Running(context.Context) (bool, error) {
+func (t *logNestedPermanentFacadeTarget) Running(context.Context) (bool, error) {
 	t.runningCalls.Add(1)
-	return false, &reviewNestedPermanentFacade{
-		err: &reviewLaunchWrapper{err: context.Canceled},
+	return false, &nestedPermanentFacade{
+		err: &launchWrapper{err: context.Canceled},
 	}
 }
-func (*reviewLogNestedPermanentFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*logNestedPermanentFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return io.NopCloser(strings.NewReader("")), nil
 }
-func (*reviewLogNestedPermanentFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*logNestedPermanentFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewTerminalJoinedContextTarget struct {
+type terminalJoinedContextTarget struct {
 	err error
 }
 
-func (*reviewTerminalJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
+func (*terminalJoinedContextTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*reviewTerminalJoinedContextTarget) Running(context.Context) (bool, error) { return true, nil }
-func (t *reviewTerminalJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (*terminalJoinedContextTarget) Running(context.Context) (bool, error) { return true, nil }
+func (t *terminalJoinedContextTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	return nil, t.err
 }
-func (*reviewTerminalJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*terminalJoinedContextTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewOpaqueTerminalFacade struct{}
+type opaqueTerminalFacade struct{}
 
-func (*reviewOpaqueTerminalFacade) Error() string { return "opaque terminal canceled" }
-func (*reviewOpaqueTerminalFacade) Is(target error) bool {
+func (*opaqueTerminalFacade) Error() string { return "opaque terminal canceled" }
+func (*opaqueTerminalFacade) Is(target error) bool {
 	return target == context.Canceled
 }
-func (*reviewOpaqueTerminalFacade) As(target any) bool {
+func (*opaqueTerminalFacade) As(target any) bool {
 	if dest, ok := target.(**cli.CLIError); ok {
 		*dest = &cli.CLIError{
 			Args:     []string{"logs", "--follow", "ctr"},
@@ -3359,38 +3359,38 @@ func (*reviewOpaqueTerminalFacade) As(target any) bool {
 	return false
 }
 
-type reviewOpaqueTerminalFacadeTarget struct {
+type opaqueTerminalFacadeTarget struct {
 	followCalls atomic.Int32
 }
 
-func (*reviewOpaqueTerminalFacadeTarget) Endpoint(context.Context, string) (string, error) {
+func (*opaqueTerminalFacadeTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*reviewOpaqueTerminalFacadeTarget) Running(context.Context) (bool, error) {
+func (*opaqueTerminalFacadeTarget) Running(context.Context) (bool, error) {
 	return true, nil
 }
-func (t *reviewOpaqueTerminalFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *opaqueTerminalFacadeTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.followCalls.Add(1)
-	return nil, &reviewOpaqueTerminalFacade{}
+	return nil, &opaqueTerminalFacade{}
 }
-func (*reviewOpaqueTerminalFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*opaqueTerminalFacadeTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }
 
-type reviewLogContextOnlyPermanentTarget struct {
+type logContextOnlyPermanentTarget struct {
 	followCalls atomic.Int32
 }
 
-func (*reviewLogContextOnlyPermanentTarget) Endpoint(context.Context, string) (string, error) {
+func (*logContextOnlyPermanentTarget) Endpoint(context.Context, string) (string, error) {
 	return "127.0.0.1:1", nil
 }
-func (*reviewLogContextOnlyPermanentTarget) Running(context.Context) (bool, error) {
+func (*logContextOnlyPermanentTarget) Running(context.Context) (bool, error) {
 	return true, nil
 }
-func (t *reviewLogContextOnlyPermanentTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
+func (t *logContextOnlyPermanentTarget) FollowLogs(context.Context) (io.ReadCloser, error) {
 	t.followCalls.Add(1)
 	return nil, &exec.Error{Name: "container", Err: context.Canceled}
 }
-func (*reviewLogContextOnlyPermanentTarget) ExecCommand(context.Context, []string) (int, error) {
+func (*logContextOnlyPermanentTarget) ExecCommand(context.Context, []string) (int, error) {
 	return 0, nil
 }

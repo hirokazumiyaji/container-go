@@ -12,9 +12,9 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
-const issue115AppleImageID = "3333333333333333333333333333333333333333333333333333333333333333"
+const appleImageID = "3333333333333333333333333333333333333333333333333333333333333333"
 
-func issue115AppleImageFixture(t *testing.T) []byte {
+func appleImageFixture(t *testing.T) []byte {
 	t.Helper()
 	data, err := os.ReadFile("testdata/apple_image_inspect_v1.3.0.json")
 	if err != nil {
@@ -23,7 +23,7 @@ func issue115AppleImageFixture(t *testing.T) []byte {
 	return data
 }
 
-type issue115AppleAddressRunner struct {
+type appleAddressRunner struct {
 	mu sync.Mutex
 
 	fixture           []byte
@@ -39,7 +39,7 @@ type issue115AppleAddressRunner struct {
 	pullTargets       []string
 }
 
-func (r *issue115AppleAddressRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *appleAddressRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -93,20 +93,20 @@ func (r *issue115AppleAddressRunner) Run(_ context.Context, args ...string) ([]b
 		if platform == "" {
 			platform = "linux/arm64/v8"
 		}
-		return issue115ReviewContainerJSON(image, "sha256:1111111111111111111111111111111111111111111111111111111111111111", platform, r.creation), nil, nil
+		return platformPinningContainerJSON(image, "sha256:1111111111111111111111111111111111111111111111111111111111111111", platform, r.creation), nil, nil
 	default:
 		return nil, nil, nil
 	}
 }
 
-func (r *issue115AppleAddressRunner) state() (runImage string, inspectTargets, pullTargets []string) {
+func (r *appleAddressRunner) state() (runImage string, inspectTargets, pullTargets []string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runImage, append([]string(nil), r.inspectTargets...), append([]string(nil), r.pullTargets...)
 }
 
-func TestIssue115AppleFixtureUsesImageResourceDescriptor(t *testing.T) {
-	identity, exists := (appleEngine{}).parseImageIdentity(issue115AppleImageFixture(t), "docker.io/library/redis:7-alpine", "")
+func TestAppleFixtureUsesImageResourceDescriptor(t *testing.T) {
+	identity, exists := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "")
 	if !exists {
 		t.Fatal("realistic Apple image fixture was reported absent")
 	}
@@ -117,7 +117,7 @@ func TestIssue115AppleFixtureUsesImageResourceDescriptor(t *testing.T) {
 		t.Fatalf("digest = %q, want fixture descriptor", identity.digest)
 	}
 
-	variant, exists := (appleEngine{}).parseImageIdentity(issue115AppleImageFixture(t), "docker.io/library/redis:7-alpine", "linux/arm64/v8")
+	variant, exists := (appleEngine{}).parseImageIdentity(appleImageFixture(t), "docker.io/library/redis:7-alpine", "linux/arm64/v8")
 	if !exists || variant.digest != "sha256:1111111111111111111111111111111111111111111111111111111111111111" {
 		t.Fatalf("variant identity = %+v, exists = %v, want root descriptor", variant, exists)
 	}
@@ -126,11 +126,11 @@ func TestIssue115AppleFixtureUsesImageResourceDescriptor(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleDescriptorReferenceIsLocallyCheckedForAllPullPolicies(t *testing.T) {
+func TestAppleDescriptorReferenceIsLocallyCheckedForAllPullPolicies(t *testing.T) {
 	for _, policy := range []PullPolicy{PullMissing, PullAlways} {
 		t.Run(policyName(policy), func(t *testing.T) {
-			r := &issue115AppleAddressRunner{
-				fixture:      issue115AppleImageFixture(t),
+			r := &appleAddressRunner{
+				fixture:      appleImageFixture(t),
 				localMissing: true,
 				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
 			}
@@ -156,10 +156,10 @@ func TestIssue115AppleDescriptorReferenceIsLocallyCheckedForAllPullPolicies(t *t
 	}
 }
 
-func TestIssue115AppleDescriptorReferenceUsesLocalExactReference(t *testing.T) {
+func TestAppleDescriptorReferenceUsesLocalExactReference(t *testing.T) {
 	for _, policy := range []PullPolicy{PullMissing, PullAlways} {
 		t.Run(policyName(policy), func(t *testing.T) {
-			r := &issue115AppleAddressRunner{fixture: issue115AppleImageFixture(t)}
+			r := &appleAddressRunner{fixture: appleImageFixture(t)}
 			ctr, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), WithPullPolicy(policy), withRunner(r), withEngine(appleEngine{}))
 			if err != nil {
@@ -185,11 +185,11 @@ func TestIssue115AppleDescriptorReferenceUsesLocalExactReference(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleDescriptorReferenceUsesExplicitMutableFallback(t *testing.T) {
+func TestAppleDescriptorReferenceUsesExplicitMutableFallback(t *testing.T) {
 	for _, policy := range []PullPolicy{PullMissing, PullAlways} {
 		t.Run(policyName(policy), func(t *testing.T) {
-			r := &issue115AppleAddressRunner{
-				fixture:      issue115AppleImageFixture(t),
+			r := &appleAddressRunner{
+				fixture:      appleImageFixture(t),
 				localMissing: true,
 				exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"}, ExitCode: 1, Stderr: "image not found: pinned"},
 			}
@@ -210,7 +210,7 @@ func TestIssue115AppleDescriptorReferenceUsesExplicitMutableFallback(t *testing.
 	}
 }
 
-func TestIssue115AppleAddressInspectErrorsRemainOperationalErrors(t *testing.T) {
+func TestAppleAddressInspectErrorsRemainOperationalErrors(t *testing.T) {
 	cases := []struct {
 		name  string
 		err   error
@@ -238,8 +238,8 @@ func TestIssue115AppleAddressInspectErrorsRemainOperationalErrors(t *testing.T) 
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			r := &issue115AppleAddressRunner{
-				fixture:         issue115AppleImageFixture(t),
+			r := &appleAddressRunner{
+				fixture:         appleImageFixture(t),
 				localInspectErr: tc.err,
 			}
 			_, err := Run(context.Background(), "redis:7-alpine",
@@ -259,9 +259,9 @@ func TestIssue115AppleAddressInspectErrorsRemainOperationalErrors(t *testing.T) 
 	}
 }
 
-func TestIssue115AppleAddressPullErrorDoesNotUseMutableFallback(t *testing.T) {
-	r := &issue115AppleAddressRunner{
-		fixture:      issue115AppleImageFixture(t),
+func TestAppleAddressPullErrorDoesNotUseMutableFallback(t *testing.T) {
+	r := &appleAddressRunner{
+		fixture:      appleImageFixture(t),
 		localMissing: true,
 		exactPullErr: &cli.CLIError{Args: []string{"image", "pull", "pinned"}, ExitCode: 1, Stderr: "permission denied: image not found"},
 	}
@@ -283,8 +283,8 @@ func TestIssue115AppleAddressPullErrorDoesNotUseMutableFallback(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleIdentitylessInspectDoesNotTrustCallerDigest(t *testing.T) {
-	r := &issue115IdentityLessRunner{}
+func TestAppleIdentitylessInspectDoesNotTrustCallerDigest(t *testing.T) {
+	r := &identityLessRunner{}
 	image := "redis:7-alpine@sha256:1111111111111111111111111111111111111111111111111111111111111111"
 	_, err := Run(context.Background(), image,
 		WithName("myctr"), WithPullPolicy(PullMissing), withRunner(r), withEngine(appleEngine{}))
@@ -296,8 +296,8 @@ func TestIssue115AppleIdentitylessInspectDoesNotTrustCallerDigest(t *testing.T) 
 	}
 }
 
-func TestIssue115MalformedAppleInspectFailsClosedWithoutPull(t *testing.T) {
-	r := &issue115AppleAddressRunner{fixture: []byte("{")}
+func TestMalformedAppleInspectFailsClosedWithoutPull(t *testing.T) {
+	r := &appleAddressRunner{fixture: []byte("{")}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullMissing), withRunner(r), withEngine(appleEngine{}))
 	if !errors.Is(err, ErrImageIdentityUnavailable) {
@@ -309,9 +309,9 @@ func TestIssue115MalformedAppleInspectFailsClosedWithoutPull(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleIdentitylessAddressInspectIsUnavailableNotNotLocal(t *testing.T) {
-	r := &issue115AppleAddressRunner{
-		fixture:           issue115AppleImageFixture(t),
+func TestAppleIdentitylessAddressInspectIsUnavailableNotNotLocal(t *testing.T) {
+	r := &appleAddressRunner{
+		fixture:           appleImageFixture(t),
 		localIdentityless: true,
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -324,8 +324,8 @@ func TestIssue115AppleIdentitylessAddressInspectIsUnavailableNotNotLocal(t *test
 	}
 }
 
-func TestIssue115ApplePrefixedIDIsNotAnImmutableRunReference(t *testing.T) {
-	prefixed := "sha256:" + issue115AppleImageID
+func TestApplePrefixedIDIsNotAnImmutableRunReference(t *testing.T) {
+	prefixed := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"id":%q,"reference":%q,"descriptor":{"digest":%q}}]`, prefixed, prefixed, prefixed))
 	identity, exists := (appleEngine{}).parseImageIdentity(data, prefixed, "")
 	if !exists {
@@ -336,10 +336,10 @@ func TestIssue115ApplePrefixedIDIsNotAnImmutableRunReference(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleUnprefixedIDRequiresMatchingDescriptor(t *testing.T) {
-	digest := "sha256:" + issue115AppleImageID
-	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":%q}},"variants":[]}]`, issue115AppleImageID, digest))
-	identity, exists := (appleEngine{}).parseImageIdentity(data, issue115AppleImageID, "")
+func TestAppleUnprefixedIDRequiresMatchingDescriptor(t *testing.T) {
+	digest := "sha256:" + appleImageID
+	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":%q}},"variants":[]}]`, appleImageID, digest))
+	identity, exists := (appleEngine{}).parseImageIdentity(data, appleImageID, "")
 	if !exists || !identity.pinned || identity.id != "" {
 		t.Fatalf("identity = %+v, exists = %v, want descriptor-verified normalized ID", identity, exists)
 	}
@@ -348,8 +348,8 @@ func TestIssue115AppleUnprefixedIDRequiresMatchingDescriptor(t *testing.T) {
 	}
 }
 
-func TestIssue115ApplePrefixedIDWithoutDescriptorFailsClosed(t *testing.T) {
-	prefixed := "sha256:" + issue115AppleImageID
+func TestApplePrefixedIDWithoutDescriptorFailsClosed(t *testing.T) {
+	prefixed := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine"},"variants":[]}]`, prefixed))
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists {
@@ -360,8 +360,8 @@ func TestIssue115ApplePrefixedIDWithoutDescriptorFailsClosed(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerImageIDRequiresMatchingVerifiedID(t *testing.T) {
-	requested := "sha256:" + issue115AppleImageID
+func TestDockerImageIDRequiresMatchingVerifiedID(t *testing.T) {
+	requested := "sha256:" + appleImageID
 	data := []byte(fmt.Sprintf(`[{"Id":"sha256:%064x","RepoDigests":["docker.io/library/redis@sha256:%064x"]}]`, 4, 5))
 	identity, exists := (dockerEngine{}).parseImageIdentity(data, requested, "")
 	if !exists || identity.pinned {
@@ -375,7 +375,7 @@ func TestIssue115DockerImageIDRequiresMatchingVerifiedID(t *testing.T) {
 	}
 }
 
-func TestIssue115BareDigestIdentityRequiresProvenanceOrVerifiedID(t *testing.T) {
+func TestBareDigestIdentityRequiresProvenanceOrVerifiedID(t *testing.T) {
 	digest := "sha256:4444444444444444444444444444444444444444444444444444444444444444"
 	bare := imageIdentity{reference: digest, digest: digest, pinned: true}
 	repository := imageIdentity{reference: "redis:7-alpine@" + digest, digest: digest, pinned: true}

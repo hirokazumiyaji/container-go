@@ -332,8 +332,12 @@ func TestLifecycleDoesNotMarkEmptyTerminationAsActive(t *testing.T) {
 		t.Fatalf("terminate: %v", err)
 	}
 	lifecycle.wait()
-	if status := lifecycle.status(); status.TerminatedByCancellation {
+	status := lifecycle.status()
+	if status.TerminatedByCancellation {
 		t.Fatalf("status = %+v, empty/inactive termination must not claim active child", status)
+	}
+	if status.TerminationProvable {
+		t.Fatalf("status = %+v, a best-effort tree must not report a provable termination", status)
 	}
 }
 
@@ -349,6 +353,8 @@ func (t *blockingTerminationTree) terminate(cmd *exec.Cmd) terminationResult {
 	return terminationResult{active: true}
 }
 func (t *blockingTerminationTree) close() {}
+
+func (*blockingTerminationTree) provesActiveTermination() bool { return true }
 
 func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 	ctx := context.Background()
@@ -386,8 +392,9 @@ func TestLifecycleSerializesTerminationWithWait(t *testing.T) {
 	close(tree.release)
 	<-terminateDone
 	<-waitDone
-	if status := lifecycle.status(); !status.TerminatedByCancellation {
-		t.Fatalf("status = %+v, want active cancellation termination", status)
+	status := lifecycle.status()
+	if !status.TerminationProvable || !status.TerminatedByCancellation {
+		t.Fatalf("status = %+v, want a provable active cancellation termination", status)
 	}
 }
 
@@ -395,16 +402,55 @@ func TestExecRunnerStatusTracksContextTermination(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	time.AfterFunc(300*time.Millisecond, cancel)
+	started := time.Now()
 	_, _, err := (&ExecRunner{Binary: writeStub(t, `sleep 5`)}).Run(ctx, "exec")
 	status, reported := RunStatusOf(err)
 	if !reported || !status.Started || !status.Reaped {
 		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
 	}
-	if processGroupTerminationSupported() && !status.TerminatedByCancellation {
-		t.Fatalf("run status = %+v, want active cancellation termination", status)
+	// The stub sleeps far past the cancellation, so a prompt return is itself
+	// the evidence that cancellation terminated the child rather than letting
+	// it run to completion.
+	if elapsed := time.Since(started); elapsed > 3*time.Second {
+		t.Fatalf("run took %v, want a prompt return after cancellation", elapsed)
 	}
-	if !processGroupTerminationSupported() && status.TerminatedByCancellation {
+	// The platform probe alone cannot decide this run: attaching the pidfd
+	// fails under transient resource pressure, and the retained fallback
+	// cannot prove the direct child was active, so assert the capability the
+	// run actually published rather than the platform's.
+	//
+	// Only this direction is an invariant. The converse does not hold: even a
+	// run that attached the identity withholds the claim when the stopped-state
+	// barrier goes unobserved (processStoppedObservationWindow) or the child
+	// exits before the cancellation lands. Both are deliberate conservative
+	// outcomes, not proof that termination failed.
+	if status.TerminatedByCancellation && !status.TerminationProvable {
 		t.Fatalf("run status = %+v, conservative fallback must not claim active termination", status)
+	}
+	if !status.TerminationProvable && processGroupTerminationSupported() {
+		t.Logf("run status = %+v: platform identity was not attached, conservative result expected", status)
+	}
+}
+
+// TestExecRunnerStatusReportsBestEffortTreeAsUnprovable pins the path a
+// failed platform-identity attach takes: the run keeps the best-effort tree,
+// so its status must not report a provable termination even though the tree
+// terminated the child.
+func TestExecRunnerStatusReportsBestEffortTreeAsUnprovable(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	time.AfterFunc(100*time.Millisecond, cancel)
+	hooks := runHooks{terminate: func(cmd *exec.Cmd) error { return terminateProcessTree(cmd) }}
+	// exec keeps the sleeper as the direct child: the stub's shell would
+	// otherwise outlive the direct kill and hold the output pipe open until
+	// the sleep expired, which only adds wall-clock to the race job.
+	_, _, err := (&ExecRunner{Binary: writeStub(t, `exec sleep 5`)}).run(ctx, hooks, "exec")
+	status, reported := RunStatusOf(err)
+	if !reported || !status.Started || !status.Reaped {
+		t.Fatalf("run status = %+v, reported=%t; want started/reaped lifecycle status", status, reported)
+	}
+	if status.TerminationProvable {
+		t.Fatalf("run status = %+v, a best-effort process tree must not be provable", status)
 	}
 }
 
@@ -910,29 +956,29 @@ func (h *hangingProbeRunner) Run(ctx context.Context, _ ...string) ([]byte, []by
 	return nil, nil, ctx.Err()
 }
 
-type issue104RecordingProbeRunner struct {
+type recordingProbeRunner struct {
 	calls int
 	err   error
 }
 
-func (r *issue104RecordingProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+func (r *recordingProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
 	r.calls++
 	return nil, nil, r.err
 }
 
-type issue104JoinedProbeRunner struct {
+type joinedProbeRunner struct {
 	err    error
 	stdout string
 }
 
-func (r *issue104JoinedProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
+func (r *joinedProbeRunner) Run(_ context.Context, _ ...string) ([]byte, []byte, error) {
 	return []byte(r.stdout), nil, r.err
 }
 
 func TestClassifyDoesNotProbeKnownOperationTimeout(t *testing.T) {
 	original := &CLIError{Args: []string{"run"}, ExitCode: 1, Stderr: "command timed out"}
 	operationErr := errors.Join(original, context.DeadlineExceeded)
-	runner := &issue104RecordingProbeRunner{err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}}
+	runner := &recordingProbeRunner{err: &CLIError{Args: []string{"system", "status"}, ExitCode: 1, Stderr: "XPC connection error"}}
 
 	got := Classify(context.Background(), runner, operationErr, appleProbe)
 	if runner.calls != 0 {
@@ -990,7 +1036,7 @@ func TestClassifyJoinedProbeConfigurationVetoesLiveness(t *testing.T) {
 		Stderr: "cannot connect to the Docker daemon",
 	}
 	probeErr := errors.Join(liveness, errors.New("x509: certificate signed by unknown authority"))
-	runner := &issue104JoinedProbeRunner{err: probeErr, stdout: "probe stdout"}
+	runner := &joinedProbeRunner{err: probeErr, stdout: "probe stdout"}
 	probe := Probe{
 		Args: []string{"version"}, Hint: "start the daemon",
 		IsUnavailable: func(error) bool { return true },

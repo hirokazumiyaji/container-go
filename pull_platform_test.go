@@ -257,7 +257,7 @@ func TestDockerKeepsGenericVariantPlatforms(t *testing.T) {
 }
 
 func TestAppleParseImageExistsPlatform(t *testing.T) {
-	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm64"}}]}]`, issue115ImageIdentityOld, issue115ImageIdentityNew))
+	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm64"}}]}]`, testImageIdentityOld, testImageIdentityNew))
 	if !(appleEngine{}).parseImageExists(data, "linux/arm64") {
 		t.Error("want match for linux/arm64")
 	}
@@ -293,7 +293,7 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 			if len(parts) == 3 {
 				variant = fmt.Sprintf(`,"variant":%q`, parts[2])
 			}
-			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q%s}}]}]`, issue115ImageIdentityOld, issue115ImageIdentityNew, parts[0], parts[1], variant))
+			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q%s}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], variant))
 			if !(appleEngine{}).parseImageExists(data, tc.requested) {
 				t.Fatalf("platform %q did not match inspected %q", tc.requested, tc.actual)
 			}
@@ -303,11 +303,11 @@ func TestApplePlatformVariantMatchingNormalizesAliases(t *testing.T) {
 
 func TestAppleParseImageExistsVariantMismatch(t *testing.T) {
 	// Variant-less image must not satisfy a variant-pinned request.
-	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, issue115ImageIdentityOld, issue115ImageIdentityNew))
+	data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm"}}]}]`, testImageIdentityOld, testImageIdentityNew))
 	if (appleEngine{}).parseImageExists(data, "linux/arm/v7") {
 		t.Error("variant-less arm must not match linux/arm/v7")
 	}
-	dataV7 := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`, issue115ImageIdentityOld, issue115ImageIdentityNew))
+	dataV7 := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":"linux","architecture":"arm","variant":"v7"}}]}]`, testImageIdentityOld, testImageIdentityNew))
 	if !(appleEngine{}).parseImageExists(dataV7, "linux/arm/v7") {
 		t.Error("v7 must match linux/arm/v7")
 	}
@@ -329,7 +329,7 @@ func TestAppleBareArmelSelectorDefaultsToV6(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			parts := strings.Split(tc.actual, "/")
-			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q,"variant":%q}}]}]`, issue115ImageIdentityOld, issue115ImageIdentityNew, parts[0], parts[1], parts[2]))
+			data := []byte(fmt.Sprintf(`[{"configuration":{"descriptor":{"digest":%q}},"variants":[{"digest":%q,"platform":{"os":%q,"architecture":%q,"variant":%q}}]}]`, testImageIdentityOld, testImageIdentityNew, parts[0], parts[1], parts[2]))
 			if got := (appleEngine{}).parseImageExists(data, tc.selector); got != tc.wantMatch {
 				t.Errorf("parseImageExists(%q) against %q = %v, want %v", tc.selector, tc.actual, got, tc.wantMatch)
 			}

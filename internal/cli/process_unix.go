@@ -41,6 +41,10 @@ type stableProcessIdentity interface {
 type unixProcessTree struct {
 	identity stableProcessIdentity
 	pid      int
+	// provable records whether this run attached the platform identity that
+	// termination evidence rests on. Without it the tree still kills the
+	// direct child, but it cannot prove the child was active.
+	provable bool
 }
 
 func newProcessTree(cmd *exec.Cmd) (processTree, error) {
@@ -48,13 +52,20 @@ func newProcessTree(cmd *exec.Cmd) (processTree, error) {
 		return nil, os.ErrProcessDone
 	}
 	identity, err := openProcessIdentity(cmd.Process)
+	// An identity attached for this run is its own proof. Only the retained
+	// handle has to ask the platform whether the stopped barrier is
+	// observable at all, and that probe is a constant off Linux.
+	provable := err == nil && identity != nil
+	if _, retained := identity.(retainedProcessIdentity); retained {
+		provable = provable && processGroupTerminationSupported()
+	}
 	if err != nil || identity == nil {
 		// A pidfd (or equivalent) is an enhancement. The retained
 		// os.Process is still safer than reacquiring a process by a
 		// numeric PID, so use it as the conservative direct-child path.
 		identity = retainedProcessIdentity{process: cmd.Process}
 	}
-	return &unixProcessTree{identity: identity, pid: cmd.Process.Pid}, nil
+	return &unixProcessTree{identity: identity, pid: cmd.Process.Pid, provable: provable}, nil
 }
 
 func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
@@ -62,6 +73,10 @@ func (t *unixProcessTree) terminate(cmd *exec.Cmd) terminationResult {
 		return terminateDirectProcessResult(cmd)
 	}
 	return terminateProcessIdentity(t.identity, t.pid)
+}
+
+func (t *unixProcessTree) provesActiveTermination() bool {
+	return t != nil && t.provable
 }
 
 func (t *unixProcessTree) close() {
@@ -126,6 +141,16 @@ func (p retainedProcessIdentity) groupID() (int, bool) {
 
 func (retainedProcessIdentity) close() {}
 
+// processAlreadyGone reports whether a signal or kill attempt failed only
+// because the target no longer exists. The pidfd identity surfaces a raw
+// ESRCH, while the retained os.Process reports os.ErrProcessDone; both mean the
+// same thing. Treating the raw errno as a generic failure would withhold proven
+// termination evidence whenever the group signal wins the race and the sole
+// waiter reaps the child before the redundant direct kill.
+func processAlreadyGone(err error) bool {
+	return errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH)
+}
+
 func terminateProcessIdentity(identity stableProcessIdentity, pid int) terminationResult {
 	if identity == nil {
 		return terminationResult{err: os.ErrProcessDone}
@@ -138,7 +163,7 @@ func terminateProcessIdentity(identity stableProcessIdentity, pid int) terminati
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	if err := identity.stop(); err != nil {
-		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		if processAlreadyGone(err) {
 			return terminationResult{err: os.ErrProcessDone}
 		}
 		// The stop operation failed, so a numeric group signal would be
@@ -178,7 +203,7 @@ func terminateProcessIdentity(identity stableProcessIdentity, pid int) terminati
 	switch {
 	case killErr == nil:
 		return terminationResult{active: true, err: groupErr}
-	case errors.Is(killErr, os.ErrProcessDone):
+	case processAlreadyGone(killErr):
 		if groupSignaled {
 			return terminationResult{active: true}
 		}
@@ -201,7 +226,7 @@ func terminateIdentityKill(identity stableProcessIdentity, priorErr error) termi
 	if killErr == nil {
 		return terminationResult{err: priorErr}
 	}
-	if errors.Is(killErr, os.ErrProcessDone) || errors.Is(killErr, syscall.ESRCH) {
+	if processAlreadyGone(killErr) {
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	if priorErr != nil {
@@ -239,7 +264,7 @@ func terminateProcessTreeWithOps(cmd *exec.Cmd, ops unixProcessOps) terminationR
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	if err := ops.signal(cmd.Process, syscall.SIGSTOP); err != nil {
-		if errors.Is(err, os.ErrProcessDone) || errors.Is(err, syscall.ESRCH) {
+		if processAlreadyGone(err) {
 			return terminationResult{err: os.ErrProcessDone}
 		}
 		if killErr := ops.kill(); killErr != nil {
@@ -276,7 +301,7 @@ func terminateProcessTreeWithOps(cmd *exec.Cmd, ops unixProcessOps) terminationR
 	switch {
 	case killErr == nil:
 		return terminationResult{active: true, err: groupErr}
-	case errors.Is(killErr, os.ErrProcessDone):
+	case processAlreadyGone(killErr):
 		if groupSignaled {
 			return terminationResult{active: true}
 		}
@@ -293,7 +318,7 @@ func terminateIdentityKillOps(ops unixProcessOps, priorErr error) terminationRes
 	if killErr == nil {
 		return terminationResult{err: priorErr}
 	}
-	if errors.Is(killErr, os.ErrProcessDone) {
+	if processAlreadyGone(killErr) {
 		return terminationResult{err: os.ErrProcessDone}
 	}
 	return terminationResult{err: errors.Join(priorErr, killErr)}

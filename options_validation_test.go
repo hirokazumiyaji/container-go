@@ -30,6 +30,14 @@ func TestRunRejectsInvalidPublicOptionsBeforeBackend(t *testing.T) {
 			opts: []Option{WithMounts(Mount{Type: MountVolume, Source: "bad=name", Target: "/data"})},
 		},
 		{
+			name: "volume without source name",
+			opts: []Option{WithMounts(Mount{Type: MountVolume, Source: "", Target: "/data"})},
+		},
+		{
+			name: "tmpfs with source name",
+			opts: []Option{WithMounts(Mount{Type: MountTmpfs, Source: "something", Target: "/data"})},
+		},
+		{
 			name: "unknown pull policy",
 			opts: []Option{WithPullPolicy(PullPolicy(99))},
 		},
@@ -286,5 +294,53 @@ func TestUnknownMountNeverBuildsPartialArg(t *testing.T) {
 	m := Mount{Type: MountType(99), Source: "volume", Target: "/data"}
 	if got := m.arg(); got != "" {
 		t.Fatalf("unknown mount arg = %q, want empty", got)
+	}
+}
+
+func TestMountArg(t *testing.T) {
+	tests := []struct {
+		name  string
+		mount Mount
+		want  string
+	}{
+		{
+			name:  "bind mount",
+			mount: Mount{Type: MountBind, Source: "/host/path", Target: "/container/path"},
+			want:  "type=bind,source=/host/path,target=/container/path",
+		},
+		{
+			name:  "bind mount readonly",
+			mount: Mount{Type: MountBind, Source: "/host/path", Target: "/container/path", ReadOnly: true},
+			want:  "type=bind,source=/host/path,target=/container/path,readonly",
+		},
+		{
+			name:  "volume mount",
+			mount: Mount{Type: MountVolume, Source: "myvol", Target: "/data"},
+			want:  "type=volume,source=myvol,target=/data",
+		},
+		{
+			name:  "volume mount readonly",
+			mount: Mount{Type: MountVolume, Source: "myvol", Target: "/data", ReadOnly: true},
+			want:  "type=volume,source=myvol,target=/data,readonly",
+		},
+		{
+			name:  "tmpfs mount",
+			mount: Mount{Type: MountTmpfs, Target: "/tmp"},
+			want:  "type=tmpfs,target=/tmp",
+		},
+		{
+			name:  "tmpfs mount readonly",
+			mount: Mount{Type: MountTmpfs, Target: "/tmp", ReadOnly: true},
+			want:  "type=tmpfs,target=/tmp,readonly",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := tt.mount.arg()
+			if got != tt.want {
+				t.Errorf("Mount.arg() = %q, want %q", got, tt.want)
+			}
+		})
 	}
 }

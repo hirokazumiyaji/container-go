@@ -62,9 +62,16 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: stable
-      # The integration suites are excluded: they need a real backend,
-      # which neither of these runners provides for both backends.
+      # The integration suites are not executed: they need a real backend,
+      # which neither of these runners provides for both backends. The tagged
+      # vet still compiles them, including the Windows-only files that no
+      # other job type-checks.
+      #
+      # Keep `integration` in step with VET_INTEGRATION in the Makefile. This
+      # leg cannot call `make vet-integration`: the Windows runner image ships
+      # no GNU Make, so the tag is repeated here rather than centralized.
       - run: go build ./...
+      - run: go vet -tags integration ./...
       - run: go test ./...
 
   # Unit tests run against a fake CLI runner, so the cheaper Linux
@@ -87,6 +94,8 @@ jobs:
         with:
           go-version: ${{ matrix.go-version }}
       - run: go test ./...
+      - run: go mod verify
+      - run: go mod tidy -diff
 
   race:
     runs-on: ubuntu-latest
@@ -121,6 +130,34 @@ jobs:
           # v2.13.0 cannot decode Go 1.27 export data (version 5).
           version: v2.14.0
 
+  # The tagged vet runs in three places, and TestTaggedVetMatchesMakefileCommand
+  # plus TestGolangciBuildTagsMatchMakefileCommand keep the copies of the tag
+  # equal. The cross-platform legs run it natively, which is the only way the
+  # Windows-only integration files get type-checked, but they cannot call
+  # `make vet-integration` because the Windows runner image ships no GNU Make.
+  #
+  # release-check.yml's `verify` job runs this same target for any PR touching
+  # Go sources, the Makefile, .golangci.yml, a workflow or bench/, so this job
+  # buys runner time rather than coverage. It exists for the same reason ci.yml
+  # keeps lint, race, govulncheck and bench-build as separate jobs instead of
+  # deferring to that gate: `verify` allows an hour and compiles govulncheck and
+  # actionlint from source, so a tagged vet failure would surface late and
+  # buried, while this job reports it in about a minute. It also covers pushes
+  # to main and workflow_dispatch, where the pull_request path filter never runs.
+  vet-integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          # The toolchain the cross-platform legs already use for the identical
+          # command, so all three tagged vet passes agree.
+          go-version: stable
+      - run: make vet-integration
+
   govulncheck:
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -137,17 +174,14 @@ jobs:
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
-      # bench/ is a separate module, so the root ./... does not reach it.
       # v1.1.4 panics against the Go 1.27.x vuln client/http2 stack; v1.8.0
       # is the current scanner that works with this toolchain.
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
-        working-directory: bench
 
-  # bench/ is a separate module, so no job above reaches it: they all run
-  # ./... from the root. Without this a Dependabot bump of bench/go.mod would
-  # merge with no signal that the module still builds.
-  bench-build:
+  # bench/ is a separate module, so no root job reaches it.
+  # The bench jobs below run unit tests, race detection, vet, lint,
+  # module verification, and govulncheck for the bench module.
+  bench-test:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -156,14 +190,46 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          # The module this job builds, not the root one. The root go.mod
-          # declares an older toolchain than bench/go.mod, so deriving from
-          # the root fails the build with "go.mod requires go >=" instead
-          # of building anything.
           go-version-file: bench/go.mod
       - run: go build ./...
         working-directory: bench
       - run: go test ./...
+        working-directory: bench
+      - run: go test -race ./...
+        working-directory: bench
+      - run: go vet ./...
+        working-directory: bench
+      - run: go mod verify
+        working-directory: bench
+      - run: go mod tidy -diff
+        working-directory: bench
+
+  bench-lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.2'
+      - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
+        with:
+          version: v2.14.0
+          working-directory: bench
+
+  bench-govulncheck:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
+        with:
+          go-version: '1.27.2'
+      - run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
         working-directory: bench
 
   # actionlint validates workflow syntax, expressions, and runner labels. It
@@ -209,6 +275,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      max-parallel: 1
       matrix:
         go-version: ['1.26.0', 'stable']
     steps:
@@ -218,6 +285,69 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           go-version: ${{ matrix.go-version }}
+      # Pre-load and cache the Docker images used across integration tests.
+      # Anonymous pulls against public.ecr.aws from shared GitHub Actions runner
+      # IPs frequently hit rate/data transfer limits ("toomanyrequests: Data
+      # limit exceeded"). Caching the image tarball eliminates repeated registry
+      # calls across workflow runs, and a Docker Hub fallback ensures the images
+      # can be fetched and tagged if the primary mirror is throttled on cache miss.
+      - name: Cache integration test Docker images
+        id: cache-images
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: /tmp/docker-images.tar
+          key: integration-docker-images-${{ runner.os }}-${{ hashFiles('integration_image_test.go') }}
+          restore-keys: |
+            integration-docker-images-${{ runner.os }}-
+      - name: Load or pre-pull integration test Docker images
+        run: |
+          target_images=(
+            "public.ecr.aws/docker/library/alpine:latest"
+            "public.ecr.aws/docker/library/redis:7-alpine"
+            "public.ecr.aws/docker/library/nginx:alpine"
+          )
+          fallback_images=(
+            "alpine:latest"
+            "redis:7-alpine"
+            "nginx:alpine"
+          )
+
+          if [ -f /tmp/docker-images.tar ]; then
+            echo "Loading cached images from /tmp/docker-images.tar..."
+            docker load -i /tmp/docker-images.tar || rm -f /tmp/docker-images.tar
+          fi
+
+          for i in "${!target_images[@]}"; do
+            target="${target_images[$i]}"
+            fallback="${fallback_images[$i]}"
+
+            if docker image inspect "$target" >/dev/null 2>&1; then
+              echo "Image $target is already present locally."
+              continue
+            fi
+
+            echo "Pulling $target..."
+            pulled=0
+            for attempt in 1 2 3; do
+              if docker pull "$target"; then
+                pulled=1
+                break
+              fi
+              echo "Pull failed (attempt $attempt/3), retrying in 3s..."
+              sleep 3
+            done
+
+            if [ "$pulled" -eq 0 ]; then
+              echo "Primary pull failed for $target; falling back to Docker Hub ($fallback)..."
+              docker pull "$fallback"
+              docker tag "$fallback" "$target"
+            fi
+          done
+
+          if [ ! -f /tmp/docker-images.tar ]; then
+            echo "Saving images to /tmp/docker-images.tar for cache..."
+            docker save -o /tmp/docker-images.tar "${target_images[@]}"
+          fi
       - run: make integration-docker
         env:
           # A missing or broken Docker backend must fail this required job

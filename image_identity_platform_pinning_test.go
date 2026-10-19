@@ -11,22 +11,22 @@ import (
 )
 
 const (
-	issue115ReviewRoot    = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
-	issue115ReviewVariant = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
-	issue115ReviewID      = "3333333333333333333333333333333333333333333333333333333333333333"
+	platformPinningRoot    = "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+	platformPinningVariant = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	platformPinningID      = "3333333333333333333333333333333333333333333333333333333333333333"
 )
 
-func issue115ReviewAppleImageJSON(variants []map[string]any) []byte {
+func platformPinningAppleImageJSON(variants []map[string]any) []byte {
 	if len(variants) == 1 {
 		variants = append(variants, map[string]any{
 			"platform": map[string]any{"os": "linux", "architecture": "amd64"},
 			"digest":   "sha256:3333333333333333333333333333333333333333333333333333333333333333",
 		})
 	}
-	return issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, variants)
+	return platformPinningAppleImageJSONForRoot(platformPinningRoot, variants)
 }
 
-func issue115ReviewAppleImageJSONForRoot(root string, variants []map[string]any) []byte {
+func platformPinningAppleImageJSONForRoot(root string, variants []map[string]any) []byte {
 	data := map[string]any{
 		"id": strings.TrimPrefix(root, "sha256:"),
 		"configuration": map[string]any{
@@ -41,7 +41,7 @@ func issue115ReviewAppleImageJSONForRoot(root string, variants []map[string]any)
 	return out
 }
 
-type issue115ReviewRunner struct {
+type platformPinningRunner struct {
 	mu sync.Mutex
 
 	inspectJSON      []byte
@@ -56,7 +56,7 @@ type issue115ReviewRunner struct {
 	calls            [][]string
 }
 
-func (r *issue115ReviewRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *platformPinningRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls = append(r.calls, append([]string(nil), args...))
@@ -93,19 +93,19 @@ func (r *issue115ReviewRunner) Run(_ context.Context, args ...string) ([]byte, [
 		if platform == "" {
 			platform = "linux/amd64"
 		}
-		return issue115ReviewContainerJSON(image, issue115ReviewRoot, platform, r.creation), nil, nil
+		return platformPinningContainerJSON(image, platformPinningRoot, platform, r.creation), nil, nil
 	default:
 		return nil, nil, nil
 	}
 }
 
-func (r *issue115ReviewRunner) state() (runImage string, inspectCalls, pullCalls int) {
+func (r *platformPinningRunner) state() (runImage string, inspectCalls, pullCalls int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.runImage, r.inspectCalls, r.pullCalls
 }
 
-func issue115ReviewContainerJSON(image, digest, platform string, creation ...string) []byte {
+func platformPinningContainerJSON(image, digest, platform string, creation ...string) []byte {
 	parts := strings.Split(platform, "/")
 	platformJSON := map[string]string{}
 	if len(parts) > 0 {
@@ -139,7 +139,7 @@ func issue115ReviewContainerJSON(image, digest, platform string, creation ...str
 	return data
 }
 
-func issue115ReviewCallHasPlatform(call []string, platform string) bool {
+func callHasPlatform(call []string, platform string) bool {
 	for i, arg := range call {
 		if arg == "--platform" && i+1 < len(call) && call[i+1] == platform {
 			return true
@@ -148,10 +148,10 @@ func issue115ReviewCallHasPlatform(call []string, platform string) bool {
 	return false
 }
 
-func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
-	input := "redis:7-alpine@" + issue115ReviewRoot
-	r := &issue115ReviewRunner{inspectJSON: issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant)}
-	identity, exists := (appleEngine{}).parseImageIdentity(issue115ReviewAppleImageJSON(nil), input, "")
+func TestAppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
+	input := "redis:7-alpine@" + platformPinningRoot
+	r := &platformPinningRunner{inspectJSON: freshAppleImageJSON(platformPinningRoot, platformPinningVariant)}
+	identity, exists := (appleEngine{}).parseImageIdentity(platformPinningAppleImageJSON(nil), input, "")
 	if !exists || !identity.pinned || identity.mutableAlias {
 		t.Fatalf("parsed name@digest identity = %+v, exists = %v, want pinned identity", identity, exists)
 	}
@@ -160,7 +160,7 @@ func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !ctr.image.pinned || ctr.image.digest != issue115ReviewRoot {
+	if !ctr.image.pinned || ctr.image.digest != platformPinningRoot {
 		t.Fatalf("run identity = %+v, want pinned root digest", ctr.image)
 	}
 	if got, _, pulls := r.state(); got != input || pulls != 0 {
@@ -168,15 +168,15 @@ func TestIssue115AppleNameDigestIsPinnedEvenWithTag(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
-	input := "redis:7-alpine@" + issue115ReviewRoot
-	r := &issue115ReviewRunner{inspectJSON: issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant)}
+func TestAppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
+	input := "redis:7-alpine@" + platformPinningRoot
+	r := &platformPinningRunner{inspectJSON: freshAppleImageJSON(platformPinningRoot, platformPinningVariant)}
 	ctr, err := Run(context.Background(), input,
 		WithName("myctr"), WithAllowMutableImageTag(), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if !ctr.image.pinned || ctr.image.mutableAlias || ctr.image.digest != issue115ReviewRoot {
+	if !ctr.image.pinned || ctr.image.mutableAlias || ctr.image.digest != platformPinningRoot {
 		t.Fatalf("identity = %+v, want name@digest to remain pinned", ctr.image)
 	}
 	if got, _, _ := r.state(); got != input {
@@ -184,13 +184,13 @@ func TestIssue115AppleNameDigestStaysPinnedWithMutableOptIn(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testing.T) {
+func TestAppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testing.T) {
 	const replacement = "sha256:4444444444444444444444444444444444444444444444444444444444444444"
-	input := "redis:7-alpine@" + issue115ReviewRoot
+	input := "redis:7-alpine@" + platformPinningRoot
 	for _, allow := range []bool{false, true} {
 		t.Run(fmt.Sprintf("allow=%v", allow), func(t *testing.T) {
-			r := &issue115ReviewRunner{
-				inspectJSON: issue115FreshAppleImageJSON(replacement, replacement),
+			r := &platformPinningRunner{
+				inspectJSON: freshAppleImageJSON(replacement, replacement),
 			}
 			opts := []Option{WithName("myctr"), withRunner(r), withEngine(appleEngine{})}
 			if allow {
@@ -207,11 +207,11 @@ func TestIssue115AppleAliasReplacementFailsClosedEvenWithMutablePolicy(t *testin
 	}
 }
 
-func TestIssue115AppleTagReplacementBeforeRunFailsIdentityCheck(t *testing.T) {
+func TestAppleTagReplacementBeforeRunFailsIdentityCheck(t *testing.T) {
 	const replacement = "sha256:5555555555555555555555555555555555555555555555555555555555555555"
-	r := &issue115ReviewRunner{
-		inspectJSON:      issue115FreshAppleImageJSON(issue115ReviewRoot, issue115ReviewVariant),
-		replacementJSON:  issue115FreshAppleImageJSON(replacement, replacement),
+	r := &platformPinningRunner{
+		inspectJSON:      freshAppleImageJSON(platformPinningRoot, platformPinningVariant),
+		replacementJSON:  freshAppleImageJSON(replacement, replacement),
 		mutateAfterFirst: true,
 	}
 	_, err := Run(context.Background(), "redis:7-alpine",
@@ -224,13 +224,13 @@ func TestIssue115AppleTagReplacementBeforeRunFailsIdentityCheck(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleEffectiveDefaultPlatformIsUsedForPullInspectAndRun(t *testing.T) {
+func TestAppleEffectiveDefaultPlatformIsUsedForPullInspectAndRun(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/arm64")
-	image := issue115ReviewAppleImageJSON([]map[string]any{{
+	image := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
-	r := &issue115ReviewRunner{inspectJSON: image}
+	r := &platformPinningRunner{inspectJSON: image}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullAlways), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
@@ -243,17 +243,17 @@ func TestIssue115AppleEffectiveDefaultPlatformIsUsedForPullInspectAndRun(t *test
 	for _, call := range r.calls {
 		if len(call) > 0 && call[0] == "run" {
 			sawRun = true
-			if !issue115ReviewCallHasPlatform(call, "linux/arm64") {
+			if !callHasPlatform(call, "linux/arm64") {
 				t.Errorf("run missing effective platform: %v", call)
 			}
 		}
 		if len(call) >= 2 && call[0] == "image" && call[1] == "pull" {
 			sawPull = true
-			if !issue115ReviewCallHasPlatform(call, "linux/arm64") {
+			if !callHasPlatform(call, "linux/arm64") {
 				t.Errorf("pull missing effective platform: %v", call)
 			}
 		}
-		if len(call) >= 2 && call[0] == "image" && call[1] == "inspect" && issue115ReviewCallHasPlatform(call, "linux/arm64") {
+		if len(call) >= 2 && call[0] == "image" && call[1] == "inspect" && callHasPlatform(call, "linux/arm64") {
 			t.Errorf("Apple image inspect must not receive a platform flag: %v", call)
 		}
 	}
@@ -262,11 +262,11 @@ func TestIssue115AppleEffectiveDefaultPlatformIsUsedForPullInspectAndRun(t *test
 	}
 }
 
-func TestIssue115AppleEffectiveDefaultPlatformValidationPrecedesCLI(t *testing.T) {
+func TestAppleEffectiveDefaultPlatformValidationPrecedesCLI(t *testing.T) {
 	for _, platform := range []string{"not-a-platform", "linux", "windows/amd64", "linux/arm64/v7"} {
 		t.Run(platform, func(t *testing.T) {
 			t.Setenv(defaultPlatformEnv, platform)
-			r := &issue115ReviewRunner{}
+			r := &platformPinningRunner{}
 			_, err := Run(context.Background(), "redis:7-alpine",
 				WithName("myctr"), withRunner(r), withEngine(appleEngine{}))
 			if err == nil {
@@ -279,31 +279,31 @@ func TestIssue115AppleEffectiveDefaultPlatformValidationPrecedesCLI(t *testing.T
 	}
 }
 
-func TestIssue115ExplicitPlatformOverridesInvalidAppleDefault(t *testing.T) {
+func TestExplicitPlatformOverridesInvalidAppleDefault(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "not-a-platform")
-	image := issue115ReviewAppleImageJSON([]map[string]any{{
+	image := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
-	r := &issue115ReviewRunner{inspectJSON: image}
+	r := &platformPinningRunner{inspectJSON: image}
 	if _, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPlatform("linux/arm64"), withRunner(r), withEngine(appleEngine{})); err != nil {
 		t.Fatalf("explicit platform should override invalid default: %v", err)
 	}
 }
 
-func TestIssue115PullWithUsesAppleEffectiveDefaultPlatform(t *testing.T) {
+func TestPullWithUsesAppleEffectiveDefaultPlatform(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/arm64")
-	r := &issue115ReviewRunner{}
+	r := &platformPinningRunner{}
 	if err := pullWith(context.Background(), r, appleEngine{}, "redis:7-alpine"); err != nil {
 		t.Fatalf("pullWith: %v", err)
 	}
-	if len(r.calls) != 1 || !issue115ReviewCallHasPlatform(r.calls[0], "linux/arm64") {
+	if len(r.calls) != 1 || !callHasPlatform(r.calls[0], "linux/arm64") {
 		t.Fatalf("pull calls = %v, want effective platform", r.calls)
 	}
 }
 
-func TestIssue115DockerIgnoresAppleDefaultPlatform(t *testing.T) {
+func TestDockerRunIgnoresAppleDefaultPlatform(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/arm64")
 	f := newTestRunner()
 	f.imagePresent = true
@@ -311,34 +311,34 @@ func TestIssue115DockerIgnoresAppleDefaultPlatform(t *testing.T) {
 		WithName("myctr"), withRunner(f), withEngine(dockerEngine{})); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if issue115ReviewCallHasPlatform(f.callWith("run"), "linux/arm64") {
+	if callHasPlatform(f.callWith("run"), "linux/arm64") {
 		t.Fatal("Docker consumed Apple's default platform")
 	}
 }
 
-func TestIssue115ApplePullMissingFetchesMissingPlatformVariant(t *testing.T) {
-	image := issue115ReviewAppleImageJSON(nil)
-	afterPull := issue115ReviewAppleImageJSON([]map[string]any{{
+func TestApplePullMissingFetchesMissingPlatformVariant(t *testing.T) {
+	image := platformPinningAppleImageJSON(nil)
+	afterPull := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
-	r := &issue115ReviewRunner{inspectJSON: image, afterPullJSON: afterPull}
+	r := &platformPinningRunner{inspectJSON: image, afterPullJSON: afterPull}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPlatform("linux/arm64"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if ctr.image.digest != issue115ReviewRoot || ctr.image.variantDigest != issue115ReviewVariant {
+	if ctr.image.digest != platformPinningRoot || ctr.image.variantDigest != platformPinningVariant {
 		t.Fatalf("resolved identity = %+v, want root and fetched variant", ctr.image)
 	}
-	if got, _, pulls := r.state(); got != "redis:7-alpine@"+issue115ReviewRoot || pulls != 1 {
+	if got, _, pulls := r.state(); got != "redis:7-alpine@"+platformPinningRoot || pulls != 1 {
 		t.Fatalf("run image=%q pulls=%d, want explicit platform fetch and root run identity", got, pulls)
 	}
 }
 
-func TestIssue115AppleExplicitPlatformRejectsEmptyVariants(t *testing.T) {
-	image := issue115ReviewAppleImageJSON(nil)
-	r := &issue115ReviewRunner{inspectJSON: image}
+func TestAppleExplicitPlatformRejectsEmptyVariants(t *testing.T) {
+	image := platformPinningAppleImageJSON(nil)
+	r := &platformPinningRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/arm64"),
 		withRunner(r), withEngine(applePullNeverBelowPreflight{}))
@@ -354,12 +354,12 @@ func TestIssue115AppleExplicitPlatformRejectsEmptyVariants(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleExplicitPlatformRejectsIncompleteVariant(t *testing.T) {
-	image := issue115ReviewAppleImageJSON([]map[string]any{{
+func TestAppleExplicitPlatformRejectsIncompleteVariant(t *testing.T) {
+	image := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
-	r := &issue115ReviewRunner{inspectJSON: image}
+	r := &platformPinningRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), WithPlatform("linux/arm64"),
 		withRunner(r), withEngine(applePullNeverBelowPreflight{}))
@@ -371,10 +371,10 @@ func TestIssue115AppleExplicitPlatformRejectsIncompleteVariant(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleEffectiveDefaultPlatformValidatesVariants(t *testing.T) {
+func TestAppleEffectiveDefaultPlatformValidatesVariants(t *testing.T) {
 	t.Setenv(defaultPlatformEnv, "linux/arm64")
-	image := issue115ReviewAppleImageJSON(nil)
-	r := &issue115ReviewRunner{inspectJSON: image}
+	image := platformPinningAppleImageJSON(nil)
+	r := &platformPinningRunner{inspectJSON: image}
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(applePullNeverBelowPreflight{}))
 	if !errors.Is(err, ErrImageIdentityNotLocal) {
@@ -385,17 +385,17 @@ func TestIssue115AppleEffectiveDefaultPlatformValidatesVariants(t *testing.T) {
 	}
 }
 
-func TestIssue115AppleSelectedVariantReplacementFailsBeforeRun(t *testing.T) {
-	initial := issue115ReviewAppleImageJSON([]map[string]any{{
+func TestAppleSelectedVariantReplacementFailsBeforeRun(t *testing.T) {
+	initial := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
 	replacementVariant := "sha256:6666666666666666666666666666666666666666666666666666666666666666"
-	replacement := issue115ReviewAppleImageJSONForRoot(issue115ReviewRoot, []map[string]any{{
+	replacement := platformPinningAppleImageJSONForRoot(platformPinningRoot, []map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
 		"digest":   replacementVariant,
 	}})
-	r := &issue115ReviewRunner{
+	r := &platformPinningRunner{
 		inspectJSON:      initial,
 		replacementJSON:  replacement,
 		mutateAfterFirst: true,
@@ -410,32 +410,32 @@ func TestIssue115AppleSelectedVariantReplacementFailsBeforeRun(t *testing.T) {
 	}
 }
 
-func TestIssue115ApplePlatformUsesRootIndexDigestForRunAndReuse(t *testing.T) {
-	image := issue115ReviewAppleImageJSON([]map[string]any{{
+func TestApplePlatformUsesRootIndexDigestForRunAndReuse(t *testing.T) {
+	image := platformPinningAppleImageJSON([]map[string]any{{
 		"platform": map[string]any{"os": "linux", "architecture": "arm64"},
-		"digest":   issue115ReviewVariant,
+		"digest":   platformPinningVariant,
 	}})
-	r := &issue115ReviewRunner{inspectJSON: image}
+	r := &platformPinningRunner{inspectJSON: image}
 	ctr, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), WithPlatform("linux/arm64"), withRunner(r), withEngine(appleEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	wantReference := "redis:7-alpine@" + issue115ReviewRoot
+	wantReference := "redis:7-alpine@" + platformPinningRoot
 	if got, _, _ := r.state(); got != wantReference {
 		t.Fatalf("run image = %q, want root index reference %q", got, wantReference)
 	}
-	if ctr.image.digest != issue115ReviewRoot || ctr.image.platform != "linux/arm64" {
+	if ctr.image.digest != platformPinningRoot || ctr.image.platform != "linux/arm64" {
 		t.Fatalf("identity = %+v, want root digest and selected platform", ctr.image)
 	}
-	if ctr.image.variantDigest != issue115ReviewVariant {
-		t.Fatalf("variant digest = %q, want %q", ctr.image.variantDigest, issue115ReviewVariant)
+	if ctr.image.variantDigest != platformPinningVariant {
+		t.Fatalf("variant digest = %q, want %q", ctr.image.variantDigest, platformPinningVariant)
 	}
 
 	actual := imageFromInfo(&engineInfo{
 		image:              "redis:7-alpine",
-		imageDigest:        issue115ReviewRoot,
-		imageVariantDigest: issue115ReviewVariant,
+		imageDigest:        platformPinningRoot,
+		imageVariantDigest: platformPinningVariant,
 		platform:           "linux/arm64",
 	})
 	if actual.reference != wantReference {
@@ -446,14 +446,14 @@ func TestIssue115ApplePlatformUsesRootIndexDigestForRunAndReuse(t *testing.T) {
 	}
 }
 
-type issue115DockerIDRunner struct {
+type dockerIDRunner struct {
 	mu           sync.Mutex
 	inspect      []byte
 	runImage     string
 	inspectCalls int
 }
 
-func (r *issue115DockerIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+func (r *dockerIDRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	switch {
@@ -470,15 +470,15 @@ func (r *issue115DockerIDRunner) Run(_ context.Context, args ...string) ([]byte,
 	}
 }
 
-func TestIssue115AppleMalformedDescriptorDoesNotFallbackToID(t *testing.T) {
-	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"not-a-digest"}}}]`, issue115ReviewID))
+func TestAppleMalformedDescriptorDoesNotFallbackToID(t *testing.T) {
+	data := []byte(fmt.Sprintf(`[{"id":%q,"configuration":{"name":"redis:7-alpine","descriptor":{"digest":"not-a-digest"}}}]`, platformPinningID))
 	identity, exists := (appleEngine{}).parseImageIdentity(data, "redis:7-alpine", "")
 	if !exists || identity.pinned {
 		t.Fatalf("identity = %+v, exists = %v, want fail-closed malformed descriptor", identity, exists)
 	}
 }
 
-func TestIssue115DockerUnprefixedInspectIDCanonicalizes(t *testing.T) {
+func TestDockerUnprefixedInspectIDCanonicalizes(t *testing.T) {
 	raw := strings.Repeat("a", 64)
 	identity, exists := (dockerEngine{}).parseImageIdentity(
 		[]byte(`[{"Id":"`+raw+`"}]`), "redis:7-alpine", "")
@@ -491,9 +491,9 @@ func TestIssue115DockerUnprefixedInspectIDCanonicalizes(t *testing.T) {
 	}
 }
 
-func TestIssue115DockerUnprefixedImageIDCanonicalizesOnlyAfterExactMatch(t *testing.T) {
-	canonical := "sha256:" + issue115ReviewID
-	input := issue115ReviewID
+func TestDockerUnprefixedImageIDCanonicalizesOnlyAfterExactMatch(t *testing.T) {
+	canonical := "sha256:" + platformPinningID
+	input := platformPinningID
 	matching := []byte(fmt.Sprintf(`[{"Id":%q}]`, canonical))
 	identity, exists := (dockerEngine{}).parseImageIdentity(matching, input, "")
 	if !exists || !identity.pinned || identity.reference != canonical {
@@ -507,10 +507,10 @@ func TestIssue115DockerUnprefixedImageIDCanonicalizesOnlyAfterExactMatch(t *test
 	}
 }
 
-func TestIssue115DockerUnprefixedImageIDRunUsesCanonicalID(t *testing.T) {
-	canonical := "sha256:" + issue115ReviewID
-	r := &issue115DockerIDRunner{inspect: []byte(fmt.Sprintf(`[{"Id":%q}]`, canonical))}
-	ctr, err := Run(context.Background(), issue115ReviewID,
+func TestDockerUnprefixedImageIDRunUsesCanonicalID(t *testing.T) {
+	canonical := "sha256:" + platformPinningID
+	r := &dockerIDRunner{inspect: []byte(fmt.Sprintf(`[{"Id":%q}]`, canonical))}
+	ctr, err := Run(context.Background(), platformPinningID,
 		WithName("myctr"), WithPullPolicy(PullNever), withRunner(r), withEngine(dockerEngine{}))
 	if err != nil {
 		t.Fatalf("Run: %v", err)

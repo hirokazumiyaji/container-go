@@ -193,7 +193,7 @@ func TestPullWithCustomRunner(t *testing.T) {
 	}
 }
 
-func TestPruneOptionsValidation(t *testing.T) {
+func TestPrunePublicOptionValidation(t *testing.T) {
 	ctx := context.Background()
 
 	// Nil option
@@ -228,8 +228,13 @@ func TestPruneOptionsValidation(t *testing.T) {
 func TestPruneWithCustomRunner(t *testing.T) {
 	r := &mockRunner{
 		runFn: func(ctx context.Context, args ...string) ([]byte, []byte, error) {
-			// return empty json or empty list
-			return []byte("[]"), nil, nil
+			// Answer the list call in the shape the detected backend parses:
+			// the Apple list is JSON, the Docker list is newline-separated IDs.
+			// An empty result has to mean "nothing to remove" on both.
+			if args[0] == "ls" {
+				return []byte("[]"), nil, nil
+			}
+			return nil, nil, nil
 		},
 	}
 	removed, err := Prune(context.Background(), WithPruneRunner(r))
@@ -279,7 +284,11 @@ func TestPruneReuseGroupOptionsValidation(t *testing.T) {
 func TestPruneReuseGroupWithCustomRunner(t *testing.T) {
 	r := &mockRunner{
 		runFn: func(ctx context.Context, args ...string) ([]byte, []byte, error) {
-			return []byte("[]"), nil, nil
+			// See TestPruneWithCustomRunner: the list shape differs per backend.
+			if args[0] == "ls" {
+				return []byte("[]"), nil, nil
+			}
+			return nil, nil, nil
 		},
 	}
 	removed, err := PruneReuseGroup(context.Background(), "integration", WithPruneRunner(r))

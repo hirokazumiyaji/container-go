@@ -57,7 +57,7 @@ func TestSettleLogMatchRemainsObservableWithContinuousReader(t *testing.T) {
 
 func TestFinalLifecycleProbeRetriesTransientError(t *testing.T) {
 	transient := errors.New("temporary lifecycle probe failure")
-	target := &issue90Target{runningErrs: []error{transient}}
+	target := &stubWaitTarget{runningErrs: []error{transient}}
 	err := poll(
 		context.Background(),
 		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
@@ -74,7 +74,7 @@ func TestFinalLifecycleProbeRetriesTransientError(t *testing.T) {
 }
 
 func TestFinalLifecycleProbePreservesPermanentCause(t *testing.T) {
-	target := &issue90Target{runningErrs: []error{ErrContainerNotFound}}
+	target := &stubWaitTarget{runningErrs: []error{ErrContainerNotFound}}
 	err := poll(
 		context.Background(),
 		options{startupTimeout: time.Second, pollInterval: time.Millisecond},
@@ -91,7 +91,7 @@ func TestFinalLifecycleProbePreservesPermanentCause(t *testing.T) {
 }
 
 type freshAlwaysTransientTarget struct {
-	*issue90Target
+	*stubWaitTarget
 	cause error
 }
 
@@ -103,8 +103,8 @@ func (t *freshAlwaysTransientTarget) Running(context.Context) (bool, error) {
 func TestFinalLifecycleProbeRetainsTransientCauseAtDeadline(t *testing.T) {
 	transient := errors.New("lifecycle stayed unavailable")
 	target := &freshAlwaysTransientTarget{
-		issue90Target: &issue90Target{},
-		cause:         transient,
+		stubWaitTarget: &stubWaitTarget{},
+		cause:          transient,
 	}
 	err := poll(
 		context.Background(),

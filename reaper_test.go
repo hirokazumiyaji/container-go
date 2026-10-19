@@ -3,10 +3,13 @@
 package container
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -255,6 +258,33 @@ func TestReaperSpawnFailuresResetOnSuccess(t *testing.T) {
 	r.closeStdin()
 	if r.spawnFailures != 0 {
 		t.Errorf("spawnFailures = %d, want 0 after success (consecutive counting)", r.spawnFailures)
+	}
+}
+
+func TestReaperGiveUpLogsOnlyOnce(t *testing.T) {
+	r := newReaper("reaper-binary-test", "delete")
+	r.spawnCommand = func() (*exec.Cmd, error) {
+		return nil, errors.New("spawn failed")
+	}
+
+	var buf bytes.Buffer
+	origOutput := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(origOutput)
+
+	// First registration should trigger spawn failures up to maxReaperSpawnFailures and log give-up once.
+	_ = r.register("id1", "")
+
+	giveUpCount := strings.Count(buf.String(), "reaper giving up temporarily")
+	if giveUpCount != 1 {
+		t.Fatalf("give-up log count = %d, want 1; output: %s", giveUpCount, buf.String())
+	}
+
+	// Next registration with new entry should retry recovery burst, but must not log give-up again.
+	_ = r.register("id2", "")
+	giveUpCount2 := strings.Count(buf.String(), "reaper giving up temporarily")
+	if giveUpCount2 != 1 {
+		t.Fatalf("give-up log count after 2nd registration = %d, want 1; output: %s", giveUpCount2, buf.String())
 	}
 }
 

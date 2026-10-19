@@ -23,3 +23,11 @@ updates:
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
+
+  # tools is a separate module declaring developer tool dependencies
+  # (actionlint, govulncheck) so Dependabot can track new versions.
+  - package-ecosystem: "gomod"
+    directory: "/tools"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5

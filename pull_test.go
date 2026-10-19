@@ -528,12 +528,18 @@ func TestPruneReuseGroupWithFakeRunner(t *testing.T) {
 }
 
 type reuseGroupRunner struct {
+	mu          sync.Mutex
 	ids         []string
 	listCalls   int
 	deleteCalls int
 }
 
 func (r *reuseGroupRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	// Prune deletes candidates from several workers at once. This fake does no
+	// blocking work and calls nothing else, so one lock around the call is
+	// enough.
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	switch args[0] {
 	case "ps":
 		r.listCalls++

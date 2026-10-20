@@ -125,7 +125,7 @@ func newPullConfig() *pullConfig {
 // WithPullRunner sets the runner used for Pull.
 func WithPullRunner(r Runner) PullOption {
 	return func(c *pullConfig) error {
-		if r == nil {
+		if runnerIsNil(r) {
 			return validationErrorf("WithPullRunner", nil, "runner must not be nil")
 		}
 		c.runner = r
@@ -172,12 +172,7 @@ func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	if err != nil {
 		return safePublicError(err)
 	}
-	runner := cfg.runner
-	if runner == nil {
-		runner = defaultRunnerFor(eng)
-	}
-	applyBinaryToRunner(runner, cfg.binary)
-	return safePublicError(pullWith(ctx, runner, eng, image))
+	return safePublicError(pullWith(ctx, effectiveRunner(cfg.runner, cfg.binary, eng), eng, image))
 }
 
 // pullWith is the fake-runner-driven core of Pull. It resolves and validates

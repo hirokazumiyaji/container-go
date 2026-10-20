@@ -285,7 +285,7 @@ func TestCommandErrorPreservesExitStatusWhenContextExpires(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := commandError(ctx, "stub", []string{"exec"}, nil, nil, rawErr)
+	err := commandError(ctx, "stub", "stub", []string{"exec"}, nil, nil, rawErr)
 	var cliErr *CLIError
 	if !errors.As(err, &cliErr) || cliErr.ExitCode != 7 {
 		t.Fatalf("error = %v, want CLIError exit code 7", err)
@@ -1442,5 +1442,35 @@ func TestIsCommandExit(t *testing.T) {
 	}
 	if IsCommandExit(nil) {
 		t.Error("nil must not count as command exit")
+	}
+}
+
+// A runner pointed at a differently-named executable still reports the
+// backend's CLI in its CLIError, which is what the classifiers compare against.
+// The executed path stays in the diagnostic text.
+func TestExecRunnerCLIErrorReportsIdentity(t *testing.T) {
+	stub := writeStub(t, `echo "boom" >&2; exit 3`)
+	r := &ExecRunner{Binary: stub, Identity: "docker"}
+	_, _, err := r.Run(context.Background(), "ps")
+	var cliErr *CLIError
+	if !errors.As(err, &cliErr) {
+		t.Fatalf("error = %v, want CLIError", err)
+	}
+	if cliErr.Binary != "docker" {
+		t.Fatalf("CLIError.Binary = %q, want the identity docker", cliErr.Binary)
+	}
+	if !strings.Contains(err.Error(), "docker") {
+		t.Fatalf("error = %v, want the identity in the diagnostic", err)
+	}
+}
+
+// Without an identity the executable names the backend, which is the
+// historical behaviour for a runner that runs the backend's own CLI.
+func TestExecRunnerIdentityDefaultsToBinary(t *testing.T) {
+	if got := (&ExecRunner{Binary: "/usr/local/bin/docker"}).identity(); got != "/usr/local/bin/docker" {
+		t.Fatalf("identity = %q, want the executable", got)
+	}
+	if got := (&ExecRunner{}).identity(); got != "container" {
+		t.Fatalf("identity = %q, want container", got)
 	}
 }

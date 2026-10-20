@@ -83,6 +83,7 @@ func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...stri
 		lifecycle:  lifecycle,
 		ctx:        ctx,
 		binary:     bin,
+		identity:   r.identity(),
 		args:       append([]string(nil), args...),
 		output:     pw,
 		stderr:     &tailBuffer{},
@@ -185,10 +186,13 @@ type processStream struct {
 	lifecycle *commandLifecycle
 	ctx       context.Context
 	binary    string
-	args      []string
-	output    *io.PipeWriter
-	stderr    *tailBuffer
-	ordered   *streamOutput
+	// identity names the backend CLI for error classification; see
+	// ExecRunner.Identity.
+	identity string
+	args     []string
+	output   *io.PipeWriter
+	stderr   *tailBuffer
+	ordered  *streamOutput
 
 	// stdoutRead and stderrRead are aliases for the single ordered child
 	// endpoint. The matching write end is local to Stream and is never
@@ -680,7 +684,7 @@ func (s *processStream) readError(readErr error) error {
 
 func (s *processStream) cliError(exitErr *exec.ExitError) error {
 	return &CLIError{
-		Binary:   s.binary,
+		Binary:   s.identity,
 		Args:     s.args,
 		ExitCode: exitErr.ExitCode(),
 		Stderr:   s.stderr.String(),

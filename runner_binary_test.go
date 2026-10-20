@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"testing"
+
+	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
 
 type mockRunner struct {
@@ -333,8 +335,129 @@ func TestPullAndPruneOrderIndependence(t *testing.T) {
 	}
 }
 
+// A configured binary names the executable to run, while the backend identity
+// error classification compares against stays the backend's own CLI. Without
+// that split, a wrapper executable would stop the backend from recognizing
+// errors its own CLI produced, silently degrading not-found, absence and
+// conflict detection.
+func TestConfiguredBinaryKeepsBackendIdentity(t *testing.T) {
+	tests := []struct {
+		name   string
+		binary string
+	}{
+		{"renamed wrapper", "/opt/docker-wrapper"},
+		{"same name in another directory", "/usr/local/bin/docker"},
+		{"bare name", "docker"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			runner, ok := effectiveRunner(&ExecRunner{Binary: tt.binary}, "", dockerEngine{}).(*ExecRunner)
+			if !ok {
+				t.Fatalf("runner = %T, want *ExecRunner", runner)
+			}
+			if runner.Binary != tt.binary {
+				t.Fatalf("runner binary = %q, want the configured %q", runner.Binary, tt.binary)
+			}
+			if runner.Identity != "docker" {
+				t.Fatalf("runner identity = %q, want docker", runner.Identity)
+			}
+			// The identity is what classification compares, so the backend must
+			// keep recognizing errors its CLI produced under the override.
+			cliErr := &cli.CLIError{Binary: runner.Identity, Args: []string{"inspect", "abc"}, ExitCode: 1}
+			if !cliBinaryMatches(cliErr.Binary, (dockerEngine{}).binary()) {
+				t.Fatalf("CLIError binary %q did not match the backend", cliErr.Binary)
+			}
+		})
+	}
+}
+
+func TestUnconfiguredEnginesKeepDefaultBinary(t *testing.T) {
+	if got := (dockerEngine{}).binary(); got != "docker" {
+		t.Fatalf("docker binary = %q, want docker", got)
+	}
+	if got := (dockerEngine{}).probe().Binary; got != "docker" {
+		t.Fatalf("docker probe binary = %q, want docker", got)
+	}
+	if got := (appleEngine{}).binary(); got != "container" {
+		t.Fatalf("apple binary = %q, want container", got)
+	}
+	if got := (appleEngine{}).probe().Binary; got != "container" {
+		t.Fatalf("apple probe binary = %q, want container", got)
+	}
+}
+
+// An ExecRunner the caller supplied without naming an executable inherits the
+// backend's CLI, which is what Run does for its default runner. Leaving it
+// empty would make ExecRunner fall back to "container" on every backend.
+func TestEffectiveRunnerAppliesEngineBinary(t *testing.T) {
+	inherited := effectiveRunner(&ExecRunner{}, "", dockerEngine{})
+	er, ok := inherited.(*ExecRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want *ExecRunner", inherited)
+	}
+	if er.Binary != "docker" {
+		t.Fatalf("runner binary = %q, want docker", er.Binary)
+	}
+
+	configured := effectiveRunner(&ExecRunner{}, "/opt/docker-wrapper", dockerEngine{})
+	if er := configured.(*ExecRunner); er.Binary != "/opt/docker-wrapper" {
+		t.Fatalf("runner binary = %q, want the configured path", er.Binary)
+	}
+}
+
+// A typed-nil pointer stored in the runner interface passes an == nil test and
+// then panics when the runner is used, so every runner option has to reject it
+// by value.
+func TestRunnerOptionsRejectTypedNil(t *testing.T) {
+	var typedNil *ExecRunner
+	options := []struct {
+		name string
+		err  error
+	}{
+		{"WithRunner", WithRunner(typedNil)(newConfig())},
+		{"WithPruneRunner", WithPruneRunner(typedNil)(&pruneConfig{})},
+		{"WithPullRunner", WithPullRunner(typedNil)(&pullConfig{})},
+	}
+	for _, tt := range options {
+		t.Run(tt.name, func(t *testing.T) {
+			if tt.err == nil {
+				t.Fatal("typed-nil runner was accepted, want a validation error")
+			}
+			var valErr *ValidationError
+			if !errors.As(tt.err, &valErr) {
+				t.Fatalf("error = %v, want ValidationError", tt.err)
+			}
+		})
+	}
+}
+
 func TestTypeAliasesUsable(t *testing.T) {
 	var _ Runner = &ExecRunner{}
 	var _ ExternalRunner = &ExecRunner{}
 	var _ Streamer = &ExecRunner{}
+}
+
+// The Run path stamps the identity on the runner it resolves, so a wrapper
+// configured through WithBinary still classifies as its backend. The caller's
+// own runner is left untouched: the library supports concurrent callers sharing
+// one runner.
+func TestRunStampsEngineIdentity(t *testing.T) {
+	configured := &ExecRunner{Binary: "/opt/docker-wrapper"}
+	cfg := newConfig()
+	cfg.eng = dockerEngine{}
+	cfg.runner = configured
+	applyEngineBinary(cfg)
+	er, ok := cfg.runner.(*ExecRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want *ExecRunner", cfg.runner)
+	}
+	if er.Identity != "docker" {
+		t.Fatalf("identity = %q, want docker", er.Identity)
+	}
+	if er.Binary != "/opt/docker-wrapper" {
+		t.Fatalf("binary = %q, want the configured wrapper", er.Binary)
+	}
+	if configured.Identity != "" {
+		t.Fatalf("caller runner was mutated: identity = %q", configured.Identity)
+	}
 }

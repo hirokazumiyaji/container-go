@@ -141,8 +141,11 @@ func (r *ExecRunner) ExternalBinary() string { return r.Binary }
 // used unkeyed CLIError literals; stdout is therefore carried by the
 // internal diagnosticError wrapper below instead of being added here.
 type CLIError struct {
-	// Binary is the CLI executable that failed (e.g. "container" or
-	// "docker"). Empty means the historical default of "container".
+	// Binary names the backend CLI this failure belongs to, e.g. "container"
+	// or "docker". Classifiers compare against it, so a runner pointed at a
+	// configured wrapper executable still reports the backend that owns it --
+	// which also means the value names the backend rather than the executable
+	// that ran. Empty means the historical default of "container".
 	Binary   string
 	Args     []string
 	ExitCode int
@@ -267,6 +270,12 @@ type ExecRunner struct {
 	// Binary is the CLI executable. Empty means "container" resolved
 	// from PATH.
 	Binary string
+	// Identity names the backend CLI this runner speaks for, which is what
+	// error classification compares against. Empty means the executable names
+	// it, which is right when Binary is the backend's own CLI. A caller that
+	// points Binary at a wrapper sets this so the wrapper's errors are still
+	// attributed to the backend that owns it.
+	Identity string
 
 	// Env is the optional slice of environment variables for child
 	// processes. When non-empty, variables override or are added to the
@@ -281,9 +290,23 @@ func (r *ExecRunner) binary() string {
 	return r.Binary
 }
 
+// identity names the backend CLI for error classification.
+func (r *ExecRunner) identity() string {
+	if r.Identity != "" {
+		return r.Identity
+	}
+	return r.binary()
+}
+
 // SetBinary overrides the CLI executable to run.
 func (r *ExecRunner) SetBinary(binary string) {
 	r.Binary = binary
+}
+
+// SetIdentity records which backend CLI this runner speaks for, for callers
+// that wrap it and still want its errors attributed to the backend.
+func (r *ExecRunner) SetIdentity(identity string) {
+	r.Identity = identity
 }
 
 // ExternalEnv returns the runner's custom environment variables.
@@ -356,6 +379,7 @@ func (r *ExecRunner) RunTo(ctx context.Context, stdout, stderr io.Writer, args .
 // for the CLIError diagnostic once the child has been reaped.
 func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stderrW io.Writer, captured func() ([]byte, []byte), args []string) error {
 	bin := r.binary()
+	identity := r.identity()
 	cmd := exec.CommandContext(ctx, bin, args...)
 	if len(r.Env) > 0 {
 		cmd.Env = MergeEnv(os.Environ(), r.Env)
@@ -414,14 +438,14 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	err := lifecycle.result()
 	status := lifecycle.status()
 	stdout, stderr := captured()
-	commandErr := commandError(ctx, bin, args, stdout, stderr, err)
+	commandErr := commandError(ctx, bin, identity, args, stdout, stderr, err)
 	if commandErr == nil && ctx.Err() != nil && status.TerminatedByCancellation {
 		commandErr = fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctx.Err())
 	}
 	return markRunStatus(commandErr, status)
 }
 
-func commandError(ctx context.Context, bin string, args []string, stdout, stderr []byte, err error) error {
+func commandError(ctx context.Context, bin, identity string, args []string, stdout, stderr []byte, err error) error {
 	if err == nil {
 		return nil
 	}
@@ -435,7 +459,7 @@ func commandError(ctx context.Context, bin string, args []string, stdout, stderr
 			return fmt.Errorf("%s %s: %w", bin, strings.Join(args, " "), ctxErr)
 		}
 		cliErr := &CLIError{
-			Binary:   bin,
+			Binary:   identity,
 			Args:     args,
 			ExitCode: exitCode,
 			Stderr:   truncateStderr(string(stderr)),
@@ -458,7 +482,7 @@ func commandError(ctx context.Context, bin string, args []string, stdout, stderr
 // commandRunError is the historical helper name retained for tests that
 // exercise cancellation races without a stdout side channel.
 func commandRunError(ctx context.Context, bin string, args []string, stderr []byte, err error) error {
-	return commandError(ctx, bin, args, nil, stderr, err)
+	return commandError(ctx, bin, bin, args, nil, stderr, err)
 }
 
 // withProbeOutput attaches captured probe streams to an error so

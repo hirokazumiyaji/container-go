@@ -5,6 +5,7 @@ import (
 	"io"
 	"path"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
@@ -408,6 +409,22 @@ func validateImageReference(image string) error {
 	return nil
 }
 
+// runnerIsNil reports whether r is unusable as a runner. A typed-nil pointer
+// stored in the interface passes an == nil test and then panics when the
+// runner is used, so a nil runner has to be rejected by value rather than by
+// interface identity.
+func runnerIsNil(r Runner) bool {
+	if r == nil {
+		return true
+	}
+	value := reflect.ValueOf(r)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
+}
+
 func applyBinaryToRunner(r Runner, binary string) {
 	if r == nil || binary == "" {
 		return
@@ -424,7 +441,7 @@ func applyBinaryToRunner(r Runner, binary string) {
 // WithRunner sets the runner used for CLI invocations.
 func WithRunner(r Runner) Option {
 	return func(c *config) error {
-		if r == nil {
+		if runnerIsNil(r) {
 			return validationErrorf("WithRunner", nil, "runner must not be nil")
 		}
 		c.runner = r

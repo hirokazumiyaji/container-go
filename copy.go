@@ -141,6 +141,21 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 		return nil
 	}
 
+	return copyFilesConcurrently(ctx, files, func(runCtx context.Context, f File) error {
+		if err := c.copyFileWithTarget(runCtx, target, f.HostPath, f.ContainerPath, false); err != nil {
+			return &fileCopyError{File: f, Err: err}
+		}
+		return nil
+	})
+}
+
+// copyFilesConcurrently applies copyFile to every file with bounded
+// parallelism, stopping at the first failure and waiting for the rest before
+// returning. A worker that finds the context already cancelled stops without
+// starting another copy, so when no copy recorded an error the caller gets the
+// context error: a cancellation landing between copies would otherwise look
+// like a fully applied copy set.
+func copyFilesConcurrently(ctx context.Context, files []File, copyFile func(context.Context, File) error) error {
 	concurrency := defaultCopyFilesParallelism
 	if len(files) < concurrency {
 		concurrency = len(files)
@@ -169,9 +184,9 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 				if copyCtx.Err() != nil {
 					return
 				}
-				if err := c.copyFileWithTarget(copyCtx, target, f.HostPath, f.ContainerPath, false); err != nil {
+				if err := copyFile(copyCtx, f); err != nil {
 					errOnce.Do(func() {
-						firstErr = &fileCopyError{File: f, Err: err}
+						firstErr = err
 						cancel()
 					})
 					return
@@ -181,7 +196,10 @@ func (c *Container) copyFiles(ctx context.Context, files []File) error {
 	}
 
 	wg.Wait()
-	return firstErr
+	if firstErr != nil {
+		return firstErr
+	}
+	return ctx.Err()
 }
 
 func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath string, allowDirectory bool) error {

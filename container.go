@@ -17,15 +17,17 @@ import (
 	"unsafe"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
+	"github.com/hirokazumiyaji/container-go/internal/ports"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 const (
-	managedLabel    = "com.github.hirokazumiyaji.container-go"
-	sessionLabel    = "com.github.hirokazumiyaji.container-go.session"
-	reuseLabel      = "com.github.hirokazumiyaji.container-go.reuse"
-	reuseGroupLabel = "com.github.hirokazumiyaji.container-go.reuse-group"
-	creationLabel   = "com.github.hirokazumiyaji.container-go.creation"
+	managedLabel    = domain.LabelManaged
+	sessionLabel    = domain.LabelSession
+	reuseLabel      = domain.LabelReuse
+	reuseGroupLabel = domain.LabelReuseGroup
+	creationLabel   = domain.LabelCreation
 
 	queryTimeout = 30 * time.Second
 	// runTimeout also covers an implicit image pull.
@@ -119,16 +121,16 @@ func newCreationID() string {
 }
 
 // State is a container lifecycle state.
-type State string
+type State = domain.State
 
 const (
-	StateRunning    State = "running"
-	StateStopped    State = "stopped"
-	StateStopping   State = "stopping"
-	StateCreated    State = "created"
-	StateRestarting State = "restarting"
-	StatePaused     State = "paused"
-	StateUnknown    State = "unknown"
+	StateRunning    State = domain.StateRunning
+	StateStopped    State = domain.StateStopped
+	StateStopping   State = domain.StateStopping
+	StateCreated    State = domain.StateCreated
+	StateRestarting State = domain.StateRestarting
+	StatePaused     State = domain.StatePaused
+	StateUnknown    State = domain.StateUnknown
 )
 
 // lockPack holds the mutable, synchronized fields of a Container. Shared
@@ -577,14 +579,7 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 }
 
 func waitForReusePoll(ctx context.Context) error {
-	timer := time.NewTimer(reusePollInterval)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-timer.C:
-		return nil
-	}
+	return ports.RealClock{}.SleepWithContext(ctx, reusePollInterval)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before

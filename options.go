@@ -2,7 +2,6 @@ package container
 
 import (
 	"fmt"
-	"net/netip"
 	"path"
 	"path/filepath"
 	"reflect"
@@ -12,7 +11,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
-	"github.com/hirokazumiyaji/container-go/internal/portspec"
+	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -118,24 +117,17 @@ func (c *config) validate() error {
 
 // allLabels merges the session labels the library always applies with
 // user-supplied ones. Internal labels always win so callers cannot
-// override the generation used for safe cleanup.
+// override the generation used for safe cleanup. validate rejects
+// WithReuseGroup without WithReuse, which is also what lets BuildLabels
+// decide whether to emit the reuse-group label.
 func (c *config) allLabels() map[string]string {
-	labels := map[string]string{}
-	for k, v := range c.labels {
-		labels[k] = v
-	}
-	labels[managedLabel] = "true"
-	labels[sessionLabel] = sessionID()
-	if c.creation != "" {
-		labels[creationLabel] = c.creation
-	}
-	if c.reuse {
-		labels[reuseLabel] = "true"
-	}
-	if c.reuseGroup != "" {
-		labels[reuseGroupLabel] = c.reuseGroup
-	}
-	return labels
+	return domain.BuildLabels(domain.LabelConfig{
+		Session:    sessionID(),
+		Creation:   c.creation,
+		Reuse:      c.reuse,
+		ReuseGroup: c.reuseGroup,
+		Custom:     c.labels,
+	})
 }
 
 // commonRunArgs builds the shared run flags after --name: labels,
@@ -711,11 +703,11 @@ type portSpec struct {
 func (p portSpec) String() string { return strconv.Itoa(p.port) + "/" + p.proto }
 
 func parsePortSpec(s string) (portSpec, error) {
-	spec, err := portspec.Parse(s)
+	spec, err := domain.ParsePortSpec(s)
 	if err != nil {
 		return portSpec{}, err
 	}
-	return portSpec{port: spec.Port, proto: spec.Protocol}, nil
+	return portSpec{port: spec.Port, proto: spec.Proto}, nil
 }
 
 type publishSpec struct {
@@ -727,93 +719,48 @@ type publishSpec struct {
 }
 
 func parsePublishSpec(s string) (publishSpec, error) {
-	spec := publishSpec{raw: s, proto: "tcp"}
-	rest := s
-	if portsPart, proto, ok := strings.Cut(s, "/"); ok {
-		if proto != "tcp" && proto != "udp" {
-			return publishSpec{}, invalidOption("published port", "protocol must be tcp or udp")
+	spec, err := domain.ParsePublishSpec(s)
+	if err != nil {
+		if field, ok := domain.FieldOf(err); ok {
+			return publishSpec{}, invalidOption(field, err.Error())
 		}
-		spec.proto = proto
-		rest = portsPart
-	}
-
-	if strings.HasPrefix(rest, "[") {
-		// Bracketed IPv6 host: [addr]:host-port:container-port
-		end := strings.Index(rest, "]:")
-		if end < 0 {
-			return publishSpec{}, invalidOption("published port", "bracketed IPv6 form is malformed")
-		}
-		spec.hostAddr = rest[1:end]
-		rest = rest[end+2:]
-	} else if parts := strings.Split(rest, ":"); len(parts) == 3 {
-		spec.hostAddr = parts[0]
-		rest = parts[1] + ":" + parts[2]
-	}
-	if spec.hostAddr != "" {
-		addr, err := netip.ParseAddr(spec.hostAddr)
-		if err != nil {
-			return publishSpec{}, fmt.Errorf("invalid publish spec %q: host address must be an IP: %w", s, err)
-		}
-		spec.hostAddr = addr.Unmap().String()
-	}
-
-	hostPart, ctrPart, ok := strings.Cut(rest, ":")
-	if !ok || strings.Contains(ctrPart, ":") {
-		return publishSpec{}, invalidOption("published port", "want [host-ip:]host-port:container-port[/proto]")
-	}
-	var err error
-	if spec.hostPort, err = parsePortNumber(hostPart); err != nil {
 		return publishSpec{}, err
 	}
-	if spec.containerPort, err = parsePortNumber(ctrPart); err != nil {
-		return publishSpec{}, err
-	}
-	return spec, nil
-}
-
-func parsePortNumber(s string) (int, error) {
-	n, err := strconv.Atoi(s)
-	if err != nil || n < 1 || n > 65535 {
-		return 0, invalidOption("port", "must be 1-65535")
-	}
-	return n, nil
+	return publishSpec{
+		hostAddr:      spec.HostAddr,
+		hostPort:      spec.HostPort,
+		containerPort: spec.ContainerPort,
+		proto:         spec.Proto,
+		raw:           spec.Raw,
+	}, nil
 }
 
 // connectAddr is the address clients should dial for a published port.
 // Preserve the address family when turning an unspecified bind into a
 // loopback destination.
 func (p publishSpec) connectAddr() string {
-	if p.hostAddr == "" {
-		return "127.0.0.1"
+	d := domain.PublishSpec{
+		HostAddr:      p.hostAddr,
+		HostPort:      p.hostPort,
+		ContainerPort: p.containerPort,
+		Proto:         p.proto,
+		Raw:           p.raw,
 	}
-	if ipIsUnspecified(p.hostAddr) {
-		if ipIs4(p.hostAddr) {
-			return "127.0.0.1"
-		}
-		return "::1"
-	}
-	return canonicalIP(p.hostAddr)
+	return d.ConnectAddr()
 }
 
 func canonicalIP(addr string) string {
-	ip, err := netip.ParseAddr(addr)
-	if err != nil {
-		return addr
-	}
-	return ip.Unmap().String()
+	return domain.CanonicalIP(addr)
 }
 
 func ipIs4(addr string) bool {
-	ip, err := netip.ParseAddr(addr)
-	return err == nil && ip.Unmap().Is4()
+	return domain.IPIs4(addr)
 }
 
 func ipIsLoopback(addr string) bool {
-	ip, err := netip.ParseAddr(addr)
-	return err == nil && ip.Unmap().IsLoopback()
+	return domain.IPIsLoopback(addr)
 }
 
 func ipIsUnspecified(addr string) bool {
-	ip, err := netip.ParseAddr(addr)
-	return err == nil && ip.Unmap().IsUnspecified()
+	return domain.IPIsUnspecified(addr)
 }

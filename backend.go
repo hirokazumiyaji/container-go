@@ -34,11 +34,11 @@ func applyEngineBinary(cfg *config) {
 func applyEngineRunnerEnv(cfg *config) {
 	if de, ok := cfg.eng.(dockerEngine); ok {
 		if er, ok := cfg.runner.(*cli.ExecRunner); ok {
-			targetEnv := de.targetEnv()
+			targetEnv := de.pinnedTargetEnv()
 			if len(targetEnv) > 0 {
 				cloned := &cli.ExecRunner{
 					Binary: er.Binary,
-					Env:    cli.MergeEnv(er.Env, targetEnv),
+					Env:    pinRunnerEnv(er.Env, targetEnv),
 				}
 				cfg.runner = cloned
 			}
@@ -49,7 +49,7 @@ func applyEngineRunnerEnv(cfg *config) {
 func defaultRunnerFor(eng engine) cli.Runner {
 	var env []string
 	if de, ok := eng.(dockerEngine); ok {
-		env = de.targetEnv()
+		env = de.pinnedTargetEnv()
 	}
 	return &cli.ExecRunner{Binary: eng.binary(), Env: env}
 }

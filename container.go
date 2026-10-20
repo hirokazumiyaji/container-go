@@ -209,6 +209,9 @@ type Container struct {
 	// Docker UID to a caller-visible handle.
 	nameInspect bool
 
+	queryTimeout time.Duration
+	probeTimeout time.Duration
+
 	sync                    *lockPack
 	diagnosticRedactorValue *cli.Redactor
 	secretsMu               sync.RWMutex
@@ -225,6 +228,20 @@ func (c *Container) TargetHost() string {
 		return c.eng.defaultHost()
 	}
 	return "127.0.0.1"
+}
+
+func (c *Container) effectiveQueryTimeout() time.Duration {
+	if c.queryTimeout > 0 {
+		return c.queryTimeout
+	}
+	return queryTimeout
+}
+
+func (c *Container) effectiveProbeTimeout() time.Duration {
+	if c.probeTimeout > 0 {
+		return c.probeTimeout
+	}
+	return 0
 }
 
 func (c *Container) pack() *lockPack {
@@ -372,7 +389,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// Establish the run budget before env-file security preflight. The
 	// preflight takes the root advisory lock and may otherwise outlive a
 	// canceled caller while another process is holding that lock.
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	runCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveRunTimeout())
 	defer cancel()
 
 	if len(cfg.env) > 0 {
@@ -458,7 +475,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := classifyErrorFor(ctx, cfg.runner, runErr, cfg.eng, "run", cfg.name)
+		classified := classifyErrorForWithProbe(ctx, cfg.runner, runErr, cfg.eng, cfg.probeTimeout, "run", cfg.name)
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, runErr, classified); cleanupErr != nil {
 			return nil, joinEnvFileCleanupError(withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
@@ -478,6 +495,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		id:                      cfg.name,
 		runner:                  cfg.runner,
 		eng:                     cfg.eng,
+		queryTimeout:            cfg.queryTimeout,
+		probeTimeout:            cfg.probeTimeout,
 		exposed:                 cfg.exposed,
 		published:               cfg.published,
 		network:                 cfg.network,
@@ -591,7 +610,7 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 	}
 	if len(env) == 0 {
 		if de, ok := cfg.eng.(dockerEngine); ok {
-			env = de.targetEnv()
+			env = de.pinnedTargetEnv()
 		}
 	}
 	reaperKey := binary
@@ -669,8 +688,12 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 	return stdout, stderr, true, err
 }
 
-func waitForReusePoll(ctx context.Context) error {
-	return ports.RealClock{}.SleepWithContext(ctx, reusePollInterval)
+func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
+	d := reusePollInterval
+	if len(interval) > 0 && interval[0] > 0 {
+		d = interval[0]
+	}
+	return ports.RealClock{}.SleepWithContext(ctx, d)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before
@@ -681,7 +704,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	if c == nil || cfg == nil || !validCreationID(c.creation) {
 		return fmt.Errorf("verify created container: invalid creation generation")
 	}
-	verifyCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 
 	var info *engineInfo
@@ -693,7 +716,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 			if !dockerIDRE.MatchString(uid) {
 				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
 			}
-			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, sync: &lockPack{uid: uid}}
+			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout, sync: &lockPack{uid: uid}}
 		}
 		unlock := func() {}
 		if cfg.eng.name() == "apple" {
@@ -716,7 +739,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
-		if err := waitForReusePoll(verifyCtx); err != nil {
+		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 	}
@@ -760,7 +783,15 @@ func (c *Container) rollback(ctx context.Context, cause error) error {
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
 	if c.reused {
-		cfg := &config{runner: c.runner, eng: c.eng, name: c.id, reuse: true, creation: c.creation}
+		cfg := &config{
+			runner:       c.runner,
+			eng:          c.eng,
+			name:         c.id,
+			reuse:        true,
+			creation:     c.creation,
+			queryTimeout: c.queryTimeout,
+			probeTimeout: c.probeTimeout,
+		}
 		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
 		if err != nil {
 			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
@@ -797,7 +828,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if !validCreationID(cfg.creation) {
 		return identityError("failed create has no valid creation generation")
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())
 	defer cancel()
 	if !requiresImmutableID(cfg.eng) {
 		unlock, err := lockName(cleanupCtx, cfg.name)
@@ -865,7 +896,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())
 	defer delCancel()
 	if err := ctr.delete(delCtx, target); err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
@@ -912,7 +943,7 @@ func (c *Container) dockerGenerationMatches(info *engineInfo) bool {
 }
 
 func (c *Container) classify(ctx context.Context, err error) error {
-	return classifyError(ctx, c.runner, err, c.eng)
+	return classifyErrorWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout)
 }
 
 func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
@@ -921,9 +952,9 @@ func (c *Container) classifyOperation(ctx context.Context, err error, operation 
 	}
 	target := c.operationTarget()
 	if target == c.id {
-		return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target)
+		return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target)
 	}
-	return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target, c.id)
+	return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target, c.id)
 }
 
 func (c *Container) deleteOperation() string {
@@ -960,7 +991,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	stopCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
 	if err != nil {
@@ -1294,6 +1325,7 @@ func (c *Container) Shared() *Container {
 	c.secretsMu.RUnlock()
 	return &Container{
 		id: c.id, runner: c.runner, eng: c.eng,
+		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
 		exposed: c.exposed, published: c.published,
 		network: c.network, networkExplicit: c.networkExplicit,
 		reused: c.reused, allowDestructive: true, creation: c.creation,
@@ -1469,7 +1501,7 @@ func (c *Container) Terminate(ctx context.Context) error {
 
 func (c *Container) delete(ctx context.Context, target string) error {
 	c.stopAttached()
-	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	delCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if contextErr := commandContextError(delCtx, err); contextErr != nil {
@@ -2027,7 +2059,7 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if name := c.cachedDefaultNetwork(); name != "" {
 		return name, nil
 	}
-	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
+	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 	if err != nil {
 		return "", err
 	}
@@ -2054,7 +2086,7 @@ func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engin
 	if !configNeedsDefaultNetwork(cfg) {
 		return nil
 	}
-	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng)
+	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
 		return err
 	}
@@ -2115,7 +2147,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		return nil, identityError("Apple handle has no valid creation generation")
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

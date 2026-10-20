@@ -114,6 +114,80 @@ func (e dockerEngine) targetEnv() []string {
 	return env
 }
 
+// pinRunnerEnv applies a pinned target environment to a runner's own
+// environment. Configured values override; a bare key is appended as a
+// removal marker only when the runner does not set that key itself. The
+// markers must stay in ExecRunner.Env because the inherited process
+// environment is merged at exec time, not here.
+func pinRunnerEnv(runnerEnv, pinned []string) []string {
+	// Collapse duplicate keys first (last occurrence wins, matching
+	// MergeEnv) so replacing a pinned key in place cannot leave an earlier
+	// stale duplicate that first-match env lookup would prefer.
+	env := make([]string, 0, len(runnerEnv)+len(pinned))
+	index := make(map[string]int, len(runnerEnv))
+	for _, entry := range runnerEnv {
+		key, _, ok := strings.Cut(entry, "=")
+		if !ok || key == "" {
+			// Index a bare removal marker too, so re-applying the pinned
+			// environment cannot append the same marker twice.
+			if key != "" {
+				if _, seen := index[key]; seen {
+					continue
+				}
+				index[key] = len(env)
+			}
+			env = append(env, entry)
+			continue
+		}
+		if at, duplicate := index[key]; duplicate {
+			env[at] = entry
+			continue
+		}
+		index[key] = len(env)
+		env = append(env, entry)
+	}
+	for _, entry := range pinned {
+		key, _, hasValue := strings.Cut(entry, "=")
+		if key == "" {
+			continue
+		}
+		if at, exists := index[key]; exists {
+			if hasValue {
+				env[at] = entry
+			}
+			continue
+		}
+		index[key] = len(env)
+		env = append(env, entry)
+	}
+	return env
+}
+
+// pinnedTargetEnv returns the complete child environment for this target:
+// every component is either its configured value or a bare key that removes
+// the inherited entry. targetEnv only lists configured components, so an
+// unset one would let a variable exported after the target was frozen
+// repoint the child CLI at another daemon.
+//
+// Connection modifiers (DOCKER_TLS_VERIFY, DOCKER_CERT_PATH,
+// DOCKER_API_VERSION) are intentionally left inherited: they change how the
+// pinned connection is negotiated, not which daemon it reaches, and
+// stripping them would break a daemon that requires TLS.
+func (e dockerEngine) pinnedTargetEnv() []string {
+	env := e.targetEnv()
+	present := make(map[string]struct{}, len(env))
+	for _, entry := range env {
+		key, _, _ := strings.Cut(entry, "=")
+		present[key] = struct{}{}
+	}
+	for _, key := range []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG", "DOCKER_DEFAULT_PLATFORM"} {
+		if _, ok := present[key]; !ok {
+			env = append(env, key)
+		}
+	}
+	return env
+}
+
 // Docker parses stop --time through a signed integer. Cap the value at
 // MaxInt32 so the argument is safe for 32-bit Docker CLIs as well as 64-bit
 // ones; the daemon's duration conversion is also safe at this limit.
@@ -191,12 +265,16 @@ func (e dockerEngine) isRemote() bool {
 // The client OS is not authoritative for a remote Docker daemon, and the
 // name "bridge" or "nat" alone does not prove that a user-defined network
 // is the daemon default.
-func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine) (string, error) {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+func dockerDefaultNetwork(ctx context.Context, runner cli.Runner, eng engine, timeouts opTimeouts) (string, error) {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{.Server.Os}}")
 	if err != nil {
-		classified := cli.Classify(ctx, runner, err, eng.probe())
+		classified := classifyErrorWithProbe(ctx, runner, err, eng, timeouts.probe)
 		return "", fmt.Errorf("inspect Docker server platform: %w", classified)
 	}
 	serverOS := strings.ToLower(strings.TrimSpace(string(stdout)))
@@ -309,11 +387,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 }
 
 func inspectDockerNetwork(ctx context.Context, cfg *config) (dockerNetworkInfo, error) {
-	queryCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	queryCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 	stdout, _, err := cfg.runner.Run(queryCtx, "network", "inspect", cfg.network)
 	if err != nil {
-		classified := cli.Classify(ctx, cfg.runner, err, cfg.eng.probe())
+		classified := classifyErrorWithProbe(ctx, cfg.runner, err, cfg.eng, cfg.effectiveProbeTimeout())
 		return dockerNetworkInfo{}, fmt.Errorf("inspect Docker network %q before starting container: %w", cfg.network, classified)
 	}
 	return parseDockerNetworkInspect(stdout, cfg.network)
@@ -1471,10 +1549,12 @@ func parseDockerVersionPair(data []byte) (dockerVersion, dockerVersion, error) {
 	return client, server, nil
 }
 
-// checkCopyFileFromContainerVersion verifies both ends of the Docker
-// client/daemon connection before any private destination is created.
-func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner) error {
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+func (dockerEngine) checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error {
+	qTimeout := timeouts.query
+	if qTimeout <= 0 {
+		qTimeout = queryTimeout
+	}
+	qCtx, cancel := withDefaultTimeout(ctx, qTimeout)
 	defer cancel()
 	stdout, _, err := runner.Run(qCtx, "version", "--format", "{{json .}}")
 	if err != nil {

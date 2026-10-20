@@ -47,7 +47,8 @@ func WithClientBackend(backend string) ClientOption {
 // WithClientBinary sets the CLI executable path for the backend.
 func WithClientBinary(binary string) ClientOption {
 	return func(c *clientConfig) error {
-		if strings.TrimSpace(binary) == "" {
+		binary = strings.TrimSpace(binary)
+		if binary == "" {
 			return fmt.Errorf("client binary must not be empty")
 		}
 		c.binary = binary
@@ -58,6 +59,9 @@ func WithClientBinary(binary string) ClientOption {
 // WithClientDockerHost sets the target DOCKER_HOST for Docker.
 func WithClientDockerHost(host string) ClientOption {
 	return func(c *clientConfig) error {
+		if err := validateDockerTargetValue("WithClientDockerHost", host); err != nil {
+			return err
+		}
 		c.dockerHost = &host
 		return nil
 	}
@@ -66,6 +70,9 @@ func WithClientDockerHost(host string) ClientOption {
 // WithClientDockerContext sets the target DOCKER_CONTEXT for Docker.
 func WithClientDockerContext(context string) ClientOption {
 	return func(c *clientConfig) error {
+		if err := validateDockerTargetValue("WithClientDockerContext", context); err != nil {
+			return err
+		}
 		c.dockerContext = &context
 		return nil
 	}
@@ -74,6 +81,9 @@ func WithClientDockerContext(context string) ClientOption {
 // WithClientDockerConfig sets the DOCKER_CONFIG directory for Docker.
 func WithClientDockerConfig(dir string) ClientOption {
 	return func(c *clientConfig) error {
+		if err := validateDockerTargetValue("WithClientDockerConfig", dir); err != nil {
+			return err
+		}
 		c.dockerConfigDir = &dir
 		return nil
 	}
@@ -82,6 +92,9 @@ func WithClientDockerConfig(dir string) ClientOption {
 // WithClientPlatform sets the target platform for Docker (DOCKER_DEFAULT_PLATFORM).
 func WithClientPlatform(platform string) ClientOption {
 	return func(c *clientConfig) error {
+		if err := validateDockerTargetValue("WithClientPlatform", platform); err != nil {
+			return err
+		}
 		c.platform = &platform
 		return nil
 	}
@@ -163,7 +176,7 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 	if runner == nil {
 		var env []string
 		if de, ok := eng.(dockerEngine); ok {
-			env = de.targetEnv()
+			env = de.pinnedTargetEnv()
 		}
 		runner = &cli.ExecRunner{Binary: binary, Env: env}
 	} else if er, ok := runner.(*cli.ExecRunner); ok {
@@ -175,8 +188,8 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 			cloned.Binary = binary
 		}
 		if de, ok := eng.(dockerEngine); ok {
-			if targetEnv := de.targetEnv(); len(targetEnv) > 0 {
-				cloned.Env = cli.MergeEnv(cloned.Env, targetEnv)
+			if targetEnv := de.pinnedTargetEnv(); len(targetEnv) > 0 {
+				cloned.Env = pinRunnerEnv(cloned.Env, targetEnv)
 			}
 		}
 		runner = cloned
@@ -195,10 +208,10 @@ func NewClient(opts ...ClientOption) (*Client, error) {
 		} else {
 			eng = resolved
 			if er, ok := runner.(*cli.ExecRunner); ok {
-				if targetEnv := resolved.targetEnv(); len(targetEnv) > 0 {
+				if targetEnv := resolved.pinnedTargetEnv(); len(targetEnv) > 0 {
 					cloned := &cli.ExecRunner{
 						Binary: er.Binary,
-						Env:    cli.MergeEnv(er.Env, targetEnv),
+						Env:    pinRunnerEnv(er.Env, targetEnv),
 					}
 					runner = cloned
 				}

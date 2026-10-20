@@ -570,6 +570,29 @@ func TestMergeEnvReplacesMatchingKeys(t *testing.T) {
 	}
 }
 
+func TestMergeEnvBareKeyRemovesInheritedEntry(t *testing.T) {
+	base := []string{"DOCKER_HOST=tcp://daemon-a:2375", "KEEP=1"}
+
+	got := MergeEnv(base, []string{"DOCKER_HOST"})
+	want := []string{"KEEP=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+
+	// A later assignment for the same key wins over the removal marker.
+	got = MergeEnv(base, []string{"DOCKER_HOST", "DOCKER_HOST=tcp://daemon-b:2375"})
+	want = []string{"KEEP=1", "DOCKER_HOST=tcp://daemon-b:2375"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+
+	// A removal marker for a key the base does not have changes nothing.
+	got = MergeEnv(base, []string{"MALFORMED"})
+	if !slices.Equal(got, base) {
+		t.Fatalf("MergeEnv = %q, want base %q", got, base)
+	}
+}
+
 func TestMergeEnvDeduplicatesAndSkipsMalformedOverrides(t *testing.T) {
 	base := []string{"FOO=1", "BAR=2"}
 	overrides := []string{"BAR=first", "MALFORMED", "=EMPTY", "BAR=second", "NEW=value"}

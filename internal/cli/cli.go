@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -94,6 +95,9 @@ type Probe struct {
 	Args   []string
 	Hint   string
 	Binary string
+	// Timeout bounds the diagnostic liveness check. When zero, probeTimeout
+	// (5 seconds) is used.
+	Timeout time.Duration
 	// Operation names the backend command represented by Args. It lets
 	// classifiers ignore joined CLIError branches from other operations.
 	Operation string
@@ -272,6 +276,11 @@ type ExecRunner struct {
 	// points Binary at a wrapper sets this so the wrapper's errors are still
 	// attributed to the backend that owns it.
 	Identity string
+
+	// Env is the optional slice of environment variables for child
+	// processes. When non-empty, variables override or are added to the
+	// process's environment.
+	Env []string
 }
 
 func (r *ExecRunner) binary() string {
@@ -298,6 +307,14 @@ func (r *ExecRunner) SetBinary(binary string) {
 // that wrap it and still want its errors attributed to the backend.
 func (r *ExecRunner) SetIdentity(identity string) {
 	r.Identity = identity
+}
+
+// ExternalEnv returns the runner's custom environment variables.
+func (r *ExecRunner) ExternalEnv() []string {
+	if len(r.Env) == 0 {
+		return nil
+	}
+	return append([]string(nil), r.Env...)
 }
 
 type runHooks struct {
@@ -364,6 +381,9 @@ func (r *ExecRunner) execute(ctx context.Context, hooks runHooks, stdoutW, stder
 	bin := r.binary()
 	identity := r.identity()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(r.Env) > 0 {
+		cmd.Env = MergeEnv(os.Environ(), r.Env)
+	}
 	configureProcessTree(cmd)
 	lifecycle := newCommandLifecycle(ctx, cmd)
 	var cancelObservedOnce sync.Once
@@ -722,7 +742,11 @@ func Classify(ctx context.Context, r Runner, err error, probe Probe) error {
 		return withContextError(ctx, err)
 	}
 
-	probeCtx, cancel := context.WithTimeout(ctx, probeTimeout)
+	timeout := probe.Timeout
+	if timeout <= 0 {
+		timeout = probeTimeout
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	probeStdout, probeStderr, probeErr := r.Run(probeCtx, probe.Args...)
 	if probeErr != nil {
@@ -1269,4 +1293,61 @@ func containsNonLivenessText(s string) bool {
 		}
 	}
 	return false
+}
+
+// MergeEnv merges base environment variables with overrides, ensuring that
+// variables in overrides replace any matching key in base. Duplicate override
+// keys keep the last value, so the child environment stays deterministic. An
+// override may also be a bare key without "=": that removes the inherited
+// entry instead of leaving a stale value behind for the child process.
+func MergeEnv(base, overrides []string) []string {
+	if len(overrides) == 0 {
+		return append([]string(nil), base...)
+	}
+	// order keeps the first appearance position of each key while value
+	// keeps its last override. An entry of "" is a removal marker: the key
+	// was named without "=", so the inherited value must be dropped and
+	// nothing is emitted for it.
+	order := make([]string, 0, len(overrides))
+	value := make(map[string]string, len(overrides))
+	for _, env := range overrides {
+		key, _, ok := strings.Cut(env, "=")
+		if !ok {
+			key = env
+			env = ""
+		}
+		if key == "" {
+			continue
+		}
+		if runtime.GOOS == "windows" {
+			key = strings.ToUpper(key)
+		}
+		if _, seen := value[key]; !seen {
+			order = append(order, key)
+		}
+		value[key] = env
+	}
+	if len(order) == 0 {
+		return append([]string(nil), base...)
+	}
+	res := make([]string, 0, len(base)+len(order))
+	for _, env := range base {
+		key, _, ok := strings.Cut(env, "=")
+		if ok {
+			lookupKey := key
+			if runtime.GOOS == "windows" {
+				lookupKey = strings.ToUpper(key)
+			}
+			if _, overridden := value[lookupKey]; overridden {
+				continue
+			}
+		}
+		res = append(res, env)
+	}
+	for _, key := range order {
+		if entry := value[key]; entry != "" {
+			res = append(res, entry)
+		}
+	}
+	return res
 }

@@ -58,6 +58,9 @@ type streamHooks struct {
 func (r *ExecRunner) stream(ctx context.Context, hooks streamHooks, args ...string) (io.ReadCloser, error) {
 	bin := r.binary()
 	cmd := exec.CommandContext(ctx, bin, args...)
+	if len(r.Env) > 0 {
+		cmd.Env = MergeEnv(os.Environ(), r.Env)
+	}
 	cmd.WaitDelay = 3 * time.Second
 	configureProcessTree(cmd)
 

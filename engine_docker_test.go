@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -527,6 +528,82 @@ func (r *blockingDockerInspectRunner) targets() []string {
 	return slices.Clone(r.inspectTarget)
 }
 
+func TestDockerPinnedTargetEnvCoversEveryComponent(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://daemon-a:2375")
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", "")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "")
+
+	env := dockerEngine{}.pinnedTargetEnv()
+	want := []string{
+		"DOCKER_HOST=tcp://daemon-a:2375",
+		"DOCKER_CONTEXT",
+		"DOCKER_CONFIG",
+		"DOCKER_DEFAULT_PLATFORM",
+	}
+	if !slices.Equal(env, want) {
+		t.Fatalf("pinnedTargetEnv() = %v, want %v", env, want)
+	}
+
+	// The bare keys remove the inherited entries, so a variable exported
+	// after the target was frozen cannot repoint the child.
+	merged := cli.MergeEnv([]string{
+		"DOCKER_HOST=tcp://late:2375",
+		"DOCKER_CONTEXT=late",
+		"DOCKER_CONFIG=/late",
+		"DOCKER_DEFAULT_PLATFORM=linux/arm64",
+		"KEEP=1",
+	}, env)
+	got := map[string]string{}
+	for _, entry := range merged {
+		key, value, _ := strings.Cut(entry, "=")
+		got[key] = value
+	}
+	if len(got) != 2 || got["DOCKER_HOST"] != "tcp://daemon-a:2375" || got["KEEP"] != "1" {
+		t.Fatalf("merged env = %v, want the frozen host and KEEP=1 only", merged)
+	}
+}
+
+func TestPinRunnerEnvKeepsRunnerValues(t *testing.T) {
+	runnerEnv := []string{"DOCKER_HOST=tcp://runner-host:2375"}
+	pinned := []string{"DOCKER_HOST", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+
+	// A removal marker must not delete a value the runner sets itself, and
+	// the marker has to survive into the runner environment so the
+	// inherited process value is still stripped at exec time.
+	got := pinRunnerEnv(runnerEnv, pinned)
+	want := []string{"DOCKER_HOST=tcp://runner-host:2375", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	got = pinRunnerEnv([]string{"DOCKER_HOST=tcp://old:2375"}, []string{"DOCKER_HOST=tcp://new:2375"})
+	want = []string{"DOCKER_HOST=tcp://new:2375"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	// A duplicate key in the runner environment collapses to the last
+	// occurrence, so first-match lookup cannot prefer a stale value.
+	got = pinRunnerEnv(
+		[]string{"DOCKER_HOST=tcp://stale:2375", "KEEP=1", "DOCKER_HOST=tcp://old:2375"},
+		[]string{"DOCKER_HOST=tcp://new:2375"},
+	)
+	want = []string{"DOCKER_HOST=tcp://new:2375", "KEEP=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("pinRunnerEnv() = %v, want %v", got, want)
+	}
+
+	// Re-applying the pinned environment is idempotent: markers are not
+	// duplicated, and a later value replaces a marker in place.
+	pinned = []string{"DOCKER_HOST=tcp://new:2375", "DOCKER_CONTEXT", "DOCKER_CONFIG"}
+	once := pinRunnerEnv(nil, pinned)
+	twice := pinRunnerEnv(once, pinned)
+	if !slices.Equal(once, twice) {
+		t.Fatalf("pinRunnerEnv() re-application = %v, want %v", twice, once)
+	}
+}
+
 func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
 	if err != nil {
@@ -543,7 +620,7 @@ func TestDockerConcurrentFirstInspectUsesResolvedID(t *testing.T) {
 		runner:  runner,
 		eng:     dockerEngine{},
 		exposed: []portSpec{{port: 6379, proto: "tcp"}},
-		sync: &lockPack{uid: dockerFixtureID},
+		sync:    &lockPack{uid: dockerFixtureID},
 	}
 
 	start := make(chan struct{})
@@ -875,6 +952,56 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 }
 
+func TestDockerRestartArgsValidatesTimeout(t *testing.T) {
+	e := dockerEngine{}
+	if got, err := e.restartArgs("myctr", nil); err != nil || !slices.Equal(got, []string{"restart", "myctr"}) {
+		t.Errorf("restartArgs(nil) = %v, %v", got, err)
+	}
+	d := 5 * time.Second
+	if got, err := e.restartArgs("myctr", &d); err != nil || !slices.Equal(got, []string{"restart", "-t", "5", "myctr"}) {
+		t.Errorf("restartArgs(5s) = %v, %v", got, err)
+	}
+	// A positive sub-second timeout rounds up like stop, while a negative or
+	// unbounded one is rejected before the CLI sees it.
+	sub := 500 * time.Millisecond
+	if got, err := e.restartArgs("myctr", &sub); err != nil || !slices.Equal(got, []string{"restart", "-t", "1", "myctr"}) {
+		t.Errorf("restartArgs(500ms) = %v, %v", got, err)
+	}
+	for name, timeout := range map[string]time.Duration{
+		"sub-second negative":   -time.Millisecond,
+		"above backend maximum": time.Duration(maxDockerStopSeconds)*time.Second + time.Nanosecond,
+		"maximum duration":      math.MaxInt64,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := e.restartArgs("myctr", &timeout); err == nil || got != nil {
+				t.Errorf("restartArgs(%v) = %v, %v, want a rejected timeout", timeout, got, err)
+			}
+		})
+	}
+}
+
+func TestParseInspectTimeReportsUnknownAsZero(t *testing.T) {
+	cases := []struct {
+		name     string
+		value    string
+		wantZero bool
+	}{
+		{name: "empty is unknown", value: "", wantZero: true},
+		{name: "go zero value is unknown", value: "0001-01-01T00:00:00Z", wantZero: true},
+		{name: "malformed is unknown", value: "yesterday", wantZero: true},
+		{name: "rfc3339", value: "2025-03-04T05:06:07Z"},
+		{name: "rfc3339nano", value: "2025-03-04T05:06:07.123456789Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseInspectTime(tc.value)
+			if got.IsZero() != tc.wantZero {
+				t.Fatalf("parseInspectTime(%q) = %v, wantZero %v", tc.value, got, tc.wantZero)
+			}
+		})
+	}
+}
+
 func TestDockerProbeUnavailableFailsClosedForConfiguration(t *testing.T) {
 	probeArgs := []string{"version", "--format", "{{.Server.Version}}"}
 	cases := []struct {
@@ -1198,7 +1325,7 @@ func (d *dockerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte,
 			return d.inspectResponses[index], nil, nil
 		}
 		return d.inspectJSON, nil, nil
-	case "image", "pull":
+	case "image", "pull", "context":
 		return d.fakeRunner.Run(ctx, args...)
 	default:
 		return nil, nil, nil

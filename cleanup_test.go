@@ -468,6 +468,11 @@ func TestPruneOptionsValidation(t *testing.T) {
 			opt:     WithPruneParallelism(0),
 			wantErr: "parallelism must be positive",
 		},
+		{
+			name:    "nil option",
+			opt:     nil,
+			wantErr: "option 0 is nil",
+		},
 	}
 
 	for _, tt := range tests {
@@ -638,3 +643,45 @@ func TestPruneTimeoutCapsCallerWithLaterDeadline(t *testing.T) {
 	}
 }
 
+// inspectDeadlinePruneRunner records the deadline the verify step is handed.
+type inspectDeadlinePruneRunner struct {
+	*fakeRunner
+	inspectDeadline time.Time
+}
+
+func (r *inspectDeadlinePruneRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "ps":
+		return []byte(cleanupDockerIDOne + "\n"), nil, nil
+	case "inspect":
+		r.inspectDeadline, _ = ctx.Deadline()
+		return []byte(fmt.Sprintf(`[{"Id":%q,"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"true",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`,
+			cleanupDockerIDOne, managedLabel, reuseLabel, creationLabel)), nil, nil
+	case "rm":
+		return nil, nil, nil
+	default:
+		return r.fakeRunner.Run(ctx, args...)
+	}
+}
+
+// TestPruneDockerCandidateIsBoundedByQueryTimeout pins the per-candidate bound
+// on the docker path. The overall prune deadline is deliberately an hour, and
+// withDefaultTimeout leaves a context that already carries a deadline
+// unchanged, so the verify step has to be capped explicitly or a hung inspect
+// runs until the overall deadline instead of queryTimeout.
+func TestPruneDockerCandidateIsBoundedByQueryTimeout(t *testing.T) {
+	runner := &inspectDeadlinePruneRunner{fakeRunner: newTestRunner()}
+	removed, err := pruneWith(context.Background(), runner, dockerEngine{}, WithPruneTimeout(time.Hour))
+	if err != nil {
+		t.Fatalf("pruneWith: %v", err)
+	}
+	if len(removed) != 1 || removed[0] != cleanupDockerIDOne {
+		t.Fatalf("removed = %v, want [%s]", removed, cleanupDockerIDOne)
+	}
+	if runner.inspectDeadline.IsZero() {
+		t.Fatal("the verify step never ran")
+	}
+	if remaining := time.Until(runner.inspectDeadline); remaining > queryTimeout {
+		t.Fatalf("verify deadline is %v away, want at most queryTimeout (%v)", remaining, queryTimeout)
+	}
+}

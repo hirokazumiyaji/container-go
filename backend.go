@@ -57,7 +57,7 @@ func applyEngineBinary(cfg *config) {
 // back to the historical "container" name on every backend.
 func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 	if configured == nil {
-		configured = &cli.ExecRunner{}
+		configured = defaultRunnerFor(eng)
 	}
 	applyBinaryToRunner(configured, binary)
 	if er, ok := configured.(*cli.ExecRunner); ok {
@@ -69,6 +69,32 @@ func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 		return &stamped
 	}
 	return applyEngineIdentity(configured, eng)
+}
+
+// applyEngineRunnerEnv points the default runner at the selected engine's
+// target environment.
+func applyEngineRunnerEnv(cfg *config) {
+	if de, ok := cfg.eng.(dockerEngine); ok {
+		if er, ok := cfg.runner.(*cli.ExecRunner); ok {
+			targetEnv := de.pinnedTargetEnv()
+			if len(targetEnv) > 0 {
+				cloned := &cli.ExecRunner{
+					Binary:   er.Binary,
+					Identity: er.Identity,
+					Env:      pinRunnerEnv(er.Env, targetEnv),
+				}
+				cfg.runner = cloned
+			}
+		}
+	}
+}
+
+func defaultRunnerFor(eng engine) cli.Runner {
+	var env []string
+	if de, ok := eng.(dockerEngine); ok {
+		env = de.pinnedTargetEnv()
+	}
+	return &cli.ExecRunner{Binary: eng.binary(), Env: env}
 }
 
 func detectEngineFor(goos, value string) (engine, error) {

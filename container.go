@@ -6,7 +6,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
+	"os"
+	"runtime"
 	"slices"
 	"sort"
 	"strconv"
@@ -148,6 +151,19 @@ type lockPack struct {
 	dynamicMu      contextLock      // serializes dynamic refresh so older inspects cannot overwrite newer ones
 	inspectMu      contextLock      // serializes inspect target selection and UID publication
 	defaultNetwork string           // Docker daemon default identity, learned lazily
+	attachMu       sync.Mutex
+	attachCancel   context.CancelFunc
+	attachDone     chan struct{}
+	// attachOutput is the WithAttachOutput destination of the current
+	// stream. It is retained so a restart can re-attach the same writer.
+	attachOutput io.Writer
+	// attachErr is the terminal failure of the current attach stream, kept
+	// for AttachedError.
+	attachErr error
+	// attachGate carries the right to write to the attach destination. It is
+	// a channel rather than a mutex so a replacement stream can give up when
+	// the sink has wedged its predecessor instead of blocking behind it.
+	attachGate chan struct{}
 }
 
 func (p *lockPack) currentTime() time.Time {
@@ -193,9 +209,39 @@ type Container struct {
 	// Docker UID to a caller-visible handle.
 	nameInspect bool
 
+	queryTimeout time.Duration
+	probeTimeout time.Duration
+
 	sync                    *lockPack
 	diagnosticRedactorValue *cli.Redactor
 	secretsMu               sync.RWMutex
+	targetHost              string
+}
+
+// TargetHost returns the client-facing default host configured when this
+// container was created.
+func (c *Container) TargetHost() string {
+	if c.targetHost != "" {
+		return c.targetHost
+	}
+	if c.eng != nil {
+		return c.eng.defaultHost()
+	}
+	return "127.0.0.1"
+}
+
+func (c *Container) effectiveQueryTimeout() time.Duration {
+	if c.queryTimeout > 0 {
+		return c.queryTimeout
+	}
+	return queryTimeout
+}
+
+func (c *Container) effectiveProbeTimeout() time.Duration {
+	if c.probeTimeout > 0 {
+		return c.probeTimeout
+	}
+	return 0
 }
 
 func (c *Container) pack() *lockPack {
@@ -287,28 +333,66 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		return nil, err
 	}
 	if cfg.eng == nil {
-		eng, err := detectEngine()
+		backend := os.Getenv(backendEnv)
+		if backend == "" && (cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil) {
+			backend = "docker"
+		}
+		eng, err := detectEngineFor(runtime.GOOS, backend)
 		if err != nil {
 			return nil, cfg.publicError(err)
 		}
 		cfg.eng = eng
 	}
+	// cfg.validate cannot see this combination before the engine is selected:
+	// with no explicit engine it runs while cfg.eng is still nil.
+	if cfg.dockerHost != nil || cfg.dockerContext != nil || cfg.dockerConfigDir != nil {
+		if _, isDocker := cfg.eng.(dockerEngine); !isDocker {
+			return nil, validationErrorf("WithDockerHost", nil, "Docker target options require Docker backend")
+		}
+	}
+	if de, ok := cfg.eng.(dockerEngine); ok {
+		if cfg.dockerHost != nil {
+			de.host = *cfg.dockerHost
+			de.explicitHost = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerContext != nil {
+			de.context = *cfg.dockerContext
+			de.explicitContext = true
+			de.explicitTarget = true
+		}
+		if cfg.dockerConfigDir != nil {
+			de.configDir = *cfg.dockerConfigDir
+			de.explicitConfigDir = true
+			de.explicitTarget = true
+		}
+		if cfg.platform != "" {
+			de.defaultPlatform = cfg.platform
+			de.explicitDefaultPlatform = true
+			de.explicitTarget = true
+		}
+		cfg.eng = de
+	}
 	applyEngineBinary(cfg)
+	applyEngineRunnerEnv(cfg)
+	// Reject Windows before the backend is asked anything: Docker context
+	// resolution runs the CLI, and chmod's 0600/0700 bits do not provide
+	// per-user secrecy there.
+	if len(cfg.env) > 0 {
+		if err := ensureEnvFileSecurity(); err != nil {
+			return nil, err
+		}
+	}
 	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return nil, err
 	}
 	// Establish the run budget before env-file security preflight. The
 	// preflight takes the root advisory lock and may otherwise outlive a
 	// canceled caller while another process is holding that lock.
-	runCtx, cancel := withDefaultTimeout(ctx, runTimeout)
+	runCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveRunTimeout())
 	defer cancel()
 
-	// Reject Windows before an image pull or any env-file storage setup.
-	// chmod's 0600/0700 bits do not provide per-user secrecy there.
 	if len(cfg.env) > 0 {
-		if err := ensureEnvFileSecurity(); err != nil {
-			return nil, err
-		}
 		// Validate the private root and reclaim provably stale directories
 		// before spending time on an image pull or backend create. The
 		// security cleanup has its own finite budget in addition to the
@@ -387,11 +471,11 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	if runErr != nil {
 		if !attempted {
 			if target, ok := runReaperTarget(cfg); ok {
-				_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+				_ = unregisterWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 			}
 			return nil, joinEnvFileCleanupError(runErr, envCleanupErr)
 		}
-		classified := classifyErrorFor(ctx, cfg.runner, runErr, cfg.eng, "run", cfg.name)
+		classified := classifyErrorForWithProbe(ctx, cfg.runner, runErr, cfg.eng, cfg.probeTimeout, "run", cfg.name)
 		if cleanupErr := cleanupFailedCreate(ctx, cfg, runErr, classified); cleanupErr != nil {
 			return nil, joinEnvFileCleanupError(withCleanupError(classified, &CleanupError{Container: cfg.name, Err: cleanupErr}), envCleanupErr)
 		}
@@ -411,6 +495,8 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		id:                      cfg.name,
 		runner:                  cfg.runner,
 		eng:                     cfg.eng,
+		queryTimeout:            cfg.queryTimeout,
+		probeTimeout:            cfg.probeTimeout,
 		exposed:                 cfg.exposed,
 		published:               cfg.published,
 		network:                 cfg.network,
@@ -419,6 +505,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		image:                   resolvedImage,
 		sync:                    &lockPack{uid: uid},
 		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
+		targetHost:              cfg.eng.defaultHost(),
 	}
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
@@ -441,13 +528,19 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		// write. Never register a second active record as a fallback:
 		// that could turn a failed state transition into a duplicate
 		// destructive target.
-		_ = completePreRegistrationWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+		_ = completePreRegistrationWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 		if uid := c.immutableID(); uid != "" {
-			_ = registerWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, uid, "")
+			_ = registerWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, uid, "")
 		}
 	}
 	if err := verifyAppleCreatedImage(ctx, c, resolvedImage); err != nil {
 		return nil, c.rollback(ctx, joinEnvFileCleanupError(err, envCleanupErr))
+	}
+	// Start the attached stream before the env-cleanup early return. Log
+	// streaming does not read the env file, and a handle returned with a
+	// cleanup warning must still honor WithAttachOutput.
+	if cfg.attachOutput != nil {
+		c.startAttached(cfg.attachOutput)
 	}
 	// Do not perform file copies or readiness polling while the env file
 	// still exists. The handle is usable, and the deferred retry retains
@@ -491,6 +584,8 @@ type runReaperTargetInfo struct {
 	binary      string
 	subcommand  string
 	deleteFlags []string
+	reaperKey   string
+	env         []string
 }
 
 func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
@@ -509,10 +604,25 @@ func runReaperTarget(cfg *config) (runReaperTargetInfo, bool) {
 			binary = cfg.eng.binary()
 		}
 	}
+	var env []string
+	if eenv, ok := cfg.runner.(interface{ ExternalEnv() []string }); ok {
+		env = eenv.ExternalEnv()
+	}
+	if len(env) == 0 {
+		if de, ok := cfg.eng.(dockerEngine); ok {
+			env = de.pinnedTargetEnv()
+		}
+	}
+	reaperKey := binary
+	if cfg.eng != nil && cfg.eng.targetID() != "" {
+		reaperKey = binary + "\x00" + cfg.eng.targetID()
+	}
 	return runReaperTargetInfo{
 		binary:      binary,
 		subcommand:  cfg.eng.reaperSubcommand(),
 		deleteFlags: append([]string(nil), cfg.eng.reaperDeleteFlags()...),
+		reaperKey:   reaperKey,
+		env:         env,
 	}, true
 }
 
@@ -521,7 +631,7 @@ func preRegisterRunWithGlobalReaper(cfg *config) {
 	if !ok {
 		return
 	}
-	_ = preRegisterWithGlobalReaper(target.binary, target.subcommand, target.deleteFlags, cfg.name, cfg.creation)
+	_ = preRegisterWithGlobalReaperTarget(target.reaperKey, target.binary, target.subcommand, target.deleteFlags, target.env, cfg.name, cfg.creation)
 }
 
 func unregisterReuseFromGlobalReaper(cfg *config) {
@@ -529,7 +639,7 @@ func unregisterReuseFromGlobalReaper(cfg *config) {
 	if !ok {
 		return
 	}
-	_ = unregisterWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+	_ = unregisterWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 }
 
 // unregisterContainerReaper removes only the records proven to belong to
@@ -542,10 +652,10 @@ func unregisterContainerReaper(cfg *config, name, creation, uid string) {
 		return
 	}
 	if uid != "" && cfg.eng.name() == "docker" {
-		_ = unregisterWithGlobalReaper(target.binary, uid, "")
+		_ = unregisterWithGlobalReaperKey(target.reaperKey, uid, "")
 	}
 	if name != "" {
-		_ = unregisterWithGlobalReaper(target.binary, name, creation)
+		_ = unregisterWithGlobalReaperKey(target.reaperKey, name, creation)
 	}
 }
 
@@ -557,7 +667,7 @@ func protectReuseReaper(cfg *config) {
 	// markShared updates the in-memory state before attempting the pipe
 	// write. Thus even a failed transition fails closed: the record is
 	// non-destructive and is replayed as shared on the next child.
-	_ = markSharedWithGlobalReaper(target.binary, cfg.name, cfg.creation)
+	_ = markSharedWithGlobalReaperKey(target.reaperKey, cfg.name, cfg.creation)
 }
 
 // runCreateLocked serializes an Apple name-addressed create with the
@@ -578,8 +688,12 @@ func runCreateLocked(ctx context.Context, cfg *config, args ...string) (stdout [
 	return stdout, stderr, true, err
 }
 
-func waitForReusePoll(ctx context.Context) error {
-	return ports.RealClock{}.SleepWithContext(ctx, reusePollInterval)
+func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
+	d := reusePollInterval
+	if len(interval) > 0 && interval[0] > 0 {
+		d = interval[0]
+	}
+	return ports.RealClock{}.SleepWithContext(ctx, d)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before
@@ -590,7 +704,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 	if c == nil || cfg == nil || !validCreationID(c.creation) {
 		return fmt.Errorf("verify created container: invalid creation generation")
 	}
-	verifyCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	verifyCtx, cancel := withDefaultTimeout(ctx, cfg.effectiveQueryTimeout())
 	defer cancel()
 
 	var info *engineInfo
@@ -602,7 +716,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 			if !dockerIDRE.MatchString(uid) {
 				return fmt.Errorf("verify created container %s: invalid immutable container ID %q", c.id, uid)
 			}
-			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, sync: &lockPack{uid: uid}}
+			inspectContainer = &Container{id: uid, runner: c.runner, eng: c.eng, queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout, sync: &lockPack{uid: uid}}
 		}
 		unlock := func() {}
 		if cfg.eng.name() == "apple" {
@@ -625,7 +739,7 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 		if !isNotFoundFor(cfg.eng, err) && !transientReuseInspectError(err) {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
-		if err := waitForReusePoll(verifyCtx); err != nil {
+		if err := waitForReusePoll(verifyCtx, cfg.effectiveReusePollInterval()); err != nil {
 			return fmt.Errorf("verify created container %s: %w", c.id, err)
 		}
 	}
@@ -663,12 +777,21 @@ func verifyCreatedOwnership(ctx context.Context, c *Container, cfg *config) erro
 // cannot verify the generation, and the caller must know the container was left
 // behind.
 func (c *Container) rollback(ctx context.Context, cause error) error {
+	c.stopAttached()
 	if keepContainers() {
 		return cause
 	}
 	cleanupCtx := context.WithoutCancel(ctx)
 	if c.reused {
-		cfg := &config{runner: c.runner, eng: c.eng, name: c.id, reuse: true, creation: c.creation}
+		cfg := &config{
+			runner:       c.runner,
+			eng:          c.eng,
+			name:         c.id,
+			reuse:        true,
+			creation:     c.creation,
+			queryTimeout: c.queryTimeout,
+			probeTimeout: c.probeTimeout,
+		}
 		deleted, err := rollbackReuse(cleanupCtx, c, cfg)
 		if err != nil {
 			return withCleanupError(cause, &CleanupError{Container: c.id, Err: err})
@@ -705,7 +828,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 	if !validCreationID(cfg.creation) {
 		return identityError("failed create has no valid creation generation")
 	}
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())
 	defer cancel()
 	if !requiresImmutableID(cfg.eng) {
 		unlock, err := lockName(cleanupCtx, cfg.name)
@@ -773,7 +896,7 @@ func cleanupFailedCreate(ctx context.Context, cfg *config, runErr, classified er
 		}
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
 	}
-	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), queryTimeout)
+	delCtx, delCancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.effectiveQueryTimeout())
 	defer delCancel()
 	if err := ctr.delete(delCtx, target); err != nil {
 		return fmt.Errorf("cleanup container %s: %w", cfg.name, err)
@@ -820,7 +943,7 @@ func (c *Container) dockerGenerationMatches(info *engineInfo) bool {
 }
 
 func (c *Container) classify(ctx context.Context, err error) error {
-	return classifyError(ctx, c.runner, err, c.eng)
+	return classifyErrorWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout)
 }
 
 func (c *Container) classifyOperation(ctx context.Context, err error, operation string) error {
@@ -829,9 +952,9 @@ func (c *Container) classifyOperation(ctx context.Context, err error, operation 
 	}
 	target := c.operationTarget()
 	if target == c.id {
-		return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target)
+		return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target)
 	}
-	return classifyErrorFor(ctx, c.runner, err, c.eng, operation, target, c.id)
+	return classifyErrorForWithProbe(ctx, c.runner, err, c.eng, c.probeTimeout, operation, target, c.id)
 }
 
 func (c *Container) deleteOperation() string {
@@ -868,7 +991,7 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("stop %s: %w", c.id, ErrSharedContainer)
 	}
-	stopCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	stopCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(stopCtx)
 	if err != nil {
@@ -879,7 +1002,312 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
 	_, _, err = c.runner.Run(stopCtx, args...)
-	return c.classifyOperation(ctx, err, "stop")
+	if err != nil {
+		return c.classifyOperation(ctx, err, "stop")
+	}
+	c.stopAttached()
+	c.clearDynamic()
+	return nil
+}
+
+// Image returns the image reference the container was created with.
+func (c *Container) Image() string {
+	return c.image.reference
+}
+
+// InspectInfo represents a point-in-time snapshot of container state and metadata.
+type InspectInfo struct {
+	id         string
+	name       string
+	image      string
+	imageID    string
+	state      State
+	exitCode   int
+	createdAt  time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+	labels     map[string]string
+	ip         string
+	platform   string
+	ports      []PortBinding
+}
+
+func (i *InspectInfo) ID() string      { return i.id }
+func (i *InspectInfo) Name() string    { return i.name }
+func (i *InspectInfo) Image() string   { return i.image }
+func (i *InspectInfo) ImageID() string { return i.imageID }
+func (i *InspectInfo) State() State    { return i.state }
+func (i *InspectInfo) ExitCode() int   { return i.exitCode }
+
+// CreatedAt returns the backend-reported creation time. The zero time is the
+// documented unknown marker: the backend omitted the field or reported a form
+// this library cannot parse, and callers must not read it as a real instant.
+// StartedAt and FinishedAt use the same marker.
+func (i *InspectInfo) CreatedAt() time.Time  { return i.createdAt }
+func (i *InspectInfo) StartedAt() time.Time  { return i.startedAt }
+func (i *InspectInfo) FinishedAt() time.Time { return i.finishedAt }
+func (i *InspectInfo) IP() string            { return i.ip }
+func (i *InspectInfo) Platform() string      { return i.platform }
+
+func (i *InspectInfo) Labels() map[string]string {
+	if i.labels == nil {
+		return nil
+	}
+	clone := make(map[string]string, len(i.labels))
+	for k, v := range i.labels {
+		clone[k] = v
+	}
+	return clone
+}
+
+func (i *InspectInfo) Ports() []PortBinding {
+	if i.ports == nil {
+		return nil
+	}
+	clone := make([]PortBinding, len(i.ports))
+	copy(clone, i.ports)
+	return clone
+}
+
+// Inspect returns a fresh snapshot of the container's metadata and runtime state.
+func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return nil, err
+	}
+	ports := make([]PortBinding, len(info.bound))
+	for idx, b := range info.bound {
+		ports[idx] = PortBinding{
+			ContainerPort: b.containerPort,
+			Proto:         b.proto,
+			HostAddr:      b.hostAddr,
+			HostPort:      b.hostPort,
+		}
+	}
+	return &InspectInfo{
+		id:         c.id,
+		name:       info.name,
+		image:      info.image,
+		imageID:    info.imageID,
+		state:      info.state,
+		exitCode:   info.exitCode,
+		createdAt:  info.createdAt,
+		startedAt:  info.startedAt,
+		finishedAt: info.finishedAt,
+		labels:     info.labels,
+		ip:         info.ip,
+		platform:   info.platform,
+		ports:      ports,
+	}, nil
+}
+
+// ExitCode returns the exit code from a fresh container inspect.
+func (c *Container) ExitCode(ctx context.Context) (int, error) {
+	info, err := c.inspectDynamicFresh(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return info.exitCode, nil
+}
+
+const waitExitPollInterval = 100 * time.Millisecond
+
+// Wait blocks until the container reaches StateStopped and returns its exit code.
+// If the container is already stopped, it returns its exit code immediately.
+func (c *Container) Wait(ctx context.Context) (int, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-timer.C:
+		}
+		info, err := c.inspectDynamicFresh(ctx)
+		if err != nil {
+			// A daemon that is briefly unreachable or busy must not fail a
+			// wait that is still within its context; only a terminal inspect
+			// error ends the wait.
+			if !transientReuseInspectError(err) {
+				return 0, err
+			}
+		} else if info.state == StateStopped {
+			return info.exitCode, nil
+		}
+		timer.Reset(waitExitPollInterval)
+	}
+}
+
+// Start starts a stopped container.
+func (c *Container) Start(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("start %s: %w", c.id, ErrSharedContainer)
+	}
+	startCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(startCtx)
+	if err != nil {
+		return err
+	}
+	args := c.eng.startArgs(target)
+	_, _, err = c.runner.Run(startCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "start"), "start", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// Restart restarts the container. On backends without a native restart command
+// (such as Apple Container), it gracefully stops then starts the container; the
+// WithAttachOutput stream ends with the stopped process and is re-attached to
+// the replacement process.
+func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
+	if timeout != nil && *timeout < 0 {
+		return newValidationErrorWithField("Restart", "timeout", *timeout,
+			fmt.Errorf("restart timeout must be >= 0, got %s", *timeout))
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("restart %s: %w", c.id, ErrSharedContainer)
+	}
+	restartCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	defer cancel()
+	target, err := c.verifiedOperationTarget(restartCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.restartArgs(target, timeout)
+	if errors.Is(err, ErrUnsupportedCapability) {
+		return c.restartAttached(ctx, timeout)
+	}
+	if err != nil {
+		return fmt.Errorf("restart %s: %w", c.id, err)
+	}
+	_, _, err = c.runner.Run(restartCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "restart"), "restart", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// restartAttached emulates Restart on a backend without a native restart
+// command. Stop ends the attached log stream with the stopped process, so the
+// same writer is attached again once the replacement process has started.
+func (c *Container) restartAttached(ctx context.Context, timeout *time.Duration) error {
+	if err := c.Stop(ctx, timeout); err != nil {
+		return err
+	}
+	if err := c.Start(ctx); err != nil {
+		return err
+	}
+	if output := c.attachedOutput(); output != nil {
+		c.startAttached(output)
+	}
+	return nil
+}
+
+// Kill terminates or sends a signal to the container's main process.
+// If no signal is provided, it defaults to SIGKILL. Only a signal that is
+// guaranteed to end the main process also ends the WithAttachOutput stream; a
+// stream left attached by a catchable signal ends when the process exits.
+func (c *Container) Kill(ctx context.Context, signal ...string) error {
+	if len(signal) > 1 {
+		return newValidationErrorWithField("Kill", "signal", signal,
+			fmt.Errorf("at most one signal may be provided"))
+	}
+	var sig string
+	if len(signal) == 1 {
+		if signal[0] == "" {
+			return newValidationErrorWithField("Kill", "signal", signal[0],
+				fmt.Errorf("signal cannot be empty"))
+		}
+		sig = signal[0]
+	}
+	if c.refusesSharedOps() {
+		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
+	}
+	killCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(killCtx)
+	if err != nil {
+		return err
+	}
+	args := c.eng.killArgs(target, sig)
+	_, _, err = c.runner.Run(killCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "kill"), "kill", target, c.id)
+	}
+	if terminatingKillSignal(sig) {
+		c.stopAttached()
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// terminatingKillSignal reports whether Kill is guaranteed to end the
+// container's main process. SIGKILL cannot be caught or ignored, so an empty
+// signal (the documented SIGKILL default) and its spellings are terminating;
+// any other signal may be handled, and its stream then ends when the process
+// actually exits.
+func terminatingKillSignal(sig string) bool {
+	switch strings.ToUpper(sig) {
+	case "", "KILL", "SIGKILL", "9":
+		return true
+	default:
+		return false
+	}
+}
+
+// Pause pauses the processes in the container. Returns ErrUnsupportedCapability
+// on backends without pause capability (Apple Container).
+func (c *Container) Pause(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("pause %s: %w", c.id, ErrSharedContainer)
+	}
+	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(pCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.pauseArgs(target)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(pCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "pause"), "pause", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
+}
+
+// Unpause unpauses the processes in the container. Returns ErrUnsupportedCapability
+// on backends without pause capability (Apple Container).
+func (c *Container) Unpause(ctx context.Context) error {
+	if c.refusesSharedOps() {
+		return fmt.Errorf("unpause %s: %w", c.id, ErrSharedContainer)
+	}
+	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	defer cancel()
+	target, err := c.verifiedOperationTarget(pCtx)
+	if err != nil {
+		return err
+	}
+	args, err := c.eng.unpauseArgs(target)
+	if err != nil {
+		return err
+	}
+	_, _, err = c.runner.Run(pCtx, args...)
+	if err != nil {
+		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "unpause"), "unpause", target, c.id)
+	}
+	c.clearDynamic()
+	return nil
 }
 
 // Shared returns a handle to the same container with Stop/Copy refusals
@@ -897,6 +1325,7 @@ func (c *Container) Shared() *Container {
 	c.secretsMu.RUnlock()
 	return &Container{
 		id: c.id, runner: c.runner, eng: c.eng,
+		queryTimeout: c.queryTimeout, probeTimeout: c.probeTimeout,
 		exposed: c.exposed, published: c.published,
 		network: c.network, networkExplicit: c.networkExplicit,
 		reused: c.reused, allowDestructive: true, creation: c.creation,
@@ -905,11 +1334,119 @@ func (c *Container) Shared() *Container {
 	}
 }
 
+// StopAttached terminates any active background log streaming started by WithAttachOutput.
+func (c *Container) StopAttached() {
+	c.stopAttached()
+}
+
+// attachStopWait bounds how long a cancelled attach stream may take to finish.
+// Cancellation stops a stream at its next read, so only a sink wedged inside a
+// write can exceed it.
+const attachStopWait = 500 * time.Millisecond
+
+func (c *Container) stopAttached() {
+	p := c.pack()
+	p.attachMu.Lock()
+	cancel := p.attachCancel
+	done := p.attachDone
+	p.attachCancel = nil
+	p.attachMu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		select {
+		case <-done:
+		case <-time.After(attachStopWait):
+		}
+	}
+}
+
+// startAttached launches the background stream behind WithAttachOutput. The
+// stream outlives the Run context by design; the goroutine owns its derived
+// context so it is cancelled when the stream ends on its own, and it closes
+// done so AttachedDone observes completion without reading shared state.
+func (c *Container) startAttached(output io.Writer) {
+	attachCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	p := c.pack()
+	p.attachMu.Lock()
+	if p.attachGate == nil {
+		p.attachGate = make(chan struct{}, 1)
+	}
+	gate := p.attachGate
+	p.attachOutput = output
+	p.attachErr = nil
+	p.attachCancel = cancel
+	p.attachDone = done
+	p.attachMu.Unlock()
+	go func() {
+		defer close(done)
+		defer cancel()
+		// The gate keeps a replacement stream from writing to the same
+		// caller-supplied io.Writer while its predecessor is still inside a
+		// write. A wedged sink never releases it, so give up after the same
+		// bound StopAttached uses and report the failure instead of blocking
+		// forever.
+		select {
+		case gate <- struct{}{}:
+			defer func() { <-gate }()
+			err := c.FollowLogsTo(attachCtx, output)
+			if attachCtx.Err() == nil {
+				c.recordAttachError(err)
+			}
+		case <-time.After(attachStopWait):
+			c.recordAttachError(errors.New("logs: previous attached stream is still writing to the output; not starting a replacement"))
+		}
+	}()
+}
+
+// recordAttachError stores a terminal stream failure for AttachedError.
+func (c *Container) recordAttachError(err error) {
+	if err == nil {
+		return
+	}
+	p := c.pack()
+	p.attachMu.Lock()
+	p.attachErr = err
+	p.attachMu.Unlock()
+}
+
+// attachedOutput returns the destination of the background stream, or nil when
+// WithAttachOutput was not used.
+func (c *Container) attachedOutput() io.Writer {
+	p := c.pack()
+	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
+	return p.attachOutput
+}
+
+// AttachedDone returns a channel that is closed when the background attached
+// log stream finishes. If WithAttachOutput was not used, it returns nil.
+func (c *Container) AttachedDone() <-chan struct{} {
+	p := c.pack()
+	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
+	return p.attachDone
+}
+
+// AttachedError returns the terminal failure of the background attached log
+// stream, or nil if it ended normally. A stream ended by StopAttached or by
+// container teardown is not a failure. The value is stable once AttachedDone is
+// closed.
+func (c *Container) AttachedError() error {
+	p := c.pack()
+	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
+	return p.attachErr
+}
+
 // Terminate force-removes the container. A Docker handle must carry a
 // validated immutable UID; a name-only handle is never an acceptable
 // fallback. Apple Container has no immutable UID, so its name path is
 // allowed only with a valid generation and a fresh locked inspect.
 func (c *Container) Terminate(ctx context.Context) error {
+	c.stopAttached()
 	if requiresImmutableID(c.eng) {
 		target, err := c.verifiedOperationTarget(ctx)
 		if err != nil {
@@ -963,7 +1500,8 @@ func (c *Container) Terminate(ctx context.Context) error {
 }
 
 func (c *Container) delete(ctx context.Context, target string) error {
-	delCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	c.stopAttached()
+	delCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	_, _, err := c.runner.Run(delCtx, c.eng.deleteArgs(target)...)
 	if contextErr := commandContextError(delCtx, err); contextErr != nil {
@@ -1030,11 +1568,11 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		if len(c.published) > 0 {
 			return "", dockerNetworkEndpointError(info.networkMode)
 		}
-		return c.eng.defaultHost(), nil
+		return c.TargetHost(), nil
 	}
 	if len(c.published) > 0 {
 		p := c.published[0]
-		b, ok := matchingPublishedBinding(info.bound, p)
+		b, ok := matchingPublishedBinding(info.bound, p, c.eng)
 		if !ok {
 			c.clearDynamic()
 			return "", fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, p.raw, info.networkMode)
@@ -1045,7 +1583,7 @@ func (c *Container) Host(ctx context.Context) (string, error) {
 		}
 		return host, nil
 	}
-	return c.eng.defaultHost(), nil
+	return c.TargetHost(), nil
 }
 
 // MappedPort resolves a declared container port ("6379/tcp" or "6379")
@@ -1114,7 +1652,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		return "", 0, err
 	}
 	if published != nil {
-		b, ok := matchingPublishedBinding(info.bound, *published)
+		b, ok := matchingPublishedBinding(info.bound, *published, c.eng)
 		if !ok {
 			c.clearDynamic()
 			return "", 0, fmt.Errorf("%w: published port %q has no host binding in Docker network mode %q", ErrPortNotExposed, published.raw, info.networkMode)
@@ -1125,7 +1663,7 @@ func (c *Container) resolve(ctx context.Context, port, operation string) (string
 		}
 		return host, b.hostPort, nil
 	}
-	if b, ok := matchingExposedBinding(info.bound, spec); ok {
+	if b, ok := matchingExposedBinding(info.bound, spec, c.eng); ok {
 		host, err := dockerBindingConnectHost(b, c.eng)
 		if err != nil {
 			return "", 0, err
@@ -1521,7 +2059,7 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if name := c.cachedDefaultNetwork(); name != "" {
 		return name, nil
 	}
-	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng)
+	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
 	if err != nil {
 		return "", err
 	}
@@ -1548,7 +2086,7 @@ func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engin
 	if !configNeedsDefaultNetwork(cfg) {
 		return nil
 	}
-	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng)
+	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
 		return err
 	}
@@ -1609,7 +2147,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 		return nil, identityError("Apple handle has no valid creation generation")
 	}
 
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target := c.inspectTargetLocked()
 	stdout, _, err := c.runner.Run(qCtx, c.eng.inspectArgs(target)...)

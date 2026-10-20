@@ -7,6 +7,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -842,6 +843,10 @@ func wrapNotFoundForOperation(eng engine, err error, operation string, targets .
 // found" from a run/exec process. The original CLIError is then returned
 // unchanged even if a runner would report its probe as unavailable.
 func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) error {
+	return classifyErrorWithProbe(ctx, r, err, eng, 0)
+}
+
+func classifyErrorWithProbe(ctx context.Context, r cli.Runner, err error, eng engine, probeTimeout time.Duration) error {
 	if err == nil {
 		return commandContextError(ctx, nil)
 	}
@@ -854,19 +859,27 @@ func classifyError(ctx context.Context, r cli.Runner, err error, eng engine) err
 	if isAmbiguousApplicationError(eng, err) {
 		return err
 	}
-	return cli.Classify(ctx, r, err, eng.probe())
+	probe := eng.probe()
+	if probeTimeout > 0 {
+		probe.Timeout = probeTimeout
+	}
+	return cli.Classify(ctx, r, err, probe)
 }
 
 func classifyErrorFor(ctx context.Context, r cli.Runner, err error, eng engine, operation string, targets ...string) error {
+	return classifyErrorForWithProbe(ctx, r, err, eng, 0, operation, targets...)
+}
+
+func classifyErrorForWithProbe(ctx context.Context, r cli.Runner, err error, eng engine, probeTimeout time.Duration, operation string, targets ...string) error {
 	if err == nil || eng == nil || operation == "" {
-		return classifyError(ctx, r, err, eng)
+		return classifyErrorWithProbe(ctx, r, err, eng, probeTimeout)
 	}
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return contextErr
 	}
 	branch, ok := matchingCLIErrorBranch(err, eng.binary(), operation, targets...)
 	if !ok {
-		return classifyError(ctx, r, err, eng)
+		return classifyErrorWithProbe(ctx, r, err, eng, probeTimeout)
 	}
 	allBranches := backendCLIErrorBranches(err, "")
 	selected := branch.cause
@@ -896,7 +909,11 @@ func classifyErrorFor(ctx context.Context, r cli.Runner, err error, eng engine, 
 		}
 		return errors.Join(selected, err)
 	}
-	classified := cli.Classify(ctx, r, selected, eng.probe())
+	probe := eng.probe()
+	if probeTimeout > 0 {
+		probe.Timeout = probeTimeout
+	}
+	classified := cli.Classify(ctx, r, selected, probe)
 	if classified == nil {
 		return err
 	}

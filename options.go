@@ -2,12 +2,14 @@ package container
 
 import (
 	"fmt"
+	"io"
 	"path"
 	"path/filepath"
 	"reflect"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -45,6 +47,11 @@ type config struct {
 	runner               cli.Runner
 	binary               string
 	eng                  engine
+	runTimeout           time.Duration
+	queryTimeout         time.Duration
+	reuseAttachTimeout   time.Duration
+	reusePollInterval    time.Duration
+	probeTimeout         time.Duration
 	name                 string
 	env                  map[string]string
 	cmd                  []string
@@ -82,6 +89,11 @@ type config struct {
 	reusedCreated         bool
 	diagnosticSecrets     []string
 	waitDiagnosticSecrets []string
+	dockerHost            *string
+	dockerContext         *string
+	dockerConfigDir       *string
+	clientPinned          bool
+	attachOutput          io.Writer
 }
 
 func newConfig() *config {
@@ -89,6 +101,13 @@ func newConfig() *config {
 		runner: &cli.ExecRunner{},
 		env:    map[string]string{},
 		labels: map[string]string{},
+	}
+}
+
+func withClientPinned() Option {
+	return func(c *config) error {
+		c.clientPinned = true
+		return nil
 	}
 }
 
@@ -104,6 +123,12 @@ func (c *config) validate() error {
 	if c.reuseGroup != "" && !c.reuse {
 		return validationErrorf("WithReuseGroup", c.reuseGroup, "WithReuseGroup requires WithReuse")
 	}
+	if c.reuse && c.attachOutput != nil {
+		// The reuse path attaches to a container this call may not have
+		// created, so the single creation-time stream WithAttachOutput
+		// promises cannot be established.
+		return validationErrorf("WithAttachOutput", nil, "WithAttachOutput cannot be combined with WithReuse")
+	}
 	seenFiles := make(map[string]struct{}, len(c.files))
 	for _, f := range c.files {
 		clean := path.Clean(f.ContainerPath)
@@ -112,7 +137,75 @@ func (c *config) validate() error {
 		}
 		seenFiles[clean] = struct{}{}
 	}
+	return c.validateDockerTarget()
+}
+
+// validateDockerTarget checks the Docker target invariants that depend on the
+// resolved engine. validate() runs before engine detection, when c.eng is
+// still nil for a plain Run, and Run checks the backend again once the engine
+// is known. Values are never echoed: a DOCKER_HOST may carry credentials.
+func (c *config) validateDockerTarget() error {
+	if c.clientPinned && (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) {
+		return validationErrorf(c.dockerTargetOption(), nil, "cannot override Docker target options on Client.Run")
+	}
+	if (c.dockerHost != nil || c.dockerContext != nil || c.dockerConfigDir != nil) && c.eng != nil && c.eng.name() != "docker" {
+		return validationErrorf(c.dockerTargetOption(), nil, "Docker target options require Docker backend")
+	}
+	if c.reuseAttachTimeout > 0 && !c.reuse {
+		return validationErrorf("WithReuseAttachTimeout", c.reuseAttachTimeout, "WithReuseAttachTimeout requires WithReuse")
+	}
+	if c.reusePollInterval > 0 && !c.reuse {
+		return validationErrorf("WithReusePollInterval", c.reusePollInterval, "WithReusePollInterval requires WithReuse")
+	}
 	return nil
+}
+
+func (c *config) effectiveRunTimeout() time.Duration {
+	if c.runTimeout > 0 {
+		return c.runTimeout
+	}
+	return runTimeout
+}
+
+func (c *config) effectiveQueryTimeout() time.Duration {
+	if c.queryTimeout > 0 {
+		return c.queryTimeout
+	}
+	return queryTimeout
+}
+
+func (c *config) effectiveReuseAttachTimeout() time.Duration {
+	if c.reuseAttachTimeout > 0 {
+		return c.reuseAttachTimeout
+	}
+	return reuseAttachTimeout
+}
+
+func (c *config) effectiveReusePollInterval() time.Duration {
+	if c.reusePollInterval > 0 {
+		return c.reusePollInterval
+	}
+	return reusePollInterval
+}
+
+func (c *config) effectiveProbeTimeout() time.Duration {
+	if c.probeTimeout > 0 {
+		return c.probeTimeout
+	}
+	return 0
+}
+
+// dockerTargetOption names the option that set a target override so a
+// validation error points at the option the caller must change.
+func (c *config) dockerTargetOption() string {
+	switch {
+	case c.dockerContext != nil:
+		return "WithDockerContext"
+	case c.dockerConfigDir != nil:
+		return "WithDockerConfig"
+	default:
+		return "WithDockerHost"
+	}
 }
 
 // allLabels merges the session labels the library always applies with
@@ -207,6 +300,73 @@ func WithReuseGroup(group string) Option {
 			return err
 		}
 		c.reuseGroup = group
+		return nil
+	}
+}
+
+// WithRunTimeout sets the timeout budget for Run, including container creation
+// and any image pull performed during run (whether implicit under PullMissing
+// or explicit under PullAlways). A positive d overrides the default 10-minute
+// timeout. Non-positive durations are rejected.
+func WithRunTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithRunTimeout", d, "timeout must be positive")
+		}
+		c.runTimeout = d
+		return nil
+	}
+}
+
+// WithQueryTimeout sets the timeout for backend queries and control operations
+// (such as inspect, stop, state, and copy). A positive d overrides the default
+// 30-second timeout. Non-positive durations are rejected.
+func WithQueryTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithQueryTimeout", d, "timeout must be positive")
+		}
+		c.queryTimeout = d
+		return nil
+	}
+}
+
+// WithProbeTimeout sets the upper bound for backend diagnostic liveness checks
+// during error classification. A positive d overrides the default 5-second
+// timeout. Non-positive durations are rejected.
+func WithProbeTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithProbeTimeout", d, "timeout must be positive")
+		}
+		c.probeTimeout = d
+		return nil
+	}
+}
+
+// WithReuseAttachTimeout sets the maximum duration to wait for another process's
+// container creation to complete before attaching. Requires WithReuse. A positive d
+// overrides the default 60-second timeout. Non-positive durations are rejected.
+func WithReuseAttachTimeout(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithReuseAttachTimeout", d, "timeout must be positive")
+		}
+		c.reuseAttachTimeout = d
+		return nil
+	}
+}
+
+// WithReusePollInterval sets the interval between inspect attempts while
+// waiting for a reused container to become ready. Requires WithReuse. A
+// positive d overrides the default 100-millisecond cadence. Non-positive
+// durations are rejected.
+func WithReusePollInterval(d time.Duration) Option {
+	return func(c *config) error {
+		if d <= 0 {
+			return validationErrorf("WithReusePollInterval", d, "poll interval must be positive")
+		}
+		c.reusePollInterval = d
 		return nil
 	}
 }
@@ -597,6 +757,21 @@ func WithPlatform(p string) Option {
 	}
 }
 
+// WithAttachOutput streams the container's log output to the provided writer
+// starting immediately after container creation. It requires a container this
+// call creates, so Run rejects it together with WithReuse; a reuse caller may
+// attach to a container another process created and would otherwise receive no
+// stream at all.
+func WithAttachOutput(w io.Writer) Option {
+	return func(c *config) error {
+		if w == nil {
+			return validationErrorf("WithAttachOutput", nil, "output writer cannot be nil")
+		}
+		c.attachOutput = w
+		return nil
+	}
+}
+
 // MountType selects how a Mount is backed.
 type MountType int
 
@@ -763,4 +938,58 @@ func ipIsLoopback(addr string) bool {
 
 func ipIsUnspecified(addr string) bool {
 	return domain.IPIsUnspecified(addr)
+}
+
+// WithDockerHost overrides the target Docker daemon host (DOCKER_HOST)
+// for this container.
+func WithDockerHost(host string) Option {
+	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerHost", host); err != nil {
+			return err
+		}
+		c.dockerHost = &host
+		return nil
+	}
+}
+
+// WithDockerContext overrides the target Docker context (DOCKER_CONTEXT)
+// for this container. A configured context takes precedence over an ambient
+// DOCKER_HOST and over an explicit WithDockerHost when both are set; an
+// explicit host still wins over an ambient context, matching the library's
+// Docker target resolution.
+func WithDockerContext(context string) Option {
+	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerContext", context); err != nil {
+			return err
+		}
+		c.dockerContext = &context
+		return nil
+	}
+}
+
+// WithDockerConfig overrides the target Docker config directory (DOCKER_CONFIG)
+// for this container.
+func WithDockerConfig(dir string) Option {
+	return func(c *config) error {
+		if err := validateDockerTargetValue("WithDockerConfig", dir); err != nil {
+			return err
+		}
+		c.dockerConfigDir = &dir
+		return nil
+	}
+}
+
+// validateDockerTargetValue rejects Docker target values that cannot be passed
+// to a child process safely or that are too large to redact from streamed
+// diagnostics. The rejected value is never echoed. An empty value is accepted
+// on purpose: it pins the target as explicitly unset, so a DOCKER_HOST that
+// appears later cannot repoint the child.
+func validateDockerTargetValue(option, value string) error {
+	if err := validateEnvValue(value); err != nil {
+		return newValidationErrorWithField(option, "value", nil, fmt.Errorf("has an invalid value: %w", err))
+	}
+	if len(value) > cli.MaxStreamOverlap || !cli.StreamValueFits(value) {
+		return invalidOption(option, "value is too large to redact safely from streamed diagnostics")
+	}
+	return nil
 }

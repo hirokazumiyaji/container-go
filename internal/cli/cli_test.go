@@ -526,6 +526,93 @@ func TestExecRunnerDefaultsToContainerBinary(t *testing.T) {
 	}
 }
 
+func TestExecRunnerAppliesCustomEnv(t *testing.T) {
+	stub := writeStub(t, `printf "%s" "$TEST_CUSTOM_VAR"`)
+	r := &ExecRunner{
+		Binary: stub,
+		Env:    []string{"TEST_CUSTOM_VAR=custom_val"},
+	}
+	if env := r.ExternalEnv(); len(env) != 1 || env[0] != "TEST_CUSTOM_VAR=custom_val" {
+		t.Fatalf("ExternalEnv() = %v, want [TEST_CUSTOM_VAR=custom_val]", env)
+	}
+
+	stdout, _, err := r.Run(context.Background(), "test")
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if string(stdout) != "custom_val" {
+		t.Fatalf("stdout = %q, want %q", string(stdout), "custom_val")
+	}
+}
+
+func TestMergeEnvReplacesMatchingKeys(t *testing.T) {
+	base := []string{"FOO=1", "BAR=2", "BAZ=3"}
+	overrides := []string{"BAR=override", "NEW=value"}
+	got := MergeEnv(base, overrides)
+
+	want := map[string]string{
+		"FOO": "1",
+		"BAR": "override",
+		"BAZ": "3",
+		"NEW": "value",
+	}
+	if len(got) != 4 {
+		t.Fatalf("len(got) = %d, want 4", len(got))
+	}
+	for _, env := range got {
+		k, v, ok := strings.Cut(env, "=")
+		if !ok {
+			t.Fatalf("malformed env entry: %q", env)
+		}
+		if want[k] != v {
+			t.Errorf("key %q = %q, want %q", k, v, want[k])
+		}
+	}
+}
+
+func TestMergeEnvBareKeyRemovesInheritedEntry(t *testing.T) {
+	base := []string{"DOCKER_HOST=tcp://daemon-a:2375", "KEEP=1"}
+
+	got := MergeEnv(base, []string{"DOCKER_HOST"})
+	want := []string{"KEEP=1"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+
+	// A later assignment for the same key wins over the removal marker.
+	got = MergeEnv(base, []string{"DOCKER_HOST", "DOCKER_HOST=tcp://daemon-b:2375"})
+	want = []string{"KEEP=1", "DOCKER_HOST=tcp://daemon-b:2375"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+
+	// A removal marker for a key the base does not have changes nothing.
+	got = MergeEnv(base, []string{"MALFORMED"})
+	if !slices.Equal(got, base) {
+		t.Fatalf("MergeEnv = %q, want base %q", got, base)
+	}
+}
+
+func TestMergeEnvDeduplicatesAndSkipsMalformedOverrides(t *testing.T) {
+	base := []string{"FOO=1", "BAR=2"}
+	overrides := []string{"BAR=first", "MALFORMED", "=EMPTY", "BAR=second", "NEW=value"}
+
+	got := MergeEnv(base, overrides)
+	want := []string{"FOO=1", "BAR=second", "NEW=value"}
+	if len(got) != len(want) {
+		t.Fatalf("MergeEnv = %q, want %q", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("MergeEnv = %q, want %q", got, want)
+		}
+	}
+
+	if got := MergeEnv(base, []string{"MALFORMED"}); len(got) != len(base) {
+		t.Fatalf("MergeEnv with only malformed overrides = %q, want base %q", got, base)
+	}
+}
+
 type fakeRunner struct {
 	results map[string]fakeResult
 }

@@ -63,7 +63,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 	if err := opts.validate(); err != nil {
 		return nil, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
@@ -104,7 +104,7 @@ func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptio
 	if err := opts.validate(); err != nil {
 		return OutputStats{}, err
 	}
-	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
@@ -267,4 +267,27 @@ func (s *classifyingStream) wrap(err error) error {
 	// infrastructure problem. Keep both causes so Read/ForLog callers can
 	// still recover CLIError and ErrContainerNotFound with errors.Is/As.
 	return wrapNotFoundFor(s.container.eng, errors.Join(classified, err))
+}
+
+// FollowLogsTo streams the container's log output directly into output until
+// the context is cancelled, the container terminates, or the stream is closed.
+// A failed sink write is reported as ErrOutputDelivery rather than being
+// hidden behind a terminal stream error, and neither is reported as success.
+func (c *Container) FollowLogsTo(ctx context.Context, output io.Writer) error {
+	if output == nil {
+		return validationErrorf("FollowLogsTo", output, "output writer cannot be nil")
+	}
+	stream, err := c.FollowLogs(ctx)
+	if err != nil {
+		return err
+	}
+	defer stream.Close()
+
+	tracked := newOutputTrackingWriter(output)
+	_, copyErr := io.Copy(tracked, stream)
+	copyErr = preserveOutputDeliveryError(copyErr, tracked)
+	if contextErr := commandContextError(ctx, copyErr); contextErr != nil {
+		return contextErr
+	}
+	return copyErr
 }

@@ -47,6 +47,7 @@ type fakeRunner struct {
 	binary                string
 	envFiles              []string // contents of --env-file captured at call time
 	inspectJSON           string
+	contextJSON           string
 	inspectResponses      []string // sequential inspect bodies for refresh tests
 	inspectCalls          int
 	failPrefix            string // fail calls whose first arg matches
@@ -59,6 +60,11 @@ type fakeRunner struct {
 	pullCalls    int
 	runPlatform  string
 	creations    map[string]string // container name -> creation generation from run args
+	env          []string
+}
+
+func (f *fakeRunner) ExternalEnv() []string {
+	return f.env
 }
 
 func (f *fakeRunner) binaryName() string {
@@ -95,6 +101,22 @@ func (f *fakeRunner) Run(_ context.Context, args ...string) ([]byte, []byte, err
 			return []byte("ok"), nil, nil
 		}
 		return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: "Cannot connect to the Docker daemon"}
+	}
+	if args[0] == "context" {
+		if f.failPrefix == "context" {
+			return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: f.failStderr}
+		}
+		if f.contextJSON != "" {
+			return []byte(f.contextJSON), nil, nil
+		}
+		name := "default"
+		if len(args) > 2 && args[2] != "" {
+			name = args[2]
+			if name == "nonexistent" {
+				return nil, nil, &cli.CLIError{Binary: f.binaryName(), Args: args, ExitCode: 1, Stderr: fmt.Sprintf("context %q: context not found", name)}
+			}
+		}
+		return []byte(fmt.Sprintf(`[{"Name":%q,"Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`, name)), nil, nil
 	}
 	// Image handling for both backends: docker inspects via
 	// `image inspect` and pulls via `pull`; apple uses
@@ -223,6 +245,22 @@ func (f *fakeRunner) callWith(subcommand string) []string {
 		}
 	}
 	return nil
+}
+
+// recordCall appends a call under the runner lock so a background attach
+// stream cannot race the test's assertions.
+func (f *fakeRunner) recordCall(args []string) {
+	f.mu.Lock()
+	f.calls = append(f.calls, args)
+	f.mu.Unlock()
+}
+
+// lockedCallWith returns the first call for subcommand under the runner lock,
+// for assertions that run while a background stream may still be recording.
+func (f *fakeRunner) lockedCallWith(subcommand string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.callWith(subcommand)
 }
 
 func newTestRunner() *fakeRunner {

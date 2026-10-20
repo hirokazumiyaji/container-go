@@ -436,3 +436,28 @@ func TestTypeAliasesUsable(t *testing.T) {
 	var _ ExternalRunner = &ExecRunner{}
 	var _ Streamer = &ExecRunner{}
 }
+
+// The Run path stamps the identity on the runner it resolves, so a wrapper
+// configured through WithBinary still classifies as its backend. The caller's
+// own runner is left untouched: the library supports concurrent callers sharing
+// one runner.
+func TestRunStampsEngineIdentity(t *testing.T) {
+	configured := &ExecRunner{Binary: "/opt/docker-wrapper"}
+	cfg := newConfig()
+	cfg.eng = dockerEngine{}
+	cfg.runner = configured
+	applyEngineBinary(cfg)
+	er, ok := cfg.runner.(*ExecRunner)
+	if !ok {
+		t.Fatalf("runner = %T, want *ExecRunner", cfg.runner)
+	}
+	if er.Identity != "docker" {
+		t.Fatalf("identity = %q, want docker", er.Identity)
+	}
+	if er.Binary != "/opt/docker-wrapper" {
+		t.Fatalf("binary = %q, want the configured wrapper", er.Binary)
+	}
+	if configured.Identity != "" {
+		t.Fatalf("caller runner was mutated: identity = %q", configured.Identity)
+	}
+}

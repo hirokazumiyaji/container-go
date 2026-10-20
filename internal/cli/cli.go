@@ -137,8 +137,11 @@ func (r *ExecRunner) ExternalBinary() string { return r.Binary }
 // used unkeyed CLIError literals; stdout is therefore carried by the
 // internal diagnosticError wrapper below instead of being added here.
 type CLIError struct {
-	// Binary is the CLI executable that failed (e.g. "container" or
-	// "docker"). Empty means the historical default of "container".
+	// Binary names the backend CLI this failure belongs to, e.g. "container"
+	// or "docker". Classifiers compare against it, so a runner pointed at a
+	// configured wrapper executable still reports the backend that owns it --
+	// which also means the value names the backend rather than the executable
+	// that ran. Empty means the historical default of "container".
 	Binary   string
 	Args     []string
 	ExitCode int
@@ -289,6 +292,12 @@ func (r *ExecRunner) identity() string {
 // SetBinary overrides the CLI executable to run.
 func (r *ExecRunner) SetBinary(binary string) {
 	r.Binary = binary
+}
+
+// SetIdentity records which backend CLI this runner speaks for, for callers
+// that wrap it and still want its errors attributed to the backend.
+func (r *ExecRunner) SetIdentity(identity string) {
+	r.Identity = identity
 }
 
 type runHooks struct {

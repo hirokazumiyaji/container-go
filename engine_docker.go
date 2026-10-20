@@ -1233,10 +1233,14 @@ type dockerInspect struct {
 	Image    string `json:"Image"`
 	Name     string `json:"Name"`
 	Platform string `json:"Platform"`
+	Created  string `json:"Created"`
 	// State is present on container inspect objects, but not on Docker
 	// network or volume inspect objects.
 	State *struct {
-		Status string `json:"Status"`
+		Status     string `json:"Status"`
+		ExitCode   int    `json:"ExitCode"`
+		StartedAt  string `json:"StartedAt"`
+		FinishedAt string `json:"FinishedAt"`
 	} `json:"State"`
 	HostConfig struct {
 		NetworkMode string `json:"NetworkMode"`
@@ -1344,6 +1348,12 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		networkMode:  c.HostConfig.NetworkMode,
 		networkNames: networkNames,
 	}
+	info.createdAt = parseInspectTime(c.Created)
+	if c.State != nil {
+		info.exitCode = c.State.ExitCode
+		info.startedAt = parseInspectTime(c.State.StartedAt)
+		info.finishedAt = parseInspectTime(c.State.FinishedAt)
+	}
 	if info.networkMode == "" {
 		// HostConfig.NetworkMode is present in current Docker inspect
 		// output. The network map fallback keeps endpoint validation
@@ -1413,6 +1423,36 @@ func dockerState(s string) State {
 	default:
 		return StateUnknown
 	}
+}
+
+func (dockerEngine) startArgs(id string) []string {
+	return []string{"start", id}
+}
+
+func (dockerEngine) restartArgs(id string, timeout *time.Duration) ([]string, error) {
+	if timeout == nil {
+		return []string{"restart", id}, nil
+	}
+	secs, err := stopTimeoutSeconds(*timeout, maxDockerStopSeconds)
+	if err != nil {
+		return nil, fmt.Errorf("restart timeout: %w", err)
+	}
+	return []string{"restart", "-t", strconv.FormatInt(secs, 10), id}, nil
+}
+
+func (dockerEngine) killArgs(id string, signal string) []string {
+	if signal != "" {
+		return []string{"kill", "--signal", signal, id}
+	}
+	return []string{"kill", id}
+}
+
+func (dockerEngine) pauseArgs(id string) ([]string, error) {
+	return []string{"pause", id}, nil
+}
+
+func (dockerEngine) unpauseArgs(id string) ([]string, error) {
+	return []string{"unpause", id}, nil
 }
 
 func (dockerEngine) stopArgs(id string, timeout *time.Duration) ([]string, error) {

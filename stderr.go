@@ -237,6 +237,8 @@ func commandTarget(args []string, operation string) string {
 		return firstPositional(args, 1, "--platform")
 	case "stop":
 		return firstPositional(args, 1, "--time")
+	case "start", "restart", "kill", "pause", "unpause":
+		return firstPositional(args, 1, "--time", "-t", "--signal", "-s")
 	case "delete", "rm":
 		return firstPositional(args, 1)
 	case "cp":

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -215,6 +216,58 @@ func TestRunStopsPostCreateWorkWhenEnvCleanupFails(t *testing.T) {
 	if waitCalled {
 		t.Fatal("readiness wait ran while env cleanup was unresolved")
 	}
+	dir := filepath.Dir(runner.envPath)
+	state := loadEnvCleanupState(dir)
+	if state == nil {
+		t.Fatal("cleanup ownership was lost")
+	}
+	state.mu.Lock()
+	lock := state.lock
+	state.lock = nil
+	state.mu.Unlock()
+	if lock != nil {
+		_ = closeEnvFileLock(lock)
+	}
+	clearEnvCleanupState(state)
+	_ = os.RemoveAll(dir)
+}
+
+// envCleanupAttachRunner adds streaming to the cleanup-gate fixture so a test
+// can observe whether WithAttachOutput started on that path.
+type envCleanupAttachRunner struct {
+	*envCleanupGateRunner
+}
+
+func (r *envCleanupAttachRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func TestRunStartsAttachedStreamBeforeEnvCleanupReturn(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("advisory env-file locks are unavailable on this platform")
+	}
+	isolateEnvFileRoot(t)
+	runner := &envCleanupAttachRunner{envCleanupGateRunner: &envCleanupGateRunner{fakeRunner: newTestRunner()}}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("cleanup-attach"), WithEnv(map[string]string{"TOKEN": "secret"}),
+		WithAttachOutput(io.Discard),
+		withRunner(runner), withEngine(appleEngine{}))
+	if err == nil {
+		t.Fatal("want env cleanup error")
+	}
+	if ctr == nil || ctr.ID() != "cleanup-attach" {
+		t.Fatalf("Run handle = %v, error = %v; want usable handle", ctr, err)
+	}
+	done := ctr.AttachedDone()
+	if done == nil {
+		t.Fatal("AttachedDone() = nil: the attached stream did not start before the env-cleanup return")
+	}
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attached stream did not finish")
+	}
+
 	dir := filepath.Dir(runner.envPath)
 	state := loadEnvCleanupState(dir)
 	if state == nil {

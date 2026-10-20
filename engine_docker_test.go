@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"slices"
 	"strings"
@@ -948,6 +949,56 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	}
 	if got := e.probe().Args; !slices.Equal(got, []string{"version", "--format", "{{.Server.Version}}"}) {
 		t.Errorf("probe = %v", got)
+	}
+}
+
+func TestDockerRestartArgsValidatesTimeout(t *testing.T) {
+	e := dockerEngine{}
+	if got, err := e.restartArgs("myctr", nil); err != nil || !slices.Equal(got, []string{"restart", "myctr"}) {
+		t.Errorf("restartArgs(nil) = %v, %v", got, err)
+	}
+	d := 5 * time.Second
+	if got, err := e.restartArgs("myctr", &d); err != nil || !slices.Equal(got, []string{"restart", "-t", "5", "myctr"}) {
+		t.Errorf("restartArgs(5s) = %v, %v", got, err)
+	}
+	// A positive sub-second timeout rounds up like stop, while a negative or
+	// unbounded one is rejected before the CLI sees it.
+	sub := 500 * time.Millisecond
+	if got, err := e.restartArgs("myctr", &sub); err != nil || !slices.Equal(got, []string{"restart", "-t", "1", "myctr"}) {
+		t.Errorf("restartArgs(500ms) = %v, %v", got, err)
+	}
+	for name, timeout := range map[string]time.Duration{
+		"sub-second negative":   -time.Millisecond,
+		"above backend maximum": time.Duration(maxDockerStopSeconds)*time.Second + time.Nanosecond,
+		"maximum duration":      math.MaxInt64,
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got, err := e.restartArgs("myctr", &timeout); err == nil || got != nil {
+				t.Errorf("restartArgs(%v) = %v, %v, want a rejected timeout", timeout, got, err)
+			}
+		})
+	}
+}
+
+func TestParseInspectTimeReportsUnknownAsZero(t *testing.T) {
+	cases := []struct {
+		name     string
+		value    string
+		wantZero bool
+	}{
+		{name: "empty is unknown", value: "", wantZero: true},
+		{name: "go zero value is unknown", value: "0001-01-01T00:00:00Z", wantZero: true},
+		{name: "malformed is unknown", value: "yesterday", wantZero: true},
+		{name: "rfc3339", value: "2025-03-04T05:06:07Z"},
+		{name: "rfc3339nano", value: "2025-03-04T05:06:07.123456789Z"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := parseInspectTime(tc.value)
+			if got.IsZero() != tc.wantZero {
+				t.Fatalf("parseInspectTime(%q) = %v, wantZero %v", tc.value, got, tc.wantZero)
+			}
+		})
 	}
 }
 

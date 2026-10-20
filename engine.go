@@ -106,7 +106,19 @@ type engineInfo struct {
 	defaultNetwork string
 	// bound lists host-side bindings of container ports, as reported
 	// by the backend (Docker's randomly assigned ports land here).
-	bound []boundPort
+	bound      []boundPort
+	exitCode   int
+	createdAt  time.Time
+	startedAt  time.Time
+	finishedAt time.Time
+}
+
+// PortBinding describes a host-to-container port mapping.
+type PortBinding struct {
+	ContainerPort int
+	Proto         string
+	HostAddr      string
+	HostPort      int
 }
 
 type boundPort struct {
@@ -132,6 +144,11 @@ type engine interface {
 	parseRunID(stdout []byte) string
 	inspectArgs(id string) []string
 	parseInspect(data []byte, id string) (*engineInfo, error)
+	startArgs(id string) []string
+	restartArgs(id string, timeout *time.Duration) ([]string, error)
+	killArgs(id string, signal string) []string
+	pauseArgs(id string) ([]string, error)
+	unpauseArgs(id string) ([]string, error)
 	stopArgs(id string, timeout *time.Duration) ([]string, error)
 	deleteArgs(id string) []string
 	copyToArgs(id, hostPath, containerPath string) []string
@@ -449,4 +466,23 @@ func validImageDigest(digest string) bool {
 		return false
 	}
 	return len(encoded) == wantLength && domain.IsHex(encoded)
+}
+
+// parseInspectTime decodes a backend timestamp. The backends express "not
+// set" as an empty string or the Go zero-value form; both map to the zero
+// time, which is the documented unknown marker on InspectInfo. A value that
+// does not match RFC 3339 is reported the same way: a cosmetic field must not
+// fail an otherwise usable Inspect, and the library never fabricates an
+// instant from a value it cannot read. RFC3339Nano also accepts timestamps
+// without fractional seconds, so one layout covers both backend forms.
+func parseInspectTime(s string) time.Time {
+	switch s {
+	case "", "0001-01-01T00:00:00Z":
+		return time.Time{}
+	}
+	t, err := time.Parse(time.RFC3339Nano, s)
+	if err != nil {
+		return time.Time{}
+	}
+	return t
 }

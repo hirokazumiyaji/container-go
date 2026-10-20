@@ -247,6 +247,22 @@ func (f *fakeRunner) callWith(subcommand string) []string {
 	return nil
 }
 
+// recordCall appends a call under the runner lock so a background attach
+// stream cannot race the test's assertions.
+func (f *fakeRunner) recordCall(args []string) {
+	f.mu.Lock()
+	f.calls = append(f.calls, args)
+	f.mu.Unlock()
+}
+
+// lockedCallWith returns the first call for subcommand under the runner lock,
+// for assertions that run while a background stream may still be recording.
+func (f *fakeRunner) lockedCallWith(subcommand string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.callWith(subcommand)
+}
+
 func newTestRunner() *fakeRunner {
 	return &fakeRunner{systemUp: true, binary: "container"}
 }

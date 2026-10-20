@@ -246,10 +246,9 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 		}
 	}
 
+	// parsePruneOptions rejects a non-positive parallelism, so cfg.parallelism
+	// is always at least one here.
 	concurrency := cfg.parallelism
-	if concurrency <= 0 {
-		concurrency = defaultPruneParallelism
-	}
 	if len(ids) < concurrency {
 		concurrency = len(ids)
 	}
@@ -322,10 +321,12 @@ func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArg
 				unattempted++
 			}
 		}
+		// Only remaining work makes the overall deadline a failure. When every
+		// candidate was attempted, the per-candidate results already say what
+		// happened, and a deadline that expired after the last one completed
+		// must not turn a fully applied prune into an error.
 		if unattempted > 0 {
 			errs = append(errs, fmt.Errorf("%s: %d container(s) remaining: %w", errKind, unattempted, overallCtx.Err()))
-		} else if len(errs) == 0 {
-			errs = append(errs, overallCtx.Err())
 		}
 	}
 
@@ -336,6 +337,13 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 	if !dockerIDRE.MatchString(id) {
 		return false, nil
 	}
+	// The verify and the delete together must not outlive one queryTimeout.
+	// The overall prune deadline is longer (five minutes by default) and
+	// withDefaultTimeout leaves a context that already has a deadline
+	// unchanged, so bounding only the delete would let a hung inspect run to
+	// the overall deadline instead.
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
+	defer cancel()
 	inspectContainer := &Container{id: id, runner: r, eng: eng, sync: &lockPack{uid: id}}
 	fresh, err := inspectContainer.inspectFresh(ctx)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
@@ -362,11 +370,9 @@ func pruneDockerCandidate(ctx context.Context, r cli.Runner, eng engine, id, err
 		// that became running after the daemon-side list.
 		return false, nil
 	}
-	dCtx, dCancel := context.WithTimeout(ctx, queryTimeout)
-	defer dCancel()
 	deleteArgs := eng.deleteArgs(id)
-	_, _, err = r.Run(dCtx, deleteArgs...)
-	if contextErr := commandContextError(dCtx, err); contextErr != nil {
+	_, _, err = r.Run(ctx, deleteArgs...)
+	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		return false, fmt.Errorf("%s %s: %w", errKind, id, contextErr)
 	}
 	if err != nil && !isNotFoundForOperation(eng, err, commandOperation(deleteArgs), id) {

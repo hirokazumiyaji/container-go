@@ -131,8 +131,10 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 	if _, err := ctr.Endpoint(ctx, "80/tcp"); !errors.Is(err, ErrContainerNotFound) {
 		t.Errorf("Endpoint error = %v, want ErrContainerNotFound", err)
 	}
-	if tail := ctr.logTail(ctx); tail != "" {
-		t.Errorf("logTail = %q, want empty for missing immutable target", tail)
+	if tail, err := ctr.logTailWithError(ctx); tail != "" {
+		t.Errorf("logTailWithError = %q, want empty for missing immutable target", tail)
+	} else if err == nil {
+		t.Error("logTailWithError = nil error for missing immutable target")
 	}
 	if err := ctr.Terminate(ctx); err != nil {
 		t.Errorf("Terminate on missing immutable target = %v, want idempotent success", err)

@@ -908,6 +908,12 @@ func isDockerContextUnavailable(err error, stderr string) bool {
 		strings.Contains(msg, "executable file not found")
 }
 
+// resolveDockerContextEndpoint is deliberately not cached process-wide. A
+// Client freezes its resolved target at construction and every handle it
+// creates carries that engine, so Client operations reuse one lookup. A
+// package-level operation resolves once per call; a process-global cache
+// could answer a changed DOCKER_CONTEXT or DOCKER_CONFIG with an earlier
+// target's endpoint.
 func resolveDockerContextEndpoint(ctx context.Context, runner cli.Runner, contextName string) (string, string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
 	defer cancel()

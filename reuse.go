@@ -188,8 +188,12 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		return nil, err
 	}
-	if err := attachDefaultNetworkForConfig(ctx, cfg, info); err != nil {
-		return nil, err
+	if configNeedsDefaultNetwork(cfg) {
+		name, err := base.ensureDefaultNetworkForConfig(ctx, cfg)
+		if err != nil {
+			return nil, err
+		}
+		info.defaultNetwork = name
 	}
 	if err := checkReuseCompatIdentity(info, resolvedImage, image, cfg); err != nil {
 		return nil, joinEnvFileCleanupError(err, leaderWarning)
@@ -226,6 +230,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		creation:        info.labels[creationLabel],
 		image:           containerImage,
 		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
+		dockerMeta:      cfg.dockerMeta,
 	}
 	ctr.applyConfigDiagnostics(cfg)
 	// The leader's files are copied in reuseCreate. Every attaching
@@ -403,6 +408,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				creation:        info.labels[creationLabel],
 				image:           resolvedImage,
 				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
+				dockerMeta:      cfg.dockerMeta,
 			}
 			ctr.applyConfigDiagnostics(cfg)
 			return ctr, nil
@@ -524,6 +530,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		creation:        cfg.creation,
 		image:           resolvedImage,
 		sync:            &lockPack{uid: uid},
+		dockerMeta:      cfg.dockerMeta,
 	}
 	ctr.applyConfigDiagnostics(cfg)
 	if target, ok := runReaperTarget(cfg); ok {
@@ -839,6 +846,7 @@ func namedContainer(cfg *config, id string) *Container {
 		network:         cfg.network,
 		networkExplicit: cfg.networkExplicit,
 		nameInspect:     true,
+		dockerMeta:      cfg.dockerMeta,
 	}
 }
 

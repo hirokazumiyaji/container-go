@@ -151,6 +151,8 @@ type lockPack struct {
 	dynamicMu      contextLock      // serializes dynamic refresh so older inspects cannot overwrite newer ones
 	inspectMu      contextLock      // serializes inspect target selection and UID publication
 	defaultNetwork string           // Docker daemon default identity, learned lazily
+	copyVersionMu  contextLock      // serializes the Docker copy-out version check
+	copyVersionOK  atomic.Bool      // a successful copy-out version check is reusable for this handle
 	attachMu       sync.Mutex
 	attachCancel   context.CancelFunc
 	attachDone     chan struct{}
@@ -212,7 +214,11 @@ type Container struct {
 	queryTimeout time.Duration
 	probeTimeout time.Duration
 
-	sync                    *lockPack
+	sync *lockPack
+	// dockerMeta is the Client-owned Docker metadata cache shared by the
+	// handles it creates. Package-level Run leaves it nil so separate
+	// operations cannot reuse another target's metadata.
+	dockerMeta              *dockerMetadataCache
 	diagnosticRedactorValue *cli.Redactor
 	secretsMu               sync.RWMutex
 	targetHost              string
@@ -512,6 +518,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 		creation:        cfg.creation,
 		image:           resolvedImage,
 		sync:            &lockPack{uid: uid},
+		dockerMeta:      cfg.dockerMeta,
 	}
 	c.applyConfigDiagnostics(cfg)
 	// The reaper only backs real CLI containers. Complete the pending
@@ -1393,8 +1400,9 @@ func (c *Container) Shared() *Container {
 		network: c.network, networkExplicit: c.networkExplicit,
 		reused: c.reused, allowDestructive: true, creation: c.creation,
 		image: c.image, nameInspect: c.nameInspect,
-		sync: c.sync, diagnosticRedactorValue: diagnosticRedactor,
-		targetHost: c.targetHost,
+		sync: c.sync, dockerMeta: c.dockerMeta,
+		diagnosticRedactorValue: diagnosticRedactor,
+		targetHost:              c.targetHost,
 	}
 }
 
@@ -2143,16 +2151,42 @@ func (c *Container) ensureDefaultNetwork(ctx context.Context) (string, error) {
 	if !c.needsDefaultNetwork() {
 		return "", nil
 	}
+	return c.ensureDefaultNetworkForConfig(ctx, nil)
+}
+
+// ensureDefaultNetworkForConfig resolves the daemon default for a caller that
+// does not own the handle. The answer is stored on the handle, so concurrent
+// reuse attaches sharing one ensure result perform one lookup; a failed
+// lookup is not stored and the next caller retries. cfg supplies the caller's
+// runner and optional Client cache for the miss path.
+func (c *Container) ensureDefaultNetworkForConfig(ctx context.Context, cfg *config) (string, error) {
 	if err := c.pack().inspectMu.Lock(ctx); err != nil {
 		return "", err
 	}
 	defer c.pack().inspectMu.Unlock()
 	if name := c.cachedDefaultNetwork(); name != "" {
-		return name, nil
+		// The handle value is valid only for the handle's own target and
+		// runner. A reuse waiter may carry a different runner (for example a
+		// custom cli.Runner), and accepting the leader's answer would validate
+		// its container against the wrong daemon.
+		if cfg == nil || dockerDefaultNetworkKey(cfg.eng, cfg.runner) == dockerDefaultNetworkKey(c.eng, c.runner) {
+			return name, nil
+		}
 	}
-	name, err := dockerDefaultNetwork(ctx, c.runner, c.eng, opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()})
+	runner, meta := c.runner, c.dockerMeta
+	eng := c.eng
+	timeouts := opTimeouts{query: c.effectiveQueryTimeout(), probe: c.effectiveProbeTimeout()}
+	if cfg != nil {
+		runner, meta, eng = cfg.runner, cfg.dockerMeta, cfg.eng
+		timeouts = opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()}
+	}
+	name, err := dockerDefaultNetworkCached(ctx, meta, runner, eng, timeouts)
 	if err != nil {
 		return "", err
+	}
+	if cfg != nil && dockerDefaultNetworkKey(cfg.eng, cfg.runner) != dockerDefaultNetworkKey(c.eng, c.runner) {
+		// Do not overwrite the handle's own answer with another runner's.
+		return name, nil
 	}
 	return c.storeDefaultNetwork(name), nil
 }
@@ -2169,15 +2203,15 @@ func (c *Container) attachDefaultNetwork(ctx context.Context, info *engineInfo) 
 	return nil
 }
 
-// attachDefaultNetworkForConfig deliberately does not consult a shared
-// reuse handle's cache. Each concurrent caller must resolve daemon
-// metadata with its own request and runner; otherwise the first caller's
-// network selection can decide a later caller's compatibility.
+// attachDefaultNetworkForConfig resolves the daemon default for a reuse
+// attach. Concurrent callers on one Client share the Client's cache, which is
+// keyed by the resolved target, so they perform one lookup per target and a
+// failed lookup is not retained.
 func attachDefaultNetworkForConfig(ctx context.Context, cfg *config, info *engineInfo) error {
 	if !configNeedsDefaultNetwork(cfg) {
 		return nil
 	}
-	name, err := dockerDefaultNetwork(ctx, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
+	name, err := dockerDefaultNetworkCached(ctx, cfg.dockerMeta, cfg.runner, cfg.eng, opTimeouts{query: cfg.effectiveQueryTimeout(), probe: cfg.effectiveProbeTimeout()})
 	if err != nil {
 		return err
 	}

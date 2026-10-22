@@ -17,6 +17,10 @@ import (
 type Client struct {
 	eng    engine
 	runner cli.Runner
+	// dockerMeta is the Docker metadata cache shared by every operation and
+	// handle this Client creates. It is keyed by the resolved target, so it
+	// never answers for another daemon.
+	dockerMeta *dockerMetadataCache
 }
 
 // ClientOption configures a Client.
@@ -293,8 +297,9 @@ func newClient(ctx context.Context, name string, opts ...ClientOption) (*Client,
 	}
 
 	return &Client{
-		eng:    eng,
-		runner: runner,
+		eng:        eng,
+		runner:     runner,
+		dockerMeta: newDockerMetadataCache(dockerMetadataTTL),
 	}, nil
 }
 
@@ -304,6 +309,7 @@ func (c *Client) Run(ctx context.Context, image string, opts ...Option) (*Contai
 		withEngine(c.eng),
 		withRunner(cloneRunner(c.runner)),
 		withClientPinned(),
+		withClientDockerMeta(c.dockerMeta),
 	}
 	allOpts := append(clientOpts, opts...)
 	return Run(ctx, image, allOpts...)

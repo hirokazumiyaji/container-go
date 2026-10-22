@@ -104,6 +104,21 @@ func TestSharedHandleLiftsTheGuardForItsOwnCopy(t *testing.T) {
 	}
 }
 
+func TestSharedHandlePreservesTargetHost(t *testing.T) {
+	r := newTestRunner()
+	ctr := sharedHandle(t, r)
+	ctr.targetHost = "reuse-original"
+	unguarded := ctr.Shared()
+
+	t.Setenv("DOCKER_HOST", "tcp://later-host:2375")
+	if got := unguarded.TargetHost(); got != ctr.TargetHost() {
+		t.Errorf("Shared().TargetHost() = %q, want %q", got, ctr.TargetHost())
+	}
+	if got := unguarded.TargetHost(); got != "reuse-original" {
+		t.Errorf("Shared().TargetHost() = %q, want the original target", got)
+	}
+}
+
 func TestSharedHandleCopiesShareIdentity(t *testing.T) {
 	r := newTestRunner()
 	r.inspectJSON = `[{"Id":"` + dockerFixtureID + `","Name":"/ci-db","State":{"Status":"running"},

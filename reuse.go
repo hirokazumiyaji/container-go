@@ -227,6 +227,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		image:           containerImage,
 		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
 	}
+	ctr.applyConfigDiagnostics(cfg)
 	// The leader's files are copied in reuseCreate. Every attaching
 	// caller applies its own files after the shared generation is known.
 	// A failed attach copy is reported without deleting the shared
@@ -388,7 +389,7 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := resolveImage(); err != nil {
 				return nil, err
 			}
-			return &Container{
+			ctr := &Container{
 				id:              cfg.name,
 				runner:          cfg.runner,
 				eng:             cfg.eng,
@@ -402,7 +403,9 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 				creation:        info.labels[creationLabel],
 				image:           resolvedImage,
 				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
-			}, nil
+			}
+			ctr.applyConfigDiagnostics(cfg)
+			return ctr, nil
 		default:
 			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
@@ -522,6 +525,7 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		image:           resolvedImage,
 		sync:            &lockPack{uid: uid},
 	}
+	ctr.applyConfigDiagnostics(cfg)
 	if target, ok := runReaperTarget(cfg); ok {
 		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
 			protectReuseReaper(cfg)

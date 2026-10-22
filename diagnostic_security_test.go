@@ -200,6 +200,61 @@ func TestReuseWaitDiagnosticsCarryStrategyContext(t *testing.T) {
 	}
 }
 
+func TestReuseWaitFailureRedactsDeclaredEnvSecrets(t *testing.T) {
+	if !envFileLocksSupported {
+		t.Skip("secure environment files are unavailable on this platform")
+	}
+	const secret = "reuse-env-7f3a9c234"
+	f := &reuseLogsRunner{
+		reuseCreateRunner: newReuseCreateRunner(),
+		stdout:            "starting\n" + secret + "\n",
+	}
+	cfg := newConfig()
+	for _, opt := range []Option{
+		WithName("diag-reuse-env-234"), WithReuse(),
+		WithEnv(map[string]string{"PASSWORD": secret}),
+		withRunner(f), withEngine(appleEngine{}),
+		WithWaitStrategy(&recordingStrategy{err: errors.New("never became ready")}),
+	} {
+		if err := opt(cfg); err != nil {
+			t.Fatalf("option: %v", err)
+		}
+	}
+	// Call the reuse path directly: Run's deferred boundary redacts every
+	// creation error, which would hide a handle that lost its matcher.
+	_, err := reuseRun(context.Background(), "redis:7-alpine", cfg)
+	if err == nil {
+		t.Fatal("want reuse wait error")
+	}
+	got := err.Error()
+	if strings.Contains(got, secret) {
+		t.Fatalf("reuse wait error = %q, contains declared environment secret", got)
+	}
+	if !strings.Contains(got, "container logs") {
+		t.Fatalf("reuse wait error = %q, want log tail", got)
+	}
+	if !strings.Contains(got, "[REDACTED]") {
+		t.Fatalf("reuse wait error = %q, want the log tail redacted", got)
+	}
+}
+
+// reuseLogsRunner creates a reuse container like reuseCreateRunner and
+// answers log-tail reads with fixed output.
+type reuseLogsRunner struct {
+	*reuseCreateRunner
+	stdout string
+}
+
+func (r *reuseLogsRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if args[0] == "logs" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return []byte(r.stdout), nil, nil
+	}
+	return r.reuseCreateRunner.Run(ctx, args...)
+}
+
 func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 	const secret = "tail-boundary-secret-117"
 	data := strings.Repeat("a", logTailLimit-4) + secret + strings.Repeat("b", 128)

@@ -288,6 +288,14 @@ func (c *Container) setImmutableID(uid string) {
 	c.pack().uidMu.Unlock()
 }
 
+// applyConfigDiagnostics installs the per-handle redactor and freezes the
+// target host. Every construction site must use it so a new handle cannot
+// silently omit either field.
+func (c *Container) applyConfigDiagnostics(cfg *config) {
+	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues())
+	c.targetHost = cfg.eng.defaultHost()
+}
+
 // Run pulls the image if needed, creates and starts a container, and
 // returns a handle to it. On failure after creation, the container is
 // normally removed before returning. If a post-create environment-file
@@ -492,21 +500,20 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 
 	c := &Container{
-		id:                      cfg.name,
-		runner:                  cfg.runner,
-		eng:                     cfg.eng,
-		queryTimeout:            cfg.queryTimeout,
-		probeTimeout:            cfg.probeTimeout,
-		exposed:                 cfg.exposed,
-		published:               cfg.published,
-		network:                 cfg.network,
-		networkExplicit:         cfg.networkExplicit,
-		creation:                cfg.creation,
-		image:                   resolvedImage,
-		sync:                    &lockPack{uid: uid},
-		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
-		targetHost:              cfg.eng.defaultHost(),
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		creation:        cfg.creation,
+		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
+	c.applyConfigDiagnostics(cfg)
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
 	// an additional deletion target. Both operations are best effort: a
@@ -1346,6 +1353,7 @@ func (c *Container) Shared() *Container {
 		reused: c.reused, allowDestructive: true, creation: c.creation,
 		image: c.image, nameInspect: c.nameInspect,
 		sync: c.sync, diagnosticRedactorValue: diagnosticRedactor,
+		targetHost: c.targetHost,
 	}
 }
 

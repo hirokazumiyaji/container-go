@@ -223,9 +223,19 @@ func copyFilesConcurrently(ctx context.Context, files []File, copyFile func(cont
 	return ctx.Err()
 }
 
+// validationCause unwraps a lower-level typed validation error so the caller
+// can re-wrap it with its own Option and Field without losing the message.
+func validationCause(err error) error {
+	var validation *ValidationError
+	if errors.As(err, &validation) {
+		return validation.Err
+	}
+	return err
+}
+
 func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath string, allowDirectory bool) error {
 	if err := validateContainerPath(containerPath); err != nil {
-		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, err)
+		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, validationCause(err))
 	}
 	if err := validateHostPathValue(hostPath); err != nil {
 		return newValidationErrorWithField("CopyToContainer", "hostPath", hostPath, err)

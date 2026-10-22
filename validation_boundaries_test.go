@@ -52,29 +52,41 @@ func assertRedactedMountValidationError(t *testing.T, err error, message string)
 
 func TestCopyMethodsRejectInvalidContainerPathAsValidationError(t *testing.T) {
 	tests := []struct {
-		name   string
-		path   string
-		option string
-		call   func(*Container, string) error
+		name    string
+		path    string
+		option  string
+		message string
+		call    func(*Container, string) error
 	}{
 		{
-			name:   "copy to",
-			path:   "relative/path",
-			option: "CopyToContainer",
+			name:    "copy to",
+			path:    "relative/path",
+			option:  "CopyToContainer",
+			message: `container path "relative/path" must be absolute`,
 			call: func(c *Container, path string) error {
 				return c.CopyToContainer(context.Background(), t.TempDir(), path)
 			},
 		},
 		{
-			name:   "copy from",
-			path:   "relative/path",
-			option: "CopyFileFromContainer",
+			name:    "copy from",
+			path:    "relative/path",
+			option:  "CopyFileFromContainer",
+			message: `container path "relative/path" must be absolute`,
 			call: func(c *Container, path string) error {
 				rc, err := c.CopyFileFromContainer(context.Background(), path)
 				if rc != nil {
 					_ = rc.Close()
 				}
 				return err
+			},
+		},
+		{
+			name:    "copy to NUL",
+			path:    "/bad\x00path",
+			option:  "CopyToContainer",
+			message: "must be valid UTF-8 without NUL bytes",
+			call: func(c *Container, path string) error {
+				return c.CopyToContainer(context.Background(), t.TempDir(), path)
 			},
 		},
 	}
@@ -86,8 +98,7 @@ func TestCopyMethodsRejectInvalidContainerPathAsValidationError(t *testing.T) {
 			f.calls = nil
 
 			err := tt.call(ctr, tt.path)
-			assertPublicValidationError(t, err, tt.option, "containerPath", tt.path,
-				fmt.Sprintf("container path %q must be absolute", tt.path))
+			assertPublicValidationError(t, err, tt.option, "containerPath", tt.path, tt.message)
 			if len(f.calls) != 0 {
 				t.Fatalf("backend was called despite invalid path: %v", f.calls)
 			}

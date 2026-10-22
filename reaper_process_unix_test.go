@@ -37,12 +37,12 @@ func TestKillReaperProcessTerminatesProcessGroup(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 	if child <= 0 {
-		killReaperProcess(cmd, reaperProcessGroupID(cmd))
+		killReaperProcess(cmd)
 		<-exited
 		t.Fatal("reaper child did not start")
 	}
 
-	killReaperProcess(cmd, reaperProcessGroupID(cmd))
+	killReaperProcess(cmd)
 	select {
 	case <-exited:
 	case <-time.After(5 * time.Second):

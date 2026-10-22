@@ -99,6 +99,8 @@ shift 3
 # Keep a backend call bounded without leaving the sleep process behind.
 # Do not enable job control: every helper and backend process must stay in
 # the reaper shell's process group so a single group kill reaches them all.
+# The backend command therefore has no group of its own, and the timer kills
+# only that direct process; a group signal here would hit the reaper itself.
 run_with_timeout() {
   seconds="$1"
   shift
@@ -118,7 +120,7 @@ run_with_timeout() {
     wait "$timer_sleeper"
     timer_rc=$?
     if [ "$timer_rc" -eq 0 ]; then
-      kill -9 -"$command_pid" 2>/dev/null || kill -9 "$command_pid" 2>/dev/null || true
+      kill -9 "$command_pid" 2>/dev/null || true
     fi
     exit 0
   ) & timer_pid=$!
@@ -372,7 +374,6 @@ type reaper struct {
 	opMu          sync.Mutex
 	mu            sync.Mutex
 	cmd           *exec.Cmd
-	pgid          int
 	stdin         io.WriteCloser
 	exited        chan struct{}
 	entries       []reaperEntry
@@ -987,7 +988,7 @@ func (r *reaper) spawnLocked() error {
 		close(exited)
 	}()
 	r.mu.Lock()
-	r.cmd, r.pgid, r.stdin, r.exited = cmd, reaperProcessGroupID(cmd), stdin, exited
+	r.cmd, r.stdin, r.exited = cmd, stdin, exited
 	r.mu.Unlock()
 	go r.monitorChild(cmd, exited)
 	return nil
@@ -1007,8 +1008,8 @@ func (r *reaper) monitorChild(cmd *exec.Cmd, exited <-chan struct{}) {
 
 func (r *reaper) stopCurrentProcess() {
 	r.mu.Lock()
-	cmd, pgid, stdin, exited := r.cmd, r.pgid, r.stdin, r.exited
-	r.cmd, r.pgid, r.stdin, r.exited = nil, 0, nil, nil
+	cmd, stdin, exited := r.cmd, r.stdin, r.exited
+	r.cmd, r.stdin, r.exited = nil, nil, nil
 	r.mu.Unlock()
 	if cmd == nil {
 		return
@@ -1017,7 +1018,7 @@ func (r *reaper) stopCurrentProcess() {
 		_ = stdin.Close()
 	}
 	if !channelClosed(exited) {
-		killReaperProcess(cmd, pgid)
+		killReaperProcess(cmd)
 	}
 	if exited != nil {
 		<-exited

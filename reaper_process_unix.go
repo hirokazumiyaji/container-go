@@ -4,10 +4,7 @@ package container
 
 import (
 	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
-	"time"
 )
 
 // configureReaperProcess gives each reaper shell its own process group.
@@ -28,52 +25,17 @@ func reaperProcessGroupID(cmd *exec.Cmd) int {
 	return pgid
 }
 
-// killReaperProcess terminates the shell's group and any job-control
-// descendants that were placed in separate groups. The shell is waited
-// by the caller; the short poll also gives descendants time to disappear
-// before a replacement process is started.
+// killReaperProcess terminates the shell and every process in its group.
+// configureReaperProcess makes the shell a group leader and the reaper runs
+// non-interactively, so children cannot move to another group. The caller
+// waits for the shell, which reaps it before its PID can be reused; this
+// function must not hold or signal numeric descendant PIDs.
 func killReaperProcess(cmd *exec.Cmd, pgid int) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	pid := cmd.Process.Pid
-	pids := descendantPIDs(pid)
-	if pgid > 0 {
+	if pgid > 0 && pgid == cmd.Process.Pid {
 		_ = syscall.Kill(-pgid, syscall.SIGKILL)
 	}
-	for i := len(pids) - 1; i >= 0; i-- {
-		_ = syscall.Kill(pids[i], syscall.SIGKILL)
-	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		alive := false
-		for _, descendant := range pids {
-			if syscall.Kill(descendant, 0) == nil {
-				alive = true
-				break
-			}
-		}
-		if !alive {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func descendantPIDs(parent int) []int {
-	out, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
-	if err != nil {
-		return nil
-	}
-	var pids []int
-	for _, line := range strings.Fields(string(out)) {
-		pid, err := strconv.Atoi(line)
-		if err != nil || pid <= 0 {
-			continue
-		}
-		pids = append(pids, pid)
-		pids = append(pids, descendantPIDs(pid)...)
-	}
-	return pids
+	_ = cmd.Process.Kill()
 }

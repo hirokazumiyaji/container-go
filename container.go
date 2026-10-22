@@ -1146,7 +1146,7 @@ func (c *Container) Start(ctx context.Context) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("start %s: %w", c.id, ErrSharedContainer)
 	}
-	startCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	startCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(startCtx)
 	if err != nil {
@@ -1173,7 +1173,7 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("restart %s: %w", c.id, ErrSharedContainer)
 	}
-	restartCtx, cancel := withDefaultTimeout(ctx, queryTimeout+durationOrZero(timeout))
+	restartCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout()+durationOrZero(timeout))
 	defer cancel()
 	target, err := c.verifiedOperationTarget(restartCtx)
 	if err != nil {
@@ -1230,7 +1230,7 @@ func (c *Container) Kill(ctx context.Context, signal ...string) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
 	}
-	killCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	killCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(killCtx)
 	if err != nil {
@@ -1268,7 +1268,7 @@ func (c *Container) Pause(ctx context.Context) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("pause %s: %w", c.id, ErrSharedContainer)
 	}
-	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	pCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(pCtx)
 	if err != nil {
@@ -1292,7 +1292,7 @@ func (c *Container) Unpause(ctx context.Context) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("unpause %s: %w", c.id, ErrSharedContainer)
 	}
-	pCtx, cancel := withDefaultTimeout(ctx, queryTimeout)
+	pCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(pCtx)
 	if err != nil {

@@ -1270,7 +1270,7 @@ func (appleEngine) containerMissing(err error) bool {
 		return false
 	}
 	switch ctx.operation {
-	case "inspect", "exec", "stop", "delete", "rm", "logs":
+	case "inspect", "exec", "stop", "delete", "rm", "logs", "start", "kill":
 		return hasCLIErrorLine(err, func(line string) bool {
 			return appleContainerMissingLine(line, ctx.target, ctx.operation)
 		})
@@ -1294,6 +1294,10 @@ func appleContainerMissingLine(line, target, command string) bool {
 			return true
 		}
 		return appleStateMissingLine(line, target, "failed to stop container:")
+	case "start":
+		return appleLifecycleMissing(line, target, "failed to start container:")
+	case "kill":
+		return appleLifecycleMissing(line, target, "failed to kill container:")
 	case "delete", "rm":
 		if rest, ok := strings.CutPrefix(line, "container not found:"); ok && cliTargetListMatches(rest, target) {
 			return true
@@ -1421,6 +1425,10 @@ func appleContainerNotFoundMessage(line, message, target, command string) bool {
 		}
 		// Bare notFound ID spelling is a real Apple 1.3 stop form.
 		return appleIDMessageMatches(message, target)
+	case "start":
+		return appleLifecycleMissing(message, target, "failed to start container:")
+	case "kill":
+		return appleLifecycleMissing(message, target, "failed to kill container:")
 	case "delete", "rm":
 		if hasGeneric && cliTargetListMatches(generic, target) {
 			return strings.Contains(lowerLine, "failed to delete container") ||
@@ -1504,6 +1512,30 @@ func appleStateMissingLine(line, target, wrapper string) bool {
 			return false
 		}
 		current = strings.TrimSpace(rest)
+	}
+	return false
+}
+
+// appleLifecycleMissing matches the absence forms a start or kill reports:
+// the generic "container not found:" leaf, the "get failed: container ...
+// not found" leaf start receives from its initial get, or the operation
+// wrapper around either leaf. The wrapper may be rendered with or without a
+// trailing colon depending on the CLI version.
+func appleLifecycleMissing(value, target, wrapper string) bool {
+	current := strings.TrimSpace(value)
+	for range 3 {
+		if appleIDMissingLine(current, target) || appleExecMissingLine(current, target) {
+			return true
+		}
+		if rest, ok := strings.CutPrefix(current, "container not found:"); ok &&
+			cliTargetListMatches(rest, target) {
+			return true
+		}
+		rest, ok := strings.CutPrefix(current, wrapper)
+		if !ok {
+			return false
+		}
+		current = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(rest), ":"))
 	}
 	return false
 }

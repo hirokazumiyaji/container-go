@@ -280,6 +280,29 @@ func TestReuseAttachesToRunningContainer(t *testing.T) {
 	}
 }
 
+// A reuse handle must freeze the target host resolved at creation so a
+// later environment change cannot retarget diagnostics or endpoints.
+func TestReuseHandleRetainsTargetHost(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "tcp://reuse-original:2375")
+	r := &reuseRunner{
+		imageID:        reuseImageID,
+		docker:         true,
+		containerImage: "other:tag",
+	}
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), WithReuse(),
+		withRunner(r), withEngine(dockerEngine{}))
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := ctr.targetHost; got != "reuse-original" {
+		t.Fatalf("reuse handle targetHost = %q, want reuse-original", got)
+	}
+	if got := ctr.Shared().targetHost; got != ctr.targetHost {
+		t.Errorf("Shared().targetHost = %q, want %q", got, ctr.targetHost)
+	}
+}
+
 // Unreadable inspect output does not mean the container is absent. The
 // attach path must surface the decode failure instead of trying to create
 // a same-name container that already exists and retrying until the attach

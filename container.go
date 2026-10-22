@@ -1331,6 +1331,7 @@ func (c *Container) Shared() *Container {
 		reused: c.reused, allowDestructive: true, creation: c.creation,
 		image: c.image, nameInspect: c.nameInspect,
 		sync: c.sync, diagnosticRedactorValue: diagnosticRedactor,
+		targetHost: c.targetHost,
 	}
 }
 

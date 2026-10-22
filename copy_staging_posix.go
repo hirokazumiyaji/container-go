@@ -18,23 +18,23 @@ func prepareCopyStagingRoot() (string, error) {
 func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 	base, err := os.UserCacheDir()
 	if err != nil {
-		return "", fmt.Errorf("copy to container: locate per-user cache: %w", err)
+		return "", fmt.Errorf("copy staging: locate per-user cache: %w", err)
 	}
 	base, err = filepath.Abs(base)
 	if err != nil {
-		return "", fmt.Errorf("copy to container: resolve per-user cache: %w", err)
+		return "", fmt.Errorf("copy staging: resolve per-user cache: %w", err)
 	}
 	if err := ensureCopyStagingBase(base, source); err != nil {
-		return "", fmt.Errorf("copy to container: ensure per-user cache: %w", err)
+		return "", fmt.Errorf("copy staging: ensure per-user cache: %w", err)
 	}
 
 	appRoot := filepath.Join(base, "containergo")
 	if err := ensurePrivateCopyStagingDir(appRoot); err != nil {
-		return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+		return "", fmt.Errorf("copy staging: create private staging parent: %w", err)
 	}
 	root := filepath.Join(appRoot, "copy-staging")
 	if err := ensurePrivateCopyStagingDir(root); err != nil {
-		return "", fmt.Errorf("copy to container: create private staging root: %w", err)
+		return "", fmt.Errorf("copy staging: create private staging root: %w", err)
 	}
 	return root, nil
 }

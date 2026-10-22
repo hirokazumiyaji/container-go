@@ -2165,7 +2165,13 @@ func (c *Container) ensureDefaultNetworkForConfig(ctx context.Context, cfg *conf
 	}
 	defer c.pack().inspectMu.Unlock()
 	if name := c.cachedDefaultNetwork(); name != "" {
-		return name, nil
+		// The handle value is valid only for the handle's own target and
+		// runner. A reuse waiter may carry a different runner (for example a
+		// custom cli.Runner), and accepting the leader's answer would validate
+		// its container against the wrong daemon.
+		if cfg == nil || dockerDefaultNetworkKey(cfg.eng, cfg.runner) == dockerDefaultNetworkKey(c.eng, c.runner) {
+			return name, nil
+		}
 	}
 	runner, meta := c.runner, c.dockerMeta
 	eng := c.eng
@@ -2177,6 +2183,10 @@ func (c *Container) ensureDefaultNetworkForConfig(ctx context.Context, cfg *conf
 	name, err := dockerDefaultNetworkCached(ctx, meta, runner, eng, timeouts)
 	if err != nil {
 		return "", err
+	}
+	if cfg != nil && dockerDefaultNetworkKey(cfg.eng, cfg.runner) != dockerDefaultNetworkKey(c.eng, c.runner) {
+		// Do not overwrite the handle's own answer with another runner's.
+		return name, nil
 	}
 	return c.storeDefaultNetwork(name), nil
 }

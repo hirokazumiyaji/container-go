@@ -173,6 +173,46 @@ func TestDockerDefaultNetworkCacheSharesConcurrentLookup(t *testing.T) {
 	}
 }
 
+func TestDockerMetadataCacheLeaderCancellationDoesNotFailJoiners(t *testing.T) {
+	cache := newDockerMetadataCache(time.Minute)
+	started := make(chan struct{})
+	release := make(chan struct{})
+	fn := func(ctx context.Context) (string, error) {
+		close(started)
+		<-release
+		return dockerNetworkBridge, ctx.Err()
+	}
+
+	leaderCtx, cancelLeader := context.WithCancel(context.Background())
+	leaderErr := make(chan error, 1)
+	go func() {
+		_, err := cache.lookup(leaderCtx, "shared", fn)
+		leaderErr <- err
+	}()
+	<-started
+	cancelLeader()
+
+	joinerDone := make(chan struct{})
+	var got string
+	var gotErr error
+	go func() {
+		got, gotErr = cache.lookup(context.Background(), "shared", fn)
+		close(joinerDone)
+	}()
+	close(release)
+	<-joinerDone
+
+	if gotErr != nil {
+		t.Fatalf("joiner error = %v, want nil", gotErr)
+	}
+	if got != dockerNetworkBridge {
+		t.Fatalf("joiner value = %q, want %q", got, dockerNetworkBridge)
+	}
+	if err := <-leaderErr; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader error = %v, want its own context.Canceled", err)
+	}
+}
+
 func TestDockerDefaultNetworkCacheSeparatesTargets(t *testing.T) {
 	cache := newDockerMetadataCache(time.Minute)
 	linux := newMetadataRunner()

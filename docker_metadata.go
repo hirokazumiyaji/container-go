@@ -14,6 +14,9 @@ const (
 	// hosts, contexts, or client configuration never reads another daemon's
 	// answer; the TTL only bounds a change on the same endpoint.
 	dockerMetadataTTL = 30 * time.Second
+	// dockerMetadataLookupTimeout bounds the detached leader lookup so a
+	// canceled caller cannot strand joiners forever.
+	dockerMetadataLookupTimeout = 30 * time.Second
 	// dockerMetadataLimit bounds the number of entries one Client can
 	// retain. A Client pins one target, so in practice it needs a handful;
 	// the limit keeps a caller that constructs engines directly from
@@ -43,6 +46,10 @@ type dockerMetadataCache struct {
 	// now and ttl are injectable so expiry is testable without sleeping.
 	now func() time.Time
 	ttl time.Duration
+	// lookupTimeout bounds one detached leader lookup. A caller that starts
+	// the flight may cancel immediately afterwards; joiners with healthy
+	// contexts must still be able to complete it.
+	lookupTimeout time.Duration
 	// limit is the maximum number of live entries; a non-positive limit
 	// disables eviction.
 	limit int
@@ -50,10 +57,11 @@ type dockerMetadataCache struct {
 
 func newDockerMetadataCache(ttl time.Duration) *dockerMetadataCache {
 	return &dockerMetadataCache{
-		entries: map[string]dockerMetadataEntry{},
-		now:     time.Now,
-		ttl:     ttl,
-		limit:   dockerMetadataLimit,
+		entries:       map[string]dockerMetadataEntry{},
+		now:           time.Now,
+		ttl:           ttl,
+		limit:         dockerMetadataLimit,
+		lookupTimeout: dockerMetadataLookupTimeout,
 	}
 }
 
@@ -80,7 +88,13 @@ func (c *dockerMetadataCache) lookup(ctx context.Context, key string, fn func(co
 		if value, ok := c.get(key); ok {
 			return value, nil
 		}
-		value, err := fn(ctx)
+		lookupCtx := ctx
+		if c.lookupTimeout > 0 {
+			var cancel context.CancelFunc
+			lookupCtx, cancel = context.WithTimeout(context.WithoutCancel(ctx), c.lookupTimeout)
+			defer cancel()
+		}
+		value, err := fn(lookupCtx)
 		if err != nil {
 			return "", err
 		}

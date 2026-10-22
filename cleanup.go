@@ -178,11 +178,19 @@ func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneWith(ctx, cfg.runnerFor(eng), eng, opts...)
+	return pruneWithConfig(ctx, cfg.runnerFor(eng), eng, cfg)
 }
 
 func pruneWith(ctx context.Context, r cli.Runner, eng engine, opts ...PruneOption) ([]string, error) {
-	return pruneListed(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", opts...)
+	cfg, err := parsePruneOptions("prune", opts)
+	if err != nil {
+		return nil, safePublicError(err)
+	}
+	return pruneWithConfig(ctx, r, eng, cfg)
+}
+
+func pruneWithConfig(ctx context.Context, r cli.Runner, eng engine, cfg pruneConfig) ([]string, error) {
+	return pruneListedWithGroupConfig(ctx, r, eng, eng.listArgs(), eng.parseStoppedManaged, "prune", "", cfg)
 }
 
 type pruneCandidate struct {
@@ -199,13 +207,22 @@ type pruneCandidate struct {
 // Apple candidates carry list-time ownership/state metadata and are
 // revalidated while the per-name lock is held before a name is deleted.
 func pruneListed(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind string, opts ...PruneOption) ([]string, error) {
-	return pruneListedWithGroup(ctx, r, eng, listArgs, parse, errKind, "", opts...)
-}
-
-func pruneListedWithGroup(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions(errKind, opts)
 	if err != nil {
 		return nil, safePublicError(err)
+	}
+	return pruneListedWithGroupConfig(ctx, r, eng, listArgs, parse, errKind, "", cfg)
+}
+
+func pruneListedWithGroupConfig(ctx context.Context, r cli.Runner, eng engine, listArgs []string, parse func([]byte) ([]string, error), errKind, reuseGroup string, cfg pruneConfig) ([]string, error) {
+	// Parsed entry points always supply positive defaults. Keep this helper
+	// fail-safe for direct internal callers: zero parallelism would silently
+	// remove nothing, and a non-positive timeout would expire immediately.
+	if cfg.parallelism < 1 {
+		cfg.parallelism = 1
+	}
+	if cfg.timeout <= 0 {
+		cfg.timeout = defaultPruneTimeout
 	}
 
 	redactor := cli.NewHashedContextRedactor(reuseGroup)

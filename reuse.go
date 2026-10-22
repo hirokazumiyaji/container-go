@@ -1200,16 +1200,27 @@ func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]
 	if err != nil {
 		return nil, safePublicError(err)
 	}
-	return pruneReuseGroupWith(ctx, cfg.runnerFor(eng), eng, group, opts...)
+	return pruneReuseGroupWithConfig(ctx, cfg.runnerFor(eng), eng, group, cfg)
 }
 
 func pruneReuseGroupWith(ctx context.Context, r cli.Runner, eng engine, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, safePublicError(err, group)
 	}
-	return pruneListedWithGroup(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
+	cfg, err := parsePruneOptions("PruneReuseGroup", opts)
+	if err != nil {
+		return nil, safePublicError(err)
+	}
+	return pruneReuseGroupWithConfig(ctx, r, eng, group, cfg)
+}
+
+func pruneReuseGroupWithConfig(ctx context.Context, r cli.Runner, eng engine, group string, cfg pruneConfig) ([]string, error) {
+	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
+		return nil, safePublicError(err, group)
+	}
+	return pruneListedWithGroupConfig(ctx, r, eng, eng.listReuseGroupArgs(group), func(data []byte) ([]string, error) {
 		return eng.parseReuseGroupIDs(data, group)
-	}, "prune reuse group "+group, group, opts...)
+	}, "prune reuse group "+group, group, cfg)
 }
 
 func reuseContextError(ctx context.Context, name string) error {

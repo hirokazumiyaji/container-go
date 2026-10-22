@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"os"
+	"runtime"
 	"strings"
 	"time"
 
@@ -40,6 +43,22 @@ const (
 	flightPull    = "pull"
 	flightMissing = "missing"
 )
+
+// pullWaitGrace lets a flight leader observe the error its own fetch
+// produces. The wait and execution budgets start from the same duration but
+// the wait timer is created first, so without a small grace the leader would
+// always return the wait deadline and drop the classified fetch error.
+const pullWaitGrace = time.Second
+
+// pullWaitBudget returns the wait deadline for a pull. It clamps the grace
+// addition so a caller-supplied maximum duration cannot overflow into an
+// already-expired context.
+func pullWaitBudget(d time.Duration) time.Duration {
+	if d > time.Duration(math.MaxInt64)-pullWaitGrace {
+		return time.Duration(math.MaxInt64)
+	}
+	return d + pullWaitGrace
+}
 
 // WithPullPolicy sets when Run fetches the image. The default is
 // PullMissing. PullAlways is honored for every WithReuse caller,
@@ -114,12 +133,122 @@ func WithImagePresenceCache(ttl time.Duration) Option {
 type PullOption func(*pullConfig) error
 
 type pullConfig struct {
-	runner Runner
-	binary string
+	runner        Runner
+	binary        string
+	platform      string
+	timeout       time.Duration
+	dockerHost    *string
+	dockerContext *string
 }
 
-func newPullConfig() *pullConfig {
-	return &pullConfig{}
+// parsePullOptions applies opts over the pull defaults. name labels the entry
+// point for a nil option, matching Run and Exec.
+func parsePullOptions(name string, opts []PullOption) (pullConfig, error) {
+	cfg := pullConfig{}
+	for i, opt := range opts {
+		if opt == nil {
+			return pullConfig{}, validationErrorf(name, i, "option %d is nil", i)
+		}
+		if err := opt(&cfg); err != nil {
+			return pullConfig{}, err
+		}
+	}
+	return cfg, nil
+}
+
+// dockerTargetOption names the option that set a Docker target override so a
+// validation error points at the option the caller must change.
+func (c pullConfig) dockerTargetOption() string {
+	if c.dockerContext != nil {
+		return "WithPullDockerContext"
+	}
+	return "WithPullDockerHost"
+}
+
+// applyDockerTarget applies explicit Docker target options to eng and rejects
+// them for a non-Docker backend.
+func (c pullConfig) applyDockerTarget(eng engine) (engine, error) {
+	if c.dockerHost == nil && c.dockerContext == nil {
+		return eng, nil
+	}
+	de, ok := eng.(dockerEngine)
+	if !ok {
+		return eng, validationErrorf(c.dockerTargetOption(), nil, "Docker target options require Docker backend")
+	}
+	if c.dockerHost != nil {
+		de.host = *c.dockerHost
+		de.explicitHost = true
+		de.explicitTarget = true
+	}
+	if c.dockerContext != nil {
+		de.context = *c.dockerContext
+		de.explicitContext = true
+		de.explicitTarget = true
+	}
+	return de, nil
+}
+
+// operationConfig builds the config pullWithConfig consumes.
+func (c pullConfig) operationConfig(r Runner, eng engine) *config {
+	return &config{
+		runner:        r,
+		eng:           eng,
+		platform:      c.platform,
+		runTimeout:    c.timeout,
+		dockerHost:    c.dockerHost,
+		dockerContext: c.dockerContext,
+	}
+}
+
+// WithPullPlatform selects the image platform, e.g. "linux/amd64".
+func WithPullPlatform(platform string) PullOption {
+	return func(c *pullConfig) error {
+		if !platformRE.MatchString(platform) {
+			return validationErrorf("WithPullPlatform", platform, "invalid platform %q", platform)
+		}
+		c.platform = platform
+		return nil
+	}
+}
+
+// WithPullTimeout sets the timeout budget for the image fetch. Backend target
+// resolution is bounded separately by the caller's context and the backend
+// query timeout. A caller waiting on a pull another caller started may wait up
+// to one second longer than this budget so a flight leader can report the
+// classified fetch error rather than a bare deadline. Non-positive durations
+// are rejected.
+func WithPullTimeout(d time.Duration) PullOption {
+	return func(c *pullConfig) error {
+		if d <= 0 {
+			return validationErrorf("WithPullTimeout", d, "timeout must be positive")
+		}
+		c.timeout = d
+		return nil
+	}
+}
+
+// WithPullDockerHost overrides the target Docker daemon host (DOCKER_HOST)
+// for this pull.
+func WithPullDockerHost(host string) PullOption {
+	return func(c *pullConfig) error {
+		if err := validateDockerTargetValue("WithPullDockerHost", host); err != nil {
+			return err
+		}
+		c.dockerHost = &host
+		return nil
+	}
+}
+
+// WithPullDockerContext overrides the target Docker context (DOCKER_CONTEXT)
+// for this pull.
+func WithPullDockerContext(context string) PullOption {
+	return func(c *pullConfig) error {
+		if err := validateDockerTargetValue("WithPullDockerContext", context); err != nil {
+			return err
+		}
+		c.dockerContext = &context
+		return nil
+	}
 }
 
 // WithPullRunner sets the runner used for Pull.
@@ -159,35 +288,57 @@ func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	if err := validateImageReference(image); err != nil {
 		return err
 	}
-	cfg := newPullConfig()
-	for i, opt := range opts {
-		if opt == nil {
-			return validationErrorf("Pull", i, "option %d is nil", i)
-		}
-		if err := opt(cfg); err != nil {
-			return err
-		}
+	cfg, err := parsePullOptions("Pull", opts)
+	if err != nil {
+		return err
 	}
-	eng, err := detectEngine()
+	// A Docker target option implies the Docker backend when no backend is
+	// configured, matching Run and NewClient.
+	backend := os.Getenv(backendEnv)
+	if backend == "" && (cfg.dockerHost != nil || cfg.dockerContext != nil) {
+		backend = "docker"
+	}
+	eng, err := detectEngineFor(runtime.GOOS, backend)
 	if err != nil {
 		return safePublicError(err)
 	}
-	return safePublicError(pullWith(ctx, effectiveRunner(cfg.runner, cfg.binary, eng), eng, image))
+	eng, err = cfg.applyDockerTarget(eng)
+	if err != nil {
+		return err
+	}
+	opCfg := cfg.operationConfig(effectiveRunner(cfg.runner, cfg.binary, eng), eng)
+	if err := pullWithConfig(ctx, opCfg, image); err != nil {
+		return opCfg.publicError(err)
+	}
+	return nil
 }
 
 // pullWith is the fake-runner-driven core of Pull. It resolves and validates
 // the effective backend configuration before entering the pull flight, so the
 // public helper and Run apply the same platform and capability rules.
 func pullWith(ctx context.Context, r cli.Runner, eng engine, image string) error {
-	cfg := &config{runner: r, eng: eng}
-	if err := eng.checkConfig(ctx, cfg); err != nil {
+	return pullWithConfig(ctx, &config{runner: r, eng: eng}, image)
+}
+
+// pullWithConfig runs a pull with the supplied operation config. It mutates cfg
+// with the resolved engine and runner, matching Run's backend configuration
+// step, so a Docker context resolved here also pins the pull's child process.
+func pullWithConfig(ctx context.Context, cfg *config, image string) error {
+	if err := cfg.eng.checkConfig(ctx, cfg); err != nil {
 		return err
 	}
 	resolvedEng := cfg.eng
-	return doErr(ctx, &imageFlights, flightKey(resolvedEng, image, flightPull, cfg.platform), func() error {
-		execCtx, cancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
-		defer cancel()
-		return pullImage(execCtx, r, resolvedEng, image, cfg.platform, opTimeouts{probe: cfg.effectiveProbeTimeout()})
+	// Bound the wait with this caller's own budget. The leader keeps its own
+	// execution budget inside the flight, so a caller that joins a long pull
+	// cannot inherit a shorter or longer timeout from whoever started it.
+	// context.WithTimeout keeps the earlier of the caller's deadline and this
+	// budget, so WithPullTimeout is not dropped when the caller also set one.
+	waitCtx, cancel := context.WithTimeout(ctx, pullWaitBudget(cfg.effectiveRunTimeout()))
+	defer cancel()
+	return doErr(waitCtx, &imageFlights, flightKey(resolvedEng, image, flightPull, cfg.platform), func() error {
+		execCtx, execCancel := withDefaultTimeout(context.WithoutCancel(ctx), cfg.effectiveRunTimeout())
+		defer execCancel()
+		return pullImage(execCtx, cfg.runner, resolvedEng, image, cfg.platform, opTimeouts{probe: cfg.effectiveProbeTimeout()})
 	})
 }
 

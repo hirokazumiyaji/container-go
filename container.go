@@ -295,6 +295,14 @@ func (c *Container) setImmutableID(uid string) {
 // with the joined error so the container is not orphaned. WithReuse
 // switches to get-or-create; see WithReuse for the shared-handle
 // lifecycle.
+// applyConfigDiagnostics installs the per-handle redactor and freezes the
+// target host. Every construction site must use it so a new handle cannot
+// silently omit either field.
+func (c *Container) applyConfigDiagnostics(cfg *config) {
+	c.diagnosticRedactorValue = newDiagnosticMatcher(cfg.diagnosticValues())
+	c.targetHost = cfg.eng.defaultHost()
+}
+
 func Run(ctx context.Context, image string, opts ...Option) (result *Container, retErr error) {
 	// Validate the public image before applying options. Option functions
 	// are user-provided code and may have side effects or return errors;
@@ -492,21 +500,20 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	}
 
 	c := &Container{
-		id:                      cfg.name,
-		runner:                  cfg.runner,
-		eng:                     cfg.eng,
-		queryTimeout:            cfg.queryTimeout,
-		probeTimeout:            cfg.probeTimeout,
-		exposed:                 cfg.exposed,
-		published:               cfg.published,
-		network:                 cfg.network,
-		networkExplicit:         cfg.networkExplicit,
-		creation:                cfg.creation,
-		image:                   resolvedImage,
-		sync:                    &lockPack{uid: uid},
-		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
-		targetHost:              cfg.eng.defaultHost(),
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		creation:        cfg.creation,
+		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
+	c.applyConfigDiagnostics(cfg)
 	// The reaper only backs real CLI containers. Complete the pending
 	// name/generation record, then retain Docker's immutable-ID record as
 	// an additional deletion target. Both operations are best effort: a

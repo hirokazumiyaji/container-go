@@ -213,22 +213,21 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 	}
 
 	ctr := &Container{
-		id:                      base.id,
-		runner:                  cfg.runner,
-		eng:                     cfg.eng,
-		queryTimeout:            cfg.queryTimeout,
-		probeTimeout:            cfg.probeTimeout,
-		exposed:                 cfg.exposed,
-		published:               cfg.published,
-		network:                 cfg.network,
-		networkExplicit:         cfg.networkExplicit,
-		reused:                  true,
-		creation:                info.labels[creationLabel],
-		image:                   containerImage,
-		sync:                    &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
-		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
-		targetHost:              cfg.eng.defaultHost(),
+		id:              base.id,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		reused:          true,
+		creation:        info.labels[creationLabel],
+		image:           containerImage,
+		sync:            &lockPack{uid: info.uid, info: immutableInfo(info), defaultNetwork: info.defaultNetwork},
 	}
+	ctr.applyConfigDiagnostics(cfg)
 	// The leader's files are copied in reuseCreate. Every attaching
 	// caller applies its own files after the shared generation is known.
 	// A failed attach copy is reported without deleting the shared
@@ -390,23 +389,23 @@ func reuseEnsureContainer(ctx context.Context, image string, cfg *config) (*Cont
 			if err := resolveImage(); err != nil {
 				return nil, err
 			}
-			return &Container{
-				id:                      cfg.name,
-				runner:                  cfg.runner,
-				eng:                     cfg.eng,
-				queryTimeout:            cfg.queryTimeout,
-				probeTimeout:            cfg.probeTimeout,
-				exposed:                 cfg.exposed,
-				published:               cfg.published,
-				network:                 cfg.network,
-				networkExplicit:         cfg.networkExplicit,
-				reused:                  true,
-				creation:                info.labels[creationLabel],
-				image:                   resolvedImage,
-				sync:                    &lockPack{uid: info.uid, info: immutableInfo(info)},
-				diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
-				targetHost:              cfg.eng.defaultHost(),
-			}, nil
+			ctr := &Container{
+				id:              cfg.name,
+				runner:          cfg.runner,
+				eng:             cfg.eng,
+				queryTimeout:    cfg.queryTimeout,
+				probeTimeout:    cfg.probeTimeout,
+				exposed:         cfg.exposed,
+				published:       cfg.published,
+				network:         cfg.network,
+				networkExplicit: cfg.networkExplicit,
+				reused:          true,
+				creation:        info.labels[creationLabel],
+				image:           resolvedImage,
+				sync:            &lockPack{uid: info.uid, info: immutableInfo(info)},
+			}
+			ctr.applyConfigDiagnostics(cfg)
+			return ctr, nil
 		default:
 			if err := waitForReusePoll(ctx, cfg.effectiveReusePollInterval()); err != nil {
 				return nil, reuseInspectWaitError(cfg.name, err, lastInspectErr)
@@ -512,22 +511,21 @@ func reuseCreateResolved(ctx context.Context, image string, cfg *config, resolve
 		return nil, joinEnvFileCleanupError(identityErr, envCleanupErr)
 	}
 	ctr := &Container{
-		id:                      cfg.name,
-		runner:                  cfg.runner,
-		eng:                     cfg.eng,
-		queryTimeout:            cfg.queryTimeout,
-		probeTimeout:            cfg.probeTimeout,
-		exposed:                 cfg.exposed,
-		published:               cfg.published,
-		network:                 cfg.network,
-		networkExplicit:         cfg.networkExplicit,
-		reused:                  true,
-		creation:                cfg.creation,
-		image:                   resolvedImage,
-		sync:                    &lockPack{uid: uid},
-		diagnosticRedactorValue: newDiagnosticMatcher(cfg.diagnosticValues()),
-		targetHost:              cfg.eng.defaultHost(),
+		id:              cfg.name,
+		runner:          cfg.runner,
+		eng:             cfg.eng,
+		queryTimeout:    cfg.queryTimeout,
+		probeTimeout:    cfg.probeTimeout,
+		exposed:         cfg.exposed,
+		published:       cfg.published,
+		network:         cfg.network,
+		networkExplicit: cfg.networkExplicit,
+		reused:          true,
+		creation:        cfg.creation,
+		image:           resolvedImage,
+		sync:            &lockPack{uid: uid},
 	}
+	ctr.applyConfigDiagnostics(cfg)
 	if target, ok := runReaperTarget(cfg); ok {
 		if err := verifyCreatedOwnership(ctx, ctr, cfg); err != nil {
 			protectReuseReaper(cfg)

@@ -95,6 +95,47 @@ func TestCopyMethodsRejectInvalidContainerPathAsValidationError(t *testing.T) {
 	}
 }
 
+func TestCopyToContainerRejectsInvalidHostPathBeforeBackend(t *testing.T) {
+	tests := []struct {
+		name    string
+		host    string
+		message string
+	}{
+		{name: "empty", host: "", message: "host path must not be empty"},
+		{name: "nul", host: "bad\x00path", message: "host path must be valid UTF-8 without NUL bytes"},
+		{name: "invalid UTF-8", host: "bad" + string([]byte{0xff}) + "path", message: "host path must be valid UTF-8 without NUL bytes"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newTestRunner()
+			ctr := runTestContainer(t, f)
+			f.calls = nil
+
+			err := ctr.CopyToContainer(context.Background(), tt.host, "/tmp/dst")
+			assertPublicValidationError(t, err, "CopyToContainer", "hostPath", tt.host, tt.message)
+			if len(f.calls) != 0 {
+				t.Fatalf("backend was called despite invalid host path: %v", f.calls)
+			}
+		})
+	}
+}
+
+func TestCopyToContainerValidatesHostPathBeforeTarget(t *testing.T) {
+	f := newTestRunner()
+	ctr := runTestContainer(t, f)
+	// An invalid target makes verifiedOperationTarget fail; the host path
+	// validation must still win because it runs before target resolution.
+	ctr.creation = ""
+	f.calls = nil
+
+	err := ctr.CopyToContainer(context.Background(), "", "/tmp/dst")
+	assertPublicValidationError(t, err, "CopyToContainer", "hostPath", "", "host path must not be empty")
+	if len(f.calls) != 0 {
+		t.Fatalf("backend was called despite invalid host path: %v", f.calls)
+	}
+}
+
 func TestCopyFileFromContainerRejectsRootAndTrailingSlashAsValidationError(t *testing.T) {
 	for _, path := range []string{"/", "/foo/", "/foo/bar/"} {
 		t.Run(path, func(t *testing.T) {

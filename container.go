@@ -1019,6 +1019,7 @@ func (c *Container) Image() string {
 type InspectInfo struct {
 	id         string
 	name       string
+	uid        string
 	image      string
 	imageID    string
 	state      State
@@ -1032,8 +1033,21 @@ type InspectInfo struct {
 	ports      []PortBinding
 }
 
-func (i *InspectInfo) ID() string      { return i.id }
-func (i *InspectInfo) Name() string    { return i.name }
+// ID returns the logical container name, which is the handle's address and
+// not necessarily the backend's immutable identity. ContainerID reports that
+// identity separately when the backend exposes one.
+func (i *InspectInfo) ID() string { return i.id }
+
+// Name returns the backend-reported container name without Docker's leading
+// slash. Apple Container addresses containers by name, so Name matches ID.
+func (i *InspectInfo) Name() string { return i.name }
+
+// ContainerID returns the backend's immutable container ID, such as Docker's
+// 64-character hexadecimal ID. It is empty when the backend has no identity
+// distinct from the logical name, including Apple Container. ID keeps
+// returning the logical name so existing callers are unaffected.
+func (i *InspectInfo) ContainerID() string { return i.uid }
+
 func (i *InspectInfo) Image() string   { return i.image }
 func (i *InspectInfo) ImageID() string { return i.imageID }
 func (i *InspectInfo) State() State    { return i.state }
@@ -1087,6 +1101,7 @@ func (c *Container) Inspect(ctx context.Context) (*InspectInfo, error) {
 	return &InspectInfo{
 		id:         c.id,
 		name:       info.name,
+		uid:        info.uid,
 		image:      info.image,
 		imageID:    info.imageID,
 		state:      info.state,

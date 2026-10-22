@@ -1337,6 +1337,7 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 
 	info := &engineInfo{
 		state:        dockerState(c.State.Status),
+		name:         strings.TrimPrefix(c.Name, "/"),
 		labels:       c.Config.Labels,
 		uid:          c.ID,
 		image:        c.Config.Image,

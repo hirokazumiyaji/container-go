@@ -30,6 +30,9 @@ func TestInspectSnapshotAndGetters(t *testing.T) {
 	if info.Name() != "myctr" {
 		t.Errorf("Name() = %q, want myctr", info.Name())
 	}
+	if info.ContainerID() != "" {
+		t.Errorf("ContainerID() = %q, want empty for a name-addressed backend", info.ContainerID())
+	}
 	if !strings.Contains(info.Image(), "redis:7-alpine") {
 		t.Errorf("Image() = %q, want redis:7-alpine", info.Image())
 	}

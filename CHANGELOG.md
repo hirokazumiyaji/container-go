@@ -15,6 +15,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `InspectInfo.ContainerID()` for the backend's immutable container ID
+  (Docker's 64-character hexadecimal ID). `InspectInfo.ID()` keeps returning
+  the logical container name and `Name()` returns the backend-reported name,
+  so existing callers are unaffected; name-addressed backends such as Apple
+  Container return an empty `ContainerID()` (#239).
 - Add `NewClientContext` and `WithPullPlatform`, `WithPullTimeout`,
   `WithPullDockerHost`, and `WithPullDockerContext`. `Client.Pull` now accepts
   `PullOption` values, `Client.Prune` and `Client.PruneReuseGroup` accept
@@ -132,6 +137,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Fixed
 
+- Populate the Docker inspect name so `InspectInfo.Name()` returns the
+  container name and `Prune`/`PruneReuseGroup` unregister the name-based
+  reaper record after deleting a container (#239).
 - Include Docker `status=dead` in `Prune` daemon-side listing so stopped
   containers the daemon can no longer reap are deleted alongside
   `exited` ones (#113).

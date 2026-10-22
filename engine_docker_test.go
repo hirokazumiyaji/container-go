@@ -168,6 +168,9 @@ func TestDockerParseInspect(t *testing.T) {
 	if info.state != StateRunning {
 		t.Errorf("state = %q", info.state)
 	}
+	if info.name != "myctr" {
+		t.Errorf("name = %q, want myctr", info.name)
+	}
 	if info.labels["com.github.hirokazumiyaji.container-go.session"] != "f00dcafe" {
 		t.Errorf("labels = %v", info.labels)
 	}
@@ -186,6 +189,34 @@ func TestDockerParseInspect(t *testing.T) {
 	want := boundPort{containerPort: 6379, proto: "tcp", hostAddr: "127.0.0.1", hostPort: 49153}
 	if !slices.Contains(info.bound, want) {
 		t.Errorf("bound = %+v, want to contain %+v", info.bound, want)
+	}
+}
+
+func TestDockerInspectReturnsNameAndImmutableContainerID(t *testing.T) {
+	data, err := os.ReadFile("testdata/docker_inspect_v29.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := &dockerRunner{fakeRunner: newDockerTestRunner(), inspectJSON: data}
+	ctr := &Container{
+		id:     "myctr",
+		runner: runner,
+		eng:    dockerEngine{},
+		sync:   &lockPack{uid: dockerFixtureID},
+	}
+
+	info, err := ctr.Inspect(context.Background())
+	if err != nil {
+		t.Fatalf("Inspect: %v", err)
+	}
+	if got := info.ID(); got != "myctr" {
+		t.Errorf("ID() = %q, want myctr", got)
+	}
+	if got := info.Name(); got != "myctr" {
+		t.Errorf("Name() = %q, want myctr", got)
+	}
+	if got := info.ContainerID(); got != dockerFixtureID {
+		t.Errorf("ContainerID() = %q, want %q", got, dockerFixtureID)
 	}
 }
 

@@ -645,6 +645,13 @@ func (appleEngine) logsFollowArgs(id string) []string {
 	return []string{"logs", "--follow", id}
 }
 
+// logsFollowResumeArgs ignores since: Apple Container truncates stdio.log
+// when a container starts, so following from the beginning of the current
+// log replays only the replacement process's output. Apple has no --since.
+func (e appleEngine) logsFollowResumeArgs(id string, _ time.Time) []string {
+	return e.logsFollowArgs(id)
+}
+
 func (appleEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	if !opts.Since.IsZero() {
 		return nil, fmt.Errorf("%w: apple backend does not support logs since", ErrUnsupportedCapability)

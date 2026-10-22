@@ -943,6 +943,10 @@ func TestDockerLifecycleArgs(t *testing.T) {
 	if got := e.logsFollowArgs("myctr"); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
 		t.Errorf("logsFollowArgs = %v", got)
 	}
+	since := time.Date(2026, 10, 22, 12, 0, 0, 123456789, time.UTC)
+	if got := e.logsFollowResumeArgs("myctr", since); !slices.Equal(got, []string{"logs", "--follow", "--since", "2026-10-22T12:00:00.123456789Z", "myctr"}) {
+		t.Errorf("logsFollowResumeArgs = %v", got)
+	}
 	execArgs := e.execArgs("myctr", &execConfig{user: "u", workdir: "/w"}, "/tmp/env", []string{"id"})
 	if !slices.Equal(execArgs, []string{"exec", "--env-file", "/tmp/env", "--user", "u", "--workdir", "/w", "myctr", "id"}) {
 		t.Errorf("execArgs = %v", execArgs)

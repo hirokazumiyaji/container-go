@@ -609,22 +609,34 @@ func TestWaitFailsFastOnTerminalInspectError(t *testing.T) {
 }
 
 // recordingStreamerRunner serves one immediately-ending stream per call and
-// records the context each stream runs under.
+// records the context and argv each stream runs under. errs optionally
+// overrides individual streams with a terminal read error.
 type recordingStreamerRunner struct {
 	inner *fakeRunner
 	data  string
+	errs  []error
 	mu    sync.Mutex
 	ctxs  []context.Context
+	args  [][]string
 }
 
 func (r *recordingStreamerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
 	return r.inner.Run(ctx, args...)
 }
 
-func (r *recordingStreamerRunner) Stream(ctx context.Context, _ ...string) (io.ReadCloser, error) {
+func (r *recordingStreamerRunner) Stream(ctx context.Context, streamArgs ...string) (io.ReadCloser, error) {
 	r.mu.Lock()
+	index := len(r.ctxs)
 	r.ctxs = append(r.ctxs, ctx)
+	r.args = append(r.args, slices.Clone(streamArgs))
+	var streamErr error
+	if index < len(r.errs) {
+		streamErr = r.errs[index]
+	}
 	r.mu.Unlock()
+	if streamErr != nil {
+		return io.NopCloser(errorReader{err: streamErr}), nil
+	}
 	return io.NopCloser(strings.NewReader(r.data)), nil
 }
 
@@ -632,6 +644,12 @@ func (r *recordingStreamerRunner) streams() []context.Context {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return slices.Clone(r.ctxs)
+}
+
+func (r *recordingStreamerRunner) streamArgs() [][]string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return slices.Clone(r.args)
 }
 
 func (r *recordingStreamerRunner) waitForStreams(t *testing.T, want int) {
@@ -717,6 +735,235 @@ func TestRestartFallbackReattachesAttachedOutput(t *testing.T) {
 		t.Fatal("AttachedDone() still reports the stream that Restart ended")
 	}
 	f.waitForStreams(t, 2)
+}
+
+func TestDockerRestartReattachesAttachedOutput(t *testing.T) {
+	f := &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n"}
+	f.inner.imagePresent = true
+	var buf bytes.Buffer
+	ctr, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"),
+		WithAttachOutput(&buf),
+		withRunner(f),
+		withEngine(dockerEngine{}),
+	)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	first := ctr.AttachedDone()
+	if first == nil {
+		t.Fatal("AttachedDone() = nil after Run, want a channel")
+	}
+	f.waitForStreams(t, 1)
+	select {
+	case <-first:
+	case <-time.After(2 * time.Second):
+		t.Fatal("initial attached stream did not finish")
+	}
+
+	if err := ctr.Restart(context.Background(), nil); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	if restart := f.inner.lockedCallWith("restart"); len(restart) == 0 {
+		t.Fatal("Restart did not use the native restart command")
+	}
+	if stop := f.inner.lockedCallWith("stop"); len(stop) != 0 {
+		t.Fatal("native Restart fell back to Stop")
+	}
+	if start := f.inner.lockedCallWith("start"); len(start) != 0 {
+		t.Fatal("native Restart fell back to Start")
+	}
+
+	second := ctr.AttachedDone()
+	if second == nil {
+		t.Fatal("AttachedDone() = nil after Restart, want the replacement stream channel")
+	}
+	if second == first {
+		t.Fatal("AttachedDone() still reports the stream that Restart ended")
+	}
+	select {
+	case <-second:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement attached stream did not finish")
+	}
+	if err := ctr.AttachedError(); err != nil {
+		t.Fatalf("AttachedError() = %v after a clean replacement stream", err)
+	}
+	f.waitForStreams(t, 2)
+	args := f.streamArgs()
+	if len(args) != 2 {
+		t.Fatalf("attach streams = %d, want 2", len(args))
+	}
+	// Docker retains logs across a restart, so the replacement stream must
+	// resume with --since rather than replaying the whole history.
+	if !slices.Contains(args[1], "--since") {
+		t.Errorf("replacement stream args = %v, want --since", args[1])
+	}
+	if got := buf.String(); got != "attached line\nattached line\n" {
+		t.Errorf("attached output = %q, want each stream once", got)
+	}
+}
+
+func TestStartReattachesAttachedOutputAfterStop(t *testing.T) {
+	streamErr := &cli.CLIError{Binary: "container", Args: []string{"logs"}, ExitCode: 1, Stderr: "stream failed"}
+	for _, tc := range []struct {
+		name      string
+		firstErr  error
+		secondErr error
+	}{
+		{
+			name:     "replacement clears the previous error",
+			firstErr: streamErr,
+		},
+		{
+			name:      "replacement error is reported",
+			secondErr: streamErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &recordingStreamerRunner{
+				inner: newTestRunner(),
+				data:  "attached line\n",
+				errs:  []error{tc.firstErr, tc.secondErr},
+			}
+			var buf bytes.Buffer
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"),
+				WithAttachOutput(&buf),
+				withRunner(f),
+				withEngine(appleEngine{}),
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			first := ctr.AttachedDone()
+			if first == nil {
+				t.Fatal("AttachedDone() = nil after Run, want a channel")
+			}
+			f.waitForStreams(t, 1)
+			select {
+			case <-first:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial attached stream did not finish")
+			}
+			if tc.firstErr != nil && ctr.AttachedError() == nil {
+				t.Fatal("AttachedError() = nil after a failed initial stream")
+			}
+
+			if err := ctr.Stop(context.Background(), nil); err != nil {
+				t.Fatalf("Stop: %v", err)
+			}
+			if err := ctr.Start(context.Background()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			if start := f.inner.lockedCallWith("start"); len(start) == 0 {
+				t.Fatal("Start did not invoke the start command")
+			}
+
+			second := ctr.AttachedDone()
+			if second == nil {
+				t.Fatal("AttachedDone() = nil after Start, want the replacement stream channel")
+			}
+			if second == first {
+				t.Fatal("AttachedDone() still reports the stream that Stop ended")
+			}
+			select {
+			case <-second:
+			case <-time.After(2 * time.Second):
+				t.Fatal("replacement attached stream did not finish")
+			}
+			if tc.secondErr != nil {
+				if err := ctr.AttachedError(); !errors.Is(err, tc.secondErr) {
+					t.Fatalf("AttachedError() = %v, want the replacement stream failure", err)
+				}
+			} else if err := ctr.AttachedError(); err != nil {
+				t.Fatalf("AttachedError() = %v after a clean replacement stream", err)
+			}
+			f.waitForStreams(t, 2)
+			args := f.streamArgs()
+			if len(args) != 2 {
+				t.Fatalf("attach streams = %d, want 2", len(args))
+			}
+			// Apple Container truncates its log at start, so the ordinary
+			// follow already resumes with only the new run's output.
+			if !slices.Equal(args[1], []string{"logs", "--follow", "myctr"}) {
+				t.Errorf("replacement stream args = %v, want the ordinary follow argv", args[1])
+			}
+		})
+	}
+}
+
+func TestStartDoesNotDuplicateActiveAttachedStream(t *testing.T) {
+	f := &blockingStreamerRunner{fakeRunner: newTestRunner()}
+	ctr := runTestContainer(t, f, WithAttachOutput(io.Discard))
+	t.Cleanup(ctr.StopAttached)
+
+	countStreams := func() int {
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		streams := 0
+		for _, call := range f.calls {
+			if call[0] == "logs" {
+				streams++
+			}
+		}
+		return streams
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for countStreams() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("initial attached stream never started")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	if streams := countStreams(); streams != 1 {
+		t.Fatalf("attach streams = %d, want the still-active stream only", streams)
+	}
+}
+
+func TestLifecycleWithoutAttachOutputStartsNoStream(t *testing.T) {
+	t.Run("start", func(t *testing.T) {
+		f := &recordingStreamerRunner{inner: newTestRunner()}
+		ctr := runTestContainer(t, f)
+		if err := ctr.Stop(context.Background(), nil); err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+		if err := ctr.Start(context.Background()); err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+		if streams := f.streams(); len(streams) != 0 {
+			t.Fatalf("attach streams = %d, want none without WithAttachOutput", len(streams))
+		}
+		if done := ctr.AttachedDone(); done != nil {
+			t.Fatal("AttachedDone() is non-nil without WithAttachOutput")
+		}
+	})
+
+	t.Run("docker restart", func(t *testing.T) {
+		f := &recordingStreamerRunner{inner: newTestRunner()}
+		f.inner.imagePresent = true
+		ctr, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"),
+			withRunner(f),
+			withEngine(dockerEngine{}),
+		)
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if err := ctr.Restart(context.Background(), nil); err != nil {
+			t.Fatalf("Restart: %v", err)
+		}
+		if streams := f.streams(); len(streams) != 0 {
+			t.Fatalf("attach streams = %d, want none without WithAttachOutput", len(streams))
+		}
+		if done := ctr.AttachedDone(); done != nil {
+			t.Fatal("AttachedDone() is non-nil without WithAttachOutput")
+		}
+	})
 }
 
 // blockingSink blocks every write until released and records how many writers

@@ -1613,6 +1613,13 @@ func (dockerEngine) logsFollowArgs(id string) []string {
 	return []string{"logs", "--follow", id}
 }
 
+// logsFollowResumeArgs starts the replacement stream at since. Docker keeps
+// the full log across restarts, so following without --since would replay
+// every line the previous stream already wrote to the output.
+func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
+	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
+}
+
 func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	args := []string{"logs"}
 	if opts.Tail > 0 {

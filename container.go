@@ -540,7 +540,7 @@ func Run(ctx context.Context, image string, opts ...Option) (result *Container, 
 	// streaming does not read the env file, and a handle returned with a
 	// cleanup warning must still honor WithAttachOutput.
 	if cfg.attachOutput != nil {
-		c.startAttached(cfg.attachOutput)
+		c.startAttached(cfg.attachOutput, time.Time{})
 	}
 	// Do not perform file copies or readiness polling while the env file
 	// still exists. The handle is usable, and the deferred retry retains
@@ -1141,8 +1141,18 @@ func (c *Container) Wait(ctx context.Context) (int, error) {
 	}
 }
 
-// Start starts a stopped container.
+// Start starts a stopped container. A configured WithAttachOutput stream that
+// ended with the previous process is re-attached once the container is
+// running; a stream that is still active is left alone so output is not
+// duplicated.
 func (c *Container) Start(ctx context.Context) error {
+	return c.start(ctx, true)
+}
+
+// start is Start with control over attached-stream reconnection. The restart
+// fallback replaces the stream itself after its Stop, so it disables the
+// reconnection here to avoid starting two streams.
+func (c *Container) start(ctx context.Context, reattach bool) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("start %s: %w", c.id, ErrSharedContainer)
 	}
@@ -1153,18 +1163,32 @@ func (c *Container) Start(ctx context.Context) error {
 		return err
 	}
 	args := c.eng.startArgs(target)
+	var output io.Writer
+	var resumeSince time.Time
+	if reattach {
+		output = c.attachedOutput()
+		if output != nil {
+			// Take the resume point before the command so Docker's --since
+			// also covers output the replacement process emits while it
+			// starts.
+			resumeSince = time.Now()
+		}
+	}
 	_, _, err = c.runner.Run(startCtx, args...)
 	if err != nil {
 		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "start"), "start", target, c.id)
 	}
 	c.clearDynamic()
+	if output != nil && !c.attachStreamActive() {
+		c.startAttached(output, resumeSince)
+	}
 	return nil
 }
 
 // Restart restarts the container. On backends without a native restart command
-// (such as Apple Container), it gracefully stops then starts the container; the
-// WithAttachOutput stream ends with the stopped process and is re-attached to
-// the replacement process.
+// (such as Apple Container), it gracefully stops then starts the container. In
+// both forms a configured WithAttachOutput stream is replaced once the new
+// process is running; the writer is not given the pre-operation history again.
 func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if timeout != nil && *timeout < 0 {
 		return newValidationErrorWithField("Restart", "timeout", *timeout,
@@ -1186,7 +1210,19 @@ func (c *Container) Restart(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("restart %s: %w", c.id, err)
 	}
+	// Docker keeps the full log across a restart. Detach first and resume
+	// from this instant so the replacement stream captures the new process
+	// without replaying lines the old stream already delivered.
+	output := c.attachedOutput()
+	var resumeSince time.Time
+	if output != nil {
+		c.stopAttached()
+		resumeSince = time.Now()
+	}
 	_, _, err = c.runner.Run(restartCtx, args...)
+	if output != nil {
+		c.startAttached(output, resumeSince)
+	}
 	if err != nil {
 		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "restart"), "restart", target, c.id)
 	}
@@ -1201,11 +1237,16 @@ func (c *Container) restartAttached(ctx context.Context, timeout *time.Duration)
 	if err := c.Stop(ctx, timeout); err != nil {
 		return err
 	}
-	if err := c.Start(ctx); err != nil {
+	output := c.attachedOutput()
+	resumeSince := time.Now()
+	if err := c.start(ctx, false); err != nil {
 		return err
 	}
-	if output := c.attachedOutput(); output != nil {
-		c.startAttached(output)
+	// Always attempt the replacement even when the previous stream is still
+	// winding down: its gate then reports a wedged sink instead of silently
+	// leaving the writer unattached.
+	if output != nil {
+		c.startAttached(output, resumeSince)
 	}
 	return nil
 }
@@ -1362,11 +1403,15 @@ func (c *Container) stopAttached() {
 	}
 }
 
-// startAttached launches the background stream behind WithAttachOutput. The
-// stream outlives the Run context by design; the goroutine owns its derived
-// context so it is cancelled when the stream ends on its own, and it closes
-// done so AttachedDone observes completion without reading shared state.
-func (c *Container) startAttached(output io.Writer) {
+// startAttached launches the background stream behind WithAttachOutput. A
+// zero resumeSince starts the initial stream and replays the backend's
+// available history. A non-zero value starts a replacement stream from that
+// instant, so a restart does not hand the writer the same history twice.
+// The stream outlives the Run context by design; the goroutine owns its
+// derived context so it is cancelled when the stream ends on its own, and it
+// closes done so AttachedDone observes completion without reading shared
+// state.
+func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	attachCtx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	p := c.pack()
@@ -1391,7 +1436,7 @@ func (c *Container) startAttached(output io.Writer) {
 		select {
 		case gate <- struct{}{}:
 			defer func() { <-gate }()
-			err := c.FollowLogsTo(attachCtx, output)
+			err := c.followLogsTo(attachCtx, output, resumeSince)
 			if attachCtx.Err() == nil {
 				c.recordAttachError(err)
 			}
@@ -1419,6 +1464,25 @@ func (c *Container) attachedOutput() io.Writer {
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
 	return p.attachOutput
+}
+
+// attachStreamActive reports whether the current attached stream is still
+// running. Start uses it to avoid attaching a second follower to a writer that
+// still has one.
+func (c *Container) attachStreamActive() bool {
+	p := c.pack()
+	p.attachMu.Lock()
+	done := p.attachDone
+	p.attachMu.Unlock()
+	if done == nil {
+		return false
+	}
+	select {
+	case <-done:
+		return false
+	default:
+		return true
+	}
 }
 
 // AttachedDone returns a channel that is closed when the background attached

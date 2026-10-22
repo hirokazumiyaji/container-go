@@ -4,10 +4,7 @@ package container
 
 import (
 	"os/exec"
-	"strconv"
-	"strings"
 	"syscall"
-	"time"
 )
 
 // configureReaperProcess gives each reaper shell its own process group.
@@ -17,63 +14,25 @@ func configureReaperProcess(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-func reaperProcessGroupID(cmd *exec.Cmd) int {
-	if cmd == nil || cmd.Process == nil {
-		return 0
-	}
-	pgid, err := syscall.Getpgid(cmd.Process.Pid)
-	if err != nil || pgid != cmd.Process.Pid {
-		return 0
-	}
-	return pgid
-}
-
-// killReaperProcess terminates the shell's group and any job-control
-// descendants that were placed in separate groups. The shell is waited
-// by the caller; the short poll also gives descendants time to disappear
-// before a replacement process is started.
-func killReaperProcess(cmd *exec.Cmd, pgid int) {
+// killReaperProcess terminates the shell and every process in its group.
+// configureReaperProcess makes the shell a group leader, and the reaper
+// script deliberately does not enable job control, so helpers and backend
+// commands stay in that group. The caller waits for the shell, which reaps
+// it before its PID can be reused; this function must not hold or signal
+// numeric descendant PIDs.
+func killReaperProcess(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
-	pid := cmd.Process.Pid
-	pids := descendantPIDs(pid)
-	if pgid > 0 {
-		_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	// Stop the leader first. A stopped process cannot exit, so its PID (and
+	// therefore the PGID, which Setpgid made equal to it) cannot be recycled
+	// between this check and the group signal. Signal uses the retained
+	// *os.Process, so an already-reaped command reports ErrProcessDone and
+	// the numeric group is never touched.
+	if err := cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+		_ = cmd.Process.Kill()
+		return
 	}
-	for i := len(pids) - 1; i >= 0; i-- {
-		_ = syscall.Kill(pids[i], syscall.SIGKILL)
-	}
-	_ = syscall.Kill(pid, syscall.SIGKILL)
-	deadline := time.Now().Add(500 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		alive := false
-		for _, descendant := range pids {
-			if syscall.Kill(descendant, 0) == nil {
-				alive = true
-				break
-			}
-		}
-		if !alive {
-			return
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-}
-
-func descendantPIDs(parent int) []int {
-	out, err := exec.Command("pgrep", "-P", strconv.Itoa(parent)).Output()
-	if err != nil {
-		return nil
-	}
-	var pids []int
-	for _, line := range strings.Fields(string(out)) {
-		pid, err := strconv.Atoi(line)
-		if err != nil || pid <= 0 {
-			continue
-		}
-		pids = append(pids, pid)
-		pids = append(pids, descendantPIDs(pid)...)
-	}
-	return pids
+	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	_ = cmd.Process.Kill()
 }

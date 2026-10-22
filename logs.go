@@ -143,6 +143,15 @@ func (c *Container) logsError(ctx, qCtx context.Context, err error) error {
 // descendants are not terminated. Once the child is reaped, Close does
 // not signal its former process group.
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
+	return c.followLogs(ctx, time.Time{})
+}
+
+// followLogs starts a follow stream. A zero resumeSince asks for the
+// backend's ordinary follow argv, which replays the available history. A
+// non-zero resumeSince asks for a replacement stream that starts at that
+// instant instead, so a re-attached writer does not receive the history a
+// previous stream already delivered.
+func (c *Container) followLogs(ctx context.Context, resumeSince time.Time) (io.ReadCloser, error) {
 	target, err := c.verifiedOperationTarget(ctx)
 	if err != nil {
 		return nil, err
@@ -151,7 +160,11 @@ func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	if !ok {
 		return nil, fmt.Errorf("logs: %w: runner does not support streaming", cli.ErrStreamSetup)
 	}
-	stream, err := s.Stream(ctx, c.eng.logsFollowArgs(target)...)
+	args := c.eng.logsFollowArgs(target)
+	if !resumeSince.IsZero() {
+		args = c.eng.logsFollowResumeArgs(target, resumeSince)
+	}
+	stream, err := s.Stream(ctx, args...)
 	if contextErr := commandContextError(ctx, err); contextErr != nil {
 		if stream != nil {
 			_ = stream.Close()
@@ -274,10 +287,14 @@ func (s *classifyingStream) wrap(err error) error {
 // A failed sink write is reported as ErrOutputDelivery rather than being
 // hidden behind a terminal stream error, and neither is reported as success.
 func (c *Container) FollowLogsTo(ctx context.Context, output io.Writer) error {
+	return c.followLogsTo(ctx, output, time.Time{})
+}
+
+func (c *Container) followLogsTo(ctx context.Context, output io.Writer, resumeSince time.Time) error {
 	if output == nil {
 		return validationErrorf("FollowLogsTo", output, "output writer cannot be nil")
 	}
-	stream, err := c.FollowLogs(ctx)
+	stream, err := c.followLogs(ctx, resumeSince)
 	if err != nil {
 		return err
 	}

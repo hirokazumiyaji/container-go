@@ -160,8 +160,22 @@ type engine interface {
 	// minimum versions before a copy-out creates a private temp directory.
 	checkCopyFileFromContainerVersion(ctx context.Context, runner cli.Runner, timeouts opTimeouts) error
 	execArgs(id string, cfg *execConfig, envFile string, cmd []string) []string
-	// logsFollowArgs builds the streaming follow argv.
+	// logsFollowArgs builds the streaming follow argv. It replays the
+	// backend's available history before following new output.
 	logsFollowArgs(id string) []string
+	// logsFollowResumeArgs builds the streaming follow argv for a
+	// replacement attach stream. Docker retains logs across a restart, so
+	// it must be told to start at since; replaying from the beginning
+	// would duplicate output the previous stream already delivered. Apple
+	// truncates stdio.log when a container starts, so its ordinary follow
+	// argv already contains only the new run's output.
+	//
+	// since comes from the client clock, while Docker compares it with the
+	// daemon's log timestamps. A remote daemon with a different clock can
+	// therefore drop new output or replay delivered output near the
+	// boundary; hosts using a remote daemon must keep their clocks
+	// synchronized (for example with NTP).
+	logsFollowResumeArgs(id string, since time.Time) []string
 	// logsArgsWithOptions builds snapshot args and rejects options the
 	// backend cannot honor.
 	logsArgsWithOptions(id string, opts LogsOptions) ([]string, error)

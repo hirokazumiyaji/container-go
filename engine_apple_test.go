@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 )
 
 func appleCapabilityConfig(t *testing.T, opts ...Option) *config {
@@ -327,5 +329,15 @@ func TestApplePullMissingIsDocumentedFallback(t *testing.T) {
 	}
 	if ctr == nil || f.pullCalls != 1 {
 		t.Fatalf("PullMissing fallback did not pull once: ctr=%v pulls=%d", ctr, f.pullCalls)
+	}
+}
+
+func TestAppleLogsFollowResumeKeepsOrdinaryFollow(t *testing.T) {
+	e := appleEngine{}
+	// Apple Container truncates stdio.log at start, so the ordinary follow
+	// already resumes with only the new run and Apple has no --since.
+	since := time.Date(2026, 10, 22, 12, 0, 0, 123456789, time.UTC)
+	if got := e.logsFollowResumeArgs("myctr", since); !slices.Equal(got, []string{"logs", "--follow", "myctr"}) {
+		t.Errorf("logsFollowResumeArgs = %v", got)
 	}
 }

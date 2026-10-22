@@ -288,13 +288,6 @@ func (c *Container) setImmutableID(uid string) {
 	c.pack().uidMu.Unlock()
 }
 
-// Run pulls the image if needed, creates and starts a container, and
-// returns a handle to it. On failure after creation, the container is
-// normally removed before returning. If a post-create environment-file
-// cleanup cannot be completed, Run returns the usable handle together
-// with the joined error so the container is not orphaned. WithReuse
-// switches to get-or-create; see WithReuse for the shared-handle
-// lifecycle.
 // applyConfigDiagnostics installs the per-handle redactor and freezes the
 // target host. Every construction site must use it so a new handle cannot
 // silently omit either field.
@@ -303,6 +296,13 @@ func (c *Container) applyConfigDiagnostics(cfg *config) {
 	c.targetHost = cfg.eng.defaultHost()
 }
 
+// Run pulls the image if needed, creates and starts a container, and
+// returns a handle to it. On failure after creation, the container is
+// normally removed before returning. If a post-create environment-file
+// cleanup cannot be completed, Run returns the usable handle together
+// with the joined error so the container is not orphaned. WithReuse
+// switches to get-or-create; see WithReuse for the shared-handle
+// lifecycle.
 func Run(ctx context.Context, image string, opts ...Option) (result *Container, retErr error) {
 	// Validate the public image before applying options. Option functions
 	// are user-provided code and may have side effects or return errors;

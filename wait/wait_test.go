@@ -629,6 +629,22 @@ func TestForExecProbesStateDuringPoll(t *testing.T) {
 	}
 }
 
+func TestForLogProbesStateAtBoundedCadence(t *testing.T) {
+	target := newFakeTarget()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	target.logs = pr
+
+	s := ForLog("never").WithStartupTimeout(1500 * time.Millisecond)
+	if err := s.WaitUntilReady(context.Background(), target); err == nil {
+		t.Fatal("want timeout error")
+	}
+	// Each State call is an inspect subprocess on a real backend.
+	if n := target.stateCalls.Load(); n < 1 || n > 2 {
+		t.Errorf("State calls = %d, want 1..2 at stateCheckInterval while following a silent stream", n)
+	}
+}
+
 func TestForExecFailsImmediatelyOnLaunchError(t *testing.T) {
 	target := newFakeTarget()
 	target.execErr = &exec.Error{Name: "container", Err: errors.New("executable file not found in $PATH")}

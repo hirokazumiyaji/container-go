@@ -140,8 +140,8 @@ func TestForLogFailsFastOnTerminalLifecycleState(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), string(state)) {
 				t.Fatalf("error = %v, want terminal %s failure", err, state)
 			}
-			if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
-				t.Fatalf("terminal state took %v; want fail-fast", elapsed)
+			if elapsed := time.Since(start); elapsed > stateCheckInterval+500*time.Millisecond {
+				t.Fatalf("terminal state took %v; want fail-fast at the state check cadence", elapsed)
 			}
 		})
 	}

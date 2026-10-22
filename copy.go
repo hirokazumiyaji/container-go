@@ -74,28 +74,29 @@ func WithFiles(files ...File) Option {
 	}
 }
 
-// validateHostPathValue rejects inputs that cannot be host filesystem paths
-// before they are resolved or passed to a backend.
-func validateHostPathValue(hostPath string) error {
+// resolveHostPath rejects inputs that cannot be host filesystem paths and
+// resolves the rest before any backend work. Resolving here also prevents a
+// later working-directory change from changing the source.
+func resolveHostPath(hostPath string) (string, error) {
 	if hostPath == "" {
-		return fmt.Errorf("host path must not be empty")
+		return "", fmt.Errorf("host path must not be empty")
 	}
 	if !utf8.ValidString(hostPath) || strings.ContainsRune(hostPath, 0) {
-		return fmt.Errorf("host path must be valid UTF-8 without NUL bytes")
-	}
-	return nil
-}
-
-// validateHostPath resolves a host path before any backend work and checks
-// that the resulting absolute path can be statted. Resolving here also
-// prevents a later working-directory change from changing the source.
-func validateHostPath(hostPath string) (string, error) {
-	if err := validateHostPathValue(hostPath); err != nil {
-		return "", err
+		return "", fmt.Errorf("host path must be valid UTF-8 without NUL bytes")
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve host path %q: %w", hostPath, err)
+	}
+	return abs, nil
+}
+
+// validateHostPath resolves a host path and checks that the resulting
+// absolute path can be statted.
+func validateHostPath(hostPath string) (string, error) {
+	abs, err := resolveHostPath(hostPath)
+	if err != nil {
+		return "", err
 	}
 	if _, err := os.Stat(abs); err != nil {
 		return "", fmt.Errorf("host path %q: %w", hostPath, err)
@@ -237,13 +238,13 @@ func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath
 	if err := validateContainerPath(containerPath); err != nil {
 		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, validationCause(err))
 	}
-	if err := validateHostPathValue(hostPath); err != nil {
+	abs, err := resolveHostPath(hostPath)
+	if err != nil {
 		return newValidationErrorWithField("CopyToContainer", "hostPath", hostPath, err)
 	}
-	abs, err := filepath.Abs(hostPath)
-	if err != nil {
-		return fmt.Errorf("copy to container: resolve host path %q: %w", hostPath, err)
-	}
+	// Unlike validateHostPath this must not follow a final link: the
+	// snapshot rejects it as unsupported, and a source that vanishes is
+	// ErrCopySourceChanged rather than a validation error.
 	if err := copySourcePathPresent(abs); err != nil {
 		return err
 	}

@@ -750,6 +750,33 @@ func cleanupCopyStagingDir(dir string) error {
 	return cleanupErr
 }
 
+// checkCopyFileFromContainerVersion verifies the Docker client/server copy-out
+// version once per handle. The handle is bound to one target, so a successful
+// answer cannot describe a different daemon. Failures are not recorded and a
+// later copy retries them. Concurrent copies share the check through
+// copyVersionMu; a waiting caller's context still bounds the wait.
+func (c *Container) checkCopyFileFromContainerVersion(ctx context.Context) error {
+	if c.eng.name() != "docker" {
+		return c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()})
+	}
+	p := c.pack()
+	if p.copyVersionOK.Load() {
+		return nil
+	}
+	if err := p.copyVersionMu.Lock(ctx); err != nil {
+		return err
+	}
+	defer p.copyVersionMu.Unlock()
+	if p.copyVersionOK.Load() {
+		return nil
+	}
+	if err := c.eng.checkCopyFileFromContainerVersion(ctx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+		return err
+	}
+	p.copyVersionOK.Store(true)
+	return nil
+}
+
 // CopyFileFromContainer copies one regular file out of the running
 // container and returns its content. It is supported by the Docker
 // backend when the host can open copied files without following links or
@@ -798,7 +825,7 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 	if err != nil {
 		return nil, c.publicError(err)
 	}
-	if err := c.eng.checkCopyFileFromContainerVersion(qCtx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
+	if err := c.checkCopyFileFromContainerVersion(qCtx); err != nil {
 		return nil, c.publicError(err)
 	}
 

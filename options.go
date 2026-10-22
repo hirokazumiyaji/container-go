@@ -80,6 +80,12 @@ type config struct {
 	// cache, which is the default and preserves one inspect per Run.
 	imageCache *imageCache
 
+	// dockerMeta carries the Client's Docker metadata cache into the
+	// operation. Package-level Run leaves it nil: caching across
+	// process-global calls could serve one target's answer to another
+	// after the environment changes.
+	dockerMeta *dockerMetadataCache
+
 	// imagePrepared is set when a reuse caller has completed its own
 	// PullAlways fetch before entering the shared ensure flight.
 	imagePrepared bool
@@ -107,6 +113,16 @@ func newConfig() *config {
 func withClientPinned() Option {
 	return func(c *config) error {
 		c.clientPinned = true
+		return nil
+	}
+}
+
+// withClientDockerMeta shares the Client's Docker metadata cache with the
+// operation, so reuse attaches and handles on one target reuse the same
+// lookups. Package-level Run does not apply it.
+func withClientDockerMeta(cache *dockerMetadataCache) Option {
+	return func(c *config) error {
+		c.dockerMeta = cache
 		return nil
 	}
 }

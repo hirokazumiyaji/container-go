@@ -121,43 +121,33 @@ func waitTargetError(err error) error {
 // failures.
 const logTailLimit = 1024 * 1024
 
-// logTail fetches up to logTailLimit trailing bytes of the container's
-// logs for diagnostics. It asks the backend for a bounded tail
-// (logsTailArgs) and keeps only the last bytes in a fixed-size ring,
-// so neither the CLI output nor the Go buffer grows with total log
-// size. Failures yield an empty tail.
-func (c *Container) logTail(ctx context.Context) string {
-	target, err := c.verifiedOperationTarget(ctx)
-	if err != nil {
-		return ""
-	}
-	return c.logTailTarget(ctx, target)
-}
-
-func (c *Container) logTailTarget(ctx context.Context, target string) string {
-	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
-	defer cancel()
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(target)...)
-	if err != nil {
-		return ""
-	}
-	tail, _ := c.diagnosticRedactor().RedactTail(io.MultiReader(bytes.NewReader(stdout), bytes.NewReader(stderr)), logTailLimit)
-	return tail
-}
-
+// logTailWithError fetches up to logTailLimit trailing bytes of the
+// verified operation target's logs for diagnostics. It asks the backend
+// for a bounded tail (logsTailArgs) and keeps only the last bytes in a
+// fixed-size ring, so neither the CLI output nor the Go buffer grows with
+// total log size. Resolving the target first keeps a deleted or replaced
+// same-name container from contributing unrelated logs to the error.
 func (c *Container) logTailWithError(ctx context.Context, extra ...string) (string, error) {
 	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
+	target, err := c.verifiedOperationTarget(qCtx)
+	if err != nil {
+		return "", err
+	}
+	return c.logTailTarget(qCtx, target, extra...)
+}
+
+func (c *Container) logTailTarget(ctx context.Context, target string, extra ...string) (string, error) {
 	redactor := c.diagnosticRedactor(extra...)
 	if streamer, ok := c.runner.(cli.SnapshotStreamer); ok {
-		stream, err := streamer.StreamSnapshot(qCtx, c.eng.logsTailArgs(c.id)...)
+		stream, err := streamer.StreamSnapshot(ctx, c.eng.logsTailArgs(target)...)
 		if err != nil {
 			return "", err
 		}
 		defer stream.Close()
 		return redactor.RedactTail(stream, logTailLimit)
 	}
-	stdout, stderr, err := c.runner.Run(qCtx, c.eng.logsTailArgs(c.id)...)
+	stdout, stderr, err := c.runner.Run(ctx, c.eng.logsTailArgs(target)...)
 	if err != nil {
 		return "", err
 	}

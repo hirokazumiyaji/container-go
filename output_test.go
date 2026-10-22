@@ -642,7 +642,10 @@ func TestLogTailRetainsBoundedLatestBytes(t *testing.T) {
 	}
 	ctr := runTestContainer(t, f)
 
-	tail := ctr.logTail(context.Background())
+	tail, err := ctr.logTailWithError(context.Background())
+	if err != nil {
+		t.Fatalf("logTailWithError: %v", err)
+	}
 	if len(tail) != logTailLimit {
 		t.Fatalf("tail len = %d, want %d", len(tail), logTailLimit)
 	}

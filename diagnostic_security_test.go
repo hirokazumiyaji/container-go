@@ -204,8 +204,11 @@ func TestLogTailRedactsBeforeFinalTruncation(t *testing.T) {
 	const secret = "tail-boundary-secret-117"
 	data := strings.Repeat("a", logTailLimit-4) + secret + strings.Repeat("b", 128)
 	runner := &fixedTailRunner{data: []byte(data)}
-	ctr := &Container{id: "diag-tail", runner: runner, eng: appleEngine{}, diagnosticRedactorValue: newDiagnosticMatcher([]string{secret})}
-	got := ctr.logTail(context.Background())
+	ctr := &Container{id: "diag-tail", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef", diagnosticRedactorValue: newDiagnosticMatcher([]string{secret})}
+	got, err := ctr.logTailWithError(context.Background())
+	if err != nil {
+		t.Fatalf("logTailWithError: %v", err)
+	}
 	if len(got) > logTailLimit {
 		t.Fatalf("tail length = %d, want <= %d", len(got), logTailLimit)
 	}

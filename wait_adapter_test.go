@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -220,5 +221,61 @@ func TestWaitTargetReturnsUnknownWithInspectError(t *testing.T) {
 	}
 	if !errors.Is(err, inspectErr) {
 		t.Errorf("State error = %v, want %v", err, inspectErr)
+	}
+}
+
+type waitFailureTailRunner struct {
+	*dockerRunner
+	logTargets []string
+}
+
+func (r *waitFailureTailRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "logs" {
+		target := args[len(args)-1]
+		r.mu.Lock()
+		r.logTargets = append(r.logTargets, target)
+		r.mu.Unlock()
+		return []byte("diagnostic tail for " + target + "\n"), nil, nil
+	}
+	return r.dockerRunner.Run(ctx, args...)
+}
+
+func TestWaitFailureLogTailUsesImmutableTarget(t *testing.T) {
+	runner := &waitFailureTailRunner{dockerRunner: &dockerRunner{fakeRunner: newTestRunner()}}
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(dockerEngine{}),
+		WithWaitStrategy(&recordingStrategy{err: errors.New("never ready")}),
+	)
+	if err == nil {
+		t.Fatal("want wait failure")
+	}
+
+	runner.mu.Lock()
+	targets := append([]string(nil), runner.logTargets...)
+	runner.mu.Unlock()
+	if !slices.Equal(targets, []string{dockerFixtureID}) {
+		t.Fatalf("log targets = %v, want immutable ID %s", targets, dockerFixtureID)
+	}
+	if !strings.Contains(err.Error(), "diagnostic tail for "+dockerFixtureID) {
+		t.Errorf("error = %v, want the tail from the immutable target", err)
+	}
+}
+
+func TestWaitFailureLogTailReturnsNoLogsWithoutVerifiedTarget(t *testing.T) {
+	runner := &waitFailureTailRunner{dockerRunner: &dockerRunner{fakeRunner: newTestRunner()}}
+	ctr := &Container{id: "replacement", runner: runner, eng: dockerEngine{}}
+
+	tail, err := ctr.logTailWithError(context.Background())
+	if !errors.Is(err, ErrGenerationReplaced) {
+		t.Fatalf("error = %v, want ErrGenerationReplaced", err)
+	}
+	if tail != "" {
+		t.Fatalf("tail = %q, want no logs for an unverified target", tail)
+	}
+	runner.mu.Lock()
+	targets := append([]string(nil), runner.logTargets...)
+	runner.mu.Unlock()
+	if len(targets) != 0 {
+		t.Fatalf("log targets = %v, want no log command before verification", targets)
 	}
 }

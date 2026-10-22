@@ -67,7 +67,7 @@ func TestDockerOperationsUseImmutableOperationTarget(t *testing.T) {
 		t.Fatalf("Logs: %v", err)
 	}
 	_ = logs.Close()
-	_ = ctr.logTail(context.Background())
+	_, _ = ctr.logTailWithError(context.Background())
 	hostPath := filepath.Join(t.TempDir(), "file")
 	if err := os.WriteFile(hostPath, []byte("data"), 0o600); err != nil {
 		t.Fatal(err)

@@ -37,7 +37,10 @@ func TestLogTailContainsTrailingMarker(t *testing.T) {
 	base.imagePresent = true
 	tr := &tailRunner{fakeRunner: base, logData: big}
 	ctr := &Container{id: "myctr", runner: tr, eng: appleEngine{}, creation: "0123456789abcdef"}
-	tail := ctr.logTail(context.Background())
+	tail, err := ctr.logTailWithError(context.Background())
+	if err != nil {
+		t.Fatalf("logTailWithError: %v", err)
+	}
 	if !strings.Contains(tail, "LATEST_FATAL_MARKER") {
 		t.Fatalf("tail missing marker, len=%d", len(tail))
 	}
@@ -87,32 +90,35 @@ func TestLogTailDoesNotReadReplacementLogs(t *testing.T) {
 		sync:   &lockPack{uid: oldUID},
 	}
 
-	if tail := ctr.logTail(context.Background()); tail != "" {
-		t.Fatalf("logTail returned replacement logs: %q", tail)
+	if tail, err := ctr.logTailWithError(context.Background()); tail != "" {
+		t.Fatalf("logTailWithError returned replacement logs: %q", tail)
+	} else if err == nil {
+		t.Fatal("logTailWithError = nil error for a removed immutable target")
 	}
 	nameHandle := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
-	if tail := nameHandle.logTail(context.Background()); tail != "" {
+	if tail, err := nameHandle.logTailWithError(context.Background()); tail != "" {
 		t.Fatalf("unverified Docker name-target probe = %q, want no logs", tail)
+	} else if err == nil {
+		t.Fatal("unverified Docker name-target probe = nil error")
 	}
 	runner.mu.Lock()
 	calls := append([][]string(nil), runner.calls...)
 	runner.mu.Unlock()
-	var logCall []string
+	var logCalls [][]string
 	for _, call := range calls {
 		if len(call) > 0 && call[0] == "logs" {
-			logCall = call
-			break
+			logCalls = append(logCalls, call)
 		}
 	}
-	if logCall == nil || logCall[len(logCall)-1] != oldUID {
-		t.Fatalf("Docker log target = %v, want old immutable UID %s", logCall, oldUID)
+	if len(logCalls) != 1 || logCalls[0][len(logCalls[0])-1] != oldUID {
+		t.Fatalf("Docker log targets = %v, want only the old immutable UID %s", logCalls, oldUID)
 	}
 }
 
 func TestLogTailUsesSnapshotStreamWithoutMaterializingRunOutput(t *testing.T) {
 	const secret = "snapshot-stream-secret-117"
 	runner := &snapshotTailRunner{data: []byte("header=" + secret + "\n" + strings.Repeat("x", 128*1024))}
-	ctr := &Container{id: "snapshot-tail", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "snapshot-tail", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef"}
 	got, err := ctr.logTailWithError(context.Background())
 	if err != nil {
 		t.Fatalf("logTailWithError: %v", err)
@@ -131,7 +137,7 @@ func TestLogTailUsesSnapshotStreamWithoutMaterializingRunOutput(t *testing.T) {
 func TestLogTailPreservesSnapshotReadError(t *testing.T) {
 	wantErr := errors.New("snapshot read failed")
 	runner := &snapshotTailRunner{data: []byte("partial"), readErr: wantErr}
-	ctr := &Container{id: "snapshot-error", runner: runner, eng: appleEngine{}}
+	ctr := &Container{id: "snapshot-error", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef"}
 	got, err := ctr.logTailWithError(context.Background())
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("error = %v, want %v", err, wantErr)

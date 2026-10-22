@@ -112,8 +112,8 @@ func TestDockerHandleOperationsUseImmutableID(t *testing.T) {
 	if err := ctr.CopyToContainer(ctx, src, "/tmp/stale-copy.txt"); !isNotFound(err) {
 		t.Errorf("CopyToContainer error = %v, want backend not-found", err)
 	}
-	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/replacement.txt"); !isNotFound(err) {
-		t.Errorf("CopyFileFromContainer error = %v, want backend not-found", err)
+	if _, err := ctr.CopyFileFromContainer(ctx, "/tmp/replacement.txt"); !errors.Is(err, ErrContainerNotFound) {
+		t.Errorf("CopyFileFromContainer error = %v, want ErrContainerNotFound", err)
 	}
 	if _, err := ctr.Logs(ctx); !errors.Is(err, ErrContainerNotFound) {
 		t.Errorf("Logs error = %v, want ErrContainerNotFound", err)

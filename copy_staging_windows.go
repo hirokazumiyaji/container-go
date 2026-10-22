@@ -21,7 +21,7 @@ func prepareCopyStagingRoot() (string, error) {
 func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 	base, err := windows.KnownFolderPath(windows.FOLDERID_LocalAppData, windows.KF_FLAG_DEFAULT)
 	if err != nil {
-		return "", fmt.Errorf("copy to container: locate per-user LocalAppData: %w", err)
+		return "", fmt.Errorf("copy staging: locate per-user LocalAppData: %w", err)
 	}
 	if err := ensureCopyStagingOutsideSource(base, source); err != nil {
 		return "", err
@@ -33,16 +33,16 @@ func prepareCopyStagingRootForSource(source *openedCopySource) (string, error) {
 		// rather than writing into that directory.
 		var random [8]byte
 		if _, randErr := rand.Read(random[:]); randErr != nil {
-			return "", fmt.Errorf("copy to container: create private staging parent: %w", err)
+			return "", fmt.Errorf("copy staging: create private staging parent: %w", err)
 		}
 		appRoot = filepath.Join(base, "containergo-"+hex.EncodeToString(random[:]))
 		if retryErr := ensureWindowsPrivateCopyStagingDir(appRoot, true); retryErr != nil {
-			return "", fmt.Errorf("copy to container: create private staging parent: %w", retryErr)
+			return "", fmt.Errorf("copy staging: create private staging parent: %w", retryErr)
 		}
 	}
 	root := filepath.Join(appRoot, "copy-staging")
 	if err := ensureWindowsPrivateCopyStagingDir(root, true); err != nil {
-		return "", fmt.Errorf("copy to container: create private staging root: %w", err)
+		return "", fmt.Errorf("copy staging: create private staging root: %w", err)
 	}
 	return root, nil
 }
@@ -345,5 +345,5 @@ func createCopyStagingDir(root string) (string, error) {
 		}
 		return path, nil
 	}
-	return "", fmt.Errorf("copy to container: could not allocate a private staging directory")
+	return "", fmt.Errorf("copy staging: could not allocate a private staging directory")
 }

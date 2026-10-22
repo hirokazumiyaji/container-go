@@ -1955,7 +1955,7 @@ func (dockerEngine) containerMissing(err error) bool {
 			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
 			return ok && cliTargetListMatches(rest, target)
 		})
-	case "rm", "stop", "exec", "logs", "cp":
+	case "rm", "stop", "start", "restart", "kill", "pause", "unpause", "exec", "logs", "cp":
 		if hasCLIErrorLine(err, func(line string) bool {
 			rest, ok := strings.CutPrefix(line, dockerStderrNoSuchCtr+":")
 			return ok && cliTargetListMatches(rest, target)

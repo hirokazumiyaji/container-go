@@ -704,7 +704,7 @@ func cliCommandTarget(command string, args []string) string {
 			}
 			return strings.Trim(strings.TrimSpace(args[i]), `"'`)
 		}
-	case "stop":
+	case "stop", "start", "restart", "kill", "pause", "unpause":
 		for i := 0; i < len(args); i++ {
 			arg := args[i]
 			if !strings.HasPrefix(arg, "-") {
@@ -739,7 +739,7 @@ func cliCommandTarget(command string, args []string) string {
 			if equal := strings.IndexByte(option, '='); equal >= 0 {
 				option = option[:equal]
 			}
-			if cliOptionTakesValue(option) && !strings.Contains(arg, "=") {
+			if cliReadOptionTakesValue(option) && !strings.Contains(arg, "=") {
 				if i+1 >= len(args) {
 					return ""
 				}
@@ -759,10 +759,24 @@ func isWindowsDriveLetter(s string) bool {
 func cliOptionTakesValue(option string) bool {
 	switch option {
 	case "--env-file", "--user", "--workdir", "--time", "--tail", "--since", "--until",
-		"--platform", "--format", "--size", "--type", "--filter", "-n":
+		"--platform", "--format", "--size", "--type", "--filter", "-n",
+		"-t", "-s", "--signal":
 		return true
 	default:
 		return false
+	}
+}
+
+// cliReadOptionTakesValue reports whether option consumes the next argv
+// element for inspect/exec/logs. The lifecycle short options -t and -s are
+// boolean shorthands in those commands (logs timestamps, exec tty, inspect
+// size), so the lifecycle value-taking set must not be applied there.
+func cliReadOptionTakesValue(option string) bool {
+	switch option {
+	case "-t", "-s", "--signal":
+		return false
+	default:
+		return cliOptionTakesValue(option)
 	}
 }
 

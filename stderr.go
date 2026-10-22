@@ -370,7 +370,7 @@ func appleContainerPrefixAllowed(operation string) bool {
 	// Exec and logs can carry workload output, so their "container: " prefix
 	// is not by itself evidence of an Apple backend diagnostic.
 	switch operation {
-	case "run", "inspect", "image inspect", "stop", "delete", "rm":
+	case "run", "inspect", "image inspect", "stop", "delete", "rm", "start", "kill":
 		return true
 	default:
 		return false

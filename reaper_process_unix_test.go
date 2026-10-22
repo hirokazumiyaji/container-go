@@ -58,3 +58,9 @@ func TestKillReaperProcessTerminatesProcessGroup(t *testing.T) {
 	}
 	t.Fatalf("reaper child %d survived process-group kill", child)
 }
+
+func TestReaperScriptKeepsDescendantsInShellProcessGroup(t *testing.T) {
+	if strings.Contains(reaperScript, "set -m") {
+		t.Fatal("reaper script enables job control; descendants can leave the shell process group and survive killReaperProcess")
+	}
+}

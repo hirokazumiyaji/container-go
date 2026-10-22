@@ -86,7 +86,6 @@ do
 "
 done <<'REAPER_ENTRY'
 set -f
-set -m 2>/dev/null || true
 bin="$REAPER_BIN"
 sub="$REAPER_SUB"
 key="$REAPER_KEY"
@@ -98,7 +97,8 @@ entry_pending="$3"
 shift 3
 
 # Keep a backend call bounded without leaving the sleep process behind.
-# Job control gives the command its own process group when supported.
+# Do not enable job control: every helper and backend process must stay in
+# the reaper shell's process group so a single group kill reaches them all.
 run_with_timeout() {
   seconds="$1"
   shift

@@ -169,6 +169,12 @@ type engine interface {
 	// would duplicate output the previous stream already delivered. Apple
 	// truncates stdio.log when a container starts, so its ordinary follow
 	// argv already contains only the new run's output.
+	//
+	// since comes from the client clock, while Docker compares it with the
+	// daemon's log timestamps. A remote daemon with a different clock can
+	// therefore drop new output or replay delivered output near the
+	// boundary; hosts using a remote daemon must keep their clocks
+	// synchronized (for example with NTP).
 	logsFollowResumeArgs(id string, since time.Time) []string
 	// logsArgsWithOptions builds snapshot args and rejects options the
 	// backend cannot honor.

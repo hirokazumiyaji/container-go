@@ -1472,9 +1472,13 @@ func (c *Container) attachedOutput() io.Writer {
 func (c *Container) attachStreamActive() bool {
 	p := c.pack()
 	p.attachMu.Lock()
+	cancel := p.attachCancel
 	done := p.attachDone
 	p.attachMu.Unlock()
-	if done == nil {
+	// stopAttached clears cancel before it waits. A non-nil done without a
+	// cancel belongs to that stopped stream, not to a live one; Start must
+	// replace it or the writer stays detached forever.
+	if cancel == nil || done == nil {
 		return false
 	}
 	select {

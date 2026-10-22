@@ -1615,7 +1615,9 @@ func (dockerEngine) logsFollowArgs(id string) []string {
 
 // logsFollowResumeArgs starts the replacement stream at since. Docker keeps
 // the full log across restarts, so following without --since would replay
-// every line the previous stream already wrote to the output.
+// every line the previous stream already wrote to the output. since is a
+// client-clock instant; a remote daemon must be time-synchronized with the
+// client or the boundary can drop/replay output.
 func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
 	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
 }

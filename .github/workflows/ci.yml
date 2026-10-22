@@ -124,7 +124,7 @@ jobs:
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
           # Match the golangci-lint binary's supported export-data format.
-          go-version: '1.27.2'
+          go-version: '1.27.3'
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           # v2.13.0 cannot decode Go 1.27 export data (version 5).
@@ -170,7 +170,7 @@ jobs:
           # Scan with a patched toolchain, not the go 1.26.0 floor in
           # bench/go.mod (that release still reports fixed stdlib CVEs).
           # Pin the patch level: floating `stable` can lag security fixes.
-          go-version: '1.27.2'
+          go-version: '1.27.3'
       # Pinned rather than @latest, so the same commit always scans the same
       # tool version. Bump the pin deliberately.
       #
@@ -213,7 +213,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
       - uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9
         with:
           version: v2.14.0
@@ -228,7 +228,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: '1.27.2'
+          go-version: '1.27.3'
       - run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
         working-directory: bench
 

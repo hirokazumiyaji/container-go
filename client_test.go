@@ -3,10 +3,14 @@ package container
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 )
@@ -572,5 +576,551 @@ func TestClientPullAndPrune(t *testing.T) {
 	}
 	if len(prunedGroup) != 0 {
 		t.Errorf("expected empty prunedGroup, got %v", prunedGroup)
+	}
+}
+
+func TestNewClientRejectsNilOption(t *testing.T) {
+	_, err := NewClient(nil)
+	assertPublicValidationError(t, err, "NewClient", "NewClient", 0, "option 0 is nil")
+
+	_, err = NewClientContext(context.Background(), nil)
+	assertPublicValidationError(t, err, "NewClientContext", "NewClientContext", 0, "option 0 is nil")
+}
+
+func TestClientOptionsReturnValidationErrors(t *testing.T) {
+	var typedNil *recordingRunner
+
+	for _, tt := range []struct {
+		name    string
+		opt     ClientOption
+		option  string
+		value   any
+		message string
+	}{
+		{
+			name:    "empty binary",
+			opt:     WithClientBinary("   "),
+			option:  "WithClientBinary",
+			value:   "",
+			message: "binary must not be empty",
+		},
+		{
+			name:    "unsafe binary",
+			opt:     WithClientBinary("/opt/bin/docker\ninjected"),
+			option:  "WithClientBinary",
+			value:   "/opt/bin/docker\ninjected",
+			message: `invalid binary path "/opt/bin/docker\ninjected"`,
+		},
+		{
+			name:    "nil runner",
+			opt:     WithClientRunner(nil),
+			option:  "WithClientRunner",
+			value:   nil,
+			message: "runner must not be nil",
+		},
+		{
+			name:    "typed nil runner",
+			opt:     WithClientRunner(typedNil),
+			option:  "WithClientRunner",
+			value:   nil,
+			message: "runner must not be nil",
+		},
+		{
+			name:    "invalid backend",
+			opt:     WithClientBackend("podman"),
+			option:  "WithClientBackend",
+			value:   nil,
+			message: `invalid CONTAINERGO_BACKEND="podman": valid values are "apple" and "docker"`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			err := tt.opt(&clientConfig{})
+			assertPublicValidationError(t, err, tt.option, tt.option, tt.value, tt.message)
+		})
+	}
+}
+
+func TestNewClientReturnsTypedErrorForUnsafeOption(t *testing.T) {
+	_, err := NewClient(WithClientBinary("   "))
+	assertPublicValidationError(t, err, "WithClientBinary", "WithClientBinary", "", "binary must not be empty")
+}
+
+// contextRecordingRunner reports the context it was given and otherwise
+// answers like a Docker CLI that can inspect a context.
+type contextRecordingRunner struct {
+	calls int
+}
+
+func (r *contextRecordingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	r.calls++
+	if err := ctx.Err(); err != nil {
+		return nil, nil, err
+	}
+	return []byte(`[{"Name":"ctx","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`), nil, nil
+}
+
+func TestNewClientContextBoundsTargetResolution(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	runner := &contextRecordingRunner{}
+	_, err := NewClientContext(ctx,
+		WithClientBackend("docker"),
+		WithClientDockerContext("ctx"),
+		WithClientRunner(runner),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewClientContext error = %v, want context.Canceled", err)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("context resolution calls = %d, want 1", runner.calls)
+	}
+}
+
+// deadlinePullRunner records the deadline of the pull invocation. Other
+// operations (such as backend target resolution) are answered with empty
+// output, which makes Docker fall back to its local target.
+type deadlinePullRunner struct {
+	pullDeadline time.Duration
+}
+
+func (r *deadlinePullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "pull" {
+		if deadline, ok := ctx.Deadline(); ok {
+			r.pullDeadline = time.Until(deadline)
+		}
+	}
+	return nil, nil, nil
+}
+
+func TestPullOptionsAreHonored(t *testing.T) {
+	t.Setenv(backendEnv, "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	t.Run("platform", func(t *testing.T) {
+		f := newDockerTestRunner()
+		if err := Pull(context.Background(), "redis:7-alpine",
+			WithPullRunner(f), WithPullPlatform("linux/arm64")); err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		if pull := f.callWith("pull"); !hasPlatformArg(pull, "linux/arm64") {
+			t.Fatalf("pull did not use the requested platform: %v", f.calls)
+		}
+	})
+
+	t.Run("timeout", func(t *testing.T) {
+		r := &deadlinePullRunner{}
+		if err := Pull(context.Background(), "redis:7-alpine",
+			WithPullRunner(r), WithPullTimeout(2*time.Second)); err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		if r.pullDeadline < time.Second || r.pullDeadline > 3*time.Second {
+			t.Fatalf("pull deadline = %v, want about 2s", r.pullDeadline)
+		}
+	})
+
+	t.Run("docker host", func(t *testing.T) {
+		f := newDockerTestRunner()
+		if err := Pull(context.Background(), "redis:7-alpine",
+			WithPullRunner(f), WithPullDockerHost("tcp://daemon-a:2375")); err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		if f.callWith("pull") == nil {
+			t.Fatalf("pull was not called: %v", f.calls)
+		}
+	})
+
+	t.Run("docker context", func(t *testing.T) {
+		f := newDockerTestRunner()
+		f.contextJSON = `[{"Name":"ctx","Endpoints":{"docker":{"Host":"unix:///var/run/docker.sock"}}}]`
+		if err := Pull(context.Background(), "redis:7-alpine",
+			WithPullRunner(f), WithPullDockerContext("ctx")); err != nil {
+			t.Fatalf("Pull: %v", err)
+		}
+		if call := f.callWith("context"); len(call) != 3 || call[1] != "inspect" || call[2] != "ctx" {
+			t.Fatalf("context was not inspected: %v", f.calls)
+		}
+		if f.callWith("pull") == nil {
+			t.Fatalf("pull was not called: %v", f.calls)
+		}
+	})
+}
+
+func TestPullDockerTargetRequiresDockerBackend(t *testing.T) {
+	host := "tcp://daemon-a:2375"
+	_, err := (pullConfig{dockerHost: &host}).applyDockerTarget(appleEngine{})
+	assertPublicValidationError(t, err, "WithPullDockerHost", "WithPullDockerHost", nil,
+		"Docker target options require Docker backend")
+}
+
+func TestClientPullHonorsOptionsAndRejectsTargetOverride(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	f := newDockerTestRunner()
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientRunner(f),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	if err := client.Pull(context.Background(), "redis:7-alpine", WithPullPlatform("linux/arm64")); err != nil {
+		t.Fatalf("Client.Pull: %v", err)
+	}
+	if pull := f.callWith("pull"); !hasPlatformArg(pull, "linux/arm64") {
+		t.Fatalf("Client.Pull did not use the requested platform: %v", f.calls)
+	}
+
+	before := len(f.calls)
+	err = client.Pull(context.Background(), "redis:7-alpine", WithPullDockerHost("tcp://daemon-b:2375"))
+	assertPublicValidationError(t, err, "WithPullDockerHost", "WithPullDockerHost", nil,
+		"cannot override Docker target options on Client.Pull")
+	if len(f.calls) != before {
+		t.Fatalf("Client.Pull invoked the backend after rejecting a target override: %v", f.calls)
+	}
+}
+
+func TestClientPruneHonorsOptions(t *testing.T) {
+	pinned := &recordingRunner{}
+	override := &recordingRunner{}
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientRunner(pinned),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	removed, err := client.Prune(context.Background(),
+		WithPruneRunner(override), WithPruneTimeout(time.Second), WithPruneParallelism(1))
+	if err != nil {
+		t.Fatalf("Client.Prune: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("removed = %v, want empty", removed)
+	}
+	if len(override.calls) == 0 {
+		t.Fatal("Client.Prune did not use the option runner")
+	}
+	if len(pinned.calls) != 0 {
+		t.Fatalf("Client.Prune used the pinned runner despite WithPruneRunner: %v", pinned.calls)
+	}
+
+	groupRunner := &recordingRunner{}
+	removed, err = client.PruneReuseGroup(context.Background(), "test-group",
+		WithPruneRunner(groupRunner), WithPruneTimeout(time.Second))
+	if err != nil {
+		t.Fatalf("Client.PruneReuseGroup: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Errorf("removed = %v, want empty", removed)
+	}
+	if len(groupRunner.calls) == 0 {
+		t.Fatal("Client.PruneReuseGroup did not use the option runner")
+	}
+}
+
+func TestClientPruneRejectsNilOption(t *testing.T) {
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientRunner(&recordingRunner{}),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	_, err = client.Prune(context.Background(), nil)
+	assertPublicValidationError(t, err, "Client.Prune", "Client.Prune", 0, "option 0 is nil")
+
+	_, err = client.PruneReuseGroup(context.Background(), "test-group", nil)
+	assertPublicValidationError(t, err, "Client.PruneReuseGroup", "Client.PruneReuseGroup", 0, "option 0 is nil")
+}
+
+func TestPullDockerTargetImpliesDockerBackend(t *testing.T) {
+	t.Setenv(backendEnv, "")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	f := newDockerTestRunner()
+	if err := Pull(context.Background(), "redis:7-alpine",
+		WithPullRunner(f), WithPullDockerHost("tcp://daemon-a:2375")); err != nil {
+		t.Fatalf("Pull: %v", err)
+	}
+	if f.callWith("pull") == nil {
+		t.Fatalf("pull was not called: %v", f.calls)
+	}
+}
+
+func TestNewClientContextReturnsCancellationWithoutExplicitTarget(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	runner := &contextRecordingRunner{}
+	_, err := NewClientContext(ctx,
+		WithClientBackend("docker"),
+		WithClientRunner(runner),
+	)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("NewClientContext error = %v, want context.Canceled", err)
+	}
+	if runner.calls != 1 {
+		t.Fatalf("context resolution calls = %d, want 1", runner.calls)
+	}
+}
+
+func TestNewClientRedactsEnvironmentDockerTarget(t *testing.T) {
+	const host = "tcp://daemon-secret.invalid:bad port"
+	t.Setenv("DOCKER_HOST", host)
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	_, err := NewClient(WithClientBackend("docker"))
+	if err == nil {
+		t.Fatal("NewClient accepted a malformed DOCKER_HOST")
+	}
+	if strings.Contains(err.Error(), "daemon-secret") {
+		t.Fatalf("environment Docker target leaked into construction error: %v", err)
+	}
+}
+
+type failingContextRunner struct {
+	detail string
+	env    []string
+}
+
+func (r *failingContextRunner) ExternalEnv() []string {
+	return r.env
+}
+
+func (r *failingContextRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	return nil, []byte(r.detail), &cli.CLIError{Binary: "docker", Args: args, ExitCode: 1, Stderr: r.detail}
+}
+
+func TestPullRedactsDockerTargetValues(t *testing.T) {
+	const contextName = "secret-context-name"
+	t.Setenv(backendEnv, "docker")
+
+	runner := &failingContextRunner{detail: "context " + contextName + ": context not found"}
+	err := Pull(context.Background(), "redis:7-alpine",
+		WithPullRunner(runner), WithPullDockerContext(contextName))
+	if err == nil {
+		t.Fatal("Pull accepted an unknown Docker context")
+	}
+	if strings.Contains(err.Error(), contextName) {
+		t.Fatalf("Docker target leaked into pull error: %v", err)
+	}
+}
+
+type blockingPullRunner struct {
+	*fakeRunner
+	started     chan struct{}
+	release     chan struct{}
+	startOnce   sync.Once
+	releaseOnce sync.Once
+}
+
+func (r *blockingPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "pull" {
+		r.startOnce.Do(func() { close(r.started) })
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func (r *blockingPullRunner) unblock() {
+	r.releaseOnce.Do(func() { close(r.release) })
+}
+
+func TestPullTimeoutBoundsWaitingOnSharedFlight(t *testing.T) {
+	t.Setenv(backendEnv, "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	const (
+		image = "redis:7-alpine"
+		host  = "tcp://daemon-a:2375"
+	)
+	leader := &blockingPullRunner{
+		fakeRunner: newDockerTestRunner(),
+		started:    make(chan struct{}),
+		release:    make(chan struct{}),
+	}
+	t.Cleanup(leader.unblock)
+
+	leaderDone := make(chan error, 1)
+	go func() {
+		leaderDone <- Pull(context.Background(), image,
+			WithPullRunner(leader),
+			WithPullDockerHost(host),
+			WithPullTimeout(30*time.Second))
+	}()
+
+	select {
+	case <-leader.started:
+	case err := <-leaderDone:
+		t.Fatalf("leader finished before pulling: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("leader did not start pulling")
+	}
+
+	follower := newDockerTestRunner()
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer waitCancel()
+	start := time.Now()
+	err := Pull(waitCtx, image,
+		WithPullRunner(follower),
+		WithPullDockerHost(host),
+		WithPullTimeout(100*time.Millisecond))
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("follower error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("follower waited %v despite its 100ms timeout", elapsed)
+	}
+
+	leader.unblock()
+	if err := <-leaderDone; err != nil {
+		t.Fatalf("leader: %v", err)
+	}
+}
+
+func TestPinRunnerTargetEnvAnchorsPruneRunner(t *testing.T) {
+	eng := newDockerEngine("tcp://daemon-a:2375", "", "", "")
+	runner := &cli.ExecRunner{Binary: "docker"}
+
+	pinned, ok := pinRunnerTargetEnv(eng, runner).(*cli.ExecRunner)
+	if !ok {
+		t.Fatal("pinRunnerTargetEnv did not return an ExecRunner")
+	}
+	found := false
+	for _, entry := range pinned.Env {
+		if entry == "DOCKER_HOST=tcp://daemon-a:2375" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("prune runner was not pinned to the Client target: %q", pinned.Env)
+	}
+	if len(runner.Env) != 0 {
+		t.Fatalf("pinRunnerTargetEnv mutated the caller runner: %q", runner.Env)
+	}
+}
+
+type timeoutErrorPullRunner struct{}
+
+func (r *timeoutErrorPullRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "pull" {
+		<-ctx.Done()
+		return nil, nil, fmt.Errorf("backend exploded")
+	}
+	return nil, nil, nil
+}
+
+func TestPullLeaderKeepsFetchErrorAfterTimeout(t *testing.T) {
+	eng := newDockerEngine("tcp://daemon-a:2375", "", "", "")
+	cfg := &config{
+		runner:     &timeoutErrorPullRunner{},
+		eng:        eng,
+		runTimeout: 100 * time.Millisecond,
+	}
+	err := pullWithConfig(context.Background(), cfg, "redis:7-alpine")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v, want context.DeadlineExceeded", err)
+	}
+	if !strings.Contains(err.Error(), "backend exploded") {
+		t.Fatalf("leader dropped the fetch error: %v", err)
+	}
+}
+
+func TestPullTimeoutNearMaxDurationDoesNotOverflow(t *testing.T) {
+	t.Setenv(backendEnv, "docker")
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	f := newDockerTestRunner()
+	err := Pull(context.Background(), "redis:7-alpine",
+		WithPullRunner(f),
+		WithPullDockerHost("tcp://daemon-a:2375"),
+		WithPullTimeout(time.Duration(math.MaxInt64)))
+	if err != nil {
+		t.Fatalf("Pull with a maximum timeout failed: %v", err)
+	}
+	if f.callWith("pull") == nil {
+		t.Fatalf("pull was not called: %v", f.calls)
+	}
+}
+
+func TestClientPruneParsesOptionsOnce(t *testing.T) {
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientRunner(&recordingRunner{}),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	calls := 0
+	opt := func(*pruneConfig) error {
+		calls++
+		return nil
+	}
+	if _, err := client.Prune(context.Background(), opt); err != nil {
+		t.Fatalf("Client.Prune: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("Client.Prune applied its options %d times, want 1", calls)
+	}
+
+	calls = 0
+	if _, err := client.PruneReuseGroup(context.Background(), "test-group", opt); err != nil {
+		t.Fatalf("Client.PruneReuseGroup: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("Client.PruneReuseGroup applied its options %d times, want 1", calls)
+	}
+}
+
+func TestNewClientRedactsRunnerDockerTarget(t *testing.T) {
+	const contextName = "runner-secret-context"
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("DOCKER_CONTEXT", "")
+
+	runner := &failingContextRunner{
+		detail: "context " + contextName + ": context not found",
+		env:    []string{"DOCKER_CONTEXT=" + contextName},
+	}
+	_, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientRunner(runner),
+	)
+	if err == nil {
+		t.Fatal("NewClient accepted an unknown runner-supplied Docker context")
+	}
+	if strings.Contains(err.Error(), contextName) {
+		t.Fatalf("runner Docker target leaked into construction error: %v", err)
+	}
+}
+
+func TestPruneWithConfigDefaultsZeroValues(t *testing.T) {
+	f := &lsRunner{fakeRunner: newTestRunner(), lsJSON: "[]"}
+	removed, err := pruneWithConfig(context.Background(), f, appleEngine{}, pruneConfig{})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want empty", removed)
 	}
 }

@@ -74,19 +74,31 @@ func effectiveRunner(configured Runner, binary string, eng engine) Runner {
 // applyEngineRunnerEnv points the default runner at the selected engine's
 // target environment.
 func applyEngineRunnerEnv(cfg *config) {
-	if de, ok := cfg.eng.(dockerEngine); ok {
-		if er, ok := cfg.runner.(*cli.ExecRunner); ok {
-			targetEnv := de.pinnedTargetEnv()
-			if len(targetEnv) > 0 {
-				cloned := &cli.ExecRunner{
-					Binary:   er.Binary,
-					Identity: er.Identity,
-					Env:      pinRunnerEnv(er.Env, targetEnv),
-				}
-				cfg.runner = cloned
-			}
-		}
+	if _, ok := cfg.eng.(dockerEngine); ok {
+		cfg.runner = pinRunnerTargetEnv(cfg.eng, cfg.runner)
 	}
+}
+
+// pinRunnerTargetEnv returns an ExecRunner anchored to eng's Docker target.
+// Prune has no --host/--context flag, so without this a caller-supplied
+// ExecRunner would use whatever the ambient environment points at. Other
+// runner types are returned unchanged because their environment is opaque.
+func pinRunnerTargetEnv(eng engine, r Runner) Runner {
+	de, ok := eng.(dockerEngine)
+	if !ok {
+		return r
+	}
+	er, ok := r.(*cli.ExecRunner)
+	if !ok {
+		return r
+	}
+	targetEnv := de.pinnedTargetEnv()
+	if len(targetEnv) == 0 {
+		return r
+	}
+	pinned := *er
+	pinned.Env = pinRunnerEnv(er.Env, targetEnv)
+	return &pinned
 }
 
 func defaultRunnerFor(eng engine) cli.Runner {

@@ -15,6 +15,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `NewClientContext` and `WithPullPlatform`, `WithPullTimeout`,
+  `WithPullDockerHost`, and `WithPullDockerContext`. `Client.Pull` now accepts
+  `PullOption` values, `Client.Prune` and `Client.PruneReuseGroup` accept
+  `PruneOption` values, and Client option validation returns typed
+  `ErrInvalidOption` errors (#243).
 - Validate Apple Container's platform, name, network, port, and memory
   capabilities before image resolution; reject unsupported `PullNever` with
   `ErrPullNeverUnsupported` and document `PullMissing`/`PullAlways` fallbacks.
@@ -76,6 +81,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- `Client.Pull`, `Client.Prune`, and `Client.PruneReuseGroup` are variadic.
+  Existing calls remain source-compatible, but method values and interface
+  implementations that use the old fixed signatures must be updated. Docker
+  target options on `Pull` now imply the Docker backend, and a Client prunes
+  through a runner pinned to the Client target (#243).
 - Raise the root module Go floor from 1.23.0 to 1.26.0 so
   `golang.org/x/sys` v0.49.0 can be used. CI older-Go legs now run
   1.26.0 instead of 1.23.0. The nested `bench/` module matches the

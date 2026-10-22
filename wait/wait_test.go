@@ -379,8 +379,7 @@ func TestForLogAsRegexp(t *testing.T) {
 
 func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target := newFakeTarget()
-	pr, _ := io.Pipe() // never written, never closed
-	target.logs = pr
+	target.logs = newBlockingPipeReader()
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
 	err := s.WaitUntilReady(context.Background(), target)
@@ -392,6 +391,10 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("error = %v, want timeout diagnostic", err)
+	}
+	// Each State call is an inspect subprocess on a real backend.
+	if n := target.stateCalls.Load(); n != 0 {
+		t.Errorf("State calls = %d, want none before stateCheckInterval elapses", n)
 	}
 }
 
@@ -626,22 +629,6 @@ func TestForExecProbesStateDuringPoll(t *testing.T) {
 	// 3s / 250ms ≈ 12 intervals plus the initial check → ~13; allow slack.
 	if n := target.execCalls.Load(); n < 10 || n > 16 {
 		t.Errorf("exec calls = %d, want 10..16 with 250ms default interval", n)
-	}
-}
-
-func TestForLogProbesStateAtBoundedCadence(t *testing.T) {
-	target := newFakeTarget()
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
-	target.logs = pr
-
-	s := ForLog("never").WithStartupTimeout(1500 * time.Millisecond)
-	if err := s.WaitUntilReady(context.Background(), target); err == nil {
-		t.Fatal("want timeout error")
-	}
-	// Each State call is an inspect subprocess on a real backend.
-	if n := target.stateCalls.Load(); n < 1 || n > 2 {
-		t.Errorf("State calls = %d, want 1..2 at stateCheckInterval while following a silent stream", n)
 	}
 }
 

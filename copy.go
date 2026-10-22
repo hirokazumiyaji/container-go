@@ -78,16 +78,29 @@ func WithFiles(files ...File) Option {
 	}
 }
 
-// validateHostPath resolves a host path before any backend work and checks
-// that the resulting absolute path can be statted. Resolving here also
-// prevents a later working-directory change from changing the source.
-func validateHostPath(hostPath string) (string, error) {
+// resolveHostPath rejects inputs that cannot be host filesystem paths and
+// resolves the rest before any backend work. Resolving here also prevents a
+// later working-directory change from changing the source.
+func resolveHostPath(hostPath string) (string, error) {
 	if hostPath == "" {
 		return "", fmt.Errorf("host path must not be empty")
+	}
+	if !utf8.ValidString(hostPath) || strings.ContainsRune(hostPath, 0) {
+		return "", fmt.Errorf("host path must be valid UTF-8 without NUL bytes")
 	}
 	abs, err := filepath.Abs(hostPath)
 	if err != nil {
 		return "", fmt.Errorf("resolve host path %q: %w", hostPath, err)
+	}
+	return abs, nil
+}
+
+// validateHostPath resolves a host path and checks that the resulting
+// absolute path can be statted.
+func validateHostPath(hostPath string) (string, error) {
+	abs, err := resolveHostPath(hostPath)
+	if err != nil {
+		return "", err
 	}
 	if _, err := os.Stat(abs); err != nil {
 		return "", fmt.Errorf("host path %q: %w", hostPath, err)
@@ -109,7 +122,16 @@ func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath
 	if c.refusesSharedOps() {
 		return fmt.Errorf("copy to container %s: %w", c.id, ErrSharedContainer)
 	}
-	return c.copyToContainer(ctx, hostPath, containerPath, true)
+	if err := c.copyToContainer(ctx, hostPath, containerPath, true); err != nil {
+		// Validation errors intentionally echo the rejected argument as their
+		// Value; keep it for callers that switch on it.
+		var validation *ValidationError
+		if errors.As(err, &validation) {
+			return err
+		}
+		return c.redactError(err, hostPath, containerPath)
+	}
+	return nil
 }
 
 const defaultCopyFilesParallelism = 4
@@ -206,14 +228,38 @@ func copyFilesConcurrently(ctx context.Context, files []File, copyFile func(cont
 	return ctx.Err()
 }
 
+// validationCause unwraps a lower-level typed validation error so the caller
+// can re-wrap it with its own Option and Field without losing the message.
+func validationCause(err error) error {
+	var validation *ValidationError
+	if errors.As(err, &validation) {
+		return validation.Err
+	}
+	return err
+}
+
 func (c *Container) copyToContainer(ctx context.Context, hostPath, containerPath string, allowDirectory bool) error {
+	if err := validateContainerPath(containerPath); err != nil {
+		return newValidationErrorWithField("CopyToContainer", "containerPath", containerPath, validationCause(err))
+	}
+	abs, err := resolveHostPath(hostPath)
+	if err != nil {
+		return newValidationErrorWithField("CopyToContainer", "hostPath", hostPath, err)
+	}
+	// Unlike validateHostPath this must not follow a final link: the
+	// snapshot rejects it as unsupported, and a source that vanishes is
+	// ErrCopySourceChanged rather than a validation error.
+	if err := copySourcePathPresent(abs); err != nil {
+		return err
+	}
+
 	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	target, err := c.verifiedOperationTarget(cliCtx)
 	if err != nil {
 		return err
 	}
-	return c.copyFileWithTarget(ctx, target, hostPath, containerPath, allowDirectory)
+	return c.copyFileWithTarget(ctx, target, abs, containerPath, allowDirectory)
 }
 
 func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, containerPath string, allowDirectory bool) (retErr error) {
@@ -240,7 +286,11 @@ func (c *Container) copyFileWithTarget(ctx context.Context, target, hostPath, co
 	cliCtx, cliCancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cliCancel()
 	_, _, err = c.runner.Run(cliCtx, c.eng.copyToArgs(target, staged, containerPath)...)
-	return wrapNotFoundFor(c.eng, c.classify(ctx, err))
+	if err != nil {
+		classified := c.classifyOperation(ctx, err, "cp")
+		return wrapNotFoundForOperation(c.eng, classified, "cp", target, c.id)
+	}
+	return nil
 }
 
 type copySnapshotLimits struct {

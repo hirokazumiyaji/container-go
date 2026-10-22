@@ -15,10 +15,7 @@ import (
 )
 
 func TestCopyFileFromContainerRejectsFIFOWithoutOpeningIt(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("TMPDIR", root)
-	t.Setenv("TMP", root)
-	t.Setenv("TEMP", root)
+	copyStagingTestRoot(t)
 
 	f := &cpRunner{
 		fakeRunner: newTestRunner(),
@@ -91,10 +88,7 @@ func (r *cancelAfterCopyRunner) Run(ctx context.Context, args ...string) ([]byte
 }
 
 func TestCopyFileFromContainerHonorsCancellationAfterCopyBeforeFIFOOpen(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("TMPDIR", root)
-	t.Setenv("TMP", root)
-	t.Setenv("TEMP", root)
+	copyStagingTestRoot(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -210,10 +204,7 @@ func TestCopyFileFromContainerRejectsDeviceWhenHostAllowsIt(t *testing.T) {
 }
 
 func TestCopyFileFromContainerRemovesPrivateDirectoryAfterRejectedTarget(t *testing.T) {
-	root := t.TempDir()
-	t.Setenv("TMPDIR", root)
-	t.Setenv("TMP", root)
-	t.Setenv("TEMP", root)
+	copyStagingTestRoot(t)
 
 	var dst string
 	f := &cpRunner{

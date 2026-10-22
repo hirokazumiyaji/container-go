@@ -351,6 +351,11 @@ var ErrCopySourceChanged = errors.New("copy source changed while staging")
 // to directories, links, or other special files.
 var ErrCopyFileNotRegular = errors.New("copied container path is not a regular file")
 
+// ErrCopyFileFromContainerTooLarge reports that a regular file copied out of
+// a container exceeds MaxCopyFileFromContainerSize. The private staging
+// directory is removed before the error is returned.
+var ErrCopyFileFromContainerTooLarge = errors.New("copied container file exceeds size limit")
+
 // ErrCopyFileFromContainerUnsupported reports that the selected backend
 // or host cannot safely perform a file copy-out. This includes Docker
 // client/server versions below the supported copy-out minimum. The method

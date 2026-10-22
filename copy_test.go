@@ -101,6 +101,38 @@ func skipIfCopyFileOpenUnsupported(t *testing.T) {
 	}
 }
 
+// copyStagingTestRoot redirects copy staging to a per-test cache base on
+// platforms that honor an environment override and returns the verified
+// staging root either way.
+func copyStagingTestRoot(t *testing.T) string {
+	t.Helper()
+	if runtime.GOOS == "darwin" {
+		home := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(home, "Library"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("HOME", home)
+	} else if runtime.GOOS != "windows" {
+		// LocalAppData on Windows is resolved through KnownFolderPath,
+		// which ignores environment overrides.
+		t.Setenv("XDG_CACHE_HOME", t.TempDir())
+	}
+	root, err := prepareCopyStagingRoot()
+	if err != nil {
+		t.Fatalf("prepareCopyStagingRoot: %v", err)
+	}
+	return root
+}
+
+func copyStagingEntryCount(t *testing.T, root string) int {
+	t.Helper()
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatalf("read staging root %q: %v", root, err)
+	}
+	return len(entries)
+}
+
 func TestCopyFileFromContainerRejectsAppleBackendBeforeCLI(t *testing.T) {
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "must not be copied"}
 	ctr := runTestContainer(t, f)
@@ -160,10 +192,8 @@ func TestCopyFileFromContainerRejectsUnsupportedDockerVersionBeforeCopy(t *testi
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			root := t.TempDir()
-			t.Setenv("TMPDIR", root)
-			t.Setenv("TMP", root)
-			t.Setenv("TEMP", root)
+			root := copyStagingTestRoot(t)
+			before := copyStagingEntryCount(t, root)
 
 			f := &cpRunner{
 				fakeRunner:    newTestRunner(),
@@ -186,12 +216,8 @@ func TestCopyFileFromContainerRejectsUnsupportedDockerVersionBeforeCopy(t *testi
 			if call := f.callWith("version"); call == nil {
 				t.Fatal("Docker version was not checked")
 			}
-			entries, err := os.ReadDir(root)
-			if err != nil {
-				t.Fatalf("read temp root: %v", err)
-			}
-			if len(entries) != 0 {
-				t.Fatalf("unsupported Docker version left temp entries: %v", entries)
+			if after := copyStagingEntryCount(t, root); after != before {
+				t.Fatalf("unsupported Docker version left staging entries: %d before, %d after", before, after)
 			}
 		})
 	}
@@ -378,10 +404,7 @@ func TestCopyFileFromContainerRejectsRootAndDirectory(t *testing.T) {
 
 func TestCopyFileFromContainerUsesCleanPOSIXPathAndFixedDestination(t *testing.T) {
 	skipIfCopyFileOpenUnsupported(t)
-	root := t.TempDir()
-	t.Setenv("TMPDIR", root)
-	t.Setenv("TMP", root)
-	t.Setenv("TEMP", root)
+	root := copyStagingTestRoot(t)
 
 	uid := strings.Repeat("a", 64)
 	f := &cpRunner{fakeRunner: newTestRunner(), fileContent: "safe", containerID: uid}
@@ -471,6 +494,147 @@ func TestCopyFileFromContainerRejectsCopiedDirectory(t *testing.T) {
 	}
 	if !errors.Is(err, ErrCopyFileNotRegular) {
 		t.Errorf("directory error = %v, want ErrCopyFileNotRegular", err)
+	}
+}
+
+func TestCopyFileFromContainerRejectsOversizedFileAndCleansUp(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	root := copyStagingTestRoot(t)
+	before := copyStagingEntryCount(t, root)
+
+	var dst string
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(path string) error {
+			dst = path
+			file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			if err != nil {
+				return err
+			}
+			if err := file.Truncate(MaxCopyFileFromContainerSize + 1); err != nil {
+				_ = file.Close()
+				return err
+			}
+			return file.Close()
+		},
+	}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/large")
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("oversized file returned a reader")
+	}
+	if !errors.Is(err, ErrCopyFileFromContainerTooLarge) {
+		t.Fatalf("error = %v, want ErrCopyFileFromContainerTooLarge", err)
+	}
+	if dst == "" {
+		t.Fatal("copy destination was not recorded")
+	}
+	if _, statErr := os.Lstat(filepath.Dir(dst)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("private staging directory %q remains after size rejection: %v", filepath.Dir(dst), statErr)
+	}
+	if after := copyStagingEntryCount(t, root); after != before {
+		t.Errorf("staging entries = %d, want %d after size rejection", after, before)
+	}
+}
+
+func TestCopyFileFromContainerCleansReadOnlyExtractedDirectory(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX permission bits are not meaningful on Windows")
+	}
+	skipIfCopyFileOpenUnsupported(t)
+
+	var dst string
+	t.Cleanup(func() {
+		if dst == "" {
+			return
+		}
+		_ = os.Chmod(filepath.Join(dst, "nested"), 0o700)
+		_ = os.Chmod(dst, 0o700)
+	})
+	f := &cpRunner{
+		fakeRunner: newTestRunner(),
+		materialize: func(path string) error {
+			dst = path
+			if err := os.Mkdir(path, 0o700); err != nil {
+				return err
+			}
+			nested := filepath.Join(path, "nested")
+			if err := os.Mkdir(nested, 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(filepath.Join(nested, "data.txt"), []byte("data"), 0o400); err != nil {
+				return err
+			}
+			if err := os.Chmod(nested, 0o500); err != nil {
+				return err
+			}
+			return os.Chmod(path, 0o500)
+		},
+	}
+	ctr := runCopyDockerTestContainer(t, f)
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/container/dir")
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("copied directory returned a reader")
+	}
+	if !errors.Is(err, ErrCopyFileNotRegular) {
+		t.Fatalf("error = %v, want ErrCopyFileNotRegular", err)
+	}
+	if dst == "" {
+		t.Fatal("copy destination was not recorded")
+	}
+	if _, statErr := os.Lstat(filepath.Dir(dst)); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("read-only private staging directory %q remains after rejection: %v", filepath.Dir(dst), statErr)
+	}
+}
+
+type copyOutFailureRunner struct {
+	*cpRunner
+	target string
+}
+
+func (r *copyOutFailureRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	if len(args) > 0 && args[0] == "cp" {
+		r.mu.Lock()
+		r.calls = append(r.calls, args)
+		r.mu.Unlock()
+		return nil, nil, &cli.CLIError{
+			Binary:   "docker",
+			Args:     args,
+			ExitCode: 1,
+			Stderr:   "Error response from daemon: No such container: " + r.target,
+		}
+	}
+	return r.cpRunner.Run(ctx, args...)
+}
+
+func TestCopyFileFromContainerClassifiesAndRedactsCpFailure(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	runner := &copyOutFailureRunner{cpRunner: &cpRunner{fakeRunner: newTestRunner()}}
+	ctr := runCopyDockerTestContainer(t, runner)
+	target := ctr.operationTarget()
+	runner.target = target
+
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/missing")
+	if rc != nil {
+		_ = rc.Close()
+		t.Fatal("failed copy returned a reader")
+	}
+	if !errors.Is(err, ErrContainerNotFound) {
+		t.Fatalf("error = %v, want ErrContainerNotFound", err)
+	}
+	if strings.Contains(err.Error(), target) {
+		t.Errorf("error %q exposes the immutable handle %q", err, target)
+	}
+	call := runner.callWith("cp")
+	if call == nil {
+		t.Fatal("cp call not recorded")
+	}
+	if _, statErr := os.Lstat(filepath.Dir(call[2])); !errors.Is(statErr, fs.ErrNotExist) {
+		t.Errorf("private staging directory %q remains after cp failure: %v", filepath.Dir(call[2]), statErr)
 	}
 }
 

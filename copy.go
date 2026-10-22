@@ -19,6 +19,10 @@ const (
 	// MaxCopyToContainerSize is the maximum aggregate number of regular-file
 	// bytes copied into the private staging tree.
 	MaxCopyToContainerSize int64 = 64 << 20
+	// MaxCopyFileFromContainerSize is the maximum number of regular-file bytes
+	// CopyFileFromContainer accepts from the container. The limit applies to
+	// the single copied file and is checked before a reader is returned.
+	MaxCopyFileFromContainerSize int64 = 64 << 20
 	// MaxCopyToContainerEntries is the maximum number of filesystem entries,
 	// including the source root, visited while building a snapshot.
 	MaxCopyToContainerEntries int64 = 10_000
@@ -684,14 +688,14 @@ func cleanupCopyStagingDir(dir string) error {
 	var cleanupErr error
 	for i := len(directories) - 1; i >= 0; i-- {
 		if err := os.Chmod(directories[i], 0o700); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy to container: make staging directory owner-writable %q: %w", directories[i], err))
+			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy staging: make staging directory owner-writable %q: %w", directories[i], err))
 		}
 	}
 	if err := os.RemoveAll(dir); err != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy to container: remove staging directory %q: %w", dir, err))
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy staging: remove staging directory %q: %w", dir, err))
 	}
 	if walkErr != nil {
-		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy to container: inspect staging directory %q for cleanup: %w", dir, walkErr))
+		cleanupErr = errors.Join(cleanupErr, fmt.Errorf("copy staging: inspect staging directory %q for cleanup: %w", dir, walkErr))
 	}
 	return cleanupErr
 }
@@ -703,8 +707,10 @@ func cleanupCopyStagingDir(dir string) error {
 // server versions >=29.7.0. Apple Container, unsupported hosts, unsupported
 // Docker versions, and Windows Go 1.23 through 1.25 return
 // ErrCopyFileFromContainerUnsupported before invoking the backend's
-// copy-out command. Close releases the temporary copy.
-func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error) {
+// copy-out command. The copied regular file must not exceed
+// MaxCopyFileFromContainerSize. Close releases the temporary copy and
+// removes its private staging directory.
+func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (rc io.ReadCloser, retErr error) {
 	if c.refusesSharedOps() {
 		return nil, fmt.Errorf("copy file from container %s: %w", c.id, ErrSharedContainer)
 	}
@@ -727,57 +733,70 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	if err := c.eng.checkCopyFileFromContainer(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	if err := checkCopyFileOpenCapability(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 
 	qCtx, cancel := withDefaultTimeout(ctx, c.effectiveQueryTimeout())
 	defer cancel()
 	target, err := c.verifiedOperationTarget(qCtx)
 	if err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	if err := c.eng.checkCopyFileFromContainerVersion(qCtx, c.runner, opTimeouts{query: c.effectiveQueryTimeout()}); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 
-	dir, err := os.MkdirTemp("", "containergo-cp-")
+	// Use the same verified private staging root as copy-in rather than an
+	// untrusted TMPDIR or %TEMP% location.
+	root, err := prepareCopyStagingRoot()
 	if err != nil {
-		return nil, c.redactError(err, containerPath)
+		return nil, c.publicError(fmt.Errorf("copy file from container: prepare private staging root: %w", err))
+	}
+	dir, err := createCopyStagingDir(root)
+	if err != nil {
+		return nil, c.publicError(fmt.Errorf("copy file from container: create private staging directory: %w", err))
 	}
 	keepDir := false
 	defer func() {
-		if !keepDir {
-			_ = os.RemoveAll(dir)
+		if keepDir {
+			return
+		}
+		if cleanupErr := cleanupCopyStagingDir(dir); cleanupErr != nil {
+			retErr = errors.Join(retErr, c.publicError(cleanupErr))
 		}
 	}()
 	// The destination name is fixed so container path components can
 	// never escape the private directory or become a host path.
 	dst := filepath.Join(dir, "payload")
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	if _, _, err := c.runner.Run(qCtx, c.eng.copyFromArgs(target, containerPath, dst)...); err != nil {
-		return nil, wrapNotFoundFor(c.eng, c.classify(ctx, err))
+		classified := wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "cp"), "cp", target, c.id)
+		return nil, c.redactError(classified, target, containerPath)
 	}
 	if err := qCtx.Err(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 
 	info, err := os.Lstat(dst)
 	if err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	if !info.Mode().IsRegular() {
-		return nil, copyFileNotRegularError(requestedPath, info.Mode())
+		return nil, c.publicError(copyFileNotRegularError(requestedPath, info.Mode()))
+	}
+	if info.Size() > MaxCopyFileFromContainerSize {
+		return nil, c.publicError(copyFileFromContainerTooLargeError(requestedPath, info.Size()))
 	}
 	if err := qCtx.Err(); err != nil {
-		return nil, err
+		return nil, c.publicError(err)
 	}
 
 	f, err := openCopyFile(dst)
@@ -785,26 +804,39 @@ func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath str
 		// A no-follow open can fail after the path changes to a link
 		// or special file. Prefer the same typed error in that case.
 		if changed, statErr := os.Lstat(dst); statErr == nil && !changed.Mode().IsRegular() {
-			return nil, copyFileNotRegularError(requestedPath, changed.Mode())
+			return nil, c.publicError(copyFileNotRegularError(requestedPath, changed.Mode()))
 		}
-		return nil, err
+		return nil, c.publicError(err)
 	}
 	openedInfo, statErr := f.Stat()
 	if statErr != nil {
-		_ = f.Close()
-		return nil, statErr
+		return nil, errors.Join(c.publicError(statErr), c.publicError(f.Close()))
 	}
 	if !openedInfo.Mode().IsRegular() {
-		_ = f.Close()
-		return nil, copyFileNotRegularError(requestedPath, openedInfo.Mode())
+		return nil, errors.Join(c.publicError(copyFileNotRegularError(requestedPath, openedInfo.Mode())), c.publicError(f.Close()))
+	}
+	if openedInfo.Size() > MaxCopyFileFromContainerSize {
+		return nil, errors.Join(
+			c.publicError(copyFileFromContainerTooLargeError(requestedPath, openedInfo.Size())),
+			c.publicError(f.Close()),
+		)
 	}
 	if err := qCtx.Err(); err != nil {
-		_ = f.Close()
-		return nil, err
+		return nil, errors.Join(c.publicError(err), c.publicError(f.Close()))
 	}
 
 	keepDir = true
 	return &tempFileReader{File: f, dir: dir}, nil
+}
+
+func copyFileFromContainerTooLargeError(containerPath string, size int64) error {
+	return fmt.Errorf(
+		"copy file from container %q: size %d exceeds limit %d: %w",
+		containerPath,
+		size,
+		MaxCopyFileFromContainerSize,
+		ErrCopyFileFromContainerTooLarge,
+	)
 }
 
 func copyFileNotRegularError(containerPath string, mode os.FileMode) error {
@@ -820,9 +852,7 @@ type tempFileReader struct {
 }
 
 func (r *tempFileReader) Close() error {
-	err := r.File.Close()
-	_ = os.RemoveAll(r.dir)
-	return err
+	return errors.Join(r.File.Close(), cleanupCopyStagingDir(r.dir))
 }
 
 // validateContainerPath enforces the invariants the copy protocol

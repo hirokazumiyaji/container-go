@@ -277,7 +277,7 @@ func receiveLogScanResult(ctx context.Context, target Target, results <-chan log
 
 	var tickerChan <-chan time.Time
 	if target != nil {
-		ticker := time.NewTicker(20 * time.Millisecond)
+		ticker := time.NewTicker(stateCheckInterval)
 		defer ticker.Stop()
 		tickerChan = ticker.C
 	}

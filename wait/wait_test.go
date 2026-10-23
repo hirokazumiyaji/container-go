@@ -379,8 +379,7 @@ func TestForLogAsRegexp(t *testing.T) {
 
 func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	target := newFakeTarget()
-	pr, _ := io.Pipe() // never written, never closed
-	target.logs = pr
+	target.logs = newBlockingPipeReader()
 
 	s := ForLog("never").WithStartupTimeout(300 * time.Millisecond)
 	err := s.WaitUntilReady(context.Background(), target)
@@ -392,6 +391,10 @@ func TestForLogTimesOutWhenPatternNeverAppears(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "timed out") {
 		t.Fatalf("error = %v, want timeout diagnostic", err)
+	}
+	// Each State call is an inspect subprocess on a real backend.
+	if n := target.stateCalls.Load(); n != 0 {
+		t.Errorf("State calls = %d, want none before stateCheckInterval elapses", n)
 	}
 }
 

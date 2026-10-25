@@ -254,8 +254,9 @@ described below are not.
 - `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
   Current bind-source validation is Unix-style; Windows host paths and
   remote Docker bind-source semantics are pending #76.
-- `WithFiles(files ...File)`: files copied into the running container
-  after start; a copy failure rolls back `Run`. On `WithReuse`, files
+- `WithFiles(files ...File)`: regular files copied into the running container
+  after start; a directory, symlink, or special source is rejected at option
+  evaluation, and a copy failure rolls back `Run`. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
   failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
@@ -308,8 +309,9 @@ they are rejected.
 `ValidationError.Err` is the source of truth for the rendered message and
 unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
-`Option`; `WithFiles` resolves and stats each host path before image or
-container work; Docker applies its complete local-volume-name grammar in
+`Option`; `WithFiles` resolves each host path and rejects anything that is
+not a regular file before image or container work; Docker applies its
+complete local-volume-name grammar in
 `checkConfig` while Apple keeps its backend-specific name rules. Copy paths
 are interpreted as POSIX paths with the `path` package, and a negative
 `Container.Stop` timeout is rejected before the CLI is called.
@@ -513,9 +515,10 @@ available on both backends.
 source entry once without following a final link; directory children are
 opened relative to the already-open parent handle. It copies from those
 handles into a current-user-only staging root before invoking either CLI.
-`WithFiles` uses the same snapshot path but rejects directories. Separate
-staging and CLI deadlines prevent filesystem work from consuming the CLI
-budget, while a caller deadline remains authoritative for both. Directory
+`WithFiles` uses the same snapshot path but rejects directories, symlinks,
+and special files when the option is applied, before any backend call.
+Separate staging and CLI deadlines prevent filesystem work from consuming the
+CLI budget, while a caller deadline remains authoritative for both. Directory
 snapshots are bounded by file bytes, entry count, depth, and aggregate
 source-path metadata. They intentionally preserve only names, bytes, and
 Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,

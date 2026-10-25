@@ -1014,8 +1014,9 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   値でも env ファイルには書かないという意図的な互換性変更です。
 - `CopyToContainer` は通常ファイルとディレクトリを最終要素のリンクを追わずに開きます。
   開いたハンドルをユーザー専用の非公開ステージングへコピーしてから、backend を呼び出します。
-  `WithFiles` は通常ファイル専用です。
-  シンボリックリンク、reparse point、特殊ファイルは拒否します。
+  `WithFiles` は通常ファイル専用で、option 評価時にディレクトリ、
+  シンボリックリンク、reparse point、特殊ファイルを backend 呼び出し前に拒否します。
+  コピー経路はシンボリックリンク、reparse point、特殊ファイルを拒否します。
   スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
   保持するメタデータは名前、バイト列、Unix パーミッションだけです。
   タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。

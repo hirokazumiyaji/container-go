@@ -1071,8 +1071,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Every CLI call is an argv vector; no shell is involved. The one shell
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
-  staging path before invoking the backend. `WithFiles` is regular-file-only.
-  Symlinks/reparse points and special files are rejected. Snapshots are
+  staging path before invoking the backend. `WithFiles` is regular-file-only
+  and rejects directories, symlinks/reparse points, and special files when the
+  option is applied, before any backend call. Snapshots are
   bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
   `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
   (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source

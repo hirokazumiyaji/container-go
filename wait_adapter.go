@@ -6,7 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os/exec"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/wait"
@@ -33,37 +36,146 @@ type waitTarget struct {
 }
 
 var (
-	_ wait.Target      = waitTarget{}
-	_ wait.StateTarget = waitTarget{}
+	_ wait.Target           = waitTarget{}
+	_ wait.StateTarget      = waitTarget{}
+	_ wait.PortListenTarget = waitTarget{}
 )
 
-func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
-	if port == "" {
-		// Port probes are TCP-only. A UDP declaration must not silently
-		// become the target of an implicit ForExposedPort/ForHTTP probe.
-		// Exposed declarations retain their order even when another port
-		// has an explicit host binding; published-only containers fall back
-		// to their first TCP binding.
-		for _, exposed := range t.c.exposed {
-			if exposed.proto == "tcp" {
-				port = exposed.String()
-				break
-			}
-		}
-		if port == "" {
-			for _, published := range t.c.published {
-				if published.proto == "tcp" {
-					port = strconv.Itoa(published.containerPort) + "/" + published.proto
-					break
-				}
-			}
-		}
-		if port == "" {
-			return "", ErrPortNotExposed
+// selectedPort resolves an empty port request the same way for Endpoint and
+// the container-side listen check. Port probes are TCP-only: a UDP
+// declaration must not silently become the target of an implicit
+// ForExposedPort/ForHTTP probe. Exposed declarations retain their order even
+// when another port has an explicit host binding; published-only containers
+// fall back to their first TCP binding.
+func (t waitTarget) selectedPort(port string) (string, error) {
+	if port != "" {
+		return port, nil
+	}
+	for _, exposed := range t.c.exposed {
+		if exposed.proto == "tcp" {
+			return exposed.String(), nil
 		}
 	}
-	endpoint, err := t.c.Endpoint(ctx, port)
+	for _, published := range t.c.published {
+		if published.proto == "tcp" {
+			return strconv.Itoa(published.containerPort) + "/" + published.proto, nil
+		}
+	}
+	return "", ErrPortNotExposed
+}
+
+func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
+	resolved, err := t.selectedPort(port)
+	if err != nil {
+		return "", err
+	}
+	endpoint, err := t.c.Endpoint(ctx, resolved)
 	return endpoint, waitTargetError(err)
+}
+
+// procNetExecTimeout bounds one container-side listen check so a hung exec
+// cannot consume the whole startup timeout. The wait context still wins when
+// it expires first.
+const procNetExecTimeout = 5 * time.Second
+
+// procNetReadLimit bounds the bytes retained from /proc/net; the exec sink
+// drains anything beyond it.
+const procNetReadLimit = 1 << 20
+
+// procNetCommand reads both address families without a shell or an external
+// port tool. Images without cat (for example distroless) make the check
+// report unsupported and fall back to the host connection.
+func procNetCommand() []string {
+	return []string{"cat", "/proc/net/tcp", "/proc/net/tcp6"}
+}
+
+// ContainerPortStatus reads the container's /proc/net tables and reports
+// whether the declared port is in LISTEN state. Docker's userland proxy
+// accepts a host connection before the container process listens, so a
+// successful host dial alone is not proof of readiness. Apple Container
+// connects directly to the VM endpoint and needs no extra check.
+func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.PortListenStatus, error) {
+	if t.c == nil || t.c.eng == nil || t.c.eng.directIP() {
+		return wait.PortListenUnsupported, nil
+	}
+	resolved, err := t.selectedPort(port)
+	if err != nil {
+		return wait.PortListenUnsupported, err
+	}
+	spec, err := parsePortSpec(resolved)
+	if err != nil {
+		return wait.PortListenUnsupported, err
+	}
+	var out bytes.Buffer
+	code, _, err := t.c.ExecTo(ctx, procNetCommand(), &out,
+		WithExecMaxBytes(procNetReadLimit),
+		WithExecTimeout(procNetExecTimeout),
+	)
+	if err != nil {
+		if portCheckUnavailable(err) {
+			return wait.PortListenUnsupported, nil
+		}
+		// Container-side probing failures are retryable; the wait loop
+		// decides when the startup timeout has expired.
+		return wait.PortListenUnsupported, waitTargetError(err)
+	}
+	// 126 and 127 mean the command could not be invoked, which is how a
+	// distroless image without cat surfaces. Do not let a partial table
+	// from such a wrapper hide the unavailable check.
+	if code == 126 || code == 127 {
+		return wait.PortListenUnsupported, nil
+	}
+	listening, supported := procNetListening(out.Bytes(), spec.port)
+	if !supported {
+		return wait.PortListenUnsupported, nil
+	}
+	if listening {
+		return wait.PortListenOpen, nil
+	}
+	return wait.PortListenClosed, nil
+}
+
+// portCheckUnavailable reports whether an exec failure means the
+// container-side check cannot run at all, rather than a transient failure
+// worth retrying. Context and backend availability errors stay retryable.
+func portCheckUnavailable(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	if errors.Is(err, ErrUnsupportedCapability) {
+		return true
+	}
+	var launchErr *exec.Error
+	return errors.As(err, &launchErr)
+}
+
+// procNetListening parses /proc/net/tcp and /proc/net/tcp6 output. supported
+// is false when the output contains neither a header nor a socket line,
+// which is how a missing cat or an unavailable /proc/net surfaces.
+func procNetListening(data []byte, port int) (listening, supported bool) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		if fields[0] == "sl" && fields[1] == "local_address" {
+			supported = true
+			continue
+		}
+		colon := strings.LastIndexByte(fields[1], ':')
+		if colon < 0 {
+			continue
+		}
+		localPort, err := strconv.ParseUint(fields[1][colon+1:], 16, 16)
+		if err != nil {
+			continue
+		}
+		supported = true
+		if int(localPort) == port && fields[3] == "0A" {
+			listening = true
+		}
+	}
+	return listening, supported
 }
 
 func (t waitTarget) Running(ctx context.Context) (bool, error) {

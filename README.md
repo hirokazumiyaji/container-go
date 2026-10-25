@@ -468,6 +468,19 @@ Implement the optional `wait.StateTarget` interface when the target can
 distinguish transient startup states; built-in strategies use it automatically
 and fall back to `Running` for compatibility.
 
+On Docker, a successful TCP connection to a published port does not prove
+that the container process listens: `docker-proxy` or Docker Desktop's port
+forwarder completes the handshake first. `ForListeningPort` and
+`ForExposedPort` therefore follow a successful host connection with a
+container-side check that the declared container port is in `LISTEN` state,
+read from `/proc/net/tcp` and `/proc/net/tcp6` through `exec`. When that check
+cannot run — Apple Container (which reaches the VM endpoint directly), an
+image without `cat` such as distroless, or another unsupported target — the
+strategy falls back to the host connection alone. That fallback is
+best-effort: it restores the historical host-only behavior because the
+container-side check is unavailable, not because the port is known to be
+ready. Use `WithHostOnly()` to skip the container-side check explicitly.
+
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
 UDP may be declared for endpoint configuration, but the current
 implementation does not reject `/udp` before probing: it is passed to a

@@ -8,75 +8,35 @@ Go のテストから使い捨てコンテナを起動できます。コンテ�
 
 ## バージョンの適用範囲
 
-最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
+最新のタグ付きリリースは `v0.3.0`（2026-10-26）です。
 このチェックアウトは、そのタグより後の開発版です。
-下記のインストールコマンドはリリース版 API のものです。
-このコマンドで、後述の開発版 API が入るわけではありません。
+下記のインストールコマンドはリリース版 API を導入します。
+`v0.3.0` には [CHANGELOG.md](CHANGELOG.md) の `0.3.0` 節に記載した API と修正が含まれます。
 
 root ライブラリのチェックアウトには Go 1.26 以降が必要です。
 `make bench-integration` が使う nested `bench/` モジュールには
-Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が必要です。
+Go 1.26 以降が必要です。`v0.3.0` モジュールにも Go 1.26 以降が必要です。
 
-| API または動作 | `v0.2.0` | 現在の開発チェックアウト |
-|---|---|---|
-| `Run`、基本オプション、ライフサイクル、エンドポイント、`Exec`、`Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、バックエンド選択、元の wait 戦略 | あり | あり |
-| `LogsOptions` と `LogsWithOptions` | なし | あり |
-| `wait.ForHTTP` のヘッダー、認証、TLS、独自クライアント設定 | なし | あり |
-| 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
-| root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
-| 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | 一部実装済み。以下の後続 issue の制約を参照 |
+現在のチェックアウトには、意図的に残している次の制約があります。
 
-以下の説明で「現在の開発」と記した節以外は、現行チェックアウトの動作を説明します。
-タグ付き `v0.2.0` の API については、バージョン表を確認してください。
+- Windows には watchdog reaper がない。reaper は `/bin/sh` を必要とするため、
+  Windows では `Cleanup`、`TerminateContainer`、ロールバック経路だけが
+  コンテナを削除します。secret な環境ファイルを必要とする操作は Windows で
+  `ErrEnvFileUnsupported` を返します。
+- remote Docker daemon に対する bind mount は `ErrUnsupportedCapability` で
+  拒否されます。daemon が自分の host で source path を解決するため、
+  client 側の path を検証できないからです。ローカル daemon では Windows の
+  host path も受理されます。
+- Apple Container は `PullNever` を扱えず（`ErrPullNeverUnsupported`）、
+  型を保持する copy-out がなく（`CopyFileFromContainer` は
+  `ErrCopyFileFromContainerUnsupported` を返す）、`--since` log option も
+  ありません。
+- network と volume の作成は out of scope です。`WithNetwork` は既存の
+  network に接続し、`WithMounts` は bind、named volume、tmpfs mount を
+  受け付けますが anonymous volume は作成しません。Dockerfile build も
+  out of scope です。
+
 コード例は単独ファイルとしてリポジトリのドキュメントテストがコンパイルします。
-
-このチェックアウトは、バックエンド固有の動作を改修する後続 issue の
-修正を統合した状態ではありません。特に次の制限があります。
-
-- Apple の `LogsWithOptions` は現在 Docker 形式の `--tail` と
-  `--since` を渡します。Apple Container は tail に `-n` を使い、
-  `--since` を提供しません。Apple の機能を文書化する前に #82 を
-  適用する必要があります。
-- endpoint 解決は最初の inspect をキャッシュし、IP アドレスと host
-  binding も含めます。この値は変わることがあるため、古い値を返す
-  ことがあります。動的な endpoint データの更新は #85 が担当します。
-- reuse は既存コンテナですべての ownership / generation label を
-  要求せず、readiness 後に generation を再確認しません。generation が
-  ない場合は name ベースの delete に到達する可能性があります。#83 と
-  #84 がこれらの fail-open 経路を扱います。
-- Docker の handle は `docker run` が出力した immutable ID を delete に使います
-  が、inspect から得た ID には target validation がありません。他の backend
-  operation は現在 logical name を対象にします。そのため stale handle が同じ
-  名前の置き換えを inspect または変更する可能性があります。#74 が operation
-  target の修正を担当し、#103 が Docker inspect target validation を担当します。
-- Docker の `Prune` は現在 exited コンテナだけを選び、dead 状態は
-  選びません。dead 状態の対応は #113 が担当します。
-- Windows Docker の bind source と remote Docker の bind source semantics は
-  現在の validation path では扱えていません。#76 が host path と remote mount を
-  担当します。
-- `ForListeningPort` と `ForExposedPort` は TCP 専用 probe です。UDP は endpoint
-  設定には宣言できますが、UDP readiness request は現在 TCP dial に渡され、timeout
-  または別の TCP listener に接続する可能性があります。#77 が protocol validation を
-  担当します。
-- `Stop` の非 nil timeout は whole second へ truncation し、negative や極端な値を
-  reject しません。#89 が timeout validation を担当します。
-- wait の timeout/cancellation error は error chain に一様に保持されません。#92 が
-  built-in strategy の error contract を担当します。
-- liveness probe failure は元の `*CLIError` を `ErrSystemNotRunning` の message に
-  flatten する。#104 が error chain の保持を担当する。
-- target に一致する entry がない successful inspect response は
-  `ErrContainerNotFound` ではなく generic error を返す場合がある。Docker
-  では empty または malformed な inspect data がその path になることがあり、
-  現在の parser は返された object の ID や name が要求値と一致するか検証しない。
-  valid だが mismatched な object は信頼できる no-match signal ではない。#103 が
-  その classification gap を担当する。
-- public option の validation は部分的です。negative log tail、zero memory、unknown
-  mount type、reuse-group grammar は一様に reject されません。#102 が typed validation を
-  担当します。
-- reaper は full inspect output を一時 file に staging するため、環境 data が残る
-  可能性があります。#111 が staging exposure と cleanup を担当します。
-
-以下の節は、後続ブランチの動作ではなく、現在の上限を説明します。
 
 ```go
 package docexample
@@ -182,20 +142,21 @@ CI の unit と Docker integration job は Linux のみを対象とするため�
 
 ## インストール
 
-リリース版 `v0.2.0` の API を使う場合:
+最新のタグ付きリリースを導入する場合:
 
 ```text
-go get github.com/hirokazumiyaji/container-go@v0.2.0
+go get github.com/hirokazumiyaji/container-go@v0.3.0
 ```
 
-現在の開発チェックアウトはリリースではありません。
-`@v0.2.0` にバージョンテーブルの開発版 API が入っていると仮定しないでください。
+`v0.3.0` のリリース版 API が導入されます。
+このチェックアウトにはタグ以降の変更が含まれることがあるため、
+再現可能なビルドには上記のようにモジュールバージョンを明示してください。
 
 ## API の安定性
 
 1.0 未満では、マイナーリリース（0.x）に破壊的変更が含まれる場合があります。
 再現可能なビルドにはモジュールバージョンを明示して pin してください
-(`go get ...@v0.2.0`)。
+(`go get ...@v0.3.0`)。
 
 ルートの `container` パッケージ（`Run`、オプション、ライフサイクルヘルパー）が
 主な統合面で、マイナーシリーズ内では比較的安定を目指します。
@@ -204,8 +165,8 @@ go get github.com/hirokazumiyaji/container-go@v0.2.0
 変更される可能性があります。可能なら組み込み strategy を使ってください。
 
 [CHANGELOG.md](CHANGELOG.md) も参照してください。
-`v0.2.0` の節はタグ付きリリースだけ、`Unreleased` の節は現在の開発 API を
-説明します。
+`0.3.0` の節はタグ付きリリースを説明し、`Unreleased` の節は
+そのタグより後の変更を説明します。
 
 ## 出力の契約
 

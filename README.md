@@ -11,75 +11,35 @@ rest of the implementation uses the standard library.
 
 ## Version scope
 
-The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
-development after that tag. The install command below is for the released
-API; it does not install the development-only APIs documented below.
+The latest tagged release is `v0.3.0` (2026-10-26). This checkout is
+development after that tag. The install command below installs the
+released API; `v0.3.0` includes the APIs and fixes documented in the
+`0.3.0` section of [CHANGELOG.md](CHANGELOG.md).
 
 The root library checkout requires Go 1.26 or later. The nested
 `bench/` module used by `make bench-integration` requires Go 1.26 or
-later. The `v0.2.0` module requires Go 1.27 or later.
+later. The `v0.3.0` module requires Go 1.26 or later.
 
-| API or behavior | `v0.2.0` | Current development checkout |
-|---|---|---|
-| `Run`, core options, lifecycle, endpoints, `Exec`, `Logs`, `FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and the original wait strategies | Available | Available |
-| `LogsOptions` and `LogsWithOptions` | Not available | Available |
-| `wait.ForHTTP` header, authentication, TLS, and custom-client setters | Not available | Available |
-| Exported `wait.AllStrategy` / `AnyStrategy` and composite `WithStartupTimeout` | Not available | Available |
-| Root `CLIError`, `ErrContainerNotFound`, and `ErrGenerationReplaced` | Not available | Available |
-| Generation-safe deletion, post-`v0.2.0` endpoint hardening, and the current reaper hardening | Not part of the `v0.2.0` contract | Partially implemented; see the follow-up issue boundaries below |
+The current checkout still has these deliberate constraints:
 
-Unless a section explicitly says “current development”, descriptions of
-behavior describe this checkout rather than the tagged `v0.2.0` release.
+- Windows has no watchdog reaper, because the reaper needs `/bin/sh`;
+  only `Cleanup`, `TerminateContainer`, and the rollback paths remove
+  containers there. Operations that need a secret environment file fail
+  with `ErrEnvFileUnsupported` on Windows.
+- A bind mount against a remote Docker daemon is rejected with
+  `ErrUnsupportedCapability`, because the daemon resolves the source path
+  on its own host. Windows host paths are accepted for a local daemon.
+- Apple Container cannot honor `PullNever`
+  (`ErrPullNeverUnsupported`), has no type-preserving copy-out
+  (`CopyFileFromContainer` returns
+  `ErrCopyFileFromContainerUnsupported`), and has no `--since` log option.
+- Network and volume creation are out of scope: `WithNetwork` attaches an
+  existing network, and `WithMounts` accepts bind, named-volume, and
+  tmpfs mounts but never creates anonymous volumes. Dockerfile builds are
+  out of scope.
+
 The code examples are standalone files and are compile-checked by the
 repository's documentation test.
-
-This checkout is not a merge of the follow-up issue branches that harden
-backend-specific behavior. In particular:
-
-- Apple `LogsWithOptions` currently uses Docker-style `--tail` and
-  `--since` arguments. Apple Container uses `-n` for a tail and has no
-  `--since` option; #82 must be applied before Apple support can be
-  documented as a capability.
-- Endpoint resolution caches the first successful inspect, including an IP
-  address and host bindings. Those values can change and may be stale; #85
-  tracks refreshing dynamic endpoint data.
-- Reuse does not require every ownership/generation label on an existing
-  container and does not re-check the generation after readiness. A missing
-  generation can reach a name-based delete path; #83 and #84 track those
-  fail-open paths.
-- A Docker handle currently uses an immutable ID printed by `docker run` for
-  deletion, but an ID recovered from inspect still lacks target validation;
-  other backend operations address the logical name. A stale handle can
-  therefore inspect or modify a same-name replacement; #74 tracks the
-  operation-target fix and #103 tracks Docker inspect target validation.
-- Docker `Prune` currently selects exited containers, not containers in the
-  dead state; #113 tracks dead-state coverage.
-- Windows Docker bind sources and remote Docker bind-source semantics are
-  not supported by the current validation path; #76 tracks host-path and
-  remote-mount handling.
-- `ForListeningPort` and `ForExposedPort` are TCP-only probes. UDP may be
-  declared for endpoint configuration, but a UDP readiness request is
-  currently passed to a TCP dial; #77 tracks protocol validation.
-- `Stop` converts non-nil durations to whole seconds by truncation and does
-  not reject negative or extreme values; #89 tracks timeout validation.
-- Wait timeout/cancellation errors are not uniformly preserved in the
-  error chain; #92 tracks the built-in strategy error contract.
-- A failed liveness probe currently flattens the original `*CLIError` into
-  an `ErrSystemNotRunning` message; #104 tracks error-chain preservation.
-- A successful inspect response with no matching target may return a
-  generic error rather than `ErrContainerNotFound`. For Docker, empty or
-  malformed inspect data can take that path, and the current parser does
-  not verify that a returned object matches the requested ID or name; a
-  valid but mismatched object is not a reliable no-match signal. #103
-  tracks that classification gap.
-- Public option validation is partial: negative log tails, zero memory,
-  unknown mount types, and reuse-group grammar are not uniformly rejected;
-  #102 tracks the typed validation work.
-- The reaper can stage full inspect output, including environment data, in
-  a temporary file; #111 tracks the staging exposure and cleanup gap.
-
-The sections below describe these current limitations rather than the
-behavior of those follow-up branches.
 
 ```go
 package docexample
@@ -161,19 +121,20 @@ after a pull.
 
 ## Installation
 
-For the released `v0.2.0` API:
+To install the latest tagged release:
 
 ```text
-go get github.com/hirokazumiyaji/container-go@v0.2.0
+go get github.com/hirokazumiyaji/container-go@v0.3.0
 ```
 
-The current development checkout is not a release. Do not assume that
-`@v0.2.0` contains the development-only APIs listed in the version table.
+This installs the released API from `v0.3.0`. This checkout may contain
+changes after that tag; pin the module version as above for reproducible
+builds.
 
 ## API stability
 
 Pre-1.0: minor releases (0.x) may include breaking API changes. Pin an
-explicit module version (`go get ...@v0.2.0`) for reproducible builds.
+explicit module version (`go get ...@v0.3.0`) for reproducible builds.
 
 The root `container` package (`Run`, options, lifecycle helpers) is the
 primary integration surface and is kept reasonably stable within a minor
@@ -182,9 +143,9 @@ custom strategies — especially [`wait.Target`](wait/wait.go) — may evolve
 as backends and probing needs change; prefer the built-in strategies when
 possible.
 
-See [CHANGELOG.md](CHANGELOG.md) for release notes. Its `v0.2.0` section
-describes only the tagged release; its `Unreleased` section describes the
-current development API.
+See [CHANGELOG.md](CHANGELOG.md) for release notes. Its `0.3.0` section
+describes the tagged release; its `Unreleased` section describes changes
+after that tag.
 
 ## Copy-out backend capability
 

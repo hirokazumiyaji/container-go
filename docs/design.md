@@ -32,18 +32,17 @@ classification depends on #103; error-chain preservation depends on
 sections describe the behavior before those changes; they do not
 promise the remaining follow-up contracts.
 
-The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
-development after that tag. The `v0.2.0` module requires Go 1.27 or
-later; the root checkout requires Go 1.26 or later, while the nested
-`bench/` module requires Go 1.26 or later. The released API and the
-current development API are not interchangeable: `LogsOptions` /
+The latest tagged release is `v0.3.0` (2026-10-26). This checkout is
+development after that tag. The `v0.3.0` module requires Go 1.26 or
+later; the nested `bench/` module requires Go 1.26 or later. The APIs
+documented in the `CHANGELOG`'s `0.3.0` section — `LogsOptions` /
 `LogsWithOptions`, the additional `wait.ForHTTP` setters, exported
 `wait.AllStrategy` / `AnyStrategy` with composite `WithStartupTimeout`,
 and the root `CLIError`, `ErrContainerNotFound`, and
-`ErrGenerationReplaced` symbols are development additions after
-`v0.2.0`. The core `Run`, options, lifecycle, endpoints, `Exec`, `Logs`,
-`FollowLogs`, copy, pull policies, reuse, cleanup, backend selection, and
-original wait strategies were present in `v0.2.0`.
+`ErrGenerationReplaced` symbols — are part of that release. The core
+`Run`, options, lifecycle, endpoints, `Exec`, `Logs`, `FollowLogs`,
+copy, pull policies, reuse, cleanup, backend selection, and original
+wait strategies were present in `v0.2.0`.
 
 ## Purpose
 

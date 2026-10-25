@@ -26,16 +26,15 @@ Windows / remote の bind source は #76、TCP 専用 readiness の validation �
 staging の cleanup は #111 に依存します。
 #85 を除き、以下の現在の節はその変更前の動作を説明します。
 
-最新のタグ付きリリースは `v0.2.0`（2026-09-02）です。
+最新のタグ付きリリースは `v0.3.0`（2026-10-26）です。
 このチェックアウトはそのタグより後の開発版です。
-`v0.2.0` モジュールには Go 1.27 以降が必要ですが、現在の root チェックアウトには
-Go 1.26 以降が必要で、nested `bench/` モジュールには Go 1.26 以降が必要です。
-リリース版 API と現在の開発版 API は同じもの
-ではありません。`LogsOptions` / `LogsWithOptions`、追加された
+`v0.3.0` モジュールには Go 1.26 以降が必要で、nested `bench/` モジュールにも
+Go 1.26 以降が必要です。`CHANGELOG` の `0.3.0` 節に記載した API、
+すなわち `LogsOptions` / `LogsWithOptions`、追加された
 `wait.ForHTTP` の setter、公開型 `wait.AllStrategy` / `AnyStrategy` と
 合成 strategy の `WithStartupTimeout`、root の `CLIError`、
-`ErrContainerNotFound`、`ErrGenerationReplaced` は `v0.2.0` 以降の
-開発版追加です。基本の `Run`、options、lifecycle、endpoint、`Exec`、
+`ErrContainerNotFound`、`ErrGenerationReplaced` はリリースに含まれます。
+基本の `Run`、options、lifecycle、endpoint、`Exec`、
 `Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、backend 選択、
 元の wait strategy は `v0.2.0` に存在しています。
 作成日: 2026-08-18(v0.2 バックエンド節を 2026-08-19 追記)

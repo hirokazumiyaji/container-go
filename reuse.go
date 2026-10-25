@@ -617,7 +617,7 @@ func copyReuseFiles(ctx context.Context, ctr *Container, files []File) error {
 	if err := ctr.copyFiles(ctx, files); err != nil {
 		var fErr *fileCopyError
 		if errors.As(err, &fErr) {
-			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, fErr.File.HostPath, fErr.File.ContainerPath, fErr.Err)
+			return fmt.Errorf("reuse %s: WithFiles copy %q to %q: %w", ctr.id, fErr.Source, fErr.ContainerPath, fErr.Err)
 		}
 		return fmt.Errorf("reuse %s: WithFiles copy: %w", ctr.id, err)
 	}

@@ -311,11 +311,11 @@ func (e *ExecTerminationError) Is(target error) bool {
 	return target == ErrExecTerminationUnsupported
 }
 
-// ErrSharedContainer reports that Stop, CopyToContainer, or
-// CopyFileFromContainer was called on a WithReuse handle. Those operations
-// would disturb peers sharing the container. Use Shared to opt in, or
-// Terminate to remove the shared container outright. Cleanup and
-// TerminateContainer still skip reused handles even after Shared.
+// ErrSharedContainer reports that Stop, CopyToContainer,
+// CopyContentToContainer, or CopyFileFromContainer was called on a WithReuse
+// handle. Those operations would disturb peers sharing the container. Use
+// Shared to opt in, or Terminate to remove the shared container outright.
+// Cleanup and TerminateContainer still skip reused handles even after Shared.
 var ErrSharedContainer = errors.New("operation refused on a shared WithReuse handle")
 
 // ErrCopySourceUnsupported reports a host source that is not a regular
@@ -326,7 +326,7 @@ var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or
 
 // ErrCopySourceTooLarge reports a source whose regular-file bytes exceed
 // MaxCopyToContainerSize. The limit applies to a directory's total
-// snapshot size as well as to a single file.
+// snapshot size, to a single file, and to File.Content.
 var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
 
 // ErrCopySourceTooManyEntries reports a source tree that exceeds

@@ -29,7 +29,7 @@ pull other Hub images locally. The root module supports Go 1.26+; the nested
 `bench/README.md`.
 
 Windows-specific copy tests use Windows build constraints and are cross-built
-with the package. Issue #119 does not add a live Windows CI runner; execute
+with the package. No live Windows CI runner is configured; execute
 `go test ./...` on Windows separately when changing Windows-specific behavior.
 
 ## Pull requests

@@ -3,7 +3,7 @@
 日本語版: [design.ja.md](design.ja.md)
 
 Created: 2026-08-18 (v0.2 backend section added 2026-08-19)
-Last synchronized: 2026-09-25
+Last synchronized: 2026-10-26
 Targets: Apple Container CLI 1.2.2 and 1.3.0 (macOS 26+, Apple Silicon;
 the versions represented by repository evidence), Docker 29.x (29.7.2
 local run and a v29 inspect fixture; Linux, Windows, macOS), root module
@@ -13,24 +13,10 @@ This document describes the current implementation in this checkout.
 The **Implementation phases** section is retained as a historical plan;
 it is not a promise that every phase is still a current API or roadmap.
 The public API and behavior described in the current sections come from
-the implementation and its tests.
-
-This checkout is not a merge of the follow-up issue branches that harden
-backend-specific behavior. Apple log options depend on #82, reuse
-ownership and final generation verification depend on #83 and #84,
-stale Docker operation targeting depends on #74, and Docker inspect
-target validation depends on #103. Dynamic endpoint refreshes (#85) are
-in this checkout: Host, Endpoint, MappedPort, and ContainerIP reuse a
-short (~1s) identity-checked inspect snapshot so readiness polls do not
-spawn a backend CLI process on every retry, while network and port data
-are still not retained indefinitely.
-Docker dead-state pruning depends on #113; missing-inspect
-classification depends on #103; error-chain preservation depends on
-#104. Windows and remote bind-source handling depend on #76, TCP-only readiness validation on #77, Stop timeout validation on
-#89, wait error-chain normalization on #92, public option validation on
-#102, and reaper staging cleanup on #111. Aside from #85, the current
-sections describe the behavior before those changes; they do not
-promise the remaining follow-up contracts.
+the implementation and its tests. Backend capabilities that do not exist
+(for example, Apple Container's missing `--since` log option) are described
+as current behavior, not as pending work. Release history belongs in
+CHANGELOG.md.
 
 The latest tagged release is `v0.2.0` (2026-09-02). This checkout is
 development after that tag. The `v0.2.0` module requires Go 1.27 or
@@ -61,9 +47,11 @@ Three constraints shape the design.
 
 - **Minimal dependencies**: the standard library plus `golang.org/x/sys`
   for platform process and file handling; no third-party container-client module.
-- **Security**: subprocess argv prevents injection; reaper staging still has
-  an environment-data exposure on abnormal termination (#111), so the
-  no-leak property is not a current guarantee.
+- **Security**: subprocess argv prevents injection. The watchdog reaper
+  projects inspect output through a structural field filter and does not
+  stage raw JSON. Legacy staging files from older versions can still contain
+  environment data; the cleanup notes in the Security design section apply
+  to deployments that ran those versions.
 - **Performance**: container (VM) startup dominates test suite time;
   the library's own overhead must stay negligible against that, and it
   must never serialize parallel startups.
@@ -252,8 +240,10 @@ described below are not.
 - `WithLabels(labels map[string]string)`: extra labels. The library's
   managed labels are reserved.
 - `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
-  Current bind-source validation is Unix-style; Windows host paths and
-  remote Docker bind-source semantics are pending #76.
+  Bind sources use host-OS path syntax, so Windows host paths are accepted
+  for a local Docker daemon; a bind mount against a remote Docker daemon is
+  rejected with `ErrUnsupportedCapability` because the daemon resolves the
+  source path on its own host.
 - `WithFiles(files ...File)`: files copied into the running container
   after start; a copy failure rolls back `Run`. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
@@ -272,20 +262,18 @@ described below are not.
   options are ignored on attach.
 - `WithReuseGroup(group string)`: label a reused container for
   `PruneReuseGroup`; it requires `WithReuse` and is not part of the
-  reuse key. `PruneReuseGroup` currently uses a weaker validation
-  grammar (#102).
+  reuse key. `PruneReuseGroup` applies the same group grammar as
+  `WithReuseGroup`.
 - `WithCPUs(n int)` / `WithMemory(size string)`: resource limits.
-  `WithMemory` currently accepts zero and does not enforce backend
-  capability limits (#102).
+  `WithMemory` rejects zero and overflow, and the Apple backend rejects
+  sizes below its 200 MiB minimum.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
-- `WithNetwork(name string)`: attach to an existing named network.
+- `WithNetwork(name string)`: attach to an existing named network; when
+  omitted, Docker keeps its daemon-selected default (`bridge` on Linux,
+  `nat` on native Windows).
 - `WithPlatform(p string)`: select an image platform such as
   `linux/amd64` (including Rosetta use on Apple Container).
-  and working directory
-- `WithNetwork(name string)`: target network; when omitted, Docker keeps
-  its daemon-selected default (`bridge` on Linux, `nat` on native Windows)
-- `WithPlatform(p string)`: e.g. `linux/amd64` (via Rosetta)
 
 Options outside the backend-neutral CLI surface are intentionally
 omitted. There is no public logger-injection option. For log consumers,
@@ -342,11 +330,12 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
 ```
 
-`Stop` accepts a duration, but the current backends convert non-nil values
-to whole seconds by truncating fractional values. Negative and extreme
-values are not rejected, and the duration is added to the query budget
-without saturation. No library-side maximum is enforced; backend limits
-apply, and #89 tracks the missing validation.
+`Stop` accepts a duration. A non-nil timeout must be non-negative; a
+negative value is rejected before the CLI call. Both backends accept whole
+seconds, so a positive sub-second timeout is rounded up, zero requests
+immediate termination, and a value whose rounded seconds exceed the backend
+limit (`math.MaxInt32` seconds for the checked CLIs) is rejected. The
+timeout is added to the operation's query budget.
 
 `Exec` is a finite, buffered operation. It returns the exit code with
 combined stdout+stderr (a non-zero exit is a result, not an error);
@@ -409,13 +398,13 @@ change their default. New code should use a positive
 `WithExecMaxBytes` or `LogsOptions.MaxBytes`, or stream directly with
 `ExecTo` / `LogsTo`.
 
-`LogsOptions.Tail` is a backend line-based tail (`--tail`) and
+`LogsOptions.Tail` is a backend line-based tail (`--tail` on Docker, `-n` on Apple) and
 `Since` is a backend timestamp filter. `MaxBytes` is applied after
 that selection and is a **prefix** cap: it retains the first bytes of
 the combined stdout/stderr arrival stream, not a byte tail. The same
 prefix policy applies to `WithExecMaxBytes` and to `LogsTo`. The wait
 failure log path is intentionally different: it keeps a trailing
-1 MiB of the backend's bounded `--tail` so the latest diagnostic
+1 MiB of the backend's bounded log tail (`--tail` on Docker, `-n` on Apple) so the latest diagnostic
 survives. Legacy unbounded readers
 retain stdout-then-stderr concatenation; bounded and streaming captures
 use observed arrival order when the runner implements `RunTo`, while the
@@ -463,34 +452,24 @@ a supported `LogsWithOptions` call return a finite snapshot because the
 backend command finishes, but neither imposes a byte limit by itself.
 `Logs` requests all output. `LogsOptions` is backend-specific: Docker
 supports `Tail` and `Since`, while the checked Apple Container CLI
-versions use `-n` for a tail and have no `--since` option. This checkout
-still sends Docker-style `--tail` and `--since` arguments to Apple, so
-`LogsWithOptions` is not backend-neutral here; #82 must be applied before
-Apple support can be documented as a capability. The #82 change is intended
-to map `Tail` to Apple's `-n` and reject `Since` as unsupported. A requested
-window's size still depends on the container output. `FollowLogs` is intentionally
-an unbounded stream and continues until its reader is closed or its
-context is cancelled. `LogsOptions` and `LogsWithOptions` are
-current-development APIs, not part of `v0.2.0`. `Terminate` is
-generation-guarded for handles with a generation, but the current reuse
-and empty-generation paths have limitations described under Reuse and
-tracked by #83 and #84.
-
-Validation is not uniform in this checkout (#102): a negative
-`LogsOptions.Tail` is treated as zero/all, `WithMemory("0")` is accepted
-by the current parser, unknown `MountType` values are not rejected by
-`WithMounts`, and `PruneReuseGroup` uses a weaker grammar than
-`WithReuseGroup`. These are current behaviors, not backend acceptance
-guarantees.
+versions use `-n` for a tail and have no `--since` option. The Apple
+backend maps `Tail` to `-n` and rejects `Since` with
+`ErrUnsupportedCapability`. A requested window's size still depends on the
+container output. `FollowLogs` is intentionally an unbounded stream and
+continues until its reader is closed or its context is cancelled.
+`LogsOptions` and `LogsWithOptions` are current-development APIs, not part
+of `v0.2.0`. `Terminate` is generation-guarded: Apple name deletion
+requires a valid creation generation, Docker deletion uses the immutable
+UID, and the reuse and failed-create paths require those ownership facts
+before deleting.
 
 `Terminate` maps to `container delete --force` on Apple Container and
 `docker rm --force` on Docker. It treats a recognized backend not-found
-CLI failure as success, so its idempotence claim is limited to that case
-(and to a successful delete). It does not normalize empty or malformed
-inspect output, and the current Docker parser does not reject a valid
-object whose ID or name differs from the requested target. Neither case
-is covered by the idempotence claim; unrelated delete failures still
-propagate. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are nil-safe
+CLI failure as success, including an inspect response that does not contain
+the requested target, so its idempotence claim covers not-found and
+successful deletion. A malformed inspect response is an error rather than a
+silent success, and unrelated delete failures still propagate.
+`Cleanup(t, ctr)` and `TerminateContainer(ctr)` are nil-safe
 helpers preserving the testcontainers-go idiom of registering cleanup
 before checking `Run`'s error.
 
@@ -553,7 +532,7 @@ binding and endpoint instead. `Host`, `Endpoint`, `MappedPort`, and
 `ContainerIP` resolve through an identity-checked dynamic inspect with a
 short (~1s) TTL shared across `Shared()` handles so readiness polling
 does not re-inspect on every 100ms retry, while stale network and port
-data are still not retained indefinitely (#85). Incomplete results (no
+data are still not retained indefinitely. Incomplete results (no
 usable IP on direct-IP backends, or no host binding on published-port
 backends) are not treated as cache hits. `State` always re-inspects so
 lifecycle fail-fast paths stay immediate.
@@ -684,17 +663,18 @@ non-reuse `Run` wait rolls the container back and, when the bounded log
 fetch succeeds, attaches a log tail capped at 1MiB to the error; a reuse
 wait leaves the shared container in place.
 
-`ForListeningPort` and `ForExposedPort` are TCP-only probes. UDP can be
-declared for endpoint configuration, but the current implementation does
-not reject `/udp` before probing: it is passed to a TCP dial and may
-time out or reach an unrelated TCP listener. Malformed specifications are
-retried until the wait ends. See #77.
+`ForListeningPort` and `ForExposedPort` are TCP-only probes.
+`ForListeningPort` rejects `/udp` and malformed specifications with a
+`*wait.ConfigError` before probing. `ForExposedPort` selects the first TCP
+port declared via `WithExposedPorts`, falling back to the first TCP
+published port when there is no exposed TCP declaration; a UDP-only
+declaration is never used as a TCP probe.
 
 | API | TCP | UDP |
 |---|---|---|
-| `WithExposedPorts` / `WithPublishedPort` | Accepted by the current option parser | Accepted for endpoint/publish configuration |
-| `wait.ForListeningPort` | `PORT` or `PORT/tcp` | Not a UDP probe; a UDP declaration may be TCP-dialed |
-| `wait.ForExposedPort` | Uses the first declared port, regardless of protocol | If that first declaration is UDP, it is still passed to a TCP dial |
+| `WithExposedPorts` / `WithPublishedPort` | Accepted | Accepted for endpoint/publish configuration |
+| `wait.ForListeningPort` | `PORT` or `PORT/tcp` | `*wait.ConfigError` before probing |
+| `wait.ForExposedPort` | First TCP exposed port, else first TCP published port | Skipped; no TCP port yields `ErrPortNotExposed` |
 
 The strategy contract is:
 
@@ -736,11 +716,11 @@ succeeds.
 **Failed create**: if the backend `run` command itself fails,
 `cleanupFailedCreate` makes a separate best-effort attempt. It skips
 name conflicts, and only inspects and deletes a container carrying this
-process's managed and session labels. When the creation label is present,
-it must match this run; an absent label is not a mismatch in this
-best-effort path. This is not a general replacement guarantee; #83 tracks
-closing the missing-generation path. Errors from its lock, inspect, or delete
-operations are not joined to the returned `Run` error.
+process's managed and session labels. The creation label must be present
+and match this run; an absent or mismatched label is never deleted. This
+is a best-effort replacement guard, not a transactional guarantee. Errors
+from its lock, inspect, or delete operations are not joined to the
+returned `Run` error.
 
 **Abnormal exit**: when the parent process exits and its reaper pipe
 closes, an external `/bin/sh` watchdog attempts force-deletion. An
@@ -757,34 +737,32 @@ are issued. Entries are processed a few at a time so the cost is not
 strictly proportional to the container count.
 
 The reaper is started lazily for a real CLI container on the non-reuse
-path. Apple Container has no separate immutable ID, so its entries use
-the container name and creation generation. The reaper checks the
-creation label before deleting by name, but it does not take the
-per-name lock. Its inspect/delete window can therefore race a
-same-name replacement; an external CLI delete/recreate cannot be
-distinguished by name either. This reaper coordination gap is a separate
-cleanup limitation.
+path. Every created container is pre-registered under its name and
+creation generation before the backend create starts. After a successful
+create, the library verifies the managed/session/creation labels and then
+registers Docker's full 64-hex immutable ID as an additional entry.
+Name-addressed entries (Apple always, and Docker until `run` returns its
+ID) are inspected and deleted under the same per-name `flock` as ordinary
+generation-checked deletion, and the reaper checks the creation label
+before deleting. An external CLI delete/recreate does not take that lock
+and remains outside the guarantee.
 
-The Docker branch is prepared to use the immutable 64-hex ID returned by
-`docker run`, but this checkout does not yet accept that ID in
-`reaper.register`; it accepts only Apple-style names. The normal Docker
-`run --detach` path therefore cannot register that ID with the reaper on
-this base. If a backend returns no parseable ID, `Run` falls back to the
-name-and-generation path. Issue #73 must be stacked for the Docker-ID
-registration path to work. After #73, Docker entries use the immutable ID
-and `docker rm --force`; normal Docker `Terminate` and rollback handles can
-use the ID independently.
+Docker ID entries are deleted by ID without a name lookup. If a backend
+returns no parseable ID, the name-and-generation path remains the deletion
+target.
 
-**Reaper staging exposure**: the current reaper stages full `inspect`
-output in an un-namespaced `mktemp` file and removes it on its ordinary
-completion or inspect-error paths. If the reaper is killed, a file
-containing environment data can remain. Before cleanup, stop container-go
-and reaper processes, then use a metadata-only listing of regular files
-owned by the user in the effective `TMPDIR`, restricted to the affected
-time window. Do not print or grep file contents, follow symlinks, or run a
-broad recursive delete. Remove only files positively tied to the affected
-run, and rotate credentials that may have appeared in inspect output
-(#111). This is not a no-leak guarantee.
+**Reaper staging exposure (legacy)**: the current reaper projects inspect
+output through a structural field filter and does not write raw JSON to
+disk. Versions before that change used an un-namespaced `mktemp` file;
+a reaper killed during inspect could therefore leave a file containing
+environment data. Those names are not safely attributable to this library.
+Before cleanup, stop container-go and reaper processes, then use a
+metadata-only listing of regular files owned by the user in the effective
+`TMPDIR`, restricted to the affected time window. Do not print or grep file
+contents, follow symlinks, or run a broad recursive delete. Remove only
+files positively tied to the affected run, and rotate credentials that may
+have appeared in inspect output. The current reaper does not create these
+files, but old installations are not covered by a no-leak guarantee.
 
 **Session labels**: every created container carries
 
@@ -796,12 +774,10 @@ run, and rotate credentials that may have appeared in inspect output
 The Apple CLI has no label filter, so orphan sweeps filter
 `container ls -a --format json` client-side. `Prune(ctx)` removes the
 containers selected by the active backend's managed filter. Apple selects
-the stopped state. The current Docker filter selects the exited state
-only, so Docker dead-state containers remain until #113 is applied;
-running and created containers are not selected. On Apple, each
-candidate is re-inspected and re-verified (generation, session,
-managed/reuse/group labels, stopped state) under the stable per-name lock
-before deletion.
+the stopped state. Docker selects the exited and dead states; running and
+created containers are not selected. On Apple, each candidate is
+re-inspected and re-verified (generation, session, managed/reuse/group
+labels, stopped state) under the stable per-name lock before deletion.
 
 Setting `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
 automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper
@@ -850,46 +826,43 @@ A loopback binding inspected on a remote daemon fails with
 container by design; callers needing isolation should use distinct
 names or reset state via `Exec`.
 
-Each creation by this checkout normally carries a `creationLabel`
-(16-hex). The current reuse path is narrower than that label suggests:
-`checkReuseOwned` requires the reuse marker and a compatible image, but
-does not require the managed or creation label. A stopped container with
-an empty inspected generation can therefore reach a name-based delete
-path. `Terminate` performs a fresh generation check only when its handle
-has a non-empty generation; an empty-generation handle takes the legacy
-name-delete path. `reuseRun` also does not re-inspect after its readiness
-strategy returns, so a replacement can occur during the wait. Issues #83
-and #84 track the ownership checks and final generation verification.
+Each creation carries a `creationLabel` (16-hex). Reuse requires the
+managed marker, the `WithReuse` marker, a valid creation generation, and
+(on Docker) a valid immutable UID before it adopts or recycles an existing
+container. A stopped container with an empty or invalid generation is
+rejected rather than reaching a name-based delete. `Terminate` also
+requires a valid generation for Apple name deletion and a valid immutable
+UID for Docker. `reuseRun` re-inspects the container by its immutable
+identity after the readiness strategy returns and re-runs the ownership
+and compatibility checks, so a replacement during the wait is not adopted.
 `CONTAINERGO_KEEP=1` does not change these reuse rules: a matching stopped
 reuse container can still be deleted and recreated, and
 `PruneReuseGroup` can still remove the group.
 
-For a handle with a valid non-empty generation, the Apple path checks a
-fresh inspect and runs inspect plus delete under a per-name `flock` in the
-temp directory (`containergo-<name>.lock`). That protects the ordinary
+For Apple, inspect plus delete runs under a per-name `flock` in the temp
+directory (`containergo-<name>.lock`). That protects the ordinary
 generation-checked `Terminate` and failed-create cleanup paths from
-cooperating library processes on the same host. That same per-name lock
-covers Apple `Prune` and `PruneReuseGroup` candidate deletion. The external
-reaper does not take this lock on the current checkout, which is a separate
-cleanup limitation. An external
-`container delete` plus re-create in the same window also remains outside
-the guarantee. A Docker handle that retains the immutable `Id` printed by
-`docker run` deletes by that ID, so a same-name replacement does not share
-the deletion target. An `Id` recovered through inspect depends on target
-validation, which the current Docker parser does not perform (#103).
-Other Docker operations on the current base still address the logical
-name; #74 tracks using the immutable ID for those operations as well.
-These are different protections; the current base does not make reuse a
-general fail-closed guarantee. The watchdog reaper registers Apple
-containers by name and generation, reads the label as a line-anchored
-JSON field (`"key": "value"`, never a substring), and skips deletion on
-mismatch. The current base does not register Docker's immutable ID with
-the reaper; issue #73 is required before Docker reaper entries can use
-`Id`. Each backend call carries a 10-30s timeout via POSIX `sleep`/`kill`
-(no `timeout(1)` dependency) so one hung daemon call cannot wedge the
-rest. The leader's own pull/create uses an independent `runTimeout`
-budget; `reuseAttachTimeout` bounds only attach polling for another
-process's container.
+cooperating library processes on the same host, and the same per-name lock
+covers Apple `Prune` and `PruneReuseGroup` candidate deletion. The reaper
+uses the same lock for name-addressed entries. An external `container
+delete` plus re-create in the same window remains outside the guarantee.
+A Docker handle deletes by the immutable `Id` printed by `docker run` or
+verified by inspect, so a same-name replacement does not share the
+deletion target. Every Docker backend operation on the handle uses that
+immutable ID; the inspect parser matches the requested ID or name and
+rejects a mismatched object. These are different protections, but reuse
+is not a general fail-closed guarantee against an untrusted process that
+uses the backend CLI directly.
+
+The watchdog reaper registers name-addressed containers by name and
+generation, reads the label as a line-anchored JSON field
+(`"key": "value"`, never a substring), and skips deletion on mismatch.
+Docker's immutable ID is registered as an additional ID entry and does not
+need a name lookup. Each backend call carries a 10-30s timeout via POSIX
+`sleep`/`kill` (no `timeout(1)` dependency) so one hung daemon call cannot
+wedge the rest. The leader's own pull/create uses an independent
+`runTimeout` budget; `reuseAttachTimeout` bounds only attach polling for
+another process's container.
 
 The pull flight collapses *concurrent* callers only: an entry is removed
 when it completes, so a `Run` that happens after the previous one has
@@ -909,8 +882,9 @@ absent, so a cached answer must not stand in for the check.
 ## Security design
 
 As a library that spawns subprocesses, these rules describe the intended
-security boundary. The reaper staging exception in #111 means that
-"no information leak" is not a current end-to-end guarantee.
+security boundary. The current reaper streams inspect output through a
+structural filter and does not stage raw JSON; legacy staging files from
+older versions are covered by the cleanup note below.
 
 **No shell involvement**. Every CLI call passes an argv array to
 `exec.Command`; no shell string is ever assembled. The single
@@ -1059,9 +1033,8 @@ Docker's daemon assigns published ports atomically.
 `LogsWithOptions` call finish a finite CLI snapshot, but `Logs` can buffer
 all available output. `LogsOptions{Tail, Since}` is backend-specific:
 Docker accepts both options, while the checked Apple Container CLI
-versions use `-n` for Tail and have no Since option. The current checkout
-still sends Docker
-flag spellings to Apple, so the option contract is pending #82. Neither
+versions use `-n` for Tail and have no Since option. The Apple backend maps
+Tail to `-n` and rejects Since with `ErrUnsupportedCapability`. Neither
 option adds a byte cap; `LogsOptions.MaxBytes`, `WithExecMaxBytes`,
 `ExecTo`, and `LogsTo` provide a prefix cap or a caller-owned sink, and
 bounded captures report truncation through `Truncated` and
@@ -1110,20 +1083,14 @@ through the retained process handle. Descendant cleanup is not claimed.
 
 ## Error handling
 
-Root and backend errors are intended to be discriminable with
-`errors.Is`/`errors.As`, but the current checkout has additional limits:
-`Classify` formats the original CLI error into the `ErrSystemNotRunning`
-wrapper as text rather than retaining it as an unwrap target (#104). A
-successful inspect response with no matching target may return a generic
-error instead of `ErrContainerNotFound` (#103). For Docker, this includes
-empty or malformed inspect data, and the current parser does not verify
-that a returned object matches the requested ID or name; a valid but
-mismatched object is not a reliable no-match signal. The built-in wait
-strategies also do not preserve context errors uniformly in every
-timeout/cancellation path (#92). Some primitive timeout errors and
-`ForLog` cancellations are string-only, while composite strategies may
-retain a context error. Do not assume one error-chain contract until
-these follow-up issues are applied.
+Root and backend errors are discriminable with `errors.Is`/`errors.As`.
+`Classify` keeps the original CLI error and probe error in the
+`ErrSystemNotRunning` chain. A successful inspect response with no matching
+target returns `ErrContainerNotFound`; for Docker, empty output is also a
+not-found result, malformed output is a decode error, and a valid but
+mismatched object is rejected because the parser matches the requested ID
+or name. Built-in wait strategies preserve context errors for their timeout
+and cancellation paths.
 
 - `ErrSystemNotRunning`: after a CLI failure, the backend-specific
   liveness probe reports that the Apple Container service or Docker
@@ -1131,11 +1098,9 @@ these follow-up issues are applied.
   in the error chain; permission, configuration, and caller
   cancellation failures are not relabeled.
 - `ErrContainerNotFound`: a classified CLI-reported missing-container
-  failure. A successful inspect response with no matching target is not
-  guaranteed to produce this sentinel and may return a generic error
-  (#103). For Docker, empty or malformed inspect data can take that
-  generic path, while a valid but mismatched object is not rejected as a
-  no-match by the current parser.
+  failure, or an inspect response that contains no entry matching the
+  requested ID or name. Malformed inspect output is a decode error rather
+  than this sentinel.
 - `ErrImageNotFound`: the Docker `PullNever` precheck found no local
   image.
 - `ErrPullNeverUnsupported`: the backend (Apple Container) cannot honor
@@ -1144,15 +1109,14 @@ these follow-up issues are applied.
 - `ErrPortNotExposed`: a port was neither declared nor published, or
   the declared port had no usable host binding.
 - `ErrGenerationReplaced`: a delete-time generation check found a
-  same-name replacement. The current reuse path does not perform the
-  final post-readiness check tracked by #83 and #84.
+  same-name replacement. Reuse re-inspects after readiness and rejects a
+  replacement rather than returning the handle.
 - `*CLIError`: a backend CLI exited non-zero. It carries the binary,
   arguments, exit code, and stderr (the diagnostic stderr copy is
   capped at 64KiB). The root `CLIError` alias is a current-development
   addition and is not part of `v0.2.0`.
 - `ErrContainerNotFound` and `ErrGenerationReplaced` are also
   current-development additions.
-- `ErrContainerNotFound`: not-found from inspect and friends
 - `ErrOutputDelivery`: a caller-owned output sink rejected CLI output;
   the original writer error remains in the chain
 - `ErrImageIdentityUnavailable`: a successful image inspect returned no
@@ -1163,8 +1127,6 @@ these follow-up issues are applied.
   not let `container run` perform an implicit fetch
 - `ErrImageIdentityMismatch`: inspect returned an identity for a
   different image; the mutable-tag fallback is not used
-- `ErrPortNotExposed`: a port was not declared or has no usable host
-  binding
 - `ErrEnvFileUnsupported`: a non-empty environment map needs a secure env
   file, but the current platform cannot provide per-user secrecy
 - `ErrCopyFileNotRegular`: a Docker copy-out destination is not a regular
@@ -1177,9 +1139,6 @@ these follow-up issues are applied.
   combination rejected before creation
 - `ErrEndpointUnreachable`: an inspected binding, notably remote-daemon
   loopback, cannot be reached by the client
-- `*CLIError`: any other CLI failure; carries the subcommand, exit
-  code, and bounded stderr diagnostic (capped at 64KiB). Classification
-  also inspects bounded stdout internally for liveness probes.
 - `*ExecTerminationError` / `ErrExecTerminationUnsupported`: context
   expiry or cancellation terminated the local CLI, regardless of any
   reported local exit status; the backend-side exec process may still be
@@ -1258,35 +1217,27 @@ paired blocks after removing comments, parses the `go` blocks, and compiles
 them in a temporary module with a quoted local `replace` to this checkout.
 The `text` signature inventories are intentionally not executable.
 
-**Integration tests** use the `integration` build tag. The root suite
-contains Apple Container and Docker lifecycle, connection, exec, copy,
-cleanup, reuse, and watchdog cases. Each backend-specific helper checks
-its CLI/service first and skips cleanly when it is unavailable.
-`make integration` runs both backends and skips the pull-heavy bench
-and single-flight scenarios; `make integration-docker` selects Docker;
-`make bench-integration` runs the pull-heavy scenarios and the separate
-benchmark module (the nested `bench/` module requires Go 1.26+).
+**Integration tests** use the `integration` build tag and run against real
+backends. The root suite contains Apple Container and Docker lifecycle,
+connection, exec, copy, cleanup, reuse, and watchdog cases. Apple tests
+require macOS 26 with Apple Container running; Docker tests require a
+running Docker daemon. Each backend-specific helper checks its CLI/service
+first and skips cleanly when it is unavailable. The Apple watchdog test is
+Darwin-only, and Windows runtime integration is not run by the repository's
+Linux-only CI jobs; Windows copy-out must be verified manually with Go 1.26+
+and Docker client/server 29.7.0+. `make integration` runs both backends and
+skips the pull-heavy bench and single-flight scenarios;
+`make integration-docker` selects Docker; `make bench-integration` runs the
+pull-heavy scenarios and the separate benchmark module (the nested `bench/`
+module requires Go 1.26+).
 
-**CI**: `.github/workflows/ci.yml` runs unit tests and race tests on
-`ubuntu-latest` with Go 1.26.0 and the stable Go release, plus lint and
-`govulncheck`. It also runs the Docker integration matrix on
-`ubuntu-latest`. Apple Container integration is intentionally local:
-the hosted Linux runners do not provide the Apple Container service or
-the required host environment. `CONTAINERGO_BACKEND=apple` or
-`CONTAINERGO_BACKEND=docker` can select one backend locally.
-**Integration tests**: split off behind the `integration` build tag
-and run against real backends. Apple tests require macOS 26 with Apple
-Container up; Docker tests require a running Docker daemon. The Apple
-watchdog test is Darwin-only, and Windows runtime integration is not run
-by the repository's Linux-only CI jobs. They check backend availability
-first and skip when the daemon or service is down. They cover startup,
-connection, exec, copy, normal cleanup, and the Darwin watchdog. Windows
-copy-out must be verified manually with Go 1.26+ and Docker client/server
-29.7.0+.
-
-**CI**: unit, race, vet, lint, and Docker integration jobs run on Ubuntu;
-Apple integration remains local because its service and host requirements
-are not available in those runners. No Windows runtime job is configured.
+**CI**: `.github/workflows/ci.yml` runs unit and race tests on
+`ubuntu-latest` with Go 1.26.0 and the stable Go release, plus lint,
+`govulncheck`, and the Docker integration matrix. Apple Container
+integration remains local because its service and host requirements are
+not available in those runners. No Windows runtime job is configured.
+`CONTAINERGO_BACKEND=apple` or `CONTAINERGO_BACKEND=docker` can select one
+backend locally.
 
 ## Backends (v0.2 and current development)
 
@@ -1333,23 +1284,6 @@ public `Pull` helper applies the same platform and capability validation.
 
 **Endpoint differences**: Docker Desktop (macOS / Windows) does not
 route to container IPs from the host, so the Docker backend defaults
-to the published-port model testcontainers uses. Ports declared via
-`WithExposedPorts` are automatically published to random ports:
-locally `-p 127.0.0.1::<port>`, on a detected non-loopback
-`DOCKER_HOST=tcp://...` daemon `-p 0.0.0.0::<port>` so the client can
-reach it; `Host` returns `127.0.0.1` (or the host from a `tcp://`
-`DOCKER_HOST`) and `MappedPort` the assigned host port. Loopback and
-unspecified binds are rewritten to `defaultHost()`, so a `127.0.0.1`
-binding observed on that detected remote daemon still resolves to the
-remote host. An explicit `WithPublishedPort` loopback bind on that
-detected remote daemon is rejected by `Run`: Docker would listen on the
-remote machine's loopback, which no client-side rewrite can reach.
-stopping / unknown), labels, immutable identity, image, container IP,
-Docker network mode, and host-side port bindings (container port →
-host address and port).
-
-**Endpoint differences**: Docker Desktop (macOS / Windows) does not
-route to container IPs from the host, so the Docker backend defaults
 to the published-port model testcontainers uses.
 Ports declared via `WithExposedPorts` are automatically published to
 random ports: locally `-p 127.0.0.1::<port>`, on a remote daemon
@@ -1359,17 +1293,18 @@ random ports: locally `-p 127.0.0.1::<port>`, on a remote daemon
 — while `unix://`, `npipe://`, loopback addresses, and an
 empty value stay local. Docker CLI client protocols are `unix`,
 `tcp`, `npipe`, and `ssh`; other schemes are not usable
-`DOCKER_HOST` endpoints. `Host` returns `127.0.0.1` (or the remote
-hostname) and `MappedPort` the assigned host port.
-Unspecified binds resolve through loopback while preserving IPv4/IPv6
-family; explicit IPv6 addresses are canonicalized through `netip`.
-For `ssh://` that hostname must be directly dialable; the CLI's SSH
-session carries only the Docker API, so an alias behind a ProxyJump or
-bastion needs a manual `ssh -L` forward.
-An explicit or reused loopback binding on a remote daemon is rejected:
-it listens on the remote machine's loopback, which no client-side
-Both `DOCKER_HOST` and Docker contexts (active or explicitly configured)
-are resolved for remote daemons.
+`DOCKER_HOST` endpoints. Both `DOCKER_HOST` and Docker contexts (active or
+explicitly configured) are resolved for remote daemons. `Host` returns
+`127.0.0.1` (or the remote hostname) and `MappedPort` the assigned host
+port. Unspecified binds resolve through loopback while preserving
+IPv4/IPv6 family; explicit IPv6 addresses are canonicalized through
+`netip`. For `ssh://` that hostname must be directly dialable; the CLI's
+SSH session carries only the Docker API, so an alias behind a ProxyJump
+or bastion needs a manual `ssh -L` forward. An explicit `WithPublishedPort`
+loopback bind on a remote daemon is rejected by `Run`, since Docker would
+listen on the remote machine's loopback. An existing loopback binding
+inspected on a remote daemon fails closed with `ErrEndpointUnreachable`
+instead of being rewritten to an unreachable host.
 The daemon assigns ports atomically at start, so the free-port race
 avoided on Apple Container does not reappear.
 The Apple backend's direct-IP default is unchanged.
@@ -1395,12 +1330,9 @@ Docker).
   to an existing named network, but the library does not create networks.
 - Volume creation and lifecycle management. `WithMounts` can use bind,
   named-volume, or tmpfs mounts, but their lifecycle belongs to the
-  caller. Current bind-source validation is Unix-style; Windows and
-  remote Docker bind-source semantics are pending #76.
-- Dockerfile builds via `container build` / `docker build`
-- Network creation and management (`WithNetwork` can attach an existing
-  Docker network)
-- Volume creation and management
+  caller. A bind mount against a remote Docker daemon is rejected with
+  `ErrUnsupportedCapability`; Windows host paths are accepted for a local
+  Docker daemon.
 - High-level packages equivalent to testcontainers modules (postgres
   and the like; revisit once the core is stable).
 - A direct Docker Engine API client. The CLI wrapper is the current
@@ -1413,12 +1345,11 @@ These are deliberately recorded rather than implied by the current API:
 
 - **Apple name-based deletion**: a non-empty, matching creation-generation
   check and per-name `flock` protect the generation-checked
-  `Terminate`/failed-create paths, as well as `Prune` and `PruneReuseGroup`,
-  on one host. The external reaper does not take that lock, and the current
-  base cannot distinguish an external CLI delete/recreate in the same window.
-  Issues #83 and #84 track the ownership and final-verification gaps;
-  closing the external race requires an immutable identity or an atomic
-  conditional delete from the backend.
+  `Terminate`/failed-create paths, `Prune`, `PruneReuseGroup`, and reaper
+  entries that address a name, on one host. The current base cannot
+  distinguish an external CLI delete/recreate in the same window; closing
+  that race requires an immutable identity or an atomic conditional delete
+  from the backend.
 - **Remote Docker detection**: remote endpoints are resolved from
   both `DOCKER_HOST` and Docker contexts (supporting `tcp://` and `ssh://` transports).
 - **Reuse compatibility**: image is checked on both backends. Docker
@@ -1431,30 +1362,19 @@ These are deliberately recorded rather than implied by the current API:
 - **Logger injection**: no public logger hook exists. Adding one would
   require a separate API and a decision about what command data may be
   exposed.
-- **Windows and remote bind mounts**: current validation is Unix-style and
-  does not establish that a remote Docker daemon can resolve a client
-  host path; #76 tracks the required capability boundary.
+- **Remote bind mounts**: a bind mount against a remote Docker daemon is
+  rejected because the daemon resolves the source on its own host. Whether
+  to support remote bind mounts is unresolved; Windows host paths are
+  accepted for a local Docker daemon.
 - **UDP readiness**: `ForListeningPort` and `ForExposedPort` are TCP-only,
-  while UDP can be declared for endpoint configuration; #77 tracks
-  fail-fast protocol validation.
-- **Stop timeout units**: current conversion truncates fractions and does
-  not validate negative, overflow, or backend limits; #89 tracks the
-  public contract.
-- **Wait error chains**: built-in strategies do not uniformly preserve
-  context errors; #92 tracks normalization.
-- **Public option validation**: negative log tails, zero memory, unknown
-  mount types, and reuse-group grammar are not uniformly rejected; #102
-  tracks typed validation.
-- **Reaper staging**: the current reaper can leave environment-bearing
-  inspect output on disk after abnormal termination; #111 tracks cleanup
-  and exposure mitigation.
-- **Reaper registration**: registration is best-effort and currently
-  accepts only Apple-style names. Docker's full ID requires the #73
-  prerequisite before it can be registered. A registration failure is
-  ignored and normal cleanup remains the fallback.
-- **`ForLog.WithPollInterval`**: the current setter has no effect because
-  log readiness is stream-based. Whether to remove it or give it
-  different semantics is unresolved.
+  and UDP declarations are endpoint configuration only. Whether to add UDP
+  probing is unresolved.
+- **Stop timeout precision**: the public option accepts a duration but both
+  backends take whole seconds, so positive sub-second values are rounded up
+  and backend limits are enforced. Whether to preserve sub-second precision
+  is unresolved.
+- **Reaper registration**: registration is best-effort. A registration
+  failure is ignored and normal cleanup remains the fallback.
 - **Direct Docker Engine API**: the current benchmark decision defers
   it; revisit only if CLI latency or another requirement crosses the
   agreed threshold.

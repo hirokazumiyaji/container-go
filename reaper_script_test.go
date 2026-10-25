@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,12 +77,20 @@ func dockerID(prefix byte) string {
 // waits for it, exactly as the spawned /bin/sh child would be driven.
 func runReaperScript(t *testing.T, binary, subcommand, key string, entries []string, env ...string) (string, error) {
 	t.Helper()
+	return runReaperScriptWithTimeout(t, binary, subcommand, key, 30, entries, env...)
+}
+
+// runReaperScriptWithTimeout is runReaperScript with an explicit
+// per-entry backend timeout. The script arms one `sleep <timeout>` timer
+// per entry, so the timeout argument also determines the timer's argv.
+func runReaperScriptWithTimeout(t *testing.T, binary, subcommand, key string, timeoutSeconds int, entries []string, env ...string) (string, error) {
+	t.Helper()
 	requirePOSIXShell(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", reaperScript, "containergo-reaper",
-		binary, subcommand, breQuote(key), "30", "1")
+		binary, subcommand, breQuote(key), strconv.Itoa(timeoutSeconds), "1")
 	cmd.Stdin = strings.NewReader(strings.Join(entries, "\n") + "\n")
 	cmd.Env = append(os.Environ(), env...)
 	out, err := cmd.CombinedOutput()
@@ -179,39 +188,49 @@ func TestReaperScriptLeavesNoSleepBehind(t *testing.T) {
 		entries = append(entries, dockerID(byte('a'+i)))
 	}
 
+	// A per-entry timeout no other test uses. The reaper's timer is
+	// exactly `sleep <timeout>`, so `ps -o args=` reports "sleep 37"
+	// only for timers this test armed. That identifier stays stable
+	// even while unrelated host tools arm sub-second sleeps: those have
+	// different argv and never match. A real orphan leak still adds one
+	// matching process per entry.
+	const timeoutSeconds = 37
+	sleepArg := "sleep " + strconv.Itoa(timeoutSeconds)
+
 	// A reap with an entry list twice over: the second pass proves the
 	// count is not drifting upward with each completed call.
 	for pass := range 2 {
-		before := countSleepProcesses(t)
-		if _, err := runReaperScript(t, probe.script(), "rm", creationLabel, entries); err != nil {
+		before := countSleepProcesses(t, sleepArg)
+		if _, err := runReaperScriptWithTimeout(t, probe.script(), "rm", creationLabel, timeoutSeconds, entries); err != nil {
 			t.Fatalf("pass %d: reaper script: %v", pass, err)
 		}
-		// The old sleeps were 30s; give the count a moment to settle.
+		// An orphan outlives the reaper; give the process table a moment
+		// to settle before counting.
 		time.Sleep(300 * time.Millisecond)
-		after := countSleepProcesses(t)
-		// Allow a few unrelated host sleeps (other package tests may arm
-		// short sleeps while this oracle runs). A per-entry leak would
-		// still raise the count by roughly len(entries).
-		if after > before+3 {
-			t.Fatalf("pass %d: sleep processes went %d -> %d; the timeout left orphan helpers behind",
+		after := countSleepProcesses(t, sleepArg)
+		// Any increase is a leak: only this test asks for a 37s timer,
+		// so no unrelated process can match the argv.
+		if after > before {
+			t.Fatalf("pass %d: reaper-owned sleep processes went %d -> %d; the timeout left orphan helpers behind",
 				pass, before, after)
 		}
 	}
 }
 
-// countSleepProcesses counts live `sleep` processes on the host. The
-// oracle is deliberately about the system rather than about the script's
-// internals, because the defect being pinned is an orphan process, not
-// a return value.
-func countSleepProcesses(t *testing.T) int {
+// countSleepProcesses counts live processes whose argument list is
+// exactly sleepArg, for example "sleep 37". Scoping the oracle to argv
+// rather than every `sleep` on the host keeps unrelated workloads (some
+// tools arm `sleep 0.05` continuously) out of the count while still
+// seeing a leaked reaper timer.
+func countSleepProcesses(t *testing.T, sleepArg string) int {
 	t.Helper()
-	out, err := exec.Command("ps", "-o", "comm=", "-ax").Output()
+	out, err := exec.Command("ps", "-o", "args=", "-ax").Output()
 	if err != nil {
 		t.Skipf("ps failed: %v", err)
 	}
 	n := 0
 	for _, line := range strings.Split(string(out), "\n") {
-		if strings.TrimSpace(line) == "sleep" {
+		if strings.TrimSpace(line) == sleepArg {
 			n++
 		}
 	}

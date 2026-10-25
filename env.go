@@ -338,7 +338,7 @@ func writeEnvFileAtWithRootContextRunner(ctx context.Context, base string, env m
 			// was canceled. Cleanup is a separate safety obligation, so
 			// detach cancellation while retaining the bounded retry budget.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(operationCtx), envCleanupDeferredTimeout)
-			cleanupErr := cleanupEnvFileAtWithRetryContextBound(cleanupCtx, base, dir)
+			cleanupErr := retryEnvFileCleanupAt(cleanupCtx, dir, envFileCleanupOptions{base: base})
 			cancel()
 			if cleanupErr != nil {
 				return path, dir, errors.Join(err, cleanupErr)
@@ -705,54 +705,38 @@ func lockCleanupEnv(ctx context.Context) error {
 	}
 }
 
+// envFileCleanupOptions describes one cleanup attempt. The zero value is the
+// production policy: derive the root from retained ownership, remove only the
+// exact children bound to the recorded directory identity, and close the
+// writer lock with closeEnvFileLock. Tests override removeAll and closeLock to
+// inject failures into that path.
+type envFileCleanupOptions struct {
+	base      string
+	removeAll func(string) error
+	closeLock func(*os.File) error
+}
+
 // cleanupEnvFile releases the writer lock and removes the complete private
 // directory. It is idempotent while ownership state is retained. Removal and
 // lock-close failures are returned; callers also retain the directory for a
 // deferred retry.
 func cleanupEnvFile(dir string) error {
-	return cleanupEnvFileContext(context.Background(), dir)
+	return cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{})
 }
 
-func cleanupEnvFileContext(ctx context.Context, dir string) error {
-	return cleanupEnvFileAtWithCloseContextBound(ctx, "", dir, removeExpectedEnvChildren, closeEnvFileLock)
-}
-
-func cleanupEnvFileAt(base, dir string, removeAll func(string) error) error {
-	return cleanupEnvFileAtContext(context.Background(), base, dir, removeAll)
-}
-
-func cleanupEnvFileAtContext(ctx context.Context, base, dir string, removeAll func(string) error) error {
-	return cleanupEnvFileAtWithCloseContext(ctx, base, dir, removeAll, closeEnvFileLock)
-}
-
-func cleanupEnvFileAtContextBound(ctx context.Context, base, dir string) error {
-	return cleanupEnvFileAtWithCloseContextBound(ctx, base, dir, removeExpectedEnvChildren, closeEnvFileLock)
-}
-
-func cleanupEnvFileAtWithClose(base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
-	return cleanupEnvFileAtWithCloseContext(context.Background(), base, dir, removeAll, closeLock)
-}
-
-func cleanupEnvFileAtWithCloseContext(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
-	return cleanupEnvFileAtWithCloseContextMode(ctx, base, dir, removeAll, closeLock, false)
-}
-
-func cleanupEnvFileAtWithCloseContextBound(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error) error {
-	return cleanupEnvFileAtWithCloseContextMode(ctx, base, dir, removeAll, closeLock, true)
-}
-
-func cleanupEnvFileAtWithCloseContextMode(ctx context.Context, base, dir string, removeAll func(string) error, closeLock func(*os.File) error, bindDirInfo bool) error {
+// cleanupEnvFileAt performs one cleanup attempt with the supplied options.
+func cleanupEnvFileAt(ctx context.Context, dir string, opts envFileCleanupOptions) error {
 	if dir == "" {
 		return nil
 	}
+	base := opts.base
+	removeAll := opts.removeAll
+	closeLock := opts.closeLock
+	if closeLock == nil {
+		closeLock = closeEnvFileLock
+	}
 	ctx, cancel := boundedEnvContext(ctx)
 	defer cancel()
-	if removeAll == nil {
-		return errors.New("environment cleanup: nil remove function")
-	}
-	if closeLock == nil {
-		return errors.New("environment cleanup: nil lock close function")
-	}
 
 	// A state transition is part of cleanup, not a best-effort afterthought:
 	// once a directory has been renamed to a tombstone, a late root-lock or
@@ -963,7 +947,7 @@ func cleanupEnvFileAtWithCloseContextMode(ctx context.Context, base, dir string,
 		}
 
 		removeStarted = true
-		if bindDirInfo {
+		if removeAll == nil {
 			if state.dirInfo == nil {
 				return fmt.Errorf("%w: environment directory %q has no validated identity for removal", errUnsafeEnvFile, dir)
 			}
@@ -1070,16 +1054,20 @@ func cleanupEnvFileAtWithCloseContextMode(ctx context.Context, base, dir string,
 func cleanupEnvFileWithRetry(dir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), envCleanupDeferredTimeout)
 	defer cancel()
-	return cleanupEnvFileWithRetryContext(ctx, "", dir)
+	return retryEnvFileCleanupAt(ctx, dir, envFileCleanupOptions{})
 }
 
 func cleanupEnvFileAfterUseContext(ctx context.Context, dir string) error {
 	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), envCleanupDeferredTimeout)
 	defer cancel()
-	return cleanupEnvFileWithRetryContext(cleanupCtx, "", dir)
+	return retryEnvFileCleanupAt(cleanupCtx, dir, envFileCleanupOptions{})
 }
 
-func cleanupEnvFileWithRetryContext(ctx context.Context, base, dir string) error {
+// retryEnvFileCleanupAt retries cleanupEnvFileAt within ctx. Cleanup is a
+// safety obligation, not ordinary caller work. Keep the caller's
+// cancellation/deadline for the foreground attempt, while the deferred or
+// background caller supplies a detached bounded context.
+func retryEnvFileCleanupAt(ctx context.Context, dir string, opts envFileCleanupOptions) error {
 	if dir == "" {
 		return nil
 	}
@@ -1088,25 +1076,6 @@ func cleanupEnvFileWithRetryContext(ctx context.Context, base, dir string) error
 			return err
 		}
 	}
-	return cleanupEnvFileAtWithRetryContextBound(ctx, base, dir)
-}
-
-func cleanupEnvFileAtWithRetryContextBound(ctx context.Context, base, dir string) error {
-	return cleanupEnvFileAtWithRetryContextMode(ctx, base, dir, removeExpectedEnvChildren, true)
-}
-
-//nolint:unused
-func cleanupEnvFileAtWithRetryContext(ctx context.Context, base, dir string, removeAll func(string) error) error {
-	return cleanupEnvFileAtWithRetryContextMode(ctx, base, dir, removeAll, false)
-}
-
-func cleanupEnvFileAtWithRetryContextMode(ctx context.Context, base, dir string, removeAll func(string) error, bindDirInfo bool) error {
-	if dir == "" {
-		return nil
-	}
-	// Cleanup is a safety obligation, not ordinary caller work. Keep the
-	// caller's cancellation/deadline for the foreground attempt, while the
-	// deferred/background retry supplies a detached bounded context.
 	retryCtx, cancel := context.WithTimeout(ctx, envCleanupBackgroundTimeout)
 	defer cancel()
 	var errs []error
@@ -1115,12 +1084,7 @@ func cleanupEnvFileAtWithRetryContextMode(ctx context.Context, base, dir string,
 		attempts = 1
 	}
 	for attempt := 0; attempt < attempts; attempt++ {
-		var err error
-		if bindDirInfo {
-			err = cleanupEnvFileAtContextBound(retryCtx, base, dir)
-		} else {
-			err = cleanupEnvFileAtContext(retryCtx, base, dir, removeAll)
-		}
+		err := cleanupEnvFileAt(retryCtx, dir, opts)
 		if err == nil {
 			return nil
 		}
@@ -1144,21 +1108,11 @@ func cleanupEnvFileAtWithRetryContextMode(ctx context.Context, base, dir string,
 	return errors.Join(errs...)
 }
 
-//nolint:unused
-func retryEnvFileCleanup(dir *string) {
-	_ = retryEnvFileCleanupWithError(dir)
-}
-
 func retryEnvFileCleanupWithError(dir *string) error {
 	if dir == nil || *dir == "" {
 		return nil
 	}
 	value := *dir
-	if hook := envCleanupBeforeAttemptHook; hook != nil {
-		if err := hook(value); err != nil {
-			return err
-		}
-	}
 	base := ""
 	if state := loadEnvCleanupState(value); state != nil {
 		state.mu.Lock()
@@ -1168,7 +1122,7 @@ func retryEnvFileCleanupWithError(dir *string) error {
 		state.mu.Unlock()
 	}
 	retryCtx, cancel := context.WithTimeout(context.Background(), envCleanupDeferredTimeout)
-	err := cleanupEnvFileAtWithRetryContextBound(retryCtx, base, value)
+	err := retryEnvFileCleanupAt(retryCtx, value, envFileCleanupOptions{base: base})
 	cancel()
 	if err == nil {
 		*dir = ""
@@ -1227,12 +1181,7 @@ func scheduleEnvCleanupRetry(dir string) {
 			if _, err := os.Lstat(current); errors.Is(err, os.ErrNotExist) {
 				return
 			}
-			var err error
-			if base == "" {
-				err = cleanupEnvFileContext(ctx, dir)
-			} else {
-				err = cleanupEnvFileAtContextBound(ctx, base, dir)
-			}
+			err := cleanupEnvFileAt(ctx, dir, envFileCleanupOptions{base: base})
 			if err == nil {
 				return
 			}
@@ -1282,23 +1231,6 @@ func isRetryablePendingEnvCleanupError(err error) bool {
 	return !errors.Is(err, errUnsafeEnvFile)
 }
 
-//nolint:unused
-func snapshotPendingEnvCleanups() []pendingEnvCleanup {
-	pending, _ := snapshotPendingEnvCleanupsContext(context.Background())
-	return pending
-}
-
-//nolint:unused
-func snapshotPendingEnvCleanupsContext(ctx context.Context) ([]pendingEnvCleanup, error) {
-	ctx, cancel := boundedEnvContext(ctx)
-	defer cancel()
-	if err := lockCleanupEnv(ctx); err != nil {
-		return nil, err
-	}
-	defer cleanupEnvMu.Unlock()
-	return snapshotPendingEnvCleanupsLocked(), nil
-}
-
 func snapshotPendingEnvCleanupsLocked() []pendingEnvCleanup {
 	seen := map[*activeEnvFile]struct{}{}
 	var pending []pendingEnvCleanup
@@ -1339,12 +1271,7 @@ func drainPendingEnvCleanupsContext(ctx context.Context, pending []pendingEnvCle
 			errs = append(errs, err)
 			break
 		}
-		var err error
-		if item.base == "" {
-			err = cleanupEnvFileContext(ctx, item.dir)
-		} else {
-			err = cleanupEnvFileAtContextBound(ctx, item.base, item.dir)
-		}
+		err := cleanupEnvFileAt(ctx, item.dir, envFileCleanupOptions{base: item.base})
 		if err != nil {
 			errs = append(errs, err)
 		}
@@ -1795,14 +1722,6 @@ func rootContainsOnlyMarker(root string) (bool, error) {
 	return true, nil
 }
 
-// openOrCreateRootMarker is retained for package-local callers that do not
-// need cancellation. New filesystem operations should use the context form.
-//
-//nolint:unused
-func openOrCreateRootMarker(root, markerPath string) (*os.File, os.FileInfo, error) {
-	return openOrCreateRootMarkerContext(context.Background(), root, markerPath)
-}
-
 func openOrCreateRootMarkerContext(ctx context.Context, root, markerPath string) (*os.File, os.FileInfo, error) {
 	for attempt := 0; attempt < 64; attempt++ {
 		if err := ctx.Err(); err != nil {
@@ -1881,14 +1800,6 @@ func openOrCreateRootMarkerContext(ctx context.Context, root, markerPath string)
 		return f, info, nil
 	}
 	return nil, nil, fmt.Errorf("%w: root marker creation remained contended", errUnsafeEnvFile)
-}
-
-// createRootMarker is retained for package-local callers that do not need
-// cancellation. New initialization paths use the context form.
-//
-//nolint:unused
-func createRootMarker(path string) (*os.File, os.FileInfo, error) {
-	return createRootMarkerContext(context.Background(), path)
 }
 
 func createRootMarkerContext(ctx context.Context, path string) (*os.File, os.FileInfo, error) {
@@ -2114,13 +2025,6 @@ func trustedEnvPathComponent(info os.FileInfo) bool {
 	// without the sticky bit are not trusted.
 	return mode.Perm()&0o002 != 0 &&
 		(mode&os.ModeSticky != 0 || mode&0o1000 != 0)
-}
-
-//nolint:unused
-func cleanupEnvDirs(root string) error {
-	ctx, cancel := boundedEnvContext(context.Background())
-	defer cancel()
-	return cleanupEnvDirsContext(ctx, root)
 }
 
 func cleanupEnvDirsContext(ctx context.Context, root string) error {
@@ -2399,14 +2303,6 @@ func validatedExpectedEnvChildrenAt(dir string, expectedDirInfo os.FileInfo) (ma
 func validateExpectedEnvChildren(dir string) error {
 	_, err := validatedExpectedEnvChildren(dir)
 	return err
-}
-
-func removeExpectedEnvChildren(dir string) error {
-	return removeExpectedEnvChildrenAt(dir, nil)
-}
-
-func removeExpectedEnvChildrenAt(dir string, expectedDirInfo os.FileInfo) error {
-	return removeExpectedEnvChildrenWithChildren(dir, expectedDirInfo, nil, false)
 }
 
 func removeExpectedEnvChildrenWithChildren(dir string, expectedDirInfo os.FileInfo, expectedChildren map[string]os.FileInfo, allowMissing bool) error {

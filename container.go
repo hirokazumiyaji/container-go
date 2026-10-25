@@ -21,7 +21,6 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
-	"github.com/hirokazumiyaji/container-go/internal/ports"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -707,7 +706,7 @@ func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
 	if len(interval) > 0 && interval[0] > 0 {
 		d = interval[0]
 	}
-	return ports.RealClock{}.SleepWithContext(ctx, d)
+	return sleepWithContext(ctx, d)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before

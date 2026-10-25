@@ -309,9 +309,12 @@ func TestCleanupRetainsOwnershipAfterLateCloseError(t *testing.T) {
 		t.Fatal(err)
 	}
 	lateErr := errors.New("injected late lock close failure")
-	err = cleanupEnvFileAtWithClose(filepath.Dir(root), dir, removeExpectedEnvChildren, func(lock *os.File) error {
-		_ = closeEnvFileLock(lock)
-		return lateErr
+	err = cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{
+		base: filepath.Dir(root),
+		closeLock: func(lock *os.File) error {
+			_ = closeEnvFileLock(lock)
+			return lateErr
+		},
 	})
 	if !errors.Is(err, lateErr) {
 		t.Fatalf("cleanup error = %v, want late close error", err)
@@ -320,7 +323,7 @@ func TestCleanupRetainsOwnershipAfterLateCloseError(t *testing.T) {
 	if state == nil || !state.pending {
 		t.Fatalf("cleanup ownership was lost after late close error: %#v", state)
 	}
-	if err := cleanupEnvFileAt(filepath.Dir(root), dir, removeExpectedEnvChildren); err != nil {
+	if err := cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{base: filepath.Dir(root)}); err != nil {
 		t.Fatalf("cleanup retry after late close error: %v", err)
 	}
 	if state := loadEnvCleanupState(dir); state != nil {
@@ -336,15 +339,18 @@ func TestCleanupEnvFileReturnsRemovalFailureAndCanRetry(t *testing.T) {
 	}
 	removeFailure := errors.New("injected removal failure")
 	attempts := 0
-	err = cleanupEnvFileAt(filepath.Dir(root), dir, func(path string) error {
-		attempts++
-		if attempts == 1 {
-			if err := os.Remove(filepath.Join(path, envFileDirMarkerName)); err != nil {
-				return err
+	err = cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{
+		base: filepath.Dir(root),
+		removeAll: func(path string) error {
+			attempts++
+			if attempts == 1 {
+				if err := os.Remove(filepath.Join(path, envFileDirMarkerName)); err != nil {
+					return err
+				}
+				return removeFailure
 			}
-			return removeFailure
-		}
-		return os.RemoveAll(path)
+			return os.RemoveAll(path)
+		},
 	})
 	if !errors.Is(err, removeFailure) {
 		t.Fatalf("cleanup error = %v, want injected removal failure", err)
@@ -362,7 +368,7 @@ func TestCleanupEnvFileReturnsRemovalFailureAndCanRetry(t *testing.T) {
 
 	// cleanupEnvFileAt models the deferred retry used by Run, reuse, and
 	// Exec. A partial first RemoveAll is allowed to finish on the retry.
-	if err := cleanupEnvFileAt(filepath.Dir(root), dir, os.RemoveAll); err != nil {
+	if err := cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{base: filepath.Dir(root), removeAll: os.RemoveAll}); err != nil {
 		t.Fatalf("cleanup retry: %v", err)
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {

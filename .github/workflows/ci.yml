@@ -129,6 +129,12 @@ jobs:
         with:
           # v2.13.0 cannot decode Go 1.27 export data (version 5).
           version: v2.14.0
+      # golangci-lint's unused check stops at package boundaries and treats
+      # every reference as a use, so it cannot see a forwarding wrapper that
+      # another only-test-reachable wrapper calls. deadcode builds the call
+      # graph from main and test binaries instead; the Makefile target pins the
+      # tool through tools/go.mod and filters the documented exported API.
+      - run: make deadcode
 
   # The tagged vet runs in three places, and TestTaggedVetMatchesMakefileCommand
   # plus TestGolangciBuildTagsMatchMakefileCommand keep the copies of the tag

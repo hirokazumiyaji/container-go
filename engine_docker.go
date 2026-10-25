@@ -1629,13 +1629,17 @@ func (dockerEngine) logsFollowResumeArgs(id string, since time.Time) []string {
 	return []string{"logs", "--follow", "--since", since.UTC().Format(time.RFC3339Nano), id}
 }
 
+// logsArgsWithOptions builds the snapshot argv. --since uses the same UTC
+// RFC3339Nano spelling as logsFollowResumeArgs: a coarse timestamp would
+// replay entries from the same second that an earlier snapshot already
+// delivered, which misleads incremental readers such as ForLog counting.
 func (dockerEngine) logsArgsWithOptions(id string, opts LogsOptions) ([]string, error) {
 	args := []string{"logs"}
 	if opts.Tail > 0 {
 		args = append(args, "--tail", strconv.Itoa(opts.Tail))
 	}
 	if !opts.Since.IsZero() {
-		args = append(args, "--since", opts.Since.Format(time.RFC3339))
+		args = append(args, "--since", opts.Since.UTC().Format(time.RFC3339Nano))
 	}
 	return append(args, id), nil
 }

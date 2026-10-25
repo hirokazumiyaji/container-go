@@ -328,6 +328,8 @@ func commandPayloadStart(args []string) int {
 			"--publish": true, "-p": true, "--mount": true, "--volume": true, "--volume-driver": true, "-v": true, "--filter": true, "--filter-file": true, "-f": true,
 			"--cpus": true, "--memory": true, "--user": true, "--workdir": true, "--network": true, "--platform": true,
 			"--entrypoint": true, "--pull": true,
+			"--shm-size": true, "--cap-add": true, "--cap-drop": true, "--ulimit": true,
+			"--add-host": true, "--hostname": true,
 		}
 	case "exec":
 		consumesNext = map[string]bool{

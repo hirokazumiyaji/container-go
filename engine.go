@@ -111,6 +111,29 @@ type engineInfo struct {
 	createdAt  time.Time
 	startedAt  time.Time
 	finishedAt time.Time
+	// runOptions is the creation-time resource and security configuration
+	// the backend reported. Reuse compares it with the requested options so
+	// an existing container cannot silently differ from what the caller
+	// asked for.
+	runOptions engineRunOptions
+}
+
+// engineRunOptions is the backend-neutral subset of creation-time run options
+// that inspect can report. cpusReported and shmSizeReported distinguish a
+// backend that did not report a value from one that reported no limit. An
+// empty capability, ulimit, or extra-host list is authoritative: both
+// backends report the explicit lists they were created with.
+type engineRunOptions struct {
+	cpus            float64
+	cpusReported    bool
+	shmSizeBytes    uint64
+	shmSizeReported bool
+	privileged      bool
+	capAdd          []string
+	capDrop         []string
+	ulimits         []ulimitSpec
+	extraHosts      []extraHostSpec
+	hostname        string
 }
 
 // PortBinding describes a host-to-container port mapping.

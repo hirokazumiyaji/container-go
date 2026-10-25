@@ -82,6 +82,18 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	if cfg.pullPolicy == PullNever {
 		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
 	}
+	if cfg.privileged {
+		return fmt.Errorf("%w: apple backend does not support WithPrivileged", ErrUnsupportedCapability)
+	}
+	if len(cfg.extraHosts) > 0 {
+		return fmt.Errorf("%w: apple backend does not support WithExtraHost", ErrUnsupportedCapability)
+	}
+	if cfg.hostname != "" {
+		return fmt.Errorf("%w: apple backend does not support WithHostname", ErrUnsupportedCapability)
+	}
+	if cfg.cpus > 0 && cfg.cpus != math.Trunc(cfg.cpus) {
+		return fmt.Errorf("%w: apple backend requires a whole-number CPU count, got %s", ErrUnsupportedCapability, formatCPUs(cfg.cpus))
+	}
 	if cfg.platform != "" {
 		if err := validateApplePlatform(cfg.platform); err != nil {
 			return err
@@ -502,6 +514,23 @@ func (appleEngine) parseInspect(data []byte, id string) (*engineInfo, error) {
 			image:              image,
 			imageDigest:        imageDigest,
 			imageVariantDigest: c.Configuration.Image.VariantDigest,
+			runOptions: engineRunOptions{
+				cpus:         float64(c.Configuration.Resources.CPUS),
+				cpusReported: c.Configuration.Resources.CPUS != 0,
+				capAdd:       c.Configuration.CapAdd,
+				capDrop:      c.Configuration.CapDrop,
+			},
+		}
+		if c.Configuration.ShmSize != nil {
+			info.runOptions.shmSizeBytes = *c.Configuration.ShmSize
+			info.runOptions.shmSizeReported = true
+		}
+		for _, limit := range c.Configuration.InitProcess.Rlimits {
+			info.runOptions.ulimits = append(info.runOptions.ulimits, ulimitSpec{
+				name: appleRlimitName(limit.Limit),
+				soft: int64(limit.Soft),
+				hard: int64(limit.Hard),
+			})
 		}
 		pConfig := c.Configuration.Platform
 		platformMeta := platformMetadataFromParts(
@@ -553,6 +582,12 @@ func appleInspectTargetMatches(c inspect.Container, target string) bool {
 		return false
 	}
 	return strings.TrimPrefix(strings.TrimSpace(c.ID), "/") == target
+}
+
+// appleRlimitName maps Apple's inspected RLIMIT_* spelling to the lowercase
+// name the public WithUlimit option uses.
+func appleRlimitName(limit string) string {
+	return strings.TrimPrefix(strings.ToLower(limit), "rlimit_")
 }
 
 func appleState(state string) State {

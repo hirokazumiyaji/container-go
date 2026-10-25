@@ -22,6 +22,17 @@ type Configuration struct {
 	Image          Image             `json:"image"`
 	Labels         map[string]string `json:"labels"`
 	PublishedPorts []PublishedPort   `json:"publishedPorts"`
+	// Resources reports the CPU allocation of the container.
+	Resources Resources `json:"resources"`
+	// CapAdd and CapDrop are the normalized CAP_* capabilities (or ALL) the
+	// container was created with.
+	CapAdd  []string `json:"capAdd"`
+	CapDrop []string `json:"capDrop"`
+	// ShmSize is nil when the container uses the default /dev/shm size.
+	ShmSize *uint64 `json:"shmSize"`
+	// InitProcess reports the container process configuration, including
+	// the RLIMIT entries set with --ulimit.
+	InitProcess InitProcess `json:"initProcess"`
 	// Platform is the platform selected when the container was created.
 	// Older CLI versions may omit it; callers must treat a zero value as
 	// unknown rather than silently treating it as the host platform.
@@ -30,6 +41,23 @@ type Configuration struct {
 	// Omitting the field and reporting an empty value are equivalent: both
 	// mean the time is unknown.
 	CreationDate string `json:"creationDate"`
+}
+
+// Resources is the inspected resource allocation.
+type Resources struct {
+	CPUS int64 `json:"cpus"`
+}
+
+// InitProcess is the inspected process configuration.
+type InitProcess struct {
+	Rlimits []Rlimit `json:"rlimits"`
+}
+
+// Rlimit is one RLIMIT entry reported for the container process.
+type Rlimit struct {
+	Limit string `json:"limit"`
+	Soft  uint64 `json:"soft"`
+	Hard  uint64 `json:"hard"`
 }
 
 type Image struct {

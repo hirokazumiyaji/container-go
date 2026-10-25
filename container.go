@@ -1958,6 +1958,18 @@ func cloneEngineInfo(info *engineInfo) *engineInfo {
 	if info.bound != nil {
 		out.bound = append([]boundPort(nil), info.bound...)
 	}
+	if info.runOptions.capAdd != nil {
+		out.runOptions.capAdd = append([]string(nil), info.runOptions.capAdd...)
+	}
+	if info.runOptions.capDrop != nil {
+		out.runOptions.capDrop = append([]string(nil), info.runOptions.capDrop...)
+	}
+	if info.runOptions.ulimits != nil {
+		out.runOptions.ulimits = append([]ulimitSpec(nil), info.runOptions.ulimits...)
+	}
+	if info.runOptions.extraHosts != nil {
+		out.runOptions.extraHosts = append([]extraHostSpec(nil), info.runOptions.extraHosts...)
+	}
 	return &out
 }
 

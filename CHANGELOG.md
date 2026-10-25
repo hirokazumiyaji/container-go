@@ -15,6 +15,16 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `WithShmSize`, `WithPrivileged`, `WithCapAdd` / `WithCapDrop`,
+  `WithUlimit`, `WithExtraHost`, and `WithHostname` run options. Values are
+  validated while options are evaluated, emitted as Docker's `--shm-size`,
+  `--privileged`, `--cap-add` / `--cap-drop`, `--ulimit`, `--add-host`, and
+  `--hostname` flags, and included in the `WithReuse` compatibility
+  identity. Reuse only requires requested capabilities to be present in the
+  inspected configuration, so an empty capability request accepts any
+  inspected set. Apple Container accepts the shm, capability, and ulimit flags
+  and rejects `WithPrivileged`, `WithExtraHost`, and `WithHostname` with
+  `ErrUnsupportedCapability`.
 - Add `InspectInfo.ContainerID()` for the backend's immutable container ID
   (Docker's 64-character hexadecimal ID). `InspectInfo.ID()` keeps returning
   the logical container name and `Name()` returns the backend-reported name,
@@ -86,6 +96,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
+- `WithCPUs` now takes a `float64` and Docker receives the value through
+  `strconv.FormatFloat(..., 'f', -1, 64)`, so fractional quotas such as
+  `0.5` are supported. Non-positive and non-finite values are rejected.
+  Apple Container requires a whole number and rejects a fractional value
+  with `ErrUnsupportedCapability`; integer values remain accepted.
 - `Client.Pull`, `Client.Prune`, and `Client.PruneReuseGroup` are variadic.
   Existing calls remain source-compatible, but method values and interface
   implementations that use the old fixed signatures must be updated. Docker

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
+	"sort"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -102,6 +104,50 @@ func isReuseIncompleteSetupError(err error) bool {
 	return errors.As(err, &incomplete)
 }
 
+// reuseFlightKey identifies one get-or-create request. Creation-time resource
+// and security options are part of the identity: callers that ask for the same
+// name with different settings must not share a leader's result. The order of
+// capabilities, ulimits, and extra hosts is irrelevant.
+func reuseFlightKey(cfg *config) string {
+	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
+	if options := cfg.runOptionsKey(); options != "" {
+		return key + "\x00" + options
+	}
+	return key
+}
+
+// runOptionsKey returns a canonical, order-independent representation of the
+// creation-time options that distinguish a reuse request.
+func (c *config) runOptionsKey() string {
+	parts := make([]string, 0, 2+len(c.capAdd)+len(c.capDrop)+len(c.ulimits)+len(c.extraHosts))
+	if c.cpus > 0 {
+		parts = append(parts, "cpus="+formatCPUs(c.cpus))
+	}
+	if c.shmSize != "" {
+		parts = append(parts, "shm-size="+c.shmSize)
+	}
+	if c.privileged {
+		parts = append(parts, "privileged")
+	}
+	for _, capability := range c.capAdd {
+		parts = append(parts, "cap-add="+capabilityKey(capability))
+	}
+	for _, capability := range c.capDrop {
+		parts = append(parts, "cap-drop="+capabilityKey(capability))
+	}
+	for _, limit := range c.ulimits {
+		parts = append(parts, "ulimit="+limit.arg())
+	}
+	for _, host := range c.extraHosts {
+		parts = append(parts, "add-host="+host.arg())
+	}
+	if c.hostname != "" {
+		parts = append(parts, "hostname="+c.hostname)
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, "\x00")
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -118,7 +164,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
+	key := reuseFlightKey(cfg)
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.
@@ -1007,7 +1053,147 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 			return fmt.Errorf("reuse %s: platform %q does not match existing %q", cfg.name, cfg.platform, info.platform)
 		}
 	}
+	if err := checkReuseRunOptions(info, cfg); err != nil {
+		return fmt.Errorf("reuse %s: %w", cfg.name, err)
+	}
 	return nil
+}
+
+// checkReuseRunOptions verifies that the existing container's inspected
+// resource and security configuration matches what this caller requested.
+// Requested CPU and shm limits must be reported and equal. Ulimit and
+// extra-host lists are compared as sets, and a requested hostname must match.
+// An unrequested CPU or shm limit places no constraint because the container
+// may legitimately have inherited one from another creator.
+//
+// Capabilities use a requested-subset rule: every capability the caller asked
+// to add or drop must be present in the inspected configuration, but an empty
+// request accepts any inspected set. Docker may report a default or normalized
+// capability set even when the caller passed no --cap-add/--cap-drop, so exact
+// equality would reject a compatible container. An inspected ALL satisfies any
+// requested capability.
+func checkReuseRunOptions(info *engineInfo, cfg *config) error {
+	reported := info.runOptions
+	if cfg.cpus > 0 {
+		if !reported.cpusReported {
+			return fmt.Errorf("cpus %s could not be verified on the existing container", formatCPUs(cfg.cpus))
+		}
+		if math.Abs(reported.cpus-cfg.cpus) > 1e-9 {
+			return fmt.Errorf("cpus %s does not match the existing container's %s", formatCPUs(cfg.cpus), formatCPUs(reported.cpus))
+		}
+	}
+	if cfg.shmSize != "" {
+		want, err := parseSizeBytes("WithShmSize", "shm", cfg.shmSize)
+		if err != nil {
+			return err
+		}
+		if !reported.shmSizeReported || reported.shmSizeBytes != want {
+			return fmt.Errorf("shm size %q does not match the existing container", cfg.shmSize)
+		}
+	}
+	if reported.privileged != cfg.privileged {
+		if cfg.privileged {
+			return errors.New("existing container is not privileged")
+		}
+		return errors.New("existing container is privileged")
+	}
+	if missing := missingCapabilities(cfg.capAdd, reported.capAdd); len(missing) > 0 {
+		return fmt.Errorf("requested added capabilities %v are missing from the existing container's %v",
+			missing, canonicalCapabilities(reported.capAdd))
+	}
+	if missing := missingCapabilities(cfg.capDrop, reported.capDrop); len(missing) > 0 {
+		return fmt.Errorf("requested dropped capabilities %v are missing from the existing container's %v",
+			missing, canonicalCapabilities(reported.capDrop))
+	}
+	if !sameUlimits(cfg.ulimits, reported.ulimits) {
+		return errors.New("ulimits do not match the existing container")
+	}
+	if !sameExtraHosts(cfg.extraHosts, reported.extraHosts) {
+		return errors.New("extra hosts do not match the existing container")
+	}
+	if cfg.hostname != "" && !strings.EqualFold(reported.hostname, cfg.hostname) {
+		return fmt.Errorf("hostname %q does not match the existing container's %q", cfg.hostname, reported.hostname)
+	}
+	return nil
+}
+
+// missingCapabilities returns the requested capabilities absent from reported.
+// An empty request has no missing capabilities, and an inspected ALL satisfies
+// every request because it already adds or drops the whole set.
+func missingCapabilities(requested, reported []string) []string {
+	want := canonicalCapabilities(requested)
+	if len(want) == 0 {
+		return nil
+	}
+	have := canonicalCapabilities(reported)
+	haveSet := make(map[string]struct{}, len(have))
+	for _, capability := range have {
+		haveSet[capability] = struct{}{}
+	}
+	if _, ok := haveSet["ALL"]; ok {
+		return nil
+	}
+	missing := make([]string, 0, len(want))
+	for _, capability := range want {
+		if _, ok := haveSet[capability]; !ok {
+			missing = append(missing, capability)
+		}
+	}
+	return missing
+}
+
+func canonicalCapabilities(caps []string) []string {
+	seen := make(map[string]struct{}, len(caps))
+	out := make([]string, 0, len(caps))
+	for _, capability := range caps {
+		key := capabilityKey(capability)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, key)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func sameUlimits(a, b []ulimitSpec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]ulimitSpec(nil), a...)
+	y := append([]ulimitSpec(nil), b...)
+	sort.Slice(x, func(i, j int) bool { return x[i].name < x[j].name })
+	sort.Slice(y, func(i, j int) bool { return y[i].name < y[j].name })
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func sameExtraHosts(a, b []extraHostSpec) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x := append([]extraHostSpec(nil), a...)
+	y := append([]extraHostSpec(nil), b...)
+	less := func(hosts []extraHostSpec, i, j int) bool {
+		hi, hj := strings.ToLower(hosts[i].host), strings.ToLower(hosts[j].host)
+		if hi != hj {
+			return hi < hj
+		}
+		return hosts[i].ip < hosts[j].ip
+	}
+	sort.Slice(x, func(i, j int) bool { return less(x, i, j) })
+	sort.Slice(y, func(i, j int) bool { return less(y, i, j) })
+	for i := range x {
+		if !strings.EqualFold(x[i].host, y[i].host) || x[i].ip != y[i].ip {
+			return false
+		}
+	}
+	return true
 }
 
 func checkReuseCompat(info *engineInfo, image string, cfg *config) error {

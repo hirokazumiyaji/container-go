@@ -15,6 +15,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Added
 
+- Add `WithNetworkAliases` to expose Docker's network-scoped DNS aliases
+  (`--network-alias`). Aliases require an explicitly selected user-defined
+  network, participate in reuse compatibility, and fail before any backend
+  call when combined with the default bridge, `host`, `none`, or `nat`;
+  Apple Container returns `ErrUnsupportedCapability` (#261).
 - Add `InspectInfo.ContainerID()` for the backend's immutable container ID
   (Docker's 64-character hexadecimal ID). `InspectInfo.ID()` keeps returning
   the logical container name and `Name()` returns the backend-reported name,

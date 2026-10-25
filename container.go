@@ -1955,6 +1955,9 @@ func cloneEngineInfo(info *engineInfo) *engineInfo {
 	if info.networkNames != nil {
 		out.networkNames = append([]string(nil), info.networkNames...)
 	}
+	if info.networkAliases != nil {
+		out.networkAliases = append([]string(nil), info.networkAliases...)
+	}
 	if info.bound != nil {
 		out.bound = append([]boundPort(nil), info.bound...)
 	}

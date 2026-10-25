@@ -10,6 +10,7 @@ import (
 	"os"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -320,6 +321,11 @@ func (e dockerEngine) checkConfig(ctx context.Context, cfg *config) error {
 	if !cfg.networkExplicit {
 		network = ""
 	}
+	if len(cfg.networkAliases) > 0 {
+		if err := dockerNetworkAliasConfigError(network); err != nil {
+			return err
+		}
+	}
 	if !dockerNetworkAllowsPublish(network) {
 		if len(cfg.published) > 0 {
 			return dockerPublishOptionError(network, "WithPublishedPort")
@@ -479,6 +485,36 @@ func dockerPublishOptionError(mode, option string) error {
 		Option:  option,
 		Detail:  detail,
 	}
+}
+
+// dockerNetworkAliasConfigError reports network modes that cannot resolve
+// network-scoped aliases. Docker registers --network-alias entries only for
+// user-defined networks; the default bridge (bridge on Linux, nat on native
+// Windows), host, and none modes all lack the embedded DNS resolver.
+func dockerNetworkAliasConfigError(network string) error {
+	switch network {
+	case "", dockerNetworkDefault, dockerNetworkBridge, dockerNetworkNAT, dockerNetworkHost, dockerNetworkNone:
+		return &ConfigError{
+			Backend: "docker",
+			Network: network,
+			Option:  "WithNetworkAliases",
+			Detail:  "network-scoped aliases require an explicitly selected user-defined network",
+		}
+	}
+	return nil
+}
+
+// dockerReuseNetworkAliasesError verifies that an existing container would
+// resolve every alias this caller asked for. Extra reported aliases are
+// expected: Docker automatically adds the container name, short ID, and
+// hostname to the endpoint's DNS names.
+func dockerReuseNetworkAliasesError(cfg *config, info *engineInfo) error {
+	for _, alias := range cfg.networkAliases {
+		if !slices.Contains(info.networkAliases, alias) {
+			return fmt.Errorf("%w: requested network alias %q is missing from the existing container", ErrNetworkMismatch, alias)
+		}
+	}
+	return nil
 }
 
 // dockerNetworkAllowsPublish reports whether Docker can create a
@@ -1262,7 +1298,9 @@ type dockerInspect struct {
 			HostPort string `json:"HostPort"`
 		} `json:"Ports"`
 		Networks map[string]struct {
-			IPAddress string `json:"IPAddress"`
+			IPAddress string   `json:"IPAddress"`
+			Aliases   []string `json:"Aliases"`
+			DNSNames  []string `json:"DNSNames"`
 		} `json:"Networks"`
 	} `json:"NetworkSettings"`
 }
@@ -1341,19 +1379,28 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 	}
 	sort.Strings(networkNames)
 
+	var networkAliases []string
+	for _, name := range networkNames {
+		endpoint := c.NetworkSettings.Networks[name]
+		networkAliases = append(networkAliases, endpoint.Aliases...)
+		networkAliases = append(networkAliases, endpoint.DNSNames...)
+	}
+	sort.Strings(networkAliases)
+
 	info := &engineInfo{
-		state:        dockerState(c.State.Status),
-		name:         strings.TrimPrefix(c.Name, "/"),
-		labels:       c.Config.Labels,
-		uid:          c.ID,
-		image:        c.Config.Image,
-		imageID:      c.Image,
-		imageDigest:  imageDigest(c.Config.Image),
-		platform:     c.Platform,
-		platformMeta: platformMetadataFromString(c.Platform),
-		ip:           c.NetworkSettings.IPAddress,
-		networkMode:  c.HostConfig.NetworkMode,
-		networkNames: networkNames,
+		state:          dockerState(c.State.Status),
+		name:           strings.TrimPrefix(c.Name, "/"),
+		labels:         c.Config.Labels,
+		uid:            c.ID,
+		image:          c.Config.Image,
+		imageID:        c.Image,
+		imageDigest:    imageDigest(c.Config.Image),
+		platform:       c.Platform,
+		platformMeta:   platformMetadataFromString(c.Platform),
+		ip:             c.NetworkSettings.IPAddress,
+		networkMode:    c.HostConfig.NetworkMode,
+		networkNames:   networkNames,
+		networkAliases: networkAliases,
 	}
 	info.createdAt = parseInspectTime(c.Created)
 	if c.State != nil {

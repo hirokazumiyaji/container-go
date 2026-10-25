@@ -185,6 +185,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限を指定する。`WithMemory` は現在 zero を受け付け、backend capability limit を強制しない（#102）。
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリを指定する。
 - `WithNetwork(name string)`：既存の名前付きネットワークへ接続する。
+- `WithNetworkAliases(aliases ...string)`：Docker の `--network-alias` として network-scoped DNS alias を追加する。明示的な user-defined `WithNetwork` が必要で、default bridge（`bridge`/`nat`）、`host`、`none` は `*ConfigError`、Apple は `ErrUnsupportedCapability` で拒否する。alias は DNS label として検証し、reuse の互換性比較にも含める。
 - `WithPlatform(p string)`：`linux/amd64` のようなイメージプラットフォームを指定する（Apple Container では Rosetta を含む）。
 - `WithExposedPorts(ports ...string)`：接続対象のコンテナポート(`"6379/tcp"` 形式)を宣言する
 - `WithEnv(env map[string]string)`：環境変数

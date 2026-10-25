@@ -355,6 +355,19 @@ and reuse operations inspect that ID; dynamic network, IP, and binding
 data are refreshed on every operation rather than served from a stale
 snapshot.
 
+For parallel tests that need the same logical name on separate networks,
+create a user-defined network per test (for example with `docker network
+create`), remove it in `t.Cleanup`, and pass `WithNetworkAliases("db")`
+with that `WithNetwork`. Each container then resolves as `db` inside its
+own network without colliding with other tests or with container names.
+Network aliases require an explicitly selected user-defined network:
+Docker's default bridge, `host`, `none`, and `nat` networks do not
+resolve them, so `Run` rejects those combinations with a `*ConfigError`
+before any backend call. The aliases are part of the reuse compatibility
+check, so a reused container that does not carry them is not adopted.
+The library attaches to existing networks; it does not create or delete
+them.
+
 Both `DOCKER_HOST` and Docker contexts are honored for host reachability;
 endpoint hosts resolve to the detected remote endpoint.
 

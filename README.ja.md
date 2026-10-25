@@ -333,6 +333,17 @@ endpoint、Host、lifecycle、reuse の inspect はその ID を対象にしま�
 network、IP、binding などの dynamic データは毎回更新され、古い snapshot
 は再利用されません。
 
+並列テストで同じ論理名を使いたい場合は、テストごとに user-defined
+network を作成し（`docker network create` など）、`t.Cleanup` で削除した
+うえで、その `WithNetwork` と `WithNetworkAliases("db")` を渡します。
+各コンテナは自分の network 内だけで `db` として解決され、他のテストや
+container 名と衝突しません。network alias には明示的な user-defined
+network が必要です。Docker の default bridge、`host`、`none`、`nat` は
+alias を解決しないため、`Run` は backend 呼び出し前に `*ConfigError` で
+拒否します。alias は reuse の互換性判定にも含まれるため、alias を持たない
+既存コンテナへは attach しません。ライブラリは既存 network へ接続するだけで、
+network の作成・削除は行いません。
+
 `DOCKER_HOST` のみを host reachability の判定に使用します。
 `docker context` 経由のリモート daemon は endpoint host の書き換えには
 使用しません。

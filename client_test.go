@@ -420,6 +420,94 @@ func TestClientPinsAbsentDockerEnvComponents(t *testing.T) {
 	}
 }
 
+func TestClientDockerConfigAndPlatformPinTargetEnv(t *testing.T) {
+	t.Setenv("DOCKER_CONTEXT", "")
+	t.Setenv("DOCKER_CONFIG", "/inherited/docker/config")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/amd64")
+
+	const (
+		configDir = "/pinned/docker/config"
+		platform  = "linux/arm64"
+	)
+	// An explicit host means target resolution needs no Docker context
+	// inspect, so construction must not invoke the backend CLI.
+	client, err := NewClient(
+		WithClientBackend("docker"),
+		WithClientDockerHost("tcp://daemon-a:2375"),
+		WithClientDockerConfig(configDir),
+		WithClientPlatform(platform),
+	)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+
+	de, ok := client.eng.(dockerEngine)
+	if !ok {
+		t.Fatalf("client.eng is %T, want dockerEngine", client.eng)
+	}
+	if !de.explicitConfigDir || de.configDir != configDir {
+		t.Errorf("engine config dir = %q (explicit %t), want %q", de.configDir, de.explicitConfigDir, configDir)
+	}
+	if !de.explicitDefaultPlatform || de.defaultPlatform != platform {
+		t.Errorf("engine platform = %q (explicit %t), want %q", de.defaultPlatform, de.explicitDefaultPlatform, platform)
+	}
+	if got := de.effectiveConfigDir(); got != configDir {
+		t.Errorf("effectiveConfigDir() = %q, want %q", got, configDir)
+	}
+	if got := de.effectiveDefaultPlatform(); got != platform {
+		t.Errorf("effectiveDefaultPlatform() = %q, want %q", got, platform)
+	}
+
+	er, ok := client.runner.(*cli.ExecRunner)
+	if !ok {
+		t.Fatalf("client.runner is %T, want *cli.ExecRunner", client.runner)
+	}
+	want := map[string]string{
+		"DOCKER_HOST":             "tcp://daemon-a:2375",
+		"DOCKER_CONFIG":           configDir,
+		"DOCKER_DEFAULT_PLATFORM": platform,
+	}
+	assertClientTargetEnv(t, er, want)
+
+	// A value exported after construction must not repoint the child CLI.
+	t.Setenv("DOCKER_CONFIG", "/late/docker/config")
+	t.Setenv("DOCKER_DEFAULT_PLATFORM", "linux/riscv64")
+	assertClientTargetEnv(t, er, want)
+
+	// The pinned target env must remove an inherited context too; the
+	// explicit host is the whole target, not a second component beside a
+	// later DOCKER_CONTEXT.
+	merged := cli.MergeEnv(os.Environ(), er.Env)
+	if _, ok := envValue(merged, "DOCKER_CONTEXT"); ok {
+		t.Errorf("pinned client env kept DOCKER_CONTEXT: %q", merged)
+	}
+}
+
+// assertClientTargetEnv checks the child environment the Client pins to,
+// after merging the process environment as the CLI runner does at exec time.
+func assertClientTargetEnv(t *testing.T, runner *cli.ExecRunner, want map[string]string) {
+	t.Helper()
+	merged := cli.MergeEnv(os.Environ(), runner.Env)
+	for key, wantValue := range want {
+		got, ok := envValue(merged, key)
+		if !ok || got != wantValue {
+			t.Errorf("child env %s = %q (present %t), want %q; env=%q", key, got, ok, wantValue, merged)
+		}
+	}
+}
+
+// envValue returns the last occurrence of key, matching exec environment
+// lookup when a caller-supplied runner already contains the variable.
+func envValue(env []string, key string) (string, bool) {
+	prefix := key + "="
+	for i := len(env) - 1; i >= 0; i-- {
+		if strings.HasPrefix(env[i], prefix) {
+			return env[i][len(prefix):], true
+		}
+	}
+	return "", false
+}
+
 func TestRunPinsAbsentDockerEnvComponents(t *testing.T) {
 	t.Setenv("DOCKER_HOST", "")
 

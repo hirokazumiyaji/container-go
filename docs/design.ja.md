@@ -246,7 +246,7 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 
 現在のチェックアウトでは validation は一様ではありません（#102）。negative な `LogsOptions.Tail` は 0/all として扱われ、`WithMemory("0")` は現在の parser に受理され、unknown な `MountType` は `WithMounts` で reject されず、`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。これらは現在の動作であり、backend がその設定を受け付ける保証ではありません。
 
-`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。
+`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctx, ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。`TerminateContainer` は caller の context を使い、`Cleanup` と `StrictCleanup` は `terminateTimeout`（既定 30 秒）の context を渡して従来の teardown 予算を維持する。
 
 `CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
 
@@ -404,9 +404,15 @@ type Strategy interface {
 各経路でエラーの見え方は異なる。
 
 **通常の cleanup**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を
-登録する。`TerminateContainer(ctr)` は nil 安全な defer 形式である。
+登録する。`TerminateContainer(ctx, ctr)` は nil 安全な defer 形式である。
+caller の context を使い、`Cleanup` と `StrictCleanup` は完全な teardown を
+`terminateTimeout`（既定 30 秒）で制限する。
 `Cleanup` の終了エラーはテストの log に残り、`TerminateContainer` は
 エラーを呼び出し元へ返す。
+
+`Container.Kill(ctx, signal string)` は signal を 1 つだけ取る。空文字列は
+既定の SIGKILL で、空でない signal は backend へそのまま渡す。そのため
+不正な綴りは可変長引数の検査ではなく backend が拒否する。
 
 **作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
 途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、
@@ -464,6 +470,8 @@ no-leak 保証ではない。
 - 作成世代ラベルと、Reuse 時の再利用グループラベル
 
 Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。現在の Docker filter は exited 状態だけを選ぶため、dead 状態のコンテナは #113 を適用するまで残る。running と created 状態は選ばない。Apple では、各 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、session、管理対象ラベル、および停止状態が再確認される。
+
+package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、Docker target の option を持たない。特定の Docker daemon や context を対象にする場合は、`WithClientDockerHost` または `WithClientDockerContext` で `Client` を作り、`Client.Prune` を使う。`Pull` は pull 固有の target option (`WithPullDockerHost`、`WithPullDockerContext`) を維持するが、`Client.Pull` は Client が target を固定するためこれらの上書きを拒否する。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグである。`Cleanup` と
 `TerminateContainer` による自動削除、リーパー登録を省略し、作成失敗、

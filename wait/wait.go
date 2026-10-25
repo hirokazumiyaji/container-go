@@ -517,13 +517,8 @@ func filterNonContext(err error) (filtered error, changed bool) {
 // filtered cause so Error/As cannot expose secrets that only that redactor
 // knew how to protect.
 func retainDiagnosticFacade(facade, filtered error) error {
-	type redactorProvider interface {
-		DiagnosticRedactor() *cli.Redactor
-	}
-	if provider, ok := facade.(redactorProvider); ok {
-		if r := provider.DiagnosticRedactor(); r != nil {
-			return cli.WithRedactor(filtered, r)
-		}
+	if r := cli.DiagnosticRedactor(facade); r != nil {
+		return cli.WithRedactor(filtered, r)
 	}
 	return filtered
 }
@@ -1067,10 +1062,7 @@ func (e *contextStrippedCause) Error() string {
 	// sanitized original rendering, except diagnostic-redactor facades whose
 	// cause was already re-redacted and must not keep mixed context wording.
 	if innerText := unfilteredInnerErrorText(e.original); innerText != "" && !strings.Contains(orig, innerText) {
-		type redactorProvider interface {
-			DiagnosticRedactor() *cli.Redactor
-		}
-		if _, ok := e.original.(redactorProvider); ok {
+		if cli.DiagnosticRedactor(e.original) != nil {
 			return causeText
 		}
 		return orig

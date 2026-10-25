@@ -117,7 +117,7 @@ func TestTerminateContainerSkipsReused(t *testing.T) {
 		t.Fatalf("Run: %v", err)
 	}
 	f.calls = nil
-	if err := TerminateContainer(ctr); err != nil {
+	if err := TerminateContainer(context.Background(), ctr); err != nil {
 		t.Fatalf("TerminateContainer: %v", err)
 	}
 	if f.callWith("delete") != nil {

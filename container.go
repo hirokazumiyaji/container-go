@@ -1281,22 +1281,10 @@ func (c *Container) restartAttached(ctx context.Context, timeout *time.Duration)
 }
 
 // Kill terminates or sends a signal to the container's main process.
-// If no signal is provided, it defaults to SIGKILL. Only a signal that is
-// guaranteed to end the main process also ends the WithAttachOutput stream; a
-// stream left attached by a catchable signal ends when the process exits.
-func (c *Container) Kill(ctx context.Context, signal ...string) error {
-	if len(signal) > 1 {
-		return newValidationErrorWithField("Kill", "signal", signal,
-			fmt.Errorf("at most one signal may be provided"))
-	}
-	var sig string
-	if len(signal) == 1 {
-		if signal[0] == "" {
-			return newValidationErrorWithField("Kill", "signal", signal[0],
-				fmt.Errorf("signal cannot be empty"))
-		}
-		sig = signal[0]
-	}
+// An empty signal defaults to SIGKILL. Only a signal that is guaranteed to
+// end the main process also ends the WithAttachOutput stream; a stream left
+// attached by a catchable signal ends when the process exits.
+func (c *Container) Kill(ctx context.Context, signal string) error {
 	if c.refusesSharedOps() {
 		return fmt.Errorf("kill %s: %w", c.id, ErrSharedContainer)
 	}
@@ -1306,12 +1294,12 @@ func (c *Container) Kill(ctx context.Context, signal ...string) error {
 	if err != nil {
 		return err
 	}
-	args := c.eng.killArgs(target, sig)
+	args := c.eng.killArgs(target, signal)
 	_, _, err = c.runner.Run(killCtx, args...)
 	if err != nil {
 		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "kill"), "kill", target, c.id)
 	}
-	if terminatingKillSignal(sig) {
+	if terminatingKillSignal(signal) {
 		c.stopAttached()
 	}
 	c.clearDynamic()

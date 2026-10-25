@@ -78,7 +78,7 @@ func (e *ConfigError) Error() string {
 
 func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
 
-func (e *ConfigError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ConfigError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ConfigError)
 	if !ok || e == nil {
 		return false
@@ -163,7 +163,7 @@ func (e *ValidationError) Is(target error) bool {
 	return e.Err != nil && errors.Is(e.Err, target)
 }
 
-func (e *ValidationError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ValidationError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ValidationError)
 	if !ok || e == nil {
 		return false
@@ -298,7 +298,7 @@ func (e *ExecTerminationError) Error() string {
 
 func (e *ExecTerminationError) Unwrap() error { return e.Err }
 
-func (e *ExecTerminationError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ExecTerminationError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ExecTerminationError)
 	if !ok || e == nil {
 		return false

@@ -15,6 +15,7 @@ import (
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
 	"github.com/hirokazumiyaji/container-go/internal/inspect"
+	"github.com/hirokazumiyaji/container-go/wait"
 )
 
 // appleEngine drives Apple Container's `container` CLI.
@@ -78,6 +79,9 @@ func (appleEngine) directIP() bool { return true }
 func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	if err := resolveEffectivePlatform(cfg); err != nil {
 		return err
+	}
+	if wait.RequiresHealthcheck(cfg.waitStrategy) {
+		return fmt.Errorf("%w: Apple Container has no HEALTHCHECK; wait.ForHealthcheck requires the Docker backend", ErrUnsupportedCapability)
 	}
 	if cfg.pullPolicy == PullNever {
 		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)

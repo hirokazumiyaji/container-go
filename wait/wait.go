@@ -74,6 +74,24 @@ type StateTarget interface {
 	State(ctx context.Context) (State, error)
 }
 
+// Health is a Docker HEALTHCHECK status reported by Target. Its zero value
+// means the image defines no HEALTHCHECK.
+type Health string
+
+const (
+	HealthNone      Health = ""
+	HealthStarting  Health = "starting"
+	HealthHealthy   Health = "healthy"
+	HealthUnhealthy Health = "unhealthy"
+)
+
+// HealthTarget is an optional extension to Target for targets that can
+// report Docker HEALTHCHECK status. ForHealthcheck returns a ConfigError for
+// targets that do not implement it.
+type HealthTarget interface {
+	Health(ctx context.Context) (Health, error)
+}
+
 // Strategy waits until a started container is ready for use.
 // Implementations must return when ctx is done so composite strategies can
 // collect their final causes without extending the caller's budget.
@@ -84,6 +102,10 @@ type Strategy interface {
 type options struct {
 	startupTimeout time.Duration
 	pollInterval   time.Duration
+	// stateFirst runs the lifecycle probe before the readiness check when
+	// it is due. Healthcheck waits use it so the 1 Hz inspect that refreshes
+	// the health snapshot happens before the check reads that snapshot.
+	stateFirst bool
 }
 
 func (o options) effective() (timeout, interval time.Duration) {
@@ -1972,9 +1994,47 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 	}
 	lastStateCheck = time.Now()
 
+	probeState := func() error {
+		if time.Since(lastStateCheck) < stateCheckInterval || waitCtx.Err() != nil {
+			return nil
+		}
+		lastStateCheck = time.Now()
+		state, err := targetState(waitCtx, target)
+		if err != nil {
+			if terminalErr := terminationErr(); terminalErr != nil {
+				if filtered := nonContextCause(err); filtered != nil {
+					lastProbeErr = filtered
+				}
+				return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
+			}
+			if isPermanentCheckError(err) || permanentProbeError(err) {
+				cause := permanentCause(err)
+				if filtered := retainedNonContextCause(cause); filtered != nil {
+					return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
+				}
+				// Context-only permanent wrapper: keep polling.
+			} else if filtered := nonContextCause(err); filtered != nil {
+				lastProbeErr = filtered
+			}
+			return nil
+		}
+		if terminalErr := terminationErr(); terminalErr != nil {
+			return terminalErr
+		}
+		if terminalWaitState(state) {
+			return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+		}
+		return nil
+	}
+
 	for {
 		if err := terminationErr(); err != nil {
 			return err
+		}
+		if o.stateFirst {
+			if err := probeState(); err != nil {
+				return err
+			}
 		}
 
 		if err := check(waitCtx); err != nil {
@@ -2010,29 +2070,9 @@ func poll(ctx context.Context, o options, target Target, what string, check func
 		if err := terminationErr(); err != nil {
 			return err
 		}
-		if time.Since(lastStateCheck) >= stateCheckInterval && waitCtx.Err() == nil {
-			lastStateCheck = time.Now()
-			state, err := targetState(waitCtx, target)
-			if err != nil {
-				if terminalErr := terminationErr(); terminalErr != nil {
-					if filtered := nonContextCause(err); filtered != nil {
-						lastProbeErr = filtered
-					}
-					return waitContextTerminationError(callerCtx, waitCtx, what, timeout, joinNonNil(lastErr, lastProbeErr))
-				}
-				if isPermanentCheckError(err) || permanentProbeError(err) {
-					cause := permanentCause(err)
-					if filtered := retainedNonContextCause(cause); filtered != nil {
-						return wrapWaitCause(what, filtered, joinNonNil(lastErr, lastProbeErr))
-					}
-					// Context-only permanent wrapper: keep polling.
-				} else if filtered := nonContextCause(err); filtered != nil {
-					lastProbeErr = filtered
-				}
-			} else if terminalErr := terminationErr(); terminalErr != nil {
-				return terminalErr
-			} else if terminalWaitState(state) {
-				return waitStoppedStateError(what, state, joinNonNil(lastErr, lastProbeErr))
+		if !o.stateFirst {
+			if err := probeState(); err != nil {
+				return err
 			}
 		}
 

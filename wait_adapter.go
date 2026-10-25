@@ -33,8 +33,9 @@ type waitTarget struct {
 }
 
 var (
-	_ wait.Target      = waitTarget{}
-	_ wait.StateTarget = waitTarget{}
+	_ wait.Target       = waitTarget{}
+	_ wait.StateTarget  = waitTarget{}
+	_ wait.HealthTarget = waitTarget{}
 )
 
 func (t waitTarget) Endpoint(ctx context.Context, port string) (string, error) {
@@ -100,6 +101,28 @@ func (t waitTarget) State(ctx context.Context) (wait.State, error) {
 func (t waitTarget) FollowLogs(ctx context.Context) (io.ReadCloser, error) {
 	stream, err := t.c.FollowLogs(ctx)
 	return stream, waitTargetError(err)
+}
+
+func (t waitTarget) Health(ctx context.Context) (wait.Health, error) {
+	if err := ctx.Err(); err != nil {
+		return wait.HealthNone, err
+	}
+	if t.c == nil || t.c.eng == nil {
+		return wait.HealthNone, nil
+	}
+	if t.c.eng.name() != "docker" {
+		return wait.HealthNone, fmt.Errorf("%w: %w", ErrUnsupportedCapability, &wait.ConfigError{
+			Strategy: "ForHealthcheck",
+			Field:    "backend",
+			Value:    t.c.eng.name(),
+			Reason:   "backend does not report Docker HEALTHCHECK status",
+		})
+	}
+	health, err := t.c.healthStatus(ctx)
+	if err != nil {
+		return wait.HealthNone, waitTargetError(err)
+	}
+	return wait.Health(health), nil
 }
 
 func (t waitTarget) ExecCommand(ctx context.Context, cmd []string) (int, error) {

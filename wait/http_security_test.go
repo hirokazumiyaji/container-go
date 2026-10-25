@@ -594,3 +594,33 @@ func TestEnvironmentWithOverridesRemovesCaseInsensitiveKeys(t *testing.T) {
 		t.Errorf("overridden values = NO_PROXY %q HTTP_PROXY %q", values["NO_PROXY"], values["HTTP_PROXY"])
 	}
 }
+
+func TestForHTTPHostHeaderReachesRequest(t *testing.T) {
+	requests := make(chan capturedHTTPRequest, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests <- captureHTTPRequest(r)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	target := newFakeTarget()
+	target.endpoint = strings.TrimPrefix(server.URL, "http://")
+
+	err := ForHTTP("/health").
+		WithHeader("Host", "virtual.example.com").
+		WithStartupTimeout(time.Second).
+		WithPollInterval(20 * time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v", err)
+	}
+
+	select {
+	case got := <-requests:
+		if got.host != "virtual.example.com" {
+			t.Errorf("server received Host %q, want %q", got.host, "virtual.example.com")
+		}
+	case <-time.After(100 * time.Millisecond):
+		t.Fatal("server did not receive the probe")
+	}
+}

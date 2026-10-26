@@ -280,6 +280,12 @@ described below are not.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
 - `WithNetwork(name string)`: attach to an existing named network.
+- `WithNetworkAliases(aliases ...string)`: add network-scoped DNS aliases
+  for Docker (`--network-alias`). Requires an explicitly selected
+  user-defined `WithNetwork`; the default bridge (`bridge`/`nat`), `host`,
+  and `none` are rejected with `*ConfigError`, and Apple returns
+  `ErrUnsupportedCapability`. Aliases are DNS labels and participate in
+  reuse compatibility.
 - `WithPlatform(p string)`: select an image platform such as
   `linux/amd64` (including Rosetta use on Apple Container).
   and working directory

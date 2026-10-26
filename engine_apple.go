@@ -79,6 +79,9 @@ func (appleEngine) checkConfig(_ context.Context, cfg *config) error {
 	if err := resolveEffectivePlatform(cfg); err != nil {
 		return err
 	}
+	if len(cfg.networkAliases) > 0 {
+		return fmt.Errorf("%w: apple backend does not support network aliases", ErrUnsupportedCapability)
+	}
 	if cfg.pullPolicy == PullNever {
 		return fmt.Errorf("%w: Apple Container's run command always resolves images; use PullMissing or PullAlways", ErrPullNeverUnsupported)
 	}

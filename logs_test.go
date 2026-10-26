@@ -268,6 +268,43 @@ func TestLogsWithOptionsBackendMatrix(t *testing.T) {
 	}
 }
 
+// TestDockerLogsSnapshotSincePreservesSubsecondPrecision fixes the exact
+// snapshot --since argument for the public snapshot paths. Docker accepts
+// RFC3339Nano, so truncating to whole seconds made an incremental caller
+// replay entries already delivered from the same second.
+func TestDockerLogsSnapshotSincePreservesSubsecondPrecision(t *testing.T) {
+	since := time.Date(2026, 1, 2, 15, 4, 5, 123456789, time.FixedZone("JST", 9*60*60))
+	wantArgs := []string{"logs", "--since", "2026-01-02T06:04:05.123456789Z", testDockerUID}
+	newDockerHandle := func(f *fakeRunner) *Container {
+		ctr := &Container{id: "myctr", runner: f, eng: dockerEngine{}}
+		ctr.setImmutableID(testDockerUID)
+		return ctr
+	}
+
+	t.Run("LogsWithOptions", func(t *testing.T) {
+		f := newDockerTestRunner()
+		rc, err := newDockerHandle(f).LogsWithOptions(context.Background(), LogsOptions{Since: since})
+		if err != nil {
+			t.Fatalf("LogsWithOptions: %v", err)
+		}
+		_ = rc.Close()
+		if call := f.callWith("logs"); !slices.Equal(call, wantArgs) {
+			t.Errorf("logs args = %v, want %v", call, wantArgs)
+		}
+	})
+
+	// LogsTo shares logsArgsWithOptions, so it must emit the same timestamp.
+	t.Run("LogsTo", func(t *testing.T) {
+		f := newDockerTestRunner()
+		if _, err := newDockerHandle(f).LogsTo(context.Background(), io.Discard, LogsOptions{Since: since}); err != nil {
+			t.Fatalf("LogsTo: %v", err)
+		}
+		if call := f.callWith("logs"); !slices.Equal(call, wantArgs) {
+			t.Errorf("logs args = %v, want %v", call, wantArgs)
+		}
+	})
+}
+
 func TestLogsDefaultsToUnbounded(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)

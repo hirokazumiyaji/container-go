@@ -30,7 +30,8 @@ type dockerMetadataEntry struct {
 }
 
 // dockerMetadataCache collapses concurrent Docker metadata lookups with the
-// same key and briefly reuses their successful results. It is owned by a
+// same key and briefly reuses their successful results. It caches the daemon
+// default network and the copy-out version capability. It is owned by a
 // Client (and carried by the handles that Client creates) rather than shared
 // process-wide, so unrelated targets cannot observe each other's answers.
 //
@@ -170,4 +171,33 @@ func dockerDefaultNetworkCached(ctx context.Context, cache *dockerMetadataCache,
 	return cache.lookup(ctx, dockerDefaultNetworkKey(eng, runner), func(ctx context.Context) (string, error) {
 		return dockerDefaultNetwork(ctx, runner, eng, timeouts)
 	})
+}
+
+// dockerCopyVersionKey identifies one daemon's copy-out version answer. It
+// shares the target component of dockerDefaultNetworkKey, so every handle a
+// Client creates on that target reuses one probe; the prefix keeps the value
+// distinct from the default-network name stored in the same map.
+func dockerCopyVersionKey(eng engine, runner cli.Runner) string {
+	return "copy-out-version\x00" + dockerDefaultNetworkKey(eng, runner)
+}
+
+const dockerCopyVersionOK = "ok"
+
+// dockerCopyFileFromContainerVersionCached verifies Docker's copy-out
+// client/server versions through the optional shared cache. Only a successful
+// check is stored, so a failed probe never poisons the next caller. A nil
+// cache performs the check directly.
+func dockerCopyFileFromContainerVersionCached(ctx context.Context, cache *dockerMetadataCache, runner cli.Runner, eng engine, timeouts opTimeouts) error {
+	check := func(ctx context.Context) (string, error) {
+		if err := eng.checkCopyFileFromContainerVersion(ctx, runner, timeouts); err != nil {
+			return "", err
+		}
+		return dockerCopyVersionOK, nil
+	}
+	if cache == nil {
+		_, err := check(ctx)
+		return err
+	}
+	_, err := cache.lookup(ctx, dockerCopyVersionKey(eng, runner), check)
+	return err
 }

@@ -1,7 +1,9 @@
 package container
 
 import (
+	"cmp"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -29,6 +31,7 @@ var parseInspectFuzzSeeds = []struct {
 	{"truncated array", `[{"id":"myctr"`},
 	{"wrong field types", `[{"Id":42,"Name":true,"State":"running"}]`},
 	{"docker running", `[{"Id":"` + fuzzDockerInspectID + `","Name":"/myctr","State":{"Status":"running"}}]`},
+	{"docker multiple port bindings", `[{"Id":"` + fuzzDockerInspectID + `","Name":"/myctr","State":{"Status":"running"},"NetworkSettings":{"Ports":{"6379/tcp":[{"HostIp":"127.0.0.1","HostPort":"16379"}],"8080/tcp":[{"HostIp":"127.0.0.1","HostPort":"18080"}],"5432/tcp":[{"HostIp":"127.0.0.1","HostPort":"15432"}]}}}]`},
 	{"docker missing state", `[{"Id":"` + fuzzDockerInspectID + `","Name":"/myctr"}]`},
 	{"docker null state", `[{"Id":"` + fuzzDockerInspectID + `","Name":"/myctr","State":null}]`},
 	{"docker empty status", `[{"Id":"` + fuzzDockerInspectID + `","Name":"/myctr","State":{"Status":" "}}]`},
@@ -87,6 +90,17 @@ func checkParseInspectInvariants(t *testing.T, eng engine, data []byte) {
 	if first == nil || second == nil {
 		t.Fatalf("%s parseInspect returned nil info without an error", eng.name())
 	}
+	// Docker's port map has no ordering contract.
+	compareBindings := func(a, b boundPort) int {
+		return cmp.Or(
+			cmp.Compare(a.containerPort, b.containerPort),
+			cmp.Compare(a.proto, b.proto),
+			cmp.Compare(a.hostAddr, b.hostAddr),
+			cmp.Compare(a.hostPort, b.hostPort),
+		)
+	}
+	slices.SortFunc(first.bound, compareBindings)
+	slices.SortFunc(second.bound, compareBindings)
 	if !reflect.DeepEqual(first, second) {
 		t.Fatalf("%s parseInspect returned different info for the same input: %+v then %+v", eng.name(), first, second)
 	}

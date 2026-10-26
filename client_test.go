@@ -478,8 +478,8 @@ func TestClientDockerConfigAndPlatformPinTargetEnv(t *testing.T) {
 	// explicit host is the whole target, not a second component beside a
 	// later DOCKER_CONTEXT.
 	merged := cli.MergeEnv(os.Environ(), er.Env)
-	if _, ok := envValue(merged, "DOCKER_CONTEXT"); ok {
-		t.Errorf("pinned client env kept DOCKER_CONTEXT: %q", merged)
+	if value, ok := envValue(merged, "DOCKER_CONTEXT"); ok {
+		t.Errorf("pinned client env kept DOCKER_CONTEXT: %q", value)
 	}
 }
 
@@ -491,7 +491,7 @@ func assertClientTargetEnv(t *testing.T, runner *cli.ExecRunner, want map[string
 	for key, wantValue := range want {
 		got, ok := envValue(merged, key)
 		if !ok || got != wantValue {
-			t.Errorf("child env %s = %q (present %t), want %q; env=%q", key, got, ok, wantValue, merged)
+			t.Errorf("child env %s = %q (present %t), want %q", key, got, ok, wantValue)
 		}
 	}
 }

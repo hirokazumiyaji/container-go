@@ -116,11 +116,6 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
 
 ### Changed
 
-- `WithCPUs` now takes a `float64` and Docker receives the value through
-  `strconv.FormatFloat(..., 'f', -1, 64)`, so fractional quotas such as
-  `0.5` are supported. Non-positive and non-finite values are rejected.
-  Apple Container requires a whole number and rejects a fractional value
-  with `ErrUnsupportedCapability`; integer values remain accepted.
 - **Breaking:** align public signatures before v1.0. Redaction methods on
   `ConfigError`, `ValidationError`, `ExecTerminationError`, `CleanupError`,
   `wait.ConfigError`, `CLIError`, and `SystemNotRunningError` are now
@@ -139,6 +134,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `WithClientDockerContext` and call `Client.Prune`. `Pull` keeps its
   pull-specific target options (`WithPullDockerHost`,
   `WithPullDockerContext`) (#265).
+- `WithCPUs` now takes a `float64` and Docker receives the value through
+  `strconv.FormatFloat(..., 'f', -1, 64)`, so fractional quotas such as
+  `0.5` are supported. Non-positive and non-finite values are rejected.
+  Apple Container requires a whole number and rejects a fractional value
+  with `ErrUnsupportedCapability`; integer values remain accepted.
 - `Client.Pull`, `Client.Prune`, and `Client.PruneReuseGroup` are variadic.
   Existing calls remain source-compatible, but method values and interface
   implementations that use the old fixed signatures must be updated. Docker

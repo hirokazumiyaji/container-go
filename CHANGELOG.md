@@ -95,8 +95,9 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `StrictCleanup` retain the previous 30-second default by passing a
   `terminateTimeout`-bounded context. `Container.Kill` takes one
   `signal string` instead of a variadic argument; the empty string keeps the
-  SIGKILL default, and callers that previously passed an explicit empty
-  signal or multiple signals must update at compile time. Remove the
+  SIGKILL default. Calls using `Kill(ctx)` must now pass `""`, and multiple
+  signals no longer compile. An explicit empty signal now selects SIGKILL
+  instead of returning a validation error. Remove the
   `wait.DiagnosticSecrets` and `wait.SecretValues` aliases in favor of
   `wait.DiagnosticValues`. Package-level `Prune` intentionally has no Docker
   target options; use a `Client` configured with `WithClientDockerHost` or

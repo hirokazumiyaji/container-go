@@ -155,8 +155,10 @@ type lockPack struct {
 	// attachTeardownOp serializes Stop and terminating Kill attach teardown
 	// ownership. A command holds it from markAttachTeardown until it publishes
 	// or discards the stream outcome, so a second command cannot replace the
-	// pending failure and strand the first stream's AttachedDone.
-	attachTeardownOp sync.Mutex
+	// pending failure and strand the first stream's AttachedDone. Waiting for
+	// ownership honors the command's context so a cancelled call does not
+	// block behind another teardown.
+	attachTeardownOp contextLock
 	attachMu         sync.Mutex
 	attachCancel     context.CancelFunc
 	attachDone       chan struct{}
@@ -1044,13 +1046,16 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
-	teardown := c.markAttachTeardown()
+	teardown, err := c.markAttachTeardown(stopCtx)
+	if err != nil {
+		return err
+	}
 	_, _, err = c.runner.Run(stopCtx, args...)
 	if err != nil {
 		c.clearAttachTeardown(teardown)
 		return c.classifyOperation(ctx, err, "stop")
 	}
-	c.commitAttachTeardown()
+	c.commitAttachTeardown(teardown)
 	c.stopAttachedTarget(teardown)
 	c.clearDynamic()
 	return nil
@@ -1330,7 +1335,10 @@ func (c *Container) Kill(ctx context.Context, signal string) error {
 	terminating := terminatingKillSignal(signal)
 	var teardown attachTeardownTarget
 	if terminating {
-		teardown = c.markAttachTeardown()
+		teardown, err = c.markAttachTeardown(killCtx)
+		if err != nil {
+			return err
+		}
 	}
 	_, _, err = c.runner.Run(killCtx, args...)
 	if err != nil {
@@ -1340,7 +1348,7 @@ func (c *Container) Kill(ctx context.Context, signal string) error {
 		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "kill"), "kill", target, c.id)
 	}
 	if terminating {
-		c.commitAttachTeardown()
+		c.commitAttachTeardown(teardown)
 		c.stopAttachedTarget(teardown)
 	}
 	c.clearDynamic()
@@ -1458,24 +1466,31 @@ type attachTeardownTarget struct {
 // container stops belongs to that teardown, not to the stream.
 // The caller owns attachTeardownOp until it calls clearAttachTeardown or
 // stopAttachedTarget, which release it.
-func (c *Container) markAttachTeardown() attachTeardownTarget {
+func (c *Container) markAttachTeardown(ctx context.Context) (attachTeardownTarget, error) {
 	p := c.pack()
-	p.attachTeardownOp.Lock()
+	if err := p.attachTeardownOp.Lock(ctx); err != nil {
+		return attachTeardownTarget{}, err
+	}
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
 	p.attachTeardown = true
 	p.attachTeardownCommand = true
 	p.attachTeardownStreamDone = p.attachStreamDone
-	return attachTeardownTarget{cancel: p.attachCancel, streamDone: p.attachStreamDone}
+	return attachTeardownTarget{cancel: p.attachCancel, streamDone: p.attachStreamDone}, nil
 }
 
 // commitAttachTeardown records that the lifecycle command succeeded. The
 // teardown mark stays set until the command's stream is stopped, but the
-// command no longer owns a pending failure.
-func (c *Container) commitAttachTeardown() {
+// command no longer owns a pending failure. A still-current stream is marked
+// inactive before it is cancelled and drained so a concurrent Start can
+// replace it instead of mistaking it for a live follower.
+func (c *Container) commitAttachTeardown(target attachTeardownTarget) {
 	p := c.pack()
 	p.attachMu.Lock()
 	p.attachTeardownCommand = false
+	if target.streamDone == p.attachStreamDone {
+		p.attachCancel = nil
+	}
 	p.attachMu.Unlock()
 }
 
@@ -1490,13 +1505,16 @@ func (c *Container) clearAttachTeardown(target attachTeardownTarget) {
 		p.attachTeardown = false
 	}
 	p.attachTeardownCommand = false
+	streamDone := p.attachTeardownStreamDone
 	p.attachTeardownStreamDone = nil
 	p.attachErr = joinAttachError(p.attachErr, p.attachTeardownErr)
 	p.attachTeardownErr = nil
 	done := p.attachTeardownDone
 	p.attachTeardownDone = nil
 	p.attachMu.Unlock()
-	closeAttachDone(done)
+	// The public channel must not close before the follower's internal
+	// completion, or a caller can call Start and still see it as active.
+	closeAttachDoneAfterStream(done, streamDone)
 }
 
 // stopAttached stops the current attached stream. Callers that started a Stop
@@ -1523,6 +1541,14 @@ func (c *Container) stopAttachedTarget(target attachTeardownTarget) {
 }
 
 func (c *Container) finishAttachStop(cancel context.CancelFunc, streamDone chan struct{}) {
+	p := c.pack()
+	p.attachMu.Lock()
+	if streamDone == p.attachStreamDone {
+		// Mark the follower inactive before the drain wait so a concurrent
+		// Start replaces it instead of treating the cancelled stream as live.
+		p.attachCancel = nil
+	}
+	p.attachMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
@@ -1532,7 +1558,6 @@ func (c *Container) finishAttachStop(cancel context.CancelFunc, streamDone chan 
 		case <-time.After(attachStopWait):
 		}
 	}
-	p := c.pack()
 	p.attachMu.Lock()
 	if p.attachTeardownCommand {
 		// Stop or Kill is still running and owns the pending failure. Leave
@@ -1543,11 +1568,8 @@ func (c *Container) finishAttachStop(cancel context.CancelFunc, streamDone chan 
 	if streamDone == p.attachStreamDone {
 		// The stream has finished or its sink is wedged. Errors from this
 		// window belonged to the teardown; output-delivery failures were
-		// recorded directly and stay in attachErr. Drop the cancel handle so
-		// a wedged write that outlives attachStopWait does not make a later
-		// Start treat the cancelled follower as active.
+		// recorded directly and stay in attachErr.
 		p.attachTeardown = false
-		p.attachCancel = nil
 	}
 	p.attachTeardownErr = nil
 	p.attachTeardownStreamDone = nil
@@ -1563,6 +1585,22 @@ func closeAttachDone(done chan struct{}) {
 	if done != nil {
 		close(done)
 	}
+}
+
+// closeAttachDoneAfterStream releases a held AttachedDone only after the
+// follower's internal completion. A caller that observes the public channel
+// closed must not still see the finished stream as active.
+func closeAttachDoneAfterStream(done, streamDone chan struct{}) {
+	if done == nil {
+		return
+	}
+	if streamDone != nil {
+		select {
+		case <-streamDone:
+		case <-time.After(attachStopWait):
+		}
+	}
+	close(done)
 }
 
 // startAttached launches the background stream behind WithAttachOutput. A
@@ -1588,12 +1626,13 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	// caller that observed AttachedDone closed that the failure is still
 	// readable after Start or Restart reattaches. Later failures are joined.
 	p.attachTeardown = false
-	var heldDone chan struct{}
+	var heldDone, heldStreamDone chan struct{}
 	if !p.attachTeardownCommand {
 		// No command owns the previous stream's outcome, so any held failure
 		// was teardown noise. A command still running must keep it: the new
 		// stream is independent and must not publish the old one's outcome.
 		p.attachTeardownErr = nil
+		heldStreamDone = p.attachTeardownStreamDone
 		p.attachTeardownStreamDone = nil
 		heldDone = p.attachTeardownDone
 		p.attachTeardownDone = nil
@@ -1602,7 +1641,7 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	p.attachDone = done
 	p.attachStreamDone = streamDone
 	p.attachMu.Unlock()
-	closeAttachDone(heldDone)
+	closeAttachDoneAfterStream(heldDone, heldStreamDone)
 	go func() {
 		// A caller that sees AttachedDone close may immediately call Start, so
 		// the internal completion must be visible first or that Start sees this

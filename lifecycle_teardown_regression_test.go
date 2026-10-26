@@ -82,6 +82,14 @@ func attachStreamDoneForTest(t *testing.T, c *Container) <-chan struct{} {
 	return p.attachStreamDone
 }
 
+func attachCancelForTest(t *testing.T, c *Container) context.CancelFunc {
+	t.Helper()
+	p := c.pack()
+	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
+	return p.attachCancel
+}
+
 func (r *teardownRacingStreamerRunner) Stream(ctx context.Context, _ ...string) (io.ReadCloser, error) {
 	r.startOnce.Do(func() { close(r.started) })
 	r.mu.Lock()
@@ -118,6 +126,23 @@ type contextReader struct {
 func (r contextReader) Read([]byte) (int, error) {
 	<-r.ctx.Done()
 	return 0, r.ctx.Err()
+}
+
+// signallingRunner reports when a lifecycle command's backend call returned,
+// which is when its attach teardown starts draining the stream.
+type signallingRunner struct {
+	*recordingStreamerRunner
+	command string
+	done    chan struct{}
+	once    sync.Once
+}
+
+func (r *signallingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	out, errOut, err := r.recordingStreamerRunner.Run(ctx, args...)
+	if len(args) > 0 && args[0] == r.command {
+		r.once.Do(func() { close(r.done) })
+	}
+	return out, errOut, err
 }
 
 type releasedReader struct {
@@ -581,14 +606,91 @@ func TestStartReattachesAfterStopAbandonsWedgedStream(t *testing.T) {
 	}
 }
 
+func TestStartReattachesWhileStopDrainsWedgedStream(t *testing.T) {
+	f := &signallingRunner{
+		recordingStreamerRunner: &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n"},
+		command:                 "stop",
+		done:                    make(chan struct{}),
+	}
+	sink := &blockingSink{entered: make(chan struct{}), released: make(chan struct{})}
+	ctr := runTestContainer(t, f, WithAttachOutput(sink))
+	t.Cleanup(func() { close(sink.released) })
+	oldDone := ctr.AttachedDone()
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach stream never wrote to the sink")
+	}
+
+	stopErr := make(chan error, 1)
+	go func() { stopErr <- ctr.Stop(context.Background(), nil) }()
+	select {
+	case <-f.done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop command did not return")
+	}
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for attachCancelForTest(t, ctr) != nil {
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ctr.AttachedDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start treated the stream Stop was draining as active")
+	}
+	select {
+	case <-oldDone:
+		t.Fatal("the wedged stream finished despite the blocked sink")
+	default:
+	}
+	if err := <-stopErr; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestHeldAttachedDoneClosesAfterInternalCompletion(t *testing.T) {
+	done := make(chan struct{})
+	streamDone := make(chan struct{})
+	returned := make(chan struct{})
+	go func() {
+		closeAttachDoneAfterStream(done, streamDone)
+		close(returned)
+	}()
+	select {
+	case <-done:
+		t.Fatal("held AttachedDone closed before the stream's internal completion")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	close(streamDone)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("held AttachedDone did not close after the stream completed")
+	}
+	<-returned
+}
+
 func TestTeardownCommandsSerializeAttachResolution(t *testing.T) {
 	ctr := runTestContainer(t, newTestRunner())
-	first := ctr.markAttachTeardown()
+	first, err := ctr.markAttachTeardown(context.Background())
+	if err != nil {
+		t.Fatalf("mark first teardown: %v", err)
+	}
 
 	acquired := make(chan struct{})
 	go func() {
-		second := ctr.markAttachTeardown()
-		ctr.clearAttachTeardown(second)
+		second, markErr := ctr.markAttachTeardown(context.Background())
+		if markErr == nil {
+			ctr.clearAttachTeardown(second)
+		}
 		close(acquired)
 	}()
 	select {
@@ -603,6 +705,26 @@ func TestTeardownCommandsSerializeAttachResolution(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("the second teardown did not proceed after the first resolved")
 	}
+}
+
+func TestTeardownOwnershipHonorsContext(t *testing.T) {
+	ctr := runTestContainer(t, newTestRunner())
+	first, err := ctr.markAttachTeardown(context.Background())
+	if err != nil {
+		t.Fatalf("mark first teardown: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	if _, err := ctr.markAttachTeardown(ctx); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second teardown error = %v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
+		t.Fatalf("second teardown waited %s for ownership, want it to honor the 20ms deadline", elapsed)
+	}
+
+	ctr.clearAttachTeardown(first)
 }
 
 func TestTeardownReportsOutputDeliveryFailure(t *testing.T) {

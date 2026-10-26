@@ -167,14 +167,12 @@ type lockPack struct {
 	// a caller that retained the previous stream's AttachedDone can still
 	// observe why that stream ended; later failures are joined to it.
 	attachErr error
-	// attachTeardown marks a stream the library is ending itself, so an error
-	// racing the teardown is not reported as a stream failure.
-	attachTeardown bool
 	// attachTeardowns tracks the in-flight Stop and terminating Kill teardowns
 	// of this handle, keyed by the stream's internal completion channel.
 	// Commands run concurrently; entries let an overlapping command for the
 	// same stream share its outcome while a command for a replacement stream
-	// keeps its own.
+	// keeps its own. A stream without an entry is not being torn down, so its
+	// failure is never suppressed by another stream's teardown.
 	attachTeardowns map[chan struct{}]*attachTeardownState
 	// attachGate carries the right to write to the attach destination. It is
 	// a channel rather than a mutex so a replacement stream can give up when
@@ -1480,7 +1478,6 @@ func (c *Container) markAttachTeardown() attachTeardownTarget {
 	p := c.pack()
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
-	p.attachTeardown = true
 	target := attachTeardownForLocked(p, p.attachStreamDone, p.attachCancel)
 	target.command = true
 	target.state.commandOwners++
@@ -1515,9 +1512,6 @@ func (c *Container) resolveAttachTeardown(target attachTeardownTarget, succeeded
 	if p.attachTeardowns[state.streamDone] == state {
 		delete(p.attachTeardowns, state.streamDone)
 	}
-	if len(p.attachTeardowns) == 0 {
-		p.attachTeardown = false
-	}
 	if state.commandOwners > 0 && !state.succeeded {
 		p.attachErr = joinAttachError(p.attachErr, state.err)
 	}
@@ -1538,7 +1532,6 @@ func (c *Container) stopAttached() {
 	p.attachCancel = nil
 	// Mark the teardown before cancelling: a stream error that races the
 	// stop belongs to the teardown, not to the stream.
-	p.attachTeardown = true
 	target := attachTeardownForLocked(p, streamDone, cancel)
 	p.attachMu.Unlock()
 	c.finishAttachStop(cancel, streamDone)
@@ -1612,7 +1605,6 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	// readable after Start or Restart reattaches. Later failures are joined.
 	// Pending teardown states belong to their commands, which keep honouring
 	// the stream they marked even after a replacement starts.
-	p.attachTeardown = false
 	p.attachCancel = cancel
 	p.attachDone = done
 	p.attachStreamDone = streamDone
@@ -1681,10 +1673,6 @@ func (c *Container) recordAttachError(done, streamDone chan struct{}, err error)
 		state.err = joinAttachError(state.err, err)
 		state.heldDone = done
 		return true
-	}
-	if p.attachTeardown {
-		// Teardown noise from a stream no command owns.
-		return false
 	}
 	p.attachErr = joinAttachError(p.attachErr, err)
 	return false

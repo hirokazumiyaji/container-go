@@ -738,6 +738,128 @@ func TestForceKillRunsDuringGracefulStop(t *testing.T) {
 	}
 }
 
+// staleSuppressionRunner serves a first attach stream that fails while a
+// graceful Stop is in the backend, then a replacement stream that stays alive
+// until the test releases it. Kill always fails at the backend.
+type staleSuppressionRunner struct {
+	*fakeRunner
+	firstStarted  chan struct{}
+	firstRelease  chan struct{}
+	firstDone     func() <-chan struct{}
+	stopEntered   chan struct{}
+	releaseStop   chan struct{}
+	secondStarted chan struct{}
+	secondRelease chan struct{}
+	firstErr      error
+	secondErr     error
+
+	mu      sync.Mutex
+	streams int
+}
+
+func (r *staleSuppressionRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "stop":
+		close(r.firstRelease)
+		<-r.firstDone()
+		close(r.stopEntered)
+		<-r.releaseStop
+		return nil, nil, nil
+	case "kill":
+		return nil, nil, errors.New("kill backend failed")
+	}
+	return r.fakeRunner.Run(context.Background(), args...)
+}
+
+func (r *staleSuppressionRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
+	r.mu.Lock()
+	r.streams++
+	index := r.streams
+	r.mu.Unlock()
+	if index == 1 {
+		return &releasedErrorReader{started: r.firstStarted, release: r.firstRelease, err: r.firstErr}, nil
+	}
+	return &releasedErrorReader{started: r.secondStarted, release: r.secondRelease, err: r.secondErr}, nil
+}
+
+type releasedErrorReader struct {
+	started chan struct{}
+	release chan struct{}
+	err     error
+	once    sync.Once
+}
+
+func (r *releasedErrorReader) Read([]byte) (int, error) {
+	r.once.Do(func() { close(r.started) })
+	<-r.release
+	return 0, r.err
+}
+
+func (r *releasedErrorReader) Close() error { return nil }
+
+func TestFailedKillOfReplacementDoesNotSuppressItsFailure(t *testing.T) {
+	firstErr := errors.New("first stream reset")
+	secondErr := errors.New("replacement stream reset")
+	f := &staleSuppressionRunner{
+		fakeRunner:    newTestRunner(),
+		firstStarted:  make(chan struct{}),
+		firstRelease:  make(chan struct{}),
+		stopEntered:   make(chan struct{}),
+		releaseStop:   make(chan struct{}),
+		secondStarted: make(chan struct{}),
+		secondRelease: make(chan struct{}),
+		firstErr:      firstErr,
+		secondErr:     secondErr,
+	}
+	ctr := runTestContainer(t, f, WithAttachOutput(io.Discard))
+	f.firstDone = func() <-chan struct{} { return attachStreamDoneForTest(t, ctr) }
+	select {
+	case <-f.firstStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach stream never started")
+	}
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- ctr.Stop(context.Background(), nil) }()
+	select {
+	case <-f.stopEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop never recorded the first stream failure")
+	}
+
+	// The first stream is finished, so Start attaches a replacement while
+	// Stop still owns the first stream's outcome.
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-f.secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement attach stream never started")
+	}
+
+	// The terminating Kill of the replacement fails at the backend, so the
+	// replacement keeps running and its failure is genuine.
+	if err := ctr.Kill(context.Background(), ""); err == nil {
+		t.Fatal("Kill returned nil, want the injected backend failure")
+	}
+
+	close(f.secondRelease)
+	select {
+	case <-ctr.AttachedDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement stream did not finish")
+	}
+	if err := ctr.AttachedError(); !errors.Is(err, secondErr) {
+		t.Fatalf("AttachedError() = %v, want the replacement's failure", err)
+	}
+
+	close(f.releaseStop)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
 func TestOverlappingTeardownsSharePendingFailure(t *testing.T) {
 	ctr := runTestContainer(t, newTestRunner())
 	streamDone := make(chan struct{})

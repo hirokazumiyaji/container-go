@@ -1283,6 +1283,10 @@ type dockerInspect struct {
 		ExitCode   int    `json:"ExitCode"`
 		StartedAt  string `json:"StartedAt"`
 		FinishedAt string `json:"FinishedAt"`
+		// Health is null when the image defines no HEALTHCHECK.
+		Health *struct {
+			Status string `json:"Status"`
+		} `json:"Health"`
 	} `json:"State"`
 	HostConfig struct {
 		NetworkMode string `json:"NetworkMode"`
@@ -1404,6 +1408,9 @@ func (dockerEngine) parseInspect(data []byte, target string) (*engineInfo, error
 		info.exitCode = c.State.ExitCode
 		info.startedAt = parseInspectTime(c.State.StartedAt)
 		info.finishedAt = parseInspectTime(c.State.FinishedAt)
+		if c.State.Health != nil {
+			info.health = c.State.Health.Status
+		}
 	}
 	if info.networkMode == "" {
 		// HostConfig.NetworkMode is present in current Docker inspect

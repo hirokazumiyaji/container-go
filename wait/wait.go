@@ -529,6 +529,7 @@ func collectNonContext(err error, set *causeSet) {
 			set.diagnostics = append(set.diagnostics, childSet.diagnostics...)
 		} else {
 			set.diagnostics = append(set.diagnostics, staticError(safeOpaqueText(err)))
+			set.classifiers = append(set.classifiers, childSet.diagnostics...)
 		}
 		set.classifiers = append(set.classifiers, childSet.classifiers...)
 		return

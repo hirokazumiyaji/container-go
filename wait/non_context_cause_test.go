@@ -269,7 +269,7 @@ func TestPollCustomWrapperKeepsIsAsWithoutContext(t *testing.T) {
 }
 
 func TestPollSanitizingWrapperKeepsSafeText(t *testing.T) {
-	secret := errors.New("super-secret-token")
+	secret := &typedCause{message: "super-secret-token"}
 	err := poll(
 		context.Background(),
 		options{startupTimeout: 25 * time.Millisecond, pollInterval: 5 * time.Millisecond},
@@ -287,6 +287,13 @@ func TestPollSanitizingWrapperKeepsSafeText(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), secret.Error()) {
 		t.Fatalf("error = %q, leaked hidden child text", err)
+	}
+	if !errors.Is(err, secret) {
+		t.Fatalf("error = %v, want hidden backend cause", err)
+	}
+	var got *typedCause
+	if !errors.As(err, &got) || got != secret {
+		t.Fatalf("error = %v, want hidden backend cause via As", err)
 	}
 	if errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, must not match context.Canceled", err)

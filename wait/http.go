@@ -218,6 +218,13 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 			return fatalCheckError{err: invalidConfigf("invalid HTTP request: %v", err)}
 		}
 		for k, v := range s.headers {
+			// net/http ignores a "Host" entry in req.Header and derives
+			// the wire header from req.Host, so a virtual-host probe
+			// has to set that field directly.
+			if strings.EqualFold(k, "Host") {
+				req.Host = v
+				continue
+			}
 			req.Header.Set(k, v)
 		}
 		if s.basicAuth {

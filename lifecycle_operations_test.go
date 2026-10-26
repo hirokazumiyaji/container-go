@@ -813,14 +813,17 @@ func TestStartReattachesAttachedOutputAfterStop(t *testing.T) {
 		name      string
 		firstErr  error
 		secondErr error
+		wantErr   error
 	}{
 		{
-			name:     "replacement clears the previous error",
+			name:     "successful replacement keeps the previous error",
 			firstErr: streamErr,
+			wantErr:  streamErr,
 		},
 		{
 			name:      "replacement error is reported",
 			secondErr: streamErr,
+			wantErr:   streamErr,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -875,12 +878,8 @@ func TestStartReattachesAttachedOutputAfterStop(t *testing.T) {
 			case <-time.After(2 * time.Second):
 				t.Fatal("replacement attached stream did not finish")
 			}
-			if tc.secondErr != nil {
-				if err := ctr.AttachedError(); !errors.Is(err, tc.secondErr) {
-					t.Fatalf("AttachedError() = %v, want the replacement stream failure", err)
-				}
-			} else if err := ctr.AttachedError(); err != nil {
-				t.Fatalf("AttachedError() = %v after a clean replacement stream", err)
+			if err := ctr.AttachedError(); !errors.Is(err, tc.wantErr) {
+				t.Fatalf("AttachedError() = %v, want %v", err, tc.wantErr)
 			}
 			f.waitForStreams(t, 2)
 			args := f.streamArgs()
@@ -891,6 +890,85 @@ func TestStartReattachesAttachedOutputAfterStop(t *testing.T) {
 			// follow already resumes with only the new run's output.
 			if !slices.Equal(args[1], []string{"logs", "--follow", "myctr"}) {
 				t.Errorf("replacement stream args = %v, want the ordinary follow argv", args[1])
+			}
+		})
+	}
+}
+
+func TestRestartPreservesAttachedErrorAcrossReattach(t *testing.T) {
+	firstErr := &cli.CLIError{Binary: "container", Args: []string{"logs"}, ExitCode: 1, Stderr: "first stream failed"}
+	secondErr := &cli.CLIError{Binary: "container", Args: []string{"logs"}, ExitCode: 1, Stderr: "second stream failed"}
+	for _, tc := range []struct {
+		name     string
+		errs     []error
+		wantErrs []error
+	}{
+		{
+			name:     "successful replacement keeps the previous failure",
+			errs:     []error{firstErr},
+			wantErrs: []error{firstErr},
+		},
+		{
+			name:     "later failure accumulates with the previous failure",
+			errs:     []error{firstErr, secondErr},
+			wantErrs: []error{firstErr, secondErr},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n", errs: tc.errs}
+			var buf bytes.Buffer
+			ctr, err := Run(context.Background(), "redis:7-alpine",
+				WithName("myctr"),
+				WithAttachOutput(&buf),
+				withRunner(f),
+				withEngine(appleEngine{}),
+			)
+			if err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			first := ctr.AttachedDone()
+			if first == nil {
+				t.Fatal("AttachedDone() = nil after Run, want a channel")
+			}
+			f.waitForStreams(t, 1)
+			select {
+			case <-first:
+			case <-time.After(2 * time.Second):
+				t.Fatal("initial attached stream did not finish")
+			}
+			if err := ctr.AttachedError(); !errors.Is(err, firstErr) {
+				t.Fatalf("AttachedError() = %v after the initial stream, want its failure", err)
+			}
+
+			if err := ctr.Restart(context.Background(), nil); err != nil {
+				t.Fatalf("Restart: %v", err)
+			}
+			second := ctr.AttachedDone()
+			if second == nil {
+				t.Fatal("AttachedDone() = nil after Restart, want the replacement stream channel")
+			}
+			if second == first {
+				t.Fatal("AttachedDone() still reports the stream that Restart ended")
+			}
+			select {
+			case <-second:
+			case <-time.After(2 * time.Second):
+				t.Fatal("replacement attached stream did not finish")
+			}
+			f.waitForStreams(t, 2)
+
+			// The channel a caller retained from the first stream stays
+			// closed, and every failure recorded so far remains matchable.
+			select {
+			case <-first:
+			default:
+				t.Fatal("the initial AttachedDone channel was reopened by the restart")
+			}
+			attachedErr := ctr.AttachedError()
+			for _, wantErr := range tc.wantErrs {
+				if !errors.Is(attachedErr, wantErr) {
+					t.Fatalf("AttachedError() = %v after reattach, want it to match %v", attachedErr, wantErr)
+				}
 			}
 		})
 	}

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os/exec"
 	"slices"
 	"strings"
 	"testing"
@@ -186,6 +188,252 @@ func TestRunValidatesWaitBeforeMissingImage(t *testing.T) {
 				t.Fatalf("backend was called before wait validation: %v", f.calls)
 			}
 		})
+	}
+}
+
+const procNetHeader = "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+
+func procNetLine(port int, state string) string {
+	return fmt.Sprintf("   0: 00000000:%04X 00000000:0000 %s 00000000:00000000 00:00000000 00000000 999 0 12345 1 0000000000000000 100 0 0 10 0\n", port, state)
+}
+
+func newDockerWaitTarget(runner cli.Runner) waitTarget {
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = dockerFixtureID
+	return waitTarget{c: ctr}
+}
+
+func TestWaitTargetContainerPortStatus(t *testing.T) {
+	tests := []struct {
+		name string
+		port string
+		out  string
+		code int
+		want wait.PortListenStatus
+	}{
+		{
+			name: "IPv4 listening",
+			port: "6379/tcp",
+			out:  procNetHeader + procNetLine(6379, "0A"),
+			want: wait.PortListenOpen,
+		},
+		{
+			name: "IPv6 listening",
+			port: "6379",
+			out: procNetHeader +
+				"   0: 00000000000000000000000000000000:18EB 00000000000000000000000000000000:0000 0A 00000000:00000000 00:00000000 00000000 999 0 12345 1 0000000000000000 100 0 0 10 0\n",
+			want: wait.PortListenOpen,
+		},
+		{
+			name: "established is not listening",
+			port: "6379/tcp",
+			out:  procNetHeader + procNetLine(6379, "01"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "different port is not listening",
+			port: "6379/tcp",
+			out:  procNetHeader + procNetLine(8081, "0A"),
+			want: wait.PortListenClosed,
+		},
+		{
+			name: "missing cat reports unsupported",
+			port: "6379/tcp",
+			code: 127,
+			want: wait.PortListenUnsupported,
+		},
+		{
+			name: "missing proc table reports unsupported",
+			port: "6379/tcp",
+			out:  "cat: /proc/net/tcp: No such file or directory\ncat: /proc/net/tcp6: No such file or directory\n",
+			code: 1,
+			want: wait.PortListenUnsupported,
+		},
+		{
+			name: "missing tcp6 with readable tcp is still authoritative",
+			port: "6379/tcp",
+			out:  procNetHeader + procNetLine(6379, "0A"),
+			code: 1,
+			want: wait.PortListenOpen,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{fakeRunner: newTestRunner(), execStdout: tc.out}
+			if tc.code != 0 {
+				f.execErr = &cli.CLIError{Binary: "docker", Args: []string{"exec"}, ExitCode: tc.code, Stderr: "cat: not found"}
+			}
+			target := newDockerWaitTarget(f)
+			got, err := target.ContainerPortStatus(context.Background(), tc.port)
+			if err != nil {
+				t.Fatalf("ContainerPortStatus: %v", err)
+			}
+			if got != tc.want {
+				t.Fatalf("status = %v, want %v", got, tc.want)
+			}
+			execCall := f.callWith("exec")
+			if len(execCall) == 0 {
+				t.Fatal("no exec call recorded")
+			}
+			wantCommand := procNetCommand()
+			if len(execCall) < len(wantCommand) {
+				t.Fatalf("exec call = %v, want the command %v", execCall, wantCommand)
+			}
+			if !slices.Equal(execCall[len(execCall)-len(wantCommand):], wantCommand) {
+				t.Errorf("exec tail = %v, want %v", execCall, wantCommand)
+			}
+		})
+	}
+}
+
+func TestWaitTargetContainerPortStatusUsesDeclaredContainerPort(t *testing.T) {
+	// The published host port (18081) is listening, but the declared
+	// container port (8081) is not. Checking the host port here would
+	// reintroduce exactly the proxy false positive this check prevents.
+	f := &execRunner{
+		fakeRunner: newTestRunner(),
+		execStdout: procNetHeader + procNetLine(18081, "0A") + procNetLine(8081, "01"),
+	}
+	ctr := &Container{
+		id:        "myctr",
+		runner:    f,
+		eng:       dockerEngine{},
+		published: []publishSpec{{hostAddr: "127.0.0.1", hostPort: 18081, containerPort: 8081, proto: "tcp", raw: "127.0.0.1:18081:8081/tcp"}},
+	}
+	ctr.pack().uid = dockerFixtureID
+	target := waitTarget{c: ctr}
+
+	status, err := target.ContainerPortStatus(context.Background(), "")
+	if err != nil {
+		t.Fatalf("ContainerPortStatus: %v", err)
+	}
+	if status != wait.PortListenClosed {
+		t.Fatalf("status = %v, want closed for the declared container port", status)
+	}
+}
+
+func TestWaitTargetContainerPortStatusSkipsApple(t *testing.T) {
+	failIfCalled := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		t.Fatal("Apple Container must not run a container-side listen check")
+		return nil, nil, nil
+	})
+	target := waitTarget{c: &Container{id: "myctr", runner: failIfCalled, eng: appleEngine{}, creation: "0123456789abcdef"}}
+
+	status, err := target.ContainerPortStatus(context.Background(), "6379/tcp")
+	if err != nil {
+		t.Fatalf("ContainerPortStatus: %v", err)
+	}
+	if status != wait.PortListenUnsupported {
+		t.Fatalf("status = %v, want unsupported", status)
+	}
+}
+
+func TestWaitTargetContainerPortStatusPropagatesExecError(t *testing.T) {
+	execErr := errors.New("temporary exec failure")
+	f := &execRunner{fakeRunner: newTestRunner(), execErr: execErr}
+	target := newDockerWaitTarget(f)
+
+	status, err := target.ContainerPortStatus(context.Background(), "6379/tcp")
+	if !errors.Is(err, execErr) {
+		t.Fatalf("error = %v, want %v", err, execErr)
+	}
+	if status != wait.PortListenUnsupported {
+		t.Fatalf("status = %v, want unsupported alongside the error", status)
+	}
+}
+
+func TestWaitTargetContainerPortStatusFallsBackWhenCheckUnavailable(t *testing.T) {
+	tests := []struct {
+		name    string
+		execErr error
+		code    int
+		out     string
+	}{
+		{
+			name:    "executable launch error",
+			execErr: &exec.Error{Name: "docker", Err: exec.ErrNotFound},
+		},
+		{
+			name:    "backend does not support exec",
+			execErr: fmt.Errorf("%w: exec is not available", ErrUnsupportedCapability),
+		},
+		{
+			name: "missing cat exit 127",
+			code: 127,
+			out:  procNetHeader + procNetLine(6379, "0A"),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := &execRunner{fakeRunner: newTestRunner(), execStdout: tc.out, execErr: tc.execErr}
+			if tc.code != 0 {
+				f.execErr = &cli.CLIError{Binary: "docker", Args: []string{"exec"}, ExitCode: tc.code, Stderr: "cat: not found"}
+			}
+			target := newDockerWaitTarget(f)
+			status, err := target.ContainerPortStatus(context.Background(), "6379/tcp")
+			if err != nil {
+				t.Fatalf("ContainerPortStatus: %v, want an unavailable check to report unsupported without error", err)
+			}
+			if status != wait.PortListenUnsupported {
+				t.Fatalf("status = %v, want unsupported", status)
+			}
+		})
+	}
+}
+
+func TestWaitTargetContainerPortStatusKeepsContextErrorRetryable(t *testing.T) {
+	f := &execRunner{fakeRunner: newTestRunner()}
+	target := newDockerWaitTarget(f)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	status, err := target.ContainerPortStatus(ctx, "6379/tcp")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if status != wait.PortListenUnsupported {
+		t.Fatalf("status = %v, want unsupported alongside the error", status)
+	}
+}
+
+type fixedEndpointWaitTarget struct {
+	waitTarget
+	endpoint string
+}
+
+func (t fixedEndpointWaitTarget) Endpoint(context.Context, string) (string, error) {
+	return t.endpoint, nil
+}
+
+func (t fixedEndpointWaitTarget) State(context.Context) (wait.State, error) {
+	return wait.StateRunning, nil
+}
+
+func TestWaitTargetHostOnlyFallbackWhenCatIsMissing(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+
+	f := &execRunner{fakeRunner: newTestRunner(), execErr: &cli.CLIError{
+		Binary:   "docker",
+		Args:     []string{"exec"},
+		ExitCode: 127,
+		Stderr:   `exec: "cat": executable file not found in $PATH`,
+	}}
+	target := fixedEndpointWaitTarget{
+		waitTarget: newDockerWaitTarget(f),
+		endpoint:   ln.Addr().String(),
+	}
+	err = wait.ForListeningPort("6379/tcp").
+		WithStartupTimeout(time.Second).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v, want the host-only fallback", err)
+	}
+	if f.callWith("exec") == nil {
+		t.Fatal("container-side check was not attempted")
 	}
 }
 

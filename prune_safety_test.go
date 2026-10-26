@@ -33,7 +33,8 @@ type pruneFixtureContainer struct {
 }
 
 type pruneFixtureConfiguration struct {
-	Labels map[string]string `json:"labels"`
+	Labels       map[string]string `json:"labels"`
+	CreationDate string            `json:"creationDate,omitempty"`
 }
 
 type pruneFixtureStatus struct {

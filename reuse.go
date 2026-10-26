@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
@@ -102,6 +103,20 @@ func isReuseIncompleteSetupError(err error) bool {
 	return errors.As(err, &incomplete)
 }
 
+// reuseFlightKey identifies one get-or-create request. Network aliases are
+// part of the identity: callers that ask for the same name with different
+// aliases must not share a leader's result because Docker registers aliases
+// only when it creates the container. Alias order is irrelevant.
+func reuseFlightKey(cfg *config) string {
+	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
+	if len(cfg.networkAliases) == 0 {
+		return key
+	}
+	aliases := append([]string(nil), cfg.networkAliases...)
+	sort.Strings(aliases)
+	return key + "\x00" + strings.Join(aliases, "\x00")
+}
+
 func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -118,7 +133,7 @@ func reuseRun(ctx context.Context, image string, cfg *config) (*Container, error
 		}
 		cfg.imagePrepared = true
 	}
-	key := cfg.eng.name() + "\x00" + cfg.eng.targetID() + "\x00" + cfg.name
+	key := reuseFlightKey(cfg)
 	var leaderWarning error
 	base, leader, err := reuseFlights.doWithLeader(ctx, key, func() (*Container, error) {
 		// Do not detach a canceled preflight into a new shared flight.
@@ -970,6 +985,9 @@ func checkReuseCompatIdentity(info *engineInfo, requested imageIdentity, origina
 		if err := dockerNetworkModeErrorDefault(requested, info.networkMode, info.networkNames, info.defaultNetwork); err != nil {
 			return fmt.Errorf("reuse %s: %w", cfg.name, err)
 		}
+		if err := dockerReuseNetworkAliasesError(cfg, info); err != nil {
+			return fmt.Errorf("reuse %s: %w", cfg.name, err)
+		}
 		if len(cfg.exposed) > 0 || len(cfg.published) > 0 {
 			if err := dockerNetworkEndpointError(info.networkMode); err != nil {
 				return fmt.Errorf("reuse %s: %w", cfg.name, err)
@@ -1200,6 +1218,7 @@ func stripImageDigest(ref string) string {
 // PruneReuseGroup force-removes every container tagged with the given
 // WithReuseGroup value, running or stopped. Use it as a CI teardown
 // step; ordinary Prune still only removes stopped managed containers.
+// PruneOption values such as WithPruneOlderThan apply.
 func PruneReuseGroup(ctx context.Context, group string, opts ...PruneOption) ([]string, error) {
 	if err := validateReuseGroupFor("PruneReuseGroup", group); err != nil {
 		return nil, err

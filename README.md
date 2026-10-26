@@ -118,10 +118,15 @@ func TestRedis(t *testing.T) {
 |---|---|---|
 | macOS | Apple Container | macOS 26+, Apple Silicon, [Apple Container](https://github.com/apple/container) CLI 1.2.2 or 1.3.0 with `container system start` done |
 | Linux | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon; copy-out requires client/server 29.7.0+ |
-| Windows | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon; copy-out requires client/server 29.7.0+ (no watchdog reaper; see below) |
+| Windows | Docker | docker CLI 29.x (29.7.2 is checked here) + running daemon; copy-out requires client/server 29.7.0+ (no watchdog reaper; use `Prune` in `TestMain`, see Cleanup contract) |
 
 Set `CONTAINERGO_BACKEND=docker` to use Docker on macOS (e.g. Docker
 Desktop), or `CONTAINERGO_BACKEND=apple` to insist on Apple Container.
+
+On Windows the watchdog reaper is unavailable, and a remote daemon
+outlives the local test environment. Schedule `Prune` from `TestMain`
+before and after the suite, as described in the Cleanup contract, rather
+than relying on the reaper to remove leftovers.
 
 The library shells out to the backend CLI (`container` or `docker`) — no
 cgo and no daemon API client. `DOCKER_HOST`, contexts, and registry auth
@@ -355,6 +360,19 @@ and reuse operations inspect that ID; dynamic network, IP, and binding
 data are refreshed on every operation rather than served from a stale
 snapshot.
 
+For parallel tests that need the same logical name on separate networks,
+create a user-defined network per test (for example with `docker network
+create`), remove it in `t.Cleanup`, and pass `WithNetworkAliases("db")`
+with that `WithNetwork`. Each container then resolves as `db` inside its
+own network without colliding with other tests or with container names.
+Network aliases require an explicitly selected user-defined network:
+Docker's default bridge, `host`, `none`, and `nat` networks do not
+resolve them, so `Run` rejects those combinations with a `*ConfigError`
+before any backend call. The aliases are part of the reuse compatibility
+check, so a reused container that does not carry them is not adopted.
+The library attaches to existing networks; it does not create or delete
+them.
+
 Both `DOCKER_HOST` and Docker contexts are honored for host reachability;
 endpoint hosts resolve to the detected remote endpoint.
 
@@ -467,6 +485,19 @@ For custom strategies, `wait.Target` retains its original `Running` method.
 Implement the optional `wait.StateTarget` interface when the target can
 distinguish transient startup states; built-in strategies use it automatically
 and fall back to `Running` for compatibility.
+
+On Docker, a successful TCP connection to a published port does not prove
+that the container process listens: `docker-proxy` or Docker Desktop's port
+forwarder completes the handshake first. `ForListeningPort` and
+`ForExposedPort` therefore follow a successful host connection with a
+container-side check that the declared container port is in `LISTEN` state,
+read from `/proc/net/tcp` and `/proc/net/tcp6` through `exec`. When that check
+cannot run — Apple Container (which reaches the VM endpoint directly), an
+image without `cat` such as distroless, or another unsupported target — the
+strategy falls back to the host connection alone. That fallback is
+best-effort: it restores the historical host-only behavior because the
+container-side check is unavailable, not because the port is known to be
+ready. Use `WithHostOnly()` to skip the container-side check explicitly.
 
 `ForListeningPort` and `ForExposedPort` are TCP-only readiness probes.
 UDP may be declared for endpoint configuration, but the current
@@ -997,6 +1028,56 @@ func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
 }
 ```
 
+`container.WithPruneOlderThan(d)` narrows that selection to candidates the
+backend reports as created before now-d. It is useful for a sweep on a
+shared or remote daemon because a concurrent job's recently stopped
+containers are left alone. A candidate whose creation time the backend
+does not report is also left in place. Ordinary `Prune` still selects only
+stopped managed containers, so a running leftover is not removed until it
+stops.
+
+### Windows and remote-daemon cleanup
+
+The reaper is a local `/bin/sh` child. It is unavailable on Windows, and it
+cannot act after the local process tree or runner VM is destroyed, for
+example when CI cancels a job or `go test -timeout` kills the process.
+Containers on a remote Docker daemon also outlive that local environment.
+Registration and deletion are best effort even when the reaper runs; do not
+treat the reaper as a cleanup acknowledgement.
+
+For those environments, sweep stopped managed containers from `TestMain`
+before and after the suite. Call the helper below from `TestMain` and exit
+with its result (`func TestMain(m *testing.M) { os.Exit(pruneAndRun(m)) }`):
+
+```go
+package docexample
+
+import (
+	"context"
+	"testing"
+	"time"
+
+	container "github.com/hirokazumiyaji/container-go"
+)
+
+func pruneAndRun(m *testing.M) int {
+	ctx := context.Background()
+	// Reap leftovers that are old enough not to belong to a concurrent run.
+	_, _ = container.Prune(ctx, container.WithPruneOlderThan(6*time.Hour))
+	code := m.Run()
+	// Remove this run's stopped containers.
+	_, _ = container.Prune(ctx)
+	return code
+}
+```
+
+`Prune` removes only stopped managed containers, from any session; running
+and created containers are left alone. On a shared or remote daemon, keep
+the age filter for the pre-suite sweep so another job's recently stopped
+containers survive, and use plain `Prune` after the suite only when the
+daemon is dedicated to this job. The same calls work against a remote
+daemon through the process environment or a `Client` pinned to that daemon.
+
 ## Reuse (shared containers across tests/processes)
 
 `WithReuse` turns `Run` into a get-or-create for a stable `WithName`.
@@ -1109,8 +1190,9 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 - Every CLI call is an argv vector; no shell is involved. The one shell
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
-  staging path before invoking the backend. `WithFiles` is regular-file-only.
-  Symlinks/reparse points and special files are rejected. Snapshots are
+  staging path before invoking the backend. `WithFiles` is regular-file-only
+  and rejects directories, symlinks/reparse points, and special files when the
+  option is applied, before any backend call. Snapshots are
   bounded by `MaxCopyToContainerSize` (64 MiB of file bytes),
   `MaxCopyToContainerEntries` (10,000 entries), `MaxCopyToContainerDepth`
   (128), and `MaxCopyToContainerMetadataSize` (8 MiB of visited source

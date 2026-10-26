@@ -450,3 +450,103 @@ func TestCopyFileFromContainerRetriesFailedVersionCheck(t *testing.T) {
 		t.Fatalf("copy version lookups = %d, want 2 (failure then retry)", got)
 	}
 }
+
+// newCopyMetadataClient returns a Client targeting one Docker daemon whose
+// runner records Docker version calls.
+func newCopyMetadataClient(runner cli.Runner) *Client {
+	return &Client{
+		eng:        newDockerEngine("tcp://daemon-a:2375", "", "", ""),
+		runner:     runner,
+		dockerMeta: newDockerMetadataCache(time.Minute),
+	}
+}
+
+func runClientCopyContainer(t *testing.T, client *Client, name string) *Container {
+	t.Helper()
+	ctr, err := client.Run(context.Background(), "redis:7-alpine", WithName(name))
+	if err != nil {
+		t.Fatalf("Run %s: %v", name, err)
+	}
+	return ctr
+}
+
+func assertClientCopySucceeds(t *testing.T, ctr *Container, name string) {
+	t.Helper()
+	rc, err := ctr.CopyFileFromContainer(context.Background(), "/out/result.txt")
+	if err != nil {
+		t.Fatalf("copy %s: %v", name, err)
+	}
+	if _, err := io.ReadAll(rc); err != nil {
+		t.Fatalf("read copy %s: %v", name, err)
+	}
+	if err := rc.Close(); err != nil {
+		t.Fatalf("close copy %s: %v", name, err)
+	}
+}
+
+// copyVersionProbeCount counts the `docker version --format {{json .}}` calls
+// that verify copy-out support. The default-network probe uses the same
+// subcommand with another format and must not be counted.
+func copyVersionProbeCount(r *countingRunner) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	count := 0
+	for _, args := range r.args {
+		if len(args) >= 3 && args[0] == "version" && args[2] == "{{json .}}" {
+			count++
+		}
+	}
+	return count
+}
+
+func TestCopyFileFromContainerSharesVersionCheckAcrossClientHandles(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	inner := newMetadataRunner()
+	inner.setBinary("docker")
+	runner := newCountingRunner(inner)
+	client := newCopyMetadataClient(runner)
+
+	var second *Container
+	for _, name := range []string{"first", "second"} {
+		ctr := runClientCopyContainer(t, client, name)
+		assertClientCopySucceeds(t, ctr, name)
+		if name == "second" {
+			second = ctr
+		}
+	}
+	// The Client cache also holds the default-network answer. Resolving it
+	// must neither consume the copy-out entry nor trigger another probe.
+	if name, err := second.ensureDefaultNetwork(context.Background()); err != nil {
+		t.Fatalf("ensure default network: %v", err)
+	} else if name != dockerNetworkBridge {
+		t.Fatalf("default network = %q, want %q", name, dockerNetworkBridge)
+	}
+	assertClientCopySucceeds(t, second, "second after network lookup")
+	if got := copyVersionProbeCount(runner); got != 1 {
+		t.Fatalf("copy version probes = %d, want 1 across the Client's handles", got)
+	}
+}
+
+func TestCopyFileFromContainerVersionCheckRetriedAcrossClientHandles(t *testing.T) {
+	skipIfCopyFileOpenUnsupported(t)
+	inner := newMetadataRunner()
+	inner.setBinary("docker")
+	inner.failCopyVer = true
+	runner := newCountingRunner(inner)
+	client := newCopyMetadataClient(runner)
+
+	first := runClientCopyContainer(t, client, "first")
+	if _, err := first.CopyFileFromContainer(context.Background(), "/out/result.txt"); !errors.Is(err, ErrCopyFileFromContainerUnsupported) {
+		t.Fatalf("first copy error = %v, want ErrCopyFileFromContainerUnsupported", err)
+	}
+
+	inner.mu.Lock()
+	inner.failCopyVer = false
+	inner.mu.Unlock()
+	second := runClientCopyContainer(t, client, "second")
+	assertClientCopySucceeds(t, second, "second")
+	assertClientCopySucceeds(t, second, "second retry")
+	if got := copyVersionProbeCount(runner); got != 2 {
+		t.Fatalf("copy version probes = %d, want 2 (failure then retry across handles)", got)
+	}
+}

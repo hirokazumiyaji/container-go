@@ -194,7 +194,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
 - `WithLabels(labels map[string]string)`：追加ラベル
 - `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
-- `WithFiles(files ...File)`：起動後にコンテナへコピーするファイル
+- `WithFiles(files ...File)`：起動後にコンテナへコピーする通常ファイル。option 評価時にディレクトリ、シンボリックリンク、特殊ファイルを拒否する
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
 - `WithCPUs(n int)` / `WithMemory(size string)`：リソース制限
 - `WithUser(u string)` / `WithWorkingDir(dir string)`：実行ユーザーと作業ディレクトリ
@@ -255,7 +255,8 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 各 source entry は、最終要素のリンクを追わずに一度だけ開く。
 ディレクトリ内の child は、既に開いた親ハンドルからの相対 open で取得する。
 そのハンドルを、backend CLI の実行前に現在のユーザー専用の staging root へコピーする。
-`WithFiles` も同じ経路を使うが、ディレクトリを拒否する。
+`WithFiles` も同じ経路を使うが、option 評価時に通常ファイル以外
+（ディレクトリ、シンボリックリンク、特殊ファイル）を `ValidationError` で拒否する。
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。

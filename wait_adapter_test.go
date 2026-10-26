@@ -527,3 +527,231 @@ func TestWaitFailureLogTailReturnsNoLogsWithoutVerifiedTarget(t *testing.T) {
 		t.Fatalf("log targets = %v, want no log command before verification", targets)
 	}
 }
+
+func TestWaitTargetHealthReadsLifecycleSnapshot(t *testing.T) {
+	validUID := strings.Repeat("a", 64)
+	responses := []string{
+		`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":{"Status":"starting"}}}]`,
+		`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":{"Status":"healthy"}}}]`,
+	}
+	inspects := 0
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		index := inspects
+		if index >= len(responses) {
+			index = len(responses) - 1
+		}
+		inspects++
+		return []byte(responses[index]), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = validUID
+	installDynamicClock(ctr)
+	target := waitTarget{c: ctr}
+
+	health, err := target.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health != wait.HealthStarting {
+		t.Fatalf("Health = %q, want %q", health, wait.HealthStarting)
+	}
+	if inspects != 1 {
+		t.Fatalf("inspects = %d, want the initial fallback inspect", inspects)
+	}
+
+	// The strategy's 1 Hz lifecycle probe is the only caller that refreshes
+	// the snapshot; Health itself must not spawn another inspect.
+	if _, err := target.State(context.Background()); err != nil {
+		t.Fatalf("State: %v", err)
+	}
+	health, err = target.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health != wait.HealthHealthy {
+		t.Fatalf("Health = %q, want the refreshed %q", health, wait.HealthHealthy)
+	}
+	if inspects != 2 {
+		t.Fatalf("inspects = %d, want Health to reuse the lifecycle snapshot", inspects)
+	}
+}
+
+func TestWaitTargetHealthRejectsAppleBeforeInspect(t *testing.T) {
+	inspects := 0
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		inspects++
+		return nil, nil, errors.New("Apple healthcheck must not inspect")
+	})
+	target := waitTarget{c: &Container{id: "myctr", runner: runner, eng: appleEngine{}, creation: "0123456789abcdef"}}
+
+	_, err := target.Health(context.Background())
+	if !errors.Is(err, ErrUnsupportedCapability) {
+		t.Fatalf("error = %v, want ErrUnsupportedCapability", err)
+	}
+	if !errors.Is(err, wait.ErrInvalidConfiguration) {
+		t.Fatalf("error = %v, want wait.ErrInvalidConfiguration", err)
+	}
+	var configErr *wait.ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("error = %v, want *wait.ConfigError", err)
+	}
+	if inspects != 0 {
+		t.Fatalf("inspects = %d, want Apple rejected before the backend runs", inspects)
+	}
+}
+
+func TestRunRejectsHealthcheckOnAppleBeforeBackendCalls(t *testing.T) {
+	strategies := []wait.Strategy{
+		wait.ForHealthcheck(),
+		wait.ForAll(wait.ForExec([]string{"true"}), wait.ForHealthcheck()),
+	}
+	for _, strategy := range strategies {
+		f := newTestRunner()
+		_, err := Run(context.Background(), "redis:7-alpine",
+			WithName("myctr"),
+			WithWaitStrategy(strategy),
+			withRunner(f), withEngine(appleEngine{}))
+		if !errors.Is(err, ErrUnsupportedCapability) {
+			t.Fatalf("Run error = %v, want ErrUnsupportedCapability", err)
+		}
+		if len(f.calls) != 0 {
+			t.Fatalf("backend was called before the Apple healthcheck rejection: %v", f.calls)
+		}
+	}
+}
+
+func TestWaitTargetMissingHealthcheckIsConfigurationError(t *testing.T) {
+	validUID := strings.Repeat("a", 64)
+	inspects := 0
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		inspects++
+		return []byte(`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":null}}]`), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = validUID
+	installDynamicClock(ctr)
+	target := waitTarget{c: ctr}
+
+	err := wait.ForHealthcheck().
+		WithStartupTimeout(time.Hour).
+		WaitUntilReady(context.Background(), target)
+	if !errors.Is(err, wait.ErrInvalidConfiguration) {
+		t.Fatalf("WaitUntilReady error = %v, want wait.ErrInvalidConfiguration", err)
+	}
+	var configErr *wait.ConfigError
+	if !errors.As(err, &configErr) {
+		t.Fatalf("error = %v, want *wait.ConfigError", err)
+	}
+	if inspects != 1 {
+		t.Errorf("inspects = %d, want the missing HEALTHCHECK to fail from the lifecycle snapshot", inspects)
+	}
+}
+
+func TestWaitTargetHealthReinspectingStaleSnapshot(t *testing.T) {
+	validUID := strings.Repeat("a", 64)
+	inspects := 0
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		inspects++
+		return []byte(`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":{"Status":"unhealthy"}}}]`), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = validUID
+	clock := installDynamicClock(ctr)
+	ctr.storeDynamic(&engineInfo{
+		state:      StateRunning,
+		health:     "healthy",
+		observedAt: clock.Now(),
+	}, ctr.dynamicGeneration())
+	target := waitTarget{c: ctr}
+
+	// A snapshot within the lifecycle probe interval is reused.
+	health, err := target.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health != wait.HealthHealthy {
+		t.Fatalf("Health = %q, want the cached %q", health, wait.HealthHealthy)
+	}
+	if inspects != 0 {
+		t.Fatalf("inspects = %d, want cached health within the interval", inspects)
+	}
+
+	// Once the snapshot is older than the interval, the cached healthy
+	// result must not hide a later unhealthy observation.
+	clock.Advance(dynamicInspectTTL + time.Millisecond)
+	health, err = target.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health after stale snapshot: %v", err)
+	}
+	if health != wait.HealthUnhealthy {
+		t.Fatalf("Health = %q, want the fresh %q", health, wait.HealthUnhealthy)
+	}
+	if inspects != 1 {
+		t.Fatalf("inspects = %d, want one fresh inspect for the stale snapshot", inspects)
+	}
+
+	// The fresh result becomes the new cached observation.
+	health, err = target.Health(context.Background())
+	if err != nil {
+		t.Fatalf("Health after fresh inspect: %v", err)
+	}
+	if health != wait.HealthUnhealthy {
+		t.Fatalf("Health = %q, want the refreshed %q", health, wait.HealthUnhealthy)
+	}
+	if inspects != 1 {
+		t.Fatalf("inspects = %d, want the fresh result to be reused within the interval", inspects)
+	}
+}
+
+func TestWaitTargetHealthFreshInspectUsesQueryTimeout(t *testing.T) {
+	validUID := strings.Repeat("a", 64)
+	queryTimeout := 25 * time.Millisecond
+	runner := waitRunnerFunc(func(ctx context.Context, _ ...string) ([]byte, []byte, error) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Error("fresh health inspect has no deadline")
+		} else if remaining := time.Until(deadline); remaining > queryTimeout+10*time.Millisecond {
+			t.Errorf("inspect deadline is %v away, want at most the %v query timeout", remaining, queryTimeout)
+		}
+		return []byte(`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":{"Status":"healthy"}}}]`), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}, queryTimeout: queryTimeout}
+	ctr.pack().uid = validUID
+
+	// The caller's deadline is much longer than the query timeout. The
+	// fallback health inspect must use the shorter query budget.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel()
+	health, err := (waitTarget{c: ctr}).Health(ctx)
+	if err != nil {
+		t.Fatalf("Health: %v", err)
+	}
+	if health != wait.HealthHealthy {
+		t.Fatalf("Health = %q, want %q", health, wait.HealthHealthy)
+	}
+}
+
+func TestWaitTargetHealthInspectRateStaysAtLifecycleCadence(t *testing.T) {
+	validUID := strings.Repeat("a", 64)
+	inspects := 0
+	runner := waitRunnerFunc(func(context.Context, ...string) ([]byte, []byte, error) {
+		inspects++
+		return []byte(`[{"Id":"` + validUID + `","Name":"/myctr","State":{"Status":"running","Health":{"Status":"starting"}}}]`), nil, nil
+	})
+	ctr := &Container{id: "myctr", runner: runner, eng: dockerEngine{}}
+	ctr.pack().uid = validUID
+	target := waitTarget{c: ctr}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1200*time.Millisecond)
+	defer cancel()
+	err := wait.ForHealthcheck().
+		WithPollInterval(100*time.Millisecond).
+		WithStartupTimeout(5*time.Second).
+		WaitUntilReady(ctx, target)
+	if err == nil {
+		t.Fatal("want a timeout while the healthcheck stays starting")
+	}
+	if inspects > 2 {
+		t.Fatalf("inspects = %d over 1.2s, want at most one per lifecycle interval", inspects)
+	}
+}

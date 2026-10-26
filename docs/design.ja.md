@@ -374,7 +374,8 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
 - `wait.ForLog(pattern)`：`FollowLogs` のストリームを読み、部分文字列（`AsRegexp` による正規表現も可）が現れるまで待つ。照合は行単位で行い、`WithOccurrence(n)` で出現回数を指定できる。ストリーム方式なので poll 方式ではない。
 - `wait.ForListeningPort(port)`：解決したエンドポイントへの TCP 接続が成功するまで poll する。
 - `wait.ForExposedPort()`：`WithExposedPorts` で最初に宣言したポートを使う。
-- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。
+- `wait.ForHTTP(path)`：解決したエンドポイントへ HTTP リクエストを送り、ステータスが条件（既定は 2xx、`WithStatusCodeMatcher` で変更可）を満たすまで待つ。`WithPort` と `WithMethod` で対象を指定する。現在の開発チェックアウトは `WithHeaders`、`WithHeader`、`WithBasicAuth`、`WithTLS`、`WithTLSConfig`、`WithHTTPClient` も追加している。これらは `v0.2.0` にはなかった。受理したレスポンスボディは `WithResponseMatcher` で最大 64KiB まで判定でき、false なら再試行する。
+- `wait.ForHealthcheck()`：Docker の `HEALTHCHECK` が healthy になるまで待つ。`starting` の間は poll を続け、`unhealthy` は終端エラーになる。`HEALTHCHECK` を持たないイメージは `*wait.ConfigError` で即座に失敗し、Apple バックエンドはコンテナを作成する前にこの戦略を拒否する。
 - `wait.ForExec(cmd)`：バックエンド CLI でコマンドを起動し、終了コード（既定は 0）が条件を満たすまで待つ。
 - `wait.ForAll(strategies...)` / `wait.ForAny(strategies...)`：戦略を合成する。子戦略は各自の設定を保持する。現在の開発チェックアウトでは公開型 `AllStrategy` と `AnyStrategy` が `WithStartupTimeout` で合成全体を制限できるが、`WithPollInterval` は公開しない。`v0.2.0` の関数は、合成全体の timeout setter を持たない interface を返す。
 - `wait.ForLog(s string)`：`container logs --follow` の出力に部分文字列(または `AsRegexp` で正規表現)が現れるまで待つ。`WithOccurrence(n)` で出現回数を指定できる
@@ -382,7 +383,8 @@ Apple Container にはヘルスチェックも wait コマンドもないため�
   指定形式は `PORT` または `PORT/tcp` だけ。
   UDP と不正な形式は `Target.Endpoint` を呼び出す前に `*wait.ConfigError` 型で返す。
   このエラーは `wait.ErrInvalidConfiguration` と一致する。
-- `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ
+- `wait.ForHTTP(path string)`：`net/http` で対象ポートへリクエストし、ステータスコード(既定 2xx、`WithStatusCodeMatcher` で変更可)を満たすまで待つ。`WithResponseMatcher` は受理したレスポンスボディを最大 64KiB まで判定する。
+- `wait.ForHealthcheck()`：Docker の `HEALTHCHECK` が healthy になるまで待つ。`starting` の間は poll を続け、`unhealthy` は終端エラーになる。`HEALTHCHECK` を持たないイメージは `*wait.ConfigError` で即座に失敗する。
 - `wait.ForExec(cmd []string)`：`container exec` の終了コード(既定 0)を満たすまで待つ
 - `wait.ForAll(ss ...Strategy)` / `wait.ForAny(ss ...Strategy)`：合成。各子は自身の `WithStartupTimeout` を持ち、正の合成 `WithStartupTimeout` で合成全体を制限できる。合成のタイムアウトを正の値にしなければ、0 または負の値では合成を無制限にし、各子のタイムアウトを適用する。
 
@@ -407,7 +409,7 @@ type Strategy interface {
 }
 ```
 
-`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。`container.Run` が `*container.Container` を両方のインターフェースへ適合させる。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
+`Target` は `Endpoint`、`Running`、`FollowLogs`、`ExecCommand` を公開する小さなインターフェースである。`Target` は `ContainerIP` を公開しない。接続 strategy は解決済み endpoint を使う。この抽象化は Apple Container の direct IP と Docker の published port の両方に適合する。`Target` は従来の `Running` メソッドをカスタム戦略との互換性のために維持する。起動中の一時状態を区別できるターゲットは、任意の `StateTarget` インターフェースも実装する。組み込み戦略は `State` を優先し、互換性のため `Running` にフォールバックする。Docker のヘルスチェック待機では、任意の `HealthTarget` インターフェースも実装する。`ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返す。`container.Run` が `*container.Container` をこれらのインターフェースへ適合させる。依存方向は `container` から `wait` だけであり、逆方向を作らないため循環参照を避ける。
 
 ## クリーンアップ
 

@@ -86,6 +86,11 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   issue #82 and are not backend-neutral in this checkout.
 - Add `wait.ForHTTP` header, basic-auth, TLS, TLS-config, and custom
   HTTP-client setters.
+- Add `wait.ForHealthcheck()` for Docker's `HEALTHCHECK` status, with
+  `wait.HealthTarget` as the optional target extension; the Apple backend
+  rejects the strategy before creating a container. Add
+  `wait.HTTPStrategy.WithResponseMatcher` for up to 64KiB of response-body
+  matching after the status matcher accepts (#260).
 - Export `wait.AllStrategy` and `wait.AnyStrategy` and add
   `WithStartupTimeout` to bound a composite wait.
 - Expose the root `CLIError` alias and add `ErrContainerNotFound` and

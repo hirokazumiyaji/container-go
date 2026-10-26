@@ -29,7 +29,7 @@ func (e *CleanupError) Error() string {
 
 func (e *CleanupError) Unwrap() error { return e.Err }
 
-func (e *CleanupError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *CleanupError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**CleanupError)
 	if !ok || e == nil {
 		return false

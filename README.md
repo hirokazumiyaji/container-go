@@ -897,8 +897,11 @@ different error visibility.
 
 1. **Normal cleanup**: `container.Cleanup(t, ctr)` registers
    `TerminateContainer` through `t.Cleanup`. A termination error is sent to
-   the test's log. `container.TerminateContainer(ctr)` is the deferred-style
-   variant and returns its error to the caller. Both helpers are nil-safe.
+   the test's log. `container.TerminateContainer(ctx, ctr)` is the
+   deferred-style variant and returns its error to the caller. It uses the
+   caller's context; `Cleanup` and `StrictCleanup` bound the complete
+   teardown, including the name-lock wait, with a `terminateTimeout`
+   context (30 seconds by default). Both helpers are nil-safe.
 2. **Post-create rollback**: if a non-reuse `Run` fails while copying files
    or waiting for readiness, `Run` calls `Terminate`. If that deletion
    fails, the returned error includes the original failure and a message
@@ -954,6 +957,41 @@ dead states. The filter does not select running or created containers. On
 Apple, each candidate is re-inspected and re-verified (generation, session,
 managed label, and stopped state) under the stable per-name lock before
 deletion.
+
+Package-level `Prune` intentionally takes only backend-neutral
+`PruneOption` values and has no Docker target options. To prune a specific
+Docker daemon or context, construct a `Client` with `WithClientDockerHost`
+or `WithClientDockerContext` and call `Client.Prune`. `Pull` is different:
+package-level `Pull` accepts its own `WithPullDockerHost` and
+`WithPullDockerContext` options for a single fetch, while `Client.Pull`
+rejects them because the Client pins its target.
+
+`Container.Kill(ctx, signal string)` takes exactly one signal. An empty
+string selects the default SIGKILL. A non-empty signal is passed to the
+backend unchanged; multiple signals are now rejected at compile time.
+
+```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
+    // The caller's context bounds TerminateContainer.
+    defer container.TerminateContainer(ctx, ctr)
+
+    if err := ctr.Kill(ctx, "SIGTERM"); err != nil {
+        t.Fatal(err)
+    }
+    if err := ctr.Kill(ctx, ""); err != nil { // empty string means SIGKILL
+        t.Fatal(err)
+    }
+}
+```
 
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a

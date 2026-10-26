@@ -73,13 +73,6 @@ func DiagnosticValues(strategy Strategy) []string {
 	return values
 }
 
-// DiagnosticSecrets is a descriptive alias for DiagnosticValues.
-func DiagnosticSecrets(strategy Strategy) []string { return DiagnosticValues(strategy) }
-
-// SecretValues is a short alias for callers that prefer secret-oriented
-// terminology.
-func SecretValues(strategy Strategy) []string { return DiagnosticValues(strategy) }
-
 func safeDiagnosticError(err error, values ...string) error {
 	return cli.WithRedactor(err, cli.NewHashedContextRedactor(values...))
 }

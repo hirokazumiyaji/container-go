@@ -22,7 +22,7 @@ const (
 )
 
 func TestTerminateContainerIsNilSafe(t *testing.T) {
-	if err := TerminateContainer(nil); err != nil {
+	if err := TerminateContainer(context.Background(), nil); err != nil {
 		t.Fatalf("TerminateContainer(nil) = %v, want nil", err)
 	}
 }
@@ -31,7 +31,7 @@ func TestTerminateContainerDeletes(t *testing.T) {
 	f := newTestRunner()
 	ctr := runTestContainer(t, f)
 
-	if err := TerminateContainer(ctr); err != nil {
+	if err := TerminateContainer(context.Background(), ctr); err != nil {
 		t.Fatalf("TerminateContainer: %v", err)
 	}
 	if f.callWith("delete") == nil {
@@ -45,7 +45,7 @@ func TestTerminateContainerHonorsKeepEnv(t *testing.T) {
 	f.calls = nil
 
 	t.Setenv("CONTAINERGO_KEEP", "1")
-	if err := TerminateContainer(ctr); err != nil {
+	if err := TerminateContainer(context.Background(), ctr); err != nil {
 		t.Fatalf("TerminateContainer: %v", err)
 	}
 	if f.callWith("delete") != nil {

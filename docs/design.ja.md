@@ -204,7 +204,7 @@ func (c *Container) Terminate(ctx context.Context) error
 backend、timeout、cancellation error の場合も、failure 前に生成された partial stdout+stderr を reader に保持し、分類済み error とともに返す。CLI が返した終了コードが利用できる場合は、最初の戻り値にも保持する。command の起動中実際に context error が競合した場合だけ、その分類は終了コードに依存しません。Windows の `Process.Kill` が終了コード `1` を返す場合でも、その status を保持したまま型付き error を返します。後から inspect が deadline を使い切っただけでは `ExecTerminationError` にはなりません。
 context 取消時は stable process identity を持つ Unix target でのみ、直接の command lifecycle が所有する間だけ local CLI process group を停止します。Linux では `waitid(WSTOPPED|WNOWAIT)` で停止状態を確認できない場合、pidfd へ直接 signal を送り、古い PGID には signal を送りません。group signal の後は直接の子にも kill を送ります。この identity を持たない Unix target は直接の子 handle だけを使います。直接の子を回収した後は古い process group ID に signal を送りません。
 Windows では lifecycle が `OpenProcess` handle を保持し、`TerminateProcess` で直接の子だけを終了します。detach された descendant や親を付け替えられた descendant は保証外です。終了済み child への kill 成功は active process の証拠として扱いません。
-Windows 固有の lifecycle test は build constraint 付きです。開発環境では Windows package を cross-compile と vet できますが、Windows の process-handle runtime test や exit-259 の active-child test は実行できません。
+Windows 固有の lifecycle test は build constraint 付きで、exit-259 の active-child test も含め `windows-latest` の unit job で実行します。
 backend CLI には exec instance を kill する共通操作がないため、active-child の証拠が利用できる場合に `*ExecTerminationError`（`errors.Is(err, ErrExecTerminationUnsupported)`）を返します。保守的な direct-handle fallback では remote process の終了を主張せず context error だけを返すことがあります。process が残り得るため、caller は container を terminate するか backend 固有 cleanup を実行します。したがって error が non-nil でも reader を読む必要があります。Linux の stable identity は pidfd が process を参照する。pidfd 非対応 kernel では、他の Unix target と同じく保守的な direct-handle fallback を使う。
 
 `WithExecEnv`、`WithExecUser`、`WithExecWorkDir` は個別の exec 呼び出しを設定する。環境変数の値は `WithEnv` と同じ一時ファイル方式を使う。
@@ -212,7 +212,7 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 
 `LogsOptions.Tail` と `MaxBytes` は非負として検証され、`WithMemory` は zero と overflow を拒否し、`WithMounts` は unknown な `MountType` を拒否する。`PruneReuseGroup` は `WithReuseGroup` と同じ group grammar を使う。
 
-`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。要求した target を含まない inspect 結果も含め、backend が認識した not-found CLI failure を成功として扱うため、冪等性の主張は not-found と delete 成功を対象にする。malformed な inspect response は沈黙した success ではなく error になり、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。
+`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。要求した target を含まない inspect 結果も含め、backend が認識した not-found CLI failure を成功として扱うため、冪等性の主張は not-found と delete 成功を対象にする。malformed な inspect response は沈黙した success ではなく error になり、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctx, ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。`TerminateContainer` は caller の context を使い、`Cleanup` と `StrictCleanup` は `terminateTimeout`（既定 30 秒）の context を渡して teardown の予算を維持する。
 
 `CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
 
@@ -365,9 +365,15 @@ type Strategy interface {
 各経路でエラーの見え方は異なる。
 
 **通常の cleanup**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を
-登録する。`TerminateContainer(ctr)` は nil 安全な defer 形式である。
+登録する。`TerminateContainer(ctx, ctr)` は nil 安全な defer 形式である。
+caller の context を使い、`Cleanup` と `StrictCleanup` は完全な teardown を
+`terminateTimeout`（既定 30 秒）で制限する。
 `Cleanup` の終了エラーはテストの log に残り、`TerminateContainer` は
 エラーを呼び出し元へ返す。
+
+`Container.Kill(ctx, signal string)` は signal を 1 つだけ取る。空文字列は
+既定の SIGKILL で、空でない signal は backend へそのまま渡す。そのため
+不正な綴りは可変長引数の検査ではなく backend が拒否する。
 
 **作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
 途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、
@@ -433,6 +439,8 @@ grep したり、シンボリックリンクを追跡したり、broad recursive
 - 作成世代ラベルと、Reuse 時の再利用グループラベル
 
 Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。Docker は exited と dead 状態を選ぶ。running と created 状態は選ばない。Apple では、各 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、session、管理対象ラベル、および停止状態が再確認される。
+
+package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、Docker target の option を持たない。特定の Docker daemon や context を対象にする場合は、`WithClientDockerHost` または `WithClientDockerContext` で `Client` を作り、`Client.Prune` を使う。`Pull` は pull 固有の target option (`WithPullDockerHost`、`WithPullDockerContext`) を維持するが、`Client.Pull` は Client が target を固定するためこれらの上書きを拒否する。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグである。`Cleanup` と
 `TerminateContainer` による自動削除、リーパー登録を省略し、作成失敗、

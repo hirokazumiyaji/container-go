@@ -166,6 +166,10 @@ type lockPack struct {
 	// attachTeardown marks a stream the library is ending itself, so an error
 	// racing the teardown is not reported as a stream failure.
 	attachTeardown bool
+	// attachTeardownErr holds failures observed while attachTeardown is set.
+	// A successful teardown discards them; a failed one publishes them because
+	// the container may still be running and the stream failure is genuine.
+	attachTeardownErr error
 	// attachGate carries the right to write to the attach destination. It is
 	// a channel rather than a mutex so a replacement stream can give up when
 	// the sink has wedged its predecessor instead of blocking behind it.
@@ -1429,11 +1433,14 @@ func (c *Container) markAttachTeardown() {
 }
 
 // clearAttachTeardown drops the teardown mark after the operation failed and
-// the stream is expected to continue.
+// publishes any stream failures observed during it: the container may still be
+// running, so those errors belong to the stream.
 func (c *Container) clearAttachTeardown() {
 	p := c.pack()
 	p.attachMu.Lock()
 	p.attachTeardown = false
+	p.attachErr = joinAttachError(p.attachErr, p.attachTeardownErr)
+	p.attachTeardownErr = nil
 	p.attachMu.Unlock()
 }
 
@@ -1456,6 +1463,13 @@ func (c *Container) stopAttached() {
 		case <-time.After(attachStopWait):
 		}
 	}
+	p.attachMu.Lock()
+	// The stream has finished or its sink is wedged. Errors from this window
+	// belonged to the teardown; output-delivery failures were recorded
+	// directly and stay in attachErr.
+	p.attachTeardown = false
+	p.attachTeardownErr = nil
+	p.attachMu.Unlock()
 }
 
 // startAttached launches the background stream behind WithAttachOutput. A
@@ -1480,6 +1494,7 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	// caller that observed AttachedDone closed that the failure is still
 	// readable after Start or Restart reattaches. Later failures are joined.
 	p.attachTeardown = false
+	p.attachTeardownErr = nil
 	p.attachCancel = cancel
 	p.attachDone = done
 	p.attachMu.Unlock()
@@ -1495,7 +1510,9 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 		case gate <- struct{}{}:
 			defer func() { <-gate }()
 			err := c.followLogsTo(attachCtx, output, resumeSince)
-			if attachCtx.Err() == nil {
+			// A teardown cancellation is not a stream failure, but losing
+			// output to a failing sink is always reportable.
+			if attachCtx.Err() == nil || errors.Is(err, ErrOutputDelivery) {
 				c.recordAttachError(err)
 			}
 		case <-time.After(attachStopWait):
@@ -1508,6 +1525,9 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 // A later failure is joined with the earlier ones so a caller holding an older
 // AttachedDone keeps matching its stream's failure; a failure that already
 // matches the accumulated value is ignored instead of growing the join.
+// Failures observed during a teardown wait until the operation's outcome is
+// known; output-delivery failures are recorded immediately because stopping
+// the container must not hide lost output.
 func (c *Container) recordAttachError(err error) {
 	if err == nil {
 		return
@@ -1515,17 +1535,26 @@ func (c *Container) recordAttachError(err error) {
 	p := c.pack()
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
-	if p.attachTeardown {
+	if p.attachTeardown && !errors.Is(err, ErrOutputDelivery) {
+		p.attachTeardownErr = joinAttachError(p.attachTeardownErr, err)
 		return
 	}
-	if p.attachErr == nil {
-		p.attachErr = err
-		return
+	p.attachErr = joinAttachError(p.attachErr, err)
+}
+
+// joinAttachError adds err to the accumulated failures without duplicating a
+// failure already present in existing.
+func joinAttachError(existing, err error) error {
+	if err == nil {
+		return existing
 	}
-	if errors.Is(p.attachErr, err) {
-		return
+	if existing == nil {
+		return err
 	}
-	p.attachErr = errors.Join(p.attachErr, err)
+	if errors.Is(existing, err) {
+		return existing
+	}
+	return errors.Join(existing, err)
 }
 
 // attachedOutput returns the destination of the background stream, or nil when

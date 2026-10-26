@@ -1022,10 +1022,14 @@ func TestCleanupAcquiresOpenLockBeforeRemoval(t *testing.T) {
 
 	observedAcquired := false
 	stop := errors.New("stop after lock observation")
-	err = cleanupEnvFileAtWithClose(filepath.Dir(root), dir, func(string) error {
-		observedAcquired = state.lockAcquired
-		return stop
-	}, closeEnvFileLock)
+	err = cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{
+		base: filepath.Dir(root),
+		removeAll: func(string) error {
+			observedAcquired = state.lockAcquired
+			return stop
+		},
+		closeLock: closeEnvFileLock,
+	})
 	if !observedAcquired {
 		t.Fatal("cleanup reached removal without acquiring the writer lock")
 	}
@@ -1058,9 +1062,12 @@ func TestPendingCleanupDrainsOnNextSecurityScan(t *testing.T) {
 		t.Fatal(err)
 	}
 	lateErr := errors.New("injected late close failure")
-	err = cleanupEnvFileAtWithClose(filepath.Dir(root), dir, removeExpectedEnvChildren, func(lock *os.File) error {
-		_ = closeEnvFileLock(lock)
-		return lateErr
+	err = cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{
+		base: filepath.Dir(root),
+		closeLock: func(lock *os.File) error {
+			_ = closeEnvFileLock(lock)
+			return lateErr
+		},
 	})
 	if !errors.Is(err, lateErr) {
 		t.Fatalf("cleanup error = %v, want late close error", err)
@@ -1179,7 +1186,7 @@ func TestEnvPathCanonicalizesTrustedSymlinkAncestor(t *testing.T) {
 	if !strings.HasPrefix(path, filepath.Join(realParent, "cache")+string(filepath.Separator)) {
 		t.Fatalf("returned path %q was not canonicalized under %q", path, realParent)
 	}
-	if err := cleanupEnvFileAt(filepath.Dir(filepath.Dir(dir)), dir, removeExpectedEnvChildren); err != nil {
+	if err := cleanupEnvFileAt(context.Background(), dir, envFileCleanupOptions{base: filepath.Dir(filepath.Dir(dir))}); err != nil {
 		t.Fatal(err)
 	}
 }

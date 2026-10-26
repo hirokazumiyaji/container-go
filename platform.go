@@ -185,11 +185,6 @@ func platformMetadataMatches(selector string, actual platformMetadata) bool {
 	return valid && matches
 }
 
-//nolint:unused // retained for callers comparing individual platform components
-func platformPartMatches(selector, actual string) bool {
-	return selector == "" || strings.EqualFold(selector, actual)
-}
-
 func platformSelectorUnverifiable(selector, actual string) bool {
 	if selector == "" {
 		return false

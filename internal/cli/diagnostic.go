@@ -42,17 +42,10 @@ func NewHashedContextRedactor(values ...string) *Redactor {
 	return diagnostic.NewHashedContextRedactor(values...)
 }
 
-// SanitizeDiagnostic escapes terminal control characters without redacting
-// application-defined values.
-func SanitizeDiagnostic(s string) string { return diagnostic.Sanitize(s) }
-
 // ComposeRedactors combines redactors without mutating any input.
 func ComposeRedactors(redactors ...*Redactor) *Redactor {
 	return diagnostic.ComposeRedactors(redactors...)
 }
-
-// Compose is a short alias for ComposeRedactors.
-func Compose(redactors ...*Redactor) *Redactor { return ComposeRedactors(redactors...) }
 
 // WithRedactor returns err with a safe diagnostic rendering. The original
 // error remains available through errors.Is/errors.As, while the returned

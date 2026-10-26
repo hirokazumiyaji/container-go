@@ -21,7 +21,6 @@ import (
 
 	"github.com/hirokazumiyaji/container-go/internal/cli"
 	"github.com/hirokazumiyaji/container-go/internal/domain"
-	"github.com/hirokazumiyaji/container-go/internal/ports"
 	"github.com/hirokazumiyaji/container-go/wait"
 )
 
@@ -709,7 +708,7 @@ func waitForReusePoll(ctx context.Context, interval ...time.Duration) error {
 	if len(interval) > 0 && interval[0] > 0 {
 		d = interval[0]
 	}
-	return ports.RealClock{}.SleepWithContext(ctx, d)
+	return sleepWithContext(ctx, d)
 }
 
 // verifyCreatedOwnership validates the labels and backend identity before
@@ -1891,6 +1890,42 @@ func (c *Container) cachedDynamic() *engineInfo {
 	return info
 }
 
+// cachedInspectSnapshot returns the most recent lifecycle/network snapshot
+// even when it carries no endpoint data. Health waits reuse the 1 Hz
+// lifecycle probe's inspect through it instead of spawning another CLI
+// process for every check.
+func (c *Container) cachedInspectSnapshot() *engineInfo {
+	p := c.pack()
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return cloneEngineInfo(p.dynamic)
+}
+
+// healthStatus reports the Docker HEALTHCHECK status from a lifecycle
+// snapshot observed within the wait probe interval. A stale snapshot is
+// re-inspected through the normal query-timeout path so a cached healthy
+// result cannot mask a later unhealthy transition.
+func (c *Container) healthStatus(ctx context.Context) (string, error) {
+	p := c.pack()
+	now := p.currentTime()
+	if info := c.cachedInspectSnapshot(); info != nil {
+		if !info.observedAt.IsZero() && now.Sub(info.observedAt) <= dynamicInspectTTL {
+			return info.health, nil
+		}
+	}
+	// Re-observe through the normal identity-checked inspect, bounded by
+	// the same query timeout as other inspect-backed reads.
+	// inspectDynamicFresh stores the result through the generation-checked
+	// dynamic cache, so later polls reuse this observation until it ages out.
+	inspectCtx, cancel := context.WithTimeout(ctx, c.effectiveQueryTimeout())
+	defer cancel()
+	info, err := c.inspectDynamicFresh(inspectCtx)
+	if err != nil {
+		return "", err
+	}
+	return info.health, nil
+}
+
 func (c *Container) refreshDynamic(ctx context.Context) (*engineInfo, error) {
 	gen := c.dynamicGeneration()
 	info, err := c.inspectFresh(ctx)
@@ -2329,6 +2364,7 @@ func (c *Container) inspectFreshLocked(ctx context.Context) (*engineInfo, error)
 	// A name-addressed discovery deliberately returns the inspected UID to
 	// its caller as data only. It is never published into the handle UID here; the
 	// caller must first validate managed/reuse/session ownership.
+	info.observedAt = c.pack().currentTime()
 	return info, nil
 }
 

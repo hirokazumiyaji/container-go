@@ -617,7 +617,8 @@ provides:
   is per line; `WithOccurrence(n)` changes the required count. This
   strategy is stream-based rather than poll-based.
 - `wait.ForListeningPort(port)`: poll a TCP connection to the resolved
-  endpoint until it succeeds.
+  endpoint and, when supported, verify the container-side LISTEN state.
+  `WithHostOnly` skips the container-side check.
 - `wait.ForExposedPort()`: use the first exposed TCP port, falling back to
   the first published TCP port when no exposed TCP port is declared.
 - `wait.ForHTTP(path)`: send an HTTP request to the resolved endpoint
@@ -626,6 +627,13 @@ provides:
   target. The current development checkout also adds `WithHeaders`,
   `WithHeader`, `WithBasicAuth`, `WithTLS`, `WithTLSConfig`, and
   `WithHTTPClient`; these setters are not in `v0.2.0`.
+  `WithResponseMatcher(func(io.Reader) bool)` checks up to 64KiB of an
+  accepted response body, and a false verdict is retried.
+- `wait.ForHealthcheck()`: wait until Docker reports the image's
+  `HEALTHCHECK` as healthy. `starting` keeps polling and `unhealthy` is
+  terminal; an image without a HEALTHCHECK fails immediately with a
+  `*wait.ConfigError`, and the Apple backend rejects the strategy before
+  creating a container.
 - `wait.ForExec(cmd)`: run a command through the backend CLI until it
   exits with an accepted code (0 by default). Each attempt has a timeout
   derived from the poll interval (1–5s); `WithExecTimeout` overrides it.
@@ -682,9 +690,11 @@ resolved endpoint, which is the right abstraction for both direct-IP
 Apple Container and published-port Docker. `Target` keeps its original `Running`
 method for custom-strategy compatibility. Targets that distinguish startup
 transitions also implement the optional `StateTarget` interface; built-in
-strategies prefer `State` and fall back to `Running`. `container.Run` adapts
-`*container.Container` to both surfaces. The dependency points from `container`
-to `wait`, never back, avoiding an import cycle.
+strategies prefer `State` and fall back to `Running`. Docker healthcheck
+waits use the optional `HealthTarget` interface; `ForHealthcheck` returns a
+`*wait.ConfigError` for targets that do not implement it. `container.Run`
+adapts `*container.Container` to all three surfaces. The dependency points
+from `container` to `wait`, never back, avoiding an import cycle.
 
 ## Cleanup
 

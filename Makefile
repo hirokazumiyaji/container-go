@@ -1,4 +1,4 @@
-.PHONY: test vet vet-integration lint integration integration-docker bench-integration release-check release-check-bench
+.PHONY: test vet vet-integration lint deadcode integration integration-docker bench-integration release-check release-check-bench
 
 test:
 	go test ./...
@@ -17,6 +17,32 @@ vet-integration:
 
 lint:
 	golangci-lint run ./...
+
+# deadcode reports functions that no main or test binary reaches. Some
+# exported entry points are intentionally only callable by library users, so
+# they never appear reachable from in-repo code; this list names exactly those
+# (plus the internal/bench compatibility helpers that predate this guard).
+# Anything else is a regression: a forwarding wrapper left behind, or an
+# unexported helper kept alive only by another unreachable function.
+#
+# Build from tools/go.mod so the tool has one pinned version and Dependabot can
+# update it; `go run ...@latest` would float and an unpinned download in CI
+# would be a supply-chain hole.
+DEADCODE_ALLOWED := WithClientDockerConfig|WithClientPlatform|ScenarioPolicies|ScenarioPolicyFor|ScenarioNames|DiagnosticSecrets|SecretValues
+
+deadcode:
+	@tmp=$$(mktemp -d); trap 'rm -rf "$$tmp"' EXIT; \
+	(cd tools && go build -o "$$tmp/deadcode" golang.org/x/tools/cmd/deadcode) || exit $$?; \
+	out=$$("$$tmp/deadcode" -test -tags integration ./...) || exit $$?; \
+	if [ -z "$$out" ]; then echo 'deadcode: no unreachable functions'; exit 0; fi; \
+	printf '%s\n' "$$out"; \
+	unexpected=$$(printf '%s\n' "$$out" | grep -Ev ': unreachable func: ($(DEADCODE_ALLOWED))$$' || true); \
+	if [ -n "$$unexpected" ]; then \
+		printf '%s\n' "$$unexpected"; \
+		echo 'error: unreachable functions beyond the documented exported API' >&2; \
+		exit 1; \
+	fi; \
+	echo 'deadcode: only documented exported API functions are unreachable'
 
 # Skip pull-heavy bench / singleflight cases here; use bench-integration.
 integration:
@@ -90,6 +116,7 @@ release-check:
 	# job does not run on a tag push, so the tag gate would not.
 	$(VET_INTEGRATION)
 	$(MAKE) lint
+	$(MAKE) deadcode
 	go test -count=1 -race ./...
 	go mod verify
 	go mod tidy -diff

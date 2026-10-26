@@ -850,8 +850,10 @@ CLI がヘルパーをデタッチする設計の場合は、子孫の終了を�
 1. **通常の cleanup**: `container.Cleanup(t, ctr)` は
    `t.Cleanup` 経由で `TerminateContainer` を登録します。終了エラーは
    テストの log に残ります。defer 形式の
-   `container.TerminateContainer(ctr)` はエラーを呼び出し元へ返します。
-   どちらの helper も nil 安全です。
+   `container.TerminateContainer(ctx, ctr)` はエラーを呼び出し元へ返します。
+   caller の context を使い、`Cleanup` と `StrictCleanup` は
+   name-lock 待ちを含む完全な teardown を `terminateTimeout`
+   (既定 30 秒) の context で制限します。どちらの helper も nil 安全です。
 2. **作成後の rollback**: 再利用でない `Run` が file copy または readiness
    待ちの途中で失敗すると、`Run` は `Terminate` を呼びます。削除にも失敗
    した場合は、元の失敗とコンテナが残ったことを示すメッセージを返り値に
@@ -911,6 +913,42 @@ reuse container は削除・再作成されます。この変数をグローバ�
 この filter は running または created 状態を選びません。Apple では、各
 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、
 session、管理対象ラベル、および停止状態が再確認されます。
+
+package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、
+Docker target の option を持ちません。特定の Docker daemon や context を
+対象にする場合は、`WithClientDockerHost` または
+`WithClientDockerContext` で `Client` を作り、`Client.Prune` を呼びます。
+`Pull` は異なり、package レベルの `Pull` は 1 回の fetch 用に
+`WithPullDockerHost` と `WithPullDockerContext` を持ちます。
+`Client.Pull` は Client が target を固定するため、これらの上書きを
+拒否します。
+
+`Container.Kill(ctx, signal string)` は signal を 1 つだけ取ります。
+空文字列は既定の SIGKILL です。空でない signal は backend へそのまま
+渡され、複数 signal はコンパイル時に拒否されます。
+
+```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
+    // caller の context が TerminateContainer の上限になる。
+    defer container.TerminateContainer(ctx, ctr)
+
+    if err := ctr.Kill(ctx, "SIGTERM"); err != nil {
+        t.Fatal(err)
+    }
+    if err := ctr.Kill(ctx, ""); err != nil { // 空文字列は SIGKILL。
+        t.Fatal(err)
+    }
+}
+```
 
 `container.WithPruneOlderThan(d)` は、backend が報告する作成時刻が
 now-d より前の candidate だけに対象を絞ります。共有 daemon や remote
@@ -1058,7 +1096,7 @@ func TestReuse(t *testing.T) {
   削除しない。明示的な `ctr.Terminate` だけが共有コンテナを消し得る。
 - reused ハンドルでは、peer の観測結果を変えてしまう操作を
   `ErrSharedContainer` で拒否する: `Stop`、`CopyToContainer`、
-  `CopyFileFromContainer`。ガードがなければ 1 パッケージの `Stop` が
+  `CopyContentToContainer`、`CopyFileFromContainer`。ガードがなければ 1 パッケージの `Stop` が
   他パッケージが使用中のコンテナを停止し、被害は对方側では原因の
   特定できない接続失敗として現れる。読み取り系(`Endpoint`、`State`、
   `Exec`、`Logs` など)は対象外。共有コンテナの lifecycle を自プロセスが
@@ -1108,6 +1146,14 @@ key prefix、schema 分離、`Exec` による reset（`FLUSHALL` など）を使
   スナップショットの上限は `MaxCopyToContainerSize`（64 MiB）、`MaxCopyToContainerEntries`（10,000 エントリ）、`MaxCopyToContainerDepth`（128）、`MaxCopyToContainerMetadataSize`（訪問したソースパスの合計 8 MiB）です。
   保持するメタデータは名前、バイト列、Unix パーミッションだけです。
   タイムスタンプ、所有者、setuid/setgid、ACL、拡張属性、alternate data stream、sparse layout、hardlink identity は保持しません。
+- `WithFiles` は `HostPath` と nil でない `Content` バイト列のどちらか一方だけを指定します。
+  両方またはどちらも指定しない場合は、option 適用時に `ValidationError` を返します。
+  nil でない空の slice は空ファイルとしてコピーします。
+  `File.Mode` は非公開ステージング上のコピーの Unix パーミッションを上書きします。
+  0 は `HostPath` のパーミッションを保持し、`Content` では `0600` を既定値にします。
+  非 0 の値は permission bits だけを含む必要があり、type、setuid、setgid、sticky bit は拒否します。
+  `CopyContentToContainer` は既存の handle に対して同じステージングと mode の規則を適用します。
+  Content は argv、error、診断に現れず、ステージングファイルは成功、失敗、キャンセルのいずれでもステージングディレクトリごと削除されます。
 - レジストリ認証情報は本 library では扱いません。Apple Container では
   `container registry login`、Docker では `docker login` を使い、認証情報と
   registry context は backend CLI が管理します。

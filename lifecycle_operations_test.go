@@ -310,13 +310,16 @@ func TestKill(t *testing.T) {
 		f := newTestRunner()
 		ctr := runTestContainer(t, f)
 
-		if err := ctr.Kill(context.Background()); err != nil {
+		if err := ctr.Kill(context.Background(), ""); err != nil {
 			t.Fatalf("Kill: %v", err)
 		}
 
 		kill := f.callWith("kill")
 		if len(kill) == 0 || !slices.Contains(kill, "myctr") {
 			t.Errorf("kill call = %v", kill)
+		}
+		if slices.Contains(kill, "--signal") {
+			t.Errorf("default kill call includes a signal: %v", kill)
 		}
 	})
 
@@ -335,15 +338,19 @@ func TestKill(t *testing.T) {
 		}
 	})
 
-	t.Run("Validation errors", func(t *testing.T) {
+	t.Run("Single signal is forwarded unchanged", func(t *testing.T) {
 		f := newTestRunner()
 		ctr := runTestContainer(t, f)
 
-		if err := ctr.Kill(context.Background(), "SIGTERM", "SIGKILL"); err == nil {
-			t.Error("expected error for multiple signals, got nil")
+		const signal = "NOT-A-SIGNAL"
+		if err := ctr.Kill(context.Background(), signal); err != nil {
+			t.Fatalf("Kill: %v", err)
 		}
-		if err := ctr.Kill(context.Background(), ""); err == nil {
-			t.Error("expected error for empty signal, got nil")
+
+		kill := f.callWith("kill")
+		joined := strings.Join(kill, " ")
+		if !strings.Contains(joined, "--signal "+signal) {
+			t.Errorf("kill call = %v, want the caller's signal forwarded", kill)
 		}
 	})
 
@@ -354,7 +361,7 @@ func TestKill(t *testing.T) {
 		shared := ctr.Shared()
 		shared.reused = true
 		shared.allowDestructive = false
-		if err := shared.Kill(context.Background()); !errors.Is(err, ErrSharedContainer) {
+		if err := shared.Kill(context.Background(), ""); !errors.Is(err, ErrSharedContainer) {
 			t.Errorf("shared Kill error = %v, want ErrSharedContainer", err)
 		}
 	})
@@ -1338,7 +1345,7 @@ func TestWithAttachOutputStoppedOnKill(t *testing.T) {
 		t.Fatal("expected non-nil AttachedDone channel")
 	}
 
-	if err := ctr.Kill(context.Background()); err != nil {
+	if err := ctr.Kill(context.Background(), ""); err != nil {
 		t.Fatalf("Kill: %v", err)
 	}
 

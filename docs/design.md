@@ -254,9 +254,11 @@ described below are not.
 - `WithMounts(mounts ...Mount)`: bind, named-volume, and tmpfs mounts.
   Current bind-source validation is Unix-style; Windows host paths and
   remote Docker bind-source semantics are pending #76.
-- `WithFiles(files ...File)`: regular files copied into the running container
-  after start; a directory, symlink, or special source is rejected at option
-  evaluation, and a copy failure rolls back `Run`. On `WithReuse`, files
+- `WithFiles(files ...File)`: regular files copied into the running
+  container after start; a copy failure rolls back `Run`. Each `File` sets
+  exactly one of `HostPath` or `Content`; `Mode` optionally overrides the
+  Unix permission bits on the private staged copy. Host directories,
+  symlinks, and special files are rejected at option evaluation. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
   failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
@@ -315,12 +317,14 @@ they are rejected.
 `ValidationError.Err` is the source of truth for the rendered message and
 unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
-`Option`; `WithFiles` resolves each host path and rejects anything that is
-not a regular file before image or container work; Docker applies its
-complete local-volume-name grammar in
-`checkConfig` while Apple keeps its backend-specific name rules. Copy paths
-are interpreted as POSIX paths with the `path` package, and a negative
-`Container.Stop` timeout is rejected before the CLI is called.
+`Option`; `WithFiles` rejects a file that sets both or neither of `HostPath`
+and `Content`, rejects non-permission `Mode` bits, and resolves and checks each
+host path is a regular file before image or container work. A `Content` slice
+is bounded by `MaxCopyToContainerSize` at option evaluation. Docker applies its
+complete local-volume-name grammar in `checkConfig` while Apple keeps its
+backend-specific name rules. Copy paths are interpreted as POSIX paths with
+the `path` package, and a negative `Container.Stop` timeout is rejected before
+the CLI is called.
 
 ### The Container handle
 
@@ -345,6 +349,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
+func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
@@ -498,9 +503,12 @@ CLI failure as success, so its idempotence claim is limited to that case
 inspect output, and the current Docker parser does not reject a valid
 object whose ID or name differs from the requested target. Neither case
 is covered by the idempotence claim; unrelated delete failures still
-propagate. `Cleanup(t, ctr)` and `TerminateContainer(ctr)` are nil-safe
+propagate. `Cleanup(t, ctr)` and `TerminateContainer(ctx, ctr)` are nil-safe
 helpers preserving the testcontainers-go idiom of registering cleanup
-before checking `Run`'s error.
+before checking `Run`'s error. `TerminateContainer` uses the caller's
+context; `Cleanup` and `StrictCleanup` pass a context bounded by
+`terminateTimeout` (30 seconds by default) so the previous default teardown
+budget is retained.
 
 `CopyFileFromContainer` is a Docker-only copy-out operation that requires
 safe host file-open semantics. The method verifies the materialized result
@@ -530,6 +538,17 @@ source-path metadata. They intentionally preserve only names, bytes, and
 Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
 extended attributes, alternate data streams, sparse layout, and hardlink
 identity are not preserved.
+
+`File.Content` and `CopyContentToContainer` write in-memory bytes as one
+regular file through the same current-user-only staging root. The staged file
+is created at `0600`, then changed to `File.Mode` (or the `mode` argument)
+when that is non-zero; zero preserves a host file's permissions and defaults
+content to `0600`. Non-permission bits are rejected, and zero therefore
+cannot request mode `0000`. Content has the same `MaxCopyToContainerSize`
+bound, uses a fixed staging name that is not derived from the container path,
+and is never included in argv, errors, or diagnostics. Staging is removed on
+success, failure, and cancellation, including a failure during the backend
+copy.
 
 ## Connection endpoints
 
@@ -745,9 +764,16 @@ best-effort abnormal-exit paths. Their error visibility is intentionally
 different.
 
 **Normal path**: `Cleanup(t, ctr)` registers `Terminate` via
-`t.Cleanup`. `TerminateContainer(ctr)` is the nil-safe deferred-style
-helper. A termination error from `Cleanup` is sent to the test log;
+`t.Cleanup`. `TerminateContainer(ctx, ctr)` is the nil-safe deferred-style
+helper. It uses the caller's context; `Cleanup` and `StrictCleanup` bound
+the complete teardown with `terminateTimeout` (30 seconds by default). A
+termination error from `Cleanup` is sent to the test log;
 `TerminateContainer` returns its error to the caller.
+
+`Container.Kill(ctx, signal string)` takes exactly one signal. An empty
+string selects the default SIGKILL; a non-empty signal is passed to the
+backend unchanged, so an invalid spelling is rejected by the backend rather
+than by a variadic-argument check.
 
 **Post-create rollback**: when a non-reuse `Run` fails while copying
 files or waiting for readiness, it calls `Terminate` for the handle it
@@ -837,6 +863,14 @@ running and created containers are not selected. On Apple, each
 candidate is re-inspected and re-verified (generation, session,
 managed/reuse/group labels, stopped state) under the stable per-name lock
 before deletion.
+
+Package-level `Prune` intentionally accepts only backend-neutral
+`PruneOption` values and no Docker target options. A caller that needs a
+specific Docker daemon or context creates a `Client` with
+`WithClientDockerHost` or `WithClientDockerContext` and uses
+`Client.Prune`. `Pull` keeps its pull-specific target options
+(`WithPullDockerHost`, `WithPullDockerContext`); `Client.Pull` rejects them
+because the Client already pins its target.
 
 Setting `CONTAINERGO_KEEP=1` is a process-wide diagnostic switch. It disables
 automatic deletion by `Cleanup` and `TerminateContainer`, skips reaper

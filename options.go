@@ -300,8 +300,9 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 // ignored when attaching; use distinct names when those differences
 // matter. Returned handles are shared: Cleanup, TerminateContainer,
 // and the watchdog reaper do not remove them. Stop, CopyToContainer,
-// and CopyFileFromContainer refuse with ErrSharedContainer so one
-// process cannot disturb peers; use Shared to opt in deliberately.
+// CopyContentToContainer, and CopyFileFromContainer refuse with
+// ErrSharedContainer so one process cannot disturb peers; use Shared to
+// opt in deliberately.
 // Explicit Terminate still removes the container — only use it when no
 // other process still needs it.
 func WithReuse() Option {

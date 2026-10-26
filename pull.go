@@ -283,7 +283,9 @@ func WithPullBinary(path string) PullOption {
 // Pull fetches the image into the backend's local store. Concurrent
 // callers in the same process share one pull of the same image; a
 // caller whose context is cancelled stops waiting without affecting
-// the others.
+// the others. WithPullDockerHost and WithPullDockerContext select the
+// Docker target for this pull; Client.Pull pins its target and rejects
+// those options.
 func Pull(ctx context.Context, image string, opts ...PullOption) error {
 	if err := validateImageReference(image); err != nil {
 		return err

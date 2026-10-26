@@ -60,6 +60,12 @@ func TestSharedHandleRefusesCopies(t *testing.T) {
 		assertRefused(t, r, ctr.CopyToContainer(context.Background(), hostFile, "/etc/config.json"))
 	})
 
+	t.Run("copy content to", func(t *testing.T) {
+		r := newTestRunner()
+		ctr := sharedHandle(t, r)
+		assertRefused(t, r, ctr.CopyContentToContainer(context.Background(), []byte("{}"), "/etc/config.json", 0))
+	})
+
 	t.Run("copy from", func(t *testing.T) {
 		r := newTestRunner()
 		ctr := sharedHandle(t, r)
@@ -165,7 +171,7 @@ func TestTerminateContainerStillSkipsSharedHandles(t *testing.T) {
 	ctr := sharedHandle(t, r)
 	unguarded := ctr.Shared()
 
-	if err := TerminateContainer(unguarded); err != nil {
+	if err := TerminateContainer(context.Background(), unguarded); err != nil {
 		t.Errorf("TerminateContainer: %v", err)
 	}
 	if len(r.calls) != 0 {

@@ -938,8 +938,11 @@ different error visibility.
 
 1. **Normal cleanup**: `container.Cleanup(t, ctr)` registers
    `TerminateContainer` through `t.Cleanup`. A termination error is sent to
-   the test's log. `container.TerminateContainer(ctr)` is the deferred-style
-   variant and returns its error to the caller. Both helpers are nil-safe.
+   the test's log. `container.TerminateContainer(ctx, ctr)` is the
+   deferred-style variant and returns its error to the caller. It uses the
+   caller's context; `Cleanup` and `StrictCleanup` bound the complete
+   teardown, including the name-lock wait, with a `terminateTimeout`
+   context (30 seconds by default). Both helpers are nil-safe.
 2. **Post-create rollback**: if a non-reuse `Run` fails while copying files
    or waiting for readiness, `Run` calls `Terminate`. If that deletion
    fails, the returned error includes the original failure and a message
@@ -997,6 +1000,41 @@ until #113 is applied. The filter does not select running or created
 containers. On Apple, each candidate is re-inspected and re-verified
 (generation, session, managed label, and stopped state) under the stable
 per-name lock before deletion.
+
+Package-level `Prune` intentionally takes only backend-neutral
+`PruneOption` values and has no Docker target options. To prune a specific
+Docker daemon or context, construct a `Client` with `WithClientDockerHost`
+or `WithClientDockerContext` and call `Client.Prune`. `Pull` is different:
+package-level `Pull` accepts its own `WithPullDockerHost` and
+`WithPullDockerContext` options for a single fetch, while `Client.Pull`
+rejects them because the Client pins its target.
+
+`Container.Kill(ctx, signal string)` takes exactly one signal. An empty
+string selects the default SIGKILL. A non-empty signal is passed to the
+backend unchanged; multiple signals are now rejected at compile time.
+
+```go
+package docexample
+
+import (
+    "context"
+    "testing"
+
+    container "github.com/hirokazumiyaji/container-go"
+)
+
+func Lifecycle(ctx context.Context, t testing.TB, ctr *container.Container) {
+    // The caller's context bounds TerminateContainer.
+    defer container.TerminateContainer(ctx, ctr)
+
+    if err := ctr.Kill(ctx, "SIGTERM"); err != nil {
+        t.Fatal(err)
+    }
+    if err := ctr.Kill(ctx, ""); err != nil { // empty string means SIGKILL
+        t.Fatal(err)
+    }
+}
+```
 
 `container.WithPruneOlderThan(d)` narrows that selection to candidates the
 backend reports as created before now-d. It is useful for a sweep on a
@@ -1158,6 +1196,11 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
 ## Security notes
 
 - Every CLI call is an argv vector; no shell is involved. The one shell
+  script (the reaper) is a fixed string that receives container IDs
+  only as validated stdin data. Name-addressed entries use the shared
+  `nameRE` token rule, while Docker's full 64-hex immutable IDs are accepted
+  separately; Apple's stricter 2–63-character name check runs before
+  container creation.
 - `CopyToContainer` opens regular files and directories without following
   final links, then snapshots the opened handles into a per-user private
   staging path before invoking the backend. `WithFiles` is regular-file-only
@@ -1170,11 +1213,16 @@ step (`FLUSHALL`, `TRUNCATE`, …) before assertions.
   permission bits only; timestamps, ownership, setuid/setgid bits, ACLs,
   extended attributes, alternate data streams, sparse layout, and hardlink
   identity are not preserved.
-  script (the reaper) is a fixed string that receives container IDs
-  only as validated stdin data. Name-addressed entries use the shared
-  `nameRE` token rule, while Docker's full 64-hex immutable IDs are accepted
-  separately; Apple's stricter 2–63-character name check runs before
-  container creation.
+- `WithFiles` accepts exactly one of `HostPath` or a non-nil `Content` byte
+  slice; setting both or neither is a `ValidationError` when the option is
+  applied. An empty non-nil slice copies an empty file. `File.Mode` overrides
+  the Unix permission bits on the private staged copy: zero preserves host
+  permissions and defaults content to `0600`, while a non-zero value must
+  contain only permission bits (type, setuid, setgid, and sticky bits are
+  rejected). `CopyContentToContainer` applies the same staging and mode rules
+  to an existing handle. Content never appears in argv, errors, or
+  diagnostics, and its staging file is removed with the staging directory on
+  success, failure, and cancellation.
 - On Unix, environment variables are passed through a `0600` file in a
   validated, current-user-owned `0700` directory under the canonical
   `os.UserCacheDir()` path. The library resolves existing symlinked ancestors

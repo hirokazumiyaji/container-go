@@ -78,7 +78,7 @@ func (e *ConfigError) Error() string {
 
 func (e *ConfigError) Unwrap() error { return ErrInvalidConfig }
 
-func (e *ConfigError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ConfigError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ConfigError)
 	if !ok || e == nil {
 		return false
@@ -163,7 +163,7 @@ func (e *ValidationError) Is(target error) bool {
 	return e.Err != nil && errors.Is(e.Err, target)
 }
 
-func (e *ValidationError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ValidationError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ValidationError)
 	if !ok || e == nil {
 		return false
@@ -298,7 +298,7 @@ func (e *ExecTerminationError) Error() string {
 
 func (e *ExecTerminationError) Unwrap() error { return e.Err }
 
-func (e *ExecTerminationError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ExecTerminationError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ExecTerminationError)
 	if !ok || e == nil {
 		return false
@@ -311,11 +311,11 @@ func (e *ExecTerminationError) Is(target error) bool {
 	return target == ErrExecTerminationUnsupported
 }
 
-// ErrSharedContainer reports that Stop, CopyToContainer, or
-// CopyFileFromContainer was called on a WithReuse handle. Those operations
-// would disturb peers sharing the container. Use Shared to opt in, or
-// Terminate to remove the shared container outright. Cleanup and
-// TerminateContainer still skip reused handles even after Shared.
+// ErrSharedContainer reports that Stop, CopyToContainer,
+// CopyContentToContainer, or CopyFileFromContainer was called on a WithReuse
+// handle. Those operations would disturb peers sharing the container. Use
+// Shared to opt in, or Terminate to remove the shared container outright.
+// Cleanup and TerminateContainer still skip reused handles even after Shared.
 var ErrSharedContainer = errors.New("operation refused on a shared WithReuse handle")
 
 // ErrCopySourceUnsupported reports a host source that is not a regular
@@ -326,7 +326,7 @@ var ErrCopySourceUnsupported = errors.New("copy source must be a regular file or
 
 // ErrCopySourceTooLarge reports a source whose regular-file bytes exceed
 // MaxCopyToContainerSize. The limit applies to a directory's total
-// snapshot size as well as to a single file.
+// snapshot size, to a single file, and to File.Content.
 var ErrCopySourceTooLarge = errors.New("copy source exceeds size limit")
 
 // ErrCopySourceTooManyEntries reports a source tree that exceeds

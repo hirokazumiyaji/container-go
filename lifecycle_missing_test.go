@@ -42,7 +42,7 @@ func TestLifecycleMissingContainerClassification(t *testing.T) {
 			timeout := 5 * time.Second
 			return c.Restart(ctx, &timeout)
 		}},
-		{name: "kill", failPrefix: "kill", run: func(c *Container) error { return c.Kill(ctx) }},
+		{name: "kill", failPrefix: "kill", run: func(c *Container) error { return c.Kill(ctx, "") }},
 		{name: "kill signal", failPrefix: "kill", run: func(c *Container) error { return c.Kill(ctx, "SIGTERM") }},
 		{name: "pause", failPrefix: "pause", run: func(c *Container) error { return c.Pause(ctx) }},
 		{name: "unpause", failPrefix: "unpause", run: func(c *Container) error { return c.Unpause(ctx) }},
@@ -72,7 +72,7 @@ func TestLifecycleMissingContainerClassification(t *testing.T) {
 		{name: "restart", failPrefix: "start", failStderr: appleStartMissing,
 			run: func(c *Container) error { return c.Restart(ctx, nil) }},
 		{name: "kill", failPrefix: "kill", failStderr: appleKillMissing,
-			run: func(c *Container) error { return c.Kill(ctx) }},
+			run: func(c *Container) error { return c.Kill(ctx, "") }},
 		{name: "kill signal", failPrefix: "kill", failStderr: appleKillMissing,
 			run: func(c *Container) error { return c.Kill(ctx, "SIGTERM") }},
 	}
@@ -187,7 +187,7 @@ func TestLifecycleUsesEffectiveQueryTimeout(t *testing.T) {
 	}{
 		{name: "start", run: func(c *Container) error { return c.Start(ctx) }},
 		{name: "restart", run: func(c *Container) error { return c.Restart(ctx, nil) }},
-		{name: "kill", run: func(c *Container) error { return c.Kill(ctx) }},
+		{name: "kill", run: func(c *Container) error { return c.Kill(ctx, "") }},
 		{name: "pause", run: func(c *Container) error { return c.Pause(ctx) }},
 		{name: "unpause", run: func(c *Container) error { return c.Unpause(ctx) }},
 	}
@@ -208,7 +208,7 @@ func TestLifecycleUsesEffectiveQueryTimeout(t *testing.T) {
 	}{
 		{name: "start", run: func(c *Container) error { return c.Start(ctx) }},
 		{name: "restart", run: func(c *Container) error { return c.Restart(ctx, nil) }},
-		{name: "kill", run: func(c *Container) error { return c.Kill(ctx) }},
+		{name: "kill", run: func(c *Container) error { return c.Kill(ctx, "") }},
 	}
 	for _, tc := range appleCases {
 		t.Run("apple "+tc.name, func(t *testing.T) {

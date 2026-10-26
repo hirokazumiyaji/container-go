@@ -181,6 +181,10 @@ type lockPack struct {
 	// attachTeardownDone is the public AttachedDone channel held open while
 	// attachTeardownErr is unresolved.
 	attachTeardownDone chan struct{}
+	// attachTeardownStreamDone identifies the stream a lifecycle command is
+	// tearing down. A replacement stream started by Start while the command is
+	// in flight must not defer its own failures to that command.
+	attachTeardownStreamDone chan struct{}
 	// attachGate carries the right to write to the attach destination. It is
 	// a channel rather than a mutex so a replacement stream can give up when
 	// the sink has wedged its predecessor instead of blocking behind it.
@@ -1035,14 +1039,14 @@ func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("stop %s: %w", c.id, err)
 	}
-	c.markAttachTeardown()
+	teardown := c.markAttachTeardown()
 	_, _, err = c.runner.Run(stopCtx, args...)
 	if err != nil {
-		c.clearAttachTeardown()
+		c.clearAttachTeardown(teardown)
 		return c.classifyOperation(ctx, err, "stop")
 	}
 	c.commitAttachTeardown()
-	c.stopAttached()
+	c.stopAttachedTarget(teardown)
 	c.clearDynamic()
 	return nil
 }
@@ -1319,19 +1323,20 @@ func (c *Container) Kill(ctx context.Context, signal string) error {
 	}
 	args := c.eng.killArgs(target, signal)
 	terminating := terminatingKillSignal(signal)
+	var teardown attachTeardownTarget
 	if terminating {
-		c.markAttachTeardown()
+		teardown = c.markAttachTeardown()
 	}
 	_, _, err = c.runner.Run(killCtx, args...)
 	if err != nil {
 		if terminating {
-			c.clearAttachTeardown()
+			c.clearAttachTeardown(teardown)
 		}
 		return wrapNotFoundForOperation(c.eng, c.classifyOperation(ctx, err, "kill"), "kill", target, c.id)
 	}
 	if terminating {
 		c.commitAttachTeardown()
-		c.stopAttached()
+		c.stopAttachedTarget(teardown)
 	}
 	c.clearDynamic()
 	return nil
@@ -1435,19 +1440,29 @@ func (c *Container) StopAttached() {
 // write can exceed it.
 const attachStopWait = 500 * time.Millisecond
 
+// attachTeardownTarget identifies the attached stream a Stop or terminating
+// Kill is ending. The command keeps the target so a Start that reattaches while
+// the command runs is not cancelled when the command completes.
+type attachTeardownTarget struct {
+	cancel     context.CancelFunc
+	streamDone chan struct{}
+}
+
 // markAttachTeardown records that a library operation is ending the container
 // and therefore its attached stream. An error the backend reports while the
 // container stops belongs to that teardown, not to the stream.
-func (c *Container) markAttachTeardown() {
+func (c *Container) markAttachTeardown() attachTeardownTarget {
 	p := c.pack()
 	p.attachMu.Lock()
+	defer p.attachMu.Unlock()
 	p.attachTeardown = true
 	p.attachTeardownCommand = true
-	p.attachMu.Unlock()
+	p.attachTeardownStreamDone = p.attachStreamDone
+	return attachTeardownTarget{cancel: p.attachCancel, streamDone: p.attachStreamDone}
 }
 
 // commitAttachTeardown records that the lifecycle command succeeded. The
-// teardown mark stays set until stopAttached cancels the stream, but the
+// teardown mark stays set until the command's stream is stopped, but the
 // command no longer owns a pending failure.
 func (c *Container) commitAttachTeardown() {
 	p := c.pack()
@@ -1459,11 +1474,14 @@ func (c *Container) commitAttachTeardown() {
 // clearAttachTeardown drops the teardown mark after the operation failed and
 // publishes any stream failures observed during it: the container may still be
 // running, so those errors belong to the stream.
-func (c *Container) clearAttachTeardown() {
+func (c *Container) clearAttachTeardown(target attachTeardownTarget) {
 	p := c.pack()
 	p.attachMu.Lock()
-	p.attachTeardown = false
+	if target.streamDone == p.attachStreamDone {
+		p.attachTeardown = false
+	}
 	p.attachTeardownCommand = false
+	p.attachTeardownStreamDone = nil
 	p.attachErr = joinAttachError(p.attachErr, p.attachTeardownErr)
 	p.attachTeardownErr = nil
 	done := p.attachTeardownDone
@@ -1472,25 +1490,38 @@ func (c *Container) clearAttachTeardown() {
 	closeAttachDone(done)
 }
 
+// stopAttached stops the current attached stream. Callers that started a Stop
+// or terminating Kill must use stopAttachedTarget instead so a Start that
+// reattached in the meantime keeps its stream.
 func (c *Container) stopAttached() {
 	p := c.pack()
 	p.attachMu.Lock()
 	cancel := p.attachCancel
-	done := p.attachStreamDone
+	streamDone := p.attachStreamDone
 	p.attachCancel = nil
 	// Mark the teardown before cancelling: a stream error that races the
 	// stop command belongs to the teardown, not to the stream.
 	p.attachTeardown = true
 	p.attachMu.Unlock()
+	c.finishAttachStop(cancel, streamDone)
+}
+
+// stopAttachedTarget stops the stream a lifecycle command marked for teardown.
+func (c *Container) stopAttachedTarget(target attachTeardownTarget) {
+	c.finishAttachStop(target.cancel, target.streamDone)
+}
+
+func (c *Container) finishAttachStop(cancel context.CancelFunc, streamDone chan struct{}) {
 	if cancel != nil {
 		cancel()
 	}
-	if done != nil {
+	if streamDone != nil {
 		select {
-		case <-done:
+		case <-streamDone:
 		case <-time.After(attachStopWait):
 		}
 	}
+	p := c.pack()
 	p.attachMu.Lock()
 	if p.attachTeardownCommand {
 		// Stop or Kill is still running and owns the pending failure. Leave
@@ -1498,11 +1529,14 @@ func (c *Container) stopAttached() {
 		p.attachMu.Unlock()
 		return
 	}
-	// The stream has finished or its sink is wedged. Errors from this window
-	// belonged to the teardown; output-delivery failures were recorded
-	// directly and stay in attachErr.
-	p.attachTeardown = false
+	if streamDone == p.attachStreamDone {
+		// The stream has finished or its sink is wedged. Errors from this
+		// window belonged to the teardown; output-delivery failures were
+		// recorded directly and stay in attachErr.
+		p.attachTeardown = false
+	}
 	p.attachTeardownErr = nil
+	p.attachTeardownStreamDone = nil
 	deferred := p.attachTeardownDone
 	p.attachTeardownDone = nil
 	p.attachMu.Unlock()
@@ -1540,18 +1574,33 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 	// caller that observed AttachedDone closed that the failure is still
 	// readable after Start or Restart reattaches. Later failures are joined.
 	p.attachTeardown = false
-	p.attachTeardownCommand = false
-	p.attachTeardownErr = nil
-	deferred := p.attachTeardownDone
-	p.attachTeardownDone = nil
+	var heldDone chan struct{}
+	if !p.attachTeardownCommand {
+		// No command owns the previous stream's outcome, so any held failure
+		// was teardown noise. A command still running must keep it: the new
+		// stream is independent and must not publish the old one's outcome.
+		p.attachTeardownErr = nil
+		p.attachTeardownStreamDone = nil
+		heldDone = p.attachTeardownDone
+		p.attachTeardownDone = nil
+	}
 	p.attachCancel = cancel
 	p.attachDone = done
 	p.attachStreamDone = streamDone
 	p.attachMu.Unlock()
-	closeAttachDone(deferred)
+	closeAttachDone(heldDone)
 	go func() {
-		defer close(streamDone)
-		defer cancel()
+		// A caller that sees AttachedDone close may immediately call Start, so
+		// the internal completion must be visible first or that Start sees this
+		// stream as still active and leaves the writer detached.
+		deferred := false
+		defer func() {
+			cancel()
+			close(streamDone)
+			if !deferred {
+				close(done)
+			}
+		}()
 		// The gate keeps a replacement stream from writing to the same
 		// caller-supplied io.Writer while its predecessor is still inside a
 		// write. A wedged sink never releases it, so give up after the same
@@ -1564,18 +1613,17 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 			// A teardown cancellation is not a stream failure, but losing
 			// output to a failing sink is always reportable.
 			if attachCtx.Err() == nil || errors.Is(err, ErrOutputDelivery) {
-				if c.recordAttachError(err) {
+				if c.recordAttachError(done, streamDone, err) {
 					// The teardown outcome decides whether this failure is
 					// published. Keep AttachedDone open until then.
-					return
+					deferred = true
 				}
 			}
 		case <-time.After(attachStopWait):
-			if c.recordAttachError(errors.New("logs: previous attached stream is still writing to the output; not starting a replacement")) {
-				return
+			if c.recordAttachError(done, streamDone, errors.New("logs: previous attached stream is still writing to the output; not starting a replacement")) {
+				deferred = true
 			}
 		}
-		close(done)
 	}()
 }
 
@@ -1583,22 +1631,30 @@ func (c *Container) startAttached(output io.Writer, resumeSince time.Time) {
 // A later failure is joined with the earlier ones so a caller holding an older
 // AttachedDone keeps matching its stream's failure; a failure that already
 // matches the accumulated value is ignored instead of growing the join.
-// Failures observed during a teardown wait until the operation's outcome is
-// known; output-delivery failures are recorded immediately because stopping
-// the container must not hide lost output. The return value reports whether
-// the failure was deferred, in which case the caller must leave AttachedDone
-// open for the teardown outcome to close.
-func (c *Container) recordAttachError(err error) bool {
+// Failures observed while a lifecycle command tears down the stream wait until
+// the command's outcome is known; output-delivery failures are recorded
+// immediately because stopping the container must not hide lost output. The
+// return value reports whether the failure was deferred, in which case the
+// caller must leave AttachedDone open for the teardown outcome to close.
+func (c *Container) recordAttachError(done, streamDone chan struct{}, err error) bool {
 	if err == nil {
 		return false
 	}
 	p := c.pack()
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
-	if p.attachTeardown && !errors.Is(err, ErrOutputDelivery) {
-		p.attachTeardownErr = joinAttachError(p.attachTeardownErr, err)
-		p.attachTeardownDone = p.attachDone
-		return true
+	if p.attachTeardown {
+		if errors.Is(err, ErrOutputDelivery) {
+			p.attachErr = joinAttachError(p.attachErr, err)
+			return false
+		}
+		if p.attachTeardownCommand && streamDone == p.attachTeardownStreamDone {
+			p.attachTeardownErr = joinAttachError(p.attachTeardownErr, err)
+			p.attachTeardownDone = done
+			return true
+		}
+		// Teardown noise from a stream the command no longer owns.
+		return false
 	}
 	p.attachErr = joinAttachError(p.attachErr, err)
 	return false

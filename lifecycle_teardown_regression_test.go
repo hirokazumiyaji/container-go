@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -41,6 +43,15 @@ type teardownRacingStreamerRunner struct {
 	releaseCommand chan struct{}
 	streamData     []byte
 	streamErr      error
+
+	blockAfterFirst bool
+	secondStarted   chan struct{}
+	secondOnce      sync.Once
+
+	mu        sync.Mutex
+	streams   int
+	secondCtx context.Context
+	startOnce sync.Once
 }
 
 func (r *teardownRacingStreamerRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
@@ -71,9 +82,42 @@ func attachStreamDoneForTest(t *testing.T, c *Container) <-chan struct{} {
 	return p.attachStreamDone
 }
 
-func (r *teardownRacingStreamerRunner) Stream(context.Context, ...string) (io.ReadCloser, error) {
-	close(r.started)
-	return io.NopCloser(&releasedReader{release: r.release, data: r.streamData, err: r.streamErr}), nil
+func (r *teardownRacingStreamerRunner) Stream(ctx context.Context, _ ...string) (io.ReadCloser, error) {
+	r.startOnce.Do(func() { close(r.started) })
+	r.mu.Lock()
+	r.streams++
+	first := r.streams == 1
+	if !first && r.blockAfterFirst {
+		r.secondCtx = ctx
+		r.secondOnce.Do(func() {
+			if r.secondStarted != nil {
+				close(r.secondStarted)
+			}
+		})
+	}
+	r.mu.Unlock()
+	if first {
+		return io.NopCloser(&releasedReader{release: r.release, data: r.streamData, err: r.streamErr}), nil
+	}
+	if r.blockAfterFirst {
+		return io.NopCloser(contextReader{ctx: ctx}), nil
+	}
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (r *teardownRacingStreamerRunner) secondStreamContext() context.Context {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.secondCtx
+}
+
+type contextReader struct {
+	ctx context.Context
+}
+
+func (r contextReader) Read([]byte) (int, error) {
+	<-r.ctx.Done()
+	return 0, r.ctx.Err()
 }
 
 type releasedReader struct {
@@ -333,6 +377,170 @@ func TestStopAttachedDoesNotDiscardPendingTeardownFailure(t *testing.T) {
 				t.Fatalf("AttachedError() = %v, want the preserved stream failure", err)
 			}
 		})
+	}
+}
+
+func TestStartReattachesAfterAttachedDoneCloses(t *testing.T) {
+	f := &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n"}
+	ctr := runTestContainer(t, f, WithAttachOutput(io.Discard))
+
+	const reattachments = 50
+	for i := 0; i < reattachments; i++ {
+		select {
+		case <-ctr.AttachedDone():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("attached stream %d did not finish", i)
+		}
+		if err := ctr.Start(context.Background()); err != nil {
+			t.Fatalf("Start after stream %d: %v", i, err)
+		}
+	}
+	f.waitForStreams(t, reattachments+1)
+}
+
+func TestStartDuringTeardownPreservesPendingFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		command string
+		run     func(*Container) error
+	}{
+		{
+			name:    "stop",
+			command: "stop",
+			run: func(c *Container) error {
+				return c.Stop(context.Background(), nil)
+			},
+		},
+		{
+			name:    "terminating kill",
+			command: "kill",
+			run: func(c *Container) error {
+				return c.Kill(context.Background(), "")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			streamErr := errors.New("follow stream reset")
+			f := &teardownRacingStreamerRunner{
+				fakeRunner:     newTestRunner(),
+				command:        tc.command,
+				release:        make(chan struct{}),
+				started:        make(chan struct{}),
+				commandWaiting: make(chan struct{}),
+				releaseCommand: make(chan struct{}),
+				streamErr:      streamErr,
+			}
+			ctr := runTestContainer(t, f, WithAttachOutput(io.Discard))
+			oldDone := ctr.AttachedDone()
+			select {
+			case <-f.started:
+			case <-time.After(2 * time.Second):
+				t.Fatal("attach stream never started")
+			}
+			f.attachDone = func() <-chan struct{} { return attachStreamDoneForTest(t, ctr) }
+			f.failPrefix = tc.command
+
+			commandDone := make(chan error, 1)
+			go func() { commandDone <- tc.run(ctr) }()
+			select {
+			case <-f.commandWaiting:
+			case <-time.After(2 * time.Second):
+				t.Fatal("command did not reach the attach failure")
+			}
+
+			// Start replaces the stream while the command that owns the
+			// deferred failure is still running.
+			if err := ctr.Start(context.Background()); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			select {
+			case <-oldDone:
+				t.Fatal("Start closed the AttachedDone owned by the teardown command")
+			default:
+			}
+			if err := ctr.AttachedError(); err != nil {
+				t.Fatalf("AttachedError() = %v before the command failed, want the failure still pending", err)
+			}
+
+			close(f.releaseCommand)
+			if err := <-commandDone; err == nil {
+				t.Fatal("teardown command returned nil, want the injected failure")
+			}
+			select {
+			case <-oldDone:
+			case <-time.After(2 * time.Second):
+				t.Fatal("the previous stream's AttachedDone did not close after the command failed")
+			}
+			if err := ctr.AttachedError(); !errors.Is(err, streamErr) {
+				t.Fatalf("AttachedError() = %v, want the preserved stream failure", err)
+			}
+		})
+	}
+}
+
+func TestStopDoesNotCancelStreamReattachedDuringTeardown(t *testing.T) {
+	streamErr := errors.New("follow stream reset")
+	f := &teardownRacingStreamerRunner{
+		fakeRunner:      newTestRunner(),
+		command:         "stop",
+		release:         make(chan struct{}),
+		started:         make(chan struct{}),
+		commandWaiting:  make(chan struct{}),
+		releaseCommand:  make(chan struct{}),
+		streamErr:       streamErr,
+		blockAfterFirst: true,
+		secondStarted:   make(chan struct{}),
+	}
+	ctr := runTestContainer(t, f, WithAttachOutput(io.Discard))
+	oldDone := ctr.AttachedDone()
+	select {
+	case <-f.started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach stream never started")
+	}
+	f.attachDone = func() <-chan struct{} { return attachStreamDoneForTest(t, ctr) }
+
+	commandDone := make(chan error, 1)
+	go func() { commandDone <- ctr.Stop(context.Background(), nil) }()
+	select {
+	case <-f.commandWaiting:
+	case <-time.After(2 * time.Second):
+		t.Fatal("stop did not reach the attach failure")
+	}
+
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-f.secondStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("replacement attach stream never started")
+	}
+	replacementCtx := f.secondStreamContext()
+
+	close(f.releaseCommand)
+	if err := <-commandDone; err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-oldDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the stopped stream's AttachedDone did not close after Stop succeeded")
+	}
+	select {
+	case <-replacementCtx.Done():
+		t.Fatal("Stop cancelled the stream that Start reattached during the command")
+	default:
+	}
+	if err := ctr.AttachedError(); err != nil {
+		t.Fatalf("AttachedError() = %v, want the successful teardown's failure discarded", err)
+	}
+
+	ctr.StopAttached()
+	select {
+	case <-replacementCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("StopAttached did not cancel the replacement stream")
 	}
 }
 

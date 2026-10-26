@@ -433,9 +433,10 @@ func TestReaperScriptStartsNextEntryWhenAnyWorkerFinishes(t *testing.T) {
 	}
 	requirePOSIXShell(t)
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "started.log")
-	rankDir := filepath.Join(dir, "rank.lock")
-	rankPath := filepath.Join(dir, "rank")
+	rankDir := filepath.Join(dir, "ranks")
+	if err := os.Mkdir(rankDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	script := filepath.Join(dir, "backend")
 	body := `#!/bin/sh
 sub="$1"
@@ -443,18 +444,13 @@ shift
 [ "$sub" = inspect ] && exit 0
 for arg in "$@"; do target="$arg"; done
 
-# Allocate a start rank under a mkdir mutex. The first, fifth, ninth, and
-# thirteenth starts sleep. Those ranks fall in four different batches under
+# Separate rank claims and target records avoid a shared counter or append log.
+# The first, fifth, ninth, and thirteenth starts sleep. Those ranks fall in four different batches under
 # the old loop but can overlap in a worker pool. awk emits entries in an
 # unspecified order, so the sleep is keyed to start order, not to an ID.
-while ! mkdir "` + rankDir + `" 2>/dev/null; do sleep 0.01 2>/dev/null || :; done
-rank=0
-[ -f "` + rankPath + `" ] && rank=$(cat "` + rankPath + `")
-rank=$((rank + 1))
-printf '%s\n' "$rank" > "` + rankPath + `"
-rmdir "` + rankDir + `"
-
-printf '%s %s\n' "$rank" "$target" >> "` + logPath + `"
+rank=1
+while ! mkdir "` + rankDir + `/$rank" 2>/dev/null; do rank=$((rank + 1)); done
+printf '%s\n' "$target" > "` + rankDir + `/$rank/target"
 case "$rank" in
   1|5|9|13) sleep 2 ;;
 esac
@@ -485,18 +481,22 @@ exit 0
 		t.Errorf("reap finished in %v, before the slowest entry could finish", elapsed)
 	}
 
-	lines := readLogLines(t, logPath)
-	if len(lines) != len(entries) {
-		t.Fatalf("start log has %d lines, want %d", len(lines), len(entries))
+	claims, err := os.ReadDir(rankDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claims) != len(entries) {
+		t.Fatalf("start records = %d, want %d", len(claims), len(entries))
 	}
 	var ranks, targets []string
-	for _, line := range lines {
-		fields := strings.Fields(line)
-		if len(fields) != 2 {
-			t.Fatalf("start log line = %q, want rank and target", line)
+	for _, claim := range claims {
+		rank := claim.Name()
+		data, err := os.ReadFile(filepath.Join(rankDir, rank, "target"))
+		if err != nil {
+			t.Fatal(err)
 		}
-		ranks = append(ranks, fields[0])
-		targets = append(targets, fields[1])
+		ranks = append(ranks, rank)
+		targets = append(targets, strings.TrimSpace(string(data)))
 	}
 	wantRanks := make([]string, 0, len(entries))
 	for i := 1; i <= len(entries); i++ {

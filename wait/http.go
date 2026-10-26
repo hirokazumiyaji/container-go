@@ -247,15 +247,9 @@ func (s *HTTPStrategy) WaitUntilReady(ctx context.Context, target Target) (retEr
 		if s.responseMatcher == nil {
 			return nil
 		}
-		// The matcher receives a reader capped at maxDrainBytes so it
-		// cannot turn the probe into an unbounded read. Drain whatever
-		// it leaves so the body is still consumed up to the same cap
-		// and the connection can be reused; a false verdict is a
-		// retryable check failure like a rejected status.
 		body := io.LimitReader(resp.Body, maxDrainBytes)
-		accepted := s.responseMatcher(body)
-		_, _ = io.Copy(io.Discard, body)
-		if !accepted {
+		if !s.responseMatcher(body) {
+			_, _ = io.Copy(io.Discard, body)
 			return fmt.Errorf("status %d accepted but response body rejected", resp.StatusCode)
 		}
 		return nil

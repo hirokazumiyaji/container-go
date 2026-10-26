@@ -164,3 +164,26 @@ func TestForHTTPResponseMatcherSkipsRejectedStatus(t *testing.T) {
 		}
 	}
 }
+
+func TestForHTTPResponseMatcherAcceptsPrefixWithoutWaitingForRemainder(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "UP")
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	t.Cleanup(srv.Close)
+
+	target := newFakeTarget()
+	target.endpoint = strings.TrimPrefix(srv.URL, "http://")
+	err := ForHTTP("/").
+		WithResponseMatcher(func(body io.Reader) bool {
+			var prefix [2]byte
+			_, err := io.ReadFull(body, prefix[:])
+			return err == nil && string(prefix[:]) == "UP"
+		}).
+		WithStartupTimeout(200*time.Millisecond).
+		WaitUntilReady(context.Background(), target)
+	if err != nil {
+		t.Fatalf("WaitUntilReady: %v, want success after the matcher accepts", err)
+	}
+}

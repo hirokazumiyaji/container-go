@@ -678,53 +678,105 @@ func TestHeldAttachedDoneClosesAfterInternalCompletion(t *testing.T) {
 	<-returned
 }
 
-func TestTeardownCommandsSerializeAttachResolution(t *testing.T) {
-	ctr := runTestContainer(t, newTestRunner())
-	first, err := ctr.markAttachTeardown(context.Background())
-	if err != nil {
-		t.Fatalf("mark first teardown: %v", err)
-	}
+// stopBlockingRunner holds a graceful stop inside the backend so a test can
+// check that a forced kill still reaches it.
+type stopBlockingRunner struct {
+	*fakeRunner
+	stopStarted chan struct{}
+	releaseStop chan struct{}
+	killStarted chan struct{}
+}
 
-	acquired := make(chan struct{})
-	go func() {
-		second, markErr := ctr.markAttachTeardown(context.Background())
-		if markErr == nil {
-			ctr.clearAttachTeardown(second)
+func (r *stopBlockingRunner) Run(ctx context.Context, args ...string) ([]byte, []byte, error) {
+	switch args[0] {
+	case "stop":
+		close(r.stopStarted)
+		select {
+		case <-r.releaseStop:
+			return nil, nil, nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
 		}
-		close(acquired)
-	}()
+	case "kill":
+		close(r.killStarted)
+		return nil, nil, nil
+	}
+	return r.fakeRunner.Run(ctx, args...)
+}
+
+func TestForceKillRunsDuringGracefulStop(t *testing.T) {
+	r := &stopBlockingRunner{
+		fakeRunner:  newTestRunner(),
+		stopStarted: make(chan struct{}),
+		releaseStop: make(chan struct{}),
+		killStarted: make(chan struct{}),
+	}
+	ctr := runTestContainer(t, r)
+
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- ctr.Stop(context.Background(), nil) }()
 	select {
-	case <-acquired:
-		t.Fatal("a second teardown acquired attach resolution before the first resolved")
-	case <-time.After(100 * time.Millisecond):
+	case <-r.stopStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("graceful Stop never reached the backend")
 	}
 
-	ctr.clearAttachTeardown(first)
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := ctr.Kill(ctx, ""); err != nil {
+		t.Fatalf("Kill during graceful Stop: %v", err)
+	}
 	select {
-	case <-acquired:
+	case <-r.killStarted:
 	case <-time.After(2 * time.Second):
-		t.Fatal("the second teardown did not proceed after the first resolved")
+		t.Fatal("Kill returned without signalling the backend")
+	}
+
+	close(r.releaseStop)
+	if err := <-stopDone; err != nil {
+		t.Fatalf("Stop: %v", err)
 	}
 }
 
-func TestTeardownOwnershipHonorsContext(t *testing.T) {
+func TestOverlappingTeardownsSharePendingFailure(t *testing.T) {
 	ctr := runTestContainer(t, newTestRunner())
-	first, err := ctr.markAttachTeardown(context.Background())
-	if err != nil {
-		t.Fatalf("mark first teardown: %v", err)
+	streamDone := make(chan struct{})
+	p := ctr.pack()
+	p.attachMu.Lock()
+	p.attachStreamDone = streamDone
+	p.attachMu.Unlock()
+
+	first := ctr.markAttachTeardown()
+	second := ctr.markAttachTeardown()
+	if first.state != second.state {
+		t.Fatal("overlapping teardowns of one stream did not share their outcome")
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
-	started := time.Now()
-	if _, err := ctr.markAttachTeardown(ctx); !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("second teardown error = %v, want context.DeadlineExceeded", err)
+	streamErr := errors.New("follow stream reset")
+	done := make(chan struct{})
+	if !ctr.recordAttachError(done, streamDone, streamErr) {
+		t.Fatal("stream failure was not deferred to the owning teardowns")
 	}
-	if elapsed := time.Since(started); elapsed > 200*time.Millisecond {
-		t.Fatalf("second teardown waited %s for ownership, want it to honor the 20ms deadline", elapsed)
-	}
-
 	ctr.clearAttachTeardown(first)
+	select {
+	case <-done:
+		t.Fatal("the first failed command published the failure while another still owned it")
+	default:
+	}
+	if err := ctr.AttachedError(); err != nil {
+		t.Fatalf("AttachedError() = %v before the last command failed, want the failure still pending", err)
+	}
+
+	close(streamDone)
+	ctr.clearAttachTeardown(second)
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("held AttachedDone did not close after the last command failed")
+	}
+	if err := ctr.AttachedError(); !errors.Is(err, streamErr) {
+		t.Fatalf("AttachedError() = %v, want the shared stream failure", err)
+	}
 }
 
 func TestTeardownReportsOutputDeliveryFailure(t *testing.T) {

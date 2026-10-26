@@ -544,6 +544,67 @@ func TestStopDoesNotCancelStreamReattachedDuringTeardown(t *testing.T) {
 	}
 }
 
+func TestStartReattachesAfterStopAbandonsWedgedStream(t *testing.T) {
+	f := &recordingStreamerRunner{inner: newTestRunner(), data: "attached line\n"}
+	sink := &blockingSink{entered: make(chan struct{}), released: make(chan struct{})}
+	ctr := runTestContainer(t, f, WithAttachOutput(sink))
+	t.Cleanup(func() { close(sink.released) })
+	oldDone := ctr.AttachedDone()
+	select {
+	case <-sink.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("attach stream never wrote to the sink")
+	}
+
+	// Stop cancels the stream, but the sink stays wedged past attachStopWait.
+	if err := ctr.Stop(context.Background(), nil); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	select {
+	case <-oldDone:
+		t.Fatal("the wedged stream finished despite the blocked sink")
+	default:
+	}
+
+	// Start must replace the cancelled follower instead of treating its open
+	// completion channel as an active stream.
+	if err := ctr.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	select {
+	case <-ctr.AttachedDone():
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not replace the cancelled wedged stream")
+	}
+	if err := ctr.AttachedError(); err == nil {
+		t.Fatal("AttachedError() = nil, want the abandoned replacement's failure")
+	}
+}
+
+func TestTeardownCommandsSerializeAttachResolution(t *testing.T) {
+	ctr := runTestContainer(t, newTestRunner())
+	first := ctr.markAttachTeardown()
+
+	acquired := make(chan struct{})
+	go func() {
+		second := ctr.markAttachTeardown()
+		ctr.clearAttachTeardown(second)
+		close(acquired)
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("a second teardown acquired attach resolution before the first resolved")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	ctr.clearAttachTeardown(first)
+	select {
+	case <-acquired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the second teardown did not proceed after the first resolved")
+	}
+}
+
 func TestTeardownReportsOutputDeliveryFailure(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

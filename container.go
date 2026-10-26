@@ -152,9 +152,14 @@ type lockPack struct {
 	defaultNetwork string           // Docker daemon default identity, learned lazily
 	copyVersionMu  contextLock      // serializes the Docker copy-out version check
 	copyVersionOK  atomic.Bool      // a successful copy-out version check is reusable for this handle
-	attachMu       sync.Mutex
-	attachCancel   context.CancelFunc
-	attachDone     chan struct{}
+	// attachTeardownOp serializes Stop and terminating Kill attach teardown
+	// ownership. A command holds it from markAttachTeardown until it publishes
+	// or discards the stream outcome, so a second command cannot replace the
+	// pending failure and strand the first stream's AttachedDone.
+	attachTeardownOp sync.Mutex
+	attachMu         sync.Mutex
+	attachCancel     context.CancelFunc
+	attachDone       chan struct{}
 	// attachStreamDone closes when the follow goroutine exits, even if the
 	// public AttachedDone is held open until a teardown outcome resolves the
 	// stream's terminal error.
@@ -1451,8 +1456,11 @@ type attachTeardownTarget struct {
 // markAttachTeardown records that a library operation is ending the container
 // and therefore its attached stream. An error the backend reports while the
 // container stops belongs to that teardown, not to the stream.
+// The caller owns attachTeardownOp until it calls clearAttachTeardown or
+// stopAttachedTarget, which release it.
 func (c *Container) markAttachTeardown() attachTeardownTarget {
 	p := c.pack()
+	p.attachTeardownOp.Lock()
 	p.attachMu.Lock()
 	defer p.attachMu.Unlock()
 	p.attachTeardown = true
@@ -1476,6 +1484,7 @@ func (c *Container) commitAttachTeardown() {
 // running, so those errors belong to the stream.
 func (c *Container) clearAttachTeardown(target attachTeardownTarget) {
 	p := c.pack()
+	defer p.attachTeardownOp.Unlock()
 	p.attachMu.Lock()
 	if target.streamDone == p.attachStreamDone {
 		p.attachTeardown = false
@@ -1506,8 +1515,10 @@ func (c *Container) stopAttached() {
 	c.finishAttachStop(cancel, streamDone)
 }
 
-// stopAttachedTarget stops the stream a lifecycle command marked for teardown.
+// stopAttachedTarget stops the stream a lifecycle command marked for teardown
+// and releases the command's attach teardown ownership.
 func (c *Container) stopAttachedTarget(target attachTeardownTarget) {
+	defer c.pack().attachTeardownOp.Unlock()
 	c.finishAttachStop(target.cancel, target.streamDone)
 }
 
@@ -1532,8 +1543,11 @@ func (c *Container) finishAttachStop(cancel context.CancelFunc, streamDone chan 
 	if streamDone == p.attachStreamDone {
 		// The stream has finished or its sink is wedged. Errors from this
 		// window belonged to the teardown; output-delivery failures were
-		// recorded directly and stay in attachErr.
+		// recorded directly and stay in attachErr. Drop the cancel handle so
+		// a wedged write that outlives attachStopWait does not make a later
+		// Start treat the cancelled follower as active.
 		p.attachTeardown = false
+		p.attachCancel = nil
 	}
 	p.attachTeardownErr = nil
 	p.attachTeardownStreamDone = nil

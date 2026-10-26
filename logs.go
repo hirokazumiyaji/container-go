@@ -291,7 +291,7 @@ func (c *Container) FollowLogsTo(ctx context.Context, output io.Writer) error {
 }
 
 func (c *Container) followLogsTo(ctx context.Context, output io.Writer, resumeSince time.Time) error {
-	if output == nil {
+	if nilWriter(output) {
 		return validationErrorf("FollowLogsTo", output, "output writer cannot be nil")
 	}
 	stream, err := c.followLogs(ctx, resumeSince)

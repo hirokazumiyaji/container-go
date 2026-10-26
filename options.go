@@ -1128,12 +1128,27 @@ func WithPlatform(p string) Option {
 // stream at all.
 func WithAttachOutput(w io.Writer) Option {
 	return func(c *config) error {
-		if w == nil {
+		if nilWriter(w) {
 			return validationErrorf("WithAttachOutput", nil, "output writer cannot be nil")
 		}
 		c.attachOutput = w
 		return nil
 	}
+}
+
+// nilWriter reports whether w is nil, including a typed-nil value stored in
+// the interface. A plain interface comparison misses that case, which would
+// otherwise panic in the background attach stream on its first write.
+func nilWriter(w io.Writer) bool {
+	if w == nil {
+		return true
+	}
+	value := reflect.ValueOf(w)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	}
+	return false
 }
 
 // MountType selects how a Mount is backed.

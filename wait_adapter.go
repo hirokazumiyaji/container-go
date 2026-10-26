@@ -95,7 +95,7 @@ func procNetCommand() []string {
 // successful host dial alone is not proof of readiness. Apple Container
 // connects directly to the VM endpoint and needs no extra check.
 func (t waitTarget) ContainerPortStatus(ctx context.Context, port string) (wait.PortListenStatus, error) {
-	if t.c == nil || t.c.eng == nil || t.c.eng.directIP() {
+	if t.c.eng.directIP() {
 		return wait.PortListenUnsupported, nil
 	}
 	resolved, err := t.selectedPort(port)

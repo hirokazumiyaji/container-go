@@ -177,7 +177,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名を指定する（省略時は `containergo-<ランダムな 16 進数>`）。共有の 1～63 文字 guard を使う。Apple のより厳密な 2～63 文字 rule は Apple バックエンドの preflight が image 解決前に強制する。
 - `WithLabels(labels map[string]string)`：追加ラベルを指定する。ライブラリが管理するラベルは予約済みである。
 - `WithMounts(mounts ...Mount)`：bind、名前付きボリューム、tmpfs のマウントを指定する。現在の bind source validation は Unix-style で、Windows host path と remote Docker の bind source semantics は #76 に残る。
-- `WithFiles(files ...File)`：起動後のコンテナへファイルをコピーする。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
+- `WithFiles(files ...File)`：起動後のコンテナへ regular file をコピーする。各 `File` は `HostPath` と `Content` のどちらか一方だけを設定し、`Mode` で非公開ステージング上の Unix permission bits を上書きできる。コピーに失敗すると `Run` をロールバックする。`WithReuse` では attach caller を含むすべての caller でコピーされ、attach 時の失敗は共有コンテナを削除せずエラーを返す。
 - `WithPublishedPort(spec string)`：ホスト側ポートの明示的な公開を指定する。Apple Container は通常コンテナへ直接接続し、Docker は `WithExposedPorts` で宣言したポートを daemon が host port へ自動公開する。特定の host port が必要な場合だけ明示的な binding を使う。
 - `WithPullPolicy(policy PullPolicy)`：`PullMissing`（既定）、`PullAlways`、`PullNever`（Docker のみ。Apple は `ErrPullNeverUnsupported`）を選ぶ。`WithReuse` の attach 前にも `PullAlways` は image を fetch する。
 - `WithReuse()`：名前付き `Run` を get-or-create にする。attach caller にも `WithFiles` と `PullAlways` が適用される。CPU、shm、capability、ulimit、extra host、hostname の option は reuse の互換性 identity に含まれ、既存コンテナと一致しなければならない。capability は requested-subset rule で、要求した `--cap-add`/`--cap-drop` のすべてが存在する必要があり、空の要求は inspect された任意の capability set を受け入れる。それ以外の作成専用 option は attach 時に無視される。
@@ -200,7 +200,7 @@ func Run(ctx context.Context, image string, opts ...Option) (*Container, error)
 - `WithName(name string)`：コンテナ名(省略時は `containergo-<乱数16進>` を採番)
 - `WithLabels(labels map[string]string)`：追加ラベル
 - `WithMounts(mounts ...Mount)`：bind、volume、tmpfs マウント
-- `WithFiles(files ...File)`：起動後にコンテナへコピーする通常ファイル。option 評価時にディレクトリ、シンボリックリンク、特殊ファイルを拒否する
+- `WithFiles(files ...File)`：起動後にコンテナへコピーする通常ファイル。`HostPath` または `Content` の一方と任意の `Mode` を指定する。host path は option 評価時に検証し、ディレクトリ、シンボリックリンク、特殊ファイルを拒否する
 - `WithPublishedPort(spec string)`：ホスト側ポート公開(既定では公開しない。後述)
 - `WithCPUs(v float64)` / `WithMemory(size string)`：リソース制限。`WithCPUs` は小数を受け付ける
 - `WithShmSize(size string)`：`/dev/shm` のサイズ
@@ -238,6 +238,7 @@ func (c *Container) LogsWithOptions(ctx context.Context, opts LogsOptions) (io.R
 func (c *Container) LogsTo(ctx context.Context, output io.Writer, opts LogsOptions) (OutputStats, error)
 func (c *Container) FollowLogs(ctx context.Context) (io.ReadCloser, error)
 func (c *Container) CopyToContainer(ctx context.Context, hostPath, containerPath string) error
+func (c *Container) CopyContentToContainer(ctx context.Context, content []byte, containerPath string, mode fs.FileMode) error
 func (c *Container) CopyFileFromContainer(ctx context.Context, containerPath string) (io.ReadCloser, error)
 func (c *Container) Stop(ctx context.Context, timeout *time.Duration) error
 func (c *Container) Terminate(ctx context.Context) error
@@ -257,7 +258,7 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 
 現在のチェックアウトでは validation は一様ではありません（#102）。negative な `LogsOptions.Tail` は 0/all として扱われ、unknown な `MountType` は `WithMounts` で reject されず、`PruneReuseGroup` は `WithReuseGroup` より弱い grammar を使います。`WithMemory` と `WithShmSize` は zero と不正なサイズを拒否します。これらは現在の動作であり、backend がその設定を受け付ける保証ではありません。
 
-`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。
+`Terminate` は Apple Container では `container delete --force`、Docker では `docker rm --force` に対応する。backend が認識した not-found CLI failure または delete 成功だけを成功として扱うため、冪等性の主張はその範囲に限られる。empty または malformed な inspect output を not-found に変換せず、現在の Docker parser は要求した target と ID や name が異なる valid object を no-match として拒否しない。どちらのケースも冪等性の保証には含まれず、unrelated な delete failure はそのまま返る。`Cleanup(t, ctr)` と `TerminateContainer(ctx, ctr)` は nil 安全なヘルパーであり、`Run` のエラーを確認する前にクリーンアップを登録できる。`TerminateContainer` は caller の context を使い、`Cleanup` と `StrictCleanup` は `terminateTimeout`（既定 30 秒）の context を渡して従来の teardown 予算を維持する。
 
 `CopyFileFromContainer` は安全な host file-open semantics を持つ Docker バックエンド向けの copy-out API である。materialize された結果が regular file であることを検証するが、すべての Docker host がすべての container file type を表現できると主張するものではない。Apple Container の CLI は host が結果を開く前にすべての source file type を保持・拒否できないため、`container cp` を起動せず `ErrCopyFileFromContainerUnsupported` を返す。Docker の copy-out は client と server の両方が 29.7.0 以上である必要がある。メソッドは private な一時ディレクトリを作成する前、および `docker cp` を実行する前に両方のバージョンを確認し、確認できない場合は同じ error で fail closed する。no-follow/nonblocking な file open がない host も同じ error で fail closed する。Windows では Go 1.23 から 1.25 が `os.OpenFile` に必要な Windows file flag を伝播しないため、Docker の copy-out には Go 1.26 以降が必要である。`CopyToContainer` は両バックエンドで使用できる。
 
@@ -270,6 +271,14 @@ backend CLI には exec instance を kill する共通操作がないため、ac
 staging と CLI には独立した deadline を設定し、caller の deadline は両方に優先する。
 ディレクトリは file bytes、entry 数、深さ、訪問したパス metadata の合計で制限する。
 スナップショットが保持するのは名前、バイト列、Unix permission bits だけで、timestamp、owner、setuid/setgid、ACL、extended attributes、alternate data stream、sparse layout、hardlink identity は保持しない。
+
+`File.Content` と `CopyContentToContainer` は、メモリ上のバイト列を 1 つの regular file として同じ現在ユーザー専用 staging root へ書き込む。
+ステージングファイルは `0600` で作成し、`File.Mode`（または `mode` 引数）が非 0 ならその値へ変更する。
+0 は host file の permission を保持し、Content では `0600` を既定値にする。
+permission bits 以外の bit は拒否するため、0 で mode `0000` を要求することはできない。
+Content は `MaxCopyToContainerSize` の上限を共有し、container path から導出しない固定のステージング名を使う。
+Content は argv、error、診断に含めない。
+staging は成功、失敗、キャンセルのいずれでも削除し、backend copy 中の失敗も同様である。
 
 ### 出力の契約
 
@@ -418,9 +427,15 @@ type Strategy interface {
 各経路でエラーの見え方は異なる。
 
 **通常の cleanup**：`Cleanup(t, ctr)` が `t.Cleanup` 経由で `Terminate` を
-登録する。`TerminateContainer(ctr)` は nil 安全な defer 形式である。
+登録する。`TerminateContainer(ctx, ctr)` は nil 安全な defer 形式である。
+caller の context を使い、`Cleanup` と `StrictCleanup` は完全な teardown を
+`terminateTimeout`（既定 30 秒）で制限する。
 `Cleanup` の終了エラーはテストの log に残り、`TerminateContainer` は
 エラーを呼び出し元へ返す。
+
+`Container.Kill(ctx, signal string)` は signal を 1 つだけ取る。空文字列は
+既定の SIGKILL で、空でない signal は backend へそのまま渡す。そのため
+不正な綴りは可変長引数の検査ではなく backend が拒否する。
 
 **作成後の rollback**：再利用でない `Run` が file copy または readiness 待ちの
 途中で失敗すると、作成した handle の `Terminate` を呼ぶ。削除にも失敗した場合、
@@ -488,6 +503,8 @@ no-leak 保証ではない。
 - 作成世代ラベルと、Reuse 時の再利用グループラベル
 
 Apple CLI にはラベルフィルタがないため、孤児の掃除は `container ls -a --format json` をクライアント側で絞り込んで行う。`Prune(ctx)` は現在の backend の managed filter が選ぶコンテナを削除する。Apple は stopped 状態を選ぶ。現在の Docker filter は exited 状態だけを選ぶため、dead 状態のコンテナは #113 を適用するまで残る。running と created 状態は選ばない。Apple では、各 candidate は削除前に安定した名前単位 lock の下で再 inspect され、世代、session、管理対象ラベル、および停止状態が再確認される。
+
+package レベルの `Prune` は backend 中立の `PruneOption` だけを受け付け、Docker target の option を持たない。特定の Docker daemon や context を対象にする場合は、`WithClientDockerHost` または `WithClientDockerContext` で `Client` を作り、`Client.Prune` を使う。`Pull` は pull 固有の target option (`WithPullDockerHost`、`WithPullDockerContext`) を維持するが、`Client.Pull` は Client が target を固定するためこれらの上書きを拒否する。
 
 `CONTAINERGO_KEEP=1` はプロセス全体の診断用フラグである。`Cleanup` と
 `TerminateContainer` による自動削除、リーパー登録を省略し、作成失敗、

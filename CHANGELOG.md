@@ -25,6 +25,12 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   inspected set. Apple Container accepts the shm, capability, and ulimit flags
   and rejects `WithPrivileged`, `WithExtraHost`, and `WithHostname` with
   `ErrUnsupportedCapability`.
+- Add in-memory copy sources. `File.Content` and `File.Mode` extend
+  `WithFiles`, and `CopyContentToContainer` copies bytes into a running
+  handle. Content uses the existing per-user private staging tree at `0600`
+  by default, never appears in argv, errors, or diagnostics, and is removed
+  with the staging directory. `HostPath` and `Content` are mutually exclusive,
+  and non-permission mode bits are rejected (#263).
 - Add `WithNetworkAliases` to expose Docker's network-scoped DNS aliases
   (`--network-alias`). Aliases require an explicitly selected user-defined
   network, participate in reuse compatibility, and fail before any backend
@@ -115,6 +121,24 @@ the tagged `v0.2.0` module requires Go 1.27 or later.
   `0.5` are supported. Non-positive and non-finite values are rejected.
   Apple Container requires a whole number and rejects a fractional value
   with `ErrUnsupportedCapability`; integer values remain accepted.
+- **Breaking:** align public signatures before v1.0. Redaction methods on
+  `ConfigError`, `ValidationError`, `ExecTerminationError`, `CleanupError`,
+  `wait.ConfigError`, `CLIError`, and `SystemNotRunningError` are now
+  unexported, so neither godoc nor API tooling exposes
+  `internal/cli.Redactor`; `errors.As` still returns redacted clones.
+  `TerminateContainer` now takes a `context.Context` first; `Cleanup` and
+  `StrictCleanup` retain the previous 30-second default by passing a
+  `terminateTimeout`-bounded context. `Container.Kill` takes one
+  `signal string` instead of a variadic argument; the empty string keeps the
+  SIGKILL default. Calls using `Kill(ctx)` must now pass `""`, and multiple
+  signals no longer compile. An explicit empty signal now selects SIGKILL
+  instead of returning a validation error. Remove the
+  `wait.DiagnosticSecrets` and `wait.SecretValues` aliases in favor of
+  `wait.DiagnosticValues`. Package-level `Prune` intentionally has no Docker
+  target options; use a `Client` configured with `WithClientDockerHost` or
+  `WithClientDockerContext` and call `Client.Prune`. `Pull` keeps its
+  pull-specific target options (`WithPullDockerHost`,
+  `WithPullDockerContext`) (#265).
 - `Client.Pull`, `Client.Prune`, and `Client.PruneReuseGroup` are variadic.
   Existing calls remain source-compatible, but method values and interface
   implementations that use the old fixed signatures must be updated. Docker

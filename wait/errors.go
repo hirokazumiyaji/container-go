@@ -52,7 +52,7 @@ func (e *ConfigError) Error() string {
 
 func (e *ConfigError) Unwrap() error { return ErrInvalidConfiguration }
 
-func (e *ConfigError) AsRedacted(target any, r *cli.Redactor) bool {
+func (e *ConfigError) asRedacted(target any, r *cli.Redactor) bool {
 	ptr, ok := target.(**ConfigError)
 	if !ok || e == nil {
 		return false

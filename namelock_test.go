@@ -150,7 +150,32 @@ func TestTerminateWaitsForNameLockBeforeInspecting(t *testing.T) {
 	}
 }
 
-func TestTerminateContainerBoundsNameLockWait(t *testing.T) {
+func TestTerminateContainerHonorsContextDeadline(t *testing.T) {
+	name := "lock-" + newContainerName()
+	unlock, err := lockName(context.Background(), name)
+	if err != nil {
+		t.Fatalf("lockName: %v", err)
+	}
+	defer unlock()
+
+	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
+	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err = TerminateContainer(ctx, ctr)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("TerminateContainer = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("TerminateContainer took %v, want bounded wait", elapsed)
+	}
+	if r.deleteCalls != 0 {
+		t.Errorf("deleteCalls = %d, want 0", r.deleteCalls)
+	}
+}
+
+func TestCleanupBoundsNameLockWait(t *testing.T) {
 	oldTimeout := terminateTimeout
 	terminateTimeout = 100 * time.Millisecond
 	t.Cleanup(func() { terminateTimeout = oldTimeout })
@@ -164,13 +189,18 @@ func TestTerminateContainerBoundsNameLockWait(t *testing.T) {
 
 	r := &generationRunner{creation: "aaaaaaaaaaaaaaaa"}
 	ctr := &Container{id: name, runner: r, eng: appleEngine{}, creation: "aaaaaaaaaaaaaaaa"}
-	start := time.Now()
-	err = TerminateContainer(ctr)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("TerminateContainer = %v, want deadline exceeded", err)
+	tb := &cleanupTBRecorder{}
+	registerCleanup(tb, ctr, true)
+	if len(tb.callbacks) != 1 {
+		t.Fatalf("callbacks = %d, want 1", len(tb.callbacks))
 	}
+	start := time.Now()
+	tb.callbacks[0]()
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
-		t.Fatalf("TerminateContainer took %v, want bounded wait", elapsed)
+		t.Fatalf("Cleanup took %v, want bounded wait", elapsed)
+	}
+	if len(tb.errors) != 1 || !strings.Contains(tb.errors[0], context.DeadlineExceeded.Error()) {
+		t.Fatalf("cleanup errors = %v, want deadline exceeded", tb.errors)
 	}
 	if r.deleteCalls != 0 {
 		t.Errorf("deleteCalls = %d, want 0", r.deleteCalls)

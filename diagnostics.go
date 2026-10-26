@@ -22,6 +22,8 @@ func (c *config) diagnosticValues() []string {
 		values = append(values, mount.Source, mount.Target, mount.arg())
 	}
 	for _, file := range c.files {
+		// Content is deliberately excluded: it must never be rendered into a
+		// diagnostic, and hashing a large in-memory secret would retain it.
 		values = append(values, file.HostPath, file.ContainerPath)
 	}
 	for _, exposed := range c.exposed {

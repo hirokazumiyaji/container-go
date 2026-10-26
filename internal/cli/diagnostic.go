@@ -77,6 +77,53 @@ func WithRedactor(err error, r *Redactor) error {
 	return &safeError{err: err, redactor: combined}
 }
 
+// RegisterRedactedAsProvider registers support for a public error type whose
+// redaction method is unexported. Providers are consulted when errors.As
+// crosses a safe diagnostic boundary.
+func RegisterRedactedAsProvider(provider func(err error, target any, r *Redactor) bool) {
+	diagnostic.RegisterRedactedAs(provider)
+}
+
+func init() {
+	RegisterRedactedAsProvider(func(err error, target any, r *Redactor) bool {
+		switch target.(type) {
+		case **CLIError:
+			var value *CLIError
+			if errors.As(err, &value) {
+				return value.asRedacted(target, r)
+			}
+		case **SystemNotRunningError:
+			var value *SystemNotRunningError
+			if errors.As(err, &value) {
+				return value.asRedacted(target, r)
+			}
+		}
+		return false
+	})
+	diagnostic.RegisterDiagnosticRedactor(func(err error) *diagnostic.Redactor {
+		if system, ok := err.(*SystemNotRunningError); ok {
+			return system.diagnosticRedactor()
+		}
+		return nil
+	})
+}
+
+// DiagnosticRedactor returns the redactor attached to a safe diagnostic, if
+// any. It keeps SystemNotRunningError from exposing the internal redactor type
+// as a public method while preserving redactor composition across boundaries.
+func DiagnosticRedactor(err error) *Redactor {
+	switch value := err.(type) {
+	case *SystemNotRunningError:
+		return value.diagnosticRedactor()
+	case *safeError:
+		return value.DiagnosticRedactor()
+	}
+	if provider, ok := err.(interface{ DiagnosticRedactor() *Redactor }); ok {
+		return provider.DiagnosticRedactor()
+	}
+	return nil
+}
+
 // safeError is the public-boundary error facade. It keeps the source error
 // only for Is and explicit UnwrapRaw; ordinary Unwrap traversal would make a
 // raw CLI diagnostic reachable again through errors.As.
@@ -224,14 +271,14 @@ func (e *SystemNotRunningError) withRedactor(r *Redactor) *SystemNotRunningError
 	}
 }
 
-func (e *SystemNotRunningError) DiagnosticRedactor() *Redactor {
+func (e *SystemNotRunningError) diagnosticRedactor() *Redactor {
 	if e == nil {
 		return nil
 	}
 	return e.redactor
 }
 
-func (e *SystemNotRunningError) AsRedacted(target any, r *diagnostic.Redactor) bool {
+func (e *SystemNotRunningError) asRedacted(target any, r *diagnostic.Redactor) bool {
 	ptr, ok := target.(**SystemNotRunningError)
 	if !ok || e == nil {
 		return false
@@ -240,7 +287,7 @@ func (e *SystemNotRunningError) AsRedacted(target any, r *diagnostic.Redactor) b
 	return true
 }
 
-func (e *CLIError) AsRedacted(target any, r *diagnostic.Redactor) bool {
+func (e *CLIError) asRedacted(target any, r *diagnostic.Redactor) bool {
 	ptr, ok := target.(**CLIError)
 	if !ok || e == nil {
 		return false
@@ -287,10 +334,8 @@ func redactorsIn(err error) []*Redactor {
 			}
 			return
 		}
-		if provider, ok := current.(interface{ DiagnosticRedactor() *diagnostic.Redactor }); ok {
-			if redactor := provider.DiagnosticRedactor(); redactor != nil {
-				redactors = append(redactors, redactor)
-			}
+		if redactor := DiagnosticRedactor(current); redactor != nil {
+			redactors = append(redactors, redactor)
 		}
 		for _, child := range rawChildren(current) {
 			walk(child)
@@ -373,9 +418,7 @@ func asSafeDiagnostic(err error, target any, r *Redactor) bool {
 	if err == nil {
 		return false
 	}
-	if provider, ok := err.(interface {
-		AsRedacted(any, *diagnostic.Redactor) bool
-	}); ok && provider.AsRedacted(target, r) {
+	if diagnostic.RedactedAs(err, target, r) {
 		return true
 	}
 	if _, safe := err.(interface{ DiagnosticSafe() }); safe {

@@ -23,14 +23,12 @@ func keepContainers() bool {
 // TerminateContainer removes the container. It is nil-safe so it can be
 // deferred before the error check on Run. Shared WithReuse handles are
 // left alone; call ctr.Terminate explicitly to remove a reused container.
-// The complete operation, including the Apple name-lock wait, is bounded
-// by terminateTimeout so a stuck peer cannot stall test cleanup forever.
-func TerminateContainer(ctr *Container) error {
+// The caller's context bounds the complete operation, including the Apple
+// name-lock wait. Cleanup and StrictCleanup apply terminateTimeout by default.
+func TerminateContainer(ctx context.Context, ctr *Container) error {
 	if ctr == nil || keepContainers() || ctr.reused {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
-	defer cancel()
 	return ctr.Terminate(ctx)
 }
 
@@ -44,7 +42,11 @@ type cleanupTB interface {
 func registerCleanup(tb cleanupTB, ctr *Container, strict bool) {
 	tb.Helper()
 	tb.Cleanup(func() {
-		if err := TerminateContainer(ctr); err != nil {
+		// Bound the complete teardown, including waiting for another
+		// process' name lock, so a stuck peer cannot stall test cleanup.
+		ctx, cancel := context.WithTimeout(context.Background(), terminateTimeout)
+		defer cancel()
+		if err := TerminateContainer(ctx, ctr); err != nil {
 			if strict {
 				tb.Errorf("container-go: cleanup %s left the container behind: %v", ctr.ID(), err)
 				return
@@ -186,8 +188,10 @@ func parsePruneOptions(name string, opts []PruneOption) (pruneConfig, error) {
 }
 
 // Prune removes stopped containers created by this library, from any
-// session. PruneOption values such as WithPruneTimeout and
-// WithPruneOlderThan apply. It returns the IDs it removed.
+// session. PruneOption values such as WithPruneTimeout and WithPruneOlderThan
+// apply. It returns the IDs it removed. The package-level function uses the
+// process backend and has no Docker target options; use Client.Prune with
+// WithClientDockerHost or WithClientDockerContext to select a target.
 func Prune(ctx context.Context, opts ...PruneOption) ([]string, error) {
 	cfg, err := parsePruneOptions("Prune", opts)
 	if err != nil {

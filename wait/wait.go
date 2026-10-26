@@ -515,8 +515,8 @@ func collectNonContext(err error, set *causeSet) {
 		return
 	}
 	if raw, ok := err.(interface{ UnwrapRaw() error }); ok {
-		if provider, ok := err.(interface{ DiagnosticRedactor() *cli.Redactor }); ok {
-			collectRedactedFacade(err, raw, provider, set)
+		if redactor := cli.DiagnosticRedactor(err); redactor != nil {
+			collectRedactedFacade(err, raw, redactor, set)
 			return
 		}
 	}
@@ -578,7 +578,7 @@ func collectNonContext(err error, set *causeSet) {
 func collectRedactedFacade(
 	facade error,
 	raw interface{ UnwrapRaw() error },
-	provider interface{ DiagnosticRedactor() *cli.Redactor },
+	redactor *cli.Redactor,
 	set *causeSet,
 ) {
 	child := raw.UnwrapRaw()
@@ -590,18 +590,11 @@ func collectRedactedFacade(
 	if len(childSet.diagnostics) == 0 && len(childSet.classifiers) == 0 {
 		return
 	}
-	redactor := provider.DiagnosticRedactor()
 	for _, diagnostic := range childSet.diagnostics {
-		if redactor != nil {
-			diagnostic = cli.WithRedactor(diagnostic, redactor)
-		}
-		set.diagnostics = append(set.diagnostics, diagnostic)
+		set.diagnostics = append(set.diagnostics, cli.WithRedactor(diagnostic, redactor))
 	}
 	for _, classifier := range childSet.classifiers {
-		if redactor != nil {
-			classifier = cli.WithRedactor(classifier, redactor)
-		}
-		set.classifiers = append(set.classifiers, classifier)
+		set.classifiers = append(set.classifiers, cli.WithRedactor(classifier, redactor))
 	}
 	// The facade itself carries the redacted As surface (for example a
 	// *cli.CLIError clone); its Is surface is filtered by classifiedCause.

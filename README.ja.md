@@ -22,6 +22,7 @@ Go 1.26 以降が必要です。`v0.2.0` モジュールには Go 1.27 以降が
 | `Run`、基本オプション、ライフサイクル、エンドポイント、`Exec`、`Logs`、`FollowLogs`、copy、pull policy、Reuse、Cleanup、バックエンド選択、元の wait 戦略 | あり | あり |
 | `LogsOptions` と `LogsWithOptions` | なし | あり |
 | `wait.ForHTTP` のヘッダー、認証、TLS、独自クライアント設定 | なし | あり |
+| `wait.ForHealthcheck` と `HTTPStrategy.WithResponseMatcher` | なし | あり |
 | 公開型 `wait.AllStrategy` / `AnyStrategy` と合成 strategy の `WithStartupTimeout` | なし | あり |
 | root の `CLIError`、`ErrContainerNotFound`、`ErrGenerationReplaced` | なし | あり |
 | 世代安全な削除、`v0.2.0` 以降の endpoint 強化、現在のリーパー強化 | `v0.2.0` の契約には含まれない | 一部実装済み。以下の後続 issue の制約を参照 |
@@ -445,6 +446,12 @@ func ReleasedWaitStrategies() {
 `ForLog` の poll interval は、パターンが見つかる前にストリームが終了してから再-open するまでの待ち時間です。
 `ForAll` と `ForAny` は既定では合成全体のタイムアウトを持ちません。正の `WithStartupTimeout` を指定すると合成全体を制限し、0 または負の値では制限せず各子の戦略のタイムアウトを適用します。
 
+現在の開発チェックアウトは、Docker の `HEALTHCHECK` 状態を待つ
+`wait.ForHealthcheck()` と、上限付きでレスポンスボディを判定する
+`HTTPStrategy.WithResponseMatcher` も追加しています。
+ヘルスチェック戦略は Docker 専用であり、Apple バックエンドはコンテナを
+作成する前にこの戦略を拒否します。
+
 コンテナが stopping、stopped、paused の状態のいずれかになると、待機は即座に失敗します。
 created、restarting、unknown と一時的な inspect エラーはタイムアウトまで再試行し、一時的なログストリームの open と EOF は再-open します。終了コードを伴うログストリームエラーは返却します。
 成功マーカーは、制限時間内の最終ライフサイクル観測で `Running` が確認された場合のみ受理されます。`ForLog` はワンショットジョブではなく、長時間稼働するサービス向けです。
@@ -454,6 +461,8 @@ created、restarting、unknown と一時的な inspect エラーはタイムア�
 カスタム戦略向けの `wait.Target` は従来の `Running` メソッドを維持します。
 起動中の一時状態を区別できるターゲットでは、任意の `wait.StateTarget` インターフェースも実装してください。
 組み込み戦略は `StateTarget` を自動利用し、互換性のため `Running` にフォールバックします。
+Docker のヘルスチェック待機では、任意の `wait.HealthTarget` インターフェースも使います。
+`ForHealthcheck` はこれを実装しないターゲットに `*wait.ConfigError` を返します。
 
 Docker では、公開ポートへの TCP 接続が成功してもコンテナ内のプロセスが
 listen しているとは限りません。`docker-proxy` や Docker Desktop の port
@@ -1168,7 +1177,7 @@ watchdog プロセスを停止し、実効 `TMPDIR`(`/tmp` と決めつけませ
 
 | testcontainers-go | 本 library |
 |---|---|
-| `wait.ForHealthCheck` | 相当機能なし。`ForLog` / `ForExec` / `ForHTTP` を使用 |
+| `wait.ForHealthCheck` | Docker 専用（`wait.ForHealthcheck`）。Apple Container にはヘルスチェックがない |
 | Dockerfile からの build | スコープ外（`container build` / `docker build` を直接使用） |
 | Ryuk reaper container | ローカルの watchdog reaper process で代替。ただし上記の制限がある |
 | random host port mapping | Apple はコンテナ IP へ直接接続。Docker はランダム loopback port へ自動公開 |

@@ -633,31 +633,30 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 	// stream cannot grow an unbounded error tree until the caller's deadline
 	// and one source never contributes twice to a single error.
 	var lastStreamErr, lastProbeErr error
-	record := func(streamErr, probeErr error) error {
-		// Retain only non-context branches. A mixed Join(context, cause) must
-		// not keep the stale context half, and a later context-only
-		// observation must not erase an already retained typed cause.
+	record := func(streamErr, probeErr error) {
+		// Retain only structured non-context causes. A mixed context branch
+		// must not reach diagnostics, and a later context-only observation
+		// must not erase an already retained typed cause.
 		if filtered := nonContextCause(streamErr); filtered != nil {
 			lastStreamErr = filtered
 		}
 		if filtered := nonContextCause(probeErr); filtered != nil {
 			lastProbeErr = filtered
 		}
-		return joinNonNil(lastStreamErr, lastProbeErr)
 	}
-	retained := func() error { return record(nil, nil) }
 	for {
-		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, retained()); terminalErr != nil {
+		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 			return terminalErr
 		}
 
 		stream, err := target.FollowLogs(waitCtx)
 		if err != nil {
-			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(err, nil)); terminalErr != nil {
+			record(err, nil)
+			if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 				return terminalErr
 			}
 			if isPermanentCheckError(err) || isTerminalStreamError(err) {
-				if filtered := retainedNonContextCause(err); filtered != nil {
+				if filtered := nonContextCause(err); filtered != nil {
 					return wrapWaitCause(what, filtered, lastProbeErr)
 				}
 				// Context-only permanent/terminal wrapper while the wait is
@@ -667,14 +666,14 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			result := scanLogStreamTarget(waitCtx, target, stream, match, s.occurrences, replay)
 			if terminalWaitState(result.state) {
 				_ = stream.Close()
-				return waitStoppedStateError(what, result.state, retained())
+				return waitStoppedStateError(what, result.state, lastStreamErr, lastProbeErr)
 			}
 			terminalStreamErr := result.terminalErr
-			resultErr := record(terminalStreamErr, nil)
+			record(terminalStreamErr, nil)
 			_ = stream.Close()
 			if result.found {
 				if cause := nonContextCause(terminalStreamErr); cause != nil {
-					if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, resultErr); terminalErr != nil {
+					if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 						return terminalErr
 					}
 					return wrapWaitCause(what, cause, lastProbeErr)
@@ -683,7 +682,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				// settle delay, or a deadline that fires during that delay,
 				// must not turn the match into a timeout.
 				if callerCtx.Err() == nil && waitCtx.Err() == nil {
-					if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, resultErr); err != nil {
+					if err := finalLifecycleError(callerCtx, waitCtx, target, what, timeout, interval, lastStreamErr, lastProbeErr); err != nil {
 						return err
 					}
 				}
@@ -700,18 +699,19 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 				}
 			}
 			if result.err != nil {
-				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(result.err, nil)); terminalErr != nil {
+				record(result.err, nil)
+				if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 					return terminalErr
 				}
 				if isPermanentCheckError(result.err) || isTerminalStreamError(result.err) {
-					if filtered := retainedNonContextCause(result.err); filtered != nil {
+					if filtered := nonContextCause(result.err); filtered != nil {
 						return wrapWaitCause(what, filtered, lastProbeErr)
 					}
 					// Context-only: reconnect rather than return canceled.
 				}
 			}
 		}
-		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, retained()); terminalErr != nil {
+		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 			return terminalErr
 		}
 
@@ -721,7 +721,7 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		probeCtx, probeCancel := boundedProbeContext(waitCtx, lifecycleProbeTimeout)
 		if err := probeCtx.Err(); err != nil {
 			probeCancel()
-			return waitContextError(what, err, retained())
+			return waitContextError(what, err, lastStreamErr, lastProbeErr)
 		}
 		state, probeErr := targetState(probeCtx, target)
 		probeCtxErr := probeCtx.Err()
@@ -729,7 +729,8 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 		if probeCtxErr != nil {
 			probeErr = joinNonNil(probeErr, probeCtxErr)
 		}
-		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, record(nil, probeErr)); terminalErr != nil {
+		record(nil, probeErr)
+		if terminalErr := waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr); terminalErr != nil {
 			return terminalErr
 		}
 		if probeErr != nil {
@@ -738,17 +739,17 @@ func (s *LogStrategy) WaitUntilReady(ctx context.Context, target Target) (retErr
 			// the wait; transient daemon/inspect failures remain causes and
 			// are retried with the next log connection.
 			if isPermanentCheckError(probeErr) {
-				if filtered := retainedNonContextCause(probeErr); filtered != nil {
-					return wrapWaitCause(what, filtered, retained())
+				if filtered := nonContextCause(probeErr); filtered != nil {
+					return wrapWaitCause(what, filtered, lastStreamErr, lastProbeErr)
 				}
 				// Context-only permanent probe wrapper: retry.
 			}
 		} else if terminalWaitState(state) {
-			return waitStoppedStateError(what, state, retained())
+			return waitStoppedStateError(what, state, lastStreamErr, lastProbeErr)
 		}
 
 		if err := waitForReconnect(waitCtx, interval); err != nil {
-			return waitContextTerminationError(callerCtx, waitCtx, what, timeout, retained())
+			return waitContextTerminationError(callerCtx, waitCtx, what, timeout, lastStreamErr, lastProbeErr)
 		}
 	}
 }

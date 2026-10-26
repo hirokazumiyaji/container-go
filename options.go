@@ -68,6 +68,7 @@ type config struct {
 	workdir              string
 	network              string
 	networkExplicit      bool
+	networkAliases       []string
 	platform             string
 	pullPolicy           PullPolicy
 	allowMutableImageTag bool
@@ -277,6 +278,9 @@ func (c *config) commonRunArgs(image, envFile string, extraPublish []string) []s
 	}
 	if c.networkExplicit && c.network != "" {
 		args = append(args, "--network", c.network)
+		for _, alias := range c.networkAliases {
+			args = append(args, "--network-alias", alias)
+		}
 	}
 	if c.platform != "" {
 		args = append(args, "--platform", c.platform)
@@ -395,6 +399,11 @@ var nameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
 // networkNameRE is the common syntactic guard. Apple applies its stricter
 // lowercase/no-separator rule in appleEngine.checkConfig.
 var networkNameRE = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,62}$`)
+
+// networkAliasRE is Docker's network-scoped DNS label: 1-63 letters, digits,
+// or hyphens with an alphanumeric first and last character. A leading dash is
+// rejected so an alias can never be parsed as a CLI flag.
+var networkAliasRE = regexp.MustCompile(`^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$`)
 
 // labelKeyRE is the Docker-style label key rule the CLI enforces,
 // extended with slash-separated OCI segments.
@@ -754,6 +763,47 @@ func WithNetwork(name string) Option {
 		c.networkExplicit = true
 		return nil
 	}
+}
+
+// WithNetworkAliases adds network-scoped DNS aliases for the container. Docker
+// passes each alias as --network-alias. Every alias must be a DNS label of
+// 1-63 letters, digits, or hyphens with an alphanumeric first and last
+// character; duplicates are rejected. Aliases require an explicitly selected
+// user-defined WithNetwork: Docker's default bridge (and its Windows "nat"
+// equivalent), host, and none networks do not resolve network-scoped aliases.
+// Apple Container has no network-alias capability, so Run returns
+// ErrUnsupportedCapability before any backend operation.
+func WithNetworkAliases(aliases ...string) Option {
+	return func(c *config) error {
+		seen := make(map[string]struct{}, len(c.networkAliases)+len(aliases))
+		for _, alias := range c.networkAliases {
+			seen[alias] = struct{}{}
+		}
+		for _, alias := range aliases {
+			if err := validateNetworkAlias(alias); err != nil {
+				return err
+			}
+			if _, exists := seen[alias]; exists {
+				return newValidationErrorWithField("WithNetworkAliases", "alias", alias,
+					fmt.Errorf("duplicate network alias %q", alias))
+			}
+			seen[alias] = struct{}{}
+		}
+		c.networkAliases = append(c.networkAliases, aliases...)
+		return nil
+	}
+}
+
+func validateNetworkAlias(alias string) error {
+	if alias == "" {
+		return newValidationErrorWithField("WithNetworkAliases", "alias", alias,
+			fmt.Errorf("network alias must not be empty"))
+	}
+	if !networkAliasRE.MatchString(alias) {
+		return newValidationErrorWithField("WithNetworkAliases", "alias", alias,
+			fmt.Errorf("invalid network alias %q", alias))
+	}
+	return nil
 }
 
 // platformRE matches the shared Docker-style "os", "os/arch", or

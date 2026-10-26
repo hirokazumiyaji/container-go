@@ -469,6 +469,16 @@ func TestPruneOptionsValidation(t *testing.T) {
 			wantErr: "parallelism must be positive",
 		},
 		{
+			name:    "negative older than",
+			opt:     WithPruneOlderThan(-time.Second),
+			wantErr: "age must be positive",
+		},
+		{
+			name:    "zero older than",
+			opt:     WithPruneOlderThan(0),
+			wantErr: "age must be positive",
+		},
+		{
 			name:    "nil option",
 			opt:     nil,
 			wantErr: "option 0 is nil",
@@ -486,6 +496,195 @@ func TestPruneOptionsValidation(t *testing.T) {
 				t.Fatalf("err = %v, want error containing %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestWithPruneOlderThanSetsConfig(t *testing.T) {
+	cfg, err := parsePruneOptions("Prune", []PruneOption{WithPruneOlderThan(2 * time.Hour)})
+	if err != nil {
+		t.Fatalf("parsePruneOptions: %v", err)
+	}
+	if cfg.olderThan != 2*time.Hour {
+		t.Fatalf("olderThan = %v, want 2h", cfg.olderThan)
+	}
+	if cfg.now == nil {
+		t.Fatal("parsed prune config has no clock")
+	}
+}
+
+// pruneAgeDockerRunner serves list IDs and per-container Docker inspect
+// creation times. Tests supply the clock through pruneConfig.
+type pruneAgeDockerRunner struct {
+	*fakeRunner
+	ids     []string
+	created map[string]time.Time
+}
+
+func (r *pruneAgeDockerRunner) Run(_ context.Context, args ...string) ([]byte, []byte, error) {
+	r.recordCall(args)
+	switch args[0] {
+	case "ps":
+		return []byte(strings.Join(r.ids, "\n") + "\n"), nil, nil
+	case "inspect":
+		id := args[len(args)-1]
+		created := ""
+		if at, ok := r.created[id]; ok && !at.IsZero() {
+			created = fmt.Sprintf(`"Created":%q,`, at.UTC().Format(time.RFC3339Nano))
+		}
+		return []byte(fmt.Sprintf(`[{"Id":%q,"Name":"/prune-age",%s"State":{"Status":"exited"},"Config":{"Image":"redis:7-alpine","Labels":{%q:"true",%q:"0123456789abcdef"}},"NetworkSettings":{}}]`,
+			id, created, managedLabel, creationLabel)), nil, nil
+	case "rm":
+		return nil, nil, nil
+	default:
+		return nil, nil, nil
+	}
+}
+
+func (r *pruneAgeDockerRunner) deletedIDs() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var ids []string
+	for _, call := range r.calls {
+		if call[0] == "rm" {
+			ids = append(ids, call[len(call)-1])
+		}
+	}
+	return ids
+}
+
+func TestPruneOlderThanFiltersDockerCandidates(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	oldID := cleanupDockerIDOne
+	boundaryID := cleanupDockerIDTwo
+	recentID := strings.Repeat("3", 64)
+	runner := &pruneAgeDockerRunner{
+		fakeRunner: newTestRunner(),
+		ids:        []string{oldID, boundaryID, recentID},
+		created: map[string]time.Time{
+			oldID:      now.Add(-2 * time.Hour),
+			boundaryID: now.Add(-time.Hour),
+			recentID:   now.Add(-30 * time.Minute),
+		},
+	}
+
+	removed, err := pruneWithConfig(context.Background(), runner, dockerEngine{}, pruneConfig{
+		olderThan: time.Hour,
+		now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if !slices.Equal(removed, []string{oldID}) {
+		t.Fatalf("removed = %v, want only the candidate older than the cutoff", removed)
+	}
+	if got := runner.deletedIDs(); !slices.Equal(got, []string{oldID}) {
+		t.Fatalf("deleted = %v, want only %s", got, oldID)
+	}
+}
+
+func TestPruneOlderThanKeepsDockerCandidateWithoutCreationTime(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	runner := &pruneAgeDockerRunner{
+		fakeRunner: newTestRunner(),
+		ids:        []string{cleanupDockerIDOne},
+		created:    map[string]time.Time{},
+	}
+
+	removed, err := pruneWithConfig(context.Background(), runner, dockerEngine{}, pruneConfig{
+		olderThan: time.Hour,
+		now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if len(removed) != 0 {
+		t.Fatalf("removed = %v, want a candidate with unknown creation time retained", removed)
+	}
+	if got := runner.deletedIDs(); len(got) != 0 {
+		t.Fatalf("deleted = %v, want no deletion", got)
+	}
+}
+
+func pruneFixtureCreated(container pruneFixtureContainer, at time.Time) pruneFixtureContainer {
+	container.Config.CreationDate = at.UTC().Format(time.RFC3339Nano)
+	return container
+}
+
+func TestPruneOlderThanFiltersAppleCandidates(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	old := pruneFixtureCreated(
+		pruneFixture("old", "aaaaaaaaaaaaaaaa", string(StateStopped), "", true),
+		now.Add(-2*time.Hour),
+	)
+	recent := pruneFixtureCreated(
+		pruneFixture("recent", "bbbbbbbbbbbbbbbb", string(StateStopped), "", true),
+		now.Add(-30*time.Minute),
+	)
+	runner := &pruneSafetyRunner{
+		list:     []pruneFixtureContainer{old, recent},
+		inspects: []pruneFixtureContainer{old, recent},
+	}
+
+	removed, err := pruneWithConfig(context.Background(), runner, appleEngine{}, pruneConfig{
+		olderThan: time.Hour,
+		now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if !slices.Equal(removed, []string{"old"}) {
+		t.Fatalf("removed = %v, want only the candidate older than the cutoff", removed)
+	}
+	if !slices.Equal(runner.deleted, []string{"old"}) {
+		t.Fatalf("deleted = %v, want only old", runner.deleted)
+	}
+	if got := runner.callCount("inspect"); got != 1 {
+		t.Fatalf("inspect calls = %d, want only the admitted candidate inspected", got)
+	}
+}
+
+func TestPruneOlderThanUsesAppleInspectTimeWhenListTimeIsMissing(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	listed := pruneFixture("old", "aaaaaaaaaaaaaaaa", string(StateStopped), "", true)
+	fresh := pruneFixtureCreated(listed, now.Add(-2*time.Hour))
+	runner := &pruneSafetyRunner{
+		list:     []pruneFixtureContainer{listed},
+		inspects: []pruneFixtureContainer{fresh},
+	}
+
+	removed, err := pruneWithConfig(context.Background(), runner, appleEngine{}, pruneConfig{
+		olderThan: time.Hour,
+		now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if !slices.Equal(removed, []string{"old"}) {
+		t.Fatalf("removed = %v, want the inspect-reported old candidate removed", removed)
+	}
+}
+
+func TestPruneOlderThanKeepsAppleCandidateThatBecameRecent(t *testing.T) {
+	now := time.Date(2026, 8, 19, 12, 0, 0, 0, time.UTC)
+	listed := pruneFixtureCreated(
+		pruneFixture("shared", "aaaaaaaaaaaaaaaa", string(StateStopped), "", true),
+		now.Add(-2*time.Hour),
+	)
+	fresh := pruneFixtureCreated(listed, now.Add(-30*time.Minute))
+	runner := &pruneSafetyRunner{
+		list:     []pruneFixtureContainer{listed},
+		inspects: []pruneFixtureContainer{fresh},
+	}
+
+	removed, err := pruneWithConfig(context.Background(), runner, appleEngine{}, pruneConfig{
+		olderThan: time.Hour,
+		now:       func() time.Time { return now },
+	})
+	if err != nil {
+		t.Fatalf("pruneWithConfig: %v", err)
+	}
+	if len(removed) != 0 || len(runner.deleted) != 0 {
+		t.Fatalf("removed = %v, deleted = %v; want the fresh recent timestamp retained", removed, runner.deleted)
 	}
 }
 

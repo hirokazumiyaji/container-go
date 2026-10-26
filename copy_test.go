@@ -1138,25 +1138,81 @@ func TestSnapshotCopySourceClassifiesPostOpenDisappearance(t *testing.T) {
 		t.Fatalf("error = %v, want preserved fs.ErrNotExist cause", err)
 	}
 }
-func TestWithFilesRejectsDirectory(t *testing.T) {
+func TestWithFilesRejectsDirectoryBeforeBackend(t *testing.T) {
 	source := filepath.Join(t.TempDir(), "tree")
 	if err := os.Mkdir(source, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runner := &cpRunner{fakeRunner: newTestRunner()}
+	runner := newCountingRunner(newTestRunner())
 
 	_, err := Run(context.Background(), "redis:7-alpine",
 		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
 		WithFiles(File{HostPath: source, ContainerPath: "/tmp/tree"}))
-	if !errors.Is(err, ErrCopySourceUnsupported) {
-		t.Fatalf("error = %v, want ErrCopySourceUnsupported", err)
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
 	}
-	if call := runner.callWith("cp"); call != nil {
-		t.Errorf("CLI was called for a file-only WithFiles source: %v", call)
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
 	}
-	if runner.callWith("delete") == nil {
-		t.Error("failed WithFiles copy did not roll back the container")
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("error = %v, want regular-file rejection", err)
 	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	}
+}
+
+func TestWithFilesRejectsSymlinkBeforeBackend(t *testing.T) {
+	root := t.TempDir()
+	target := filepath.Join(root, "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(root, "link.txt")
+	if err := os.Symlink(target, source); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	_, err := Run(context.Background(), "redis:7-alpine",
+		WithName("myctr"), withRunner(runner), withEngine(appleEngine{}),
+		WithFiles(File{HostPath: source, ContainerPath: "/tmp/link.txt"}))
+	if !errors.Is(err, ErrInvalidOption) {
+		t.Fatalf("error = %v, want ErrInvalidOption", err)
+	}
+	var validationErr *ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Option != "WithFiles" || validationErr.Field != "hostPath" {
+		t.Fatalf("error = %v, want ValidationError for WithFiles/hostPath", err)
+	}
+	if !strings.Contains(err.Error(), "not a regular file") {
+		t.Fatalf("error = %v, want regular-file rejection", err)
+	}
+	if got := runner.count(); got != 0 {
+		t.Fatalf("backend CLI calls = %d, want 0: %v", got, runner.args)
+	}
+}
+
+func TestWithFilesAcceptsRegularFile(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "input.txt")
+	if err := os.WriteFile(source, []byte("data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runner := newCountingRunner(newTestRunner())
+
+	runTestContainer(t, runner, WithFiles(File{HostPath: source, ContainerPath: "/tmp/input.txt"}))
+
+	runner.mu.Lock()
+	defer runner.mu.Unlock()
+	if runner.calls.Load() == 0 {
+		t.Fatal("backend CLI was not invoked for a regular file")
+	}
+	for _, args := range runner.args {
+		if len(args) == 3 && args[0] == "cp" && args[2] == "myctr:/tmp/input.txt" {
+			return
+		}
+	}
+	t.Fatalf("no cp call for the regular file: %v", runner.args)
 }
 func TestCopyToContainerCleansNonEmptyReadOnlyDirectory(t *testing.T) {
 	if runtime.GOOS == "windows" {

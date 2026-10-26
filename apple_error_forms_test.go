@@ -36,6 +36,9 @@ func TestAppleContainerMissingFixtures(t *testing.T) {
 			if fixture.Operation == "exec" {
 				args = append(args, "true")
 			}
+			if fixture.Operation == "cp" {
+				args = []string{"cp", "/host/source", fixture.Target + ":/tmp/destination"}
+			}
 			cliErr := &cli.CLIError{
 				Binary: "container",
 				Args:   args,

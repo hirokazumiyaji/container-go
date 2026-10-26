@@ -257,7 +257,8 @@ described below are not.
 - `WithFiles(files ...File)`: regular files copied into the running
   container after start; a copy failure rolls back `Run`. Each `File` sets
   exactly one of `HostPath` or `Content`; `Mode` optionally overrides the
-  Unix permission bits on the private staged copy. On `WithReuse`, files
+  Unix permission bits on the private staged copy. Host directories,
+  symlinks, and special files are rejected at option evaluation. On `WithReuse`, files
   are copied for every caller, including attach callers; an attach copy
   failure returns an error without deleting the shared container.
 - `WithPublishedPort(spec string)`: explicit host-side port publishing.
@@ -282,6 +283,12 @@ described below are not.
 - `WithUser(u string)` / `WithWorkingDir(dir string)`: process user
   and working directory.
 - `WithNetwork(name string)`: attach to an existing named network.
+- `WithNetworkAliases(aliases ...string)`: add network-scoped DNS aliases
+  for Docker (`--network-alias`). Requires an explicitly selected
+  user-defined `WithNetwork`; the default bridge (`bridge`/`nat`), `host`,
+  and `none` are rejected with `*ConfigError`, and Apple returns
+  `ErrUnsupportedCapability`. Aliases are DNS labels and participate in
+  reuse compatibility.
 - `WithPlatform(p string)`: select an image platform such as
   `linux/amd64` (including Rosetta use on Apple Container).
   and working directory
@@ -311,10 +318,10 @@ they are rejected.
 unwrap chain. The exported `Message` field remains for source compatibility
 but does not override `Err`. `Run` validates its image before invoking any
 `Option`; `WithFiles` rejects a file that sets both or neither of `HostPath`
-and `Content`, rejects non-permission `Mode` bits, and resolves and stats each
-host path before image or container work. A `Content` slice is bounded by
-`MaxCopyToContainerSize` at option evaluation. Docker applies its complete
-local-volume-name grammar in `checkConfig` while Apple keeps its
+and `Content`, rejects non-permission `Mode` bits, and resolves and checks each
+host path is a regular file before image or container work. A `Content` slice
+is bounded by `MaxCopyToContainerSize` at option evaluation. Docker applies its
+complete local-volume-name grammar in `checkConfig` while Apple keeps its
 backend-specific name rules. Copy paths are interpreted as POSIX paths with
 the `path` package, and a negative `Container.Stop` timeout is rejected before
 the CLI is called.
@@ -519,9 +526,10 @@ available on both backends.
 source entry once without following a final link; directory children are
 opened relative to the already-open parent handle. It copies from those
 handles into a current-user-only staging root before invoking either CLI.
-`WithFiles` uses the same snapshot path but rejects directories. Separate
-staging and CLI deadlines prevent filesystem work from consuming the CLI
-budget, while a caller deadline remains authoritative for both. Directory
+`WithFiles` uses the same snapshot path but rejects directories, symlinks,
+and special files when the option is applied, before any backend call.
+Separate staging and CLI deadlines prevent filesystem work from consuming the
+CLI budget, while a caller deadline remains authoritative for both. Directory
 snapshots are bounded by file bytes, entry count, depth, and aggregate
 source-path metadata. They intentionally preserve only names, bytes, and
 Unix permission bits; timestamps, ownership, setuid/setgid bits, ACLs,
@@ -772,6 +780,18 @@ by a POSIX `sleep`/`kill` timeout that cleans up its timer process, and
 the whole reap has an overall budget past which no new backend calls
 are issued. Entries are processed a few at a time so the cost is not
 strictly proportional to the container count.
+
+**Recovering leftovers**: the watchdog cannot help on Windows, after the
+local process tree or runner VM is destroyed (for example on CI
+cancellation or `go test -timeout`), or for containers that outlive the
+local environment on a remote Docker daemon. The supported recovery
+pattern is to call `Prune(ctx)` from `TestMain` before and after the
+suite. `Prune` removes stopped managed containers from any session;
+running and created containers remain. `WithPruneOlderThan(d)` restricts
+a sweep to candidates the backend reports as created before now-d and
+leaves candidates whose creation time is unknown, so a shared or remote
+daemon does not lose another job's recent containers. This is recovery,
+not a replacement watchdog.
 
 The reaper is started lazily for a real CLI container on the non-reuse
 path. Apple Container has no separate immutable ID, so its entries use

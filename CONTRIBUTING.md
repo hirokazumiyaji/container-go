@@ -58,7 +58,7 @@ To cut a release:
    the pinning prose — and the `SECURITY.md` support matrix to cover `X.Y.x`.
    `internal/releasecheck` names each one it checks if you miss any.
 3. Run `make release-check` from a clean checkout: build, vet (including the
-   `integration`-tagged files), `golangci-lint`, `go test -race`,
+   `integration`-tagged files), `golangci-lint`, `deadcode`, `go test -race`,
    `go mod verify`, a `go mod tidy -diff` no-op check, `govulncheck`, and
    `actionlint`, then the same for the separate `bench` module. This is the
    pre-tag gate — the same target the workflow runs — so a green local run

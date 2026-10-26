@@ -12,6 +12,7 @@
 - `make test` runs the full default test suite (`go test ./...`) without requiring a container backend.
 - `make vet` runs `go vet ./...`.
 - `make lint` runs `golangci-lint run ./...` (also enforced in CI).
+- `make deadcode` reports functions unreachable from any main or test binary; it runs in CI and `make release-check`, and fails on findings outside the exported API allowlist in the Makefile.
 - `make integration` runs tagged integration tests against the available default backend (skips pull-heavy bench/singleflight cases); `make integration-docker` limits them to Docker; `make bench-integration` runs the pull-heavy scenarios. These require the relevant CLI and daemon/service. Integration images use the AWS public ECR Docker Hub mirror to avoid anonymous pull rate limits. Set `CONTAINERGO_BACKEND` to skip the other backend's tests.
 - `go fmt ./...` formats all packages.
 

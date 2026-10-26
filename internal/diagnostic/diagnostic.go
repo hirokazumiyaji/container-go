@@ -212,9 +212,6 @@ func ComposeRedactors(redactors ...*Redactor) *Redactor {
 	return redactors[0].Compose(redactors[1:]...)
 }
 
-// Compose is a short alias for ComposeRedactors.
-func Compose(redactors ...*Redactor) *Redactor { return ComposeRedactors(redactors...) }
-
 // Text redacts known values, applies structural secret rules, and escapes
 // control characters. The returned text is safe to write to a terminal or a CI
 // log.
@@ -1141,11 +1138,8 @@ func (e *safeError) UnwrapRaw() error {
 	return e.err
 }
 
-// Wrap returns an error whose Error method is safe for terminal and log
-// output while retaining source identity for errors.Is and explicit UnwrapRaw.
-func Wrap(err error) error { return WithRedactor(err, NewRedactor()) }
-
-// WithRedactor is the configurable form of Wrap.
+// WithRedactor returns err with a safe diagnostic rendering while retaining
+// source identity for errors.Is and explicit UnwrapRaw.
 func WithRedactor(err error, r *Redactor) error {
 	if err == nil {
 		return nil

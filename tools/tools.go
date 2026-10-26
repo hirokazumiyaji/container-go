@@ -5,5 +5,6 @@ package tools
 
 import (
 	_ "github.com/rhysd/actionlint/cmd/actionlint"
+	_ "golang.org/x/tools/cmd/deadcode"
 	_ "golang.org/x/vuln/cmd/govulncheck"
 )
